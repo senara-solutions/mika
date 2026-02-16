@@ -6,6 +6,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage
 
+# Import all models so SQLAlchemy relationships resolve correctly
+import app.models.audit  # noqa: F401
+import app.models.channel  # noqa: F401
+import app.models.consent  # noqa: F401
+import app.models.conversation  # noqa: F401
+import app.models.user  # noqa: F401
+
 
 @pytest.fixture
 def user_id() -> str:
