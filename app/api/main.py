@@ -20,6 +20,8 @@ from app.channels.telegram.middleware import (
     DbSessionMiddleware,
     TypingMiddleware,
 )
+from app.channels.whatsapp import WhatsAppAdapter
+from app.channels.whatsapp.handlers import router as wa_router
 from app.common.db import async_session_factory
 from app.common.logging import get_logger, setup_logging
 from app.config import settings
@@ -41,6 +43,8 @@ async def lifespan(application: FastAPI):
 
     # Register channel adapters
     register_adapter("telegram", TelegramAdapter())
+    if settings.whatsapp_phone_id:
+        register_adapter("whatsapp", WhatsAppAdapter())
 
     # Set up Telegram dispatcher
     dp.include_router(tg_router)
@@ -73,6 +77,7 @@ app.add_middleware(SessionAuthMiddleware)
 app.include_router(auth_router)
 app.include_router(dashboard_router)
 app.include_router(memory_router)
+app.include_router(wa_router)
 
 
 @app.get("/health")

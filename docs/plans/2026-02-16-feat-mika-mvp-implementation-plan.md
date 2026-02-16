@@ -746,9 +746,10 @@ class ChannelAdapter(ABC):
 ##### Tasks
 
 - [ ] Start Meta business verification (should have been initiated Week 1-2)
-- [ ] Implement `app/channels/whatsapp/client.py` -- PyWa setup with FastAPI
-- [ ] Implement `app/channels/whatsapp/handlers.py` -- message handler (reuses message router)
-- [ ] Implement 24-hour window tracking: `user_channels.last_message_at` for WhatsApp entries
+- [x] Implement `app/channels/whatsapp/__init__.py` -- WhatsAppAdapter using httpx + Meta Cloud API
+- [x] Implement `app/channels/whatsapp/handlers.py` -- webhook verification + message handler (reuses message router)
+- [x] Implement 24-hour window tracking: `user_channels.last_message_at` for WhatsApp entries
+- [x] Register WhatsApp adapter and router in `app/api/main.py` (conditional on config)
 - [ ] Design and submit WhatsApp message templates to Meta:
   - Follow-up nudge: "Hi {{1}}, you mentioned {{2}}. Want me to help with that?"
   - Morning briefing: "Good morning {{1}}! Here's your daily update from Mika."
@@ -758,7 +759,7 @@ class ChannelAdapter(ABC):
   - If window closed: send approved template
   - If template not approved: fall back to Telegram
 - [ ] Handle multi-channel: unified conversation history, channel preference per user
-- [ ] Write tests: WhatsApp message handling, window tracking, template fallback
+- [x] Write tests: WhatsApp message handling, adapter, webhook verification (11 tests)
 
 #### Phase 3d: Privacy APIs (Week 8)
 
