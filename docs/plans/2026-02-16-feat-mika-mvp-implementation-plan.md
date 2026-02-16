@@ -736,10 +736,10 @@ class ChannelAdapter(ABC):
 
 ##### Tasks
 
-- [ ] Implement memory viewer: Neo4j subgraph visualization (people, commitments, facts, patterns)
-- [ ] Implement memory correction: user can edit/delete individual memory nodes
-- [ ] Implement conversation history viewer: paginated message list from Postgres
-- [ ] Implement search across conversations
+- [x] Implement memory viewer: Neo4j subgraph visualization (people, commitments, facts, patterns)
+- [x] Implement memory correction: user can edit/delete individual memory nodes
+- [x] Implement conversation history viewer: paginated message list from Postgres
+- [x] Implement search across conversations
 
 #### Phase 3c: WhatsApp Integration (Weeks 7-8)
 

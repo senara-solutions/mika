@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from app.api.middleware import SessionAuthMiddleware
 from app.api.routes.auth import router as auth_router
 from app.api.routes.dashboard import router as dashboard_router
+from app.api.routes.memory import router as memory_router
 from app.channels.router import register_adapter
 from app.channels.telegram import TelegramAdapter
 from app.channels.telegram.bot import dp, get_bot
@@ -71,6 +72,7 @@ app.add_middleware(SessionAuthMiddleware)
 # Include routers
 app.include_router(auth_router)
 app.include_router(dashboard_router)
+app.include_router(memory_router)
 
 
 @app.get("/health")

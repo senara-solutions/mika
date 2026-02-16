@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Conversations - Mika{% endblock %}
+{% block body %}
+<nav>
+    <div class="container">
+        <a href="/dashboard" class="brand">Mika</a>
+        <div class="nav-links">
+            <a href="/dashboard/settings">Settings</a>
+            <a href="/logout">Log out</a>
+        </div>
+    </div>
+</nav>
+<div class="container">
+    <div class="sidebar-layout">
+        <div class="sidebar">
+            <a href="/dashboard">Overview</a>
+            <a href="/dashboard/memory">Memory</a>
+            <a href="/dashboard/conversations" class="active">Conversations</a>
+            <a href="/dashboard/settings">Settings</a>
+        </div>
+        <div class="main-content">
+            <h1>Conversation History</h1>
+
+            <form method="GET" action="/dashboard/conversations" style="margin-bottom:20px; display:flex; gap:8px;">
+                <input type="text" name="search" value="{{ search }}" placeholder="Search conversations..." style="flex:1; padding:10px 12px; border:1px solid #ddd; border-radius:8px; font-size:1rem;">
+                <button type="submit" class="btn">Search</button>
+                {% if search %}<a href="/dashboard/conversations" class="btn btn-outline">Clear</a>{% endif %}
+            </form>
+
+            <p style="color:#666; margin-bottom:16px;">{{ total }} message{{ 's' if total != 1 else '' }}{% if search %} matching "{{ search }}"{% endif %}</p>
+
+            {% if not conversations %}
+            <p style="color:#666">No conversations yet.</p>
+            {% else %}
+            <div style="display:flex; flex-direction:column; gap:8px;">
+                {% for conv in conversations %}
+                <div style="padding:12px 16px; background:{% if conv.role == 'user' %}#f0f4ff{% else %}#f9f9f9{% endif %}; border-radius:8px;">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                        <strong style="color:{% if conv.role == 'user' %}#336{% else %}#363{% endif %}">{{ 'You' if conv.role == 'user' else 'Mika' }}</strong>
+                        <small style="color:#999">{{ conv.created_at.strftime('%Y-%m-%d %H:%M') if conv.created_at else '' }}</small>
+                    </div>
+                    <div style="white-space:pre-wrap; word-break:break-word;">{{ conv.content[:500] }}{% if conv.content|length > 500 %}...{% endif %}</div>
+                </div>
+                {% endfor %}
+            </div>
+
+            {% if total_pages > 1 %}
+            <div style="display:flex; justify-content:center; gap:8px; margin-top:24px;">
+                {% if page > 1 %}
+                <a href="/dashboard/conversations?page={{ page - 1 }}{% if search %}&search={{ search }}{% endif %}" class="btn btn-outline">Previous</a>
+                {% endif %}
+                <span style="padding:10px; color:#666;">Page {{ page }} of {{ total_pages }}</span>
+                {% if page < total_pages %}
+                <a href="/dashboard/conversations?page={{ page + 1 }}{% if search %}&search={{ search }}{% endif %}" class="btn btn-outline">Next</a>
+                {% endif %}
+            </div>
+            {% endif %}
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

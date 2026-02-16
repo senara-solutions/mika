@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Memory - Mika{% endblock %}
+{% block body %}
+<nav>
+    <div class="container">
+        <a href="/dashboard" class="brand">Mika</a>
+        <div class="nav-links">
+            <a href="/dashboard/settings">Settings</a>
+            <a href="/logout">Log out</a>
+        </div>
+    </div>
+</nav>
+<div class="container">
+    <div class="sidebar-layout">
+        <div class="sidebar">
+            <a href="/dashboard">Overview</a>
+            <a href="/dashboard/memory" class="active">Memory</a>
+            <a href="/dashboard/conversations">Conversations</a>
+            <a href="/dashboard/settings">Settings</a>
+        </div>
+        <div class="main-content">
+            <h1>Memory Graph</h1>
+            {% if request.query_params.get('deleted') %}
+            <div class="alert alert-success">Memory node deleted.</div>
+            {% endif %}
+
+            {% if not nodes %}
+            <p style="color:#666">No memory nodes yet. Start chatting with Mika to build your knowledge graph.</p>
+            {% else %}
+            {% set node_groups = {} %}
+            {% for node in nodes %}
+                {% set label = node.label %}
+                {% if label not in node_groups %}
+                    {% set _ = node_groups.update({label: []}) %}
+                {% endif %}
+                {% set _ = node_groups[label].append(node) %}
+            {% endfor %}
+
+            {% for label in ['Person', 'Commitment', 'Fact', 'Preference', 'Topic', 'Pattern'] %}
+            {% set group_nodes = nodes | selectattr('label', 'equalto', label) | list %}
+            {% if group_nodes %}
+            <div style="margin-bottom:24px">
+                <h2>{{ label }}s</h2>
+                <div style="display:grid; gap:12px; margin-top:12px">
+                    {% for node in group_nodes %}
+                    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; background:#f9f9f9; border-radius:8px;">
+                        <div>
+                            {% if label == 'Person' %}
+                                <strong>{{ node.properties.get('name', 'Unknown') }}</strong>
+                                {% if node.properties.get('relationship') %}<span style="color:#666"> ({{ node.properties.relationship }})</span>{% endif %}
+                                {% if node.properties.get('context') %}<br><small style="color:#999">{{ node.properties.context }}</small>{% endif %}
+                            {% elif label == 'Commitment' %}
+                                <strong>{{ node.properties.get('description', '') }}</strong>
+                                {% if node.properties.get('due_date') %}<span style="color:#666"> (due: {{ node.properties.due_date }})</span>{% endif %}
+                                <span class="badge" style="margin-left:8px; padding:2px 8px; border-radius:4px; font-size:0.8rem; {% if node.properties.get('status') == 'completed' %}background:#efe; color:#3a3{% else %}background:#fef; color:#a63{% endif %}">{{ node.properties.get('status', 'pending') }}</span>
+                            {% elif label == 'Fact' %}
+                                <strong>{{ node.properties.get('key', '') }}</strong>: {{ node.properties.get('value', '') }}
+                            {% elif label == 'Preference' %}
+                                <strong>{{ node.properties.get('category', '') }}</strong>: {{ node.properties.get('value', '') }}
+                            {% elif label == 'Topic' %}
+                                <strong>{{ node.properties.get('name', '') }}</strong>
+                                {% if node.properties.get('importance') %}<span style="color:#666"> ({{ node.properties.importance }})</span>{% endif %}
+                            {% elif label == 'Pattern' %}
+                                <strong>{{ node.properties.get('type', '') }}</strong>: {{ node.properties.get('description', '') }}
+                            {% endif %}
+                        </div>
+                        <form method="POST" action="/dashboard/memory/delete/{{ label }}/{{ node.properties.get('canonical_name') or node.properties.get('key') or node.properties.get('name') or node.properties.get('category') or '' }}" style="margin:0">
+                            <button type="submit" class="btn btn-outline" style="padding:4px 12px; font-size:0.85rem" onclick="return confirm('Delete this memory?')">Delete</button>
+                        </form>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+            {% endfor %}
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
