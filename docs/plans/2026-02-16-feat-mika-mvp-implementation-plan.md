@@ -674,13 +674,13 @@ class ChannelAdapter(ABC):
 
 ##### Tasks
 
-- [ ] Implement `app/worker/tasks/briefings.py`:
+- [x] Implement `app/worker/tasks/briefings.py`:
   - `morning_briefing_dispatcher()` -- Celery Beat task, runs every 15 minutes
   - For each user whose local time is in briefing window (default 7:00-7:15 AM):
     - Query Neo4j: pending commitments, recent topics, patterns
     - Compose briefing via Claude Sonnet (not full agent -- simpler, faster)
     - Send via preferred channel
-- [ ] Briefing format: concise, actionable. Example:
+- [x] Briefing format: concise, actionable. Example:
   ```
   Good morning! Here's what's on your plate today:
 
@@ -691,14 +691,14 @@ class ChannelAdapter(ABC):
   Yesterday you mentioned wanting to research competitor pricing.
   Want me to get started on that?
   ```
-- [ ] Add user preference: opt-in/out of morning briefings (default: on)
-- [ ] Write tests: briefing composition, timezone dispatcher, opt-out handling
+- [x] Add user preference: opt-in/out of morning briefings (default: on)
+- [x] Write tests: briefing composition, timezone dispatcher, opt-out handling
 
 ##### Acceptance Criteria
 
-- [ ] Users receive a morning briefing at their configured time
-- [ ] Briefing includes pending commitments and recent context
-- [ ] Users can opt out via `/settings` or by telling Mika
+- [x] Users receive a morning briefing at their configured time
+- [x] Briefing includes pending commitments and recent context
+- [x] Users can opt out via `/settings` or by telling Mika
 
 #### Phase 2d: Conversation Summarization (Week 4)
 
