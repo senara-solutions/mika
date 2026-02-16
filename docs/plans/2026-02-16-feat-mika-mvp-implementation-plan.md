@@ -644,31 +644,31 @@ class ChannelAdapter(ABC):
 
 ##### Tasks
 
-- [ ] Enhance memory extraction to specifically identify commitments:
+- [x] Enhance memory extraction to specifically identify commitments:
   - "I need to send Sarah the proposal by Friday" -> `Commitment` node with due_date, status=pending
   - "Done with the proposal" -> update `Commitment.status` to completed
-- [ ] Implement `app/worker/tasks/follow_ups.py`:
+- [x] Implement `app/worker/tasks/follow_ups.py`:
   - `scan_pending_commitments()` -- Celery Beat task, runs every 4 hours
   - Query Neo4j for all users' pending commitments approaching due date
   - For each flagged commitment: compose a nudge message via the agent
   - Send via message router (respecting preferred channel and timezone)
-- [ ] Implement timezone-aware scheduling:
+- [x] Implement timezone-aware scheduling:
   - Celery Beat fires dispatcher every 15 minutes
   - Dispatcher checks: is it within the user's "active hours" (default 8 AM - 9 PM local)?
   - Only send proactive messages during active hours
-- [ ] Implement rate limiting for proactive messages:
+- [x] Implement rate limiting for proactive messages:
   - Max 1 proactive message per user per hour
   - Max 3 proactive messages per user per day
   - Track in Redis with TTL-based counters
-- [ ] Write tests: commitment extraction, follow-up scanning, timezone handling, rate limiting
+- [x] Write tests: commitment extraction, follow-up scanning, timezone handling, rate limiting
 
 ##### Acceptance Criteria
 
-- [ ] Mika extracts commitments from conversation ("I need to send the proposal by Friday")
-- [ ] Mika follows up on overdue/approaching commitments
-- [ ] Follow-ups respect timezone (no 3 AM nudges)
-- [ ] Rate limiting prevents spam
-- [ ] Commitment status updates when user says "done"
+- [x] Mika extracts commitments from conversation ("I need to send the proposal by Friday")
+- [x] Mika follows up on overdue/approaching commitments
+- [x] Follow-ups respect timezone (no 3 AM nudges)
+- [x] Rate limiting prevents spam
+- [x] Commitment status updates when user says "done"
 
 #### Phase 2c: Morning Briefing (Week 4)
 
