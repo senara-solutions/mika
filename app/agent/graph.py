@@ -13,12 +13,21 @@ from app.agent.nodes.execute_action import execute_action
 from app.agent.nodes.listen_and_reason import listen_and_reason
 from app.agent.nodes.respond import respond
 from app.agent.nodes.retrieve_memory import retrieve_memory
+from app.agent.onboarding import (
+    OnboardingState,
+    classify_consent_response,
+    is_onboarding_active,
+    next_state,
+)
+from app.agent.prompts import PRIVACY_DETAILS
 from app.agent.state import MikaState
 from app.common.logging import get_logger
 from app.models.conversation import Conversation
 from app.models.user import User
 
 logger = get_logger(__name__)
+
+ADVANCE_MARKER = "[ONBOARDING_ADVANCE]"
 
 
 def build_graph() -> StateGraph:
@@ -71,11 +80,15 @@ async def invoke_agent(
         extra={"user_id": user_id, "channel_type": channel_type},
     )
 
-    # Load conversation history from Postgres
-    history_messages = await _load_conversation_history(user_id)
-
     # Get user's onboarding state
     onboarding_state = await _get_onboarding_state(user_id)
+
+    # Handle consent phase before invoking the full agent
+    if onboarding_state == OnboardingState.AWAITING_CONSENT:
+        return await _handle_consent(user_id, message_text, channel_type)
+
+    # Load conversation history from Postgres
+    history_messages = await _load_conversation_history(user_id)
 
     # Build initial state
     all_messages = history_messages + [HumanMessage(content=message_text)]
@@ -106,6 +119,12 @@ async def invoke_agent(
     # Extract response text
     response_text = _extract_response(result)
 
+    # Check for onboarding state advancement
+    if is_onboarding_active(onboarding_state):
+        response_text = await _check_onboarding_advance(
+            user_id, onboarding_state, response_text
+        )
+
     # Save conversation to Postgres
     await _save_conversation(
         user_id, channel_type, message_text, response_text
@@ -120,6 +139,65 @@ async def invoke_agent(
         extract_and_store_memory.delay(user_id, message_text)
     except Exception:
         logger.debug("Memory extraction not available yet")
+
+    return response_text
+
+
+async def _handle_consent(
+    user_id: str,
+    message_text: str,
+    channel_type: str,
+) -> str:
+    """Handle the consent phase of onboarding."""
+    classification = classify_consent_response(message_text)
+
+    if classification == "accepted":
+        await _update_onboarding_state(
+            user_id, OnboardingState.COLLECTING_BASICS
+        )
+        await _update_consent(user_id, llm=True, memory=True)
+        response = (
+            "Great, let's get started!\n\n"
+            "I'd love to learn a bit about you so I can be most helpful. "
+            "What should I call you?"
+        )
+    elif classification == "more_info":
+        response = PRIVACY_DETAILS
+    else:
+        response = (
+            "No worries! Just reply **Sounds good** when you're ready "
+            "to get started, or **Tell me more** if you'd like to know "
+            "more about how your data is handled."
+        )
+
+    await _save_conversation(
+        user_id, channel_type, message_text, response
+    )
+    return response
+
+
+async def _check_onboarding_advance(
+    user_id: str,
+    current_state: str,
+    response_text: str,
+) -> str:
+    """Check if the agent wants to advance the onboarding state."""
+    if ADVANCE_MARKER in response_text:
+        new_state = next_state(current_state)
+        if new_state:
+            await _update_onboarding_state(user_id, new_state)
+            logger.info(
+                "Onboarding advanced",
+                extra={
+                    "user_id": user_id,
+                    "from": current_state,
+                    "to": new_state,
+                },
+            )
+            if new_state == OnboardingState.COMPLETED:
+                await _mark_onboarding_completed(user_id)
+        # Strip the marker from the response
+        response_text = response_text.replace(ADVANCE_MARKER, "").strip()
 
     return response_text
 
@@ -184,6 +262,67 @@ async def _get_onboarding_state(user_id: str) -> str | None:
             return state
     except Exception:
         return None
+
+
+async def _update_onboarding_state(
+    user_id: str, new_state: str
+) -> None:
+    """Update user's onboarding state in Postgres."""
+    try:
+        from app.common.db import async_session_factory
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(User).where(User.id == uuid.UUID(user_id))
+            )
+            user = result.scalar_one_or_none()
+            if user:
+                user.onboarding_state = new_state
+                await session.commit()
+    except Exception:
+        logger.exception("Failed to update onboarding state")
+
+
+async def _mark_onboarding_completed(user_id: str) -> None:
+    """Mark user's onboarding as completed."""
+    try:
+        from app.common.db import async_session_factory
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(User).where(User.id == uuid.UUID(user_id))
+            )
+            user = result.scalar_one_or_none()
+            if user:
+                user.onboarding_completed = True
+                user.onboarding_state = OnboardingState.COMPLETED
+                await session.commit()
+    except Exception:
+        logger.exception("Failed to mark onboarding completed")
+
+
+async def _update_consent(
+    user_id: str, *, llm: bool, memory: bool
+) -> None:
+    """Update user consent flags."""
+    try:
+        from app.common.db import async_session_factory
+        from app.models.consent import UserConsent
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(UserConsent).where(
+                    UserConsent.user_id == uuid.UUID(user_id)
+                )
+            )
+            consent = result.scalar_one_or_none()
+            if consent:
+                consent.llm_processing = llm
+                consent.memory_storage = memory
+                consent.consented_at = datetime.now(UTC)
+                await session.commit()
+    except Exception:
+        logger.exception("Failed to update consent")
 
 
 async def _save_conversation(
