@@ -704,19 +704,19 @@ class ChannelAdapter(ABC):
 
 ##### Tasks
 
-- [ ] Implement `app/worker/tasks/maintenance.py`:
+- [x] Implement `app/worker/tasks/maintenance.py`:
   - `summarize_old_conversations()` -- weekly Celery Beat task
   - For each user: conversations older than 7 days are summarized via Claude Sonnet
   - Summary stored as `Fact` nodes in Neo4j (key: `weekly_summary_YYYY_WW`)
   - Original messages retained in Postgres but not loaded into agent context
-- [ ] Update `retrieve_memory` node to include recent weekly summaries in context
-- [ ] Write tests: summarization task, context window loading
+- [x] Update `retrieve_memory` node to include recent weekly summaries in context
+- [x] Write tests: summarization task, context window loading
 
 ##### Acceptance Criteria
 
-- [ ] Old conversations are summarized weekly
-- [ ] Summaries appear in agent memory context
-- [ ] Agent context window stays within token budget (~8K input tokens)
+- [x] Old conversations are summarized weekly
+- [x] Summaries appear in agent memory context
+- [x] Agent context window stays within token budget (~8K input tokens)
 
 ---
 
