@@ -15,6 +15,7 @@ class User(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     encrypted_name: Mapped[bytes | None] = mapped_column(nullable=True)
     timezone: Mapped[str] = mapped_column(String(50), default="UTC")
     preferred_channel: Mapped[str] = mapped_column(String(20), default="telegram")

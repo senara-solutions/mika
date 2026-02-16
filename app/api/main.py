@@ -1,11 +1,16 @@
-"""FastAPI application with Telegram webhook endpoint."""
+"""FastAPI application with Telegram webhook and web dashboard."""
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from aiogram.types import Update
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.templating import Jinja2Templates
 
+from app.api.middleware import SessionAuthMiddleware
+from app.api.routes.auth import router as auth_router
+from app.api.routes.dashboard import router as dashboard_router
 from app.channels.router import register_adapter
 from app.channels.telegram import TelegramAdapter
 from app.channels.telegram.bot import dp, get_bot
@@ -20,11 +25,18 @@ from app.config import settings
 
 logger = get_logger(__name__)
 
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     setup_logging("DEBUG" if settings.debug else "INFO")
     logger.info("Starting Mika API server")
+
+    # Set up Jinja2 templates
+    application.state.templates = Jinja2Templates(
+        directory=str(TEMPLATES_DIR)
+    )
 
     # Register channel adapters
     register_adapter("telegram", TelegramAdapter())
@@ -53,10 +65,25 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="Mika API", lifespan=lifespan)
 
+# Add session auth middleware
+app.add_middleware(SessionAuthMiddleware)
+
+# Include routers
+app.include_router(auth_router)
+app.include_router(dashboard_router)
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/")
+async def root():
+    """Redirect to dashboard or login."""
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse("/dashboard")
 
 
 @app.post("/webhook/telegram")

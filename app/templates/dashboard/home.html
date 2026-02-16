@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Mika{% endblock %}
+{% block body %}
+<nav>
+    <div class="container">
+        <a href="/dashboard" class="brand">Mika</a>
+        <div class="nav-links">
+            <a href="/dashboard/settings">Settings</a>
+            <a href="/logout">Log out</a>
+        </div>
+    </div>
+</nav>
+<div class="container">
+    <div class="sidebar-layout">
+        <div class="sidebar">
+            <a href="/dashboard" class="active">Overview</a>
+            <a href="/dashboard/memory">Memory</a>
+            <a href="/dashboard/conversations">Conversations</a>
+            <a href="/dashboard/settings">Settings</a>
+        </div>
+        <div class="main-content">
+            <h1>Welcome{% if user.encrypted_name %}, {{ user.encrypted_name }}{% endif %}</h1>
+            <p>Your AI executive assistant is ready. Message Mika via Telegram or WhatsApp to get started.</p>
+
+            <div style="margin-top:24px; display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:16px;">
+                <div class="card">
+                    <h2>Channels</h2>
+                    <p>{{ user.preferred_channel | title }} connected</p>
+                    <a href="/link-telegram" class="btn btn-outline" style="margin-top:12px">Link Telegram</a>
+                </div>
+                <div class="card">
+                    <h2>Timezone</h2>
+                    <p>{{ user.timezone }}</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

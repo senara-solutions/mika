@@ -726,11 +726,11 @@ class ChannelAdapter(ABC):
 
 ##### Tasks
 
-- [ ] Decide: Django or FastAPI for dashboard (recommendation: FastAPI + Jinja2 templates for consistency with existing FastAPI webhook server)
-- [ ] Implement auth: email/password signup + session-based auth
-- [ ] Implement Telegram account linking: generate deep link token on web signup, user clicks `t.me/MikaBot?start=<token>`, bot handler links accounts
-- [ ] Implement dashboard layout: sidebar nav, responsive design
-- [ ] Implement settings page: timezone, notification preferences, channel connections, active hours
+- [x] Decide: Django or FastAPI for dashboard (recommendation: FastAPI + Jinja2 templates for consistency with existing FastAPI webhook server)
+- [x] Implement auth: email/password signup + session-based auth
+- [x] Implement Telegram account linking: generate deep link token on web signup, user clicks `t.me/MikaBot?start=<token>`, bot handler links accounts
+- [x] Implement dashboard layout: sidebar nav, responsive design
+- [x] Implement settings page: timezone, notification preferences, channel connections, active hours
 
 #### Phase 3b: Memory Viewer + Conversation History (Week 6)
 
