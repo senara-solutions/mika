@@ -134,10 +134,31 @@ async def cmd_settings(message: Message) -> None:
 async def cmd_export(message: Message, db: AsyncSession) -> None:
     if message.chat.type != "private":
         return
-    await message.answer(
-        "Data export is being prepared. "
-        "I'll send it to you shortly."
-    )
+    tg_user_id = str(message.from_user.id)
+    user, _ = await get_or_create_user(tg_user_id, db)
+
+    try:
+        from app.api.routes.privacy import _gather_memory_data, _gather_postgres_data
+
+        profile, channels, conversations = await _gather_postgres_data(str(user.id))
+        memory = await _gather_memory_data(str(user.id))
+
+        summary = (
+            f"**Your Data Summary:**\n"
+            f"- Profile: {profile.get('email', 'No email')}, "
+            f"timezone {profile.get('timezone', 'UTC')}\n"
+            f"- Connected channels: {len(channels)}\n"
+            f"- Conversations: {len(conversations)} messages\n"
+            f"- Memory nodes: {len(memory)}\n\n"
+            f"For a full export (ZIP download), visit the web dashboard "
+            f"at /api/privacy/export."
+        )
+        await message.answer(summary)
+    except Exception:
+        await message.answer(
+            "Data export is being prepared. "
+            "I'll send it to you shortly."
+        )
 
 
 @router.message(Command("delete"))
@@ -149,6 +170,41 @@ async def cmd_delete(message: Message, db: AsyncSession) -> None:
         "This cannot be undone. Reply **Yes, delete everything** "
         "to confirm."
     )
+
+
+@router.message(F.text == "Yes, delete everything")
+async def handle_delete_confirmation(
+    message: Message, db: AsyncSession
+) -> None:
+    """Handle confirmation of data deletion."""
+    if message.chat.type != "private":
+        return
+
+    tg_user_id = str(message.from_user.id)
+    user, _ = await get_or_create_user(tg_user_id, db)
+
+    try:
+        from app.api.routes.privacy import (
+            _clear_redis_cache,
+            _delete_neo4j_data,
+            _delete_postgres_user,
+        )
+
+        user_id = str(user.id)
+        await _delete_neo4j_data(user_id)
+        await _delete_postgres_user(user_id)
+        await _clear_redis_cache(user_id)
+
+        await message.answer(
+            "All your data has been deleted. "
+            "If you want to start over, send /start."
+        )
+    except Exception:
+        logger.exception("Failed to delete user data via Telegram")
+        await message.answer(
+            "Something went wrong deleting your data. "
+            "Please try again or use the web dashboard."
+        )
 
 
 @router.message(F.chat.type != "private")

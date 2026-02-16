@@ -765,12 +765,13 @@ class ChannelAdapter(ABC):
 
 ##### Tasks
 
-- [ ] Implement `app/api/routes/privacy.py`:
-  - `POST /api/privacy/export` -- trigger data export (Postgres + Neo4j + conversations)
-  - `POST /api/privacy/delete` -- cascade delete with confirmation
-- [ ] Implement `/export` and `/delete` Telegram commands (trigger same APIs)
-- [ ] Export format: ZIP containing JSON files (profile.json, conversations.json, memory.json)
-- [ ] Deletion: Neo4j subgraph -> Postgres conversations -> Postgres user -> Redis cache -> audit log entry
+- [x] Implement `app/api/routes/privacy.py`:
+  - `POST /api/privacy/export` -- ZIP data export (Postgres + Neo4j + conversations)
+  - `POST /api/privacy/delete` -- cascade delete (Neo4j -> Postgres -> Redis)
+  - `GET /api/privacy/export` -- dashboard privacy page
+- [x] Implement `/export` and `/delete` Telegram commands (trigger same privacy functions)
+- [x] Export format: ZIP containing JSON files (profile.json, channels.json, conversations.json, memory.json)
+- [x] Deletion: Neo4j subgraph -> Postgres user (cascade) -> Redis cache keys
 
 ---
 

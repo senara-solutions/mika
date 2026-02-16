@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Privacy - Mika{% endblock %}
+{% block body %}
+<nav>
+    <div class="container">
+        <a href="/dashboard" class="brand">Mika</a>
+        <div class="nav-links">
+            <a href="/dashboard/settings">Settings</a>
+            <a href="/logout">Log out</a>
+        </div>
+    </div>
+</nav>
+<div class="container">
+    <div class="sidebar-layout">
+        <div class="sidebar">
+            <a href="/dashboard">Overview</a>
+            <a href="/dashboard/memory">Memory</a>
+            <a href="/dashboard/conversations">Conversations</a>
+            <a href="/dashboard/settings">Settings</a>
+            <a href="/api/privacy/export" class="active">Privacy</a>
+        </div>
+        <div class="main-content">
+            <h1>Your Data</h1>
+            <p>Mika stores your conversations, memory, and preferences. You can export or delete all of your data at any time.</p>
+
+            <h2>Export Data</h2>
+            <p>Download a ZIP file containing your profile, conversations, and memory data.</p>
+            <form method="POST" action="/api/privacy/export">
+                <button type="submit" class="btn">Export My Data</button>
+            </form>
+
+            <h2 style="margin-top: 2rem;">Delete All Data</h2>
+            <p>Permanently delete your account and all associated data. This cannot be undone.</p>
+            <form method="POST" action="/api/privacy/delete" onsubmit="return confirm('Are you sure? This will permanently delete ALL your data and cannot be undone.');">
+                <button type="submit" class="btn btn-danger">Delete All My Data</button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
