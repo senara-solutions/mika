@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.api.middleware import SessionAuthMiddleware
 from app.api.routes.auth import router as auth_router
+from app.api.routes.calendar import router as calendar_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.memory import router as memory_router
 from app.api.routes.privacy import router as privacy_router
@@ -78,6 +79,7 @@ app.add_middleware(SessionAuthMiddleware)
 app.include_router(auth_router)
 app.include_router(dashboard_router)
 app.include_router(memory_router)
+app.include_router(calendar_router)
 app.include_router(privacy_router)
 app.include_router(wa_router)
 

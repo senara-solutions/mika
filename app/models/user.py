@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models import Base
@@ -28,6 +28,9 @@ class User(Base):
     )
     last_active_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    google_credentials: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True
     )
 
     channels: Mapped[list["UserChannel"]] = relationship(  # noqa: F821

@@ -20,11 +20,14 @@ Here is the user's context from their memory graph:
 
 {memory_context}
 
+{calendar_section}
+
 Write a briefing that:
 - Greets them warmly
+- Summarizes today's calendar if available
 - Lists pending commitments (with due dates if known)
 - Mentions any recent topics they were interested in
-- Offers to help with one specific thing
+- Offers to help with one specific thing (e.g., meeting prep, follow-up)
 - Is under 200 words
 
 Return ONLY the briefing text, no JSON or markdown formatting."""
@@ -84,13 +87,35 @@ def _get_memory_context(user_id: str) -> str:
     return asyncio.get_event_loop().run_until_complete(_fetch())
 
 
-def _compose_briefing(memory_context: str) -> str:
+def _get_calendar_context(user_id: str) -> str:
+    """Get today's calendar events for the user."""
+
+    async def _fetch():
+        from app.integrations.google_calendar import get_user_calendar_data
+
+        return await get_user_calendar_data(user_id)
+
+    try:
+        result = asyncio.get_event_loop().run_until_complete(_fetch())
+        return result or ""
+    except Exception:
+        return ""
+
+
+def _compose_briefing(memory_context: str, calendar_context: str = "") -> str:
     """Compose briefing using Claude Sonnet."""
     from app.common.llm import get_sonnet
 
+    calendar_section = ""
+    if calendar_context:
+        calendar_section = f"Today's calendar:\n\n{calendar_context}"
+
     async def _invoke():
         llm = get_sonnet()
-        prompt = BRIEFING_PROMPT.format(memory_context=memory_context)
+        prompt = BRIEFING_PROMPT.format(
+            memory_context=memory_context,
+            calendar_section=calendar_section,
+        )
         response = await llm.ainvoke(prompt)
         return response.content.strip()
 
@@ -190,8 +215,11 @@ def morning_briefing_dispatcher() -> dict:
         if not memory_context:
             continue
 
+        # Get calendar context (optional)
+        calendar_context = _get_calendar_context(user_id)
+
         # Compose briefing
-        briefing = _compose_briefing(memory_context)
+        briefing = _compose_briefing(memory_context, calendar_context)
         if not briefing:
             continue
 
