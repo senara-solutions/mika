@@ -1,0 +1,145 @@
+[
+  {
+    "name": "tmux_create_session",
+    "description": "Create a new tmux session. Optionally start it with a command and/or in a specific directory.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Session name (optional, auto-generated if omitted)"
+        },
+        "command": {
+          "type": "string",
+          "description": "Command to run immediately in the session (optional)"
+        },
+        "working_dir": {
+          "type": "string",
+          "description": "Working directory for the session (optional)"
+        }
+      },
+      "required": []
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/create_session.sh"
+    }
+  },
+  {
+    "name": "tmux_send_command",
+    "description": "Send text input to a tmux session pane. By default sends Enter after the text. Use special_key for control sequences like C-c or Escape.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "Target session name"
+        },
+        "text": {
+          "type": "string",
+          "description": "Text to send to the pane"
+        },
+        "special_key": {
+          "type": "string",
+          "description": "Special key to send instead of Enter after text (e.g., 'C-c', 'Escape', 'Tab'). If set without text, sends just the key."
+        },
+        "no_enter": {
+          "type": "boolean",
+          "description": "If true, do not send Enter after the text (default: false)"
+        }
+      },
+      "required": ["session"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/send_command.sh"
+    }
+  },
+  {
+    "name": "tmux_read_output",
+    "description": "Read the current visible output from a tmux session pane. Returns the last N lines (default 50).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "Target session name"
+        },
+        "lines": {
+          "type": "integer",
+          "description": "Number of lines to capture from the end (default: 50)"
+        },
+        "full": {
+          "type": "boolean",
+          "description": "If true, capture the entire scrollback buffer"
+        }
+      },
+      "required": ["session"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/read_output.sh"
+    }
+  },
+  {
+    "name": "tmux_list_sessions",
+    "description": "List all tmux sessions with their status, window count, and creation time.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/list_sessions.sh"
+    }
+  },
+  {
+    "name": "tmux_kill_session",
+    "description": "Kill (destroy) a tmux session by name.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "Session name to kill"
+        }
+      },
+      "required": ["session"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/kill_session.sh"
+    }
+  },
+  {
+    "name": "tmux_wait_for_text",
+    "description": "Wait for specific text to appear in a tmux pane output. Polls at regular intervals until the text is found or timeout is reached.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "Target session name"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "Text pattern to wait for"
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Maximum seconds to wait (default: 15, max: 25)"
+        },
+        "regex": {
+          "type": "boolean",
+          "description": "If true, treat pattern as a regex (default: false, uses fixed string match)"
+        }
+      },
+      "required": ["session", "pattern"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/wait_for_text.sh"
+    }
+  }
+]

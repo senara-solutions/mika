@@ -1,0 +1,202 @@
+openapi: 3.1.0
+info:
+  title: Mika Gateway API
+  description: Shared routing layer for Telegram/WhatsApp webhooks. Receives inbound messages, routes to per-customer agent containers, and relays outbound responses.
+  license:
+    name: MIT
+    identifier: MIT
+  version: 0.1.0
+paths:
+  /livez:
+    get:
+      tags:
+      - routes
+      summary: GET /livez — Liveness probe (no auth, no DB).
+      description: |-
+        Returns 200 unconditionally — the fact that HTTP is responding proves liveness.
+        Readiness (ready flag + DB) is checked by /readyz.
+      operationId: handle_liveness
+      responses:
+        '200':
+          description: Process is alive
+  /readyz:
+    get:
+      tags:
+      - routes
+      summary: GET /readyz, /health — Readiness probe (no auth).
+      description: Returns 200 if ready and Postgres is reachable, 503 otherwise.
+      operationId: handle_readiness
+      responses:
+        '200':
+          description: Ready and database reachable
+        '503':
+          description: Not ready or database unreachable
+  /send:
+    post:
+      tags:
+      - routes
+      summary: POST /send — containers deliver outbound messages to Telegram.
+      description: Authenticated via `require_bearer_token` middleware.
+      operationId: handle_send
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendPayload'
+        required: true
+      responses:
+        '200':
+          description: Message sent to Telegram
+        '400':
+          description: Invalid payload (empty or oversized text)
+        '401':
+          description: Missing or invalid Bearer token
+        '410':
+          description: Bot blocked by user
+        '429':
+          description: Telegram rate limit exceeded
+        '502':
+          description: Telegram API error
+      security:
+      - bearer: []
+  /webhook/telegram:
+    post:
+      tags:
+      - routes
+      summary: POST /webhook/telegram — receive Telegram updates.
+      description: |-
+        Validates the X-Telegram-Bot-Api-Secret-Token header using constant-time comparison.
+        Returns 200 to Telegram immediately, then processes asynchronously.
+        Request body is a Telegram Update JSON object (see Telegram Bot API docs).
+      operationId: handle_webhook
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelegramUpdate'
+        required: true
+      responses:
+        '200':
+          description: Update accepted
+        '401':
+          description: Invalid webhook secret
+        '503':
+          description: At capacity, Telegram will retry
+components:
+  schemas:
+    PhotoSize:
+      type: object
+      required:
+      - file_id
+      - file_unique_id
+      - width
+      - height
+      properties:
+        file_id:
+          type: string
+        file_size:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        file_unique_id:
+          type: string
+        height:
+          type: integer
+          format: int32
+          minimum: 0
+        width:
+          type: integer
+          format: int32
+          minimum: 0
+    SendPayload:
+      type: object
+      required:
+      - chat_id
+      - text
+      properties:
+        chat_id:
+          type: integer
+          format: int64
+        request_id:
+          type:
+          - string
+          - 'null'
+        text:
+          type: string
+    TelegramChat:
+      type: object
+      required:
+      - id
+      properties:
+        id:
+          type: integer
+          format: int64
+    TelegramDocument:
+      type: object
+      required:
+      - file_id
+      - file_unique_id
+      properties:
+        file_id:
+          type: string
+        file_name:
+          type:
+          - string
+          - 'null'
+        file_size:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        file_unique_id:
+          type: string
+        mime_type:
+          type:
+          - string
+          - 'null'
+    TelegramMessage:
+      type: object
+      required:
+      - chat
+      properties:
+        caption:
+          type:
+          - string
+          - 'null'
+        chat:
+          $ref: '#/components/schemas/TelegramChat'
+        document:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TelegramDocument'
+        photo:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/PhotoSize'
+        text:
+          type:
+          - string
+          - 'null'
+    TelegramUpdate:
+      type: object
+      required:
+      - update_id
+      properties:
+        message:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TelegramMessage'
+        update_id:
+          type: integer
+          format: int64
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: Shared secret between gateway and agent containers (MIKA_INTERNAL_TOKEN)

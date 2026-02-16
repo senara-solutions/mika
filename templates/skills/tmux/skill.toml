@@ -1,0 +1,9 @@
+[skill]
+name = "tmux"
+description = "Manage tmux sessions for long-running processes and background tasks"
+version = "0.1.0"
+always_on = true
+timeout_secs = 30
+
+[triggers]
+keywords = ["tmux", "terminal session", "background process", "long-running"]

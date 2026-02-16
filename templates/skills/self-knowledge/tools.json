@@ -1,0 +1,45 @@
+[
+  {
+    "name": "get_cli_reference",
+    "description": "Get the complete CLI reference documentation showing all available commands, subcommands, and options for the mika CLI.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "get_cli_reference"
+    }
+  },
+  {
+    "name": "get_api_spec",
+    "description": "Get the OpenAPI specification for the mika-server (agent) HTTP API.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "service": {
+          "type": "string",
+          "enum": ["agent"],
+          "description": "Which service's API spec to retrieve: 'agent' (mika-server)"
+        }
+      },
+      "required": ["service"]
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "get_api_spec"
+    }
+  },
+  {
+    "name": "get_architecture_overview",
+    "description": "Get a comprehensive overview of Mika's architecture including system design, memory model, agent loop, skills system, deployment, and more.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "get_architecture_overview"
+    }
+  }
+]

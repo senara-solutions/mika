@@ -1,0 +1,16 @@
+# Mika default configuration
+# Override with config/local.toml or MIKA_* environment variables.
+
+claude_model = "claude-sonnet-4-6"
+claude_max_tokens = 4096
+db_path = "mika.db"
+log_level = "info"
+server_port = 8080
+
+# Layer 3 vector search (embedding API key set via MIKA_OPENAI_API_KEY env var)
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 512
+
+# Disable bundled skill re-sync on startup (useful for debugging handlers).
+# WARNING: Do not enable in production — prevents security updates to handler scripts.
+# disable_bundled_skills = false

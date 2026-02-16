@@ -1,0 +1,20 @@
+[
+  {
+    "name": "web_search",
+    "description": "Search the web for current information on a topic. Returns titles, URLs, and descriptions from search results.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query (be specific for best results)"
+        }
+      },
+      "required": ["query"]
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "web_search"
+    }
+  }
+]

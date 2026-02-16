@@ -1,0 +1,116 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "=0.1.7-alpha.10"
+
+# Zero-copy conversions (f32 slices → bytes for sqlite-vec)
+zerocopy = "0.7"
+
+# Configuration
+config = "0.15"
+toml = "0.9"
+
+# Directories
+dirs = "6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# Async trait
+async-trait = "0.1"
+
+# HTTP
+http = "1"
+
+# HTTP server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit", "set-header"] }
+subtle = "2"
+http-body-util = "0.1"
+
+# Security
+secrecy = { version = "0.10", features = ["serde"] }
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "yaml"] }
+
+# CLI / TUI
+clap = { version = "4", features = ["derive"] }
+clap-markdown = "0.1"
+# unstable-rendered-line-info: enables Paragraph::line_count() for accurate scroll (stable in practice since 0.25)
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+tui-textarea = { version = "0.7", features = ["crossterm"] }
+crossterm = "0.28"
+
+# Encoding
+base64 = "0.22"
+bytes = "1"
+
+# Clipboard & Image encoding
+arboard = { version = "3", features = ["image-data"] }
+png = "0.17"
+
+# Unicode
+unicode-width = "0.2"
+
+# MCP (Model Context Protocol)
+rmcp = { version = "0.17", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+
+# Postgres (mika-gateway)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+
+# Utilities
+rand = "0.9"
+hex = "0.4"
+
+# Testing
+tempfile = "3"
+serial_test = "3"
+
+# Workspace crates
+mika-common = { path = "crates/mika-common" }
+mika-agent = { path = "crates/mika-agent" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
