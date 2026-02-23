@@ -1,5 +1,6 @@
 use config::{Config, Environment, File};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone)]
 pub struct Settings {
@@ -32,6 +33,10 @@ pub struct Settings {
     /// Customer ID (set per container)
     #[serde(default)]
     pub customer_id: Option<String>,
+
+    /// Resolved home directory path (populated after load, not from config file)
+    #[serde(skip)]
+    pub home_dir: PathBuf,
 }
 
 fn default_claude_model() -> String {
@@ -51,14 +56,23 @@ fn default_log_level() -> String {
 }
 
 impl Settings {
-    /// Load settings from config file + environment variables.
-    /// Environment variables are prefixed with MIKA_ (e.g., MIKA_ANTHROPIC_API_KEY).
-    /// Separator is "__" so single underscores in env var names are preserved
-    /// (e.g., MIKA_CLAUDE_MODEL → claude_model).
-    pub fn load() -> anyhow::Result<Self> {
-        let settings = Config::builder()
+    /// Load settings from config files + environment variables.
+    ///
+    /// Config cascade (lowest to highest priority):
+    ///   1. config/default.toml  (bundled defaults)
+    ///   2. config/local.toml    (gitignored local overrides)
+    ///   3. ~/.mika/config.toml  (user home directory config)
+    ///   4. MIKA_* env vars      (highest priority)
+    ///
+    /// The `home_dir` argument is the resolved Mika home directory.
+    /// If `db_path` is not explicitly set, it defaults to `{home_dir}/data/mika.db`.
+    pub fn load(home_dir: &Path) -> anyhow::Result<Self> {
+        let home_config = home_dir.join("config.toml");
+
+        let mut settings: Settings = Config::builder()
             .add_source(File::with_name("config/default").required(false))
             .add_source(File::with_name("config/local").required(false))
+            .add_source(File::from(home_config).required(false))
             .add_source(
                 Environment::with_prefix("MIKA")
                     .prefix_separator("_")
@@ -66,6 +80,18 @@ impl Settings {
             )
             .build()?
             .try_deserialize()?;
+
+        settings.home_dir = home_dir.to_path_buf();
+
+        // If db_path is still the default "mika.db", resolve it to ~/.mika/data/mika.db
+        if settings.db_path == "mika.db" {
+            settings.db_path = home_dir
+                .join("data")
+                .join("mika.db")
+                .to_string_lossy()
+                .to_string();
+        }
+
         Ok(settings)
     }
 }
@@ -81,6 +107,7 @@ impl std::fmt::Debug for Settings {
             .field("log_level", &self.log_level)
             .field("routing_url", &self.routing_url)
             .field("customer_id", &self.customer_id)
+            .field("home_dir", &self.home_dir)
             .finish()
     }
 }
@@ -88,19 +115,84 @@ impl std::fmt::Debug for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
-    #[test]
-    fn test_defaults() {
-        // Safety: test is single-threaded; no other thread reads these env vars.
+    /// Set required env vars and clear optional ones to ensure clean state.
+    fn clean_env() {
+        // Safety: tests set env vars; no production thread reads these.
         unsafe {
             std::env::set_var("MIKA_ANTHROPIC_API_KEY", "test-key");
             std::env::set_var("MIKA_ENCRYPTION_KEY", "0".repeat(64));
+            std::env::remove_var("MIKA_CLAUDE_MODEL");
+            std::env::remove_var("MIKA_DB_PATH");
         }
+    }
 
-        let settings = Settings::load().unwrap();
+    #[test]
+    #[serial]
+    fn test_defaults() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
         assert_eq!(settings.claude_model, "claude-sonnet-4-6");
         assert_eq!(settings.claude_max_tokens, 4096);
-        assert_eq!(settings.db_path, "mika.db");
         assert_eq!(settings.log_level, "info");
+        // db_path should resolve to home_dir/data/mika.db
+        let expected_db = tmp.path().join("data").join("mika.db");
+        assert_eq!(settings.db_path, expected_db.to_string_lossy());
+        assert_eq!(settings.home_dir, tmp.path());
+    }
+
+    #[test]
+    #[serial]
+    fn test_home_config_loaded() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "claude_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert_eq!(settings.claude_model, "claude-opus-4-6");
+        assert_eq!(settings.log_level, "debug");
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_overrides_home_config() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_CLAUDE_MODEL", "claude-haiku-4-5") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "claude_model = \"claude-opus-4-6\"\n",
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+        // Env var should win over home config
+        assert_eq!(settings.claude_model, "claude-haiku-4-5");
+
+        unsafe { std::env::remove_var("MIKA_CLAUDE_MODEL") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_explicit_db_path_not_overridden() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_DB_PATH", "/custom/path.db") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert_eq!(settings.db_path, "/custom/path.db");
+
+        unsafe { std::env::remove_var("MIKA_DB_PATH") };
     }
 }

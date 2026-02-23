@@ -1,12 +1,13 @@
-mod add_commitment;
-mod set_preference;
+mod search_memory;
+mod store_fact;
 mod update_core_memory;
-mod upsert_person;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
+use std::path::Path;
+use std::sync::atomic::AtomicU32;
 
 use crate::db::Database;
 
@@ -16,6 +17,10 @@ pub const MAX_INPUT_LEN: usize = 10_000;
 /// Context available to every tool during execution.
 pub struct ToolContext<'a> {
     pub db: &'a Database,
+    pub session_id: &'a str,
+    pub home_dir: &'a Path,
+    pub core_memory_edit_count: &'a AtomicU32,
+    pub is_onboarding: bool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
@@ -90,8 +95,7 @@ impl ToolRegistry {
 pub fn default_tools() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(update_core_memory::UpdateCoreMemoryTool));
-    registry.register(Box::new(upsert_person::UpsertPersonTool));
-    registry.register(Box::new(add_commitment::AddCommitmentTool));
-    registry.register(Box::new(set_preference::SetPreferenceTool));
+    registry.register(Box::new(store_fact::StoreFactTool));
+    registry.register(Box::new(search_memory::SearchMemoryTool));
     registry
 }
