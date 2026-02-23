@@ -2,64 +2,57 @@
 
 ## Project Overview
 
-Mika is a conversation-first AI executive assistant that lives in Telegram (then WhatsApp), with persistent memory via a Neo4j knowledge graph, proactive follow-ups via Celery, and a web dashboard for settings and memory management.
+Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with encrypted SQLite storage. A shared routing layer handles Telegram/WhatsApp and forwards messages to the correct container.
 
 ## Stack
 
-- **Language:** Python 3.12+
-- **Agent framework:** LangGraph + LangChain
-- **LLM:** Claude (Sonnet 4.5 default, Opus 4.6 for complex tasks)
-- **Knowledge graph:** Neo4j 5 Community
-- **Relational DB:** PostgreSQL 16 + SQLAlchemy 2 (async) + Alembic
-- **Task queue:** Celery + Redis
-- **Telegram:** aiogram 3.x
-- **WhatsApp:** PyWa
-- **Web API:** FastAPI
-- **Package manager:** uv
+- **Language:** Rust (edition 2024)
+- **Agent engine:** Explicit Rust loop (no framework) — retrieve context → build prompt → Claude API → match stop_reason → execute tools or respond
+- **LLM:** Claude (Sonnet 4.5 default, Opus 4.6 for complex tasks) via direct reqwest calls
+- **Per-customer DB:** SQLite + sqlite-vec (conversations, memory, embeddings)
+- **Shared DB:** PostgreSQL 16 via sqlx (customers, channel mappings, invitations)
+- **Encryption:** AES-256-GCM via `ring` for sensitive SQLite columns
+- **HTTP:** axum 0.8 (routing layer), reqwest 0.12 (Claude API)
+- **Async runtime:** tokio
+- **Config:** config-rs with MIKA_ env prefix
+- **Logging:** tracing + tracing-subscriber (JSON for prod, pretty for dev)
 
 ## Directory Structure
 
-- `app/` - Main application package
-  - `agent/` - LangGraph agent (graph, state, prompts, nodes)
-  - `tools/` - LangChain tool definitions
-  - `memory/` - Neo4j memory layer (repository, extractor, schema, driver)
-  - `worker/` - Celery tasks and beat schedule
-  - `channels/` - Message router + channel adapters (telegram, whatsapp)
-  - `api/` - FastAPI app + routes (webhooks, auth, dashboard, privacy)
-  - `models/` - SQLAlchemy models
-  - `common/` - Shared utilities (LLM factory, encryption, logging)
-- `alembic/` - Database migrations
-- `tests/` - Test suite (mirrors app/ structure)
-- `scripts/` - Utility scripts
+- `crates/mika-common/` - Shared library: config, encryption, Claude client, logging, types
+- `crates/mika-agent/` - Agent container: SQLite DB, agent loop, tools, prompt assembly, CLI binary
+- `crates/mika-routing/` - Routing layer: axum HTTP server, PostgreSQL, channel adapters
+- `docs/brainstorms/` - Decision brainstorm documents
+- `docs/plans/` - Implementation plans
+- `config/` - Configuration files (default.toml, local.toml)
 
 ## Conventions
 
-- **Async by default:** All DB, Neo4j, and HTTP operations are async
-- **Type hints:** Required on all function signatures
-- **Naming:** snake_case for functions/variables, PascalCase for classes
-- **Imports:** Use absolute imports (`from app.config import settings`)
-- **Testing:** pytest + pytest-asyncio. Tests mirror app/ structure.
-- **Linting:** ruff (select: E, F, I, N, W, UP)
-- **Models:** SQLAlchemy 2.0 mapped_column style
-- **Settings:** pydantic-settings via `app.config.settings` singleton
+- **Async by default:** All I/O operations use async/await with tokio
+- **Error handling:** `anyhow::Result` for application code, `thiserror` for library errors
+- **Naming:** snake_case for functions/variables, PascalCase for types, SCREAMING_SNAKE for constants
+- **Edition 2024:** `unsafe` blocks required for `std::env::set_var` etc.
+- **Testing:** `#[cfg(test)] mod tests` inline in each module, `cargo test` to run
+- **No framework:** The agent loop is a plain Rust async function, not a framework
 
 ## Commands
 
-- `uv run pytest` - Run tests
-- `uv run ruff check .` - Lint
-- `uv run ruff format .` - Format
-- `uv run alembic upgrade head` - Run migrations
-- `uv run uvicorn app.api.main:app --reload` - Dev server
-- `uv run celery -A app.worker.celery_app worker -l info` - Celery worker
-- `uv run celery -A app.worker.celery_app beat -l info` - Celery beat
-- `docker compose up -d` - Start local infrastructure (Neo4j, Redis, Postgres)
+- `cargo build` - Build all crates
+- `cargo test` - Run all tests
+- `cargo run --bin mika-cli` - Run CLI test harness
+- `cargo clippy` - Lint
+- `cargo fmt` - Format
 
-## Neo4j Conventions
+## Architecture
 
-- All memory nodes have a `user_id` property for data isolation
-- Use MERGE (not CREATE) for idempotent writes
-- All queries scoped by user_id (defense in depth)
-- Node labels: User, Person, Commitment, Topic, Pattern, Preference, Fact
+- **One container per customer** on Kubernetes
+- **Shared Telegram/WhatsApp bot** with stateless routing (no customer data in router)
+- **Three-layer memory model:**
+  - Layer 1: Core memory (always in context, agent-editable via tools)
+  - Layer 2: Structured facts (People, Commitments, Preferences, Events)
+  - Layer 3: Vector search (sqlite-vec + FTS5 hybrid)
+- **Proactive behavior:** tokio-cron-scheduler + heartbeat for follow-ups
+- **Google Calendar:** Python sidecar service (kept separate)
 
 ## Reference Repositories
 

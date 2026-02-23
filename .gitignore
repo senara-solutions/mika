@@ -1,16 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
-dist/
-build/
-
-# Virtual environments
-.venv/
-venv/
+# Rust
+/target/
+**/*.rs.bk
 
 # Environment variables
 .env
@@ -23,19 +13,11 @@ venv/
 *.swp
 *.swo
 
-# Neo4j data
-neo4j_data/
-data/
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-
-# Alembic
-alembic/versions/__pycache__/
+# Data
+data/
+*.db
+*.sqlite
