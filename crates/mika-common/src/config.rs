@@ -6,7 +6,7 @@ pub struct Settings {
     /// Anthropic API key
     pub anthropic_api_key: String,
 
-    /// Claude model ID (default: claude-sonnet-4-5-20250514)
+    /// Claude model ID (default: claude-sonnet-4-6)
     #[serde(default = "default_claude_model")]
     pub claude_model: String,
 
@@ -35,7 +35,7 @@ pub struct Settings {
 }
 
 fn default_claude_model() -> String {
-    "claude-sonnet-4-5-20250514".to_string()
+    "claude-sonnet-4-6".to_string()
 }
 
 fn default_max_tokens() -> u32 {
@@ -53,12 +53,17 @@ fn default_log_level() -> String {
 impl Settings {
     /// Load settings from config file + environment variables.
     /// Environment variables are prefixed with MIKA_ (e.g., MIKA_ANTHROPIC_API_KEY).
-    /// Note: field underscores map directly (no nested separator).
+    /// Separator is "__" so single underscores in env var names are preserved
+    /// (e.g., MIKA_CLAUDE_MODEL → claude_model).
     pub fn load() -> anyhow::Result<Self> {
         let settings = Config::builder()
             .add_source(File::with_name("config/default").required(false))
             .add_source(File::with_name("config/local").required(false))
-            .add_source(Environment::with_prefix("MIKA"))
+            .add_source(
+                Environment::with_prefix("MIKA")
+                    .prefix_separator("_")
+                    .separator("__"),
+            )
             .build()?
             .try_deserialize()?;
         Ok(settings)
@@ -93,7 +98,7 @@ mod tests {
         }
 
         let settings = Settings::load().unwrap();
-        assert_eq!(settings.claude_model, "claude-sonnet-4-5-20250514");
+        assert_eq!(settings.claude_model, "claude-sonnet-4-6");
         assert_eq!(settings.claude_max_tokens, 4096);
         assert_eq!(settings.db_path, "mika.db");
         assert_eq!(settings.log_level, "info");

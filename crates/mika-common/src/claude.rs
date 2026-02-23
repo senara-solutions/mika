@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn test_serialize_request() {
         let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250514".into(),
+            model: "claude-sonnet-4-6".into(),
             max_tokens: 4096,
             system: Some("You are Mika.".into()),
             messages: vec![Message {

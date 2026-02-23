@@ -10,7 +10,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - **Language:** Rust (edition 2024)
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context → build prompt → Claude API → match stop_reason → execute tools or respond
-- **LLM:** Claude (Sonnet 4.5 default) via direct reqwest calls to Messages API
+- **LLM:** Claude (Sonnet 4.6 default) via direct reqwest calls to Messages API
 - **Database:** SQLite via rusqlite (per-customer, encrypted at field level)
 - **Encryption:** AES-256-GCM via `ring` (cached LessSafeKey, zeroized on drop), HMAC-SHA256 for lookups
 - **HTTP:** reqwest 0.12 (Claude API client with typed errors and retry)
