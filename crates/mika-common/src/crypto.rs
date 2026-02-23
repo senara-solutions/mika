@@ -1,6 +1,7 @@
 use ring::aead::{Aad, AES_256_GCM, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
+use zeroize::ZeroizeOnDrop;
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -21,27 +22,37 @@ pub enum CryptoError {
 
 /// AES-256-GCM encryption key.
 /// Wraps ring's LessSafeKey for encrypt/decrypt operations.
-#[derive(Clone)]
+/// Key bytes are automatically zeroed on drop via `ZeroizeOnDrop`.
+#[derive(ZeroizeOnDrop)]
 pub struct EncryptionKey {
+    #[zeroize(skip)] // LessSafeKey handles its own memory
+    cached_key: LessSafeKey,
     key_bytes: [u8; 32],
 }
 
 impl EncryptionKey {
     /// Create from a hex-encoded 32-byte key (64 hex characters).
-    pub fn from_hex(hex: &str) -> Result<Self, CryptoError> {
-        let bytes = hex::decode(hex).map_err(|e| CryptoError::InvalidHexKey(e.to_string()))?;
+    pub fn from_hex(hex_str: &str) -> Result<Self, CryptoError> {
+        let bytes = hex::decode(hex_str).map_err(|e| CryptoError::InvalidHexKey(e.to_string()))?;
         if bytes.len() != 32 {
             return Err(CryptoError::InvalidKeyLength(bytes.len()));
         }
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(&bytes);
-        Ok(Self { key_bytes })
+
+        let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes)
+            .map_err(|_| CryptoError::EncryptionFailed)?;
+        let cached_key = LessSafeKey::new(unbound);
+
+        Ok(Self {
+            cached_key,
+            key_bytes,
+        })
     }
 
-    fn make_key(&self) -> Result<LessSafeKey, CryptoError> {
-        let unbound =
-            UnboundKey::new(&AES_256_GCM, &self.key_bytes).map_err(|_| CryptoError::EncryptionFailed)?;
-        Ok(LessSafeKey::new(unbound))
+    /// Access the raw key bytes (e.g. for HMAC operations).
+    pub fn key_bytes(&self) -> &[u8; 32] {
+        &self.key_bytes
     }
 
     /// Encrypt plaintext. Returns nonce (12 bytes) || ciphertext || tag (16 bytes).
@@ -51,11 +62,11 @@ impl EncryptionKey {
         rng.fill(&mut nonce_bytes)
             .map_err(|_| CryptoError::EncryptionFailed)?;
 
-        let key = self.make_key()?;
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
         let mut in_out = plaintext.to_vec();
-        key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        self.cached_key
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
             .map_err(|_| CryptoError::EncryptionFailed)?;
 
         // Prepend nonce
@@ -75,11 +86,11 @@ impl EncryptionKey {
         let mut nonce_arr = [0u8; NONCE_LEN];
         nonce_arr.copy_from_slice(nonce_bytes);
 
-        let key = self.make_key()?;
         let nonce = Nonce::assume_unique_for_key(nonce_arr);
 
         let mut in_out = ciphertext_and_tag.to_vec();
-        let plaintext = key
+        let plaintext = self
+            .cached_key
             .open_in_place(nonce, Aad::empty(), &mut in_out)
             .map_err(|_| CryptoError::DecryptionFailed)?;
         Ok(plaintext.to_vec())
@@ -97,17 +108,12 @@ impl EncryptionKey {
     }
 }
 
-// We need the hex crate
-mod hex {
-    pub fn decode(hex: &str) -> Result<Vec<u8>, String> {
-        if hex.len() % 2 != 0 {
-            return Err("odd length hex string".to_string());
-        }
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
-            .collect()
-    }
+/// HMAC-SHA256 using the given key bytes. Returns hex-encoded digest string.
+pub fn hmac_sha256_hex(key_bytes: &[u8; 32], input: &str) -> String {
+    use ring::hmac;
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key_bytes);
+    let tag = hmac::sign(&hmac_key, input.as_bytes());
+    hex::encode(tag.as_ref())
 }
 
 #[cfg(test)]
@@ -168,5 +174,25 @@ mod tests {
     fn test_ciphertext_too_short() {
         let key = test_key();
         assert!(key.decrypt(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn test_key_bytes_accessor() {
+        let key = test_key();
+        assert_eq!(key.key_bytes(), &[0x01u8; 32]);
+    }
+
+    #[test]
+    fn test_hmac_sha256_hex() {
+        let key_bytes = [0x01u8; 32];
+        let hash = hmac_sha256_hex(&key_bytes, "hello");
+        // Should be 64 hex chars (32 bytes)
+        assert_eq!(hash.len(), 64);
+        // Should be deterministic
+        let hash2 = hmac_sha256_hex(&key_bytes, "hello");
+        assert_eq!(hash, hash2);
+        // Different input should produce different hash
+        let hash3 = hmac_sha256_hex(&key_bytes, "world");
+        assert_ne!(hash, hash3);
     }
 }

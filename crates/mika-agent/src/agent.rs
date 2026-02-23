@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use mika_common::claude::{
     ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
 };
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::db::Database;
@@ -10,6 +11,7 @@ use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 
 const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
+const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 
 /// Run the agent loop for a single inbound message.
 /// Returns the assistant's text response.
@@ -17,21 +19,47 @@ pub async fn run_agent(
     db: &Database,
     claude: &ClaudeClient,
     tools: &ToolRegistry,
-    customer_id: &str,
-    routing_url: Option<&str>,
     user_message: &str,
     channel_type: &str,
 ) -> Result<String> {
     // Save the user message
     db.save_message("user", user_message, channel_type)?;
 
+    let timeout_result = tokio::time::timeout(
+        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
+        run_agent_inner(db, claude, tools, channel_type),
+    )
+    .await;
+
+    match timeout_result {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            warn!(
+                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
+                "agent loop total timeout exceeded"
+            );
+            let fallback =
+                "I'm sorry, that took too long. Let me try a simpler approach next time.";
+            db.save_message("assistant", fallback, channel_type)?;
+            Ok(fallback.to_string())
+        }
+    }
+}
+
+/// Inner agent loop, separated so the outer function can wrap it in a timeout.
+async fn run_agent_inner(
+    db: &Database,
+    claude: &ClaudeClient,
+    tools: &ToolRegistry,
+    channel_type: &str,
+) -> Result<String> {
     // Load context
     let system = prompt::load_system_prompt(db)?;
     let history = db.load_recent_messages(20)?;
     let tool_defs = tools.definitions();
 
     // Build initial message list from history
-    let mut messages: Vec<Message> = history
+    let messages: Vec<Message> = history
         .iter()
         .map(|msg| Message {
             role: msg.role.clone(),
@@ -39,29 +67,29 @@ pub async fn run_agent(
         })
         .collect();
 
-    let tool_ctx = ToolContext {
-        db,
-        customer_id,
-        routing_url,
+    let tool_ctx = ToolContext { db };
+
+    // Build the request once; only messages changes between iterations.
+    // We clone the request when passing to send_message (which takes ownership),
+    // then push new messages directly onto the original to avoid rebuilding
+    // system (~4KB) and tool_defs (all JSON schemas) each iteration.
+    let mut request = MessagesRequest {
+        model: claude.model.clone(),
+        max_tokens: claude.max_tokens,
+        system: Some(system),
+        messages,
+        tools: if tool_defs.is_empty() {
+            None
+        } else {
+            Some(tool_defs)
+        },
     };
 
     for step in 0..MAX_TOOL_STEPS {
-        debug!(step, messages_len = messages.len(), "agent loop step");
-
-        let request = MessagesRequest {
-            model: claude.model.clone(),
-            max_tokens: claude.max_tokens,
-            system: Some(system.clone()),
-            messages: messages.clone(),
-            tools: if tool_defs.is_empty() {
-                None
-            } else {
-                Some(tool_defs.clone())
-            },
-        };
+        debug!(step, messages_len = request.messages.len(), "agent loop step");
 
         let response = claude
-            .send_message(request)
+            .send_message(request.clone())
             .await
             .context("Claude API call failed")?;
 
@@ -75,8 +103,8 @@ pub async fn run_agent(
                 return Ok(text);
             }
             StopReason::ToolUse => {
-                // Add the assistant's response (with tool_use blocks) to messages
-                messages.push(Message {
+                // Add the assistant's response (with tool_use blocks) directly to the request
+                request.messages.push(Message {
                     role: "assistant".to_string(),
                     content: MessageContent::Blocks(response.content.clone()),
                 });
@@ -95,8 +123,8 @@ pub async fn run_agent(
                     }
                 }
 
-                // Add tool results as a user message
-                messages.push(Message {
+                // Add tool results as a user message directly to the request
+                request.messages.push(Message {
                     role: "user".to_string(),
                     content: MessageContent::Blocks(tool_results),
                 });

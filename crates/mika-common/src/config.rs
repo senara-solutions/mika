@@ -1,7 +1,7 @@
 use config::{Config, Environment, File};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Settings {
     /// Anthropic API key
     pub anthropic_api_key: String,
@@ -16,10 +16,6 @@ pub struct Settings {
 
     /// AES-256-GCM encryption key (hex-encoded, 32 bytes = 64 hex chars)
     pub encryption_key: String,
-
-    /// OpenAI API key for embeddings
-    #[serde(default)]
-    pub openai_api_key: Option<String>,
 
     /// SQLite database path
     #[serde(default = "default_db_path")]
@@ -66,6 +62,21 @@ impl Settings {
             .build()?
             .try_deserialize()?;
         Ok(settings)
+    }
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("anthropic_api_key", &"[REDACTED]")
+            .field("claude_model", &self.claude_model)
+            .field("claude_max_tokens", &self.claude_max_tokens)
+            .field("encryption_key", &"[REDACTED]")
+            .field("db_path", &self.db_path)
+            .field("log_level", &self.log_level)
+            .field("routing_url", &self.routing_url)
+            .field("customer_id", &self.customer_id)
+            .finish()
     }
 }
 

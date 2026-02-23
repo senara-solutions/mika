@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput, MAX_INPUT_LEN};
 
 pub struct SetPreferenceTool;
 
@@ -40,6 +40,21 @@ impl Tool for SetPreferenceTool {
 
         if category.is_empty() || value.is_empty() {
             return Ok(ToolOutput::error("Both 'category' and 'value' are required."));
+        }
+
+        if category.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Input too long: 'category' is {} characters (max: {}). Please shorten it.",
+                category.len(),
+                MAX_INPUT_LEN
+            )));
+        }
+        if value.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Input too long: 'value' is {} characters (max: {}). Please shorten it.",
+                value.len(),
+                MAX_INPUT_LEN
+            )));
         }
 
         ctx.db.set_preference(category, value)?;

@@ -21,7 +21,6 @@ pub fn build_system_prompt(core_memory: &[CoreMemoryEntry]) -> String {
     prompt.push_str("- When the user mentions a person, use the upsert_person tool to remember them.\n");
     prompt.push_str("- When the user makes or mentions a commitment, use the add_commitment tool.\n");
     prompt.push_str("- When you learn a preference, use the set_preference tool.\n");
-    prompt.push_str("- Use the search_memory tool to recall relevant past context.\n");
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
 
     prompt

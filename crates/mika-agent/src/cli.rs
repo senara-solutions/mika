@@ -36,7 +36,6 @@ async fn main() -> Result<()> {
     );
 
     let tool_registry = tools::default_tools();
-    let customer_id = settings.customer_id.as_deref().unwrap_or("cli-user");
 
     println!("Mika CLI — type a message and press Enter. Type 'quit' to exit.\n");
 
@@ -63,8 +62,6 @@ async fn main() -> Result<()> {
             &db,
             &claude,
             &tool_registry,
-            customer_id,
-            settings.routing_url.as_deref(),
             input,
             "cli",
         )

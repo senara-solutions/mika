@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput, MAX_INPUT_LEN};
 
 pub struct UpsertPersonTool;
 
@@ -44,8 +44,35 @@ impl Tool for UpsertPersonTool {
             return Ok(ToolOutput::error("'name' is required."));
         }
 
+        if name.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Input too long: 'name' is {} characters (max: {}). Please shorten it.",
+                name.len(),
+                MAX_INPUT_LEN
+            )));
+        }
+
         let relationship = input["relationship"].as_str();
         let notes = input["notes"].as_str();
+
+        if let Some(r) = relationship {
+            if r.len() > MAX_INPUT_LEN {
+                return Ok(ToolOutput::error(format!(
+                    "Input too long: 'relationship' is {} characters (max: {}). Please shorten it.",
+                    r.len(),
+                    MAX_INPUT_LEN
+                )));
+            }
+        }
+        if let Some(n) = notes {
+            if n.len() > MAX_INPUT_LEN {
+                return Ok(ToolOutput::error(format!(
+                    "Input too long: 'notes' is {} characters (max: {}). Please shorten it.",
+                    n.len(),
+                    MAX_INPUT_LEN
+                )));
+            }
+        }
 
         ctx.db.upsert_person(name, relationship, notes)?;
 

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput, MAX_INPUT_LEN};
 
 const MAX_CORE_MEMORY_TOKENS: i32 = 2000;
 
@@ -42,6 +42,21 @@ impl Tool for UpdateCoreMemoryTool {
 
         if key.is_empty() || value.is_empty() {
             return Ok(ToolOutput::error("Both 'key' and 'value' are required."));
+        }
+
+        if key.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Input too long: 'key' is {} characters (max: {}). Please shorten it.",
+                key.len(),
+                MAX_INPUT_LEN
+            )));
+        }
+        if value.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Input too long: 'value' is {} characters (max: {}). Please shorten it.",
+                value.len(),
+                MAX_INPUT_LEN
+            )));
         }
 
         // Check token limit before writing

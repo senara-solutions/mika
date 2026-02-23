@@ -52,6 +52,18 @@ impl Database {
         &self.key
     }
 
+    /// Verify the encryption key works by encrypting and decrypting a test value.
+    /// Call this on startup to fail fast if the key is wrong.
+    pub fn check_encryption_key(&self) -> Result<()> {
+        let test = "mika-key-check";
+        let encrypted = self.key.encrypt_string(test)?;
+        let decrypted = self.key.decrypt_string(&encrypted)?;
+        if decrypted != test {
+            anyhow::bail!("encryption key check failed: roundtrip mismatch");
+        }
+        Ok(())
+    }
+
     // -- Schema migrations --
 
     fn current_version(&self) -> Result<i64> {
@@ -130,8 +142,9 @@ impl Database {
             -- People (Layer 2)
             CREATE TABLE IF NOT EXISTS people (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                canonical_name TEXT NOT NULL UNIQUE,
-                relationship TEXT,
+                canonical_name_encrypted BLOB NOT NULL,
+                canonical_name_hash TEXT NOT NULL UNIQUE,
+                relationship_encrypted BLOB,
                 notes_encrypted BLOB,
                 first_mentioned TEXT NOT NULL DEFAULT (datetime('now')),
                 last_mentioned TEXT NOT NULL DEFAULT (datetime('now'))
@@ -154,7 +167,8 @@ impl Database {
             -- Preferences (Layer 2)
             CREATE TABLE IF NOT EXISTS preferences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL UNIQUE,
+                category_encrypted BLOB NOT NULL,
+                category_hash TEXT NOT NULL UNIQUE,
                 value_encrypted BLOB NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -169,16 +183,6 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);
 
-            -- Cron schedule persistence
-            CREATE TABLE IF NOT EXISTS schedules (
-                name TEXT PRIMARY KEY,
-                cron_expr TEXT NOT NULL,
-                timezone TEXT NOT NULL,
-                last_fired TEXT,
-                next_fire TEXT,
-                enabled BOOLEAN NOT NULL DEFAULT 1
-            );
-
             -- Record version
             INSERT INTO schema_version (version) VALUES (1);
             ",
@@ -186,6 +190,11 @@ impl Database {
             .context("failed to apply migration v1")?;
 
         Ok(())
+    }
+
+    /// Compute HMAC-SHA256 hash for deterministic lookups.
+    fn hmac_hash(&self, input: &str) -> String {
+        mika_common::crypto::hmac_sha256_hex(self.key.key_bytes(), input)
     }
 
     // -- Conversations --
@@ -219,16 +228,27 @@ impl Database {
                     created_at: row.get(4)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read conversation row");
+                    None
+                }
+            })
             .filter_map(|raw| {
-                let content = self.key.decrypt_string(&raw.content_encrypted).ok()?;
-                Some(ConversationMessage {
-                    id: raw.id,
-                    role: raw.role,
-                    content,
-                    channel_type: raw.channel_type,
-                    created_at: raw.created_at,
-                })
+                match self.key.decrypt_string(&raw.content_encrypted) {
+                    Ok(content) => Some(ConversationMessage {
+                        id: raw.id,
+                        role: raw.role,
+                        content,
+                        channel_type: raw.channel_type,
+                        created_at: raw.created_at,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(row_id = raw.id, error = %e, "decryption failed for conversation row, skipping");
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -285,15 +305,26 @@ impl Database {
                     updated_at: row.get(3)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read core_memory row");
+                    None
+                }
+            })
             .filter_map(|raw| {
-                let value = self.key.decrypt_string(&raw.value_encrypted).ok()?;
-                Some(CoreMemoryEntry {
-                    key: raw.key,
-                    value,
-                    token_count: raw.token_count,
-                    updated_at: raw.updated_at,
-                })
+                match self.key.decrypt_string(&raw.value_encrypted) {
+                    Ok(value) => Some(CoreMemoryEntry {
+                        key: raw.key,
+                        value,
+                        token_count: raw.token_count,
+                        updated_at: raw.updated_at,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(key = raw.key, error = %e, "decryption failed for core_memory row, skipping");
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -334,7 +365,7 @@ impl Database {
     /// Seed default core memory for a new customer.
     pub fn seed_core_memory(&self) -> Result<()> {
         self.set_core_memory("user_summary", "New user. No information yet.")?;
-        self.set_core_memory("persona", "Mika — personal AI executive assistant.")?;
+        self.set_core_memory("persona", "Mika -- personal AI executive assistant.")?;
         self.set_core_memory("current_goals", "Get to know the user and understand their needs.")?;
         Ok(())
     }
@@ -343,25 +374,31 @@ impl Database {
 
     /// Insert or update a person. Returns their ID.
     pub fn upsert_person(&self, name: &str, relationship: Option<&str>, notes: Option<&str>) -> Result<i64> {
+        let name_encrypted = self.key.encrypt_string(name)?;
+        let name_hash = self.hmac_hash(name);
+        let relationship_encrypted = relationship
+            .map(|r| self.key.encrypt_string(r))
+            .transpose()?;
         let notes_encrypted = notes
             .map(|n| self.key.encrypt_string(n))
             .transpose()?;
 
         self.conn
             .execute(
-                "INSERT INTO people (canonical_name, relationship, notes_encrypted, last_mentioned)
-                 VALUES (?1, ?2, ?3, datetime('now'))
-                 ON CONFLICT(canonical_name) DO UPDATE SET
-                    relationship = COALESCE(excluded.relationship, people.relationship),
+                "INSERT INTO people (canonical_name_encrypted, canonical_name_hash, relationship_encrypted, notes_encrypted, last_mentioned)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))
+                 ON CONFLICT(canonical_name_hash) DO UPDATE SET
+                    canonical_name_encrypted = excluded.canonical_name_encrypted,
+                    relationship_encrypted = COALESCE(excluded.relationship_encrypted, people.relationship_encrypted),
                     notes_encrypted = COALESCE(excluded.notes_encrypted, people.notes_encrypted),
                     last_mentioned = excluded.last_mentioned",
-                rusqlite::params![name, relationship, notes_encrypted],
+                rusqlite::params![name_encrypted, name_hash, relationship_encrypted, notes_encrypted],
             )
             .context("failed to upsert person")?;
 
         let id = self.conn.query_row(
-            "SELECT id FROM people WHERE canonical_name = ?1",
-            [name],
+            "SELECT id FROM people WHERE canonical_name_hash = ?1",
+            [&name_hash],
             |row| row.get(0),
         )?;
         Ok(id)
@@ -369,17 +406,18 @@ impl Database {
 
     /// Get a person by name (decrypted).
     pub fn get_person(&self, name: &str) -> Result<Option<Person>> {
+        let name_hash = self.hmac_hash(name);
         let mut stmt = self.conn.prepare(
-            "SELECT id, canonical_name, relationship, notes_encrypted, first_mentioned, last_mentioned
-             FROM people WHERE canonical_name = ?1",
+            "SELECT id, canonical_name_encrypted, relationship_encrypted, notes_encrypted, first_mentioned, last_mentioned
+             FROM people WHERE canonical_name_hash = ?1",
         )?;
 
         let row = stmt
-            .query_row([name], |row| {
+            .query_row([&name_hash], |row| {
                 Ok(RawPersonRow {
                     id: row.get(0)?,
-                    canonical_name: row.get(1)?,
-                    relationship: row.get(2)?,
+                    canonical_name_encrypted: row.get(1)?,
+                    relationship_encrypted: row.get(2)?,
                     notes_encrypted: row.get(3)?,
                     first_mentioned: row.get(4)?,
                     last_mentioned: row.get(5)?,
@@ -389,6 +427,12 @@ impl Database {
 
         match row {
             Some(raw) => {
+                let canonical_name = self.key.decrypt_string(&raw.canonical_name_encrypted)?;
+                let relationship = raw
+                    .relationship_encrypted
+                    .as_ref()
+                    .map(|enc| self.key.decrypt_string(enc))
+                    .transpose()?;
                 let notes = raw
                     .notes_encrypted
                     .as_ref()
@@ -396,8 +440,8 @@ impl Database {
                     .transpose()?;
                 Ok(Some(Person {
                     id: raw.id,
-                    canonical_name: raw.canonical_name,
-                    relationship: raw.relationship,
+                    canonical_name,
+                    relationship,
                     notes,
                     first_mentioned: raw.first_mentioned,
                     last_mentioned: raw.last_mentioned,
@@ -410,7 +454,7 @@ impl Database {
     /// List all people (decrypted).
     pub fn list_people(&self) -> Result<Vec<Person>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, canonical_name, relationship, notes_encrypted, first_mentioned, last_mentioned
+            "SELECT id, canonical_name_encrypted, relationship_encrypted, notes_encrypted, first_mentioned, last_mentioned
              FROM people ORDER BY last_mentioned DESC",
         )?;
 
@@ -418,27 +462,56 @@ impl Database {
             .query_map([], |row| {
                 Ok(RawPersonRow {
                     id: row.get(0)?,
-                    canonical_name: row.get(1)?,
-                    relationship: row.get(2)?,
+                    canonical_name_encrypted: row.get(1)?,
+                    relationship_encrypted: row.get(2)?,
                     notes_encrypted: row.get(3)?,
                     first_mentioned: row.get(4)?,
                     last_mentioned: row.get(5)?,
                 })
             })?
-            .filter_map(|r| r.ok())
-            .map(|raw| {
-                let notes = raw
-                    .notes_encrypted
-                    .as_ref()
-                    .and_then(|enc| self.key.decrypt_string(enc).ok());
-                Person {
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read people row");
+                    None
+                }
+            })
+            .filter_map(|raw| {
+                let canonical_name = match self.key.decrypt_string(&raw.canonical_name_encrypted) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        tracing::warn!(row_id = raw.id, error = %e, "decryption failed for person canonical_name, skipping");
+                        return None;
+                    }
+                };
+                let relationship = match raw.relationship_encrypted.as_ref() {
+                    Some(enc) => match self.key.decrypt_string(enc) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            tracing::warn!(row_id = raw.id, error = %e, "decryption failed for person relationship, skipping");
+                            return None;
+                        }
+                    },
+                    None => None,
+                };
+                let notes = match raw.notes_encrypted.as_ref() {
+                    Some(enc) => match self.key.decrypt_string(enc) {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            tracing::warn!(row_id = raw.id, error = %e, "decryption failed for person notes, skipping");
+                            return None;
+                        }
+                    },
+                    None => None,
+                };
+                Some(Person {
                     id: raw.id,
-                    canonical_name: raw.canonical_name,
-                    relationship: raw.relationship,
+                    canonical_name,
+                    relationship,
                     notes,
                     first_mentioned: raw.first_mentioned,
                     last_mentioned: raw.last_mentioned,
-                }
+                })
             })
             .collect();
 
@@ -447,14 +520,14 @@ impl Database {
 
     // -- Commitments (Layer 2) --
 
-    /// Add a commitment (encrypted). Uses SHA-256 hash for dedup.
+    /// Add a commitment (encrypted). Uses HMAC-SHA256 for dedup.
     pub fn add_commitment(
         &self,
         description: &str,
         due_date: Option<&str>,
         person_id: Option<i64>,
     ) -> Result<i64> {
-        let hash = sha256_hex(description);
+        let hash = self.hmac_hash(description);
         let encrypted = self.key.encrypt_string(description)?;
 
         self.conn
@@ -492,18 +565,29 @@ impl Database {
                     completed_at: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read commitment row");
+                    None
+                }
+            })
             .filter_map(|raw| {
-                let description = self.key.decrypt_string(&raw.description_encrypted).ok()?;
-                Some(Commitment {
-                    id: raw.id,
-                    description,
-                    status: raw.status,
-                    due_date: raw.due_date,
-                    person_id: raw.person_id,
-                    created_at: raw.created_at,
-                    completed_at: raw.completed_at,
-                })
+                match self.key.decrypt_string(&raw.description_encrypted) {
+                    Ok(description) => Some(Commitment {
+                        id: raw.id,
+                        description,
+                        status: raw.status,
+                        due_date: raw.due_date,
+                        person_id: raw.person_id,
+                        created_at: raw.created_at,
+                        completed_at: raw.completed_at,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(row_id = raw.id, error = %e, "decryption failed for commitment, skipping");
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -512,18 +596,22 @@ impl Database {
 
     /// Update commitment status.
     pub fn update_commitment_status(&self, id: i64, status: &str) -> Result<()> {
-        let completed_at = if status == "completed" {
-            "datetime('now')"
-        } else {
-            "NULL"
-        };
+        const VALID_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
+        if !VALID_STATUSES.contains(&status) {
+            anyhow::bail!("invalid commitment status: {status}");
+        }
 
-        self.conn.execute(
-            &format!(
-                "UPDATE commitments SET status = ?1, completed_at = {completed_at} WHERE id = ?2"
-            ),
-            rusqlite::params![status, id],
-        )?;
+        if status == "completed" {
+            self.conn.execute(
+                "UPDATE commitments SET status = ?1, completed_at = datetime('now') WHERE id = ?2",
+                rusqlite::params![status, id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE commitments SET status = ?1, completed_at = NULL WHERE id = ?2",
+                rusqlite::params![status, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -531,15 +619,18 @@ impl Database {
 
     /// Upsert a preference (encrypted).
     pub fn set_preference(&self, category: &str, value: &str) -> Result<()> {
-        let encrypted = self.key.encrypt_string(value)?;
+        let category_encrypted = self.key.encrypt_string(category)?;
+        let category_hash = self.hmac_hash(category);
+        let value_encrypted = self.key.encrypt_string(value)?;
         self.conn
             .execute(
-                "INSERT INTO preferences (category, value_encrypted, updated_at)
-                 VALUES (?1, ?2, datetime('now'))
-                 ON CONFLICT(category) DO UPDATE SET
+                "INSERT INTO preferences (category_encrypted, category_hash, value_encrypted, updated_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))
+                 ON CONFLICT(category_hash) DO UPDATE SET
+                    category_encrypted = excluded.category_encrypted,
                     value_encrypted = excluded.value_encrypted,
                     updated_at = excluded.updated_at",
-                rusqlite::params![category, encrypted],
+                rusqlite::params![category_encrypted, category_hash, value_encrypted],
             )
             .context("failed to upsert preference")?;
         Ok(())
@@ -547,11 +638,12 @@ impl Database {
 
     /// Get a preference by category (decrypted).
     pub fn get_preference(&self, category: &str) -> Result<Option<String>> {
+        let category_hash = self.hmac_hash(category);
         let encrypted: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT value_encrypted FROM preferences WHERE category = ?1",
-                [category],
+                "SELECT value_encrypted FROM preferences WHERE category_hash = ?1",
+                [&category_hash],
                 |row| row.get(0),
             )
             .optional()?;
@@ -636,8 +728,8 @@ struct RawCoreMemoryRow {
 
 struct RawPersonRow {
     id: i64,
-    canonical_name: String,
-    relationship: Option<String>,
+    canonical_name_encrypted: Vec<u8>,
+    relationship_encrypted: Option<Vec<u8>>,
     notes_encrypted: Option<Vec<u8>>,
     first_mentioned: String,
     last_mentioned: String,
@@ -651,16 +743,6 @@ struct RawCommitmentRow {
     person_id: Option<i64>,
     created_at: String,
     completed_at: Option<String>,
-}
-
-/// Simple SHA-256 hex hash using ring.
-fn sha256_hex(input: &str) -> String {
-    use ring::digest;
-    let hash = digest::digest(&digest::SHA256, input.as_bytes());
-    hash.as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 // Bring in rusqlite optional extension
@@ -848,13 +930,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_hex() {
-        let hash = sha256_hex("hello");
+    fn test_hmac_sha256_hex() {
+        let key_bytes = [0x01u8; 32];
+        let hash = mika_common::crypto::hmac_sha256_hex(&key_bytes, "hello");
+        // HMAC-SHA256 produces 64 hex chars (32 bytes)
         assert_eq!(hash.len(), 64);
-        assert_eq!(
-            hash,
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
+        // Should be deterministic
+        let hash2 = mika_common::crypto::hmac_sha256_hex(&key_bytes, "hello");
+        assert_eq!(hash, hash2);
     }
 
     #[test]
@@ -862,7 +945,7 @@ mod tests {
         let db = test_db();
         db.save_message("user", "Secret meeting at noon", "telegram").unwrap();
 
-        // Read raw encrypted blob — should NOT contain plaintext
+        // Read raw encrypted blob -- should NOT contain plaintext
         let raw: Vec<u8> = db
             .conn
             .query_row(
@@ -874,5 +957,60 @@ mod tests {
 
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(!raw_str.contains("Secret meeting"));
+    }
+
+    #[test]
+    fn test_check_encryption_key() {
+        let db = test_db();
+        // Should succeed with a valid key
+        db.check_encryption_key().unwrap();
+    }
+
+    #[test]
+    fn test_people_encrypted_at_rest() {
+        let db = test_db();
+        db.upsert_person("Sarah Chen", Some("colleague"), Some("VP of Engineering")).unwrap();
+
+        // Read raw canonical_name_encrypted -- should NOT contain plaintext
+        let raw_name: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT canonical_name_encrypted FROM people WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_name_str = String::from_utf8_lossy(&raw_name);
+        assert!(!raw_name_str.contains("Sarah Chen"), "canonical_name should be encrypted at rest");
+
+        // Read raw relationship_encrypted -- should NOT contain plaintext
+        let raw_rel: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT relationship_encrypted FROM people WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_rel_str = String::from_utf8_lossy(&raw_rel);
+        assert!(!raw_rel_str.contains("colleague"), "relationship should be encrypted at rest");
+    }
+
+    #[test]
+    fn test_preferences_encrypted_at_rest() {
+        let db = test_db();
+        db.set_preference("communication_style", "Direct and concise").unwrap();
+
+        // Read raw category_encrypted -- should NOT contain plaintext
+        let raw_cat: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT category_encrypted FROM preferences WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_cat_str = String::from_utf8_lossy(&raw_cat);
+        assert!(!raw_cat_str.contains("communication_style"), "category should be encrypted at rest");
     }
 }

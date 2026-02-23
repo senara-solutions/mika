@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput, MAX_INPUT_LEN};
 
 pub struct AddCommitmentTool;
 
@@ -44,10 +44,35 @@ impl Tool for AddCommitmentTool {
             return Ok(ToolOutput::error("'description' is required."));
         }
 
+        if description.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Input too long: 'description' is {} characters (max: {}). Please shorten it.",
+                description.len(),
+                MAX_INPUT_LEN
+            )));
+        }
+
         let due_date = input["due_date"].as_str();
+
+        if let Some(d) = due_date {
+            if d.len() > MAX_INPUT_LEN {
+                return Ok(ToolOutput::error(format!(
+                    "Input too long: 'due_date' is {} characters (max: {}). Please shorten it.",
+                    d.len(),
+                    MAX_INPUT_LEN
+                )));
+            }
+        }
 
         // Look up person by name if provided
         let person_id = if let Some(name) = input["person_name"].as_str() {
+            if name.len() > MAX_INPUT_LEN {
+                return Ok(ToolOutput::error(format!(
+                    "Input too long: 'person_name' is {} characters (max: {}). Please shorten it.",
+                    name.len(),
+                    MAX_INPUT_LEN
+                )));
+            }
             ctx.db.get_person(name)?.map(|p| p.id)
         } else {
             None

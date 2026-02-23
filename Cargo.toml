@@ -12,9 +12,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP
-axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -22,10 +20,11 @@ serde_json = "1"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
 
 # Encryption
 ring = "0.17"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
 
 # Configuration
 config = "0.15"
@@ -50,4 +49,3 @@ async-trait = "0.1"
 # Workspace crates
 mika-common = { path = "crates/mika-common" }
 mika-agent = { path = "crates/mika-agent" }
-mika-routing = { path = "crates/mika-routing" }

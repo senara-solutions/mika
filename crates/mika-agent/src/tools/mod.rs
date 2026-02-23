@@ -10,11 +10,12 @@ use serde_json::Value;
 
 use crate::db::Database;
 
+/// Maximum length (in characters) allowed for any single string input to a tool.
+pub const MAX_INPUT_LEN: usize = 10_000;
+
 /// Context available to every tool during execution.
 pub struct ToolContext<'a> {
     pub db: &'a Database,
-    pub customer_id: &'a str,
-    pub routing_url: Option<&'a str>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

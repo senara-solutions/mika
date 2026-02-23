@@ -15,7 +15,6 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
-ring.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

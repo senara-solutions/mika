@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use thiserror::Error;
 use tracing::{debug, warn};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -98,6 +99,18 @@ struct ApiErrorDetail {
     message: String,
 }
 
+// -- Typed errors --
+
+#[derive(Error, Debug)]
+pub enum ClaudeApiError {
+    #[error("Claude API HTTP error ({status})")]
+    HttpError { status: u16 },
+    #[error("Claude API request failed")]
+    Transport(#[from] reqwest::Error),
+    #[error("Claude API response parse error")]
+    ParseError(#[source] reqwest::Error),
+}
+
 // -- Client --
 
 impl MessagesResponse {
@@ -146,6 +159,11 @@ impl ClaudeClient {
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: MessagesRequest) -> Result<MessagesResponse> {
+        // Validate API key header value upfront (non-retryable configuration error).
+        // Use an opaque message to avoid leaking the actual key value.
+        let api_key_header = HeaderValue::from_str(&self.api_key)
+            .context("invalid API key characters")?;
+
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -155,7 +173,7 @@ impl ClaudeClient {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.send_once(&request).await {
+            match self.send_once(&request, api_key_header.clone()).await {
                 Ok(response) => {
                     debug!(
                         input_tokens = response.usage.input_tokens,
@@ -171,21 +189,24 @@ impl ClaudeClient {
                         last_error = Some(e);
                         continue;
                     }
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
+        Err(last_error
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
     }
 
-    async fn send_once(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+    async fn send_once(
+        &self,
+        request: &MessagesRequest,
+        api_key_header: HeaderValue,
+    ) -> std::result::Result<MessagesResponse, ClaudeApiError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&self.api_key).context("invalid API key")?,
-        );
+        headers.insert("x-api-key", api_key_header);
         headers.insert(
             "anthropic-version",
             HeaderValue::from_static(API_VERSION),
@@ -197,30 +218,33 @@ impl ClaudeClient {
             .headers(headers)
             .json(request)
             .send()
-            .await
-            .context("failed to send request to Claude API")?;
+            .await?;
 
         let status = response.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
+            // Log the body at warn level but do NOT include it in the error
             let body = response.text().await.unwrap_or_default();
             let message = serde_json::from_str::<ApiErrorResponse>(&body)
                 .map(|e| e.error.message)
                 .unwrap_or(body);
-            anyhow::bail!("Claude API error ({}): {}", status, message);
+            warn!(status = status_code, error_message = %message, "Claude API error response");
+            return Err(ClaudeApiError::HttpError { status: status_code });
         }
 
-        let response: MessagesResponse = response
-            .json()
-            .await
-            .context("failed to parse Claude API response")?;
+        let response: MessagesResponse =
+            response.json().await.map_err(ClaudeApiError::ParseError)?;
 
         Ok(response)
     }
 }
 
-fn is_retryable(error: &anyhow::Error) -> bool {
-    let msg = error.to_string();
-    msg.contains("429") || msg.contains("500") || msg.contains("529") || msg.contains("timeout")
+fn is_retryable(error: &ClaudeApiError) -> bool {
+    match error {
+        ClaudeApiError::HttpError { status } => matches!(status, 429 | 500 | 529),
+        ClaudeApiError::Transport(e) => e.is_timeout(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
