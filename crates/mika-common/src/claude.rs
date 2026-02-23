@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -161,15 +161,19 @@ impl ClaudeClient {
     pub async fn send_message(&self, request: MessagesRequest) -> Result<MessagesResponse> {
         // Validate API key header value upfront (non-retryable configuration error).
         // Use an opaque message to avoid leaking the actual key value.
-        let api_key_header = HeaderValue::from_str(&self.api_key)
-            .context("invalid API key characters")?;
+        let api_key_header =
+            HeaderValue::from_str(&self.api_key).context("invalid API key characters")?;
 
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                warn!(attempt, delay_ms = delay.as_millis(), "retrying Claude API call");
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "retrying Claude API call"
+                );
                 tokio::time::sleep(delay).await;
             }
 
@@ -207,10 +211,7 @@ impl ClaudeClient {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("x-api-key", api_key_header);
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static(API_VERSION),
-        );
+        headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
 
         let response = self
             .client
@@ -229,7 +230,9 @@ impl ClaudeClient {
                 .map(|e| e.error.message)
                 .unwrap_or(body);
             warn!(status = status_code, error_message = %message, "Claude API error response");
-            return Err(ClaudeApiError::HttpError { status: status_code });
+            return Err(ClaudeApiError::HttpError {
+                status: status_code,
+            });
         }
 
         let response: MessagesResponse =
@@ -285,7 +288,7 @@ mod tests {
     #[test]
     fn test_serialize_request() {
         let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250514".into(),
+            model: "claude-sonnet-4-6".into(),
             max_tokens: 4096,
             system: Some("You are Mika.".into()),
             messages: vec![Message {

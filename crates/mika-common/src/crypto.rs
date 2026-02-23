@@ -1,4 +1,4 @@
-use ring::aead::{Aad, AES_256_GCM, LessSafeKey, Nonce, UnboundKey};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
 use zeroize::ZeroizeOnDrop;
@@ -40,8 +40,8 @@ impl EncryptionKey {
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(&bytes);
 
-        let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes)
-            .map_err(|_| CryptoError::EncryptionFailed)?;
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, &key_bytes).map_err(|_| CryptoError::EncryptionFailed)?;
         let cached_key = LessSafeKey::new(unbound);
 
         Ok(Self {

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use mika_common::claude::{
     ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
 };
+use std::path::Path;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -13,21 +15,29 @@ const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 
+/// Parameters for running the agent loop.
+pub struct AgentParams<'a> {
+    pub db: &'a Database,
+    pub claude: &'a ClaudeClient,
+    pub tools: &'a ToolRegistry,
+    pub user_message: &'a str,
+    pub channel_type: &'a str,
+    pub session_id: &'a str,
+    pub home_dir: &'a Path,
+    pub is_onboarding: bool,
+}
+
 /// Run the agent loop for a single inbound message.
 /// Returns the assistant's text response.
-pub async fn run_agent(
-    db: &Database,
-    claude: &ClaudeClient,
-    tools: &ToolRegistry,
-    user_message: &str,
-    channel_type: &str,
-) -> Result<String> {
+pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
     // Save the user message
-    db.save_message("user", user_message, channel_type)?;
+    params
+        .db
+        .save_message("user", params.user_message, params.channel_type)?;
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_agent_inner(db, claude, tools, channel_type),
+        run_agent_inner(params),
     )
     .await;
 
@@ -40,21 +50,34 @@ pub async fn run_agent(
             );
             let fallback =
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
-            db.save_message("assistant", fallback, channel_type)?;
+            params
+                .db
+                .save_message("assistant", fallback, params.channel_type)?;
             Ok(fallback.to_string())
         }
     }
 }
 
 /// Inner agent loop, separated so the outer function can wrap it in a timeout.
-async fn run_agent_inner(
-    db: &Database,
-    claude: &ClaudeClient,
-    tools: &ToolRegistry,
-    channel_type: &str,
-) -> Result<String> {
-    // Load context
-    let system = prompt::load_system_prompt(db)?;
+async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
+    let db = params.db;
+    let claude = params.claude;
+    let tools = params.tools;
+    let channel_type = params.channel_type;
+
+    // Load context: soul, identity, core memory → build system prompt
+    let soul_content = std::fs::read_to_string(params.home_dir.join("soul.md")).unwrap_or_default();
+    let identity = prompt::load_identity(params.home_dir);
+    let core_memory = db.get_all_core_memory()?;
+
+    let prompt_ctx = prompt::PromptContext {
+        soul_content: &soul_content,
+        identity: &identity,
+        core_memory: &core_memory,
+        is_onboarding: params.is_onboarding,
+    };
+    let system = prompt::build_system_prompt(&prompt_ctx);
+
     let history = db.load_recent_messages(20)?;
     let tool_defs = tools.definitions();
 
@@ -67,7 +90,14 @@ async fn run_agent_inner(
         })
         .collect();
 
-    let tool_ctx = ToolContext { db };
+    let core_memory_edit_count = AtomicU32::new(0);
+    let tool_ctx = ToolContext {
+        db,
+        session_id: params.session_id,
+        home_dir: params.home_dir,
+        core_memory_edit_count: &core_memory_edit_count,
+        is_onboarding: params.is_onboarding,
+    };
 
     // Build the request once; only messages changes between iterations.
     // We clone the request when passing to send_message (which takes ownership),
@@ -86,7 +116,11 @@ async fn run_agent_inner(
     };
 
     for step in 0..MAX_TOOL_STEPS {
-        debug!(step, messages_len = request.messages.len(), "agent loop step");
+        debug!(
+            step,
+            messages_len = request.messages.len(),
+            "agent loop step"
+        );
 
         let response = claude
             .send_message(request.clone())
@@ -171,7 +205,9 @@ async fn execute_tool(
         }
         Err(_) => {
             warn!(tool = %name, "tool execution timed out");
-            ToolOutput::error(format!("Tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"))
+            ToolOutput::error(format!(
+                "Tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
+            ))
         }
     }
 }
