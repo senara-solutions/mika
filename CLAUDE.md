@@ -60,3 +60,13 @@ Mika is a conversation-first AI executive assistant that lives in Telegram (then
 - Use MERGE (not CREATE) for idempotent writes
 - All queries scoped by user_id (defense in depth)
 - Node labels: User, Person, Commitment, Topic, Pattern, Preference, Fact
+
+## Reference Repositories
+
+Local clones of agent platforms to study for patterns and inspiration. Read freely when designing Mika features.
+
+- **OpenClaw** — `/home/samidarko/workspace/senara-solutions/openclaw/`
+  TypeScript monorepo. Study for: channel adapter architecture (hub-and-spoke gateway), skills system (Markdown/YAML definitions), multi-channel UX patterns, community marketplace model.
+
+- **LettaBot** — `/home/samidarko/workspace/senara-solutions/lettabot/`
+  TypeScript. Study for: memory hierarchy patterns (core/archival/recall from MemGPT), autonomous memory self-editing via tool calls, agent state persistence, channel integrations built on top of Letta's memory API.
