@@ -30,8 +30,10 @@ impl AsyncDatabase {
     /// Acquire a reference to the underlying sync `Database`.
     /// Only for use in tests or migration/setup code that runs before
     /// the async server starts.
-    pub fn blocking(&self) -> std::sync::MutexGuard<'_, Database> {
-        self.inner.lock().expect("database mutex poisoned")
+    pub fn blocking(&self) -> Result<std::sync::MutexGuard<'_, Database>> {
+        self.inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database mutex poisoned"))
     }
 
     // -- Conversations --
@@ -42,7 +44,7 @@ impl AsyncDatabase {
         let content = content.to_string();
         let channel_type = channel_type.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.save_message(&role, &content, &channel_type)
         })
         .await?
@@ -57,7 +59,7 @@ impl AsyncDatabase {
         let channel_types: Option<Vec<String>> =
             channel_types.map(|ts| ts.iter().map(|s| s.to_string()).collect());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             match &channel_types {
                 Some(types) => {
                     let refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
@@ -75,7 +77,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let key = key.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_core_memory(&key)
         })
         .await?
@@ -84,7 +86,7 @@ impl AsyncDatabase {
     pub async fn get_all_core_memory(&self) -> Result<Vec<CoreMemoryEntry>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_all_core_memory()
         })
         .await?
@@ -95,7 +97,7 @@ impl AsyncDatabase {
         let key = key.to_string();
         let value = value.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.set_core_memory(&key, &value)
         })
         .await?
@@ -104,7 +106,7 @@ impl AsyncDatabase {
     pub async fn total_core_memory_tokens(&self) -> Result<i32> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.total_core_memory_tokens()
         })
         .await?
@@ -114,7 +116,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let user_md_content = user_md_content.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.seed_core_memory(user_md_content.as_deref())
         })
         .await?
@@ -133,7 +135,7 @@ impl AsyncDatabase {
         let relationship = relationship.map(|s| s.to_string());
         let notes = notes.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.upsert_person(&name, relationship.as_deref(), notes.as_deref())
         })
         .await?
@@ -143,7 +145,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_person(&name)
         })
         .await?
@@ -152,7 +154,7 @@ impl AsyncDatabase {
     pub async fn list_people(&self) -> Result<Vec<Person>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.list_people()
         })
         .await?
@@ -170,7 +172,7 @@ impl AsyncDatabase {
         let description = description.to_string();
         let due_date = due_date.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.add_commitment(&description, due_date.as_deref(), person_id)
         })
         .await?
@@ -180,7 +182,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let status = status.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.list_commitments(&status)
         })
         .await?
@@ -190,7 +192,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let status = status.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.update_commitment_status(id, &status)
         })
         .await?
@@ -203,7 +205,7 @@ impl AsyncDatabase {
         let category = category.to_string();
         let value = value.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.set_preference(&category, &value)
         })
         .await?
@@ -213,7 +215,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let category = category.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_preference(&category)
         })
         .await?
@@ -222,7 +224,7 @@ impl AsyncDatabase {
     pub async fn list_preferences(&self) -> Result<Vec<Preference>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.list_preferences()
         })
         .await?
@@ -241,7 +243,7 @@ impl AsyncDatabase {
         let event_date = event_date.map(|s| s.to_string());
         let context = context.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.add_event(&description, event_date.as_deref(), context.as_deref())
         })
         .await?
@@ -250,7 +252,7 @@ impl AsyncDatabase {
     pub async fn list_events(&self) -> Result<Vec<Event>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.list_events()
         })
         .await?
@@ -275,7 +277,7 @@ impl AsyncDatabase {
         let after_value = after_value.to_string();
         let reasoning = reasoning.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.log_memory_event(
                 &session_id,
                 &tool_name,
@@ -292,7 +294,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let session_id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_memory_events(&session_id)
         })
         .await?
@@ -305,7 +307,7 @@ impl AsyncDatabase {
         let fire_at = fire_at.to_string();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.add_reminder(&fire_at, &message)
         })
         .await?
@@ -314,7 +316,7 @@ impl AsyncDatabase {
     pub async fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_pending_reminders()
         })
         .await?
@@ -323,7 +325,7 @@ impl AsyncDatabase {
     pub async fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_future_reminders()
         })
         .await?
@@ -332,7 +334,7 @@ impl AsyncDatabase {
     pub async fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_past_due_reminders()
         })
         .await?
@@ -341,7 +343,7 @@ impl AsyncDatabase {
     pub async fn mark_reminder_delivered(&self, id: i64) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.mark_reminder_delivered(id)
         })
         .await?
@@ -350,7 +352,7 @@ impl AsyncDatabase {
     pub async fn mark_reminder_failed(&self, id: i64) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.mark_reminder_failed(id)
         })
         .await?
@@ -359,7 +361,7 @@ impl AsyncDatabase {
     pub async fn cancel_reminder(&self, id: i64) -> Result<bool> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.cancel_reminder(id)
         })
         .await?
@@ -368,7 +370,7 @@ impl AsyncDatabase {
     pub async fn list_active_reminders(&self) -> Result<Vec<Reminder>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.list_active_reminders()
         })
         .await?
@@ -379,7 +381,7 @@ impl AsyncDatabase {
     pub async fn record_heartbeat_send(&self) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.record_heartbeat_send()
         })
         .await?
@@ -389,7 +391,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let tz = timezone_offset.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.count_heartbeat_sends_today(&tz)
         })
         .await?
@@ -398,7 +400,7 @@ impl AsyncDatabase {
     pub async fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.count_heartbeat_sends_last_hour()
         })
         .await?
@@ -407,7 +409,7 @@ impl AsyncDatabase {
     pub async fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.prune_old_heartbeat_sends(days)
         })
         .await?
@@ -423,7 +425,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let summary = summary.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.save_conversation_summary(&summary, compacted_through_id)
         })
         .await?
@@ -432,7 +434,7 @@ impl AsyncDatabase {
     pub async fn delete_compacted_messages(&self, through_id: i64) -> Result<u32> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.delete_compacted_messages(through_id)
         })
         .await?
@@ -441,7 +443,7 @@ impl AsyncDatabase {
     pub async fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.load_conversation_summary()
         })
         .await?
@@ -450,7 +452,7 @@ impl AsyncDatabase {
     pub async fn count_messages(&self) -> Result<usize> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.count_messages()
         })
         .await?
@@ -462,7 +464,7 @@ impl AsyncDatabase {
     ) -> Result<Vec<ConversationMessage>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.load_messages_before_window(window_size)
         })
         .await?
@@ -476,7 +478,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let summary = summary.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.replace_with_summary(&summary, compacted_through_id)
         })
         .await?
@@ -488,7 +490,7 @@ impl AsyncDatabase {
         let db = Arc::clone(&self.inner);
         let key = key.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_customer_config(&key)
         })
         .await?
@@ -499,7 +501,7 @@ impl AsyncDatabase {
         let key = key.to_string();
         let value = value.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.set_customer_config(&key, &value)
         })
         .await?
@@ -512,7 +514,7 @@ impl AsyncDatabase {
         let text = text.to_string();
         let request_id = request_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.record_failed_send(&text, request_id.as_deref())
         })
         .await?
@@ -521,7 +523,7 @@ impl AsyncDatabase {
     pub async fn get_failed_sends(&self) -> Result<Vec<FailedSend>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.get_failed_sends()
         })
         .await?
@@ -530,7 +532,7 @@ impl AsyncDatabase {
     pub async fn delete_failed_send(&self, id: i64) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.delete_failed_send(id)
         })
         .await?
@@ -539,7 +541,7 @@ impl AsyncDatabase {
     pub async fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.increment_failed_send_retry(id)
         })
         .await?
@@ -548,7 +550,7 @@ impl AsyncDatabase {
     pub async fn last_user_message_time(&self) -> Result<Option<String>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().expect("database mutex poisoned");
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.last_user_message_time()
         })
         .await?
@@ -729,7 +731,7 @@ mod tests {
         db.save_message("user", "test", "cli").await.unwrap();
 
         // blocking() should see the same data
-        let guard = db.blocking();
+        let guard = db.blocking().unwrap();
         let messages = guard.load_recent_messages(10, None).unwrap();
         assert_eq!(messages.len(), 1);
     }

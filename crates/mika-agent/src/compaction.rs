@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use mika_common::claude::{ClaudeClient, Message, MessageContent, MessagesRequest};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::db::{ConversationMessage, Database};
 
 const COMPACTION_THRESHOLD: usize = 50;
 const CONTEXT_WINDOW: usize = 20;
+const MAX_COMPACTION_BATCH: usize = 100;
+const MAX_SUMMARY_CHARS: usize = 4000;
 
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
 You are summarizing a conversation between an AI executive assistant and their user.
@@ -34,14 +36,40 @@ pub async fn maybe_compact(db: &Database, claude: &ClaudeClient) -> Result<()> {
         return Ok(());
     }
 
+    // Cap batch size to prevent sending too much to the summarization API
+    let batch = if old_messages.len() > MAX_COMPACTION_BATCH {
+        warn!(
+            total = old_messages.len(),
+            batch = MAX_COMPACTION_BATCH,
+            "capping compaction batch size"
+        );
+        &old_messages[..MAX_COMPACTION_BATCH]
+    } else {
+        &old_messages
+    };
+
     info!(
-        old_count = old_messages.len(),
+        old_count = batch.len(),
         total, "compacting conversation"
     );
 
-    let summary_text = summarize_messages(claude, &old_messages, existing_summary.as_ref()).await?;
+    let mut summary_text = summarize_messages(claude, batch, existing_summary.as_ref()).await?;
 
-    let highest_id = old_messages.last().map(|m| m.id).unwrap_or(0);
+    // Truncate summary if it exceeds the size guard
+    if summary_text.len() > MAX_SUMMARY_CHARS {
+        warn!(
+            len = summary_text.len(),
+            max = MAX_SUMMARY_CHARS,
+            "truncating oversized summary"
+        );
+        summary_text.truncate(MAX_SUMMARY_CHARS);
+        // Ensure we don't cut in the middle of a multi-byte char
+        while !summary_text.is_char_boundary(summary_text.len()) {
+            summary_text.pop();
+        }
+    }
+
+    let highest_id = batch.last().map(|m| m.id).unwrap_or(0);
     db.replace_with_summary(&summary_text, highest_id)?;
 
     info!(compacted_through_id = highest_id, "compaction complete");

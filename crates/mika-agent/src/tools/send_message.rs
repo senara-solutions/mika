@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -26,11 +26,6 @@ impl Tool for SendMessageTool {
                     "text": {
                         "type": "string",
                         "description": "The message to send to the user"
-                    },
-                    "urgency": {
-                        "type": "string",
-                        "enum": ["high", "normal", "low"],
-                        "description": "Message priority. Currently all deliver immediately."
                     }
                 },
                 "required": ["text"]
@@ -50,13 +45,17 @@ impl Tool for SendMessageTool {
             )));
         }
 
+        // Persist the outbound message for conversation history
+        ctx.db.save_message("assistant", text, "outbound")?;
+
         match &ctx.message_sender {
             Some(sender) => {
                 sender.send(text).await?;
+                debug!("send_message delivered via sender");
                 Ok(ToolOutput::success("Message sent."))
             }
             None => {
-                info!(text, "send_message (CLI mode, no sender configured)");
+                info!("send_message (CLI mode, no sender configured)");
                 Ok(ToolOutput::success("Message delivered (CLI)."))
             }
         }

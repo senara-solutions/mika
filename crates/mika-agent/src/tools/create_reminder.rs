@@ -46,6 +46,9 @@ impl Tool for CreateReminderTool {
         if fire_at.is_empty() {
             return Ok(ToolOutput::error("'fire_at' is required."));
         }
+        if fire_at.len() > 64 {
+            return Ok(ToolOutput::error("'fire_at' is too long."));
+        }
         if message.is_empty() {
             return Ok(ToolOutput::error("'message' is required."));
         }
@@ -71,6 +74,15 @@ impl Tool for CreateReminderTool {
         }
 
         let id = ctx.db.add_reminder(fire_at, message)?;
+
+        ctx.db.log_memory_event(
+            ctx.session_id,
+            "create_reminder",
+            &format!("reminder:{id}"),
+            None,
+            &format!("{fire_at} — {message}"),
+            None,
+        )?;
 
         Ok(ToolOutput::success(format!(
             "Reminder #{id} scheduled for {fire_at}."

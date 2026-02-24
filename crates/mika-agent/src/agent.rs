@@ -158,31 +158,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
                 return Ok(text);
             }
             StopReason::ToolUse => {
-                // Add the assistant's response (with tool_use blocks) directly to the request
-                request.messages.push(Message {
-                    role: "assistant".to_string(),
-                    content: MessageContent::Blocks(response.content.clone()),
-                });
-
-                // Execute each tool call
-                let mut tool_results = Vec::new();
-                for block in &response.content {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
-                        debug!(tool = %name, "executing tool");
-                        let output = execute_tool(tools, name, input.clone(), &tool_ctx).await;
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: output.content,
-                            is_error: if output.is_error { Some(true) } else { None },
-                        });
-                    }
-                }
-
-                // Add tool results as a user message directly to the request
-                request.messages.push(Message {
-                    role: "user".to_string(),
-                    content: MessageContent::Blocks(tool_results),
-                });
+                process_tool_calls(response.content, tools, &tool_ctx, &mut request)
+                    .await;
             }
             StopReason::StopSequence => {
                 let text = response.text();
@@ -199,6 +176,38 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     let fallback = "I need a moment to think about that. Let me get back to you.";
     db.save_message("assistant", fallback, channel_type)?;
     Ok(fallback.to_string())
+}
+
+/// Execute tool-use blocks from a response and push both assistant and
+/// tool-result messages onto the request. Shared between conversation and
+/// silent agent loops.
+async fn process_tool_calls(
+    response_content: Vec<ContentBlock>,
+    tools: &ToolRegistry,
+    tool_ctx: &ToolContext<'_>,
+    request: &mut MessagesRequest,
+) {
+    let mut tool_results = Vec::new();
+    for block in &response_content {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            debug!(tool = %name, "executing tool");
+            let output = execute_tool(tools, name, input.clone(), tool_ctx).await;
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: output.content,
+                is_error: if output.is_error { Some(true) } else { None },
+            });
+        }
+    }
+
+    request.messages.push(Message {
+        role: "assistant".to_string(),
+        content: MessageContent::Blocks(response_content),
+    });
+    request.messages.push(Message {
+        role: "user".to_string(),
+        content: MessageContent::Blocks(tool_results),
+    });
 }
 
 /// Execute a single tool with timeout.
@@ -386,28 +395,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 return Ok(());
             }
             StopReason::ToolUse => {
-                request.messages.push(Message {
-                    role: "assistant".to_string(),
-                    content: MessageContent::Blocks(response.content.clone()),
-                });
-
-                let mut tool_results = Vec::new();
-                for block in &response.content {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
-                        debug!(tool = %name, channel_type, "silent agent executing tool");
-                        let output = execute_tool(tools, name, input.clone(), &tool_ctx).await;
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: output.content,
-                            is_error: if output.is_error { Some(true) } else { None },
-                        });
-                    }
-                }
-
-                request.messages.push(Message {
-                    role: "user".to_string(),
-                    content: MessageContent::Blocks(tool_results),
-                });
+                process_tool_calls(response.content, tools, &tool_ctx, &mut request)
+                    .await;
             }
         }
     }

@@ -107,6 +107,13 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- Track people, commitments, preferences, and events using the appropriate tools.\n",
     );
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
+    prompt.push_str(
+        "- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC). \
+         Use the current time shown above to compute future times.\n",
+    );
+    prompt.push_str(
+        "- You can list and cancel reminders with list_reminders and cancel_reminder.\n",
+    );
     let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
     write!(
         prompt,

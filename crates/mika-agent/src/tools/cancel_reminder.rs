@@ -40,6 +40,14 @@ impl Tool for CancelReminderTool {
 
         let cancelled = ctx.db.cancel_reminder(id)?;
         if cancelled {
+            ctx.db.log_memory_event(
+                ctx.session_id,
+                "cancel_reminder",
+                &format!("reminder:{id}"),
+                None,
+                "cancelled",
+                None,
+            )?;
             Ok(ToolOutput::success(format!(
                 "Reminder #{id} has been cancelled."
             )))

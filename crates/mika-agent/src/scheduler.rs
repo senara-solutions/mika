@@ -24,9 +24,16 @@ pub struct ReminderScheduler<'a> {
 
 impl ReminderScheduler<'_> {
     /// Recover pending reminders on startup.
-    /// - Past-due reminders: fire immediately
+    /// - Past-due reminders: fire immediately (max 5 to avoid blocking startup)
     /// - Future reminders: log count (timer scheduling is Phase 2)
+    ///
+    /// Also prunes old heartbeat_sends records.
     pub async fn recover(&self) -> Result<()> {
+        // Prune heartbeat sends older than 7 days to prevent unbounded growth
+        if let Err(e) = self.db.prune_old_heartbeat_sends(7) {
+            warn!(error = %e, "failed to prune old heartbeat sends");
+        }
+
         let past_due = self.db.get_past_due_reminders()?;
         let future = self.db.get_future_reminders()?;
 
@@ -41,8 +48,20 @@ impl ReminderScheduler<'_> {
             "recovering reminders"
         );
 
-        // Fire past-due reminders immediately
-        for reminder in &past_due {
+        // Fire past-due reminders (cap at 5 to avoid blocking startup)
+        const MAX_RECOVERY_REMINDERS: usize = 5;
+        for (i, reminder) in past_due.iter().enumerate() {
+            if i >= MAX_RECOVERY_REMINDERS {
+                warn!(
+                    skipped = past_due.len() - MAX_RECOVERY_REMINDERS,
+                    "too many past-due reminders, marking excess as failed"
+                );
+                for skipped in &past_due[MAX_RECOVERY_REMINDERS..] {
+                    let _ = self.db.mark_reminder_failed(skipped.id);
+                }
+                break;
+            }
+
             info!(
                 id = reminder.id,
                 fire_at = %reminder.fire_at,
