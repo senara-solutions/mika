@@ -69,6 +69,7 @@ impl ToolOutput {
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    cached_defs: Vec<ToolDefinition>,
 }
 
 impl Default for ToolRegistry {
@@ -79,15 +80,19 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            cached_defs: Vec::new(),
+        }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.cached_defs.push(tool.definition());
         self.tools.push(tool);
     }
 
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|t| t.definition()).collect()
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.cached_defs
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

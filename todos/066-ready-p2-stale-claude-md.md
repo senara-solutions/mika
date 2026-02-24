@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "066"
 tags: [code-review, documentation, rust-v2]
@@ -45,3 +45,4 @@ The project-level `CLAUDE.md` still references encryption concepts that were rem
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from code review of commit 3619d13 | CLAUDE.md must be updated whenever major refactors ship |
+| 2026-02-24 | Resolved: updated test count (127->130), added update_fact/store_fact/search_memory to Layer 2 description. Encryption refs, ToolContext, env vars, and platform systems were already accurate from prior fixes. | Most items in original todo were already resolved by earlier commits; always re-check current state before editing |

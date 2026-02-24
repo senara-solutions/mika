@@ -27,6 +27,7 @@ pub struct AgentParams<'a> {
     pub session_id: &'a str,
     pub home_dir: &'a Path,
     pub is_onboarding: bool,
+    pub message_sender: Option<&'a dyn MessageSender>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -44,13 +45,13 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
     .await;
 
     match timeout_result {
-        Ok(Ok(ref response)) => {
+        Ok(Ok(response)) => {
             // Post-turn compaction: summarize old messages if threshold exceeded.
             // Runs inline (not spawned) — acceptable latency for Phase 1 CLI.
             if let Err(e) = compaction::maybe_compact(params.db, params.claude).await {
                 warn!(error = %e, "post-turn compaction failed");
             }
-            Ok(response.clone())
+            Ok(response)
         }
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
@@ -94,9 +95,9 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     // Inject conversation summary into system prompt if one exists
     if let Some(summary) = db.load_conversation_summary()? {
         system.push_str("\n## Conversation Summary\n");
-        system.push_str("Summary of earlier conversation (older messages have been compacted):\n");
+        system.push_str("<context type=\"summary\" trust=\"data\">\n");
         system.push_str(&summary.content);
-        system.push('\n');
+        system.push_str("\n</context>\n");
     }
 
     let history = db.load_recent_messages(20, Some(&["cli", "telegram"]))?;
@@ -118,7 +119,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: params.is_onboarding,
-        message_sender: None,
+        message_sender: params.message_sender,
     };
 
     // Build the request once; only messages changes between iterations.
@@ -132,7 +133,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         tools: if tool_defs.is_empty() {
             None
         } else {
-            Some(tool_defs)
+            Some(tool_defs.to_vec())
         },
     };
 
@@ -323,7 +324,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         }
         SilentTrigger::Reminder { message, .. } => {
             format!(
-                "This is a REMINDER firing. The user asked to be reminded:\n\"{message}\"\n\
+                "This is a REMINDER firing. The user asked to be reminded:\n\
+                 <reminder-data>{message}</reminder-data>\n\
                  Deliver this reminder using send_message, adding any relevant context."
             )
         }
@@ -344,7 +346,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     let user_msg = match &params.trigger {
         SilentTrigger::Heartbeat => "[heartbeat trigger]".to_string(),
         SilentTrigger::Reminder { message, .. } => {
-            format!("[reminder trigger: {message}]")
+            format!("[reminder trigger: <reminder-data>{message}</reminder-data>]")
         }
     };
 
@@ -372,7 +374,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         tools: if tool_defs.is_empty() {
             None
         } else {
-            Some(tool_defs)
+            Some(tool_defs.to_vec())
         },
     };
 

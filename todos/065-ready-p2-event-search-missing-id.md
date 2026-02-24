@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "065"
 tags: [code-review, agent-native, quality, rust-v2]

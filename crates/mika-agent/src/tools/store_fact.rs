@@ -193,10 +193,7 @@ fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         return Ok(err);
     }
 
-    // Prefer event_date, fall back to due_date for backward compatibility
-    let event_date = input["event_date"]
-        .as_str()
-        .or_else(|| input["due_date"].as_str());
+    let event_date = input["event_date"].as_str();
     let notes = input["notes"].as_str();
 
     ctx.db.add_event(description, event_date, notes)?;
@@ -317,29 +314,6 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Board meeting"));
-    }
-
-    #[tokio::test]
-    async fn test_store_event_due_date_fallback() {
-        let db = test_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
-        let tool = StoreFactTool;
-
-        // Backward compatibility: due_date still works for events
-        let result = tool
-            .execute(
-                serde_json::json!({
-                    "category": "event",
-                    "description": "Team offsite",
-                    "due_date": "2026-05-01"
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert!(result.content.contains("Team offsite"));
     }
 
     #[tokio::test]

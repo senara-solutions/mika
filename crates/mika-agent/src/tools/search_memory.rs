@@ -128,10 +128,14 @@ impl Tool for SearchMemoryTool {
                     event.context.as_deref().unwrap_or("")
                 );
                 if searchable.to_lowercase().contains(&query_lower) {
-                    let mut desc = format!("[event] {}", event.description);
+                    let mut desc = format!(
+                        "[event] {} (id:{}",
+                        event.description, event.id
+                    );
                     if let Some(ref date) = event.event_date {
-                        desc.push_str(&format!(" ({date})"));
+                        desc.push_str(&format!(", {date}"));
                     }
+                    desc.push(')');
                     results.push(desc);
                 }
             }

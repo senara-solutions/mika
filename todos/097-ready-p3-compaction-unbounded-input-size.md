@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "097"
 tags: [code-review, security, performance]

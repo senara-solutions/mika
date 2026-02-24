@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
             session_id: &session_id,
             home_dir: &home_dir,
             is_onboarding,
+            message_sender: None,
         })
         .await
         {

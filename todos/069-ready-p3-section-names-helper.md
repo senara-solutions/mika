@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "069"
 tags: [code-review, quality, rust-v2]

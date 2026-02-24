@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "094"
 tags: [code-review, performance, agent-native]

@@ -8,6 +8,7 @@ const COMPACTION_THRESHOLD: usize = 50;
 const CONTEXT_WINDOW: usize = 20;
 const MAX_COMPACTION_BATCH: usize = 100;
 const MAX_SUMMARY_CHARS: usize = 4000;
+const MAX_COMPACTION_INPUT_CHARS: usize = 50_000;
 
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
 You are summarizing a conversation between an AI executive assistant and their user.
@@ -92,11 +93,27 @@ async fn summarize_messages(
     }
 
     user_prompt.push_str("## Messages to Summarize\n");
+    let mut char_count = 0usize;
+    let mut included = 0usize;
     for msg in messages {
+        let msg_chars = msg.role.len() + 2 + msg.content.len() + 1; // "role: content\n"
+        if char_count + msg_chars > MAX_COMPACTION_INPUT_CHARS {
+            break;
+        }
+        char_count += msg_chars;
+        included += 1;
         user_prompt.push_str(&msg.role);
         user_prompt.push_str(": ");
         user_prompt.push_str(&msg.content);
         user_prompt.push('\n');
+    }
+    if included < messages.len() {
+        warn!(
+            total = messages.len(),
+            included,
+            char_budget = MAX_COMPACTION_INPUT_CHARS,
+            "truncated compaction input to stay within character budget"
+        );
     }
 
     user_prompt.push_str("\nPlease produce a concise bullet-point summary.");

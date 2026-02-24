@@ -5,6 +5,10 @@ use tracing::{debug, info};
 
 const CURRENT_SCHEMA_VERSION: i64 = 5;
 
+/// Canonical list of valid commitment statuses at the database level.
+/// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
+pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
+
 /// Canonical list of core memory section names and their default values.
 /// Used by seed_core_memory, CLI reset, update_core_memory validation, and prompt assembly.
 pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
@@ -550,25 +554,37 @@ impl Database {
         Ok(commitments)
     }
 
-    /// Update commitment status.
-    pub fn update_commitment_status(&self, id: i64, status: &str) -> Result<()> {
-        const VALID_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
-        if !VALID_STATUSES.contains(&status) {
+    /// Update commitment status. Returns `true` if a row was updated, `false` if the id was not found.
+    pub fn update_commitment_status(&self, id: i64, status: &str) -> Result<bool> {
+        if !COMMITMENT_STATUSES.contains(&status) {
             anyhow::bail!("invalid commitment status: {status}");
         }
 
-        if status == "completed" {
+        let rows = if status == "completed" {
             self.conn.execute(
                 "UPDATE commitments SET status = ?1, completed_at = datetime('now') WHERE id = ?2",
                 rusqlite::params![status, id],
-            )?;
+            )?
         } else {
             self.conn.execute(
                 "UPDATE commitments SET status = ?1, completed_at = NULL WHERE id = ?2",
                 rusqlite::params![status, id],
-            )?;
-        }
-        Ok(())
+            )?
+        };
+        Ok(rows > 0)
+    }
+
+    /// Get the current status of a commitment by id.
+    pub fn get_commitment_status(&self, id: i64) -> Result<Option<String>> {
+        let status = self
+            .conn
+            .query_row(
+                "SELECT status FROM commitments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
     }
 
     // -- Preferences (Layer 2) --

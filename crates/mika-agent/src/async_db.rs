@@ -188,12 +188,21 @@ impl AsyncDatabase {
         .await?
     }
 
-    pub async fn update_commitment_status(&self, id: i64, status: &str) -> Result<()> {
+    pub async fn update_commitment_status(&self, id: i64, status: &str) -> Result<bool> {
         let db = Arc::clone(&self.inner);
         let status = status.to_string();
         tokio::task::spawn_blocking(move || {
             let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
             db.update_commitment_status(id, &status)
+        })
+        .await?
+    }
+
+    pub async fn get_commitment_status(&self, id: i64) -> Result<Option<String>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
+            db.get_commitment_status(id)
         })
         .await?
     }
