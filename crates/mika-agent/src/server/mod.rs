@@ -82,9 +82,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         startup_time: std::time::Instant::now(),
     };
 
-    // Routes with auth (message, heartbeat)
+    // Routes with auth (message, heartbeat) — route_layer applies to routes above it
     let app = Router::new()
         .route("/message", post(handlers::handle_message))
+        .route("/heartbeat", post(handlers::handle_heartbeat))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
@@ -169,6 +170,7 @@ mod tests {
     fn test_app(state: AppState) -> Router {
         Router::new()
             .route("/message", post(handlers::handle_message))
+            .route("/heartbeat", post(handlers::handle_heartbeat))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth::require_internal_token,
@@ -385,5 +387,55 @@ mod tests {
 
         let chat_id = db.get_customer_config("chat_id").await.unwrap();
         assert_eq!(chat_id, Some("789".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_returns_401_without_token() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/heartbeat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"request_id":"hb1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_returns_204_when_mutex_held() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+
+        // Set timezone so active-hours check passes
+        let _ = state.db.set_customer_config("timezone", "UTC").await;
+
+        // Pre-acquire the lock to simulate a busy agent
+        let _guard = state.agent_lock.clone().lock_owned().await;
+
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"request_id":"hb2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 }

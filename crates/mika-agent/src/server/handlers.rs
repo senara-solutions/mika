@@ -5,13 +5,16 @@ use axum::{
     response::IntoResponse,
 };
 use std::sync::atomic::Ordering;
-use tracing::{error, info};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
-use crate::agent::{self, AgentParams, check_onboarding};
+use crate::agent::{self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent};
+use crate::async_db::AsyncDatabase;
 use crate::compaction;
+use crate::messaging::{GatewayMessageSender, MessageSender};
 
 use super::state::AppState;
-use super::types::{AcceptedResponse, HealthResponse, MessageRequest};
+use super::types::{AcceptedResponse, HeartbeatRequest, HealthResponse, MessageRequest};
 
 /// GET /health — K8s liveness/readiness probe (no auth required).
 pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -36,7 +39,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 /// POST /message — gateway forwards a user message for async processing.
 ///
 /// Returns 202 Accepted immediately, then spawns the agent loop in background.
-/// Agent responses are delivered via GatewayMessageSender (wired in Phase 2 PR 3).
+/// Agent responses are delivered outbound via GatewayMessageSender.
 pub async fn handle_message(
     State(state): State<AppState>,
     Json(req): Json<MessageRequest>,
@@ -80,12 +83,18 @@ pub async fn handle_message(
     tokio::spawn(async move {
         let _lock = lock; // Hold lock for duration of agent loop
 
+        // Flush any previously failed sends before processing
+        flush_failed_sends(&s).await;
+
         let session_id = uuid::Uuid::new_v4().to_string();
         let is_onboarding = check_onboarding(&s.db).await;
 
-        // Build message_sender — GatewayMessageSender will be wired in PR 3.
-        // For now, agent responses are saved to DB only.
-        let message_sender = None;
+        let sender = GatewayMessageSender::new(
+            s.gateway_url.clone(),
+            s.internal_token.clone(),
+            s.db.clone(),
+        );
+        let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
         let params = AgentParams {
             db: &s.db,
@@ -96,17 +105,24 @@ pub async fn handle_message(
             session_id: &session_id,
             home_dir: &s.home_dir,
             is_onboarding,
-            message_sender,
+            message_sender: Some(sender_arc.clone()),
         };
 
         match agent::run_agent(&params).await {
-            Ok(_response) => {
+            Ok(response) => {
                 info!(request_id = req.request_id, "agent loop completed");
-                // TODO (PR 3): send _response via GatewayMessageSender
+                // Send final agent response to user via gateway
+                if !response.is_empty() {
+                    if let Err(e) = sender_arc.send(&response).await {
+                        error!(error = %e, request_id = req.request_id, "failed to send response");
+                    }
+                }
             }
             Err(e) => {
                 error!(error = %e, request_id = req.request_id, "agent loop failed");
-                // TODO (PR 3): send error message via GatewayMessageSender
+                let _ = sender_arc
+                    .send("Sorry, I had a hiccup processing your message. Could you try again?")
+                    .await;
             }
         }
 
@@ -116,7 +132,7 @@ pub async fn handle_message(
         let claude = s.claude.clone();
         tokio::spawn(async move {
             if let Err(e) = compaction::maybe_compact(&db, &claude).await {
-                tracing::warn!(error = %e, "post-turn compaction failed");
+                warn!(error = %e, "post-turn compaction failed");
             }
         });
     });
@@ -130,3 +146,135 @@ pub async fn handle_message(
     )
         .into_response()
 }
+
+/// POST /heartbeat — K8s CronJob triggers proactive check-in.
+///
+/// Pre-filters (active hours, rate limits) without acquiring Mutex.
+/// Returns 204 if skipped, 200 if accepted for processing.
+pub async fn handle_heartbeat(
+    State(state): State<AppState>,
+    Json(_req): Json<HeartbeatRequest>,
+) -> impl IntoResponse {
+    // Pre-filter: check if heartbeat should run (no Mutex, no Claude call)
+    if !heartbeat_should_run(&state.db).await {
+        return StatusCode::NO_CONTENT;
+    }
+
+    // try_lock — heartbeat is skippable if agent is busy
+    let lock = match state.agent_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => return StatusCode::NO_CONTENT,
+    };
+
+    // Spawn silent agent loop
+    let s = state.clone();
+    tokio::spawn(async move {
+        let _lock = lock;
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let sender = GatewayMessageSender::new(
+            s.gateway_url.clone(),
+            s.internal_token.clone(),
+            s.db.clone(),
+        );
+        let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
+
+        let params = SilentAgentParams {
+            db: &s.db,
+            claude: &s.claude,
+            tools: &s.tools,
+            trigger: SilentTrigger::Heartbeat,
+            home_dir: &s.home_dir,
+            session_id: &session_id,
+            message_sender: Some(sender_arc),
+        };
+
+        if let Err(e) = run_silent_agent(&params).await {
+            warn!(error = %e, "heartbeat agent loop failed");
+        }
+
+        // Record the heartbeat send for rate limiting
+        if let Err(e) = s.db.record_heartbeat_send().await {
+            warn!(error = %e, "failed to record heartbeat send");
+        }
+    });
+
+    StatusCode::OK
+}
+
+/// Flush previously failed outbound sends (best-effort, up to 5).
+async fn flush_failed_sends(state: &AppState) {
+    let sends = match state.db.get_pending_failed_sends(5).await {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let sender = GatewayMessageSender::new(
+        state.gateway_url.clone(),
+        state.internal_token.clone(),
+        state.db.clone(),
+    );
+
+    for send in sends {
+        match sender.send(&send.text).await {
+            Ok(()) => {
+                let _ = state.db.delete_failed_send(send.id).await;
+                info!(id = send.id, "flushed failed send");
+            }
+            Err(_) => {
+                let _ = state.db.increment_failed_send_retry(send.id).await;
+            }
+        }
+    }
+}
+
+/// Pre-filter for heartbeat: checks active hours, rate limits, and recent activity.
+/// Returns false if the heartbeat should be skipped (cheap — no Mutex or Claude call).
+async fn heartbeat_should_run(db: &AsyncDatabase) -> bool {
+    let tz_str = db
+        .get_customer_config("timezone")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "UTC".to_string());
+
+    // 1. Active hours check (8:00-21:00 in customer's timezone)
+    let now_utc = chrono::Utc::now();
+    let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+    let now_local = now_utc.with_timezone(&tz);
+    let hour = now_local.hour();
+    if !(8..21).contains(&hour) {
+        return false;
+    }
+
+    // 2. Rate limit: max 1 heartbeat per hour
+    if db.count_heartbeat_sends_last_hour().await.unwrap_or(0) >= 1 {
+        return false;
+    }
+
+    // 3. Rate limit: max 3 heartbeats per day
+    if db
+        .count_heartbeat_sends_today(&tz_str)
+        .await
+        .unwrap_or(0)
+        >= 3
+    {
+        return false;
+    }
+
+    // 4. Skip if user messaged recently (within last 2 hours)
+    if let Ok(Some(last_msg)) = db.last_user_message_time().await {
+        if let Ok(parsed) =
+            chrono::NaiveDateTime::parse_from_str(&last_msg, "%Y-%m-%d %H:%M:%S")
+        {
+            let elapsed = now_utc.naive_utc() - parsed;
+            if elapsed < chrono::TimeDelta::hours(2) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+use chrono::Timelike;

@@ -24,3 +24,4 @@ config/local.*
 data/
 *.db
 *.sqlite
+settings.local.json

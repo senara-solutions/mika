@@ -24,6 +24,12 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Inbound heartbeat trigger from the gateway/K8s CronJob.
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatRequest {
+    pub request_id: String,
+}
+
 /// Health check response body.
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
