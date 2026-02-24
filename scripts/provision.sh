@@ -155,11 +155,6 @@ echo "  Installed: mika-${CUSTOMER_ID}"
 
 # --- Step 3: Register in Postgres (parameterized via psql \set) ---
 echo "Step 3/4: Registering in Postgres..."
-CUSTOMER_ID="$CUSTOMER_ID" \
-CUSTOMER_NAME="$CUSTOMER_NAME" \
-PLAN="$PLAN" \
-TIMEZONE="$TIMEZONE" \
-PAIRING_TOKEN="$PAIRING_TOKEN" \
 psql "${DATABASE_URL}" \
     -v ON_ERROR_STOP=1 \
     -v customer_id="${CUSTOMER_ID}" \
