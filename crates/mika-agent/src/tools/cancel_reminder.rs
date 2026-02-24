@@ -32,13 +32,13 @@ impl Tool for CancelReminderTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let id = input["id"].as_i64().unwrap_or(0);
-        if id == 0 {
+        if id <= 0 {
             return Ok(ToolOutput::error(
                 "'id' is required and must be a positive integer.",
             ));
         }
 
-        let cancelled = ctx.db.cancel_reminder(id)?;
+        let cancelled = ctx.db.cancel_reminder(id).await?;
         if cancelled {
             ctx.db.log_memory_event(
                 ctx.session_id,
@@ -47,7 +47,7 @@ impl Tool for CancelReminderTool {
                 None,
                 "cancelled",
                 None,
-            )?;
+            ).await?;
             Ok(ToolOutput::success(format!(
                 "Reminder #{id} has been cancelled."
             )))
@@ -62,14 +62,15 @@ impl Tool for CancelReminderTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_ctx, test_db};
+    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
     use std::sync::atomic::AtomicU32;
 
     #[tokio::test]
     async fn test_cancel_reminder_success() {
-        let db = test_db();
+        let db = test_async_db();
         let id = db
             .add_reminder("2099-01-01T00:00:00Z", "To cancel")
+            .await
             .unwrap();
 
         let counter = AtomicU32::new(0);
@@ -83,13 +84,13 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("cancelled"));
 
-        let pending = db.get_pending_reminders().unwrap();
+        let pending = db.get_pending_reminders().await.unwrap();
         assert_eq!(pending.len(), 0);
     }
 
     #[tokio::test]
     async fn test_cancel_reminder_not_found() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = CancelReminderTool;
@@ -104,11 +105,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_reminder_already_delivered() {
-        let db = test_db();
+        let db = test_async_db();
         let id = db
             .add_reminder("2020-01-01T00:00:00Z", "Already delivered")
+            .await
             .unwrap();
-        db.mark_reminder_delivered(id).unwrap();
+        db.mark_reminder_delivered(id).await.unwrap();
 
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
@@ -123,8 +125,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_reminder_negative_id() {
+        let db = test_async_db();
+        let counter = AtomicU32::new(0);
+        let ctx = test_ctx(&db, &counter);
+        let tool = CancelReminderTool;
+
+        let result = tool
+            .execute(serde_json::json!({"id": -5}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("'id' is required"));
+    }
+
+    #[tokio::test]
     async fn test_cancel_reminder_missing_id() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = CancelReminderTool;

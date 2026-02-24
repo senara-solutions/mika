@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
 
-use crate::db::Database;
+use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
 
 /// Maximum length (in characters) allowed for any single string input to a tool.
@@ -22,7 +22,7 @@ pub const MAX_INPUT_LEN: usize = 10_000;
 
 /// Context available to every tool during execution.
 pub struct ToolContext<'a> {
-    pub db: &'a Database,
+    pub db: &'a AsyncDatabase,
     pub session_id: &'a str,
     pub home_dir: &'a Path,
     pub core_memory_edit_count: &'a AtomicU32,

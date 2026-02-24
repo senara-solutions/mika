@@ -46,7 +46,7 @@ impl Tool for SendMessageTool {
         }
 
         // Persist the outbound message for conversation history
-        ctx.db.save_message("assistant", text, "outbound")?;
+        ctx.db.save_message("assistant", text, "outbound").await?;
 
         match &ctx.message_sender {
             Some(sender) => {
@@ -66,7 +66,7 @@ impl Tool for SendMessageTool {
 mod tests {
     use super::*;
     use crate::messaging::MessageSender;
-    use crate::test_utils::test_helpers::{test_ctx, test_db};
+    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
 
@@ -97,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_no_sender() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = SendMessageTool;
@@ -112,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_with_sender() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let mock = MockSender::new();
         let ctx = crate::tools::ToolContext {
@@ -136,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_empty_text() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = SendMessageTool;
@@ -151,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_too_long() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = SendMessageTool;

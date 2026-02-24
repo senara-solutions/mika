@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use mika_agent::agent::{self, AgentParams};
+use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{CORE_MEMORY_SECTIONS, Database, core_memory_section_names};
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::tools;
@@ -50,6 +51,10 @@ async fn main() -> Result<()> {
         tracing::info!("seeded core memory for new database");
     }
 
+    // Wrap sync Database in async handler — takes ownership of `db`.
+    // All subsequent calls use `async_db`.
+    let async_db = AsyncDatabase::new(db);
+
     let claude = ClaudeClient::new(
         settings.anthropic_api_key.clone(),
         settings.claude_model.clone(),
@@ -64,7 +69,7 @@ async fn main() -> Result<()> {
 
     // Recover any past-due reminders on startup
     let scheduler = ReminderScheduler {
-        db: &db,
+        db: &async_db,
         claude: &claude,
         tools: &tool_registry,
         home_dir: &home_dir,
@@ -97,7 +102,7 @@ async fn main() -> Result<()> {
 
         // Handle slash commands
         if input.starts_with('/') {
-            handle_slash_command(input, &db, &home_dir)?;
+            handle_slash_command(input, &async_db, &home_dir).await?;
             continue;
         }
 
@@ -108,8 +113,8 @@ async fn main() -> Result<()> {
             .find(|(k, _)| *k == "user_summary")
             .map(|(_, v)| *v)
             .unwrap_or("New user. No information yet.");
-        let is_onboarding = db
-            .get_core_memory("user_summary")?
+        let is_onboarding = async_db
+            .get_core_memory("user_summary").await?
             .map(|e| e.value == user_summary_default)
             .unwrap_or(true);
 
@@ -118,7 +123,7 @@ async fn main() -> Result<()> {
         }
 
         match agent::run_agent(&AgentParams {
-            db: &db,
+            db: &async_db,
             claude: &claude,
             tools: &tool_registry,
             user_message: input,
@@ -142,7 +147,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) -> Result<()> {
+async fn handle_slash_command(input: &str, db: &AsyncDatabase, home_dir: &std::path::Path) -> Result<()> {
     match input {
         "/help" => {
             println!("\nAvailable commands:");
@@ -153,7 +158,7 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
             println!("  quit / exit      — Exit the CLI\n");
         }
         "/memory" => {
-            let entries = db.get_all_core_memory()?;
+            let entries = db.get_all_core_memory().await?;
             if entries.is_empty() {
                 println!("\nNo core memory entries.\n");
             } else {
@@ -168,7 +173,7 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
             }
         }
         "/reminders" => {
-            let reminders = db.get_pending_reminders()?;
+            let reminders = db.get_pending_reminders().await?;
             if reminders.is_empty() {
                 println!("\nNo pending reminders.\n");
             } else {
@@ -198,7 +203,7 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
                     default_value.to_string()
                 };
 
-                db.set_core_memory(block, &reset_value)?;
+                db.set_core_memory(block, &reset_value).await?;
                 println!("\nReset [{block}] to default.\n");
             } else {
                 let allowed = core_memory_section_names();

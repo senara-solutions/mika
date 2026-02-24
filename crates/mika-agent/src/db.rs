@@ -1129,18 +1129,23 @@ impl Database {
     /// Compact memory events older than `days` days into monthly summaries.
     /// Groups events by year/month, aggregates counts, and replaces raw events
     /// with summary rows in `memory_event_summaries`.
-    pub fn compact_old_memory_events(&self, days: u32) -> Result<()> {
+    /// Returns the number of raw events deleted (0 if nothing to compact).
+    pub fn compact_old_memory_events(&self, days: u32) -> Result<usize> {
+        use chrono::{Datelike, NaiveDateTime};
         use std::collections::HashMap;
 
         let modifier = format!("-{days} days");
-        let cutoff: String = self.conn.query_row(
-            "SELECT datetime('now', ?1)",
-            [&modifier],
-            |row| row.get(0),
-        )?;
 
-        // Fetch events older than cutoff, grouped conceptually by year/month
-        let mut stmt = self.conn.prepare(
+        // Wrap everything (SELECT + INSERT summaries + batch DELETE) in one transaction
+        let tx = self.conn.unchecked_transaction()?;
+
+        let cutoff: String =
+            tx.query_row("SELECT datetime('now', ?1)", [&modifier], |row| {
+                row.get(0)
+            })?;
+
+        // Fetch events older than cutoff
+        let mut stmt = tx.prepare(
             "SELECT id, tool_name, target_key, created_at
              FROM memory_events
              WHERE created_at < ?1
@@ -1148,7 +1153,6 @@ impl Database {
         )?;
 
         struct RawEvent {
-            id: i64,
             tool_name: String,
             target_key: String,
             created_at: String,
@@ -1157,16 +1161,17 @@ impl Database {
         let events: Vec<RawEvent> = stmt
             .query_map([&cutoff], |row| {
                 Ok(RawEvent {
-                    id: row.get(0)?,
                     tool_name: row.get(1)?,
                     target_key: row.get(2)?,
                     created_at: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
         if events.is_empty() {
-            return Ok(());
+            tx.commit()?;
+            return Ok(0);
         }
 
         // Group by year/month
@@ -1177,20 +1182,18 @@ impl Database {
             category_counts: HashMap<String, u32>,
             target_counts: HashMap<String, u32>,
             total: u32,
-            event_ids: Vec<i64>,
         }
 
         let mut buckets: HashMap<(i32, u32), MonthBucket> = HashMap::new();
 
         for event in &events {
-            // Parse year/month from created_at (format: "YYYY-MM-DD HH:MM:SS")
-            let (year, month) = if event.created_at.len() >= 7 {
-                let year: i32 = event.created_at[..4].parse().unwrap_or(0);
-                let month: u32 = event.created_at[5..7].parse().unwrap_or(0);
-                (year, month)
-            } else {
+            // Safe chrono parsing (replaces fragile string slicing)
+            let Some(dt) =
+                NaiveDateTime::parse_from_str(&event.created_at, "%Y-%m-%d %H:%M:%S").ok()
+            else {
                 continue;
             };
+            let (year, month) = (dt.year(), dt.month());
 
             let bucket = buckets.entry((year, month)).or_insert_with(|| MonthBucket {
                 year,
@@ -1199,10 +1202,12 @@ impl Database {
                 category_counts: HashMap::new(),
                 target_counts: HashMap::new(),
                 total: 0,
-                event_ids: Vec::new(),
             });
 
-            *bucket.tool_counts.entry(event.tool_name.clone()).or_insert(0) += 1;
+            *bucket
+                .tool_counts
+                .entry(event.tool_name.clone())
+                .or_insert(0) += 1;
 
             // Extract category from target_key (e.g., "person:Alice" -> "person")
             let category = event
@@ -1213,15 +1218,15 @@ impl Database {
                 .to_string();
             *bucket.category_counts.entry(category).or_insert(0) += 1;
 
-            *bucket.target_counts.entry(event.target_key.clone()).or_insert(0) += 1;
+            *bucket
+                .target_counts
+                .entry(event.target_key.clone())
+                .or_insert(0) += 1;
 
             bucket.total += 1;
-            bucket.event_ids.push(event.id);
         }
 
-        // Write summaries and delete raw events in a transaction
-        let tx = self.conn.unchecked_transaction()?;
-
+        // Write summaries with ON CONFLICT upsert
         for bucket in buckets.values() {
             // Build top targets (top 10 by count)
             let mut targets: Vec<(&String, &u32)> = bucket.target_counts.iter().collect();
@@ -1237,8 +1242,13 @@ impl Database {
             let top_targets_json = serde_json::to_string(&top_targets)?;
 
             tx.execute(
-                "INSERT OR REPLACE INTO memory_event_summaries (year, month, tool_counts, category_counts, total_mutations, top_targets)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO memory_event_summaries (year, month, tool_counts, category_counts, total_mutations, top_targets)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(year, month) DO UPDATE SET
+                    tool_counts = excluded.tool_counts,
+                    category_counts = excluded.category_counts,
+                    total_mutations = excluded.total_mutations,
+                    top_targets = excluded.top_targets",
                 rusqlite::params![
                     bucket.year,
                     bucket.month,
@@ -1248,15 +1258,16 @@ impl Database {
                     top_targets_json
                 ],
             )?;
-
-            // Delete compacted raw events
-            for id in &bucket.event_ids {
-                tx.execute("DELETE FROM memory_events WHERE id = ?1", [id])?;
-            }
         }
 
+        // Batch delete all compacted raw events in one statement
+        let deleted = tx.execute(
+            "DELETE FROM memory_events WHERE created_at < ?1",
+            [&cutoff],
+        )?;
+
         tx.commit()?;
-        Ok(())
+        Ok(deleted)
     }
 
     /// Get database file size using PRAGMA page_count * PRAGMA page_size.
@@ -1950,4 +1961,149 @@ mod tests {
         assert_eq!(tz, "-05:00");
     }
 
+    // -- Compaction tests --
+
+    /// Helper to insert a memory event with a specific created_at timestamp.
+    fn insert_event_at(db: &super::Database, tool: &str, target: &str, created_at: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO memory_events (session_id, tool_name, target_key, after_value, created_at)
+                 VALUES ('test', ?1, ?2, 'v', ?3)",
+                rusqlite::params![tool, target, created_at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_compact_no_old_events() {
+        let db = test_db();
+        // No events at all — should return 0
+        let deleted = db.compact_old_memory_events(90).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_compact_groups_by_month() {
+        let db = test_db();
+        // Insert events across 3 different months, all old enough to compact
+        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
+        insert_event_at(&db, "store_fact", "person:Bob", "2020-01-20 10:00:00");
+        insert_event_at(&db, "update_fact", "commitment:1", "2020-02-10 10:00:00");
+        insert_event_at(&db, "store_fact", "event:meeting", "2020-03-05 10:00:00");
+
+        let deleted = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted, 4);
+
+        // Should have 3 summary rows (one per month)
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_event_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Raw events should be gone
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_compact_preserves_recent_events() {
+        let db = test_db();
+        // Insert old event
+        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
+        // Insert recent event (use a far-future date so it's always "recent")
+        insert_event_at(&db, "store_fact", "person:Bob", "2099-12-31 10:00:00");
+
+        let deleted = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted, 1);
+
+        // Recent event should still exist
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn test_compact_returns_deletion_count() {
+        let db = test_db();
+        insert_event_at(&db, "store_fact", "person:A", "2020-01-01 10:00:00");
+        insert_event_at(&db, "store_fact", "person:B", "2020-01-02 10:00:00");
+        insert_event_at(&db, "store_fact", "person:C", "2020-01-03 10:00:00");
+
+        let deleted = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted, 3);
+    }
+
+    #[test]
+    fn test_compact_idempotent() {
+        let db = test_db();
+        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
+        insert_event_at(&db, "update_fact", "person:Alice", "2020-01-20 10:00:00");
+
+        // First compaction
+        let deleted1 = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted1, 2);
+
+        // Second compaction — nothing left to compact
+        let deleted2 = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted2, 0);
+
+        // Summary should still be there and unchanged
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_event_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_compact_summary_content() {
+        let db = test_db();
+        insert_event_at(&db, "store_fact", "person:Alice", "2020-03-10 10:00:00");
+        insert_event_at(&db, "store_fact", "person:Bob", "2020-03-15 10:00:00");
+        insert_event_at(&db, "update_fact", "commitment:1", "2020-03-20 10:00:00");
+
+        db.compact_old_memory_events(1).unwrap();
+
+        // Verify the summary row content
+        let (tool_counts, category_counts, total, year, month): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = db
+            .conn
+            .query_row(
+                "SELECT tool_counts, category_counts, total_mutations, year, month FROM memory_event_summaries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+
+        assert_eq!(year, 2020);
+        assert_eq!(month, 3);
+        assert_eq!(total, 3);
+
+        let tc: serde_json::Value = serde_json::from_str(&tool_counts).unwrap();
+        assert_eq!(tc["store_fact"], 2);
+        assert_eq!(tc["update_fact"], 1);
+
+        let cc: serde_json::Value = serde_json::from_str(&category_counts).unwrap();
+        assert_eq!(cc["person"], 2);
+        assert_eq!(cc["commitment"], 1);
+    }
 }

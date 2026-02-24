@@ -67,10 +67,10 @@ impl Tool for StoreFactTool {
         let category = input["category"].as_str().unwrap_or("");
 
         match category {
-            "person" => store_person(&input, ctx),
-            "commitment" => store_commitment(&input, ctx),
-            "preference" => store_preference(&input, ctx),
-            "event" => store_event(&input, ctx),
+            "person" => store_person(&input, ctx).await,
+            "commitment" => store_commitment(&input, ctx).await,
+            "preference" => store_preference(&input, ctx).await,
+            "event" => store_event(&input, ctx).await,
             "" => Ok(ToolOutput::error("'category' is required.")),
             other => Ok(ToolOutput::error(format!(
                 "Invalid category '{other}'. Use: person, commitment, preference, event"
@@ -90,7 +90,7 @@ fn validate_len(field: &str, value: &str) -> Option<ToolOutput> {
     }
 }
 
-fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     let name = input["name"].as_str().unwrap_or("");
     if name.is_empty() {
         return Ok(ToolOutput::error("'name' is required for person category."));
@@ -102,7 +102,7 @@ fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     let relationship = input["relationship"].as_str();
     let notes = input["notes"].as_str();
 
-    ctx.db.upsert_person(name, relationship, notes)?;
+    ctx.db.upsert_person(name, relationship, notes).await?;
 
     // Log audit event
     let target = format!("person:{name}");
@@ -112,12 +112,13 @@ fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         relationship.map(|r| format!(" — {r}")).unwrap_or_default()
     );
     ctx.db
-        .log_memory_event(ctx.session_id, "store_fact", &target, None, &after, None)?;
+        .log_memory_event(ctx.session_id, "store_fact", &target, None, &after, None)
+        .await?;
 
     Ok(ToolOutput::success(format!("Stored person: {name}")))
 }
 
-fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     let description = input["description"].as_str().unwrap_or("");
     if description.is_empty() {
         return Ok(ToolOutput::error(
@@ -132,22 +133,26 @@ fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> 
 
     // Look up person if name provided
     let person_id = if let Some(name) = input["name"].as_str() {
-        ctx.db.get_person(name)?.map(|p| p.id)
+        ctx.db.get_person(name).await?.map(|p| p.id)
     } else {
         None
     };
 
-    ctx.db.add_commitment(description, due_date, person_id)?;
+    ctx.db
+        .add_commitment(description, due_date, person_id)
+        .await?;
 
     let target = format!("commitment:{description}");
-    ctx.db.log_memory_event(
-        ctx.session_id,
-        "store_fact",
-        &target,
-        None,
-        description,
-        None,
-    )?;
+    ctx.db
+        .log_memory_event(
+            ctx.session_id,
+            "store_fact",
+            &target,
+            None,
+            description,
+            None,
+        )
+        .await?;
 
     let due_info = due_date.map(|d| format!(" (due: {d})")).unwrap_or_default();
     Ok(ToolOutput::success(format!(
@@ -155,7 +160,7 @@ fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> 
     )))
 }
 
-fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     let key = input["key"].as_str().unwrap_or("");
     let value = input["value"].as_str().unwrap_or("");
 
@@ -171,18 +176,19 @@ fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> 
         return Ok(err);
     }
 
-    ctx.db.set_preference(key, value)?;
+    ctx.db.set_preference(key, value).await?;
 
     let target = format!("preference:{key}");
     ctx.db
-        .log_memory_event(ctx.session_id, "store_fact", &target, None, value, None)?;
+        .log_memory_event(ctx.session_id, "store_fact", &target, None, value, None)
+        .await?;
 
     Ok(ToolOutput::success(format!(
         "Stored preference [{key}]: {value}"
     )))
 }
 
-fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     let description = input["description"].as_str().unwrap_or("");
     if description.is_empty() {
         return Ok(ToolOutput::error(
@@ -196,17 +202,19 @@ fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     let event_date = input["event_date"].as_str();
     let notes = input["notes"].as_str();
 
-    ctx.db.add_event(description, event_date, notes)?;
+    ctx.db.add_event(description, event_date, notes).await?;
 
     let target = format!("event:{description}");
-    ctx.db.log_memory_event(
-        ctx.session_id,
-        "store_fact",
-        &target,
-        None,
-        description,
-        None,
-    )?;
+    ctx.db
+        .log_memory_event(
+            ctx.session_id,
+            "store_fact",
+            &target,
+            None,
+            description,
+            None,
+        )
+        .await?;
 
     Ok(ToolOutput::success(format!(
         "Stored event: \"{description}\""
@@ -216,12 +224,12 @@ fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_ctx, test_db};
+    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
     use std::sync::atomic::AtomicU32;
 
     #[tokio::test]
     async fn test_store_person() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = StoreFactTool;
@@ -241,13 +249,13 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Alice Chen"));
 
-        let person = db.get_person("Alice Chen").unwrap().unwrap();
+        let person = db.get_person("Alice Chen").await.unwrap().unwrap();
         assert_eq!(person.relationship, Some("CTO".to_string()));
     }
 
     #[tokio::test]
     async fn test_store_commitment() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = StoreFactTool;
@@ -266,13 +274,13 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Q4 budget"));
 
-        let commitments = db.list_commitments("pending").unwrap();
+        let commitments = db.list_commitments("pending").await.unwrap();
         assert_eq!(commitments.len(), 1);
     }
 
     #[tokio::test]
     async fn test_store_preference() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = StoreFactTool;
@@ -290,13 +298,13 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let pref = db.get_preference("meeting_time").unwrap().unwrap();
+        let pref = db.get_preference("meeting_time").await.unwrap().unwrap();
         assert_eq!(pref, "Morning, before 10am");
     }
 
     #[tokio::test]
     async fn test_store_event_with_event_date() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = StoreFactTool;
@@ -318,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_fact_logs_audit() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = StoreFactTool;
@@ -333,7 +341,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = db.get_memory_events("test-session").unwrap();
+        let events = db.get_memory_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "store_fact");
         assert!(events[0].target_key.starts_with("person:"));
@@ -341,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_fact_missing_required() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = StoreFactTool;

@@ -105,7 +105,7 @@ impl Tool for UpdateCoreMemoryTool {
         }
 
         // Get existing value (for before snapshot and action logic)
-        let existing = ctx.db.get_core_memory(section)?;
+        let existing = ctx.db.get_core_memory(section).await?;
         let before_value = existing.as_ref().map(|e| e.value.as_str());
 
         // Compute new value based on action
@@ -163,7 +163,7 @@ impl Tool for UpdateCoreMemoryTool {
         }
 
         // Write to DB
-        ctx.db.set_core_memory(section, &new_value)?;
+        ctx.db.set_core_memory(section, &new_value).await?;
 
         // Log audit event
         ctx.db.log_memory_event(
@@ -173,7 +173,7 @@ impl Tool for UpdateCoreMemoryTool {
             before_value,
             &new_value,
             Some(reasoning),
-        )?;
+        ).await?;
 
         // Increment edit counter
         ctx.core_memory_edit_count.fetch_add(1, Ordering::Relaxed);
@@ -187,7 +187,7 @@ impl Tool for UpdateCoreMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_ctx_with_onboarding as test_ctx, test_db};
+    use crate::test_utils::test_helpers::{test_async_db, test_ctx_with_onboarding as test_ctx};
     use std::sync::atomic::AtomicU32;
 
     fn make_input(section: &str, action: &str, content: &str, reasoning: &str) -> Value {
@@ -201,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_invalid_section() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -216,8 +216,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_replace_action() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -236,14 +236,14 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let entry = db.get_core_memory("persona").unwrap().unwrap();
+        let entry = db.get_core_memory("persona").await.unwrap().unwrap();
         assert_eq!(entry.value, "Mika — sharp, proactive EA.");
     }
 
     #[tokio::test]
     async fn test_append_action() {
-        let db = test_db();
-        db.set_core_memory("key_people", "Alice — CTO").unwrap();
+        let db = test_async_db();
+        db.set_core_memory("key_people", "Alice — CTO").await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -257,15 +257,15 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let entry = db.get_core_memory("key_people").unwrap().unwrap();
+        let entry = db.get_core_memory("key_people").await.unwrap().unwrap();
         assert_eq!(entry.value, "Alice — CTO\nBob — VP Engineering");
     }
 
     #[tokio::test]
     async fn test_append_exceeds_block_limit() {
-        let db = test_db();
+        let db = test_async_db();
         // Set a block near the limit (~500 tokens = ~2000 chars)
-        db.set_core_memory("persona", &"x".repeat(1900)).unwrap();
+        db.set_core_memory("persona", &"x".repeat(1900)).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -283,8 +283,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_line_action() {
-        let db = test_db();
+        let db = test_async_db();
         db.set_core_memory("key_people", "Alice — CTO\nBob — VP Eng\nCarol — PM")
+            .await
             .unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
@@ -299,14 +300,16 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let entry = db.get_core_memory("key_people").unwrap().unwrap();
+        let entry = db.get_core_memory("key_people").await.unwrap().unwrap();
         assert_eq!(entry.value, "Alice — CTO\nCarol — PM");
     }
 
     #[tokio::test]
     async fn test_remove_line_no_match() {
-        let db = test_db();
-        db.set_core_memory("key_people", "Alice — CTO").unwrap();
+        let db = test_async_db();
+        db.set_core_memory("key_people", "Alice — CTO")
+            .await
+            .unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -324,8 +327,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_triggers() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -353,8 +356,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_exempt_during_onboarding() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, true); // onboarding = true
         let tool = UpdateCoreMemoryTool;
@@ -379,8 +382,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_audit_event_logged() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -397,7 +400,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = db.get_memory_events("test-session").unwrap();
+        let events = db.get_memory_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_core_memory");
         assert_eq!(events[0].target_key, "user_summary");
@@ -414,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_per_block_token_limit() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -433,8 +436,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_action() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter, false);
         let tool = UpdateCoreMemoryTool;
@@ -454,7 +457,7 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let entry = db.get_core_memory("user_summary").unwrap().unwrap();
+        let entry = db.get_core_memory("user_summary").await.unwrap().unwrap();
         assert_eq!(entry.value, "Alice, CEO of Acme Corp.");
 
         // Reset user_summary back to its default (content field omitted)
@@ -473,7 +476,7 @@ mod tests {
         assert!(result.content.contains("reset"));
 
         // Verify it is back to the default value from CORE_MEMORY_SECTIONS
-        let entry = db.get_core_memory("user_summary").unwrap().unwrap();
+        let entry = db.get_core_memory("user_summary").await.unwrap().unwrap();
         assert_eq!(entry.value, "New user. No information yet.");
     }
 }

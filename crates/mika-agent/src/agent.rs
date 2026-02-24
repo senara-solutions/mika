@@ -7,8 +7,8 @@ use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use crate::async_db::AsyncDatabase;
 use crate::compaction;
-use crate::db::Database;
 use crate::messaging::MessageSender;
 use crate::prompt;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
@@ -19,7 +19,7 @@ const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 
 /// Parameters for running the agent loop.
 pub struct AgentParams<'a> {
-    pub db: &'a Database,
+    pub db: &'a AsyncDatabase,
     pub claude: &'a ClaudeClient,
     pub tools: &'a ToolRegistry,
     pub user_message: &'a str,
@@ -36,7 +36,8 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
     // Save the user message
     params
         .db
-        .save_message("user", params.user_message, params.channel_type)?;
+        .save_message("user", params.user_message, params.channel_type)
+        .await?;
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
@@ -63,7 +64,8 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
             params
                 .db
-                .save_message("assistant", fallback, params.channel_type)?;
+                .save_message("assistant", fallback, params.channel_type)
+                .await?;
             Ok(fallback.to_string())
         }
     }
@@ -79,8 +81,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     // Load context: soul, identity, core memory → build system prompt
     let soul_content = std::fs::read_to_string(params.home_dir.join("soul.md")).unwrap_or_default();
     let identity = prompt::load_identity(params.home_dir);
-    let core_memory = db.get_all_core_memory()?;
-    let timezone = db.get_customer_config("timezone")?;
+    let core_memory = db.get_all_core_memory().await?;
+    let timezone = db.get_customer_config("timezone").await?;
 
     let prompt_ctx = prompt::PromptContext {
         soul_content: &soul_content,
@@ -93,14 +95,19 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
     // Inject conversation summary into system prompt if one exists
-    if let Some(summary) = db.load_conversation_summary()? {
+    if let Some(summary) = db.load_conversation_summary().await? {
         system.push_str("\n## Conversation Summary\n");
         system.push_str("<context type=\"summary\" trust=\"data\">\n");
         system.push_str(&summary.content);
         system.push_str("\n</context>\n");
     }
 
-    let history = db.load_recent_messages(20, Some(&["cli", "telegram"]))?;
+    let history = db
+        .load_recent_messages(
+            20,
+            Some(vec!["cli".to_owned(), "telegram".to_owned()]),
+        )
+        .await?;
     let tool_defs = tools.definitions();
 
     // Build initial message list from history
@@ -153,7 +160,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
             StopReason::EndTurn | StopReason::MaxTokens => {
                 let text = response.text();
                 if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type)?;
+                    db.save_message("assistant", &text, channel_type).await?;
                 }
                 info!(step, stop_reason = ?response.stop_reason, "agent done");
                 return Ok(text);
@@ -165,7 +172,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
             StopReason::StopSequence => {
                 let text = response.text();
                 if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type)?;
+                    db.save_message("assistant", &text, channel_type).await?;
                 }
                 return Ok(text);
             }
@@ -175,7 +182,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     // Exceeded max steps
     warn!("agent loop exceeded {MAX_TOOL_STEPS} steps");
     let fallback = "I need a moment to think about that. Let me get back to you.";
-    db.save_message("assistant", fallback, channel_type)?;
+    db.save_message("assistant", fallback, channel_type).await?;
     Ok(fallback.to_string())
 }
 
@@ -253,7 +260,7 @@ pub enum SilentTrigger {
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
 pub struct SilentAgentParams<'a> {
-    pub db: &'a Database,
+    pub db: &'a AsyncDatabase,
     pub claude: &'a ClaudeClient,
     pub tools: &'a ToolRegistry,
     pub trigger: SilentTrigger,
@@ -284,8 +291,8 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
             // For reminders, mark delivered/failed based on result
             if let SilentTrigger::Reminder { id, .. } = &params.trigger {
                 match &result {
-                    Ok(_) => params.db.mark_reminder_delivered(*id)?,
-                    Err(_) => params.db.mark_reminder_failed(*id)?,
+                    Ok(_) => params.db.mark_reminder_delivered(*id).await?,
+                    Err(_) => params.db.mark_reminder_failed(*id).await?,
                 }
             }
             result
@@ -296,7 +303,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
                 channel_type, "silent agent timeout exceeded"
             );
             if let SilentTrigger::Reminder { id, .. } = &params.trigger {
-                params.db.mark_reminder_failed(*id)?;
+                params.db.mark_reminder_failed(*id).await?;
             }
             Ok(())
         }
@@ -311,9 +318,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     // Build silent-mode system prompt
     let soul_content = std::fs::read_to_string(params.home_dir.join("soul.md")).unwrap_or_default();
     let identity = prompt::load_identity(params.home_dir);
-    let core_memory = db.get_all_core_memory()?;
-    let pending_commitments = db.list_commitments("pending")?;
-    let timezone = db.get_customer_config("timezone")?;
+    let core_memory = db.get_all_core_memory().await?;
+    let pending_commitments = db.list_commitments("pending").await?;
+    let timezone = db.get_customer_config("timezone").await?;
 
     let trigger_context = match &params.trigger {
         SilentTrigger::Heartbeat => {
@@ -391,7 +398,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 // Save the assistant's internal text (not delivered to user)
                 let text = response.text();
                 if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type)?;
+                    db.save_message("assistant", &text, channel_type).await?;
                 }
                 info!(step, channel_type, "silent agent done");
                 return Ok(());

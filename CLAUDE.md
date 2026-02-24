@@ -36,12 +36,12 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Data at rest:** Plaintext SQLite on K8s encrypted volumes. Per-customer container isolation. Case-insensitive COLLATE NOCASE on unique text columns.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque.
 - **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender }`. Tool trait uses `#[async_trait(?Send)]` (futures are NOT Send).
-- **Async DB:** `AsyncDatabase` wraps sync `Database` with `Arc<Mutex<Database>>` + `tokio::task::spawn_blocking`. Clone-able, Send+Sync. Not yet integrated into agent loop (Phase 2).
+- **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `mpsc` channel (closure-based dispatch). Clone-able, Send+Sync. Integrated into agent loop, tools, and scheduler.
 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (117 tests)
+- `cargo test` — Run all tests (132 tests)
 - `cargo run --bin mika-cli` — Run CLI test harness
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
@@ -60,7 +60,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Silent mode agent loop:** Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
 - **MessageSender trait:** `#[async_trait(?Send)]` for outbound messaging. CLI prints to stdout. Phase 2 will add Telegram/WhatsApp senders.
 - **Reminder scheduler:** `ReminderScheduler::recover()` fires past-due reminders on startup via silent agent. Future reminders logged but not timer-scheduled (Phase 2).
-- **Schema version:** 5 (v5 adds: reminders, heartbeat_sends, customer_config, failed_sends tables; compacted_through_id column on conversations)
+- **Schema version:** 6 (v6 adds: memory_event_summaries table for tiered retention)
 
 ## Environment Variables
 
@@ -69,8 +69,7 @@ See `.env.example` for the full list. Required:
 
 ## Pending Work
 
-- **Phase 2 — HTTP server:** Integrate AsyncDatabase into agent loop, add Telegram/WhatsApp channel adapters, timer-based reminder scheduling, gateway routing
-- `todos/027-ready-p1-sync-sqlite-blocking-tokio.md` — ~~Wrap sync SQLite in async~~ Done: `async_db.rs` created, integration deferred to Phase 2
+- **Phase 2 — HTTP server:** Add Telegram/WhatsApp channel adapters, timer-based reminder scheduling, gateway routing
 
 ## Reference Repositories
 
