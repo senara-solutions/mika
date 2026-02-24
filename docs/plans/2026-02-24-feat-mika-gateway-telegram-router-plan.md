@@ -5,7 +5,7 @@ status: completed
 date: 2026-02-24
 brainstorm: docs/brainstorms/2026-02-24-platform-systems-brainstorm.md
 parent_plan: docs/plans/2026-02-24-feat-platform-systems-gateway-provisioning-heartbeat-plan.md
-review_todos: "136-153"
+review_todos: "136-153, 154-167"
 ---
 
 # mika-gateway — Telegram Webhook Router
@@ -696,6 +696,29 @@ This plan was updated based on 18 findings from a multi-agent technical review (
 
 ---
 
+## Post-Implementation Review Findings
+
+After implementation, a second multi-agent review (todos 154-167) identified 14 additional findings:
+
+| ID | Priority | Finding | Resolution |
+|----|----------|---------|------------|
+| 154 | P1 | `constant_time_eq` misleading length-padding | Simplify to 1-liner using `subtle::ConstantTimeEq` directly |
+| 155 | P1 | Non-atomic dedup (read-then-check race) | Use conditional `UPDATE ... WHERE last_update_id < $1` |
+| 156 | P1 | Unbounded `tokio::spawn` (no concurrency limit) | Add `tokio::sync::Semaphore` to cap in-flight webhook tasks |
+| 157 | P1 | No pairing token format validation | Validate 64-char hex before DB query |
+| 158 | P1 | Nullable `pairing_expires_at` allows immortal tokens | Make `NOT NULL` or add `CHECK` constraint |
+| 159 | P1 | `reqwest::Client::new()` with no timeouts | Configure connect/pool/request timeouts via `ClientBuilder` |
+| 160 | P2 | `webhook_secret` stored as plain `String` | Change to `SecretString` for zeroize-on-drop |
+| 161 | P2 | Single `/health` for both liveness and readiness | Split into `/livez` and `/readyz` for K8s best practice |
+| 162 | P2 | Dead code: `generate_pairing_token`, `message_id`, unused deps | Remove dead code and unused `chrono`/`tracing-subscriber` deps |
+| 163 | P2 | Bare `/start` (no payload) treated as text message | Detect and reply with helpful "use your invite link" message |
+| 164 | P3 | Inline Bearer auth validation (duplication) | Extract into shared Axum middleware |
+| 165 | P3 | Pairing duplicate `telegram_chat_id` gives generic error | Catch PG unique violation (23505) for specific message |
+| 166 | P3 | `request_id` not threaded through `GatewayMessageSender` | Pass inbound `request_id` to outbound for log correlation |
+| 167 | P3 | `text.len()` checks bytes but error says "characters" | Fix error message to say "bytes" or use `text.chars().count()` |
+
+---
+
 ## References
 
 ### Internal
@@ -704,7 +727,8 @@ This plan was updated based on 18 findings from a multi-agent technical review (
 - Phase 2 server patterns: `crates/mika-agent/src/server/` (auth, handlers, state, types)
 - Container auth: `crates/mika-agent/src/server/auth.rs` (constant-time Bearer validation)
 - Outbound messaging: `crates/mika-agent/src/messaging.rs` (GatewayMessageSender)
-- Review findings: `todos/136-ready-p1-*.md` through `todos/153-ready-p3-*.md`
+- Pre-implementation review findings: `todos/136-ready-p1-*.md` through `todos/153-ready-p3-*.md`
+- Post-implementation review findings: `todos/154-ready-p1-*.md` through `todos/167-ready-p3-*.md`
 
 ### External
 - Telegram Bot API: https://core.telegram.org/bots/api
