@@ -1,7 +1,7 @@
 ---
 title: "feat: Helm charts and provisioning scripts for K8s deployment"
 type: feat
-status: active
+status: completed
 date: 2026-02-24
 parent: docs/plans/2026-02-24-feat-platform-systems-gateway-provisioning-heartbeat-plan.md
 brainstorm: docs/brainstorms/2026-02-24-platform-systems-brainstorm.md
@@ -1099,39 +1099,39 @@ helm template gw helm/mika-gateway/ --set image.repository=ecr/mika-gateway --se
 
 ### Functional Requirements
 
-- [ ] `helm lint helm/mika-customer/` passes with required values
-- [ ] `helm lint helm/mika-gateway/` passes with required values
-- [ ] `helm template` renders valid K8s manifests for both charts
-- [ ] Customer Deployment uses `Recreate` strategy (RWO PVC compatibility)
-- [ ] Customer Service named `mika-{customer_id}` (matches gateway `container_url()`)
-- [ ] Customer PVC named `mika-{customer_id}-data` (matches deprovision.sh)
-- [ ] ExternalSecret references correct AWS Secrets Manager keys
-- [ ] CronJob heartbeat template included and conditionally enabled
-- [ ] `provision.sh --dry-run` shows all planned actions without executing
-- [ ] `provision.sh` generates 64-char hex pairing token with 72-hour expiry
-- [ ] `provision.sh` outputs Telegram deep link using pairing token (not customer_id)
-- [ ] `provision.sh` rollback cleans up on any step failure (trap ERR)
-- [ ] `deprovision.sh --dry-run` shows all planned actions without executing
-- [ ] `deprovision.sh` requires confirmation (type customer_id) unless `--force`
-- [ ] `deprovision.sh` validates UUID format before proceeding
+- [x] `helm lint helm/mika-customer/` passes with required values
+- [x] `helm lint helm/mika-gateway/` passes with required values
+- [x] `helm template` renders valid K8s manifests for both charts
+- [x] Customer Deployment uses `Recreate` strategy (RWO PVC compatibility)
+- [x] Customer Service named `mika-{customer_id}` (matches gateway `container_url()`)
+- [x] Customer PVC named `mika-{customer_id}-data` (matches deprovision.sh)
+- ~~[ ] ExternalSecret references correct AWS Secrets Manager keys~~ (YAGNI: dropped ESO, using inline K8s Secrets)
+- ~~[ ] CronJob heartbeat template included and conditionally enabled~~ (YAGNI: replaced with shared heartbeat-all.sh)
+- [x] `provision.sh --dry-run` shows all planned actions without executing
+- [x] `provision.sh` generates 64-char hex pairing token with 72-hour expiry
+- [x] `provision.sh` outputs Telegram deep link using pairing token (not customer_id)
+- [x] `provision.sh` rollback cleans up on any step failure (trap ERR)
+- [x] `deprovision.sh --dry-run` shows all planned actions without executing
+- [x] `deprovision.sh` requires confirmation (type customer_id) unless `--force`
+- [x] `deprovision.sh` validates UUID format before proceeding
 
 ### Non-Functional Requirements
 
-- [ ] All pods run as non-root UID 1000
-- [ ] SecurityContext drops ALL capabilities, disables privilege escalation
-- [ ] NetworkPolicy restricts agent ingress to gateway only
-- [ ] NetworkPolicy restricts agent egress to gateway + Claude API only
-- [ ] PDB prevents simultaneous gateway pod eviction
-- [ ] No secrets stored in Helm values files (ExternalSecret for sensitive data)
-- [ ] Gateway Deployment sets `readOnlyRootFilesystem: true`
+- [x] All pods run as non-root UID 1000
+- [x] SecurityContext drops ALL capabilities, disables privilege escalation
+- ~~[ ] NetworkPolicy restricts agent ingress to gateway only~~ (YAGNI: dropped, AWS VPC CNI doesn't enforce)
+- ~~[ ] NetworkPolicy restricts agent egress to gateway + Claude API only~~ (YAGNI: dropped)
+- ~~[ ] PDB prevents simultaneous gateway pod eviction~~ (YAGNI: dropped for single-replica start)
+- [x] No secrets stored in Helm values files (secretKeyRef for all sensitive data)
+- [x] Gateway Deployment sets `readOnlyRootFilesystem: true`
 
 ### Quality Gates
 
-- [ ] `helm lint` clean for both charts
-- [ ] `shellcheck scripts/provision.sh` clean
-- [ ] `shellcheck scripts/deprovision.sh` clean
-- [ ] No hardcoded secrets in any file
-- [ ] Scripts have `--help` usage documentation
+- [x] `helm lint` clean for both charts
+- [ ] `shellcheck scripts/provision.sh` clean (shellcheck not installed locally)
+- [ ] `shellcheck scripts/deprovision.sh` clean (shellcheck not installed locally)
+- [x] No hardcoded secrets in any file
+- [x] Scripts have `--help` usage documentation
 
 ---
 
@@ -1141,8 +1141,8 @@ helm template gw helm/mika-gateway/ --set image.repository=ecr/mika-gateway --se
 |-----------|--------|--------|
 | Docker images (PR #7) | Merged | Phase 1-2 (image references) |
 | AWS EKS cluster | Not provisioned | Live deployment (not chart creation) |
-| External Secrets Operator | Not installed | ExternalSecret CRDs |
-| AWS Secrets Manager | Available | Secret creation in provision.sh |
+| ~~External Secrets Operator~~ | ~~Not installed~~ | ~~Dropped (YAGNI)~~ |
+| ~~AWS Secrets Manager~~ | ~~Available~~ | ~~Dropped — using inline K8s Secrets~~ |
 | Postgres (gateway DB) | Not provisioned | provision.sh Postgres INSERT |
 | Telegram bot | Not created | TELEGRAM_BOT_USERNAME env var |
 | ECR repository | Not created | image.repository values |

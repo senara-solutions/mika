@@ -62,6 +62,13 @@ done
 : "${TELEGRAM_BOT_USERNAME:?TELEGRAM_BOT_USERNAME is required}"
 
 # --- Validate inputs ---
+# Customer name: alphanumeric, spaces, hyphens, periods, apostrophes. 1-100 chars.
+# Prevents issues with Helm --set YAML parsing and Postgres text.
+if [[ ! "$CUSTOMER_NAME" =~ ^[a-zA-Z0-9\ \'\.\-]{1,100}$ ]]; then
+    echo "Error: customer_name must be 1-100 chars, alphanumeric/spaces/hyphens/periods/apostrophes only" >&2
+    exit 1
+fi
+
 if [[ "$PLAN" != "standard" && "$PLAN" != "premium" ]]; then
     echo "Error: plan must be 'standard' or 'premium', got '$PLAN'" >&2
     exit 1
