@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "039"
 tags: [code-review, bug, tools, database, rust-v2]

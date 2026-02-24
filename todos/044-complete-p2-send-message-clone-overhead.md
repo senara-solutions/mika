@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "044"
 tags: [code-review, performance, rust-v2]

@@ -1,5 +1,6 @@
-use crate::db::CoreMemoryEntry;
+use crate::db::{CORE_MEMORY_SECTIONS, CoreMemoryEntry};
 use serde::Deserialize;
+use std::fmt::Write;
 use std::path::Path;
 
 /// Agent identity loaded from ~/.mika/identity.toml.
@@ -46,13 +47,19 @@ pub struct PromptContext<'a> {
     pub is_onboarding: bool,
 }
 
-const ONBOARDING_PROMPT: &str = "\
-## First Session
-This is your first conversation with the user. Introduce yourself briefly and warmly. \
-Ask who they are and what they're working on. Use update_core_memory to seed all \
-four blocks (persona, user_summary, current_priorities, key_people) from their \
-responses. Keep it to 2-3 natural exchanges, then transition to being helpful \
-with whatever they need.";
+fn onboarding_prompt() -> String {
+    let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+    format!(
+        "## First Session\n\
+         This is your first conversation with the user. Introduce yourself briefly and warmly. \
+         Ask who they are and what they're working on. Use update_core_memory to seed all \
+         {} blocks ({}) from their \
+         responses. Keep it to 2-3 natural exchanges, then transition to being helpful \
+         with whatever they need.",
+        section_names.len(),
+        section_names.join(", ")
+    )
+}
 
 /// Build the system prompt from context.
 pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
@@ -65,7 +72,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     }
 
     // Identity
-    prompt.push_str(&format!("## Identity\nYou are {}.\n\n", ctx.identity.name));
+    write!(prompt, "## Identity\nYou are {}.\n\n", ctx.identity.name).unwrap();
 
     // Core Memory
     prompt.push_str("## Core Memory\n");
@@ -74,7 +81,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     );
 
     for entry in ctx.core_memory {
-        prompt.push_str(&format!("### {}\n{}\n\n", entry.key, entry.value));
+        write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
     }
 
     // Instructions
@@ -84,12 +91,19 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- Track people, commitments, preferences, and events using the appropriate tools.\n",
     );
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
-    prompt.push_str("- You have 4 memory blocks (persona, user_summary, current_priorities, key_people),\n  each limited to ~500 tokens. Be concise and prioritize what matters most.\n");
+    let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+    write!(
+        prompt,
+        "- You have {} memory blocks ({}),\n  each limited to ~500 tokens. Be concise and prioritize what matters most.\n",
+        section_names.len(),
+        section_names.join(", ")
+    )
+    .unwrap();
 
     // Onboarding prompt (only on first session)
     if ctx.is_onboarding {
         prompt.push('\n');
-        prompt.push_str(ONBOARDING_PROMPT);
+        prompt.push_str(&onboarding_prompt());
         prompt.push('\n');
     }
 

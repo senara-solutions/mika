@@ -1,23 +1,13 @@
 use anyhow::{Context, Result};
 use mika_agent::agent::{self, AgentParams};
-use mika_agent::db::Database;
+use mika_agent::db::{CORE_MEMORY_SECTIONS, Database};
 use mika_agent::tools;
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::home;
 use mika_common::logging;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
 use uuid::Uuid;
-
-const CORE_MEMORY_DEFAULTS: &[(&str, &str)] = &[
-    ("persona", "Mika -- personal AI executive assistant."),
-    (
-        "current_priorities",
-        "Get to know the user and understand their needs.",
-    ),
-    ("key_people", "No one tracked yet."),
-];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +26,7 @@ async fn main() -> Result<()> {
     let settings = Settings::load(&home_dir)
         .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY env var.")?;
 
-    let db_path = PathBuf::from(&settings.db_path);
+    let db_path = &settings.db_path;
 
     // Ensure parent directory exists for the database
     if let Some(parent) = db_path.parent() {
@@ -44,7 +34,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    let db = Database::open(&db_path).context("failed to open database")?;
+    let db = Database::open(db_path).context("failed to open database")?;
 
     // Seed core memory if empty (first run or fresh database)
     if db.get_all_core_memory()?.is_empty() {
@@ -71,16 +61,6 @@ async fn main() -> Result<()> {
     let session_id = Uuid::new_v4().to_string();
     tracing::info!(session_id = %session_id, "starting CLI session");
 
-    // Detect onboarding: user_summary still equals the seed value
-    let is_onboarding = db
-        .get_core_memory("user_summary")?
-        .map(|e| e.value == "New user. No information yet.")
-        .unwrap_or(true);
-
-    if is_onboarding {
-        tracing::info!("onboarding mode: first conversation with user");
-    }
-
     println!("Mika CLI — type a message and press Enter. Type /help for commands.\n");
 
     let stdin = io::stdin();
@@ -106,6 +86,22 @@ async fn main() -> Result<()> {
         if input.starts_with('/') {
             handle_slash_command(input, &db, &home_dir)?;
             continue;
+        }
+
+        // Detect onboarding: user_summary still equals the seed value.
+        // Checked each iteration so it updates once the agent populates core memory.
+        let user_summary_default = CORE_MEMORY_SECTIONS
+            .iter()
+            .find(|(k, _)| *k == "user_summary")
+            .map(|(_, v)| *v)
+            .unwrap_or("New user. No information yet.");
+        let is_onboarding = db
+            .get_core_memory("user_summary")?
+            .map(|e| e.value == user_summary_default)
+            .unwrap_or(true);
+
+        if is_onboarding {
+            tracing::info!("onboarding mode: first conversation with user");
         }
 
         match agent::run_agent(&AgentParams {
@@ -158,19 +154,10 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
         }
         s if s.starts_with("/reset ") => {
             let block = s.strip_prefix("/reset ").unwrap().trim();
-            let allowed = [
-                "persona",
-                "user_summary",
-                "current_priorities",
-                "key_people",
-            ];
 
-            if !allowed.contains(&block) {
-                println!(
-                    "\nInvalid block '{block}'. Allowed: {}\n",
-                    allowed.join(", ")
-                );
-            } else {
+            let section = CORE_MEMORY_SECTIONS.iter().find(|(k, _)| *k == block);
+
+            if let Some(&(_, default_value)) = section {
                 // Determine reset value
                 let reset_value = if block == "user_summary" {
                     // Re-seed from user.md if available
@@ -179,19 +166,19 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
                     let from_file = content
                         .as_deref()
                         .filter(|s| !s.starts_with("# Tell Mika about yourself"));
-                    from_file
-                        .unwrap_or("New user. No information yet.")
-                        .to_string()
+                    from_file.unwrap_or(default_value).to_string()
                 } else {
-                    CORE_MEMORY_DEFAULTS
-                        .iter()
-                        .find(|(k, _)| *k == block)
-                        .map(|(_, v)| v.to_string())
-                        .unwrap_or_default()
+                    default_value.to_string()
                 };
 
                 db.set_core_memory(block, &reset_value)?;
                 println!("\nReset [{block}] to default.\n");
+            } else {
+                let allowed: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+                println!(
+                    "\nInvalid block '{block}'. Allowed: {}\n",
+                    allowed.join(", ")
+                );
             }
         }
         _ => {

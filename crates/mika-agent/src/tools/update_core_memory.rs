@@ -5,13 +5,8 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use crate::db::CORE_MEMORY_SECTIONS;
 
-const ALLOWED_SECTIONS: &[&str] = &[
-    "persona",
-    "user_summary",
-    "current_priorities",
-    "key_people",
-];
 const MAX_TOKENS_PER_BLOCK: i32 = 500;
 const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
 
@@ -24,32 +19,37 @@ impl Tool for UpdateCoreMemoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
+        let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+        let section_list = section_names.join(", ");
         ToolDefinition {
             name: "update_core_memory".to_string(),
-            description: "Update your persistent core memory blocks. Core memory is always visible in the system prompt. You have 4 blocks: persona, user_summary, current_priorities, key_people. Each block is limited to ~500 tokens.".to_string(),
+            description: format!(
+                "Update your persistent core memory blocks. Core memory is always visible in the system prompt. You have {} blocks: {section_list}. Each block is limited to ~500 tokens.",
+                section_names.len()
+            ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "section": {
                         "type": "string",
-                        "enum": ["persona", "user_summary", "current_priorities", "key_people"],
+                        "enum": section_names,
                         "description": "Which core memory block to update"
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["replace", "append", "remove_line"],
-                        "description": "How to modify the block: replace (full replacement), append (add to end), remove_line (remove first line containing the content)"
+                        "enum": ["replace", "append", "remove_line", "reset"],
+                        "description": "How to modify the block: replace (full replacement), append (add to end), remove_line (remove first line containing the content), reset (restore block to its default value — content field is ignored)"
                     },
                     "content": {
                         "type": "string",
-                        "description": "New content (for replace/append) or text to find and remove (for remove_line)"
+                        "description": "New content (for replace/append) or text to find and remove (for remove_line). Not required for reset."
                     },
                     "reasoning": {
                         "type": "string",
                         "description": "Why you are making this change (recorded in audit log)"
                     }
                 },
-                "required": ["section", "action", "content", "reasoning"]
+                "required": ["section", "action", "reasoning"]
             }),
         }
     }
@@ -60,25 +60,31 @@ impl Tool for UpdateCoreMemoryTool {
         let content = input["content"].as_str().unwrap_or("");
         let reasoning = input["reasoning"].as_str().unwrap_or("");
 
-        // Validate required fields
-        if section.is_empty() || action.is_empty() || content.is_empty() || reasoning.is_empty() {
+        // Validate required fields (content is not required for "reset")
+        let content_required = action != "reset";
+        if section.is_empty()
+            || action.is_empty()
+            || (content_required && content.is_empty())
+            || reasoning.is_empty()
+        {
             return Ok(ToolOutput::error(
-                "All fields are required: section, action, content, reasoning.",
+                "Required fields missing: section, action, reasoning (and content for non-reset actions).",
             ));
         }
 
         // Validate section
-        if !ALLOWED_SECTIONS.contains(&section) {
+        let allowed_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+        if !allowed_names.contains(&section) {
             return Ok(ToolOutput::error(format!(
                 "Invalid section '{section}'. Allowed: {}",
-                ALLOWED_SECTIONS.join(", ")
+                allowed_names.join(", ")
             )));
         }
 
         // Validate action
-        if !["replace", "append", "remove_line"].contains(&action) {
+        if !["replace", "append", "remove_line", "reset"].contains(&action) {
             return Ok(ToolOutput::error(format!(
-                "Invalid action '{action}'. Allowed: replace, append, remove_line"
+                "Invalid action '{action}'. Allowed: replace, append, remove_line, reset"
             )));
         }
 
@@ -137,6 +143,14 @@ impl Tool for UpdateCoreMemoryTool {
 
                 lines.join("\n")
             }
+            "reset" => {
+                let default_value = CORE_MEMORY_SECTIONS
+                    .iter()
+                    .find(|(k, _)| *k == section)
+                    .map(|(_, v)| *v)
+                    .expect("section already validated above");
+                default_value.to_string()
+            }
             _ => unreachable!(), // Already validated above
         };
 
@@ -173,27 +187,8 @@ impl Tool for UpdateCoreMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::test_utils::test_helpers::{test_ctx_with_onboarding as test_ctx, test_db};
     use std::sync::atomic::AtomicU32;
-
-    fn test_db() -> Database {
-        Database::open_in_memory().unwrap()
-    }
-
-    fn test_ctx<'a>(
-        db: &'a Database,
-        edit_count: &'a AtomicU32,
-        is_onboarding: bool,
-    ) -> ToolContext<'a> {
-        static HOME_DIR: &str = "/tmp/mika-test";
-        ToolContext {
-            db,
-            session_id: "test-session",
-            home_dir: std::path::Path::new(HOME_DIR),
-            core_memory_edit_count: edit_count,
-            is_onboarding,
-        }
-    }
 
     fn make_input(section: &str, action: &str, content: &str, reasoning: &str) -> Value {
         serde_json::json!({
@@ -434,5 +429,51 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("tokens"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_action() {
+        let db = test_db();
+        db.seed_core_memory(None).unwrap();
+        let counter = AtomicU32::new(0);
+        let ctx = test_ctx(&db, &counter, false);
+        let tool = UpdateCoreMemoryTool;
+
+        // Overwrite user_summary with a custom value
+        let result = tool
+            .execute(
+                make_input(
+                    "user_summary",
+                    "replace",
+                    "Alice, CEO of Acme Corp.",
+                    "User introduced herself",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let entry = db.get_core_memory("user_summary").unwrap().unwrap();
+        assert_eq!(entry.value, "Alice, CEO of Acme Corp.");
+
+        // Reset user_summary back to its default (content field omitted)
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "section": "user_summary",
+                    "action": "reset",
+                    "reasoning": "User asked to start fresh"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("reset"));
+
+        // Verify it is back to the default value from CORE_MEMORY_SECTIONS
+        let entry = db.get_core_memory("user_summary").unwrap().unwrap();
+        assert_eq!(entry.value, "New user. No information yet.");
     }
 }

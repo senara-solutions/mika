@@ -1,6 +1,7 @@
 mod search_memory;
 mod store_fact;
 mod update_core_memory;
+mod update_fact;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -97,5 +98,6 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(update_core_memory::UpdateCoreMemoryTool));
     registry.register(Box::new(store_fact::StoreFactTool));
     registry.register(Box::new(search_memory::SearchMemoryTool));
+    registry.register(Box::new(update_fact::UpdateFactTool));
     registry
 }

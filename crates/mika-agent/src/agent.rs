@@ -100,9 +100,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     };
 
     // Build the request once; only messages changes between iterations.
-    // We clone the request when passing to send_message (which takes ownership),
-    // then push new messages directly onto the original to avoid rebuilding
-    // system (~4KB) and tool_defs (all JSON schemas) each iteration.
+    // send_message takes a reference, so we push new messages directly onto
+    // the original to avoid rebuilding system (~4KB) and tool_defs each iteration.
     let mut request = MessagesRequest {
         model: claude.model.clone(),
         max_tokens: claude.max_tokens,
@@ -123,7 +122,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         );
 
         let response = claude
-            .send_message(request.clone())
+            .send_message(&request)
             .await
             .context("Claude API call failed")?;
 

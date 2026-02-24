@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "058"
 tags: [code-review, documentation, rust-v2]

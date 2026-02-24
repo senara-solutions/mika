@@ -1,10 +1,10 @@
 # Mika
 
-AI executive assistant with persistent memory, per-customer container isolation, and encrypted local storage.
+AI executive assistant with persistent memory and per-customer container isolation.
 
 ## What is Mika?
 
-Mika is a conversation-first AI assistant designed for executives. It remembers what you tell it, tracks your commitments, learns your preferences, and keeps notes on the people in your life — all stored in an encrypted SQLite database that only you can access.
+Mika is a conversation-first AI assistant designed for executives. It remembers what you tell it, tracks your commitments, learns your preferences, and keeps notes on the people in your life — all stored in a per-customer SQLite database on Kubernetes encrypted volumes.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ Mika is a conversation-first AI assistant designed for executives. It remembers 
     +--------------+ +----------+ +-------------+
 ```
 
-Each customer gets an isolated container with their own encrypted SQLite database. No customer data is shared.
+Each customer gets an isolated container with their own SQLite database on an encrypted volume. No customer data is shared.
 
 ## Features
 
@@ -34,15 +34,13 @@ Each customer gets an isolated container with their own encrypted SQLite databas
 - **People tracking** — Remembers names, relationships, and notes about contacts
 - **Commitment tracking** — Tracks tasks and deadlines with deduplication
 - **Preference learning** — Stores how you like things done
-- **Field-level encryption** — All PII encrypted with AES-256-GCM, HMAC lookups for queries
-- **Secret protection** — Encryption keys zeroized on drop, secrets redacted from logs
+- **Secret protection** — API keys redacted from logs
 
 ## Quick Start
 
 ```bash
 # Set required environment variables
 export MIKA_ANTHROPIC_API_KEY=sk-ant-...
-export MIKA_ENCRYPTION_KEY=$(openssl rand -hex 32)
 
 # Run the CLI
 cargo run --bin mika-cli
@@ -54,7 +52,7 @@ See `.env.example` for all configuration options.
 
 ```
 crates/
-  mika-common/    Shared: config, encryption, Claude API client, logging
+  mika-common/    Shared: config, Claude API client, logging, home directory
   mika-agent/     Agent: SQLite DB, agent loop, tools, prompt, CLI binary
 config/
   default.toml    Default configuration values

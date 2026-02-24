@@ -5,6 +5,18 @@ use tracing::{debug, info};
 
 const CURRENT_SCHEMA_VERSION: i64 = 4;
 
+/// Canonical list of core memory section names and their default values.
+/// Used by seed_core_memory, CLI reset, update_core_memory validation, and prompt assembly.
+pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
+    ("user_summary", "New user. No information yet."),
+    ("persona", "Mika -- personal AI executive assistant."),
+    (
+        "current_priorities",
+        "Get to know the user and understand their needs.",
+    ),
+    ("key_people", "No one tracked yet."),
+];
+
 /// Per-customer SQLite database.
 /// Data-at-rest encryption is provided by Kubernetes encrypted volumes.
 pub struct Database {
@@ -40,10 +52,6 @@ impl Database {
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
-    }
-
-    pub fn conn(&self) -> &Connection {
-        &self.conn
     }
 
     // -- Schema migrations --
@@ -97,10 +105,12 @@ impl Database {
     fn migrate_v4(&self) -> Result<()> {
         info!("applying migration v4: plaintext schema (encryption removed)");
 
-        // Drop all existing tables if they exist (pre-production, no data to preserve)
         self.conn
             .execute_batch(
                 "
+            BEGIN;
+
+            -- Drop all existing tables if they exist (pre-production, no data to preserve)
             DROP TABLE IF EXISTS memory_events;
             DROP TABLE IF EXISTS events;
             DROP TABLE IF EXISTS preferences;
@@ -109,13 +119,7 @@ impl Database {
             DROP TABLE IF EXISTS core_memory;
             DROP TABLE IF EXISTS conversations;
             DROP TABLE IF EXISTS schema_version;
-            ",
-            )
-            .context("failed to drop old tables")?;
 
-        self.conn
-            .execute_batch(
-                "
             -- Schema version tracking
             CREATE TABLE schema_version (
                 version INTEGER PRIMARY KEY,
@@ -131,7 +135,6 @@ impl Database {
                 metadata TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX idx_conv_created ON conversations(created_at);
 
             -- Core memory (Layer 1)
             CREATE TABLE core_memory (
@@ -197,6 +200,8 @@ impl Database {
 
             -- Record version
             INSERT INTO schema_version (version) VALUES (4);
+
+            COMMIT;
             ",
             )
             .context("failed to apply migration v4")?;
@@ -234,14 +239,7 @@ impl Database {
                     created_at: row.get(4)?,
                 })
             })?
-            .filter_map(|r| match r {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read conversation row");
-                    None
-                }
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         // Reverse to oldest-first order
         messages.reverse();
@@ -285,14 +283,7 @@ impl Database {
                     updated_at: row.get(3)?,
                 })
             })?
-            .filter_map(|r| match r {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read core_memory row");
-                    None
-                }
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(entries)
     }
@@ -328,16 +319,16 @@ impl Database {
     }
 
     /// Seed default core memory for a new customer.
-    /// If user_md_content is provided, use it for user_summary.
+    /// If user_md_content is provided, use it for user_summary instead of the default.
     pub fn seed_core_memory(&self, user_md_content: Option<&str>) -> Result<()> {
-        let user_summary = user_md_content.unwrap_or("New user. No information yet.");
-        self.set_core_memory("user_summary", user_summary)?;
-        self.set_core_memory("persona", "Mika -- personal AI executive assistant.")?;
-        self.set_core_memory(
-            "current_priorities",
-            "Get to know the user and understand their needs.",
-        )?;
-        self.set_core_memory("key_people", "No one tracked yet.")?;
+        for &(key, default_value) in CORE_MEMORY_SECTIONS {
+            let value = if key == "user_summary" {
+                user_md_content.unwrap_or(default_value)
+            } else {
+                default_value
+            };
+            self.set_core_memory(key, value)?;
+        }
         Ok(())
     }
 
@@ -363,7 +354,7 @@ impl Database {
             .context("failed to upsert person")?;
 
         let id = self.conn.query_row(
-            "SELECT id FROM people WHERE canonical_name = ?1 COLLATE NOCASE",
+            "SELECT id FROM people WHERE canonical_name = ?1",
             [name],
             |row| row.get(0),
         )?;
@@ -376,7 +367,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
-                 FROM people WHERE canonical_name = ?1 COLLATE NOCASE",
+                 FROM people WHERE canonical_name = ?1",
                 [name],
                 |row| {
                     Ok(Person {
@@ -411,14 +402,7 @@ impl Database {
                     last_mentioned: row.get(5)?,
                 })
             })?
-            .filter_map(|r| match r {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read people row");
-                    None
-                }
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(people)
     }
@@ -441,7 +425,7 @@ impl Database {
             .context("failed to insert commitment")?;
 
         let id = self.conn.query_row(
-            "SELECT id FROM commitments WHERE description = ?1 COLLATE NOCASE",
+            "SELECT id FROM commitments WHERE description = ?1",
             [description],
             |row| row.get(0),
         )?;
@@ -467,14 +451,7 @@ impl Database {
                     completed_at: row.get(6)?,
                 })
             })?
-            .filter_map(|r| match r {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read commitment row");
-                    None
-                }
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(commitments)
     }
@@ -522,7 +499,7 @@ impl Database {
         let value: Option<String> = self
             .conn
             .query_row(
-                "SELECT value FROM preferences WHERE category = ?1 COLLATE NOCASE",
+                "SELECT value FROM preferences WHERE category = ?1",
                 [category],
                 |row| row.get(0),
             )
@@ -531,22 +508,19 @@ impl Database {
     }
 
     /// List all preferences (for substring search).
-    pub fn list_preferences(&self) -> Result<Vec<(String, String)>> {
+    pub fn list_preferences(&self) -> Result<Vec<Preference>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT category, value FROM preferences ORDER BY category")?;
+            .prepare("SELECT category, value, updated_at FROM preferences ORDER BY category")?;
         let prefs = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok(Preference {
+                    category: row.get(0)?,
+                    value: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
             })?
-            .filter_map(|r| match r {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read preference row");
-                    None
-                }
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(prefs)
     }
 
@@ -566,6 +540,28 @@ impl Database {
             )
             .context("failed to insert event")?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// List all events.
+    pub fn list_events(&self) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, event_date, context, created_at
+             FROM events ORDER BY event_date ASC NULLS LAST",
+        )?;
+
+        let events = stmt
+            .query_map([], |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    event_date: row.get(2)?,
+                    context: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(events)
     }
 
     // -- Memory Events (Audit Log) --
@@ -610,14 +606,7 @@ impl Database {
                     created_at: row.get(7)?,
                 })
             })?
-            .filter_map(|r| match r {
-                Ok(row) => Some(row),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read memory_event row");
-                    None
-                }
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(events)
     }
@@ -664,6 +653,22 @@ pub struct Commitment {
 }
 
 #[derive(Debug, Clone)]
+pub struct Preference {
+    pub category: String,
+    pub value: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub id: i64,
+    pub description: String,
+    pub event_date: Option<String>,
+    pub context: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct MemoryEvent {
     pub id: i64,
     pub session_id: String,
@@ -680,11 +685,7 @@ use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn test_db() -> Database {
-        Database::open_in_memory().unwrap()
-    }
+    use crate::test_utils::test_helpers::test_db;
 
     #[test]
     fn test_migration_creates_tables() {

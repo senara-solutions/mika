@@ -158,7 +158,7 @@ impl ClaudeClient {
     }
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
-    pub async fn send_message(&self, request: MessagesRequest) -> Result<MessagesResponse> {
+    pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
         // Validate API key header value upfront (non-retryable configuration error).
         // Use an opaque message to avoid leaking the actual key value.
         let api_key_header =
@@ -177,7 +177,7 @@ impl ClaudeClient {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.send_once(&request, api_key_header.clone()).await {
+            match self.send_once(request, api_key_header.clone()).await {
                 Ok(response) => {
                     debug!(
                         input_tokens = response.usage.input_tokens,
