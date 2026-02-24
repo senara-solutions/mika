@@ -15,9 +15,6 @@ pub struct Settings {
     #[serde(default = "default_max_tokens")]
     pub claude_max_tokens: u32,
 
-    /// AES-256-GCM encryption key (hex-encoded, 32 bytes = 64 hex chars)
-    pub encryption_key: String,
-
     /// SQLite database path
     #[serde(default = "default_db_path")]
     pub db_path: String,
@@ -102,7 +99,6 @@ impl std::fmt::Debug for Settings {
             .field("anthropic_api_key", &"[REDACTED]")
             .field("claude_model", &self.claude_model)
             .field("claude_max_tokens", &self.claude_max_tokens)
-            .field("encryption_key", &"[REDACTED]")
             .field("db_path", &self.db_path)
             .field("log_level", &self.log_level)
             .field("routing_url", &self.routing_url)
@@ -122,7 +118,6 @@ mod tests {
         // Safety: tests set env vars; no production thread reads these.
         unsafe {
             std::env::set_var("MIKA_ANTHROPIC_API_KEY", "test-key");
-            std::env::set_var("MIKA_ENCRYPTION_KEY", "0".repeat(64));
             std::env::remove_var("MIKA_CLAUDE_MODEL");
             std::env::remove_var("MIKA_DB_PATH");
         }

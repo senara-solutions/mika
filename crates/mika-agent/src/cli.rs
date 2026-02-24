@@ -4,7 +4,6 @@ use mika_agent::db::Database;
 use mika_agent::tools;
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
-use mika_common::crypto::EncryptionKey;
 use mika_common::home;
 use mika_common::logging;
 use std::io::{self, BufRead, Write};
@@ -34,12 +33,8 @@ async fn main() -> Result<()> {
         println!("\n  ✦ Mika initialized at {}\n", home_dir.display());
     }
 
-    let settings = Settings::load(&home_dir).context(
-        "Failed to load config. Set MIKA_ANTHROPIC_API_KEY and MIKA_ENCRYPTION_KEY env vars.",
-    )?;
-
-    let key = EncryptionKey::from_hex(&settings.encryption_key)
-        .context("invalid MIKA_ENCRYPTION_KEY (need 64 hex chars)")?;
+    let settings = Settings::load(&home_dir)
+        .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY env var.")?;
 
     let db_path = PathBuf::from(&settings.db_path);
 
@@ -49,7 +44,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    let db = Database::open(&db_path, key).context("failed to open database")?;
+    let db = Database::open(&db_path).context("failed to open database")?;
 
     // Seed core memory if empty (first run or fresh database)
     if db.get_all_core_memory()?.is_empty() {

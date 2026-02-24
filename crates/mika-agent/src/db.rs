@@ -1,22 +1,20 @@
 use anyhow::{Context, Result};
-use mika_common::crypto::EncryptionKey;
 use rusqlite::Connection;
 use std::path::Path;
 use tracing::{debug, info};
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// Per-customer SQLite database.
-/// All sensitive fields are encrypted with AES-256-GCM at the application level.
+/// Data-at-rest encryption is provided by Kubernetes encrypted volumes.
 pub struct Database {
     conn: Connection,
-    key: EncryptionKey,
 }
 
 impl Database {
     /// Open (or create) a per-customer SQLite database at `path`.
     /// Runs migrations automatically.
-    pub fn open(path: &Path, key: EncryptionKey) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
 
@@ -29,39 +27,23 @@ impl Database {
         )
         .context("failed to set SQLite pragmas")?;
 
-        let db = Self { conn, key };
+        let db = Self { conn };
         db.migrate()?;
         Ok(db)
     }
 
     /// Open an in-memory database (for tests).
-    pub fn open_in_memory(key: EncryptionKey) -> Result<Self> {
+    pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("failed to set pragmas")?;
-        let db = Self { conn, key };
+        let db = Self { conn };
         db.migrate()?;
         Ok(db)
     }
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    pub fn key(&self) -> &EncryptionKey {
-        &self.key
-    }
-
-    /// Verify the encryption key works by encrypting and decrypting a test value.
-    /// Call this on startup to fail fast if the key is wrong.
-    pub fn check_encryption_key(&self) -> Result<()> {
-        let test = "mika-key-check";
-        let encrypted = self.key.encrypt_string(test)?;
-        let decrypted = self.key.decrypt_string(&encrypted)?;
-        if decrypted != test {
-            anyhow::bail!("encryption key check failed: roundtrip mismatch");
-        }
-        Ok(())
     }
 
     // -- Schema migrations --
@@ -94,136 +76,160 @@ impl Database {
 
     fn migrate(&self) -> Result<()> {
         let version = self.current_version()?;
-        debug!(current_version = version, target_version = CURRENT_SCHEMA_VERSION, "checking migrations");
+        debug!(
+            current_version = version,
+            target_version = CURRENT_SCHEMA_VERSION,
+            "checking migrations"
+        );
 
         if version >= CURRENT_SCHEMA_VERSION {
             return Ok(());
         }
 
-        if version < 1 {
-            self.migrate_v1()?;
+        if version < 4 {
+            self.migrate_v4()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
         Ok(())
     }
 
-    fn migrate_v1(&self) -> Result<()> {
-        info!("applying migration v1: initial schema");
+    fn migrate_v4(&self) -> Result<()> {
+        info!("applying migration v4: plaintext schema (encryption removed)");
+
+        // Drop all existing tables if they exist (pre-production, no data to preserve)
+        self.conn
+            .execute_batch(
+                "
+            DROP TABLE IF EXISTS memory_events;
+            DROP TABLE IF EXISTS events;
+            DROP TABLE IF EXISTS preferences;
+            DROP TABLE IF EXISTS commitments;
+            DROP TABLE IF EXISTS people;
+            DROP TABLE IF EXISTS core_memory;
+            DROP TABLE IF EXISTS conversations;
+            DROP TABLE IF EXISTS schema_version;
+            ",
+            )
+            .context("failed to drop old tables")?;
 
         self.conn
             .execute_batch(
                 "
             -- Schema version tracking
-            CREATE TABLE IF NOT EXISTS schema_version (
+            CREATE TABLE schema_version (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             -- Conversations (message history)
-            CREATE TABLE IF NOT EXISTS conversations (
+            CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 role TEXT NOT NULL,
-                content_encrypted BLOB NOT NULL,
+                content TEXT NOT NULL,
                 channel_type TEXT NOT NULL,
                 metadata TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations(created_at);
+            CREATE INDEX idx_conv_created ON conversations(created_at);
 
             -- Core memory (Layer 1)
-            CREATE TABLE IF NOT EXISTS core_memory (
+            CREATE TABLE core_memory (
                 key TEXT PRIMARY KEY,
-                value_encrypted BLOB NOT NULL,
+                value TEXT NOT NULL,
                 token_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             -- People (Layer 2)
-            CREATE TABLE IF NOT EXISTS people (
+            CREATE TABLE people (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                canonical_name_encrypted BLOB NOT NULL,
-                canonical_name_hash TEXT NOT NULL UNIQUE,
-                relationship_encrypted BLOB,
-                notes_encrypted BLOB,
+                canonical_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                relationship TEXT,
+                notes TEXT,
                 first_mentioned TEXT NOT NULL DEFAULT (datetime('now')),
                 last_mentioned TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             -- Commitments (Layer 2)
-            CREATE TABLE IF NOT EXISTS commitments (
+            CREATE TABLE commitments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                description_encrypted BLOB NOT NULL,
-                description_hash TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 status TEXT NOT NULL DEFAULT 'pending',
                 due_date TEXT,
                 person_id INTEGER REFERENCES people(id),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 completed_at TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_commit_status ON commitments(status);
-            CREATE INDEX IF NOT EXISTS idx_commit_due ON commitments(due_date);
+            CREATE INDEX idx_commit_status ON commitments(status);
+            CREATE INDEX idx_commit_due ON commitments(due_date);
 
             -- Preferences (Layer 2)
-            CREATE TABLE IF NOT EXISTS preferences (
+            CREATE TABLE preferences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_encrypted BLOB NOT NULL,
-                category_hash TEXT NOT NULL UNIQUE,
-                value_encrypted BLOB NOT NULL,
+                category TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             -- Events (Layer 2)
-            CREATE TABLE IF NOT EXISTS events (
+            CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                description_encrypted BLOB NOT NULL,
+                description TEXT NOT NULL,
                 event_date TEXT,
                 context TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);
+            CREATE INDEX idx_events_date ON events(event_date);
+
+            -- Memory events (audit log)
+            CREATE TABLE memory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                before_value TEXT,
+                after_value TEXT,
+                reasoning TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_memory_events_session ON memory_events(session_id);
 
             -- Record version
-            INSERT INTO schema_version (version) VALUES (1);
+            INSERT INTO schema_version (version) VALUES (4);
             ",
             )
-            .context("failed to apply migration v1")?;
+            .context("failed to apply migration v4")?;
 
         Ok(())
     }
 
-    /// Compute HMAC-SHA256 hash for deterministic lookups.
-    fn hmac_hash(&self, input: &str) -> String {
-        mika_common::crypto::hmac_sha256_hex(self.key.key_bytes(), input)
-    }
-
     // -- Conversations --
 
-    /// Save a conversation message (encrypted).
+    /// Save a conversation message.
     pub fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
-        let encrypted = self.key.encrypt_string(content)?;
         self.conn
             .execute(
-                "INSERT INTO conversations (role, content_encrypted, channel_type) VALUES (?1, ?2, ?3)",
-                rusqlite::params![role, encrypted, channel_type],
+                "INSERT INTO conversations (role, content, channel_type) VALUES (?1, ?2, ?3)",
+                rusqlite::params![role, content, channel_type],
             )
             .context("failed to insert conversation")?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Load the N most recent messages (decrypted), oldest first.
+    /// Load the N most recent messages, oldest first.
     pub fn load_recent_messages(&self, limit: usize) -> Result<Vec<ConversationMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content_encrypted, channel_type, created_at
+            "SELECT id, role, content, channel_type, created_at
              FROM conversations ORDER BY id DESC LIMIT ?1",
         )?;
 
         let mut messages: Vec<ConversationMessage> = stmt
             .query_map([limit as i64], |row| {
-                Ok(RawConversationRow {
+                Ok(ConversationMessage {
                     id: row.get(0)?,
                     role: row.get(1)?,
-                    content_encrypted: row.get(2)?,
+                    content: row.get(2)?,
                     channel_type: row.get(3)?,
                     created_at: row.get(4)?,
                 })
@@ -235,21 +241,6 @@ impl Database {
                     None
                 }
             })
-            .filter_map(|raw| {
-                match self.key.decrypt_string(&raw.content_encrypted) {
-                    Ok(content) => Some(ConversationMessage {
-                        id: raw.id,
-                        role: raw.role,
-                        content,
-                        channel_type: raw.channel_type,
-                        created_at: raw.created_at,
-                    }),
-                    Err(e) => {
-                        tracing::warn!(row_id = raw.id, error = %e, "decryption failed for conversation row, skipping");
-                        None
-                    }
-                }
-            })
             .collect();
 
         // Reverse to oldest-first order
@@ -259,48 +250,37 @@ impl Database {
 
     // -- Core Memory --
 
-    /// Get a core memory value by key (decrypted).
+    /// Get a core memory value by key.
     pub fn get_core_memory(&self, key: &str) -> Result<Option<CoreMemoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT key, value_encrypted, token_count, updated_at FROM core_memory WHERE key = ?1",
-        )?;
-
-        let entry = stmt
-            .query_row([key], |row| {
-                Ok(RawCoreMemoryRow {
-                    key: row.get(0)?,
-                    value_encrypted: row.get(1)?,
-                    token_count: row.get(2)?,
-                    updated_at: row.get(3)?,
-                })
-            })
+        let entry = self
+            .conn
+            .query_row(
+                "SELECT key, value, token_count, updated_at FROM core_memory WHERE key = ?1",
+                [key],
+                |row| {
+                    Ok(CoreMemoryEntry {
+                        key: row.get(0)?,
+                        value: row.get(1)?,
+                        token_count: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
             .optional()?;
-
-        match entry {
-            Some(raw) => {
-                let value = self.key.decrypt_string(&raw.value_encrypted)?;
-                Ok(Some(CoreMemoryEntry {
-                    key: raw.key,
-                    value,
-                    token_count: raw.token_count,
-                    updated_at: raw.updated_at,
-                }))
-            }
-            None => Ok(None),
-        }
+        Ok(entry)
     }
 
-    /// Get all core memory entries (decrypted).
+    /// Get all core memory entries.
     pub fn get_all_core_memory(&self) -> Result<Vec<CoreMemoryEntry>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT key, value_encrypted, token_count, updated_at FROM core_memory ORDER BY key")?;
+            .prepare("SELECT key, value, token_count, updated_at FROM core_memory ORDER BY key")?;
 
         let entries: Vec<CoreMemoryEntry> = stmt
             .query_map([], |row| {
-                Ok(RawCoreMemoryRow {
+                Ok(CoreMemoryEntry {
                     key: row.get(0)?,
-                    value_encrypted: row.get(1)?,
+                    value: row.get(1)?,
                     token_count: row.get(2)?,
                     updated_at: row.get(3)?,
                 })
@@ -312,40 +292,25 @@ impl Database {
                     None
                 }
             })
-            .filter_map(|raw| {
-                match self.key.decrypt_string(&raw.value_encrypted) {
-                    Ok(value) => Some(CoreMemoryEntry {
-                        key: raw.key,
-                        value,
-                        token_count: raw.token_count,
-                        updated_at: raw.updated_at,
-                    }),
-                    Err(e) => {
-                        tracing::warn!(key = raw.key, error = %e, "decryption failed for core_memory row, skipping");
-                        None
-                    }
-                }
-            })
             .collect();
 
         Ok(entries)
     }
 
-    /// Upsert a core memory entry (encrypts value).
+    /// Upsert a core memory entry.
     /// Returns token count. Approximate: chars / 4.
     pub fn set_core_memory(&self, key: &str, value: &str) -> Result<i32> {
         let token_count = (value.len() / 4) as i32;
-        let encrypted = self.key.encrypt_string(value)?;
 
         self.conn
             .execute(
-                "INSERT INTO core_memory (key, value_encrypted, token_count, updated_at)
+                "INSERT INTO core_memory (key, value, token_count, updated_at)
                  VALUES (?1, ?2, ?3, datetime('now'))
                  ON CONFLICT(key) DO UPDATE SET
-                    value_encrypted = excluded.value_encrypted,
+                    value = excluded.value,
                     token_count = excluded.token_count,
                     updated_at = excluded.updated_at",
-                rusqlite::params![key, encrypted, token_count],
+                rusqlite::params![key, value, token_count],
             )
             .context("failed to upsert core memory")?;
 
@@ -354,117 +319,94 @@ impl Database {
 
     /// Total token count across all core memory entries.
     pub fn total_core_memory_tokens(&self) -> Result<i32> {
-        let total: i32 = self
-            .conn
-            .query_row("SELECT COALESCE(SUM(token_count), 0) FROM core_memory", [], |row| {
-                row.get(0)
-            })?;
+        let total: i32 = self.conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM core_memory",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(total)
     }
 
     /// Seed default core memory for a new customer.
-    pub fn seed_core_memory(&self) -> Result<()> {
-        self.set_core_memory("user_summary", "New user. No information yet.")?;
+    /// If user_md_content is provided, use it for user_summary.
+    pub fn seed_core_memory(&self, user_md_content: Option<&str>) -> Result<()> {
+        let user_summary = user_md_content.unwrap_or("New user. No information yet.");
+        self.set_core_memory("user_summary", user_summary)?;
         self.set_core_memory("persona", "Mika -- personal AI executive assistant.")?;
-        self.set_core_memory("current_goals", "Get to know the user and understand their needs.")?;
+        self.set_core_memory(
+            "current_priorities",
+            "Get to know the user and understand their needs.",
+        )?;
+        self.set_core_memory("key_people", "No one tracked yet.")?;
         Ok(())
     }
 
     // -- People (Layer 2) --
 
     /// Insert or update a person. Returns their ID.
-    pub fn upsert_person(&self, name: &str, relationship: Option<&str>, notes: Option<&str>) -> Result<i64> {
-        let name_encrypted = self.key.encrypt_string(name)?;
-        let name_hash = self.hmac_hash(name);
-        let relationship_encrypted = relationship
-            .map(|r| self.key.encrypt_string(r))
-            .transpose()?;
-        let notes_encrypted = notes
-            .map(|n| self.key.encrypt_string(n))
-            .transpose()?;
-
+    pub fn upsert_person(
+        &self,
+        name: &str,
+        relationship: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO people (canonical_name_encrypted, canonical_name_hash, relationship_encrypted, notes_encrypted, last_mentioned)
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'))
-                 ON CONFLICT(canonical_name_hash) DO UPDATE SET
-                    canonical_name_encrypted = excluded.canonical_name_encrypted,
-                    relationship_encrypted = COALESCE(excluded.relationship_encrypted, people.relationship_encrypted),
-                    notes_encrypted = COALESCE(excluded.notes_encrypted, people.notes_encrypted),
+                "INSERT INTO people (canonical_name, relationship, notes, last_mentioned)
+                 VALUES (?1, ?2, ?3, datetime('now'))
+                 ON CONFLICT(canonical_name) DO UPDATE SET
+                    relationship = COALESCE(excluded.relationship, people.relationship),
+                    notes = COALESCE(excluded.notes, people.notes),
                     last_mentioned = excluded.last_mentioned",
-                rusqlite::params![name_encrypted, name_hash, relationship_encrypted, notes_encrypted],
+                rusqlite::params![name, relationship, notes],
             )
             .context("failed to upsert person")?;
 
         let id = self.conn.query_row(
-            "SELECT id FROM people WHERE canonical_name_hash = ?1",
-            [&name_hash],
+            "SELECT id FROM people WHERE canonical_name = ?1 COLLATE NOCASE",
+            [name],
             |row| row.get(0),
         )?;
         Ok(id)
     }
 
-    /// Get a person by name (decrypted).
+    /// Get a person by name (case-insensitive).
     pub fn get_person(&self, name: &str) -> Result<Option<Person>> {
-        let name_hash = self.hmac_hash(name);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, canonical_name_encrypted, relationship_encrypted, notes_encrypted, first_mentioned, last_mentioned
-             FROM people WHERE canonical_name_hash = ?1",
-        )?;
-
-        let row = stmt
-            .query_row([&name_hash], |row| {
-                Ok(RawPersonRow {
-                    id: row.get(0)?,
-                    canonical_name_encrypted: row.get(1)?,
-                    relationship_encrypted: row.get(2)?,
-                    notes_encrypted: row.get(3)?,
-                    first_mentioned: row.get(4)?,
-                    last_mentioned: row.get(5)?,
-                })
-            })
+        let person = self
+            .conn
+            .query_row(
+                "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
+                 FROM people WHERE canonical_name = ?1 COLLATE NOCASE",
+                [name],
+                |row| {
+                    Ok(Person {
+                        id: row.get(0)?,
+                        canonical_name: row.get(1)?,
+                        relationship: row.get(2)?,
+                        notes: row.get(3)?,
+                        first_mentioned: row.get(4)?,
+                        last_mentioned: row.get(5)?,
+                    })
+                },
+            )
             .optional()?;
-
-        match row {
-            Some(raw) => {
-                let canonical_name = self.key.decrypt_string(&raw.canonical_name_encrypted)?;
-                let relationship = raw
-                    .relationship_encrypted
-                    .as_ref()
-                    .map(|enc| self.key.decrypt_string(enc))
-                    .transpose()?;
-                let notes = raw
-                    .notes_encrypted
-                    .as_ref()
-                    .map(|enc| self.key.decrypt_string(enc))
-                    .transpose()?;
-                Ok(Some(Person {
-                    id: raw.id,
-                    canonical_name,
-                    relationship,
-                    notes,
-                    first_mentioned: raw.first_mentioned,
-                    last_mentioned: raw.last_mentioned,
-                }))
-            }
-            None => Ok(None),
-        }
+        Ok(person)
     }
 
-    /// List all people (decrypted).
+    /// List all people.
     pub fn list_people(&self) -> Result<Vec<Person>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, canonical_name_encrypted, relationship_encrypted, notes_encrypted, first_mentioned, last_mentioned
+            "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
              FROM people ORDER BY last_mentioned DESC",
         )?;
 
         let people: Vec<Person> = stmt
             .query_map([], |row| {
-                Ok(RawPersonRow {
+                Ok(Person {
                     id: row.get(0)?,
-                    canonical_name_encrypted: row.get(1)?,
-                    relationship_encrypted: row.get(2)?,
-                    notes_encrypted: row.get(3)?,
+                    canonical_name: row.get(1)?,
+                    relationship: row.get(2)?,
+                    notes: row.get(3)?,
                     first_mentioned: row.get(4)?,
                     last_mentioned: row.get(5)?,
                 })
@@ -476,43 +418,6 @@ impl Database {
                     None
                 }
             })
-            .filter_map(|raw| {
-                let canonical_name = match self.key.decrypt_string(&raw.canonical_name_encrypted) {
-                    Ok(name) => name,
-                    Err(e) => {
-                        tracing::warn!(row_id = raw.id, error = %e, "decryption failed for person canonical_name, skipping");
-                        return None;
-                    }
-                };
-                let relationship = match raw.relationship_encrypted.as_ref() {
-                    Some(enc) => match self.key.decrypt_string(enc) {
-                        Ok(r) => Some(r),
-                        Err(e) => {
-                            tracing::warn!(row_id = raw.id, error = %e, "decryption failed for person relationship, skipping");
-                            return None;
-                        }
-                    },
-                    None => None,
-                };
-                let notes = match raw.notes_encrypted.as_ref() {
-                    Some(enc) => match self.key.decrypt_string(enc) {
-                        Ok(n) => Some(n),
-                        Err(e) => {
-                            tracing::warn!(row_id = raw.id, error = %e, "decryption failed for person notes, skipping");
-                            return None;
-                        }
-                    },
-                    None => None,
-                };
-                Some(Person {
-                    id: raw.id,
-                    canonical_name,
-                    relationship,
-                    notes,
-                    first_mentioned: raw.first_mentioned,
-                    last_mentioned: raw.last_mentioned,
-                })
-            })
             .collect();
 
         Ok(people)
@@ -520,44 +425,41 @@ impl Database {
 
     // -- Commitments (Layer 2) --
 
-    /// Add a commitment (encrypted). Uses HMAC-SHA256 for dedup.
+    /// Add a commitment. Uses case-insensitive UNIQUE for dedup.
     pub fn add_commitment(
         &self,
         description: &str,
         due_date: Option<&str>,
         person_id: Option<i64>,
     ) -> Result<i64> {
-        let hash = self.hmac_hash(description);
-        let encrypted = self.key.encrypt_string(description)?;
-
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO commitments (description_encrypted, description_hash, due_date, person_id)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![encrypted, hash, due_date, person_id],
+                "INSERT OR IGNORE INTO commitments (description, due_date, person_id)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![description, due_date, person_id],
             )
             .context("failed to insert commitment")?;
 
         let id = self.conn.query_row(
-            "SELECT id FROM commitments WHERE description_hash = ?1",
-            [&hash],
+            "SELECT id FROM commitments WHERE description = ?1 COLLATE NOCASE",
+            [description],
             |row| row.get(0),
         )?;
         Ok(id)
     }
 
-    /// List commitments by status (decrypted).
+    /// List commitments by status.
     pub fn list_commitments(&self, status: &str) -> Result<Vec<Commitment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, description_encrypted, status, due_date, person_id, created_at, completed_at
+            "SELECT id, description, status, due_date, person_id, created_at, completed_at
              FROM commitments WHERE status = ?1 ORDER BY due_date ASC NULLS LAST",
         )?;
 
         let commitments: Vec<Commitment> = stmt
             .query_map([status], |row| {
-                Ok(RawCommitmentRow {
+                Ok(Commitment {
                     id: row.get(0)?,
-                    description_encrypted: row.get(1)?,
+                    description: row.get(1)?,
                     status: row.get(2)?,
                     due_date: row.get(3)?,
                     person_id: row.get(4)?,
@@ -570,23 +472,6 @@ impl Database {
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to read commitment row");
                     None
-                }
-            })
-            .filter_map(|raw| {
-                match self.key.decrypt_string(&raw.description_encrypted) {
-                    Ok(description) => Some(Commitment {
-                        id: raw.id,
-                        description,
-                        status: raw.status,
-                        due_date: raw.due_date,
-                        person_id: raw.person_id,
-                        created_at: raw.created_at,
-                        completed_at: raw.completed_at,
-                    }),
-                    Err(e) => {
-                        tracing::warn!(row_id = raw.id, error = %e, "decryption failed for commitment, skipping");
-                        None
-                    }
                 }
             })
             .collect();
@@ -617,55 +502,104 @@ impl Database {
 
     // -- Preferences (Layer 2) --
 
-    /// Upsert a preference (encrypted).
+    /// Upsert a preference (case-insensitive category).
     pub fn set_preference(&self, category: &str, value: &str) -> Result<()> {
-        let category_encrypted = self.key.encrypt_string(category)?;
-        let category_hash = self.hmac_hash(category);
-        let value_encrypted = self.key.encrypt_string(value)?;
         self.conn
             .execute(
-                "INSERT INTO preferences (category_encrypted, category_hash, value_encrypted, updated_at)
-                 VALUES (?1, ?2, ?3, datetime('now'))
-                 ON CONFLICT(category_hash) DO UPDATE SET
-                    category_encrypted = excluded.category_encrypted,
-                    value_encrypted = excluded.value_encrypted,
+                "INSERT INTO preferences (category, value, updated_at)
+                 VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(category) DO UPDATE SET
+                    value = excluded.value,
                     updated_at = excluded.updated_at",
-                rusqlite::params![category_encrypted, category_hash, value_encrypted],
+                rusqlite::params![category, value],
             )
             .context("failed to upsert preference")?;
         Ok(())
     }
 
-    /// Get a preference by category (decrypted).
+    /// Get a preference by category (case-insensitive).
     pub fn get_preference(&self, category: &str) -> Result<Option<String>> {
-        let category_hash = self.hmac_hash(category);
-        let encrypted: Option<Vec<u8>> = self
+        let value: Option<String> = self
             .conn
             .query_row(
-                "SELECT value_encrypted FROM preferences WHERE category_hash = ?1",
-                [&category_hash],
+                "SELECT value FROM preferences WHERE category = ?1 COLLATE NOCASE",
+                [category],
                 |row| row.get(0),
             )
             .optional()?;
-
-        match encrypted {
-            Some(enc) => Ok(Some(self.key.decrypt_string(&enc)?)),
-            None => Ok(None),
-        }
+        Ok(value)
     }
 
     // -- Events (Layer 2) --
 
-    /// Add an event (encrypted description).
-    pub fn add_event(&self, description: &str, event_date: Option<&str>, context: Option<&str>) -> Result<i64> {
-        let encrypted = self.key.encrypt_string(description)?;
+    /// Add an event.
+    pub fn add_event(
+        &self,
+        description: &str,
+        event_date: Option<&str>,
+        context: Option<&str>,
+    ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO events (description_encrypted, event_date, context) VALUES (?1, ?2, ?3)",
-                rusqlite::params![encrypted, event_date, context],
+                "INSERT INTO events (description, event_date, context) VALUES (?1, ?2, ?3)",
+                rusqlite::params![description, event_date, context],
             )
             .context("failed to insert event")?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    // -- Memory Events (Audit Log) --
+
+    /// Log a memory mutation event for auditability.
+    pub fn log_memory_event(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        target_key: &str,
+        before_value: Option<&str>,
+        after_value: &str,
+        reasoning: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO memory_events (session_id, tool_name, target_key, before_value, after_value, reasoning)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![session_id, tool_name, target_key, before_value, after_value, reasoning],
+            )
+            .context("failed to log memory event")?;
+        Ok(())
+    }
+
+    /// Get memory events for a session.
+    pub fn get_memory_events(&self, session_id: &str) -> Result<Vec<MemoryEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning, created_at
+             FROM memory_events WHERE session_id = ?1 ORDER BY id",
+        )?;
+
+        let events: Vec<MemoryEvent> = stmt
+            .query_map([session_id], |row| {
+                Ok(MemoryEvent {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    target_key: row.get(3)?,
+                    before_value: row.get(4)?,
+                    after_value: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read memory_event row");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(events)
     }
 }
 
@@ -709,40 +643,16 @@ pub struct Commitment {
     pub completed_at: Option<String>,
 }
 
-// -- Internal raw row types (before decryption) --
-
-struct RawConversationRow {
-    id: i64,
-    role: String,
-    content_encrypted: Vec<u8>,
-    channel_type: String,
-    created_at: String,
-}
-
-struct RawCoreMemoryRow {
-    key: String,
-    value_encrypted: Vec<u8>,
-    token_count: i32,
-    updated_at: String,
-}
-
-struct RawPersonRow {
-    id: i64,
-    canonical_name_encrypted: Vec<u8>,
-    relationship_encrypted: Option<Vec<u8>>,
-    notes_encrypted: Option<Vec<u8>>,
-    first_mentioned: String,
-    last_mentioned: String,
-}
-
-struct RawCommitmentRow {
-    id: i64,
-    description_encrypted: Vec<u8>,
-    status: String,
-    due_date: Option<String>,
-    person_id: Option<i64>,
-    created_at: String,
-    completed_at: Option<String>,
+#[derive(Debug, Clone)]
+pub struct MemoryEvent {
+    pub id: i64,
+    pub session_id: String,
+    pub tool_name: String,
+    pub target_key: String,
+    pub before_value: Option<String>,
+    pub after_value: String,
+    pub reasoning: Option<String>,
+    pub created_at: String,
 }
 
 // Bring in rusqlite optional extension
@@ -752,12 +662,8 @@ use rusqlite::OptionalExtension;
 mod tests {
     use super::*;
 
-    fn test_key() -> EncryptionKey {
-        EncryptionKey::from_hex(&"01".repeat(32)).unwrap()
-    }
-
     fn test_db() -> Database {
-        Database::open_in_memory(test_key()).unwrap()
+        Database::open_in_memory().unwrap()
     }
 
     #[test]
@@ -765,28 +671,32 @@ mod tests {
         let db = test_db();
         let version: i64 = db
             .conn
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 4);
     }
 
     #[test]
     fn test_migration_idempotent() {
         let db = test_db();
-        // Running migrate again should be a no-op
         db.migrate().unwrap();
         let version: i64 = db
             .conn
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 4);
     }
 
     #[test]
     fn test_conversation_roundtrip() {
         let db = test_db();
         db.save_message("user", "Hello Mika!", "telegram").unwrap();
-        db.save_message("assistant", "Hi! How can I help?", "telegram").unwrap();
+        db.save_message("assistant", "Hi! How can I help?", "telegram")
+            .unwrap();
 
         let messages = db.load_recent_messages(10).unwrap();
         assert_eq!(messages.len(), 2);
@@ -800,11 +710,11 @@ mod tests {
     fn test_conversation_limit() {
         let db = test_db();
         for i in 0..20 {
-            db.save_message("user", &format!("Message {i}"), "telegram").unwrap();
+            db.save_message("user", &format!("Message {i}"), "telegram")
+                .unwrap();
         }
         let messages = db.load_recent_messages(5).unwrap();
         assert_eq!(messages.len(), 5);
-        // Should be the 5 most recent, oldest first
         assert_eq!(messages[0].content, "Message 15");
         assert_eq!(messages[4].content, "Message 19");
     }
@@ -813,41 +723,48 @@ mod tests {
     fn test_core_memory_crud() {
         let db = test_db();
 
-        // Set
         let tokens = db.set_core_memory("user_summary", "Loves coffee.").unwrap();
         assert!(tokens > 0);
 
-        // Get
         let entry = db.get_core_memory("user_summary").unwrap().unwrap();
         assert_eq!(entry.value, "Loves coffee.");
         assert_eq!(entry.key, "user_summary");
 
-        // Update
-        db.set_core_memory("user_summary", "Loves coffee and tea.").unwrap();
+        db.set_core_memory("user_summary", "Loves coffee and tea.")
+            .unwrap();
         let entry = db.get_core_memory("user_summary").unwrap().unwrap();
         assert_eq!(entry.value, "Loves coffee and tea.");
 
-        // Missing key
         assert!(db.get_core_memory("nonexistent").unwrap().is_none());
     }
 
     #[test]
     fn test_core_memory_seed() {
         let db = test_db();
-        db.seed_core_memory().unwrap();
+        db.seed_core_memory(None).unwrap();
 
         let all = db.get_all_core_memory().unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
 
         let summary = db.get_core_memory("user_summary").unwrap().unwrap();
         assert_eq!(summary.value, "New user. No information yet.");
     }
 
     #[test]
+    fn test_core_memory_seed_with_user_md() {
+        let db = test_db();
+        db.seed_core_memory(Some("I'm a CEO who loves hiking"))
+            .unwrap();
+
+        let summary = db.get_core_memory("user_summary").unwrap().unwrap();
+        assert_eq!(summary.value, "I'm a CEO who loves hiking");
+    }
+
+    #[test]
     fn test_total_token_count() {
         let db = test_db();
-        db.set_core_memory("a", &"x".repeat(100)).unwrap(); // ~25 tokens
-        db.set_core_memory("b", &"y".repeat(200)).unwrap(); // ~50 tokens
+        db.set_core_memory("a", &"x".repeat(100)).unwrap();
+        db.set_core_memory("b", &"y".repeat(200)).unwrap();
         let total = db.total_core_memory_tokens().unwrap();
         assert_eq!(total, 75);
     }
@@ -856,7 +773,9 @@ mod tests {
     fn test_people_crud() {
         let db = test_db();
 
-        let id = db.upsert_person("Sarah Chen", Some("colleague"), Some("VP of Engineering")).unwrap();
+        let id = db
+            .upsert_person("Sarah Chen", Some("colleague"), Some("VP of Engineering"))
+            .unwrap();
         assert!(id > 0);
 
         let person = db.get_person("Sarah Chen").unwrap().unwrap();
@@ -864,8 +783,8 @@ mod tests {
         assert_eq!(person.relationship, Some("colleague".to_string()));
         assert_eq!(person.notes, Some("VP of Engineering".to_string()));
 
-        // Upsert updates relationship
-        db.upsert_person("Sarah Chen", Some("manager"), None).unwrap();
+        db.upsert_person("Sarah Chen", Some("manager"), None)
+            .unwrap();
         let person = db.get_person("Sarah Chen").unwrap().unwrap();
         assert_eq!(person.relationship, Some("manager".to_string()));
 
@@ -883,20 +802,37 @@ mod tests {
     }
 
     #[test]
+    fn test_person_lookup_case_insensitive() {
+        let db = test_db();
+        db.upsert_person("Sarah Chen", Some("colleague"), None)
+            .unwrap();
+
+        // Lookup with different casing should find the same person
+        let person = db.get_person("sarah chen").unwrap().unwrap();
+        assert_eq!(person.canonical_name, "Sarah Chen");
+        assert_eq!(person.relationship, Some("colleague".to_string()));
+
+        let person = db.get_person("SARAH CHEN").unwrap().unwrap();
+        assert_eq!(person.canonical_name, "Sarah Chen");
+    }
+
+    #[test]
     fn test_commitments() {
         let db = test_db();
 
-        let id = db.add_commitment("Review Q4 budget", Some("2026-03-01"), None).unwrap();
+        let id = db
+            .add_commitment("Review Q4 budget", Some("2026-03-01"), None)
+            .unwrap();
         assert!(id > 0);
 
-        // Duplicate should be ignored (same hash)
-        db.add_commitment("Review Q4 budget", Some("2026-03-01"), None).unwrap();
+        // Duplicate should be ignored (same description, case-insensitive)
+        db.add_commitment("Review Q4 budget", Some("2026-03-01"), None)
+            .unwrap();
 
         let pending = db.list_commitments("pending").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].description, "Review Q4 budget");
 
-        // Complete it
         db.update_commitment_status(id, "completed").unwrap();
         let pending = db.list_commitments("pending").unwrap();
         assert_eq!(pending.len(), 0);
@@ -905,112 +841,86 @@ mod tests {
     }
 
     #[test]
+    fn test_commitment_dedup_case_insensitive() {
+        let db = test_db();
+        db.add_commitment("Review Q4 budget", Some("2026-03-01"), None)
+            .unwrap();
+        db.add_commitment("review q4 budget", Some("2026-03-01"), None)
+            .unwrap();
+
+        let pending = db.list_commitments("pending").unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
     fn test_preferences() {
         let db = test_db();
 
-        db.set_preference("communication_style", "Direct and concise").unwrap();
+        db.set_preference("communication_style", "Direct and concise")
+            .unwrap();
         let pref = db.get_preference("communication_style").unwrap().unwrap();
         assert_eq!(pref, "Direct and concise");
 
-        // Update
-        db.set_preference("communication_style", "Friendly and warm").unwrap();
+        db.set_preference("communication_style", "Friendly and warm")
+            .unwrap();
         let pref = db.get_preference("communication_style").unwrap().unwrap();
         assert_eq!(pref, "Friendly and warm");
 
-        // Missing
         assert!(db.get_preference("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_preference_case_insensitive() {
+        let db = test_db();
+        db.set_preference("Food", "No shellfish").unwrap();
+
+        let pref = db.get_preference("food").unwrap().unwrap();
+        assert_eq!(pref, "No shellfish");
+
+        let pref = db.get_preference("FOOD").unwrap().unwrap();
+        assert_eq!(pref, "No shellfish");
     }
 
     #[test]
     fn test_events() {
         let db = test_db();
 
-        let id = db.add_event("Board meeting", Some("2026-03-15"), Some("business")).unwrap();
+        let id = db
+            .add_event("Board meeting", Some("2026-03-15"), Some("business"))
+            .unwrap();
         assert!(id > 0);
     }
 
     #[test]
-    fn test_hmac_sha256_hex() {
-        let key_bytes = [0x01u8; 32];
-        let hash = mika_common::crypto::hmac_sha256_hex(&key_bytes, "hello");
-        // HMAC-SHA256 produces 64 hex chars (32 bytes)
-        assert_eq!(hash.len(), 64);
-        // Should be deterministic
-        let hash2 = mika_common::crypto::hmac_sha256_hex(&key_bytes, "hello");
-        assert_eq!(hash, hash2);
-    }
-
-    #[test]
-    fn test_data_encrypted_at_rest() {
+    fn test_memory_events() {
         let db = test_db();
-        db.save_message("user", "Secret meeting at noon", "telegram").unwrap();
+        db.log_memory_event(
+            "sess-1",
+            "store_fact",
+            "person:Alice",
+            None,
+            "Alice — colleague",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event(
+            "sess-1",
+            "update_core_memory",
+            "persona",
+            Some("old"),
+            "new",
+            Some("user asked"),
+        )
+        .unwrap();
 
-        // Read raw encrypted blob -- should NOT contain plaintext
-        let raw: Vec<u8> = db
-            .conn
-            .query_row(
-                "SELECT content_encrypted FROM conversations WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let events = db.get_memory_events("sess-1").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "store_fact");
+        assert_eq!(events[0].target_key, "person:Alice");
+        assert_eq!(events[1].reasoning, Some("user asked".to_string()));
 
-        let raw_str = String::from_utf8_lossy(&raw);
-        assert!(!raw_str.contains("Secret meeting"));
-    }
-
-    #[test]
-    fn test_check_encryption_key() {
-        let db = test_db();
-        // Should succeed with a valid key
-        db.check_encryption_key().unwrap();
-    }
-
-    #[test]
-    fn test_people_encrypted_at_rest() {
-        let db = test_db();
-        db.upsert_person("Sarah Chen", Some("colleague"), Some("VP of Engineering")).unwrap();
-
-        // Read raw canonical_name_encrypted -- should NOT contain plaintext
-        let raw_name: Vec<u8> = db
-            .conn
-            .query_row(
-                "SELECT canonical_name_encrypted FROM people WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let raw_name_str = String::from_utf8_lossy(&raw_name);
-        assert!(!raw_name_str.contains("Sarah Chen"), "canonical_name should be encrypted at rest");
-
-        // Read raw relationship_encrypted -- should NOT contain plaintext
-        let raw_rel: Vec<u8> = db
-            .conn
-            .query_row(
-                "SELECT relationship_encrypted FROM people WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let raw_rel_str = String::from_utf8_lossy(&raw_rel);
-        assert!(!raw_rel_str.contains("colleague"), "relationship should be encrypted at rest");
-    }
-
-    #[test]
-    fn test_preferences_encrypted_at_rest() {
-        let db = test_db();
-        db.set_preference("communication_style", "Direct and concise").unwrap();
-
-        // Read raw category_encrypted -- should NOT contain plaintext
-        let raw_cat: Vec<u8> = db
-            .conn
-            .query_row(
-                "SELECT category_encrypted FROM preferences WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let raw_cat_str = String::from_utf8_lossy(&raw_cat);
-        assert!(!raw_cat_str.contains("communication_style"), "category should be encrypted at rest");
+        // Different session returns empty
+        let events = db.get_memory_events("other").unwrap();
+        assert!(events.is_empty());
     }
 }

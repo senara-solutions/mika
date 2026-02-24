@@ -174,15 +174,10 @@ impl Tool for UpdateCoreMemoryTool {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use mika_common::crypto::EncryptionKey;
     use std::sync::atomic::AtomicU32;
 
-    fn test_key() -> EncryptionKey {
-        EncryptionKey::from_hex(&"01".repeat(32)).unwrap()
-    }
-
     fn test_db() -> Database {
-        Database::open_in_memory(test_key()).unwrap()
+        Database::open_in_memory().unwrap()
     }
 
     fn test_ctx<'a>(

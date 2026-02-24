@@ -11,8 +11,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Language:** Rust (edition 2024)
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context → build prompt → Claude API → match stop_reason → execute tools or respond
 - **LLM:** Claude (Sonnet 4.6 default) via direct reqwest calls to Messages API
-- **Database:** SQLite via rusqlite (per-customer, encrypted at field level)
-- **Encryption:** AES-256-GCM via `ring` (cached LessSafeKey, zeroized on drop), HMAC-SHA256 for lookups
+- **Database:** SQLite via rusqlite (per-customer, plaintext on K8s encrypted volumes)
 - **HTTP:** reqwest 0.12 (Claude API client with typed errors and retry)
 - **Async runtime:** tokio
 - **Config:** config-rs with `MIKA_` env prefix
@@ -20,7 +19,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 ## Directory Structure
 
-- `crates/mika-common/` — Shared library: config, encryption (AES + HMAC), Claude API client, logging
+- `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, CLI binary
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/brainstorms/` — Decision brainstorm documents
@@ -29,14 +28,14 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 ## Conventions
 
-- **Error handling:** `anyhow::Result` for application code, `thiserror` for library errors (e.g., `CryptoError`, `ClaudeApiError`)
+- **Error handling:** `anyhow::Result` for application code, `thiserror` for library errors (e.g., `ClaudeApiError`)
 - **Naming:** snake_case for functions/variables, PascalCase for types, SCREAMING_SNAKE for constants
 - **Edition 2024:** `unsafe` blocks required for `std::env::set_var` etc.
 - **Testing:** `#[cfg(test)] mod tests` inline in each module, `cargo test` to run
 - **No framework:** The agent loop is a plain Rust async function, not a framework
-- **Encryption:** All PII fields (names, relationships, categories, notes, messages) encrypted with AES-256-GCM. HMAC-SHA256 hashes for UNIQUE lookups on encrypted columns.
-- **Secrets:** `EncryptionKey` uses `ZeroizeOnDrop`. `Settings` has manual `Debug` impl that redacts secrets. API key errors are opaque.
-- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains only `{ db }`.
+- **Data at rest:** Plaintext SQLite on K8s encrypted volumes. Per-customer container isolation. Case-insensitive COLLATE NOCASE on unique text columns.
+- **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque.
+- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding }`.
 
 ## Commands
 
@@ -51,17 +50,16 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **One container per customer** on Kubernetes
 - **Three-layer memory model:**
   - Layer 1: Core memory (always in system prompt, agent-editable via `update_core_memory` tool, 2000 token limit)
-  - Layer 2: Structured facts (People, Commitments, Preferences, Events — encrypted at rest)
+  - Layer 2: Structured facts (People, Commitments, Preferences, Events — plaintext)
   - Layer 3: Vector search (sqlite-vec + FTS5 hybrid — not yet implemented)
 - **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
-- **Decryption resilience:** Failed decryptions logged at WARN level, startup key check
+- **Audit log:** `memory_events` table tracks all memory mutations per session
 
 ## Environment Variables
 
 See `.env.example` for the full list. Required:
 - `MIKA_ANTHROPIC_API_KEY` — Anthropic API key
-- `MIKA_ENCRYPTION_KEY` — 64 hex chars (32 bytes) for AES-256-GCM
 
 ## Pending Work
 
