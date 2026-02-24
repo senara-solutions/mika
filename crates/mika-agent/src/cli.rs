@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use mika_agent::agent::{self, AgentParams};
-use mika_agent::db::{CORE_MEMORY_SECTIONS, Database};
+use mika_agent::db::{CORE_MEMORY_SECTIONS, Database, core_memory_section_names};
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::tools;
 use mika_common::claude::ClaudeClient;
@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
             session_id: &session_id,
             home_dir: &home_dir,
             is_onboarding,
+            message_sender: None,
         })
         .await
         {
@@ -200,7 +201,7 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
                 db.set_core_memory(block, &reset_value)?;
                 println!("\nReset [{block}] to default.\n");
             } else {
-                let allowed: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+                let allowed = core_memory_section_names();
                 println!(
                     "\nInvalid block '{block}'. Allowed: {}\n",
                     allowed.join(", ")

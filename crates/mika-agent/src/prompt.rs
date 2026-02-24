@@ -1,4 +1,4 @@
-use crate::db::{CORE_MEMORY_SECTIONS, Commitment, CoreMemoryEntry};
+use crate::db::{Commitment, CoreMemoryEntry, core_memory_section_names};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::fmt::Write;
@@ -51,7 +51,7 @@ pub struct PromptContext<'a> {
 }
 
 fn onboarding_prompt() -> String {
-    let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+    let section_names = core_memory_section_names();
     format!(
         "## First Session\n\
          This is your first conversation with the user. Introduce yourself briefly and warmly. \
@@ -114,7 +114,13 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- You can list and cancel reminders with list_reminders and cancel_reminder.\n",
     );
-    let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+    prompt.push_str(
+        "- Mark commitments as completed or cancelled using the update_fact tool.\n",
+    );
+    prompt.push_str(
+        "- You can reset a core memory section to its default value using update_core_memory with the reset action.\n",
+    );
+    let section_names = core_memory_section_names();
     write!(
         prompt,
         "- You have {} memory blocks ({}),\n  each limited to ~500 tokens. Be concise and prioritize what matters most.\n",
@@ -193,6 +199,15 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
          Use the send_message tool to contact the user. If you have nothing worthwhile \
          to say, simply respond with a brief internal note and do NOT call send_message.\n\n",
+    );
+
+    // Available tools summary
+    prompt.push_str("## Available Tools\n");
+    prompt.push_str(
+        "You have access to all tools. Use them as appropriate:\n\
+         - search_memory / store_fact / update_core_memory / update_fact: Read and update the user's memory\n\
+         - create_reminder / list_reminders / cancel_reminder: Manage reminders\n\
+         - send_message: Contact the user (required in silent mode for output)\n\n",
     );
 
     // Trigger-specific context

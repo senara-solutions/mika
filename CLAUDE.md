@@ -41,7 +41,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (127 tests)
+- `cargo test` — Run all tests (117 tests)
 - `cargo run --bin mika-cli` — Run CLI test harness
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
@@ -51,7 +51,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **One container per customer** on Kubernetes
 - **Three-layer memory model:**
   - Layer 1: Core memory (always in system prompt, agent-editable via `update_core_memory` tool, 2000 token limit)
-  - Layer 2: Structured facts (People, Commitments, Preferences, Events — plaintext)
+  - Layer 2: Structured facts (People, Commitments, Preferences, Events — plaintext). Managed via `store_fact`, `update_fact`, `search_memory` tools.
   - Layer 3: Vector search (sqlite-vec + FTS5 hybrid — not yet implemented)
 - **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)

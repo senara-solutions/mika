@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::db::CORE_MEMORY_SECTIONS;
+use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
 
 const MAX_TOKENS_PER_BLOCK: i32 = 500;
 const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
@@ -19,7 +19,7 @@ impl Tool for UpdateCoreMemoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+        let section_names = core_memory_section_names();
         let section_list = section_names.join(", ");
         ToolDefinition {
             name: "update_core_memory".to_string(),
@@ -73,7 +73,7 @@ impl Tool for UpdateCoreMemoryTool {
         }
 
         // Validate section
-        let allowed_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+        let allowed_names = core_memory_section_names();
         if !allowed_names.contains(&section) {
             return Ok(ToolOutput::error(format!(
                 "Invalid section '{section}'. Allowed: {}",

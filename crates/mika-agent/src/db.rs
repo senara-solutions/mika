@@ -3,7 +3,11 @@ use rusqlite::Connection;
 use std::path::Path;
 use tracing::{debug, info};
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
+
+/// Canonical list of valid commitment statuses at the database level.
+/// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
+pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
 /// Canonical list of core memory section names and their default values.
 /// Used by seed_core_memory, CLI reset, update_core_memory validation, and prompt assembly.
@@ -16,6 +20,11 @@ pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     ),
     ("key_people", "No one tracked yet."),
 ];
+
+/// Returns just the section names from CORE_MEMORY_SECTIONS.
+pub fn core_memory_section_names() -> Vec<&'static str> {
+    CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect()
+}
 
 /// Per-customer SQLite database.
 /// Data-at-rest encryption is provided by Kubernetes encrypted volumes.
@@ -99,6 +108,9 @@ impl Database {
         }
         if version < 5 {
             self.migrate_v5()?;
+        }
+        if version < 6 {
+            self.migrate_v6()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -266,6 +278,36 @@ impl Database {
             ",
             )
             .context("failed to apply migration v5")?;
+
+        Ok(())
+    }
+
+    fn migrate_v6(&self) -> Result<()> {
+        info!("applying migration v6: memory_event_summaries for tiered retention");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS memory_event_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                tool_counts TEXT NOT NULL,
+                category_counts TEXT NOT NULL,
+                total_mutations INTEGER NOT NULL,
+                top_targets TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(year, month)
+            );
+
+            INSERT INTO schema_version (version) VALUES (6);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v6")?;
 
         Ok(())
     }
@@ -550,25 +592,37 @@ impl Database {
         Ok(commitments)
     }
 
-    /// Update commitment status.
-    pub fn update_commitment_status(&self, id: i64, status: &str) -> Result<()> {
-        const VALID_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
-        if !VALID_STATUSES.contains(&status) {
+    /// Update commitment status. Returns `true` if a row was updated, `false` if the id was not found.
+    pub fn update_commitment_status(&self, id: i64, status: &str) -> Result<bool> {
+        if !COMMITMENT_STATUSES.contains(&status) {
             anyhow::bail!("invalid commitment status: {status}");
         }
 
-        if status == "completed" {
+        let rows = if status == "completed" {
             self.conn.execute(
                 "UPDATE commitments SET status = ?1, completed_at = datetime('now') WHERE id = ?2",
                 rusqlite::params![status, id],
-            )?;
+            )?
         } else {
             self.conn.execute(
                 "UPDATE commitments SET status = ?1, completed_at = NULL WHERE id = ?2",
                 rusqlite::params![status, id],
-            )?;
-        }
-        Ok(())
+            )?
+        };
+        Ok(rows > 0)
+    }
+
+    /// Get the current status of a commitment by id.
+    pub fn get_commitment_status(&self, id: i64) -> Result<Option<String>> {
+        let status = self
+            .conn
+            .query_row(
+                "SELECT status FROM commitments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
     }
 
     // -- Preferences (Layer 2) --
@@ -671,14 +725,23 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Query reminders with an additional WHERE clause appended after `status = 'pending'`.
-    fn query_reminders(&self, extra_where: &str) -> Result<Vec<Reminder>> {
-        let sql = format!(
-            "SELECT id, fire_at, message, status, created_at, delivered_at \
-             FROM reminders WHERE status = 'pending'{} ORDER BY fire_at ASC",
-            extra_where
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
+    /// Query reminders using a type-safe filter enum.
+    fn query_reminders(&self, filter: ReminderFilter) -> Result<Vec<Reminder>> {
+        let sql = match filter {
+            ReminderFilter::All => {
+                "SELECT id, fire_at, message, status, created_at, delivered_at \
+                 FROM reminders WHERE status = 'pending' ORDER BY fire_at ASC"
+            }
+            ReminderFilter::Future => {
+                "SELECT id, fire_at, message, status, created_at, delivered_at \
+                 FROM reminders WHERE status = 'pending' AND fire_at > datetime('now') ORDER BY fire_at ASC"
+            }
+            ReminderFilter::PastDue => {
+                "SELECT id, fire_at, message, status, created_at, delivered_at \
+                 FROM reminders WHERE status = 'pending' AND fire_at <= datetime('now') ORDER BY fire_at ASC"
+            }
+        };
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let reminders = stmt
             .query_map([], |row| {
                 Ok(Reminder {
@@ -696,17 +759,17 @@ impl Database {
 
     /// Get all pending reminders (any fire_at).
     pub fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
-        self.query_reminders("")
+        self.query_reminders(ReminderFilter::All)
     }
 
     /// Get pending reminders whose fire_at is in the future.
     pub fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
-        self.query_reminders(" AND fire_at > datetime('now')")
+        self.query_reminders(ReminderFilter::Future)
     }
 
     /// Get pending reminders whose fire_at is at or past now (ready to deliver).
     pub fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
-        self.query_reminders(" AND fire_at <= datetime('now')")
+        self.query_reminders(ReminderFilter::PastDue)
     }
 
     /// Mark a reminder as delivered.
@@ -734,38 +797,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    // -- Heartbeat Rate Limiting --
-
-    /// Record a heartbeat send for rate limiting.
-    pub fn record_heartbeat_send(&self) -> Result<()> {
-        self.conn
-            .execute("INSERT INTO heartbeat_sends DEFAULT VALUES", [])?;
-        Ok(())
-    }
-
-    /// Count heartbeat sends in the current day for a given timezone.
-    /// Uses SQLite date functions to compute "today" in the user's timezone.
-    pub fn count_heartbeat_sends_today(&self, timezone_offset: &str) -> Result<u32> {
-        // timezone_offset is like "+08:00" or "-05:00"
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM heartbeat_sends
-             WHERE date(sent_at, ?1) = date('now', ?1)",
-            [timezone_offset],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
-    /// Count heartbeat sends in the last hour (UTC).
-    pub fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM heartbeat_sends
-             WHERE sent_at >= datetime('now', '-1 hour')",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
+    // -- Heartbeat Pruning --
 
     /// Delete heartbeat sends older than `days` days.
     pub fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
@@ -780,7 +812,9 @@ impl Database {
     // -- Conversation Compaction --
 
     /// Save a conversation summary row. Returns the new row ID.
-    pub fn save_conversation_summary(
+    /// Only used directly by tests; production code uses `replace_with_summary`.
+    #[cfg(test)]
+    fn save_conversation_summary(
         &self,
         summary: &str,
         compacted_through_id: i64,
@@ -795,7 +829,9 @@ impl Database {
 
     /// Delete messages up to and including `through_id`, excluding summary rows.
     /// Returns the number of deleted rows.
-    pub fn delete_compacted_messages(&self, through_id: i64) -> Result<u32> {
+    /// Only used directly by tests; production code uses `replace_with_summary`.
+    #[cfg(test)]
+    fn delete_compacted_messages(&self, through_id: i64) -> Result<u32> {
         let rows = self.conn.execute(
             "DELETE FROM conversations WHERE id <= ?1 AND role != 'summary'",
             [through_id],
@@ -884,19 +920,136 @@ impl Database {
     /// Atomically replace old messages with a summary.
     /// Deletes messages up to the highest ID in the batch and saves a summary row.
     pub fn replace_with_summary(&self, summary: &str, compacted_through_id: i64) -> Result<i64> {
-        self.conn.execute("BEGIN", [])?;
-        let result = (|| {
-            // Delete old summary rows (we keep only the latest)
-            self.conn
-                .execute("DELETE FROM conversations WHERE role = 'summary'", [])?;
-            self.delete_compacted_messages(compacted_through_id)?;
-            self.save_conversation_summary(summary, compacted_through_id)
-        })();
-        match &result {
-            Ok(_) => self.conn.execute("COMMIT", [])?,
-            Err(_) => self.conn.execute("ROLLBACK", [])?,
-        };
-        result
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM conversations WHERE role = 'summary'", [])?;
+        tx.execute(
+            "DELETE FROM conversations WHERE id <= ?1 AND role != 'summary'",
+            [compacted_through_id],
+        )?;
+        tx.execute(
+            "INSERT INTO conversations (role, content, channel_type, compacted_through_id) VALUES ('summary', ?1, 'system', ?2)",
+            rusqlite::params![summary, compacted_through_id],
+        )?;
+        let id = tx.query_row("SELECT last_insert_rowid()", [], |row| row.get(0))?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    // -- Search methods (SQL LIKE filter) --
+
+    /// Search commitments by description substring (case-insensitive via LIKE).
+    pub fn search_commitments(&self, query: &str) -> Result<Vec<Commitment>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, description, status, due_date, person_id, created_at, completed_at
+             FROM commitments WHERE description LIKE '%' || ?1 || '%'
+             ORDER BY due_date ASC NULLS LAST",
+        )?;
+        let commitments = stmt
+            .query_map([query], |row| {
+                Ok(Commitment {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    status: row.get(2)?,
+                    due_date: row.get(3)?,
+                    person_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                    completed_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(commitments)
+    }
+
+    /// Search people by name, relationship, or notes substring (case-insensitive via LIKE).
+    pub fn search_people(&self, query: &str) -> Result<Vec<Person>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
+             FROM people
+             WHERE canonical_name LIKE '%' || ?1 || '%'
+                OR relationship LIKE '%' || ?1 || '%'
+                OR notes LIKE '%' || ?1 || '%'
+             ORDER BY last_mentioned DESC",
+        )?;
+        let people = stmt
+            .query_map([query], |row| {
+                Ok(Person {
+                    id: row.get(0)?,
+                    canonical_name: row.get(1)?,
+                    relationship: row.get(2)?,
+                    notes: row.get(3)?,
+                    first_mentioned: row.get(4)?,
+                    last_mentioned: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(people)
+    }
+
+    /// Search preferences by category or value substring (case-insensitive via LIKE).
+    pub fn search_preferences(&self, query: &str) -> Result<Vec<Preference>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT category, value, updated_at FROM preferences
+             WHERE category LIKE '%' || ?1 || '%'
+                OR value LIKE '%' || ?1 || '%'
+             ORDER BY category",
+        )?;
+        let prefs = stmt
+            .query_map([query], |row| {
+                Ok(Preference {
+                    category: row.get(0)?,
+                    value: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(prefs)
+    }
+
+    /// Search events by description, date, or context substring (case-insensitive via LIKE).
+    pub fn search_events(&self, query: &str) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, description, event_date, context, created_at
+             FROM events
+             WHERE description LIKE '%' || ?1 || '%'
+                OR event_date LIKE '%' || ?1 || '%'
+                OR context LIKE '%' || ?1 || '%'
+             ORDER BY event_date ASC NULLS LAST",
+        )?;
+        let events = stmt
+            .query_map([query], |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    event_date: row.get(2)?,
+                    context: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(events)
+    }
+
+    /// Search pending reminders by message substring (case-insensitive via LIKE).
+    pub fn search_reminders(&self, query: &str) -> Result<Vec<Reminder>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, fire_at, message, status, created_at, delivered_at
+             FROM reminders
+             WHERE status = 'pending' AND message LIKE '%' || ?1 || '%'
+             ORDER BY fire_at ASC",
+        )?;
+        let reminders = stmt
+            .query_map([query], |row| {
+                Ok(Reminder {
+                    id: row.get(0)?,
+                    fire_at: row.get(1)?,
+                    message: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    delivered_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(reminders)
     }
 
     // -- Customer Config --
@@ -922,67 +1075,6 @@ impl Database {
             rusqlite::params![key, value],
         )?;
         Ok(())
-    }
-
-    // -- Failed Sends --
-
-    /// Record a failed outbound send for retry.
-    pub fn record_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO failed_sends (text, request_id) VALUES (?1, ?2)",
-            rusqlite::params![text, request_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Get all failed sends for retry.
-    pub fn get_failed_sends(&self) -> Result<Vec<FailedSend>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, text, request_id, created_at, retry_count
-             FROM failed_sends ORDER BY created_at ASC",
-        )?;
-        let sends = stmt
-            .query_map([], |row| {
-                Ok(FailedSend {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    request_id: row.get(2)?,
-                    created_at: row.get(3)?,
-                    retry_count: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(sends)
-    }
-
-    /// Remove a failed send after successful retry.
-    pub fn delete_failed_send(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM failed_sends WHERE id = ?1", [id])?;
-        Ok(())
-    }
-
-    /// Increment the retry count for a failed send.
-    pub fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE failed_sends SET retry_count = retry_count + 1 WHERE id = ?1",
-            [id],
-        )?;
-        Ok(())
-    }
-
-    /// Get the timestamp of the last user message (for heartbeat staleness check).
-    pub fn last_user_message_time(&self) -> Result<Option<String>> {
-        let time = self
-            .conn
-            .query_row(
-                "SELECT created_at FROM conversations
-                 WHERE role = 'user' ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(time)
     }
 
     // -- Memory Events (Audit Log) --
@@ -1031,9 +1123,171 @@ impl Database {
 
         Ok(events)
     }
+
+    // -- Tiered Retention --
+
+    /// Compact memory events older than `days` days into monthly summaries.
+    /// Groups events by year/month, aggregates counts, and replaces raw events
+    /// with summary rows in `memory_event_summaries`.
+    pub fn compact_old_memory_events(&self, days: u32) -> Result<()> {
+        use std::collections::HashMap;
+
+        let modifier = format!("-{days} days");
+        let cutoff: String = self.conn.query_row(
+            "SELECT datetime('now', ?1)",
+            [&modifier],
+            |row| row.get(0),
+        )?;
+
+        // Fetch events older than cutoff, grouped conceptually by year/month
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tool_name, target_key, created_at
+             FROM memory_events
+             WHERE created_at < ?1
+             ORDER BY created_at ASC",
+        )?;
+
+        struct RawEvent {
+            id: i64,
+            tool_name: String,
+            target_key: String,
+            created_at: String,
+        }
+
+        let events: Vec<RawEvent> = stmt
+            .query_map([&cutoff], |row| {
+                Ok(RawEvent {
+                    id: row.get(0)?,
+                    tool_name: row.get(1)?,
+                    target_key: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Group by year/month
+        struct MonthBucket {
+            year: i32,
+            month: u32,
+            tool_counts: HashMap<String, u32>,
+            category_counts: HashMap<String, u32>,
+            target_counts: HashMap<String, u32>,
+            total: u32,
+            event_ids: Vec<i64>,
+        }
+
+        let mut buckets: HashMap<(i32, u32), MonthBucket> = HashMap::new();
+
+        for event in &events {
+            // Parse year/month from created_at (format: "YYYY-MM-DD HH:MM:SS")
+            let (year, month) = if event.created_at.len() >= 7 {
+                let year: i32 = event.created_at[..4].parse().unwrap_or(0);
+                let month: u32 = event.created_at[5..7].parse().unwrap_or(0);
+                (year, month)
+            } else {
+                continue;
+            };
+
+            let bucket = buckets.entry((year, month)).or_insert_with(|| MonthBucket {
+                year,
+                month,
+                tool_counts: HashMap::new(),
+                category_counts: HashMap::new(),
+                target_counts: HashMap::new(),
+                total: 0,
+                event_ids: Vec::new(),
+            });
+
+            *bucket.tool_counts.entry(event.tool_name.clone()).or_insert(0) += 1;
+
+            // Extract category from target_key (e.g., "person:Alice" -> "person")
+            let category = event
+                .target_key
+                .split(':')
+                .next()
+                .unwrap_or(&event.target_key)
+                .to_string();
+            *bucket.category_counts.entry(category).or_insert(0) += 1;
+
+            *bucket.target_counts.entry(event.target_key.clone()).or_insert(0) += 1;
+
+            bucket.total += 1;
+            bucket.event_ids.push(event.id);
+        }
+
+        // Write summaries and delete raw events in a transaction
+        let tx = self.conn.unchecked_transaction()?;
+
+        for bucket in buckets.values() {
+            // Build top targets (top 10 by count)
+            let mut targets: Vec<(&String, &u32)> = bucket.target_counts.iter().collect();
+            targets.sort_by(|a, b| b.1.cmp(a.1));
+            targets.truncate(10);
+            let top_targets: Vec<String> = targets
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, v))
+                .collect();
+
+            let tool_counts_json = serde_json::to_string(&bucket.tool_counts)?;
+            let category_counts_json = serde_json::to_string(&bucket.category_counts)?;
+            let top_targets_json = serde_json::to_string(&top_targets)?;
+
+            tx.execute(
+                "INSERT OR REPLACE INTO memory_event_summaries (year, month, tool_counts, category_counts, total_mutations, top_targets)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    bucket.year,
+                    bucket.month,
+                    tool_counts_json,
+                    category_counts_json,
+                    bucket.total,
+                    top_targets_json
+                ],
+            )?;
+
+            // Delete compacted raw events
+            for id in &bucket.event_ids {
+                tx.execute("DELETE FROM memory_events WHERE id = ?1", [id])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get database file size using PRAGMA page_count * PRAGMA page_size.
+    pub fn db_size_bytes(&self) -> Result<u64> {
+        let page_count: u64 =
+            self.conn
+                .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: u64 =
+            self.conn
+                .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(page_count * page_size)
+    }
+
+    /// Run VACUUM to reclaim space after deletions.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
 }
 
 // -- Public types --
+
+/// Type-safe filter for reminder queries, replacing raw SQL string interpolation.
+pub enum ReminderFilter {
+    /// All pending reminders regardless of fire_at.
+    All,
+    /// Pending reminders with fire_at in the future.
+    Future,
+    /// Pending reminders with fire_at at or past now.
+    PastDue,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConversationMessage {
@@ -1100,15 +1354,6 @@ pub struct Reminder {
 }
 
 #[derive(Debug, Clone)]
-pub struct FailedSend {
-    pub id: i64,
-    pub text: String,
-    pub request_id: Option<String>,
-    pub created_at: String,
-    pub retry_count: i32,
-}
-
-#[derive(Debug, Clone)]
 pub struct MemoryEvent {
     pub id: i64,
     pub session_id: String,
@@ -1136,7 +1381,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1149,7 +1394,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1385,12 +1630,12 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // -- v5 migration tests --
+    // -- Migration tests --
 
     #[test]
     fn test_v5_tables_exist() {
         let db = test_db();
-        // Verify all v5 tables exist by querying sqlite_master
+        // Verify all v5+ tables exist by querying sqlite_master
         let tables: Vec<String> = {
             let mut stmt = db
                 .conn
@@ -1405,6 +1650,7 @@ mod tests {
         assert!(tables.contains(&"heartbeat_sends".to_string()));
         assert!(tables.contains(&"customer_config".to_string()));
         assert!(tables.contains(&"failed_sends".to_string()));
+        assert!(tables.contains(&"memory_event_summaries".to_string()));
     }
 
     #[test]
@@ -1544,29 +1790,7 @@ mod tests {
         assert_eq!(active[0].message, "active one");
     }
 
-    // -- Heartbeat rate limiting tests --
-
-    #[test]
-    fn test_heartbeat_send_counting() {
-        let db = test_db();
-
-        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 0);
-
-        db.record_heartbeat_send().unwrap();
-        db.record_heartbeat_send().unwrap();
-
-        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 2);
-    }
-
-    #[test]
-    fn test_heartbeat_sends_today() {
-        let db = test_db();
-        db.record_heartbeat_send().unwrap();
-
-        // UTC offset "+00:00" should see the send on "today"
-        let count = db.count_heartbeat_sends_today("+00:00").unwrap();
-        assert_eq!(count, 1);
-    }
+    // -- Heartbeat pruning tests --
 
     #[test]
     fn test_prune_heartbeat_sends() {
@@ -1578,14 +1802,21 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.record_heartbeat_send().unwrap(); // recent one
+        // Insert a recent one directly
+        db.conn
+            .execute("INSERT INTO heartbeat_sends DEFAULT VALUES", [])
+            .unwrap();
 
-        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 1);
+        let total_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM heartbeat_sends", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_before, 2);
 
         // Prune sends older than 7 days
         db.prune_old_heartbeat_sends(7).unwrap();
 
-        // The old one should be gone, but the count_last_hour still sees 1
+        // The old one should be gone, recent one remains
         let total: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM heartbeat_sends", [], |row| row.get(0))
@@ -1719,48 +1950,4 @@ mod tests {
         assert_eq!(tz, "-05:00");
     }
 
-    // -- Failed sends tests --
-
-    #[test]
-    fn test_failed_send_lifecycle() {
-        let db = test_db();
-
-        let id = db
-            .record_failed_send("Hello user!", Some("req-123"))
-            .unwrap();
-        assert!(id > 0);
-
-        let sends = db.get_failed_sends().unwrap();
-        assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].text, "Hello user!");
-        assert_eq!(sends[0].request_id, Some("req-123".to_string()));
-        assert_eq!(sends[0].retry_count, 0);
-
-        // Increment retry
-        db.increment_failed_send_retry(id).unwrap();
-        let sends = db.get_failed_sends().unwrap();
-        assert_eq!(sends[0].retry_count, 1);
-
-        // Delete after successful retry
-        db.delete_failed_send(id).unwrap();
-        let sends = db.get_failed_sends().unwrap();
-        assert_eq!(sends.len(), 0);
-    }
-
-    // -- Last user message time --
-
-    #[test]
-    fn test_last_user_message_time() {
-        let db = test_db();
-
-        // No messages yet
-        assert!(db.last_user_message_time().unwrap().is_none());
-
-        db.save_message("user", "hello", "cli").unwrap();
-        db.save_message("assistant", "hi", "cli").unwrap();
-
-        // Should return the user message time (not assistant)
-        let time = db.last_user_message_time().unwrap().unwrap();
-        assert!(!time.is_empty());
-    }
 }
