@@ -1,5 +1,5 @@
 use config::{Config, Environment};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 /// Gateway-specific settings, loaded from MIKA_* environment variables.
@@ -53,8 +53,20 @@ impl GatewaySettings {
         reqwest::Url::parse(&settings.telegram_webhook_url)
             .map_err(|e| anyhow::anyhow!("MIKA_TELEGRAM_WEBHOOK_URL is not a valid URL: {e}"))?;
 
+        // Validate tokens are fixed-length hex (eliminates constant_time_eq length timing leak)
+        validate_hex_token(&settings.internal_token, "MIKA_INTERNAL_TOKEN")?;
+        validate_hex_token(&settings.telegram_webhook_secret, "MIKA_TELEGRAM_WEBHOOK_SECRET")?;
+
         Ok(settings)
     }
+}
+
+fn validate_hex_token(token: &SecretString, name: &str) -> anyhow::Result<()> {
+    let val = token.expose_secret();
+    if val.len() != 64 || !val.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("{name} must be exactly 64 hex characters (32 bytes hex-encoded)");
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for GatewaySettings {
@@ -82,9 +94,9 @@ mod tests {
             GatewaySettings {
                 database_url: SecretString::from("postgres://user:pass@localhost/db"),
                 telegram_bot_token: SecretString::from("123:ABC"),
-                telegram_webhook_secret: SecretString::from("secret"),
+                telegram_webhook_secret: SecretString::from("a".repeat(64)),
                 telegram_webhook_url: "https://example.com/webhook".to_string(),
-                internal_token: SecretString::from("token-123"),
+                internal_token: SecretString::from("b".repeat(64)),
                 gateway_port: 8080,
                 log_level: "info".to_string(),
             }

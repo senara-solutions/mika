@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
 use tracing::warn;
 
@@ -22,7 +23,7 @@ pub trait MessageSender: Send + Sync {
 pub struct GatewayMessageSender {
     client: reqwest::Client,
     gateway_url: String,
-    internal_token: String,
+    internal_token: SecretString,
     db: AsyncDatabase,
     request_id: Option<String>,
 }
@@ -30,7 +31,7 @@ pub struct GatewayMessageSender {
 impl GatewayMessageSender {
     pub fn new(
         gateway_url: String,
-        internal_token: String,
+        internal_token: SecretString,
         db: AsyncDatabase,
         client: reqwest::Client,
         request_id: Option<String>,
@@ -48,7 +49,7 @@ impl GatewayMessageSender {
         let resp = self
             .client
             .post(format!("{}/send", self.gateway_url))
-            .bearer_auth(&self.internal_token)
+            .bearer_auth(self.internal_token.expose_secret())
             .json(payload)
             .timeout(Duration::from_secs(10))
             .send()

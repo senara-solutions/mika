@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     // Connect to Postgres
     let pool = sqlx::postgres::PgPoolOptions::new()
         .min_connections(2)
-        .max_connections(10)
+        .max_connections(20)
         .acquire_timeout(std::time::Duration::from_secs(1))
         .connect(settings.database_url.expose_secret())
         .await?;
@@ -66,6 +66,8 @@ async fn main() -> Result<()> {
         internal_token: settings.internal_token.clone(),
         webhook_secret: settings.telegram_webhook_secret.clone(),
         ready: ready.clone(),
+        // Capacity budget: 30 permits * 2 queries/task = 60 peak connection acquisitions.
+        // Pool of 20 connections provides sufficient headroom.
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
     };
 

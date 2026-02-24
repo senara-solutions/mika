@@ -15,6 +15,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+secrecy.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 

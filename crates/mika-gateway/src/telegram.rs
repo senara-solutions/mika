@@ -51,6 +51,9 @@ pub enum ParsedMessage {
         text: String,
         update_id: i64,
     },
+    BareStart {
+        chat_id: i64,
+    },
     Unsupported {
         chat_id: i64,
     },
@@ -69,7 +72,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
     match &message.text {
         Some(text) => {
             if text == "/start" {
-                return ParsedMessage::Unsupported { chat_id };
+                return ParsedMessage::BareStart { chat_id };
             }
             if let Some(payload) = text.strip_prefix("/start ") {
                 let token = payload.trim();
@@ -121,6 +124,7 @@ struct SetWebhookPayload {
     url: String,
     secret_token: String,
     allowed_updates: Vec<String>,
+    max_connections: u32,
 }
 
 /// Telegram API client wrapper.
@@ -192,6 +196,7 @@ impl TelegramClient {
             url: webhook_url.to_string(),
             secret_token: webhook_secret.to_string(),
             allowed_updates: vec!["message".to_string()],
+            max_connections: 30,
         };
 
         let resp = self
@@ -337,7 +342,7 @@ mod tests {
         };
         assert_eq!(
             parse_update(&update),
-            ParsedMessage::Unsupported { chat_id: 42 }
+            ParsedMessage::BareStart { chat_id: 42 }
         );
     }
 

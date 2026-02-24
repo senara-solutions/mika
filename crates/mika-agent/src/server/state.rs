@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mika_common::claude::ClaudeClient;
+use secrecy::SecretString;
 
 use crate::async_db::AsyncDatabase;
 use crate::scheduler::ReminderScheduler;
@@ -20,7 +21,7 @@ pub struct AppState {
     pub scheduler: Arc<ReminderScheduler>,
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,
     pub ready: Arc<AtomicBool>,
-    pub internal_token: String,
+    pub internal_token: SecretString,
     pub gateway_url: String,
     pub home_dir: PathBuf,
     pub startup_time: std::time::Instant,

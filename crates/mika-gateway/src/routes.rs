@@ -104,7 +104,7 @@ async fn handle_webhook(
         Ok(p) => p,
         Err(_) => {
             warn!("webhook at capacity, shedding load");
-            return StatusCode::OK;
+            return StatusCode::SERVICE_UNAVAILABLE;
         }
     };
 
@@ -128,8 +128,17 @@ async fn handle_webhook(
             } => {
                 handle_text_message(&s, chat_id, &text, update_id).await;
             }
+            ParsedMessage::BareStart { chat_id } => {
+                let _ = s
+                    .telegram
+                    .send_message(
+                        chat_id,
+                        "Welcome! If you have an invite link, please use it to get started. If you're already set up, just type a message.",
+                    )
+                    .await;
+            }
             ParsedMessage::Unsupported { chat_id } => {
-                // Fire-and-forget reply for non-text messages
+                // Fire-and-forget reply for non-text media (photo/sticker/voice)
                 let _ = s
                     .telegram
                     .send_message(
@@ -236,7 +245,15 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
             reply_transient_error(&state.telegram, chat_id).await;
         }
         Err(e) => {
-            warn!(error = %e, customer_id = %row.id, "container unreachable");
+            // Reset dedup so Telegram retry can succeed (CAS prevents incorrect rollback)
+            let _ = sqlx::query(
+                "UPDATE customers SET last_update_id = last_update_id - 1 WHERE id = $1 AND last_update_id = $2",
+            )
+            .bind(row.id)
+            .bind(update_id)
+            .execute(&state.pool)
+            .await;
+            warn!(error = %e, customer_id = %row.id, "container unreachable, dedup reset");
             reply_transient_error(&state.telegram, chat_id).await;
         }
     }
@@ -306,13 +323,14 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
                 .await;
         }
         Err(e) => {
-            // Unique violation on telegram_chat_id — this Telegram account is already paired
             if let Some(db_err) = e.as_database_error() {
                 if db_err.code().as_deref() == Some("23505") {
-                    let _ = state
-                        .telegram
-                        .send_message(chat_id, "This Telegram account is already linked to another account.")
-                        .await;
+                    let msg = if db_err.constraint().is_some_and(|c| c.contains("telegram_chat_id")) {
+                        "This Telegram account is already linked to another account."
+                    } else {
+                        "Pairing failed. Please contact support."
+                    };
+                    let _ = state.telegram.send_message(chat_id, msg).await;
                     return;
                 }
             }
@@ -368,9 +386,12 @@ async fn handle_send(
         .send_message(payload.chat_id, &payload.text)
         .await
     {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => {
+            info!(chat_id = payload.chat_id, request_id = ?payload.request_id, "sent to telegram");
+            StatusCode::OK.into_response()
+        }
         Err(TelegramApiError::BotBlocked) => {
-            warn!(chat_id = payload.chat_id, "bot blocked by user");
+            warn!(chat_id = payload.chat_id, request_id = ?payload.request_id, "bot blocked by user");
             StatusCode::GONE.into_response()
         }
         Err(TelegramApiError::RateLimited { retry_after }) => {
@@ -381,7 +402,7 @@ async fn handle_send(
             (StatusCode::TOO_MANY_REQUESTS, resp_headers).into_response()
         }
         Err(e) => {
-            warn!(chat_id = payload.chat_id, error = %e, "telegram send failed");
+            warn!(chat_id = payload.chat_id, request_id = ?payload.request_id, error = %e, "telegram send failed");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -391,20 +412,18 @@ async fn handle_send(
 struct SendPayload {
     chat_id: i64,
     text: String,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 // -- Health handlers --
 
 /// GET /livez — K8s liveness probe (no auth, no DB).
 ///
-/// Returns 200 if the process is alive. Does not check Postgres —
-/// avoids false-positive restarts under pool exhaustion.
-async fn handle_liveness(State(state): State<AppState>) -> StatusCode {
-    if state.ready.load(Ordering::Acquire) {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
+/// Returns 200 unconditionally — the fact that HTTP is responding proves liveness.
+/// Readiness (ready flag + DB) is checked by /readyz.
+async fn handle_liveness() -> StatusCode {
+    StatusCode::OK
 }
 
 /// GET /readyz, /health — K8s readiness probe (no auth).

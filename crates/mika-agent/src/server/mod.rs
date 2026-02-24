@@ -157,6 +157,7 @@ mod tests {
     use crate::test_utils::test_helpers::test_async_db;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use secrecy::SecretString;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -181,7 +182,7 @@ mod tests {
             scheduler,
             agent_lock: Arc::new(tokio::sync::Mutex::new(())),
             ready: Arc::new(AtomicBool::new(false)),
-            internal_token: "test-token-secret".to_string(),
+            internal_token: SecretString::from("test-token-secret"),
             gateway_url: "http://localhost:9999".to_string(),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             startup_time: std::time::Instant::now(),

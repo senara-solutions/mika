@@ -1,4 +1,5 @@
 use config::{Config, Environment, File};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,7 @@ pub struct Settings {
 
     /// Internal bearer token for gateway ↔ container auth
     #[serde(default)]
-    pub internal_token: Option<String>,
+    pub internal_token: Option<SecretString>,
 
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
@@ -95,6 +96,16 @@ impl Settings {
         // If db_path is still the default "mika.db", resolve it to ~/.mika/data/mika.db
         if settings.db_path == Path::new("mika.db") {
             settings.db_path = home_dir.join("data").join("mika.db");
+        }
+
+        // Validate internal_token format if present (fixed-length eliminates timing leak)
+        if let Some(ref token) = settings.internal_token {
+            let val = token.expose_secret();
+            if val.len() != 64 || !val.bytes().all(|b| b.is_ascii_hexdigit()) {
+                anyhow::bail!(
+                    "MIKA_INTERNAL_TOKEN must be exactly 64 hex characters (32 bytes hex-encoded)"
+                );
+            }
         }
 
         Ok(settings)
