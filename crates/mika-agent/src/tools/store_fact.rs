@@ -43,7 +43,11 @@ impl Tool for StoreFactTool {
                     },
                     "due_date": {
                         "type": "string",
-                        "description": "ISO date, e.g. '2026-03-01' (commitment, event)"
+                        "description": "ISO date for commitments, e.g. '2026-03-01'"
+                    },
+                    "event_date": {
+                        "type": "string",
+                        "description": "ISO date for events, e.g. '2026-04-15'"
                     },
                     "key": {
                         "type": "string",
@@ -189,10 +193,13 @@ fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         return Ok(err);
     }
 
-    let due_date = input["due_date"].as_str();
+    // Prefer event_date, fall back to due_date for backward compatibility
+    let event_date = input["event_date"]
+        .as_str()
+        .or_else(|| input["due_date"].as_str());
     let notes = input["notes"].as_str();
 
-    ctx.db.add_event(description, due_date, notes)?;
+    ctx.db.add_event(description, event_date, notes)?;
 
     let target = format!("event:{description}");
     ctx.db.log_memory_event(
@@ -212,23 +219,8 @@ fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::test_utils::test_helpers::{test_ctx, test_db};
     use std::sync::atomic::AtomicU32;
-
-    fn test_db() -> Database {
-        Database::open_in_memory().unwrap()
-    }
-
-    fn test_ctx<'a>(db: &'a Database, edit_count: &'a AtomicU32) -> ToolContext<'a> {
-        static HOME_DIR: &str = "/tmp/mika-test";
-        ToolContext {
-            db,
-            session_id: "test-session",
-            home_dir: std::path::Path::new(HOME_DIR),
-            core_memory_edit_count: edit_count,
-            is_onboarding: false,
-        }
-    }
 
     #[tokio::test]
     async fn test_store_person() {
@@ -306,7 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_event() {
+    async fn test_store_event_with_event_date() {
         let db = test_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
@@ -317,7 +309,7 @@ mod tests {
                 serde_json::json!({
                     "category": "event",
                     "description": "Board meeting",
-                    "due_date": "2026-04-15"
+                    "event_date": "2026-04-15"
                 }),
                 &ctx,
             )
@@ -325,6 +317,29 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Board meeting"));
+    }
+
+    #[tokio::test]
+    async fn test_store_event_due_date_fallback() {
+        let db = test_db();
+        let counter = AtomicU32::new(0);
+        let ctx = test_ctx(&db, &counter);
+        let tool = StoreFactTool;
+
+        // Backward compatibility: due_date still works for events
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "category": "event",
+                    "description": "Team offsite",
+                    "due_date": "2026-05-01"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Team offsite"));
     }
 
     #[tokio::test]

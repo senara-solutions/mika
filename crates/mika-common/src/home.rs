@@ -135,9 +135,11 @@ understanding when starting fresh.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
 
     #[test]
+    #[serial]
     fn test_resolve_home_dir_with_mika_home() {
         // Safety: test sets env var; no other thread reads this.
         unsafe { std::env::set_var("MIKA_HOME", "/tmp/test-mika-home") };
@@ -147,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_home_dir_default() {
         // Safety: test removes env var; no other thread reads this.
         unsafe { std::env::remove_var("MIKA_HOME") };

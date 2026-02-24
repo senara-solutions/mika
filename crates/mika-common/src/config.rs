@@ -17,7 +17,7 @@ pub struct Settings {
 
     /// SQLite database path
     #[serde(default = "default_db_path")]
-    pub db_path: String,
+    pub db_path: PathBuf,
 
     /// Log level
     #[serde(default = "default_log_level")]
@@ -44,8 +44,8 @@ fn default_max_tokens() -> u32 {
     4096
 }
 
-fn default_db_path() -> String {
-    "mika.db".to_string()
+fn default_db_path() -> PathBuf {
+    PathBuf::from("mika.db")
 }
 
 fn default_log_level() -> String {
@@ -81,12 +81,8 @@ impl Settings {
         settings.home_dir = home_dir.to_path_buf();
 
         // If db_path is still the default "mika.db", resolve it to ~/.mika/data/mika.db
-        if settings.db_path == "mika.db" {
-            settings.db_path = home_dir
-                .join("data")
-                .join("mika.db")
-                .to_string_lossy()
-                .to_string();
+        if settings.db_path == Path::new("mika.db") {
+            settings.db_path = home_dir.join("data").join("mika.db");
         }
 
         Ok(settings)
@@ -135,7 +131,7 @@ mod tests {
         assert_eq!(settings.log_level, "info");
         // db_path should resolve to home_dir/data/mika.db
         let expected_db = tmp.path().join("data").join("mika.db");
-        assert_eq!(settings.db_path, expected_db.to_string_lossy());
+        assert_eq!(settings.db_path, expected_db);
         assert_eq!(settings.home_dir, tmp.path());
     }
 
@@ -186,7 +182,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::load(tmp.path()).unwrap();
-        assert_eq!(settings.db_path, "/custom/path.db");
+        assert_eq!(settings.db_path, PathBuf::from("/custom/path.db"));
 
         unsafe { std::env::remove_var("MIKA_DB_PATH") };
     }

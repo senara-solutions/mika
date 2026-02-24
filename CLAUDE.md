@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with encrypted SQLite storage. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
+Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with plaintext SQLite storage on K8s encrypted volumes. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
 
 **Current phase:** Phase 1 — agent core with CLI test harness.
 
@@ -35,12 +35,13 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Data at rest:** Plaintext SQLite on K8s encrypted volumes. Per-customer container isolation. Case-insensitive COLLATE NOCASE on unique text columns.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque.
-- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding }`.
+- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender }`. Tool trait uses `#[async_trait(?Send)]` (futures are NOT Send).
+- **Async DB:** `AsyncDatabase` wraps sync `Database` with `Arc<Mutex<Database>>` + `tokio::task::spawn_blocking`. Clone-able, Send+Sync. Not yet integrated into agent loop (Phase 2).
 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (32 tests)
+- `cargo test` — Run all tests (127 tests)
 - `cargo run --bin mika-cli` — Run CLI test harness
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
@@ -55,6 +56,11 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
 - **Audit log:** `memory_events` table tracks all memory mutations per session
+- **Conversation compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt (not message history). Runs inline post-turn in CLI.
+- **Silent mode agent loop:** Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
+- **MessageSender trait:** `#[async_trait(?Send)]` for outbound messaging. CLI prints to stdout. Phase 2 will add Telegram/WhatsApp senders.
+- **Reminder scheduler:** `ReminderScheduler::recover()` fires past-due reminders on startup via silent agent. Future reminders logged but not timer-scheduled (Phase 2).
+- **Schema version:** 5 (v5 adds: reminders, heartbeat_sends, customer_config, failed_sends tables; compacted_through_id column on conversations)
 
 ## Environment Variables
 
@@ -63,7 +69,8 @@ See `.env.example` for the full list. Required:
 
 ## Pending Work
 
-- `todos/027-pending-p1-sync-sqlite-blocking-tokio.md` — Wrap sync SQLite in async (needed before Phase 2 HTTP server)
+- **Phase 2 — HTTP server:** Integrate AsyncDatabase into agent loop, add Telegram/WhatsApp channel adapters, timer-based reminder scheduling, gateway routing
+- `todos/027-ready-p1-sync-sqlite-blocking-tokio.md` — ~~Wrap sync SQLite in async~~ Done: `async_db.rs` created, integration deferred to Phase 2
 
 ## Reference Repositories
 

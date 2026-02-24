@@ -109,10 +109,30 @@ impl Tool for SearchMemoryTool {
         // Search preferences
         if category == "all" || category == "preference" {
             let prefs = ctx.db.list_preferences()?;
-            for (cat, val) in prefs {
-                let searchable = format!("{cat} {val}");
+            for pref in prefs {
+                let searchable = format!("{} {}", pref.category, pref.value);
                 if searchable.to_lowercase().contains(&query_lower) {
-                    results.push(format!("[preference] {cat}: {val}"));
+                    results.push(format!("[preference] {}: {}", pref.category, pref.value));
+                }
+            }
+        }
+
+        // Search events
+        if category == "all" || category == "event" {
+            let events = ctx.db.list_events()?;
+            for event in events {
+                let searchable = format!(
+                    "{} {} {}",
+                    event.description,
+                    event.event_date.as_deref().unwrap_or(""),
+                    event.context.as_deref().unwrap_or("")
+                );
+                if searchable.to_lowercase().contains(&query_lower) {
+                    let mut desc = format!("[event] {}", event.description);
+                    if let Some(ref date) = event.event_date {
+                        desc.push_str(&format!(" ({date})"));
+                    }
+                    results.push(desc);
                 }
             }
         }
@@ -134,23 +154,8 @@ impl Tool for SearchMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::test_utils::test_helpers::{test_ctx, test_db};
     use std::sync::atomic::AtomicU32;
-
-    fn test_db() -> Database {
-        Database::open_in_memory().unwrap()
-    }
-
-    fn test_ctx<'a>(db: &'a Database, edit_count: &'a AtomicU32) -> ToolContext<'a> {
-        static HOME_DIR: &str = "/tmp/mika-test";
-        ToolContext {
-            db,
-            session_id: "test-session",
-            home_dir: std::path::Path::new(HOME_DIR),
-            core_memory_edit_count: edit_count,
-            is_onboarding: false,
-        }
-    }
 
     #[tokio::test]
     async fn test_search_finds_person() {
@@ -274,5 +279,41 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Meeting time"));
         assert!(result.content.contains("Morning"));
+    }
+
+    #[tokio::test]
+    async fn test_search_finds_event_by_description() {
+        let db = test_db();
+        db.add_event(
+            "Board meeting with investors",
+            Some("2026-03-15"),
+            Some("quarterly review"),
+        )
+        .unwrap();
+        let counter = AtomicU32::new(0);
+        let ctx = test_ctx(&db, &counter);
+        let tool = SearchMemoryTool;
+
+        // Search by description substring
+        let result = tool
+            .execute(serde_json::json!({"query": "investors"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("[event]"));
+        assert!(result.content.contains("Board meeting with investors"));
+        assert!(result.content.contains("2026-03-15"));
+
+        // Search with event category filter
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "board", "category": "event"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("[event]"));
+        assert!(!result.content.contains("[person]"));
     }
 }
