@@ -9,11 +9,11 @@ dependencies: []
 # Database Migrations Lack Transaction Wrapping
 
 ## Problem Statement
-`migrate_v1()`, `migrate_v2()`, and `migrate_v3()` use `execute_batch` without wrapping in explicit transactions. A partial failure leaves the database in an inconsistent state (some tables created, version not bumped).
+`migrate_v1()`, `migrate_v2()`, `migrate_v3()`, and `migrate_v4()` use `execute_batch` without wrapping in explicit transactions. A partial failure leaves the database in an inconsistent state (some tables created, version not bumped). `migrate_v4()` is especially risky — it DROPs all tables and recreates them.
 
-**Location:** `crates/mika-agent/src/db.rs` - migrate_v1, migrate_v2, migrate_v3
+**Location:** `crates/mika-agent/src/db.rs` — migrate_v1 through migrate_v4
 
-**Reported by:** pattern-recognition-specialist
+**Reported by:** pattern-recognition-specialist, performance-oracle, learnings-researcher, architecture-strategist
 
 ## Proposed Solutions
 
@@ -29,3 +29,4 @@ dependencies: []
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from multi-agent code review | |
+| 2026-02-24 | Re-confirmed in encryption-strip review — now includes migrate_v4() which DROPs all tables | 4 agents flagged this |

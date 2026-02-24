@@ -9,7 +9,7 @@ dependencies: []
 # Test Helper Duplication Across 4 Modules
 
 ## Problem Statement
-`test_key()`, `test_db()`, and `test_ctx()` functions are duplicated across db.rs, store_fact.rs, search_memory.rs, and update_core_memory.rs (~80 lines of identical code).
+`test_db()` and `test_ctx()` functions are duplicated across db.rs, store_fact.rs, search_memory.rs, and update_core_memory.rs (~60 lines of identical code). `test_key()` was removed during the encryption strip refactor, but the remaining helpers are still duplicated 4x.
 
 **Reported by:** pattern-recognition-specialist
 
@@ -31,3 +31,4 @@ Add `#[cfg(test)] pub mod test_utils` to lib.rs with shared test helpers.
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from multi-agent code review | |
+| 2026-02-24 | test_key() removed by encryption strip. test_db() and test_ctx() still duplicated 4x | code-simplicity-reviewer, learnings-researcher |

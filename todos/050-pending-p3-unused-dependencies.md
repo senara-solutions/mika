@@ -25,3 +25,4 @@ dependencies: []
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from multi-agent code review | |
+| 2026-02-24 | ring, zeroize, hex removed by encryption strip. chrono/uuid status unchanged. | code-simplicity-reviewer |
