@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "052"
 tags: [code-review, performance, crypto, rust-v2]
@@ -23,3 +23,4 @@ Cache the `hmac::Key` in the `EncryptionKey` struct alongside `cached_key`.
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from multi-agent code review | Individually ~100ns per call, adds up in search |
+| 2026-02-24 | Resolved — HMAC removed entirely in encryption strip refactor | No HMAC code remains |

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "041"
 tags: [code-review, security, database, rust-v2]
@@ -46,3 +46,4 @@ Store both `target_key_hash` (HMAC) and `target_key_encrypted` (AES).
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from multi-agent code review | |
+| 2026-02-24 | Resolved — encryption stripped, all columns plaintext by design | No longer a concern |

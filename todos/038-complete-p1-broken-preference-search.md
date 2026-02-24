@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "038"
 tags: [code-review, bug, tools, rust-v2]
@@ -50,3 +50,5 @@ Index preference keys and values in a full-text search table.
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from multi-agent code review | Preference search was known gap per code comment |
+| 2026-02-24 | Re-confirmed in encryption-strip review — simpler fix now (plaintext, no HMAC). Need `list_preferences()` in db.rs, then substring match in search_memory.rs | 3 agents flagged: agent-native-reviewer, code-simplicity-reviewer, performance-oracle |
+| 2026-02-24 | Fixed — added `list_preferences()` to db.rs, updated search_memory.rs to use substring matching, added test_search_finds_preference_by_value_substring | Verified: searches "shellfish" finds Food preference, searches "meeting" finds Meeting time |
