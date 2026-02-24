@@ -116,14 +116,16 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
     // Log audit event with before_value
     let target = format!("commitment:{id}");
     let after = format!("status -> {status}");
-    ctx.db.log_memory_event(
-        ctx.session_id,
-        "update_fact",
-        &target,
-        before_status.as_deref(),
-        &after,
-        None,
-    ).await?;
+    ctx.db
+        .log_memory_event(
+            ctx.session_id,
+            "update_fact",
+            &target,
+            before_status.as_deref(),
+            &after,
+            None,
+        )
+        .await?;
 
     Ok(ToolOutput::success(format!(
         "Updated commitment (id:{id}) status to '{status}'."
@@ -133,18 +135,17 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_update_commitment_completed() {
-        let db = test_async_db();
-        let id = db
+        let harness = TestHarness::new();
+        let id = harness
+            .db
             .add_commitment("Review Q4 budget", Some("2026-03-01"), None)
             .await
             .unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -161,17 +162,20 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("completed"));
 
-        let commitments = db.list_commitments("completed").await.unwrap();
+        let commitments = harness.db.list_commitments("completed").await.unwrap();
         assert_eq!(commitments.len(), 1);
         assert_eq!(commitments[0].description, "Review Q4 budget");
     }
 
     #[tokio::test]
     async fn test_update_commitment_cancelled() {
-        let db = test_async_db();
-        let id = db.add_commitment("Cancel this task", None, None).await.unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Cancel this task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -187,16 +191,19 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let commitments = db.list_commitments("cancelled").await.unwrap();
+        let commitments = harness.db.list_commitments("cancelled").await.unwrap();
         assert_eq!(commitments.len(), 1);
     }
 
     #[tokio::test]
     async fn test_update_commitment_invalid_status() {
-        let db = test_async_db();
-        let id = db.add_commitment("Some task", None, None).await.unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Some task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -216,9 +223,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fact_missing_id() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -237,9 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fact_invalid_category() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -259,10 +264,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fact_logs_audit() {
-        let db = test_async_db();
-        let id = db.add_commitment("Audit test task", None, None).await.unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Audit test task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         tool.execute(
@@ -276,7 +284,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_memory_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_fact");
         assert!(events[0].target_key.starts_with("commitment:"));
@@ -285,9 +293,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fact_negative_id_rejected() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -302,14 +309,17 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("'id' is required and must be a positive integer"));
+        assert!(
+            result
+                .content
+                .contains("'id' is required and must be a positive integer")
+        );
     }
 
     #[tokio::test]
     async fn test_update_fact_nonexistent_commitment() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         let result = tool
@@ -329,10 +339,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fact_audit_captures_before_value() {
-        let db = test_async_db();
-        let id = db.add_commitment("Before-value test", None, None).await.unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Before-value test", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = UpdateFactTool;
 
         tool.execute(
@@ -346,7 +359,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_memory_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].before_value.as_deref(),

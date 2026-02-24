@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 use std::path::Path;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;

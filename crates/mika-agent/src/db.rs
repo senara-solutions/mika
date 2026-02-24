@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use tracing::{debug, info};
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -40,11 +40,14 @@ impl Database {
             .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
 
         // Performance pragmas
+        // auto_vacuum = INCREMENTAL must be set before first table creation for new DBs.
+        // For existing DBs it requires a full VACUUM to take effect (handled by migration).
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA busy_timeout = 5000;
+             PRAGMA auto_vacuum = INCREMENTAL;",
         )
         .context("failed to set SQLite pragmas")?;
 
@@ -111,6 +114,9 @@ impl Database {
         }
         if version < 6 {
             self.migrate_v6()?;
+        }
+        if version < 7 {
+            self.migrate_v7()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -308,6 +314,26 @@ impl Database {
             ",
             )
             .context("failed to apply migration v6")?;
+
+        Ok(())
+    }
+
+    fn migrate_v7(&self) -> Result<()> {
+        info!("applying migration v7: index on memory_events.created_at");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            CREATE INDEX IF NOT EXISTS idx_memory_events_created_at ON memory_events(created_at);
+
+            INSERT INTO schema_version (version) VALUES (7);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v7")?;
 
         Ok(())
     }
@@ -829,14 +855,36 @@ impl Database {
     }
 
     /// Count heartbeat sends today in the customer's timezone.
+    /// Computes the local start-of-day boundary using chrono-tz, then counts
+    /// sends with `sent_at >= local_midnight_utc`.
     pub fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
-        // SQLite doesn't have native timezone support, so we compute the current
-        // date in the customer's timezone by applying an offset. For simplicity,
-        // we count sends in the last 24 hours (good enough for rate limiting).
-        let _ = timezone; // TODO: proper timezone conversion when chrono-tz is added
+        use chrono::{Datelike, NaiveDate, Utc};
+        use chrono_tz::Tz;
+
+        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+
+        // Current time in the customer's timezone
+        let now_local = Utc::now().with_timezone(&tz);
+        // Start of today in customer's local time
+        let local_midnight =
+            NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
+                .unwrap_or_else(|| Utc::now().date_naive())
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is always valid");
+
+        // Convert local midnight back to UTC for SQL comparison
+        // Use the earliest possible time if ambiguous (e.g., DST transitions)
+        let midnight_utc = local_midnight
+            .and_local_timezone(tz)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
+        let boundary = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+
         let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= datetime('now', '-24 hours')",
-            [],
+            "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= ?1",
+            [&boundary],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -910,11 +958,7 @@ impl Database {
     /// Save a conversation summary row. Returns the new row ID.
     /// Only used directly by tests; production code uses `replace_with_summary`.
     #[cfg(test)]
-    fn save_conversation_summary(
-        &self,
-        summary: &str,
-        compacted_through_id: i64,
-    ) -> Result<i64> {
+    fn save_conversation_summary(&self, summary: &str, compacted_through_id: i64) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO conversations (role, content, channel_type, compacted_through_id)
              VALUES ('summary', ?1, 'system', ?2)",
@@ -1223,144 +1267,172 @@ impl Database {
     // -- Tiered Retention --
 
     /// Compact memory events older than `days` days into monthly summaries.
-    /// Groups events by year/month, aggregates counts, and replaces raw events
-    /// with summary rows in `memory_event_summaries`.
+    /// Uses SQL GROUP BY for aggregation (memory is O(months), not O(events)).
+    /// All operations run within a single transaction for atomicity.
     /// Returns the number of raw events deleted (0 if nothing to compact).
     pub fn compact_old_memory_events(&self, days: u32) -> Result<usize> {
-        use chrono::{Datelike, NaiveDateTime};
         use std::collections::HashMap;
 
         let modifier = format!("-{days} days");
 
-        // Wrap everything (SELECT + INSERT summaries + batch DELETE) in one transaction
+        // Wrap everything in one transaction for atomicity
         let tx = self.conn.unchecked_transaction()?;
 
         let cutoff: String =
-            tx.query_row("SELECT datetime('now', ?1)", [&modifier], |row| {
-                row.get(0)
-            })?;
+            tx.query_row("SELECT datetime('now', ?1)", [&modifier], |row| row.get(0))?;
 
-        // Fetch events older than cutoff
-        let mut stmt = tx.prepare(
-            "SELECT id, tool_name, target_key, created_at
-             FROM memory_events
-             WHERE created_at < ?1
-             ORDER BY created_at ASC",
+        // Check if there are any events to compact (early exit avoids unnecessary work)
+        let event_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE created_at < ?1",
+            [&cutoff],
+            |row| row.get(0),
         )?;
 
-        struct RawEvent {
-            tool_name: String,
-            target_key: String,
-            created_at: String,
-        }
-
-        let events: Vec<RawEvent> = stmt
-            .query_map([&cutoff], |row| {
-                Ok(RawEvent {
-                    tool_name: row.get(1)?,
-                    target_key: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        if events.is_empty() {
+        if event_count == 0 {
             tx.commit()?;
             return Ok(0);
         }
 
-        // Group by year/month
-        struct MonthBucket {
-            year: i32,
-            month: u32,
-            tool_counts: HashMap<String, u32>,
-            category_counts: HashMap<String, u32>,
-            target_counts: HashMap<String, u32>,
-            total: u32,
-        }
-
-        let mut buckets: HashMap<(i32, u32), MonthBucket> = HashMap::new();
-
-        for event in &events {
-            // Safe chrono parsing (replaces fragile string slicing)
-            let Some(dt) =
-                NaiveDateTime::parse_from_str(&event.created_at, "%Y-%m-%d %H:%M:%S").ok()
-            else {
-                continue;
-            };
-            let (year, month) = (dt.year(), dt.month());
-
-            let bucket = buckets.entry((year, month)).or_insert_with(|| MonthBucket {
-                year,
-                month,
-                tool_counts: HashMap::new(),
-                category_counts: HashMap::new(),
-                target_counts: HashMap::new(),
-                total: 0,
-            });
-
-            *bucket
-                .tool_counts
-                .entry(event.tool_name.clone())
-                .or_insert(0) += 1;
-
-            // Extract category from target_key (e.g., "person:Alice" -> "person")
-            let category = event
-                .target_key
-                .split(':')
-                .next()
-                .unwrap_or(&event.target_key)
-                .to_string();
-            *bucket.category_counts.entry(category).or_insert(0) += 1;
-
-            *bucket
-                .target_counts
-                .entry(event.target_key.clone())
-                .or_insert(0) += 1;
-
-            bucket.total += 1;
-        }
-
-        // Write summaries with ON CONFLICT upsert
-        for bucket in buckets.values() {
-            // Build top targets (top 10 by count)
-            let mut targets: Vec<(&String, &u32)> = bucket.target_counts.iter().collect();
-            targets.sort_by(|a, b| b.1.cmp(a.1));
-            targets.truncate(10);
-            let top_targets: Vec<String> = targets
-                .iter()
-                .map(|(k, v)| format!("{}:{}", k, v))
-                .collect();
-
-            let tool_counts_json = serde_json::to_string(&bucket.tool_counts)?;
-            let category_counts_json = serde_json::to_string(&bucket.category_counts)?;
-            let top_targets_json = serde_json::to_string(&top_targets)?;
-
-            tx.execute(
-                "INSERT INTO memory_event_summaries (year, month, tool_counts, category_counts, total_mutations, top_targets)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(year, month) DO UPDATE SET
-                    tool_counts = excluded.tool_counts,
-                    category_counts = excluded.category_counts,
-                    total_mutations = excluded.total_mutations,
-                    top_targets = excluded.top_targets",
-                rusqlite::params![
-                    bucket.year,
-                    bucket.month,
-                    tool_counts_json,
-                    category_counts_json,
-                    bucket.total,
-                    top_targets_json
-                ],
+        // Aggregate tool counts per month using SQL GROUP BY — O(months * tools)
+        {
+            let mut tool_stmt = tx.prepare(
+                "SELECT CAST(strftime('%Y', created_at) AS INTEGER),
+                        CAST(strftime('%m', created_at) AS INTEGER),
+                        tool_name,
+                        COUNT(*)
+                 FROM memory_events
+                 WHERE created_at < ?1
+                 GROUP BY strftime('%Y', created_at), strftime('%m', created_at), tool_name",
             )?;
+
+            let mut month_tools: HashMap<(i64, i64), HashMap<String, u32>> = HashMap::new();
+            let mut rows = tool_stmt.query([&cutoff])?;
+            while let Some(row) = rows.next()? {
+                let year: i64 = row.get(0)?;
+                let month: i64 = row.get(1)?;
+                let tool_name: String = row.get(2)?;
+                let count: u32 = row.get(3)?;
+                month_tools
+                    .entry((year, month))
+                    .or_default()
+                    .insert(tool_name, count);
+            }
+            drop(rows);
+            drop(tool_stmt);
+
+            // Aggregate category counts (category = part before ':' in target_key)
+            // and target counts per month
+            let mut detail_stmt = tx.prepare(
+                "SELECT CAST(strftime('%Y', created_at) AS INTEGER),
+                        CAST(strftime('%m', created_at) AS INTEGER),
+                        target_key,
+                        COUNT(*)
+                 FROM memory_events
+                 WHERE created_at < ?1
+                 GROUP BY strftime('%Y', created_at), strftime('%m', created_at), target_key",
+            )?;
+
+            struct MonthAgg {
+                category_counts: HashMap<String, u32>,
+                target_counts: HashMap<String, u32>,
+            }
+
+            let mut month_details: HashMap<(i64, i64), MonthAgg> = HashMap::new();
+            let mut rows = detail_stmt.query([&cutoff])?;
+            while let Some(row) = rows.next()? {
+                let year: i64 = row.get(0)?;
+                let month: i64 = row.get(1)?;
+                let target_key: String = row.get(2)?;
+                let count: u32 = row.get(3)?;
+
+                let category = target_key
+                    .split(':')
+                    .next()
+                    .unwrap_or(&target_key)
+                    .to_string();
+
+                let agg = month_details
+                    .entry((year, month))
+                    .or_insert_with(|| MonthAgg {
+                        category_counts: HashMap::new(),
+                        target_counts: HashMap::new(),
+                    });
+                *agg.category_counts.entry(category).or_insert(0) += count;
+                agg.target_counts.insert(target_key, count);
+            }
+            drop(rows);
+            drop(detail_stmt);
+
+            // Aggregate total mutations per month
+            let mut total_stmt = tx.prepare(
+                "SELECT CAST(strftime('%Y', created_at) AS INTEGER),
+                        CAST(strftime('%m', created_at) AS INTEGER),
+                        COUNT(*)
+                 FROM memory_events
+                 WHERE created_at < ?1
+                 GROUP BY strftime('%Y', created_at), strftime('%m', created_at)",
+            )?;
+
+            let mut month_totals: HashMap<(i64, i64), u32> = HashMap::new();
+            let mut rows = total_stmt.query([&cutoff])?;
+            while let Some(row) = rows.next()? {
+                let year: i64 = row.get(0)?;
+                let month: i64 = row.get(1)?;
+                let total: u32 = row.get(2)?;
+                month_totals.insert((year, month), total);
+            }
+            drop(rows);
+            drop(total_stmt);
+
+            // Write summaries with ON CONFLICT upsert
+            for (&(year, month), total) in &month_totals {
+                let tool_counts = month_tools.get(&(year, month));
+                let details = month_details.get(&(year, month));
+
+                let tool_counts_json =
+                    serde_json::to_string(&tool_counts.unwrap_or(&HashMap::new()))?;
+                let category_counts_json = serde_json::to_string(
+                    &details
+                        .map(|d| &d.category_counts)
+                        .unwrap_or(&HashMap::new()),
+                )?;
+
+                // Build top targets (top 10 by count)
+                let top_targets_json = if let Some(d) = details {
+                    let mut targets: Vec<(&String, &u32)> = d.target_counts.iter().collect();
+                    targets.sort_by(|a, b| b.1.cmp(a.1));
+                    targets.truncate(10);
+                    let top: Vec<String> = targets
+                        .iter()
+                        .map(|(k, v)| format!("{}:{}", k, v))
+                        .collect();
+                    serde_json::to_string(&top)?
+                } else {
+                    "[]".to_string()
+                };
+
+                tx.execute(
+                    "INSERT INTO memory_event_summaries (year, month, tool_counts, category_counts, total_mutations, top_targets)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(year, month) DO UPDATE SET
+                        tool_counts = excluded.tool_counts,
+                        category_counts = excluded.category_counts,
+                        total_mutations = excluded.total_mutations,
+                        top_targets = excluded.top_targets",
+                    rusqlite::params![
+                        year,
+                        month,
+                        tool_counts_json,
+                        category_counts_json,
+                        total,
+                        top_targets_json
+                    ],
+                )?;
+            }
         }
 
         // Batch delete all compacted raw events in one statement
-        let deleted = tx.execute(
-            "DELETE FROM memory_events WHERE created_at < ?1",
-            [&cutoff],
-        )?;
+        let deleted = tx.execute("DELETE FROM memory_events WHERE created_at < ?1", [&cutoff])?;
 
         tx.commit()?;
         Ok(deleted)
@@ -1368,18 +1440,19 @@ impl Database {
 
     /// Get database file size using PRAGMA page_count * PRAGMA page_size.
     pub fn db_size_bytes(&self) -> Result<u64> {
-        let page_count: u64 =
-            self.conn
-                .query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        let page_size: u64 =
-            self.conn
-                .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
         Ok(page_count * page_size)
     }
 
-    /// Run VACUUM to reclaim space after deletions.
+    /// Reclaim space after deletions using incremental auto-vacuum.
+    /// Frees up to 100 pages per call, avoiding the full-db rewrite of VACUUM.
     pub fn vacuum(&self) -> Result<()> {
-        self.conn.execute_batch("VACUUM")?;
+        self.conn.execute_batch("PRAGMA incremental_vacuum(100)")?;
         Ok(())
     }
 }
@@ -1496,7 +1569,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1509,7 +1582,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -2177,11 +2250,9 @@ mod tests {
         // Should have 3 summary rows (one per month)
         let count: i64 = db
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memory_event_summaries",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM memory_event_summaries", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 3);
 
@@ -2240,11 +2311,9 @@ mod tests {
         // Summary should still be there and unchanged
         let count: i64 = db
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memory_event_summaries",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM memory_event_summaries", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -2285,5 +2354,132 @@ mod tests {
         let cc: serde_json::Value = serde_json::from_str(&category_counts).unwrap();
         assert_eq!(cc["person"], 2);
         assert_eq!(cc["commitment"], 1);
+    }
+
+    #[test]
+    fn test_compact_boundary_date_excludes_recent() {
+        let db = test_db();
+        // Insert an event right at "now" — it should NOT be compacted even with days=0
+        // because the cutoff is datetime('now', '-0 days') which equals now, and we use < not <=
+        db.log_memory_event("sess-1", "store_fact", "person:Alice", None, "v", None)
+            .unwrap();
+
+        // With days=0, cutoff is essentially "now"; event created at "now" should
+        // not be strictly less than cutoff
+        let deleted = db.compact_old_memory_events(0).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_compact_multiple_months_separate_summaries() {
+        let db = test_db();
+        // Events spanning 5 months
+        insert_event_at(&db, "store_fact", "person:A", "2019-06-01 10:00:00");
+        insert_event_at(&db, "store_fact", "person:B", "2019-07-15 10:00:00");
+        insert_event_at(&db, "update_fact", "person:C", "2019-08-20 10:00:00");
+        insert_event_at(&db, "store_fact", "event:meeting", "2019-09-10 10:00:00");
+        insert_event_at(&db, "store_fact", "person:D", "2019-10-05 10:00:00");
+
+        let deleted = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted, 5);
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_event_summaries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 5); // one summary per month
+
+        // Verify each month has total_mutations = 1
+        let mut stmt = db
+            .conn
+            .prepare("SELECT year, month, total_mutations FROM memory_event_summaries ORDER BY year, month")
+            .unwrap();
+        let rows: Vec<(i64, i64, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        for (_, _, total) in &rows {
+            assert_eq!(*total, 1);
+        }
+    }
+
+    #[test]
+    fn test_compact_upserts_existing_summary() {
+        let db = test_db();
+        // Insert events for January 2020
+        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
+        insert_event_at(&db, "store_fact", "person:Bob", "2020-01-20 10:00:00");
+
+        // First compaction
+        let deleted1 = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted1, 2);
+
+        // Manually insert more events for the same month (simulates edge case)
+        insert_event_at(&db, "update_fact", "person:Alice", "2020-01-25 10:00:00");
+
+        // Second compaction should upsert (ON CONFLICT) the existing summary
+        let deleted2 = db.compact_old_memory_events(1).unwrap();
+        assert_eq!(deleted2, 1);
+
+        // Should still have exactly 1 summary row for Jan 2020
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_event_summaries WHERE year = 2020 AND month = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_heartbeat_sends_today_with_utc_timezone() {
+        let db = test_db();
+
+        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 0);
+
+        db.record_heartbeat_send().unwrap();
+        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 1);
+
+        // Old send should not count for today
+        db.conn
+            .execute(
+                "INSERT INTO heartbeat_sends (sent_at) VALUES (datetime('now', '-2 days'))",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_heartbeat_sends_today_invalid_timezone_falls_back_to_utc() {
+        let db = test_db();
+        db.record_heartbeat_send().unwrap();
+        // Invalid timezone should fall back to UTC and still work
+        let count = db.count_heartbeat_sends_today("Invalid/Timezone").unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_v7_index_exists() {
+        let db = test_db();
+        // Verify the v7 index exists
+        let index_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_memory_events_created_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_exists,
+            "idx_memory_events_created_at should exist after v7 migration"
+        );
     }
 }

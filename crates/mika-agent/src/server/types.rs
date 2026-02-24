@@ -16,14 +16,6 @@ pub struct AcceptedResponse {
     pub status: String,
 }
 
-/// Error response body.
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    pub error: String,
-}
-
 /// Inbound heartbeat trigger from the gateway/K8s CronJob.
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatRequest {

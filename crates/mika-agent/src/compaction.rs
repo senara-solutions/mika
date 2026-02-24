@@ -50,10 +50,7 @@ pub async fn maybe_compact(db: &AsyncDatabase, claude: &ClaudeClient) -> Result<
         &old_messages
     };
 
-    info!(
-        old_count = batch.len(),
-        total, "compacting conversation"
-    );
+    info!(old_count = batch.len(), total, "compacting conversation");
 
     let mut summary_text = summarize_messages(claude, batch, existing_summary.as_ref()).await?;
 

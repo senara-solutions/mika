@@ -3,6 +3,7 @@ use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{CORE_MEMORY_SECTIONS, Database, core_memory_section_names};
 use mika_agent::scheduler::ReminderScheduler;
+use mika_agent::startup;
 use mika_agent::tools;
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
@@ -40,17 +41,7 @@ async fn main() -> Result<()> {
     let db = Database::open(db_path).context("failed to open database")?;
 
     // Seed core memory if empty (first run or fresh database)
-    if db.get_all_core_memory()?.is_empty() {
-        // Load user.md content to seed user_summary if available
-        let user_md_path = home_dir.join("user.md");
-        let user_md_content = std::fs::read_to_string(&user_md_path).ok();
-        let user_md_ref = user_md_content.as_deref().filter(|s| {
-            // Only use user.md if the user actually edited it (not the default template)
-            !s.starts_with("# Tell Mika about yourself")
-        });
-        db.seed_core_memory(user_md_ref)?;
-        tracing::info!("seeded core memory for new database");
-    }
+    startup::seed_core_memory_if_empty(&db, &home_dir)?;
 
     // Wrap sync Database in async handler — takes ownership of `db`.
     // All subsequent calls use `async_db`.
@@ -125,6 +116,7 @@ async fn main() -> Result<()> {
             home_dir: &home_dir,
             is_onboarding,
             message_sender: None,
+            skip_compaction: false,
         })
         .await
         {
@@ -140,7 +132,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_slash_command(input: &str, db: &AsyncDatabase, home_dir: &std::path::Path) -> Result<()> {
+async fn handle_slash_command(
+    input: &str,
+    db: &AsyncDatabase,
+    home_dir: &std::path::Path,
+) -> Result<()> {
     match input {
         "/help" => {
             println!("\nAvailable commands:");
@@ -172,7 +168,10 @@ async fn handle_slash_command(input: &str, db: &AsyncDatabase, home_dir: &std::p
             } else {
                 println!("\n--- Pending Reminders ---");
                 for r in &reminders {
-                    println!("  #{}: \"{}\" at {} (created: {})", r.id, r.message, r.fire_at, r.created_at);
+                    println!(
+                        "  #{}: \"{}\" at {} (created: {})",
+                        r.id, r.message, r.fire_at, r.created_at
+                    );
                 }
                 println!("\n-------------------------\n");
             }

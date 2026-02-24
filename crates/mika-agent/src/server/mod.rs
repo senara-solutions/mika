@@ -1,10 +1,14 @@
 mod auth;
 mod handlers;
+pub mod json_extractor;
 pub mod state;
 pub mod types;
 
 use anyhow::{Result, anyhow};
-use axum::{Router, middleware, routing::{get, post}};
+use axum::{
+    Router, middleware,
+    routing::{get, post},
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
@@ -15,10 +19,28 @@ use mika_common::config::Settings;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
+use crate::messaging::{GatewayMessageSender, MessageSender};
 use crate::scheduler::ReminderScheduler;
+use crate::startup;
 use crate::tools;
 
 use state::AppState;
+
+/// Build the Axum router with all routes and middleware.
+///
+/// Shared between production `run_server` and test `test_app`.
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/message", post(handlers::handle_message))
+        .route("/heartbeat", post(handlers::handle_heartbeat))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
+        ))
+        // Health endpoint is OUTSIDE auth layer (for K8s probes)
+        .route("/health", get(handlers::handle_health))
+        .with_state(state)
+}
 
 /// Start the Mika HTTP server.
 ///
@@ -31,15 +53,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let db = Database::open(&settings.db_path)?;
 
     // Seed core memory if empty
-    if db.get_all_core_memory()?.is_empty() {
-        let user_md_path = home_dir.join("user.md");
-        let user_md_content = std::fs::read_to_string(&user_md_path).ok();
-        let user_md_ref = user_md_content
-            .as_deref()
-            .filter(|s| !s.starts_with("# Tell Mika about yourself"));
-        db.seed_core_memory(user_md_ref)?;
-        info!("seeded core memory for new database");
-    }
+    startup::seed_core_memory_if_empty(&db, home_dir)?;
 
     let async_db = AsyncDatabase::new(db);
 
@@ -50,23 +64,38 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     );
     let tool_registry = Arc::new(tools::default_tools());
     let ready = Arc::new(AtomicBool::new(false));
+    let http_client = reqwest::Client::new();
 
     // Validate required settings for server mode
     let gateway_url = settings
         .routing_url
         .clone()
         .ok_or_else(|| anyhow!("MIKA_ROUTING_URL is required in server mode"))?;
+
+    // Validate gateway URL is well-formed
+    reqwest::Url::parse(&gateway_url)
+        .map_err(|e| anyhow!("MIKA_ROUTING_URL is not a valid URL: {e}"))?;
+
     let internal_token = settings
         .internal_token
         .clone()
         .ok_or_else(|| anyhow!("MIKA_INTERNAL_TOKEN is required in server mode"))?;
+
+    // Create GatewayMessageSender for the scheduler
+    let scheduler_sender = GatewayMessageSender::new(
+        gateway_url.clone(),
+        internal_token.clone(),
+        async_db.clone(),
+        http_client.clone(),
+    );
+    let scheduler_sender: Arc<dyn MessageSender> = Arc::new(scheduler_sender);
 
     let scheduler = Arc::new(ReminderScheduler {
         db: async_db.clone(),
         claude: claude.clone(),
         tools: tool_registry.clone(),
         home_dir: home_dir.to_path_buf(),
-        message_sender: None, // Wired in PR 3 with GatewayMessageSender
+        message_sender: Some(scheduler_sender),
     });
 
     let state = AppState {
@@ -80,19 +109,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         gateway_url,
         home_dir: home_dir.to_path_buf(),
         startup_time: std::time::Instant::now(),
+        http_client,
     };
 
-    // Routes with auth (message, heartbeat) — route_layer applies to routes above it
-    let app = Router::new()
-        .route("/message", post(handlers::handle_message))
-        .route("/heartbeat", post(handlers::handle_heartbeat))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_internal_token,
-        ))
-        // Health endpoint is OUTSIDE auth layer (for K8s probes)
-        .route("/health", get(handlers::handle_health))
-        .with_state(state);
+    let app = build_router(state);
 
     let port = settings.server_port;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -133,9 +153,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::test_helpers::test_async_db;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use crate::test_utils::test_helpers::test_async_db;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -164,19 +184,12 @@ mod tests {
             gateway_url: "http://localhost:9999".to_string(),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             startup_time: std::time::Instant::now(),
+            http_client: reqwest::Client::new(),
         }
     }
 
     fn test_app(state: AppState) -> Router {
-        Router::new()
-            .route("/message", post(handlers::handle_message))
-            .route("/heartbeat", post(handlers::handle_heartbeat))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth::require_internal_token,
-            ))
-            .route("/health", get(handlers::handle_health))
-            .with_state(state)
+        build_router(state)
     }
 
     #[tokio::test]
@@ -216,9 +229,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), 1024)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert!(json["uptime_secs"].is_number());
@@ -294,9 +305,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        let body = axum::body::to_bytes(resp.into_body(), 1024)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["request_id"], "req-001");
         assert_eq!(json["status"], "accepted");
@@ -353,9 +362,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        let body = axum::body::to_bytes(resp.into_body(), 1024)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "agent busy");
     }

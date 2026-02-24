@@ -224,14 +224,12 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_store_person() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = StoreFactTool;
 
         let result = tool
@@ -249,15 +247,14 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Alice Chen"));
 
-        let person = db.get_person("Alice Chen").await.unwrap().unwrap();
+        let person = harness.db.get_person("Alice Chen").await.unwrap().unwrap();
         assert_eq!(person.relationship, Some("CTO".to_string()));
     }
 
     #[tokio::test]
     async fn test_store_commitment() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = StoreFactTool;
 
         let result = tool
@@ -274,15 +271,14 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Q4 budget"));
 
-        let commitments = db.list_commitments("pending").await.unwrap();
+        let commitments = harness.db.list_commitments("pending").await.unwrap();
         assert_eq!(commitments.len(), 1);
     }
 
     #[tokio::test]
     async fn test_store_preference() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = StoreFactTool;
 
         let result = tool
@@ -298,15 +294,19 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let pref = db.get_preference("meeting_time").await.unwrap().unwrap();
+        let pref = harness
+            .db
+            .get_preference("meeting_time")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(pref, "Morning, before 10am");
     }
 
     #[tokio::test]
     async fn test_store_event_with_event_date() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = StoreFactTool;
 
         let result = tool
@@ -326,9 +326,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_fact_logs_audit() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = StoreFactTool;
 
         tool.execute(
@@ -341,7 +340,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_memory_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "store_fact");
         assert!(events[0].target_key.starts_with("person:"));
@@ -349,9 +348,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_fact_missing_required() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = StoreFactTool;
 
         // Person without name

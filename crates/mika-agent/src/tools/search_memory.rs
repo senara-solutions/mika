@@ -106,10 +106,7 @@ impl Tool for SearchMemoryTool {
         if category == "all" || category == "event" {
             let events = ctx.db.search_events(query).await?;
             for event in events {
-                let mut desc = format!(
-                    "[event] {} (id:{}",
-                    event.description, event.id
-                );
+                let mut desc = format!("[event] {} (id:{}", event.description, event.id);
                 if let Some(ref date) = event.event_date {
                     desc.push_str(&format!(", {date}"));
                 }
@@ -151,17 +148,17 @@ impl Tool for SearchMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_search_finds_person() {
-        let db = test_async_db();
-        db.upsert_person("Alice Chen", Some("CTO"), Some("Likes coffee"))
+        let harness = TestHarness::new();
+        harness
+            .db
+            .upsert_person("Alice Chen", Some("CTO"), Some("Likes coffee"))
             .await
             .unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         let result = tool
@@ -175,12 +172,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_finds_commitment() {
-        let db = test_async_db();
-        db.add_commitment("Review Q4 budget", Some("2026-03-01"), None)
+        let harness = TestHarness::new();
+        harness
+            .db
+            .add_commitment("Review Q4 budget", Some("2026-03-01"), None)
             .await
             .unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         let result = tool
@@ -194,9 +192,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_no_results() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         let result = tool
@@ -209,11 +206,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_filters_by_category() {
-        let db = test_async_db();
-        db.upsert_person("Alice", None, None).await.unwrap();
-        db.add_commitment("Call Alice", None, None).await.unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        harness.db.upsert_person("Alice", None, None).await.unwrap();
+        harness
+            .db
+            .add_commitment("Call Alice", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         // Search only in person category
@@ -230,10 +230,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_core_memory() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         let result = tool
@@ -249,15 +248,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_finds_preference_by_value_substring() {
-        let db = test_async_db();
-        db.set_preference("Food", "No shellfish, prefers sushi")
+        let harness = TestHarness::new();
+        harness
+            .db
+            .set_preference("Food", "No shellfish, prefers sushi")
             .await
             .unwrap();
-        db.set_preference("Meeting time", "Morning, before 10am")
+        harness
+            .db
+            .set_preference("Meeting time", "Morning, before 10am")
             .await
             .unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         // Search by value substring
@@ -284,16 +286,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_event_includes_context() {
-        let db = test_async_db();
-        db.add_event(
-            "Team offsite in Bali",
-            Some("2026-06-01"),
-            Some("annual planning retreat"),
-        )
-        .await
-        .unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        harness
+            .db
+            .add_event(
+                "Team offsite in Bali",
+                Some("2026-06-01"),
+                Some("annual planning retreat"),
+            )
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         let result = tool
@@ -307,16 +310,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_finds_event_by_description() {
-        let db = test_async_db();
-        db.add_event(
-            "Board meeting with investors",
-            Some("2026-03-15"),
-            Some("quarterly review"),
-        )
-        .await
-        .unwrap();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        harness
+            .db
+            .add_event(
+                "Board meeting with investors",
+                Some("2026-03-15"),
+                Some("quarterly review"),
+            )
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
         let tool = SearchMemoryTool;
 
         // Search by description substring

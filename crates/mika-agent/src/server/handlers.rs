@@ -1,24 +1,24 @@
-use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-};
-use std::sync::atomic::Ordering;
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use chrono::Timelike;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tracing::Instrument;
 use tracing::{error, info, warn};
 
-use crate::agent::{self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent};
+use crate::agent::{
+    self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent,
+};
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 
+use super::json_extractor::JsonBody;
 use super::state::AppState;
-use super::types::{AcceptedResponse, HeartbeatRequest, HealthResponse, MessageRequest};
+use super::types::{AcceptedResponse, HealthResponse, HeartbeatRequest, MessageRequest};
 
 /// GET /health — K8s liveness/readiness probe (no auth required).
 pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
-    if !state.ready.load(Ordering::Relaxed) {
+    if !state.ready.load(Ordering::Acquire) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HealthResponse {
@@ -42,7 +42,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 /// Agent responses are delivered outbound via GatewayMessageSender.
 pub async fn handle_message(
     State(state): State<AppState>,
-    Json(req): Json<MessageRequest>,
+    JsonBody(req): JsonBody<MessageRequest>,
 ) -> impl IntoResponse {
     // Validate input
     if req.text.is_empty() || req.text.len() > 50_000 {
@@ -78,71 +78,80 @@ pub async fn handle_message(
 
     let request_id = req.request_id.clone();
 
-    // Spawn async agent processing
-    let s = state.clone();
+    // Spawn flush of previously failed sends in parallel (best-effort, non-blocking)
+    let flush_state = state.clone();
     tokio::spawn(async move {
-        let _lock = lock; // Hold lock for duration of agent loop
+        flush_failed_sends(&flush_state).await;
+    });
 
-        // Flush any previously failed sends before processing
-        flush_failed_sends(&s).await;
+    // Spawn async agent processing with request_id span for log correlation
+    let s = state.clone();
+    let span = tracing::info_span!("process_message", request_id = %request_id);
+    tokio::spawn(
+        async move {
+            let _lock = lock; // Hold lock for duration of agent loop
 
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let is_onboarding = check_onboarding(&s.db).await;
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let is_onboarding = check_onboarding(&s.db).await;
 
-        let sender = GatewayMessageSender::new(
-            s.gateway_url.clone(),
-            s.internal_token.clone(),
-            s.db.clone(),
-        );
-        let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
+            let sender = GatewayMessageSender::new(
+                s.gateway_url.clone(),
+                s.internal_token.clone(),
+                s.db.clone(),
+                s.http_client.clone(),
+            );
+            let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
-        let params = AgentParams {
-            db: &s.db,
-            claude: &s.claude,
-            tools: &s.tools,
-            user_message: &req.text,
-            channel_type: &req.channel,
-            session_id: &session_id,
-            home_dir: &s.home_dir,
-            is_onboarding,
-            message_sender: Some(sender_arc.clone()),
-        };
+            let params = AgentParams {
+                db: &s.db,
+                claude: &s.claude,
+                tools: &s.tools,
+                user_message: &req.text,
+                channel_type: &req.channel,
+                session_id: &session_id,
+                home_dir: &s.home_dir,
+                is_onboarding,
+                message_sender: Some(sender_arc.clone()),
+                skip_compaction: true,
+            };
 
-        match agent::run_agent(&params).await {
-            Ok(response) => {
-                info!(request_id = req.request_id, "agent loop completed");
-                // Send final agent response to user via gateway
-                if !response.is_empty() {
-                    if let Err(e) = sender_arc.send(&response).await {
-                        error!(error = %e, request_id = req.request_id, "failed to send response");
+            match agent::run_agent(&params).await {
+                Ok(response) => {
+                    info!("agent loop completed");
+                    // Send final agent response to user via gateway
+                    if !response.is_empty() {
+                        if let Err(e) = sender_arc.send(&response).await {
+                            error!(error = %e, "failed to send response");
+                        }
                     }
                 }
+                Err(e) => {
+                    error!(error = %e, "agent loop failed");
+                    let _ = sender_arc
+                        .send("Sorry, I had a hiccup processing your message. Could you try again?")
+                        .await;
+                }
             }
-            Err(e) => {
-                error!(error = %e, request_id = req.request_id, "agent loop failed");
-                let _ = sender_arc
-                    .send("Sorry, I had a hiccup processing your message. Could you try again?")
-                    .await;
-            }
-        }
 
-        // Spawn compaction outside the lock
-        drop(_lock);
-        let db = s.db.clone();
-        let claude = s.claude.clone();
-        tokio::spawn(async move {
-            if let Err(e) = compaction::maybe_compact(&db, &claude).await {
-                warn!(error = %e, "post-turn compaction failed");
-            }
-        });
-    });
+            // Spawn compaction outside the lock
+            drop(_lock);
+            let db = s.db.clone();
+            let claude = s.claude.clone();
+            tokio::spawn(async move {
+                if let Err(e) = compaction::maybe_compact(&db, &claude).await {
+                    warn!(error = %e, "post-turn compaction failed");
+                }
+            });
+        }
+        .instrument(span),
+    );
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!(AcceptedResponse {
+        Json(AcceptedResponse {
             request_id,
             status: "accepted".to_string(),
-        })),
+        }),
     )
         .into_response()
 }
@@ -153,10 +162,13 @@ pub async fn handle_message(
 /// Returns 204 if skipped, 200 if accepted for processing.
 pub async fn handle_heartbeat(
     State(state): State<AppState>,
-    Json(_req): Json<HeartbeatRequest>,
+    JsonBody(req): JsonBody<HeartbeatRequest>,
 ) -> impl IntoResponse {
+    info!(request_id = %req.request_id, "heartbeat received");
+
     // Pre-filter: check if heartbeat should run (no Mutex, no Claude call)
     if !heartbeat_should_run(&state.db).await {
+        info!(request_id = %req.request_id, "heartbeat skipped by pre-filter");
         return StatusCode::NO_CONTENT;
     }
 
@@ -176,6 +188,7 @@ pub async fn handle_heartbeat(
             s.gateway_url.clone(),
             s.internal_token.clone(),
             s.db.clone(),
+            s.http_client.clone(),
         );
         let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
@@ -213,6 +226,7 @@ async fn flush_failed_sends(state: &AppState) {
         state.gateway_url.clone(),
         state.internal_token.clone(),
         state.db.clone(),
+        state.http_client.clone(),
     );
 
     for send in sends {
@@ -253,20 +267,13 @@ async fn heartbeat_should_run(db: &AsyncDatabase) -> bool {
     }
 
     // 3. Rate limit: max 3 heartbeats per day
-    if db
-        .count_heartbeat_sends_today(&tz_str)
-        .await
-        .unwrap_or(0)
-        >= 3
-    {
+    if db.count_heartbeat_sends_today(&tz_str).await.unwrap_or(0) >= 3 {
         return false;
     }
 
     // 4. Skip if user messaged recently (within last 2 hours)
     if let Ok(Some(last_msg)) = db.last_user_message_time().await {
-        if let Ok(parsed) =
-            chrono::NaiveDateTime::parse_from_str(&last_msg, "%Y-%m-%d %H:%M:%S")
-        {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&last_msg, "%Y-%m-%d %H:%M:%S") {
             let elapsed = now_utc.naive_utc() - parsed;
             if elapsed < chrono::TimeDelta::hours(2) {
                 return false;
@@ -276,5 +283,3 @@ async fn heartbeat_should_run(db: &AsyncDatabase) -> bool {
 
     true
 }
-
-use chrono::Timelike;

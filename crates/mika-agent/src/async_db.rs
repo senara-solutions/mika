@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
@@ -16,11 +17,19 @@ type DbClosure = Box<dyn FnOnce(&Database) + Send>;
 /// `Database` (and its `rusqlite::Connection`). Callers send closures over
 /// an `mpsc` channel; results come back via `tokio::sync::oneshot`.
 ///
-/// `Clone` is cheap (clones the `mpsc::Sender`). All clones share the
+/// `Clone` is cheap (clones the inner `Arc`). All clones share the
 /// same background thread and connection.
 #[derive(Clone)]
 pub struct AsyncDatabase {
-    sender: mpsc::Sender<DbClosure>,
+    inner: Arc<AsyncDatabaseInner>,
+}
+
+struct AsyncDatabaseInner {
+    /// Wrapped in `Option` so `shutdown()` can drop it to signal the thread.
+    sender: Mutex<Option<mpsc::Sender<DbClosure>>>,
+    /// Handle to the background DB thread, used for graceful shutdown.
+    /// `None` after `shutdown()` has joined the thread.
+    thread_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AsyncDatabase {
@@ -30,16 +39,26 @@ impl AsyncDatabase {
     /// processing subsequent closures (see [`std::panic::catch_unwind`]).
     pub fn new(db: Database) -> Self {
         let (tx, rx) = mpsc::channel::<DbClosure>();
-        std::thread::spawn(move || {
-            while let Ok(f) = rx.recv() {
-                if let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    f(&db);
-                })) {
-                    tracing::error!("database closure panicked — thread continues");
+        let handle = std::thread::Builder::new()
+            .name("mika-db".to_string())
+            .spawn(move || {
+                while let Ok(f) = rx.recv() {
+                    if let Err(_panic) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            f(&db);
+                        }))
+                    {
+                        tracing::error!("database closure panicked — thread continues");
+                    }
                 }
-            }
-        });
-        Self { sender: tx }
+            })
+            .expect("failed to spawn database thread");
+        Self {
+            inner: Arc::new(AsyncDatabaseInner {
+                sender: Mutex::new(Some(tx)),
+                thread_handle: Mutex::new(Some(handle)),
+            }),
+        }
     }
 
     /// Open a database at `path` and wrap it in an async handle.
@@ -48,28 +67,53 @@ impl AsyncDatabase {
         Ok(Self::new(db))
     }
 
+    /// Gracefully shut down the database thread.
+    ///
+    /// Drops the internal sender (so the thread's `recv()` loop exits)
+    /// and joins the thread. Safe to call multiple times; subsequent
+    /// calls are no-ops. Any in-flight or future `with_db` calls will
+    /// receive an error once the sender is dropped.
+    pub fn shutdown(&self) {
+        // Drop the sender first so the background thread's rx.recv() returns Err.
+        {
+            let mut sender_guard = self.inner.sender.lock().expect("sender lock poisoned");
+            *sender_guard = None;
+        }
+        // Now join the thread (it will exit promptly since the channel is closed).
+        let mut handle_guard = self
+            .inner
+            .thread_handle
+            .lock()
+            .expect("handle lock poisoned");
+        if let Some(handle) = handle_guard.take() {
+            let _ = handle.join();
+        }
+    }
+
     /// Send a closure to the background thread and await its result.
     async fn with_db<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(Box::new(move |db| {
-                let _ = tx.send(f(db));
-            }))
-            .map_err(|_| anyhow!("database thread has stopped"))?;
-        rx.await.map_err(|_| anyhow!("database thread dropped reply"))?
+        {
+            let sender_guard = self.inner.sender.lock().expect("sender lock poisoned");
+            let sender = sender_guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("database has been shut down"))?;
+            sender
+                .send(Box::new(move |db| {
+                    let _ = tx.send(f(db));
+                }))
+                .map_err(|_| anyhow!("database thread has stopped"))?;
+        }
+        rx.await
+            .map_err(|_| anyhow!("database thread dropped reply"))?
     }
 
     // -- Conversation --
 
-    pub async fn save_message(
-        &self,
-        role: &str,
-        content: &str,
-        channel_type: &str,
-    ) -> Result<i64> {
+    pub async fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
         let (r, c, ct) = (role.to_owned(), content.to_owned(), channel_type.to_owned());
         self.with_db(move |db| db.save_message(&r, &c, &ct)).await
     }
@@ -80,8 +124,9 @@ impl AsyncDatabase {
         channel_filter: Option<Vec<String>>,
     ) -> Result<Vec<ConversationMessage>> {
         self.with_db(move |db| {
-            let refs: Option<Vec<&str>> =
-                channel_filter.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let refs: Option<Vec<&str>> = channel_filter
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             db.load_recent_messages(limit, refs.as_deref())
         })
         .await
@@ -313,11 +358,7 @@ impl AsyncDatabase {
 
     // -- Failed Sends --
 
-    pub async fn save_failed_send(
-        &self,
-        text: &str,
-        request_id: Option<&str>,
-    ) -> Result<i64> {
+    pub async fn save_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
         let (t, r) = (text.to_owned(), request_id.map(|s| s.to_owned()));
         self.with_db(move |db| db.save_failed_send(&t, r.as_deref()))
             .await
@@ -359,8 +400,7 @@ impl AsyncDatabase {
 
     pub async fn set_customer_config(&self, key: &str, value: &str) -> Result<()> {
         let (k, v) = (key.to_owned(), value.to_owned());
-        self.with_db(move |db| db.set_customer_config(&k, &v))
-            .await
+        self.with_db(move |db| db.set_customer_config(&k, &v)).await
     }
 
     // -- Audit --
@@ -464,7 +504,12 @@ mod tests {
 
         // Send a closure that panics — the thread should catch it
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        db.sender
+        db.inner
+            .sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
             .send(Box::new(move |_db| {
                 let _ = tx.send(());
                 panic!("intentional test panic");
@@ -489,5 +534,43 @@ mod tests {
 
         let entry = db.get_core_memory("user_summary").await.unwrap().unwrap();
         assert_eq!(entry.value, "New user. No information yet.");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_joins_thread() {
+        let db = test_async_db();
+        db.save_message("user", "before shutdown", "cli")
+            .await
+            .unwrap();
+
+        // Verify data is there before shutdown
+        let messages = db.load_recent_messages(10, None).await.unwrap();
+        assert_eq!(messages.len(), 1);
+
+        // Shutdown should complete without hanging (only clone, so thread joins)
+        db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_rejects_subsequent_operations() {
+        let db = test_async_db();
+        db.save_message("user", "msg", "cli").await.unwrap();
+
+        db.shutdown();
+
+        // After shutdown, operations should return an error
+        let result = db.load_recent_messages(10, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shut down"));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_idempotent() {
+        let db = test_async_db();
+        db.save_message("user", "msg", "cli").await.unwrap();
+
+        // Calling shutdown multiple times should not panic
+        db.shutdown();
+        db.shutdown();
     }
 }

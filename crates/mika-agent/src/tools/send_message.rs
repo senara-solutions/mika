@@ -66,8 +66,7 @@ impl Tool for SendMessageTool {
 mod tests {
     use super::*;
     use crate::messaging::MessageSender;
-    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
     use std::sync::{Arc, Mutex};
 
     /// Test sender that captures messages.
@@ -97,9 +96,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_no_sender() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = SendMessageTool;
 
         let result = tool
@@ -112,14 +110,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_with_sender() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
+        let harness = TestHarness::new();
         let mock = Arc::new(MockSender::new());
         let ctx = crate::tools::ToolContext {
-            db: &db,
+            db: &harness.db,
             session_id: "test",
             home_dir: std::path::Path::new("/tmp"),
-            core_memory_edit_count: &counter,
+            core_memory_edit_count: &harness.counter,
             is_onboarding: false,
             message_sender: Some(mock.clone()),
         };
@@ -136,9 +133,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_empty_text() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = SendMessageTool;
 
         let result = tool
@@ -151,9 +147,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_too_long() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = SendMessageTool;
 
         let long_text = "x".repeat(MAX_INPUT_LEN + 1);

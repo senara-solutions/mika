@@ -40,14 +40,16 @@ impl Tool for CancelReminderTool {
 
         let cancelled = ctx.db.cancel_reminder(id).await?;
         if cancelled {
-            ctx.db.log_memory_event(
-                ctx.session_id,
-                "cancel_reminder",
-                &format!("reminder:{id}"),
-                None,
-                "cancelled",
-                None,
-            ).await?;
+            ctx.db
+                .log_memory_event(
+                    ctx.session_id,
+                    "cancel_reminder",
+                    &format!("reminder:{id}"),
+                    None,
+                    "cancelled",
+                    None,
+                )
+                .await?;
             Ok(ToolOutput::success(format!(
                 "Reminder #{id} has been cancelled."
             )))
@@ -62,19 +64,18 @@ impl Tool for CancelReminderTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_cancel_reminder_success() {
-        let db = test_async_db();
-        let id = db
+        let harness = TestHarness::new();
+        let id = harness
+            .db
             .add_reminder("2099-01-01T00:00:00Z", "To cancel")
             .await
             .unwrap();
 
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let ctx = harness.ctx();
         let tool = CancelReminderTool;
 
         let result = tool
@@ -84,15 +85,14 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("cancelled"));
 
-        let pending = db.get_pending_reminders().await.unwrap();
+        let pending = harness.db.get_pending_reminders().await.unwrap();
         assert_eq!(pending.len(), 0);
     }
 
     #[tokio::test]
     async fn test_cancel_reminder_not_found() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CancelReminderTool;
 
         let result = tool
@@ -105,15 +105,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_reminder_already_delivered() {
-        let db = test_async_db();
-        let id = db
+        let harness = TestHarness::new();
+        let id = harness
+            .db
             .add_reminder("2020-01-01T00:00:00Z", "Already delivered")
             .await
             .unwrap();
-        db.mark_reminder_delivered(id).await.unwrap();
+        harness.db.mark_reminder_delivered(id).await.unwrap();
 
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let ctx = harness.ctx();
         let tool = CancelReminderTool;
 
         let result = tool
@@ -126,9 +126,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_reminder_negative_id() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CancelReminderTool;
 
         let result = tool
@@ -141,9 +140,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_reminder_missing_id() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CancelReminderTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();

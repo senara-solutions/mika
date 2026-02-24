@@ -37,4 +37,31 @@ pub mod test_helpers {
             message_sender: None,
         }
     }
+
+    /// Test harness that owns the database and edit counter, reducing
+    /// boilerplate in tool tests. Use `harness.ctx()` to get a `ToolContext`
+    /// and `harness.db` for direct database access during test setup.
+    pub struct TestHarness {
+        pub db: AsyncDatabase,
+        pub counter: AtomicU32,
+    }
+
+    impl TestHarness {
+        pub fn new() -> Self {
+            Self {
+                db: test_async_db(),
+                counter: AtomicU32::new(0),
+            }
+        }
+
+        /// Create a non-onboarding ToolContext borrowing from this harness.
+        pub fn ctx(&self) -> ToolContext<'_> {
+            test_ctx(&self.db, &self.counter)
+        }
+
+        /// Create a ToolContext with configurable onboarding flag.
+        pub fn ctx_with_onboarding(&self, is_onboarding: bool) -> ToolContext<'_> {
+            test_ctx_with_onboarding(&self.db, &self.counter, is_onboarding)
+        }
+    }
 }

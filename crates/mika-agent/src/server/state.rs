@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use mika_common::claude::ClaudeClient;
 
@@ -24,4 +24,15 @@ pub struct AppState {
     pub gateway_url: String,
     pub home_dir: PathBuf,
     pub startup_time: std::time::Instant,
+    pub http_client: reqwest::Client,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("internal_token", &"[REDACTED]")
+            .field("gateway_url", &self.gateway_url)
+            .field("home_dir", &self.home_dir)
+            .finish_non_exhaustive()
+    }
 }

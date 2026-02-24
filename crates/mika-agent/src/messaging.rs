@@ -31,9 +31,10 @@ impl GatewayMessageSender {
         gateway_url: String,
         internal_token: String,
         db: AsyncDatabase,
+        client: reqwest::Client,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             gateway_url,
             internal_token,
             db,

@@ -112,7 +112,10 @@ impl std::fmt::Debug for Settings {
             .field("routing_url", &self.routing_url)
             .field("customer_id", &self.customer_id)
             .field("server_port", &self.server_port)
-            .field("internal_token", &self.internal_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "internal_token",
+                &self.internal_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("home_dir", &self.home_dir)
             .finish()
     }

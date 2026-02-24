@@ -3,8 +3,8 @@ use mika_common::claude::{
     ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
 };
 use std::path::Path;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -45,6 +45,8 @@ pub struct AgentParams<'a> {
     pub home_dir: &'a Path,
     pub is_onboarding: bool,
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    /// When true, skip inline post-turn compaction (server mode spawns it separately).
+    pub skip_compaction: bool,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -65,9 +67,12 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
     match timeout_result {
         Ok(Ok(response)) => {
             // Post-turn compaction: summarize old messages if threshold exceeded.
-            // Runs inline (not spawned) — acceptable latency for Phase 1 CLI.
-            if let Err(e) = compaction::maybe_compact(params.db, params.claude).await {
-                warn!(error = %e, "post-turn compaction failed");
+            // Runs inline (not spawned) — acceptable latency for CLI mode.
+            // Server mode sets skip_compaction=true and spawns compaction outside the agent lock.
+            if !params.skip_compaction {
+                if let Err(e) = compaction::maybe_compact(params.db, params.claude).await {
+                    warn!(error = %e, "post-turn compaction failed");
+                }
             }
             Ok(response)
         }
@@ -96,8 +101,10 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     let channel_type = params.channel_type;
 
     // Load context: soul, identity, core memory → build system prompt
-    let soul_content = std::fs::read_to_string(params.home_dir.join("soul.md")).unwrap_or_default();
-    let identity = prompt::load_identity(params.home_dir);
+    let soul_content = tokio::fs::read_to_string(params.home_dir.join("soul.md"))
+        .await
+        .unwrap_or_default();
+    let identity = prompt::load_identity_async(params.home_dir).await;
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
 
@@ -119,12 +126,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         system.push_str("\n</context>\n");
     }
 
-    let history = db
-        .load_recent_messages(
-            20,
-            Some(vec!["cli".to_owned(), "telegram".to_owned()]),
-        )
-        .await?;
+    let history = db.load_recent_messages(20, None).await?;
     let tool_defs = tools.definitions();
 
     // Build initial message list from history
@@ -183,8 +185,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
                 return Ok(text);
             }
             StopReason::ToolUse => {
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request)
-                    .await;
+                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
             }
             StopReason::StopSequence => {
                 let text = response.text();
@@ -333,8 +334,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     let tools = params.tools;
 
     // Build silent-mode system prompt
-    let soul_content = std::fs::read_to_string(params.home_dir.join("soul.md")).unwrap_or_default();
-    let identity = prompt::load_identity(params.home_dir);
+    let soul_content = tokio::fs::read_to_string(params.home_dir.join("soul.md"))
+        .await
+        .unwrap_or_default();
+    let identity = prompt::load_identity_async(params.home_dir).await;
     let core_memory = db.get_all_core_memory().await?;
     let pending_commitments = db.list_commitments("pending").await?;
     let timezone = db.get_customer_config("timezone").await?;
@@ -421,8 +424,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 return Ok(());
             }
             StopReason::ToolUse => {
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request)
-                    .await;
+                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
             }
         }
     }

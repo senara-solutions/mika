@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "104"
 tags: [code-review, performance, data-integrity]

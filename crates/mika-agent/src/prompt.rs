@@ -40,6 +40,16 @@ pub fn load_identity(home_dir: &Path) -> Identity {
     }
 }
 
+/// Async version of [`load_identity`] using `tokio::fs` to avoid
+/// blocking the async runtime.
+pub async fn load_identity_async(home_dir: &Path) -> Identity {
+    let path = home_dir.join("identity.toml");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => toml::from_str(&content).unwrap_or_default(),
+        Err(_) => Identity::default(),
+    }
+}
+
 /// Context needed to build the system prompt.
 pub struct PromptContext<'a> {
     pub soul_content: &'a str,
@@ -64,43 +74,62 @@ fn onboarding_prompt() -> String {
     )
 }
 
+/// Write the soul content section (personality baseline from soul.md).
+fn write_soul_section(prompt: &mut String, soul_content: &str) {
+    if !soul_content.is_empty() {
+        prompt.push_str(soul_content);
+        prompt.push_str("\n\n");
+    }
+}
+
+/// Write the identity section.
+fn write_identity_section(prompt: &mut String, identity: &Identity) {
+    write!(prompt, "## Identity\nYou are {}.\n\n", identity.name).unwrap();
+}
+
+/// Write the current time section with optional timezone.
+fn write_time_section(prompt: &mut String, current_utc: DateTime<Utc>, timezone: Option<&str>) {
+    prompt.push_str("## Current Time\n");
+    writeln!(prompt, "UTC: {}", current_utc.format("%Y-%m-%dT%H:%M:%SZ")).unwrap();
+    if let Some(tz) = timezone {
+        writeln!(prompt, "User timezone: {tz}").unwrap();
+    }
+    prompt.push('\n');
+}
+
+/// Write the core memory section with `<core-memory>` XML delimiters.
+/// An optional `description` is inserted between the heading and the data block.
+fn write_core_memory_section(
+    prompt: &mut String,
+    core_memory: &[CoreMemoryEntry],
+    description: Option<&str>,
+) {
+    prompt.push_str("## Core Memory\n");
+    if let Some(desc) = description {
+        prompt.push_str(desc);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("<core-memory>\n");
+    for entry in core_memory {
+        write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
+    }
+    prompt.push_str("</core-memory>\n\n");
+}
+
 /// Build the system prompt from context.
 pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(4096);
 
-    // Soul content (personality baseline from soul.md)
-    if !ctx.soul_content.is_empty() {
-        prompt.push_str(ctx.soul_content);
-        prompt.push_str("\n\n");
-    }
-
-    // Identity
-    write!(prompt, "## Identity\nYou are {}.\n\n", ctx.identity.name).unwrap();
-
-    // Current Time
-    prompt.push_str("## Current Time\n");
-    writeln!(
-        prompt,
-        "UTC: {}",
-        ctx.current_utc.format("%Y-%m-%dT%H:%M:%SZ")
-    )
-    .unwrap();
-    if let Some(tz) = &ctx.timezone {
-        writeln!(prompt, "User timezone: {tz}").unwrap();
-    }
-    prompt.push('\n');
-
-    // Core Memory
-    prompt.push_str("## Core Memory\n");
-    prompt.push_str(
-        "These are your persistent memory blocks. Update them using the update_core_memory tool.\n\n",
+    write_soul_section(&mut prompt, ctx.soul_content);
+    write_identity_section(&mut prompt, ctx.identity);
+    write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
+    write_core_memory_section(
+        &mut prompt,
+        ctx.core_memory,
+        Some(
+            "These are your persistent memory blocks. Update them using the update_core_memory tool.",
+        ),
     );
-
-    prompt.push_str("<core-memory>\n");
-    for entry in ctx.core_memory {
-        write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
-    }
-    prompt.push_str("</core-memory>\n\n");
 
     // Instructions
     prompt.push_str("## Instructions\n");
@@ -113,15 +142,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC). \
          Use the current time shown above to compute future times.\n",
     );
-    prompt.push_str(
-        "- You can list and cancel reminders with list_reminders and cancel_reminder.\n",
-    );
+    prompt
+        .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
     prompt.push_str(
         "- Use search_memory to find stored facts across all categories before asking the user to repeat information.\n",
     );
-    prompt.push_str(
-        "- Mark commitments as completed or cancelled using the update_fact tool.\n",
-    );
+    prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
     prompt.push_str(
         "- You can reset a core memory section to its default value using update_core_memory with the reset action.\n",
     );
@@ -160,35 +186,10 @@ pub struct SilentPromptContext<'a> {
 pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(4096);
 
-    // Soul content
-    if !ctx.soul_content.is_empty() {
-        prompt.push_str(ctx.soul_content);
-        prompt.push_str("\n\n");
-    }
-
-    // Identity
-    write!(prompt, "## Identity\nYou are {}.\n\n", ctx.identity.name).unwrap();
-
-    // Current Time
-    prompt.push_str("## Current Time\n");
-    writeln!(
-        prompt,
-        "UTC: {}",
-        ctx.current_utc.format("%Y-%m-%dT%H:%M:%SZ")
-    )
-    .unwrap();
-    if let Some(tz) = &ctx.timezone {
-        writeln!(prompt, "User timezone: {tz}").unwrap();
-    }
-    prompt.push('\n');
-
-    // Core Memory
-    prompt.push_str("## Core Memory\n");
-    prompt.push_str("<core-memory>\n");
-    for entry in ctx.core_memory {
-        write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
-    }
-    prompt.push_str("</core-memory>\n\n");
+    write_soul_section(&mut prompt, ctx.soul_content);
+    write_identity_section(&mut prompt, ctx.identity);
+    write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
+    write_core_memory_section(&mut prompt, ctx.core_memory, None);
 
     // Pending commitments
     if !ctx.pending_commitments.is_empty() {

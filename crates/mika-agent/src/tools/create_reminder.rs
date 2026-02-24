@@ -75,14 +75,16 @@ impl Tool for CreateReminderTool {
 
         let id = ctx.db.add_reminder(fire_at, message).await?;
 
-        ctx.db.log_memory_event(
-            ctx.session_id,
-            "create_reminder",
-            &format!("reminder:{id}"),
-            None,
-            &format!("{fire_at} — {message}"),
-            None,
-        ).await?;
+        ctx.db
+            .log_memory_event(
+                ctx.session_id,
+                "create_reminder",
+                &format!("reminder:{id}"),
+                None,
+                &format!("{fire_at} — {message}"),
+                None,
+            )
+            .await?;
 
         Ok(ToolOutput::success(format!(
             "Reminder #{id} scheduled for {fire_at}."
@@ -93,14 +95,12 @@ impl Tool for CreateReminderTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_create_reminder_valid() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CreateReminderTool;
 
         let result = tool
@@ -116,16 +116,15 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("scheduled"));
 
-        let reminders = db.get_pending_reminders().await.unwrap();
+        let reminders = harness.db.get_pending_reminders().await.unwrap();
         assert_eq!(reminders.len(), 1);
         assert_eq!(reminders[0].message, "Year-end review");
     }
 
     #[tokio::test]
     async fn test_create_reminder_past_time() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CreateReminderTool;
 
         let result = tool
@@ -144,9 +143,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_reminder_invalid_datetime() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CreateReminderTool;
 
         let result = tool
@@ -165,9 +163,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_reminder_missing_fields() {
-        let db = test_async_db();
-        let counter = AtomicU32::new(0);
-        let ctx = test_ctx(&db, &counter);
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
         let tool = CreateReminderTool;
 
         let result = tool
