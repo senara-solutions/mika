@@ -59,6 +59,12 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 # Security
 secrecy = { version = "0.10", features = ["serde"] }
 
+# CLI / TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+tui-textarea = { version = "0.7", features = ["crossterm"] }
+crossterm = "0.28"
+
 # Utilities
 rand = "0.9"
 hex = "0.4"

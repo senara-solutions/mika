@@ -1,0 +1,23 @@
+[package]
+name = "mika-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mika"
+path = "src/main.rs"
+
+[dependencies]
+mika-common.workspace = true
+mika-agent.workspace = true
+tokio.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+tui-textarea.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+chrono.workspace = true

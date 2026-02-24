@@ -5,10 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "mika-cli"
-path = "src/cli.rs"
-
-[[bin]]
 name = "mika-server"
 path = "src/bin/mika-server.rs"
 

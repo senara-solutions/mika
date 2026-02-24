@@ -387,6 +387,10 @@ impl AsyncDatabase {
         self.with_db(|db| db.db_size_bytes()).await
     }
 
+    pub async fn schema_version(&self) -> Result<i64> {
+        self.with_db(|db| db.schema_version()).await
+    }
+
     pub async fn vacuum(&self) -> Result<()> {
         self.with_db(|db| db.vacuum()).await
     }

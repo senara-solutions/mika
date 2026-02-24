@@ -18,7 +18,12 @@ pub async fn require_internal_token(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match token {
-        Some(t) if bool::from(t.as_bytes().ct_eq(state.internal_token.expose_secret().as_bytes())) => {
+        Some(t)
+            if bool::from(
+                t.as_bytes()
+                    .ct_eq(state.internal_token.expose_secret().as_bytes()),
+            ) =>
+        {
             next.run(req).await.into_response()
         }
         _ => (

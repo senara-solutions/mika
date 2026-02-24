@@ -55,7 +55,10 @@ impl GatewaySettings {
 
         // Validate tokens are fixed-length hex (eliminates constant_time_eq length timing leak)
         validate_hex_token(&settings.internal_token, "MIKA_INTERNAL_TOKEN")?;
-        validate_hex_token(&settings.telegram_webhook_secret, "MIKA_TELEGRAM_WEBHOOK_SECRET")?;
+        validate_hex_token(
+            &settings.telegram_webhook_secret,
+            "MIKA_TELEGRAM_WEBHOOK_SECRET",
+        )?;
 
         Ok(settings)
     }

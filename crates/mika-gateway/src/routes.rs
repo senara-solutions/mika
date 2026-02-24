@@ -209,7 +209,7 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
     .await;
 
     match claimed {
-        Ok(Some(_)) => {} // claimed — proceed to forward
+        Ok(Some(_)) => {}   // claimed — proceed to forward
         Ok(None) => return, // already processed by another task
         Err(e) => {
             warn!(error = %e, "dedup update failed");
@@ -325,7 +325,10 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
         Err(e) => {
             if let Some(db_err) = e.as_database_error() {
                 if db_err.code().as_deref() == Some("23505") {
-                    let msg = if db_err.constraint().is_some_and(|c| c.contains("telegram_chat_id")) {
+                    let msg = if db_err
+                        .constraint()
+                        .is_some_and(|c| c.contains("telegram_chat_id"))
+                    {
                         "This Telegram account is already linked to another account."
                     } else {
                         "Pairing failed. Please contact support."
@@ -513,7 +516,9 @@ mod tests {
         let valid = generate_pairing_token();
         assert!(is_valid_pairing_token(&valid));
         assert!(!is_valid_pairing_token("too-short"));
-        assert!(!is_valid_pairing_token("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")); // 64 chars, not hex
+        assert!(!is_valid_pairing_token(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )); // 64 chars, not hex
         assert!(!is_valid_pairing_token("")); // empty
     }
 

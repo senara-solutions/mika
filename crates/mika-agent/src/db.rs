@@ -5,6 +5,9 @@ use tracing::{debug, info};
 
 const CURRENT_SCHEMA_VERSION: i64 = 7;
 
+/// Current schema version, exposed for status commands.
+pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
+
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
@@ -1454,6 +1457,11 @@ impl Database {
     pub fn vacuum(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA incremental_vacuum(100)")?;
         Ok(())
+    }
+
+    /// Return the current schema version of the database.
+    pub fn schema_version(&self) -> Result<i64> {
+        self.current_version()
     }
 }
 

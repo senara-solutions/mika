@@ -21,7 +21,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Directory Structure
 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
-- `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, CLI binary, HTTP server binary
+- `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
+- `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup)
 - `crates/mika-gateway/` — Gateway: Telegram webhook router, customer pairing, outbound relay (Postgres-backed)
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/brainstorms/` — Decision brainstorm documents
@@ -44,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - `cargo build` — Build all crates
 - `cargo test` — Run all tests (147 tests)
-- `cargo run --bin mika-cli` — Run CLI test harness
+- `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
