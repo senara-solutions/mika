@@ -367,15 +367,6 @@ impl AsyncDatabase {
         .await?
     }
 
-    pub async fn list_active_reminders(&self) -> Result<Vec<Reminder>> {
-        let db = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|_| anyhow::anyhow!("database mutex poisoned"))?;
-            db.list_active_reminders()
-        })
-        .await?
-    }
-
     // -- Heartbeat Rate Limiting --
 
     pub async fn record_heartbeat_send(&self) -> Result<()> {

@@ -671,12 +671,14 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Get all pending reminders (any fire_at).
-    pub fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, fire_at, message, status, created_at, delivered_at
-             FROM reminders WHERE status = 'pending' ORDER BY fire_at ASC",
-        )?;
+    /// Query reminders with an additional WHERE clause appended after `status = 'pending'`.
+    fn query_reminders(&self, extra_where: &str) -> Result<Vec<Reminder>> {
+        let sql = format!(
+            "SELECT id, fire_at, message, status, created_at, delivered_at \
+             FROM reminders WHERE status = 'pending'{} ORDER BY fire_at ASC",
+            extra_where
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let reminders = stmt
             .query_map([], |row| {
                 Ok(Reminder {
@@ -690,50 +692,21 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(reminders)
+    }
+
+    /// Get all pending reminders (any fire_at).
+    pub fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
+        self.query_reminders("")
     }
 
     /// Get pending reminders whose fire_at is in the future.
     pub fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, fire_at, message, status, created_at, delivered_at
-             FROM reminders WHERE status = 'pending' AND fire_at > datetime('now')
-             ORDER BY fire_at ASC",
-        )?;
-        let reminders = stmt
-            .query_map([], |row| {
-                Ok(Reminder {
-                    id: row.get(0)?,
-                    fire_at: row.get(1)?,
-                    message: row.get(2)?,
-                    status: row.get(3)?,
-                    created_at: row.get(4)?,
-                    delivered_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(reminders)
+        self.query_reminders(" AND fire_at > datetime('now')")
     }
 
     /// Get pending reminders whose fire_at is at or past now (ready to deliver).
     pub fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, fire_at, message, status, created_at, delivered_at
-             FROM reminders WHERE status = 'pending' AND fire_at <= datetime('now')
-             ORDER BY fire_at ASC",
-        )?;
-        let reminders = stmt
-            .query_map([], |row| {
-                Ok(Reminder {
-                    id: row.get(0)?,
-                    fire_at: row.get(1)?,
-                    message: row.get(2)?,
-                    status: row.get(3)?,
-                    created_at: row.get(4)?,
-                    delivered_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(reminders)
+        self.query_reminders(" AND fire_at <= datetime('now')")
     }
 
     /// Mark a reminder as delivered.
@@ -759,11 +732,6 @@ impl Database {
             [id],
         )?;
         Ok(rows > 0)
-    }
-
-    /// List all active (pending) reminders.
-    pub fn list_active_reminders(&self) -> Result<Vec<Reminder>> {
-        self.get_pending_reminders()
     }
 
     // -- Heartbeat Rate Limiting --
@@ -1562,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_active_reminders() {
+    fn test_get_pending_reminders_excludes_cancelled() {
         let db = test_db();
         db.add_reminder("2099-01-01T00:00:00Z", "active one")
             .unwrap();
@@ -1571,7 +1539,7 @@ mod tests {
             .unwrap();
         db.cancel_reminder(id2).unwrap();
 
-        let active = db.list_active_reminders().unwrap();
+        let active = db.get_pending_reminders().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].message, "active one");
     }

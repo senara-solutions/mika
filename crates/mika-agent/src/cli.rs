@@ -146,6 +146,7 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
         "/help" => {
             println!("\nAvailable commands:");
             println!("  /memory          — Show all core memory blocks");
+            println!("  /reminders       — Show pending reminders");
             println!("  /reset <block>   — Reset a core memory block to default");
             println!("  /help            — Show this help message");
             println!("  quit / exit      — Exit the CLI\n");
@@ -163,6 +164,18 @@ fn handle_slash_command(input: &str, db: &Database, home_dir: &std::path::Path) 
                     );
                 }
                 println!("\n-------------------\n");
+            }
+        }
+        "/reminders" => {
+            let reminders = db.get_pending_reminders()?;
+            if reminders.is_empty() {
+                println!("\nNo pending reminders.\n");
+            } else {
+                println!("\n--- Pending Reminders ---");
+                for r in &reminders {
+                    println!("  #{}: \"{}\" at {} (created: {})", r.id, r.message, r.fire_at, r.created_at);
+                }
+                println!("\n-------------------------\n");
             }
         }
         s if s.starts_with("/reset ") => {

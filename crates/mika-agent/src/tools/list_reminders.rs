@@ -26,7 +26,7 @@ impl Tool for ListRemindersTool {
     }
 
     async fn execute(&self, _input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        let reminders = ctx.db.list_active_reminders()?;
+        let reminders = ctx.db.get_pending_reminders()?;
 
         if reminders.is_empty() {
             return Ok(ToolOutput::success("No active reminders."));
@@ -35,8 +35,8 @@ impl Tool for ListRemindersTool {
         let mut output = String::from("Active reminders:\n");
         for r in &reminders {
             output.push_str(&format!(
-                "- #{}: \"{}\" at {} (status: {})\n",
-                r.id, r.message, r.fire_at, r.status
+                "- #{}: \"{}\" at {} (created: {})\n",
+                r.id, r.message, r.fire_at, r.created_at
             ));
         }
 
