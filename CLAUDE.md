@@ -4,7 +4,7 @@
 
 Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with plaintext SQLite storage on K8s encrypted volumes. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
 
-**Current phase:** Phase 1 — agent core with CLI test harness.
+**Current phase:** Phase 2 — container HTTP server (Axum) with gateway messaging.
 
 ## Stack
 
@@ -12,7 +12,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context → build prompt → Claude API → match stop_reason → execute tools or respond
 - **LLM:** Claude (Sonnet 4.6 default) via direct reqwest calls to Messages API
 - **Database:** SQLite via rusqlite (per-customer, plaintext on K8s encrypted volumes)
-- **HTTP:** reqwest 0.12 (Claude API client with typed errors and retry)
+- **HTTP server:** Axum 0.8 (mika-server binary) with tower-http middleware
+- **HTTP client:** reqwest 0.12 (Claude API client with typed errors and retry)
 - **Async runtime:** tokio
 - **Config:** config-rs with `MIKA_` env prefix
 - **Logging:** tracing + tracing-subscriber (JSON for prod, pretty for dev)
@@ -20,7 +21,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Directory Structure
 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
-- `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, CLI binary
+- `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, CLI binary, HTTP server binary
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/brainstorms/` — Decision brainstorm documents
 - `docs/plans/` — Implementation plans
@@ -35,14 +36,15 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Data at rest:** Plaintext SQLite on K8s encrypted volumes. Per-customer container isolation. Case-insensitive COLLATE NOCASE on unique text columns.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque.
-- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender }`. Tool trait uses `#[async_trait(?Send)]` (futures are NOT Send).
+- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender }`. Tool trait uses `#[async_trait]` (Send futures, required for `tokio::spawn` in server handlers).
 - **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `mpsc` channel (closure-based dispatch). Clone-able, Send+Sync. Integrated into agent loop, tools, and scheduler.
 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (132 tests)
+- `cargo test` — Run all tests (147 tests)
 - `cargo run --bin mika-cli` — Run CLI test harness
+- `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
 
@@ -58,8 +60,11 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Audit log:** `memory_events` table tracks all memory mutations per session
 - **Conversation compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt (not message history). Runs inline post-turn in CLI.
 - **Silent mode agent loop:** Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
-- **MessageSender trait:** `#[async_trait(?Send)]` for outbound messaging. CLI prints to stdout. Phase 2 will add Telegram/WhatsApp senders.
-- **Reminder scheduler:** `ReminderScheduler::recover()` fires past-due reminders on startup via silent agent. Future reminders logged but not timer-scheduled (Phase 2).
+- **MessageSender trait:** `#[async_trait]` with `Send + Sync` bounds for `Arc<dyn MessageSender>`. CLI prints to stdout. Server uses `GatewayMessageSender` (POST to gateway `/send` with retry + failed_sends fallback).
+- **Reminder scheduler:** `ReminderScheduler` uses owned types (no lifetime params). `recover()` fires past-due reminders on startup via silent agent.
+- **HTTP server (mika-server):** Axum-based with 3 endpoints: `/health` (no auth, K8s probes), `/message` (Bearer auth, 202 async), `/heartbeat` (Bearer auth, CronJob trigger). `AppState` is Clone via Arc-wrapped deps. Agent lock (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock` (429 if busy).
+- **Heartbeat pre-filter:** Active hours (8-21 local via chrono-tz), rate limits (1/hour, 3/day), skip if user messaged within 2h. All checks before acquiring Mutex.
+- **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 6 (v6 adds: memory_event_summaries table for tiered retention)
 
 ## Environment Variables
@@ -67,9 +72,13 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 See `.env.example` for the full list. Required:
 - `MIKA_ANTHROPIC_API_KEY` — Anthropic API key
 
+Server mode additionally requires:
+- `MIKA_ROUTING_URL` — Gateway URL for outbound message delivery
+- `MIKA_INTERNAL_TOKEN` — Shared secret for Bearer auth between gateway and agent
+
 ## Pending Work
 
-- **Phase 2 — HTTP server:** Add Telegram/WhatsApp channel adapters, timer-based reminder scheduling, gateway routing
+- **Phase 2 — Remaining:** Telegram/WhatsApp channel adapters, timer-based reminder scheduling (create_reminder → tokio timer), gateway routing layer, K8s deployment manifests
 
 ## Reference Repositories
 

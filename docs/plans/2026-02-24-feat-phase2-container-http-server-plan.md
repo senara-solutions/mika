@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 2 — Container HTTP Server"
 type: feat
-status: active
+status: completed
 date: 2026-02-24
 parent: docs/plans/2026-02-24-feat-platform-systems-gateway-provisioning-heartbeat-plan.md
 brainstorm: docs/brainstorms/2026-02-24-platform-systems-brainstorm.md
@@ -781,30 +781,30 @@ All sequential — each PR builds on the previous.
 ## Acceptance Criteria
 
 ### Functional
-- [ ] `POST /message` returns 202 and processes agent loop asynchronously
-- [ ] Agent response delivered via `POST /send` to gateway
-- [ ] `POST /message` returns 429 when agent is busy
-- [ ] `POST /message` returns 401 without valid bearer token
-- [ ] `GET /health` returns 503 during startup, 200 when ready
-- [ ] `POST /heartbeat` pre-filters (active hours, rate limits, recency)
-- [ ] `POST /heartbeat` returns 204 when skipped (pre-filter or busy)
-- [ ] Newly created reminders fire via Tokio timer without restart
-- [ ] Past-due reminders fire in background after health check passes
-- [ ] Failed /send attempts save to `failed_sends` and flush on next interaction
-- [ ] `chat_id` extracted from first message and stored for outbound sends
-- [ ] Graceful shutdown waits for in-flight agent loop
+- [x] `POST /message` returns 202 and processes agent loop asynchronously
+- [x] Agent response delivered via `POST /send` to gateway
+- [x] `POST /message` returns 429 when agent is busy
+- [x] `POST /message` returns 401 without valid bearer token
+- [x] `GET /health` returns 503 during startup, 200 when ready
+- [x] `POST /heartbeat` pre-filters (active hours, rate limits, recency)
+- [x] `POST /heartbeat` returns 204 when skipped (pre-filter or busy)
+- [ ] Newly created reminders fire via Tokio timer without restart (deferred)
+- [x] Past-due reminders fire in background after health check passes
+- [x] Failed /send attempts save to `failed_sends` and flush on next interaction
+- [x] `chat_id` extracted from first message and stored for outbound sends
+- [x] Graceful shutdown waits for in-flight agent loop
 
 ### Non-Functional
-- [ ] Container cold start < 5s to health 200
-- [ ] All 132+ existing tests pass
-- [ ] `cargo clippy` clean, 0 warnings
-- [ ] `mika-cli` still works (no regression)
-- [ ] `mika-server` binary builds and starts
+- [x] Container cold start < 5s to health 200
+- [x] All 147 tests pass (132 → 147)
+- [x] `cargo clippy` clean, 0 warnings
+- [x] `mika-cli` still works (no regression)
+- [x] `mika-server` binary builds and starts
 
 ### Quality Gates
-- [ ] ~27 new tests (10 + 8 + 9)
-- [ ] CLAUDE.md updated with server commands and new architecture
-- [ ] Bearer token uses constant-time comparison
+- [x] 15 new tests (10 + 8 + 2 heartbeat — timer tests deferred with timer scheduling)
+- [x] CLAUDE.md updated with server commands and new architecture
+- [x] Bearer token uses constant-time comparison
 
 ## Risk Analysis
 
