@@ -1,5 +1,5 @@
 ---
-status: ready
+status: wont_fix
 priority: p2
 issue_id: "141"
 tags: [plan-review, architecture, agent-native]

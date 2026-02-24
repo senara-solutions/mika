@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -31,8 +32,9 @@ pub struct AppState {
     pub telegram: TelegramClient,
     pub http_client: reqwest::Client,
     pub internal_token: SecretString,
-    pub webhook_secret: String,
+    pub webhook_secret: SecretString,
     pub ready: Arc<AtomicBool>,
+    pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -57,10 +59,17 @@ pub fn build_router(state: AppState) -> Router {
         // Send: Containers POST outbound messages (validated by Bearer token)
         .route(
             "/send",
-            post(handle_send).layer(RequestBodyLimitLayer::new(256 * 1024)),
+            post(handle_send)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(256 * 1024)),
         )
-        // Health: K8s probes (no auth)
-        .route("/health", get(handle_health))
+        // K8s probes (no auth)
+        .route("/health", get(handle_readiness))
+        .route("/readyz", get(handle_readiness))
+        .route("/livez", get(handle_liveness))
         // Security headers on all responses
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
@@ -80,21 +89,31 @@ async fn handle_webhook(
     headers: HeaderMap,
     Json(update): Json<TelegramUpdate>,
 ) -> StatusCode {
-    // Validate secret_token header (constant-time, length-padded)
+    // Validate secret_token header (constant-time)
     let secret = headers
         .get("x-telegram-bot-api-secret-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !constant_time_eq(secret, &state.webhook_secret) {
+    if !constant_time_eq(secret, state.webhook_secret.expose_secret()) {
         return StatusCode::UNAUTHORIZED;
     }
+
+    // Concurrency limit: shed load when at capacity (Telegram will retry)
+    let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!("webhook at capacity, shedding load");
+            return StatusCode::OK;
+        }
+    };
 
     let parsed = parse_update(&update);
 
     // Dispatch asynchronously — always return 200 to Telegram
     let s = state.clone();
     tokio::spawn(async move {
+        let _permit = permit; // held until task completes
         match parsed {
             ParsedMessage::Start {
                 chat_id,
@@ -140,7 +159,7 @@ fn container_url(customer_id: &Uuid) -> String {
 async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_id: i64) {
     // Look up customer by telegram_chat_id (runtime query — no DATABASE_URL needed at build time)
     let row = match sqlx::query_as::<_, CustomerRow>(
-        "SELECT id, status, last_update_id FROM customers WHERE telegram_chat_id = $1",
+        "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
     )
     .bind(chat_id)
     .fetch_optional(&state.pool)
@@ -164,15 +183,29 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
         }
     };
 
-    // Dedup: drop if already processed
-    if update_id <= row.last_update_id {
-        return;
-    }
-
     // Suspended customer: silent drop + log
     if row.status == "suspended" {
         info!(chat_id, customer_id = %row.id, "message from suspended customer, dropping");
         return;
+    }
+
+    // Atomic dedup: claim this update_id before forwarding.
+    // If another task already claimed it, skip silently.
+    let claimed = sqlx::query(
+        "UPDATE customers SET last_update_id = $1 WHERE id = $2 AND last_update_id < $1 RETURNING id",
+    )
+    .bind(update_id)
+    .bind(row.id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match claimed {
+        Ok(Some(_)) => {} // claimed — proceed to forward
+        Ok(None) => return, // already processed by another task
+        Err(e) => {
+            warn!(error = %e, "dedup update failed");
+            return;
+        }
     }
 
     let url = container_url(&row.id);
@@ -195,15 +228,7 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
 
     match result {
         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
-            // Update last_update_id after successful forward
-            if let Err(e) = sqlx::query("UPDATE customers SET last_update_id = $1 WHERE id = $2")
-                .bind(update_id)
-                .bind(row.id)
-                .execute(&state.pool)
-                .await
-            {
-                warn!(error = %e, "failed to update last_update_id");
-            }
+            // Successfully forwarded
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -219,8 +244,22 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
 
 // -- Pairing --
 
+/// Validate pairing token format: must be 64-char hex (32 bytes hex-encoded).
+fn is_valid_pairing_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Handle /start <pairing_token> deep link for customer pairing.
 async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
+    // Reject malformed tokens before hitting the database
+    if !is_valid_pairing_token(pairing_token) {
+        let _ = state
+            .telegram
+            .send_message(chat_id, "Invalid or expired invite link.")
+            .await;
+        return;
+    }
+
     // Atomic: only pairs if token valid, not expired, not already paired, status is 'provisioned'
     let result = sqlx::query_as::<_, PairingResultRow>(
         r#"UPDATE customers
@@ -229,7 +268,7 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
            WHERE pairing_token = $2
              AND telegram_chat_id IS NULL
              AND status = 'provisioned'
-             AND (pairing_expires_at IS NULL OR pairing_expires_at > now())
+             AND pairing_expires_at > now()
            RETURNING id"#,
     )
     .bind(chat_id)
@@ -267,9 +306,41 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
                 .await;
         }
         Err(e) => {
+            // Unique violation on telegram_chat_id — this Telegram account is already paired
+            if let Some(db_err) = e.as_database_error() {
+                if db_err.code().as_deref() == Some("23505") {
+                    let _ = state
+                        .telegram
+                        .send_message(chat_id, "This Telegram account is already linked to another account.")
+                        .await;
+                    return;
+                }
+            }
             warn!(error = %e, chat_id, "pairing query failed");
             reply_transient_error(&state.telegram, chat_id).await;
         }
+    }
+}
+
+// -- Bearer auth middleware --
+
+/// Middleware: validates `Authorization: Bearer <token>` using constant-time comparison.
+async fn require_bearer_token(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    let token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if constant_time_eq(t, state.internal_token.expose_secret()) => {
+            next.run(req).await.into_response()
+        }
+        _ => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
@@ -277,28 +348,16 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
 
 /// POST /send — containers deliver outbound messages to Telegram.
 ///
-/// Authenticated via Bearer MIKA_INTERNAL_TOKEN.
+/// Authenticated via `require_bearer_token` middleware.
 async fn handle_send(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(payload): Json<SendPayload>,
 ) -> impl IntoResponse {
-    // Validate Bearer token
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    match token {
-        Some(t) if constant_time_eq(t, state.internal_token.expose_secret()) => {}
-        _ => return StatusCode::UNAUTHORIZED.into_response(),
-    }
-
     // Validate payload
     if payload.text.is_empty() || payload.text.len() > 50_000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "text must be 1-50000 characters"})),
+            Json(serde_json::json!({"error": "text must be 1-50000 bytes"})),
         )
             .into_response();
     }
@@ -317,9 +376,7 @@ async fn handle_send(
         Err(TelegramApiError::RateLimited { retry_after }) => {
             let mut resp_headers = HeaderMap::new();
             if let Some(secs) = retry_after {
-                if let Ok(val) = secs.to_string().parse() {
-                    resp_headers.insert("retry-after", val);
-                }
+                resp_headers.insert("retry-after", HeaderValue::from(secs));
             }
             (StatusCode::TOO_MANY_REQUESTS, resp_headers).into_response()
         }
@@ -334,21 +391,30 @@ async fn handle_send(
 struct SendPayload {
     chat_id: i64,
     text: String,
-    #[allow(dead_code)]
-    request_id: Option<String>,
 }
 
-// -- Health handler --
+// -- Health handlers --
 
-/// GET /health — K8s liveness/readiness probe (no auth).
+/// GET /livez — K8s liveness probe (no auth, no DB).
+///
+/// Returns 200 if the process is alive. Does not check Postgres —
+/// avoids false-positive restarts under pool exhaustion.
+async fn handle_liveness(State(state): State<AppState>) -> StatusCode {
+    if state.ready.load(Ordering::Acquire) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// GET /readyz, /health — K8s readiness probe (no auth).
 ///
 /// Returns 200 if ready and Postgres is reachable, 503 otherwise.
-async fn handle_health(State(state): State<AppState>) -> StatusCode {
+async fn handle_readiness(State(state): State<AppState>) -> StatusCode {
     if !state.ready.load(Ordering::Acquire) {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
-    // Quick pool connectivity check
     match sqlx::query("SELECT 1").execute(&state.pool).await {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -357,19 +423,9 @@ async fn handle_health(State(state): State<AppState>) -> StatusCode {
 
 // -- Helpers --
 
-/// Constant-time string comparison, padded to avoid timing leak on length.
+/// Constant-time string comparison using the `subtle` crate.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
-    // Length check is constant-time via bitwise comparison
-    if a_bytes.len() != b_bytes.len() {
-        // Still do a comparison to avoid timing leak on length branch
-        let _ = a_bytes.ct_eq(a_bytes);
-        return false;
-    }
-
-    bool::from(a_bytes.ct_eq(b_bytes))
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
 /// Send a generic transient error reply (fire-and-forget).
@@ -382,20 +438,12 @@ async fn reply_transient_error(telegram: &TelegramClient, chat_id: i64) {
         .await;
 }
 
-/// Generate a cryptographic pairing token (32 random bytes, hex-encoded).
-pub fn generate_pairing_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    hex::encode(bytes)
-}
-
 // -- DB row types (for sqlx runtime queries) --
 
 #[derive(Debug, sqlx::FromRow)]
 struct CustomerRow {
     id: Uuid,
     status: String,
-    last_update_id: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -407,30 +455,25 @@ struct PairingResultRow {
 mod tests {
     use super::*;
 
+    /// Generate a cryptographic pairing token (32 random bytes, hex-encoded).
+    fn generate_pairing_token() -> String {
+        let mut bytes = [0u8; 32];
+        rand::fill(&mut bytes);
+        hex::encode(bytes)
+    }
+
     #[test]
-    fn test_constant_time_eq_same() {
+    fn test_constant_time_eq() {
         assert!(constant_time_eq("secret", "secret"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different() {
         assert!(!constant_time_eq("secret", "wrong"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_length() {
         assert!(!constant_time_eq("short", "longer_string"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_empty() {
         assert!(constant_time_eq("", ""));
     }
 
     #[test]
     fn test_generate_pairing_token_length() {
         let token = generate_pairing_token();
-        assert_eq!(token.len(), 64); // 32 bytes * 2 hex chars each
+        assert_eq!(token.len(), 64);
     }
 
     #[test]
@@ -444,6 +487,15 @@ mod tests {
     fn test_generate_pairing_token_is_hex() {
         let token = generate_pairing_token();
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_is_valid_pairing_token() {
+        let valid = generate_pairing_token();
+        assert!(is_valid_pairing_token(&valid));
+        assert!(!is_valid_pairing_token("too-short"));
+        assert!(!is_valid_pairing_token("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")); // 64 chars, not hex
+        assert!(!is_valid_pairing_token("")); // empty
     }
 
     #[test]

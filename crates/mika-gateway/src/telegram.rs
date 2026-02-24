@@ -29,8 +29,6 @@ pub struct TelegramUpdate {
 
 #[derive(Debug, Deserialize)]
 pub struct TelegramMessage {
-    #[allow(dead_code)]
-    pub message_id: i64,
     pub chat: TelegramChat,
     pub text: Option<String>,
 }
@@ -70,6 +68,9 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
 
     match &message.text {
         Some(text) => {
+            if text == "/start" {
+                return ParsedMessage::Unsupported { chat_id };
+            }
             if let Some(payload) = text.strip_prefix("/start ") {
                 let token = payload.trim();
                 if token.is_empty() {
@@ -120,7 +121,6 @@ struct SetWebhookPayload {
     url: String,
     secret_token: String,
     allowed_updates: Vec<String>,
-    max_connections: u32,
 }
 
 /// Telegram API client wrapper.
@@ -192,7 +192,6 @@ impl TelegramClient {
             url: webhook_url.to_string(),
             secret_token: webhook_secret.to_string(),
             allowed_updates: vec!["message".to_string()],
-            max_connections: 40,
         };
 
         let resp = self
@@ -237,7 +236,6 @@ mod tests {
         let update = TelegramUpdate {
             update_id: 100,
             message: Some(TelegramMessage {
-                message_id: 1,
                 chat: TelegramChat { id: 42 },
                 text: Some("Hello Mika!".to_string()),
             }),
@@ -258,7 +256,6 @@ mod tests {
         let update = TelegramUpdate {
             update_id: 101,
             message: Some(TelegramMessage {
-                message_id: 2,
                 chat: TelegramChat { id: 42 },
                 text: Some(format!("/start {token}")),
             }),
@@ -277,7 +274,6 @@ mod tests {
         let update = TelegramUpdate {
             update_id: 102,
             message: Some(TelegramMessage {
-                message_id: 3,
                 chat: TelegramChat { id: 42 },
                 text: Some("/start  abc123  ".to_string()),
             }),
@@ -296,7 +292,6 @@ mod tests {
         let update = TelegramUpdate {
             update_id: 103,
             message: Some(TelegramMessage {
-                message_id: 4,
                 chat: TelegramChat { id: 42 },
                 text: Some("/start ".to_string()),
             }),
@@ -312,7 +307,6 @@ mod tests {
         let update = TelegramUpdate {
             update_id: 104,
             message: Some(TelegramMessage {
-                message_id: 5,
                 chat: TelegramChat { id: 42 },
                 text: None,
             }),
@@ -330,6 +324,21 @@ mod tests {
             message: None,
         };
         assert_eq!(parse_update(&update), ParsedMessage::NoMessage);
+    }
+
+    #[test]
+    fn test_parse_bare_start() {
+        let update = TelegramUpdate {
+            update_id: 106,
+            message: Some(TelegramMessage {
+                chat: TelegramChat { id: 42 },
+                text: Some("/start".to_string()),
+            }),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Unsupported { chat_id: 42 }
+        );
     }
 
     #[test]

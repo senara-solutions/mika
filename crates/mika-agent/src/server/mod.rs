@@ -87,6 +87,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         internal_token.clone(),
         async_db.clone(),
         http_client.clone(),
+        None,
     );
     let scheduler_sender: Arc<dyn MessageSender> = Arc::new(scheduler_sender);
 

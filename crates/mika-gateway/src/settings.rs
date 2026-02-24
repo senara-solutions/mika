@@ -12,7 +12,7 @@ pub struct GatewaySettings {
     pub telegram_bot_token: SecretString,
 
     /// Secret token for validating inbound Telegram webhooks
-    pub telegram_webhook_secret: String,
+    pub telegram_webhook_secret: SecretString,
 
     /// Public URL Telegram calls for webhook delivery
     pub telegram_webhook_url: String,
@@ -82,7 +82,7 @@ mod tests {
             GatewaySettings {
                 database_url: SecretString::from("postgres://user:pass@localhost/db"),
                 telegram_bot_token: SecretString::from("123:ABC"),
-                telegram_webhook_secret: "secret".to_string(),
+                telegram_webhook_secret: SecretString::from("secret"),
                 telegram_webhook_url: "https://example.com/webhook".to_string(),
                 internal_token: SecretString::from("token-123"),
                 gateway_port: 8080,

@@ -99,6 +99,7 @@ pub async fn handle_message(
                 s.internal_token.clone(),
                 s.db.clone(),
                 s.http_client.clone(),
+                Some(req.request_id.clone()),
             );
             let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
@@ -189,6 +190,7 @@ pub async fn handle_heartbeat(
             s.internal_token.clone(),
             s.db.clone(),
             s.http_client.clone(),
+            Some(req.request_id.clone()),
         );
         let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
@@ -227,6 +229,7 @@ async fn flush_failed_sends(state: &AppState) {
         state.internal_token.clone(),
         state.db.clone(),
         state.http_client.clone(),
+        None,
     );
 
     for send in sends {

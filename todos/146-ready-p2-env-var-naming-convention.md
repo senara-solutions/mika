@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "146"
 tags: [plan-review, architecture, conventions]

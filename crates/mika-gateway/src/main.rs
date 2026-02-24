@@ -39,7 +39,12 @@ async fn main() -> Result<()> {
     info!("migrations applied");
 
     // Create shared HTTP client
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()?;
 
     // Create Telegram client
     let telegram = TelegramClient::new(http_client.clone(), settings.telegram_bot_token.clone());
@@ -48,7 +53,7 @@ async fn main() -> Result<()> {
     telegram
         .set_webhook(
             &settings.telegram_webhook_url,
-            &settings.telegram_webhook_secret,
+            settings.telegram_webhook_secret.expose_secret(),
         )
         .await?;
     info!(url = %settings.telegram_webhook_url, "telegram webhook registered");
@@ -61,6 +66,7 @@ async fn main() -> Result<()> {
         internal_token: settings.internal_token.clone(),
         webhook_secret: settings.telegram_webhook_secret.clone(),
         ready: ready.clone(),
+        webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
     };
 
     let app = build_router(state);

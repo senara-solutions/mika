@@ -24,6 +24,7 @@ pub struct GatewayMessageSender {
     gateway_url: String,
     internal_token: String,
     db: AsyncDatabase,
+    request_id: Option<String>,
 }
 
 impl GatewayMessageSender {
@@ -32,12 +33,14 @@ impl GatewayMessageSender {
         internal_token: String,
         db: AsyncDatabase,
         client: reqwest::Client,
+        request_id: Option<String>,
     ) -> Self {
         Self {
             client,
             gateway_url,
             internal_token,
             db,
+            request_id,
         }
     }
 
@@ -70,7 +73,11 @@ impl MessageSender for GatewayMessageSender {
             .parse::<i64>()
             .map_err(|e| anyhow!("invalid chat_id: {e}"))?;
 
-        let payload = serde_json::json!({ "chat_id": chat_id, "text": text });
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "request_id": self.request_id,
+        });
 
         // First attempt
         match self.try_send(&payload).await {
