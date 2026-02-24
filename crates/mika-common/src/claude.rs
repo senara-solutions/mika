@@ -135,6 +135,7 @@ impl MessagesResponse {
     }
 }
 
+#[derive(Clone)]
 pub struct ClaudeClient {
     client: reqwest::Client,
     api_key: String,

@@ -31,6 +31,14 @@ pub struct Settings {
     #[serde(default)]
     pub customer_id: Option<String>,
 
+    /// HTTP server port (default: 8080, only used in server mode)
+    #[serde(default = "default_server_port")]
+    pub server_port: u16,
+
+    /// Internal bearer token for gateway ↔ container auth
+    #[serde(default)]
+    pub internal_token: Option<String>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -50,6 +58,10 @@ fn default_db_path() -> PathBuf {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_server_port() -> u16 {
+    8080
 }
 
 impl Settings {
@@ -99,6 +111,8 @@ impl std::fmt::Debug for Settings {
             .field("log_level", &self.log_level)
             .field("routing_url", &self.routing_url)
             .field("customer_id", &self.customer_id)
+            .field("server_port", &self.server_port)
+            .field("internal_token", &self.internal_token.as_ref().map(|_| "[REDACTED]"))
             .field("home_dir", &self.home_dir)
             .finish()
     }

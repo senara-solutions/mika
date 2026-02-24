@@ -4,8 +4,8 @@ use std::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::db::{
-    Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, MemoryEvent, Person,
-    Preference, Reminder,
+    Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent,
+    Person, Preference, Reminder,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -25,11 +25,18 @@ pub struct AsyncDatabase {
 
 impl AsyncDatabase {
     /// Spawn a dedicated OS thread that owns `db` and processes closures.
+    ///
+    /// If a closure panics, the thread logs the error and continues
+    /// processing subsequent closures (see [`std::panic::catch_unwind`]).
     pub fn new(db: Database) -> Self {
         let (tx, rx) = mpsc::channel::<DbClosure>();
         std::thread::spawn(move || {
             while let Ok(f) = rx.recv() {
-                f(&db);
+                if let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    f(&db);
+                })) {
+                    tracing::error!("database closure panicked — thread continues");
+                }
             }
         });
         Self { sender: tx }
@@ -285,6 +292,51 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn record_heartbeat_send(&self) -> Result<()> {
+        self.with_db(|db| db.record_heartbeat_send()).await
+    }
+
+    pub async fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
+        self.with_db(|db| db.count_heartbeat_sends_last_hour())
+            .await
+    }
+
+    pub async fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
+        let tz = timezone.to_owned();
+        self.with_db(move |db| db.count_heartbeat_sends_today(&tz))
+            .await
+    }
+
+    pub async fn last_user_message_time(&self) -> Result<Option<String>> {
+        self.with_db(|db| db.last_user_message_time()).await
+    }
+
+    // -- Failed Sends --
+
+    pub async fn save_failed_send(
+        &self,
+        text: &str,
+        request_id: Option<&str>,
+    ) -> Result<i64> {
+        let (t, r) = (text.to_owned(), request_id.map(|s| s.to_owned()));
+        self.with_db(move |db| db.save_failed_send(&t, r.as_deref()))
+            .await
+    }
+
+    pub async fn get_pending_failed_sends(&self, limit: usize) -> Result<Vec<FailedSend>> {
+        self.with_db(move |db| db.get_pending_failed_sends(limit))
+            .await
+    }
+
+    pub async fn delete_failed_send(&self, id: i64) -> Result<()> {
+        self.with_db(move |db| db.delete_failed_send(id)).await
+    }
+
+    pub async fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
+        self.with_db(move |db| db.increment_failed_send_retry(id))
+            .await
+    }
+
     pub async fn compact_old_memory_events(&self, days: u32) -> Result<usize> {
         self.with_db(move |db| db.compact_old_memory_events(days))
             .await
@@ -401,6 +453,30 @@ mod tests {
         let messages = db2.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "From clone 1");
+    }
+
+    #[tokio::test]
+    async fn test_async_db_survives_panic() {
+        let db = test_async_db();
+        db.save_message("user", "before panic", "cli")
+            .await
+            .unwrap();
+
+        // Send a closure that panics — the thread should catch it
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        db.sender
+            .send(Box::new(move |_db| {
+                let _ = tx.send(());
+                panic!("intentional test panic");
+            }))
+            .unwrap();
+        // Wait for the panicking closure to execute
+        rx.await.unwrap();
+
+        // Thread should still be alive — this call should succeed
+        let messages = db.load_recent_messages(10, None).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "before panic");
     }
 
     #[tokio::test]

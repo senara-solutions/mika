@@ -809,6 +809,102 @@ impl Database {
         Ok(())
     }
 
+    /// Record a heartbeat send (for rate limiting).
+    pub fn record_heartbeat_send(&self) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO heartbeat_sends (sent_at) VALUES (datetime('now'))",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Count heartbeat sends in the last hour.
+    pub fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= datetime('now', '-1 hour')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count heartbeat sends today in the customer's timezone.
+    pub fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
+        // SQLite doesn't have native timezone support, so we compute the current
+        // date in the customer's timezone by applying an offset. For simplicity,
+        // we count sends in the last 24 hours (good enough for rate limiting).
+        let _ = timezone; // TODO: proper timezone conversion when chrono-tz is added
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= datetime('now', '-24 hours')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Most recent user message timestamp (for heartbeat pre-filter).
+    pub fn last_user_message_time(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT created_at FROM conversations \
+                 WHERE role = 'user' AND channel_type IN ('cli', 'telegram') \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    // -- Failed Sends --
+
+    /// Save a failed outbound send for later retry.
+    pub fn save_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO failed_sends (text, request_id) VALUES (?1, ?2)",
+            rusqlite::params![text, request_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get oldest failed sends for flushing (max retry_count 3, max age 24h).
+    pub fn get_pending_failed_sends(&self, limit: usize) -> Result<Vec<FailedSend>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, request_id, created_at, retry_count \
+             FROM failed_sends \
+             WHERE retry_count < 3 AND created_at > datetime('now', '-24 hours') \
+             ORDER BY created_at ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(FailedSend {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    request_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    retry_count: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete a successfully flushed send.
+    pub fn delete_failed_send(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM failed_sends WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Increment retry count on a failed flush.
+    pub fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE failed_sends SET retry_count = retry_count + 1 WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     // -- Conversation Compaction --
 
     /// Save a conversation summary row. Returns the new row ID.
@@ -1376,6 +1472,14 @@ pub struct MemoryEvent {
     pub created_at: String,
 }
 
+pub struct FailedSend {
+    pub id: i64,
+    pub text: String,
+    pub request_id: Option<String>,
+    pub created_at: String,
+    pub retry_count: i32,
+}
+
 // Bring in rusqlite optional extension
 use rusqlite::OptionalExtension;
 
@@ -1833,6 +1937,82 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM heartbeat_sends", [], |row| row.get(0))
             .unwrap();
         assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn test_record_and_count_heartbeat_sends() {
+        let db = test_db();
+
+        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 0);
+        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 0);
+
+        db.record_heartbeat_send().unwrap();
+        db.record_heartbeat_send().unwrap();
+
+        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 2);
+        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_last_user_message_time() {
+        let db = test_db();
+
+        // No messages yet
+        assert!(db.last_user_message_time().unwrap().is_none());
+
+        // Add a user message
+        db.save_message("user", "hello", "cli").unwrap();
+        let ts = db.last_user_message_time().unwrap();
+        assert!(ts.is_some());
+
+        // Heartbeat messages should not count
+        db.save_message("assistant", "hi", "heartbeat").unwrap();
+        let ts2 = db.last_user_message_time().unwrap();
+        assert_eq!(ts, ts2); // same as before
+    }
+
+    #[test]
+    fn test_failed_send_lifecycle() {
+        let db = test_db();
+
+        // No sends initially
+        let sends = db.get_pending_failed_sends(10).unwrap();
+        assert!(sends.is_empty());
+
+        // Save a failed send
+        let id = db.save_failed_send("hello user", Some("req-123")).unwrap();
+        assert!(id > 0);
+
+        // Retrieve it
+        let sends = db.get_pending_failed_sends(10).unwrap();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].text, "hello user");
+        assert_eq!(sends[0].request_id.as_deref(), Some("req-123"));
+        assert_eq!(sends[0].retry_count, 0);
+
+        // Increment retry
+        db.increment_failed_send_retry(id).unwrap();
+        let sends = db.get_pending_failed_sends(10).unwrap();
+        assert_eq!(sends[0].retry_count, 1);
+
+        // Delete after successful flush
+        db.delete_failed_send(id).unwrap();
+        let sends = db.get_pending_failed_sends(10).unwrap();
+        assert!(sends.is_empty());
+    }
+
+    #[test]
+    fn test_failed_sends_respects_retry_limit() {
+        let db = test_db();
+
+        let id = db.save_failed_send("doomed msg", None).unwrap();
+        db.increment_failed_send_retry(id).unwrap();
+        db.increment_failed_send_retry(id).unwrap();
+        db.increment_failed_send_retry(id).unwrap();
+
+        // retry_count = 3 → should not appear in pending
+        let sends = db.get_pending_failed_sends(10).unwrap();
+        assert!(sends.is_empty());
     }
 
     // -- Compaction tests --

@@ -4,6 +4,7 @@ use mika_common::claude::{
 };
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -27,7 +28,7 @@ pub struct AgentParams<'a> {
     pub session_id: &'a str,
     pub home_dir: &'a Path,
     pub is_onboarding: bool,
-    pub message_sender: Option<&'a dyn MessageSender>,
+    pub message_sender: Option<Arc<dyn MessageSender>>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -126,7 +127,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: params.is_onboarding,
-        message_sender: params.message_sender,
+        message_sender: params.message_sender.clone(),
     };
 
     // Build the request once; only messages changes between iterations.
@@ -266,7 +267,7 @@ pub struct SilentAgentParams<'a> {
     pub trigger: SilentTrigger,
     pub home_dir: &'a Path,
     pub session_id: &'a str,
-    pub message_sender: Option<&'a dyn MessageSender>,
+    pub message_sender: Option<Arc<dyn MessageSender>>,
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -370,7 +371,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
-        message_sender: params.message_sender,
+        message_sender: params.message_sender.clone(),
     };
 
     let mut request = MessagesRequest {

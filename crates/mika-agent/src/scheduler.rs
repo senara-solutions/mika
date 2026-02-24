@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mika_common::claude::ClaudeClient;
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
@@ -14,15 +15,17 @@ use crate::tools::ToolRegistry;
 /// Future reminders are not timer-scheduled (no persistent runtime in CLI).
 ///
 /// Phase 2 (HTTP server): Will add Tokio timer scheduling for future reminders.
-pub struct ReminderScheduler<'a> {
-    pub db: &'a AsyncDatabase,
-    pub claude: &'a ClaudeClient,
-    pub tools: &'a ToolRegistry,
-    pub home_dir: &'a Path,
-    pub message_sender: Option<&'a dyn MessageSender>,
+///
+/// Owns all dependencies so it can be stored in `Arc<ReminderScheduler>` for AppState.
+pub struct ReminderScheduler {
+    pub db: AsyncDatabase,
+    pub claude: ClaudeClient,
+    pub tools: Arc<ToolRegistry>,
+    pub home_dir: PathBuf,
+    pub message_sender: Option<Arc<dyn MessageSender>>,
 }
 
-impl ReminderScheduler<'_> {
+impl ReminderScheduler {
     /// Recover pending reminders on startup.
     /// - Past-due reminders: fire immediately (max 5 to avoid blocking startup)
     /// - Future reminders: log count (timer scheduling is Phase 2)
@@ -88,16 +91,16 @@ impl ReminderScheduler<'_> {
             );
             let session_id = format!("reminder-recovery-{}", reminder.id);
             let params = SilentAgentParams {
-                db: self.db,
-                claude: self.claude,
-                tools: self.tools,
+                db: &self.db,
+                claude: &self.claude,
+                tools: &self.tools,
                 trigger: SilentTrigger::Reminder {
                     id: reminder.id,
                     message: reminder.message.clone(),
                 },
-                home_dir: self.home_dir,
+                home_dir: &self.home_dir,
                 session_id: &session_id,
-                message_sender: self.message_sender,
+                message_sender: self.message_sender.clone(),
             };
 
             if let Err(e) = run_silent_agent(&params).await {

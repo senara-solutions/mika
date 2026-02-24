@@ -67,8 +67,8 @@ mod tests {
     use super::*;
     use crate::messaging::MessageSender;
     use crate::test_utils::test_helpers::{test_async_db, test_ctx};
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Mutex};
 
     /// Test sender that captures messages.
     struct MockSender {
@@ -87,7 +87,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl MessageSender for MockSender {
         async fn send(&self, text: &str) -> Result<()> {
             self.messages.lock().unwrap().push(text.to_string());
@@ -114,14 +114,14 @@ mod tests {
     async fn test_send_message_with_sender() {
         let db = test_async_db();
         let counter = AtomicU32::new(0);
-        let mock = MockSender::new();
+        let mock = Arc::new(MockSender::new());
         let ctx = crate::tools::ToolContext {
             db: &db,
             session_id: "test",
             home_dir: std::path::Path::new("/tmp"),
             core_memory_edit_count: &counter,
             is_onboarding: false,
-            message_sender: Some(&mock),
+            message_sender: Some(mock.clone()),
         };
         let tool = SendMessageTool;
 
