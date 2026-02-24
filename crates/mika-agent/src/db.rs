@@ -5,9 +5,6 @@ use tracing::{debug, info};
 
 const CURRENT_SCHEMA_VERSION: i64 = 7;
 
-/// Current schema version, exposed for status commands.
-pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
-
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];

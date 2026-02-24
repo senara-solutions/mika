@@ -33,6 +33,6 @@ pub async fn run(args: ReminderArgs) -> Result<()> {
         }
     }
 
-    ctx.async_db.shutdown();
+    // Database shutdown happens automatically via Drop on ctx
     Ok(())
 }

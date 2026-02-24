@@ -11,25 +11,32 @@ Arguments:
 
 Options:
   --force       Skip confirmation prompt
+  --output json Output structured JSON instead of human-readable text
   --dry-run     Show what would be done without executing
   --help        Show this help
+
+Exit codes:
+  0   Success
+  1   Invalid arguments
 
 Required environment variables:
   DATABASE_URL    Postgres connection string for gateway DB
 USAGE
-    exit 1
+    exit "${1:-1}"
 }
 
 # --- Parse arguments ---
 CUSTOMER_ID=""
 FORCE=false
 DRY_RUN=false
+OUTPUT_FORMAT="text"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --force)    FORCE=true; shift ;;
+        --output)   OUTPUT_FORMAT="$2"; shift 2 ;;
         --dry-run)  DRY_RUN=true; shift ;;
-        --help)     usage ;;
+        --help)     usage 0 ;;
         -*)         echo "Error: Unknown option: $1" >&2; usage ;;
         *)
             if [[ -z "$CUSTOMER_ID" ]]; then
@@ -40,6 +47,11 @@ while [[ $# -gt 0 ]]; do
             shift ;;
     esac
 done
+
+if [[ "$OUTPUT_FORMAT" != "text" && "$OUTPUT_FORMAT" != "json" ]]; then
+    echo "Error: --output must be 'text' or 'json', got '${OUTPUT_FORMAT}'" >&2
+    exit 1
+fi
 
 [[ -z "$CUSTOMER_ID" ]] && { echo "Error: customer_id is required" >&2; usage; }
 
@@ -122,6 +134,10 @@ psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
     -c "DELETE FROM customers WHERE id = :'customer_id'::uuid;" \
     2>/dev/null || echo "  (no row to delete)"
 
-echo ""
-echo "=== Deprovisioning Complete ==="
-echo "Customer ${CUSTOMER_ID} has been fully deprovisioned."
+if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    printf '{"customer_id":"%s","status":"success"}\n' "${CUSTOMER_ID}"
+else
+    echo ""
+    echo "=== Deprovisioning Complete ==="
+    echo "Customer ${CUSTOMER_ID} has been fully deprovisioned."
+fi

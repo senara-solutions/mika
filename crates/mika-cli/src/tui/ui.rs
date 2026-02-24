@@ -73,8 +73,13 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                     Style::default().add_modifier(Modifier::BOLD),
                 )]);
                 lines.push(prefix);
-                let md_lines = markdown::render(&msg.content);
-                lines.extend(md_lines);
+                // Use cached rendered lines if available, otherwise render now
+                if let Some(ref cached) = msg.rendered {
+                    lines.extend(cached.clone());
+                } else {
+                    let md_lines = markdown::render(&msg.content);
+                    lines.extend(md_lines);
+                }
             }
             ChatRole::System => {
                 lines.push(Line::default());
@@ -86,7 +91,7 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         }
     }
 
-    // Progressive reveal of pending response
+    // Progressive reveal of pending response (re-rendered each frame since content changes)
     if let Some(ref full) = app.pending_response {
         lines.push(Line::default());
         let prefix = Line::from(vec![Span::styled(
@@ -95,7 +100,9 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         )]);
         lines.push(prefix);
 
-        let revealed = &full[..app.reveal_index.min(full.len())];
+        // Use floor_char_boundary to ensure we slice on a valid UTF-8 char boundary
+        let safe_index = full.floor_char_boundary(app.reveal_index.min(full.len()));
+        let revealed = &full[..safe_index];
         let md_lines = markdown::render(revealed);
         lines.extend(md_lines);
     }
@@ -117,14 +124,18 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         )]));
     }
 
-    // Calculate scroll: show the bottom of messages by default
-    let total_lines = lines.len() as u16;
-    let visible_height = inner.height;
+    // Calculate scroll: show the bottom of messages by default.
+    // Use usize for all arithmetic to avoid u16 truncation on long conversations.
+    let total_lines = lines.len();
+    let visible_height = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset);
 
+    // Clamp to u16::MAX at the ratatui call site (Paragraph::scroll takes u16)
+    let scroll_u16 = effective_scroll.min(u16::MAX as usize) as u16;
+
     let paragraph = Paragraph::new(lines)
-        .scroll((effective_scroll, 0))
+        .scroll((scroll_u16, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
 }

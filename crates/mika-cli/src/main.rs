@@ -12,6 +12,11 @@ use mika_common::home;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Initialize tracing so structured logs are not silently dropped.
+    // All CLI modes use pretty (human-readable) output at warn level.
+    // TUI commands write to stderr which ratatui's alternate screen handles.
+    mika_common::logging::init_pretty("warn");
+
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat
         None => {
@@ -27,5 +32,6 @@ async fn main() -> Result<()> {
         Some(Commands::Reminders(args)) => commands::reminders::run(args).await,
         Some(Commands::Status) => commands::status::run().await,
         Some(Commands::Config(args)) => commands::config::run(args).await,
+        Some(Commands::Ask { message }) => commands::ask::run(&message).await,
     }
 }

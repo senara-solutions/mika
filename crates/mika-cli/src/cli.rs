@@ -21,6 +21,11 @@ pub enum Commands {
     Status,
     /// View or edit configuration
     Config(ConfigArgs),
+    /// Send a message and print the response (non-interactive)
+    Ask {
+        /// The message to send (use "-" to read from stdin)
+        message: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -45,6 +50,8 @@ pub enum MemoryCommand {
     Preferences,
     /// List events
     Events,
+    /// Reset a core memory block to its default value
+    Reset { block: String },
 }
 
 #[derive(clap::Args)]

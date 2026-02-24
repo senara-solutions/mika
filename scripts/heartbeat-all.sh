@@ -17,7 +17,7 @@ Required environment variables:
   DATABASE_URL          Postgres connection string for gateway DB
   MIKA_INTERNAL_TOKEN   Shared 64-char hex auth token
 USAGE
-    exit 1
+    exit "${1:-1}"
 }
 
 DRY_RUN=false
@@ -25,7 +25,7 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dry-run)  DRY_RUN=true; shift ;;
-        --help)     usage ;;
+        --help)     usage 0 ;;
         -*)         echo "Error: Unknown option: $1" >&2; usage ;;
         *)          echo "Error: Unexpected argument: $1" >&2; usage ;;
     esac
@@ -59,16 +59,16 @@ while IFS= read -r cid; do
         continue
     fi
 
-    if curl -sf -X POST \
+    HTTP_CODE=$(curl -s -X POST \
         -H "Authorization: Bearer ${MIKA_INTERNAL_TOKEN}" \
         -H "Content-Type: application/json" \
-        -o /dev/null -w "" \
-        --connect-timeout 5 \
-        --max-time 10 \
-        "${URL}" 2>/dev/null; then
+        -o /dev/null -w '%{http_code}' \
+        --connect-timeout 5 --max-time 10 \
+        "${URL}" 2>/dev/null) || HTTP_CODE="000"
+    if [[ "$HTTP_CODE" =~ ^2 ]]; then
         SUCCEEDED=$((SUCCEEDED + 1))
     else
-        echo "  Warning: heartbeat failed for ${cid}" >&2
+        echo "  Warning: heartbeat failed for ${cid} (HTTP ${HTTP_CODE})" >&2
         FAILED=$((FAILED + 1))
     fi
 done <<< "$CUSTOMER_IDS"

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use mika_agent::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
 
 use crate::cli::{MemoryArgs, MemoryCommand};
 use crate::init;
@@ -164,8 +165,36 @@ pub async fn run(args: MemoryArgs) -> Result<()> {
                 println!();
             }
         }
+        Some(MemoryCommand::Reset { block }) => {
+            let section = CORE_MEMORY_SECTIONS
+                .iter()
+                .find(|(k, _)| *k == block.as_str());
+
+            if let Some(&(_, default_value)) = section {
+                let reset_value = if block == "user_summary" {
+                    // Re-seed from user.md if available
+                    let user_md_path = ctx.home_dir.join("user.md");
+                    let content = std::fs::read_to_string(&user_md_path).ok();
+                    let from_file = content
+                        .as_deref()
+                        .filter(|s| !s.starts_with("# Tell Mika about yourself"));
+                    from_file.unwrap_or(default_value).to_string()
+                } else {
+                    default_value.to_string()
+                };
+
+                db.set_core_memory(&block, &reset_value).await?;
+                println!("\n  Reset [{block}] to default.\n");
+            } else {
+                let allowed = core_memory_section_names();
+                println!(
+                    "\n  Invalid block '{block}'. Allowed: {}\n",
+                    allowed.join(", ")
+                );
+            }
+        }
     }
 
-    ctx.async_db.shutdown();
+    // Database shutdown happens automatically via Drop on ctx
     Ok(())
 }

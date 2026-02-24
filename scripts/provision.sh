@@ -12,21 +12,30 @@ Arguments:
 
 Options:
   --timezone TZ   IANA timezone (default: UTC)
+  --output json   Output structured JSON instead of human-readable text
   --dry-run       Show what would be done without executing
   --help          Show this help
+
+Exit codes:
+  0   Success
+  1   Invalid arguments
+  2   K8s secret creation failed
+  3   Helm install failed
+  4   Postgres registration failed
+  10  Provisioning and rollback both failed
 
 Required environment variables:
   DATABASE_URL            Postgres connection string for gateway DB
   MIKA_ANTHROPIC_API_KEY  Anthropic API key for the customer
   MIKA_INTERNAL_TOKEN     Shared 64-char hex auth token
   TELEGRAM_BOT_USERNAME   Telegram bot username (for deep link)
+  MIKA_IMAGE_REPO         ECR image repository
 
 Optional environment variables:
-  MIKA_IMAGE_REPO         ECR image repository
   MIKA_IMAGE_TAG          Image tag (default: latest)
   MIKA_GATEWAY_URL        Gateway URL (default: http://mika-gateway.mika-system.svc.cluster.local:8080)
 USAGE
-    exit 1
+    exit "${1:-1}"
 }
 
 # --- Parse arguments ---
@@ -34,12 +43,14 @@ CUSTOMER_NAME=""
 PLAN="standard"
 TIMEZONE="UTC"
 DRY_RUN=false
+OUTPUT_FORMAT="text"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --timezone) TIMEZONE="$2"; shift 2 ;;
+        --output)   OUTPUT_FORMAT="$2"; shift 2 ;;
         --dry-run)  DRY_RUN=true; shift ;;
-        --help)     usage ;;
+        --help)     usage 0 ;;
         -*)         echo "Error: Unknown option: $1" >&2; usage ;;
         *)
             if [[ -z "$CUSTOMER_NAME" ]]; then
@@ -53,6 +64,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$OUTPUT_FORMAT" != "text" && "$OUTPUT_FORMAT" != "json" ]]; then
+    echo "Error: --output must be 'text' or 'json', got '${OUTPUT_FORMAT}'" >&2
+    exit 1
+fi
+
 [[ -z "$CUSTOMER_NAME" ]] && { echo "Error: customer_name is required" >&2; usage; }
 
 # --- Validate required env vars ---
@@ -60,6 +76,7 @@ done
 : "${MIKA_ANTHROPIC_API_KEY:?MIKA_ANTHROPIC_API_KEY is required}"
 : "${MIKA_INTERNAL_TOKEN:?MIKA_INTERNAL_TOKEN is required}"
 : "${TELEGRAM_BOT_USERNAME:?TELEGRAM_BOT_USERNAME is required}"
+: "${MIKA_IMAGE_REPO:?MIKA_IMAGE_REPO is required}"
 
 # --- Validate inputs ---
 # Customer name: alphanumeric, spaces, hyphens, periods, apostrophes. 1-100 chars.
@@ -105,30 +122,55 @@ fi
 
 # --- Rollback on failure ---
 STEP_COMPLETED=0
+PROVISION_EXIT_CODE=1
 cleanup() {
+    local rollback_failed=false
     echo "" >&2
     echo "!!! Provisioning failed at step ${STEP_COMPLETED}. Rolling back..." >&2
     if [[ $STEP_COMPLETED -ge 3 ]]; then
         echo "  Rolling back Postgres row..." >&2
-        psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 <<'ROLLBACK_SQL' 2>/dev/null || true
-\set customer_id_val :'CUSTOMER_ID'
-DELETE FROM customers WHERE id = :'customer_id_val'::uuid;
+        if ! psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
+            -v customer_id="${CUSTOMER_ID}" \
+            <<'ROLLBACK_SQL' 2>/dev/null; then
+DELETE FROM customers WHERE id = :'customer_id'::uuid;
 ROLLBACK_SQL
+            rollback_failed=true
+        fi
     fi
     if [[ $STEP_COMPLETED -ge 2 ]]; then
         echo "  Rolling back Helm release..." >&2
-        helm uninstall "mika-${CUSTOMER_ID}" --namespace "${NAMESPACE}" 2>/dev/null || true
+        if ! helm uninstall "mika-${CUSTOMER_ID}" --namespace "${NAMESPACE}" 2>/dev/null; then
+            rollback_failed=true
+        fi
     fi
     if [[ $STEP_COMPLETED -ge 1 ]]; then
         echo "  Rolling back K8s secret..." >&2
-        kubectl delete secret "mika-${CUSTOMER_ID}-secrets" -n "${NAMESPACE}" 2>/dev/null || true
+        if ! kubectl delete secret "mika-${CUSTOMER_ID}-secrets" -n "${NAMESPACE}" 2>/dev/null; then
+            rollback_failed=true
+        fi
+    fi
+    if [[ "$rollback_failed" == "true" ]]; then
+        echo "Rollback encountered errors." >&2
+        if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+            printf '{"customer_id":"%s","namespace":"%s","status":"rollback_failed"}\n' \
+                "${CUSTOMER_ID}" "${NAMESPACE}"
+        fi
+        exit 10
     fi
     echo "Rollback complete." >&2
-    exit 1
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        printf '{"customer_id":"%s","namespace":"%s","status":"failed"}\n' \
+            "${CUSTOMER_ID}" "${NAMESPACE}"
+    fi
+    exit "${PROVISION_EXIT_CODE}"
 }
 trap cleanup ERR
 
+# --- Ensure namespace exists ---
+kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
+
 # --- Step 1: Create K8s secret ---
+PROVISION_EXIT_CODE=2
 echo "Step 1/4: Creating K8s secret..."
 kubectl create secret generic "mika-${CUSTOMER_ID}-secrets" \
     --namespace "${NAMESPACE}" \
@@ -139,14 +181,15 @@ STEP_COMPLETED=1
 echo "  Created: mika-${CUSTOMER_ID}-secrets"
 
 # --- Step 2: Helm install ---
+PROVISION_EXIT_CODE=3
 echo "Step 2/4: Installing Helm release..."
 helm install "mika-${CUSTOMER_ID}" ./helm/mika-customer \
     --namespace "${NAMESPACE}" --create-namespace \
     --set customer.id="${CUSTOMER_ID}" \
-    --set "customer.name=${CUSTOMER_NAME}" \
+    --set-string "customer.name=${CUSTOMER_NAME}" \
     --set customer.plan="${PLAN}" \
     --set customer.timezone="${TIMEZONE}" \
-    --set image.repository="${MIKA_IMAGE_REPO:-}" \
+    --set image.repository="${MIKA_IMAGE_REPO}" \
     --set image.tag="${MIKA_IMAGE_TAG:-latest}" \
     --set gateway.url="${GATEWAY_URL}" \
     --wait --timeout 120s
@@ -154,6 +197,7 @@ STEP_COMPLETED=2
 echo "  Installed: mika-${CUSTOMER_ID}"
 
 # --- Step 3: Register in Postgres (parameterized via psql \set) ---
+PROVISION_EXIT_CODE=4
 echo "Step 3/4: Registering in Postgres..."
 psql "${DATABASE_URL}" \
     -v ON_ERROR_STOP=1 \
@@ -183,11 +227,16 @@ echo "Step 4/4: Generating deep link..."
 DEEP_LINK="https://t.me/${TELEGRAM_BOT_USERNAME}?start=${PAIRING_TOKEN}"
 STEP_COMPLETED=4
 
-echo ""
-echo "=== Provisioning Complete ==="
-echo "Customer ID:   ${CUSTOMER_ID}"
-echo "Deep link:     ${DEEP_LINK}"
-echo "Pairing token: ${PAIRING_TOKEN}"
-echo "Token expires: 72 hours from now"
-echo ""
-echo "Send the deep link to the customer to start onboarding."
+if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    printf '{"customer_id":"%s","namespace":"%s","status":"success"}\n' \
+        "${CUSTOMER_ID}" "${NAMESPACE}"
+else
+    echo ""
+    echo "=== Provisioning Complete ==="
+    echo "Customer ID:   ${CUSTOMER_ID}"
+    echo "Deep link:     ${DEEP_LINK}"
+    echo "Pairing token: ${PAIRING_TOKEN}"
+    echo "Token expires: 72 hours from now"
+    echo ""
+    echo "Send the deep link to the customer to start onboarding."
+fi

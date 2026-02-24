@@ -48,7 +48,7 @@ pub async fn run() -> Result<()> {
     let worker_tools = tool_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
-    tokio::spawn(async move {
+    let agent_handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
                 AgentRequest::Message(text) => {
@@ -115,17 +115,21 @@ pub async fn run() -> Result<()> {
 
     // Main loop
     loop {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        if app.needs_redraw {
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            app.needs_redraw = false;
+        }
 
         match events.next().await {
             Some(AppEvent::Key(key)) => {
                 input::handle_key(&mut app, key);
+                app.needs_redraw = true;
             }
             Some(AppEvent::Tick) => {
                 app.tick();
             }
             Some(AppEvent::Resize) => {
-                // Terminal handles resize automatically
+                app.needs_redraw = true;
             }
             None => break,
         }
@@ -139,9 +143,19 @@ pub async fn run() -> Result<()> {
     // Restore terminal
     restore_terminal()?;
 
-    // Shutdown database
-    ctx.async_db.shutdown();
+    // Shut down event reader thread
+    events.shutdown();
 
+    // Check agent worker for panics
+    if agent_handle.is_finished() {
+        if let Err(e) = agent_handle.await {
+            eprintln!("Agent worker error: {e}");
+        }
+    } else {
+        agent_handle.abort();
+    }
+
+    // Database shutdown happens automatically via Drop on ctx
     Ok(())
 }
 

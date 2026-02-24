@@ -1,5 +1,8 @@
+use ratatui::text::Line;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
+
+use crate::tui::markdown;
 
 /// Agent processing status.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +18,8 @@ pub enum AgentStatus {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Pre-rendered markdown lines (cached to avoid re-parsing every frame).
+    pub rendered: Option<Vec<Line<'static>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +43,7 @@ pub struct AgentResponse {
 /// Main application state.
 pub struct App<'a> {
     pub messages: Vec<ChatMessage>,
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     pub status: AgentStatus,
     pub should_quit: bool,
 
@@ -62,6 +67,9 @@ pub struct App<'a> {
 
     // Animated thinking dots
     pub tick_count: u64,
+
+    /// Whether the UI needs to be redrawn (set true on state changes).
+    pub needs_redraw: bool,
 }
 
 impl<'a> App<'a> {
@@ -92,6 +100,7 @@ impl<'a> App<'a> {
             model,
             identity_name,
             tick_count: 0,
+            needs_redraw: true,
         }
     }
 
@@ -107,10 +116,11 @@ impl<'a> App<'a> {
         self.input_history.push(text.clone());
         self.history_index = None;
 
-        // Add user message to display
+        // Add user message to display (no markdown rendering needed for user messages)
         self.messages.push(ChatMessage {
             role: ChatRole::User,
             content: text.clone(),
+            rendered: None,
         });
 
         // Send to agent worker
@@ -125,6 +135,7 @@ impl<'a> App<'a> {
 
         // Auto-scroll to bottom
         self.scroll_offset = 0;
+        self.needs_redraw = true;
     }
 
     /// Called on each tick to advance progressive reveal and check for agent responses.
@@ -132,49 +143,77 @@ impl<'a> App<'a> {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         // Check for agent response
-        if let Ok(response) = self.agent_rx.try_recv() {
-            if response.is_error {
-                self.messages.push(ChatMessage {
-                    role: ChatRole::System,
-                    content: format!("Error: {}", response.content),
-                });
-                self.status = AgentStatus::Idle;
-            } else {
-                self.pending_response = Some(response.content);
-                self.reveal_index = 0;
-                self.status = AgentStatus::Responding(0);
+        match self.agent_rx.try_recv() {
+            Ok(response) => {
+                if response.is_error {
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: format!("Error: {}", response.content),
+                        rendered: None,
+                    });
+                    self.status = AgentStatus::Idle;
+                } else {
+                    self.pending_response = Some(response.content);
+                    self.reveal_index = 0;
+                    self.status = AgentStatus::Responding(0);
+                }
+                self.needs_redraw = true;
             }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // Agent worker crashed or exited unexpectedly
+                if self.status == AgentStatus::Thinking {
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: "Agent worker stopped unexpectedly.".to_string(),
+                        rendered: None,
+                    });
+                    self.status = AgentStatus::Idle;
+                    self.needs_redraw = true;
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
         }
 
         // Advance progressive reveal
-        if let Some(ref full) = self.pending_response {
+        if let Some(ref full) = self.pending_response.clone() {
             let len = full.len();
             if self.reveal_index < len {
-                // Reveal in chunks for smooth appearance
-                let chunk = 8.min(len - self.reveal_index);
-                self.reveal_index += chunk;
+                // Reveal in chunks for smooth appearance.
+                // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 chars.
+                self.reveal_index = full.floor_char_boundary(self.reveal_index + 8).min(len);
                 self.status = AgentStatus::Responding(self.reveal_index);
+                self.needs_redraw = true;
             } else {
-                // Reveal complete — add full message
+                // Reveal complete — add full message with pre-rendered markdown
+                let rendered = markdown::render(full);
                 self.messages.push(ChatMessage {
                     role: ChatRole::Assistant,
                     content: full.clone(),
+                    rendered: Some(rendered),
                 });
                 self.pending_response = None;
                 self.reveal_index = 0;
                 self.status = AgentStatus::Idle;
                 // Auto-scroll to bottom
                 self.scroll_offset = 0;
+                self.needs_redraw = true;
             }
+        }
+
+        // Thinking animation needs redraw every tick while active
+        if self.status == AgentStatus::Thinking {
+            self.needs_redraw = true;
         }
     }
 
-    pub fn scroll_up(&mut self, amount: u16) {
+    pub fn scroll_up(&mut self, amount: usize) {
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
+        self.needs_redraw = true;
     }
 
-    pub fn scroll_down(&mut self, amount: u16) {
+    pub fn scroll_down(&mut self, amount: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+        self.needs_redraw = true;
     }
 
     pub fn history_previous(&mut self) {

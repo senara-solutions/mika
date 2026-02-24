@@ -61,7 +61,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         settings.anthropic_api_key.clone(),
         settings.claude_model.clone(),
         settings.claude_max_tokens,
-    );
+    )?;
     let tool_registry = Arc::new(tools::default_tools());
     let ready = Arc::new(AtomicBool::new(false));
     let http_client = reqwest::Client::new();
@@ -163,10 +163,11 @@ mod tests {
     fn test_state() -> AppState {
         let db = test_async_db();
         let claude = ClaudeClient::new(
-            "test-key".to_string(),
+            Some("test-key".to_string()),
             "claude-sonnet-4-6".to_string(),
             4096,
-        );
+        )
+        .expect("test API key should be valid");
         let tools_reg = Arc::new(tools::default_tools());
         let scheduler = Arc::new(ReminderScheduler {
             db: db.clone(),

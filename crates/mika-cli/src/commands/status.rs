@@ -55,6 +55,6 @@ pub async fn run() -> Result<()> {
     println!("  Events:         {}", events.map(|e| e.len()).unwrap_or(0));
     println!();
 
-    ctx.async_db.shutdown();
+    // Database shutdown happens automatically via Drop on ctx
     Ok(())
 }

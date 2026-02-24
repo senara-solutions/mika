@@ -2,12 +2,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::tui::app::{AgentStatus, App};
 
-/// Handle a key event, returning true if the event was consumed.
-pub fn handle_key(app: &mut App<'_>, key: KeyEvent) -> bool {
+/// Handle a key event.
+pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
     // Ctrl+C always quits
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
-        return true;
+        return;
     }
 
     // Esc clears input
@@ -17,17 +17,17 @@ pub fn handle_key(app: &mut App<'_>, key: KeyEvent) -> bool {
             .set_cursor_line_style(ratatui::style::Style::default());
         app.textarea.set_placeholder_text("Type a message...");
         app.history_index = None;
-        return true;
+        return;
     }
 
     // PageUp / PageDown scroll messages
     if key.code == KeyCode::PageUp {
         app.scroll_up(5);
-        return true;
+        return;
     }
     if key.code == KeyCode::PageDown {
         app.scroll_down(5);
-        return true;
+        return;
     }
 
     // Enter sends message (only when idle and not shift-held)
@@ -35,21 +35,20 @@ pub fn handle_key(app: &mut App<'_>, key: KeyEvent) -> bool {
         if app.status == AgentStatus::Idle {
             app.send_message();
         }
-        return true;
+        return;
     }
 
     // Up/Down for history when input is empty
     let input_empty = app.textarea.lines().iter().all(|l| l.trim().is_empty());
     if input_empty && key.code == KeyCode::Up {
         app.history_previous();
-        return true;
+        return;
     }
     if input_empty && key.code == KeyCode::Down {
         app.history_next();
-        return true;
+        return;
     }
 
     // Pass everything else to textarea
     app.textarea.input(key);
-    true
 }

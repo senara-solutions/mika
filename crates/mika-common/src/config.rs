@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone)]
 pub struct Settings {
-    /// Anthropic API key
-    pub anthropic_api_key: String,
+    /// Anthropic API key (optional; only required for commands that call the Claude API)
+    #[serde(default)]
+    pub anthropic_api_key: Option<String>,
 
     /// Claude model ID (default: claude-sonnet-4-6)
     #[serde(default = "default_claude_model")]
@@ -115,7 +116,10 @@ impl Settings {
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Settings")
-            .field("anthropic_api_key", &"[REDACTED]")
+            .field(
+                "anthropic_api_key",
+                &self.anthropic_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("claude_model", &self.claude_model)
             .field("claude_max_tokens", &self.claude_max_tokens)
             .field("db_path", &self.db_path)

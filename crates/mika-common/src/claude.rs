@@ -144,18 +144,22 @@ pub struct ClaudeClient {
 }
 
 impl ClaudeClient {
-    pub fn new(api_key: String, model: String, max_tokens: u32) -> Self {
+    pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self> {
+        let api_key = api_key
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("MIKA_ANTHROPIC_API_KEY is required but not set"))?;
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build HTTP client");
 
-        Self {
+        Ok(Self {
             client,
             api_key,
             model,
             max_tokens,
-        }
+        })
     }
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).

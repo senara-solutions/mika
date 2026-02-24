@@ -16,13 +16,27 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
             println!("  Max tokens: {}", ctx.settings.claude_max_tokens);
             println!("  Log level:  {}", ctx.settings.log_level);
             println!("  DB path:    {}", ctx.settings.db_path.display());
-            println!("  API key:    [REDACTED]");
+            println!(
+                "  API key:    {}",
+                if ctx.settings.anthropic_api_key.is_some() {
+                    "[REDACTED]"
+                } else {
+                    "[NOT SET]"
+                }
+            );
             println!();
         }
         Some(ConfigCommand::Edit) => {
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+            let parts: Vec<&str> = editor.split_whitespace().collect();
+            if parts.is_empty() {
+                anyhow::bail!("$EDITOR is empty or whitespace-only");
+            }
             let identity_path = ctx.home_dir.join("identity.toml");
-            let status = Command::new(&editor).arg(&identity_path).status()?;
+            let status = Command::new(parts[0])
+                .args(&parts[1..])
+                .arg(&identity_path)
+                .status()?;
             if !status.success() {
                 anyhow::bail!("{editor} exited with {status}");
             }
@@ -36,6 +50,6 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
         }
     }
 
-    ctx.async_db.shutdown();
+    // Database shutdown happens automatically via Drop on ctx
     Ok(())
 }
