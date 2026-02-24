@@ -6,6 +6,6 @@ config/local.toml
 docs/
 todos/
 *.md
-!crates/**/*.md
+scripts/
 .claude/
 .github/

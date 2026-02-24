@@ -2,7 +2,8 @@
 FROM rust:1.85-slim AS builder
 
 # Install OpenSSL for reqwest
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# No gcc/libc-dev needed: -p mika-gateway skips rusqlite (bundled SQLite C compilation)
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -20,10 +21,9 @@ RUN mkdir -p crates/mika-common/src && echo "pub fn _dummy() {}" > crates/mika-c
     && mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
     && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
 
-# 3. Build dependencies only (cached layer)
-RUN cargo build --release --bin mika-gateway -p mika-gateway 2>/dev/null || true
-# Clean dummy source and workspace crate artifacts (keep dependency cache)
-RUN rm -rf crates/ \
+# 3. Build dependencies only, then clean workspace crate artifacts (keep dependency cache)
+RUN cargo build --release --bin mika-gateway -p mika-gateway || true \
+    && rm -rf crates/ \
     && rm -f target/release/mika-gateway \
     && rm -rf target/release/.fingerprint/mika-* \
     && rm -rf target/release/deps/libmika_* target/release/deps/mika_*

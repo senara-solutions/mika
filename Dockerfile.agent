@@ -2,7 +2,7 @@
 FROM rust:1.85-slim AS builder
 
 # Install C compiler for rusqlite bundled SQLite + OpenSSL for reqwest
-RUN apt-get update && apt-get install -y gcc libc-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -20,10 +20,9 @@ RUN mkdir -p crates/mika-common/src && echo "pub fn _dummy() {}" > crates/mika-c
     && mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
     && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
 
-# 3. Build dependencies only (this layer is cached until Cargo.toml/lock changes)
-RUN cargo build --release --bin mika-server -p mika-agent 2>/dev/null || true
-# Clean dummy source and workspace crate artifacts (keep dependency cache)
-RUN rm -rf crates/ \
+# 3. Build dependencies only, then clean workspace crate artifacts (keep dependency cache)
+RUN cargo build --release --bin mika-server -p mika-agent || true \
+    && rm -rf crates/ \
     && rm -f target/release/mika-server target/release/mika-cli \
     && rm -rf target/release/.fingerprint/mika-* \
     && rm -rf target/release/deps/libmika_* target/release/deps/mika_*
@@ -49,10 +48,9 @@ COPY --from=builder /app/target/release/mika-server /usr/local/bin/mika-server
 # Copy default config (loaded as optional by Settings::load)
 COPY config/default.toml /app/config/default.toml
 
-# Set up home directory structure (bootstrap creates subdirs on first run)
+# Set up volume mount point (bootstrap creates data/ and logs/ subdirs on first run)
 ENV MIKA_HOME=/home/mika/.mika
-RUN mkdir -p /home/mika/.mika/data /home/mika/.mika/logs \
-    && chown -R mika:mika /home/mika/.mika
+RUN mkdir -p /home/mika/.mika && chown mika:mika /home/mika/.mika
 
 WORKDIR /app
 USER mika
