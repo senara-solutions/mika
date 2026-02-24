@@ -41,7 +41,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (130 tests)
+- `cargo test` — Run all tests (117 tests)
 - `cargo run --bin mika-cli` — Run CLI test harness
 - `cargo clippy` — Lint
 - `cargo fmt` — Format

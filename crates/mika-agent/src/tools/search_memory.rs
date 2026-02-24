@@ -16,7 +16,7 @@ impl Tool for SearchMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_memory".to_string(),
-            description: "Search your stored facts across all categories (people, commitments, preferences, events, core memory). Uses case-insensitive substring matching.".to_string(),
+            description: "Search your stored facts across all categories (people, commitments, preferences, events, reminders, core memory). Uses case-insensitive substring matching.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -26,7 +26,7 @@ impl Tool for SearchMemoryTool {
                     },
                     "category": {
                         "type": "string",
-                        "enum": ["all", "person", "commitment", "preference", "event", "core_memory"],
+                        "enum": ["all", "person", "commitment", "preference", "event", "reminder", "core_memory"],
                         "description": "Category to search in (default: all)"
                     }
                 },
@@ -52,7 +52,7 @@ impl Tool for SearchMemoryTool {
 
         let mut results = Vec::new();
 
-        // Search core memory
+        // Search core memory (no LIKE index, still in-memory filter — tiny table)
         if category == "all" || category == "core_memory" {
             let entries = ctx.db.get_all_core_memory()?;
             for entry in entries {
@@ -64,80 +64,68 @@ impl Tool for SearchMemoryTool {
             }
         }
 
-        // Search people
+        // Search people (SQL LIKE)
         if category == "all" || category == "person" {
-            let people = ctx.db.list_people()?;
+            let people = ctx.db.search_people(query)?;
             for person in people {
-                let searchable = format!(
-                    "{} {} {}",
-                    person.canonical_name,
-                    person.relationship.as_deref().unwrap_or(""),
-                    person.notes.as_deref().unwrap_or("")
-                );
-                if searchable.to_lowercase().contains(&query_lower) {
-                    let mut desc = format!("[person] {} (id:{})", person.canonical_name, person.id);
-                    if let Some(ref rel) = person.relationship {
-                        desc.push_str(&format!(" — {rel}"));
-                    }
-                    if let Some(ref notes) = person.notes {
-                        desc.push_str(&format!(" | {notes}"));
-                    }
-                    results.push(desc);
+                let mut desc = format!("[person] {} (id:{})", person.canonical_name, person.id);
+                if let Some(ref rel) = person.relationship {
+                    desc.push_str(&format!(" — {rel}"));
                 }
+                if let Some(ref notes) = person.notes {
+                    desc.push_str(&format!(" | {notes}"));
+                }
+                results.push(desc);
             }
         }
 
-        // Search commitments
+        // Search commitments (SQL LIKE across all statuses)
         if category == "all" || category == "commitment" {
-            for status in &["pending", "completed", "cancelled"] {
-                let commitments = ctx.db.list_commitments(status)?;
-                for c in commitments {
-                    if c.description.to_lowercase().contains(&query_lower) {
-                        let mut desc = format!(
-                            "[commitment] {} (id:{}, status:{})",
-                            c.description, c.id, c.status
-                        );
-                        if let Some(ref due) = c.due_date {
-                            desc.push_str(&format!(" due:{due}"));
-                        }
-                        results.push(desc);
-                    }
-                }
-            }
-        }
-
-        // Search preferences
-        if category == "all" || category == "preference" {
-            let prefs = ctx.db.list_preferences()?;
-            for pref in prefs {
-                let searchable = format!("{} {}", pref.category, pref.value);
-                if searchable.to_lowercase().contains(&query_lower) {
-                    results.push(format!("[preference] {}: {}", pref.category, pref.value));
-                }
-            }
-        }
-
-        // Search events
-        if category == "all" || category == "event" {
-            let events = ctx.db.list_events()?;
-            for event in events {
-                let searchable = format!(
-                    "{} {} {}",
-                    event.description,
-                    event.event_date.as_deref().unwrap_or(""),
-                    event.context.as_deref().unwrap_or("")
+            let commitments = ctx.db.search_commitments(query)?;
+            for c in commitments {
+                let mut desc = format!(
+                    "[commitment] {} (id:{}, status:{})",
+                    c.description, c.id, c.status
                 );
-                if searchable.to_lowercase().contains(&query_lower) {
-                    let mut desc = format!(
-                        "[event] {} (id:{}",
-                        event.description, event.id
-                    );
-                    if let Some(ref date) = event.event_date {
-                        desc.push_str(&format!(", {date}"));
-                    }
-                    desc.push(')');
-                    results.push(desc);
+                if let Some(ref due) = c.due_date {
+                    desc.push_str(&format!(" due:{due}"));
                 }
+                results.push(desc);
+            }
+        }
+
+        // Search preferences (SQL LIKE)
+        if category == "all" || category == "preference" {
+            let prefs = ctx.db.search_preferences(query)?;
+            for pref in prefs {
+                results.push(format!("[preference] {}: {}", pref.category, pref.value));
+            }
+        }
+
+        // Search events (SQL LIKE)
+        if category == "all" || category == "event" {
+            let events = ctx.db.search_events(query)?;
+            for event in events {
+                let mut desc = format!(
+                    "[event] {} (id:{}",
+                    event.description, event.id
+                );
+                if let Some(ref date) = event.event_date {
+                    desc.push_str(&format!(", {date}"));
+                }
+                desc.push(')');
+                results.push(desc);
+            }
+        }
+
+        // Search reminders (SQL LIKE)
+        if category == "all" || category == "reminder" {
+            let reminders = ctx.db.search_reminders(query)?;
+            for r in reminders {
+                results.push(format!(
+                    "[reminder] #{}: \"{}\" at {} (created: {})",
+                    r.id, r.message, r.fire_at, r.created_at
+                ));
             }
         }
 

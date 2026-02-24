@@ -34,6 +34,21 @@ impl ReminderScheduler<'_> {
             warn!(error = %e, "failed to prune old heartbeat sends");
         }
 
+        // Compact memory events older than 90 days into monthly summaries
+        if let Err(e) = self.db.compact_old_memory_events(90) {
+            warn!(error = %e, "failed to compact old memory events");
+        }
+        if let Err(e) = self.db.vacuum() {
+            warn!(error = %e, "failed to vacuum database");
+        }
+        match self.db.db_size_bytes() {
+            Ok(size) if size > 500_000_000 => {
+                warn!(size_bytes = size, "database size exceeds 500MB");
+            }
+            Err(e) => warn!(error = %e, "failed to check database size"),
+            _ => {}
+        }
+
         let past_due = self.db.get_past_due_reminders()?;
         let future = self.db.get_future_reminders()?;
 

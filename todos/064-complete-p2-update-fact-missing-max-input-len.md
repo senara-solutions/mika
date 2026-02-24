@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "064"
 tags: [code-review, security, quality, rust-v2]

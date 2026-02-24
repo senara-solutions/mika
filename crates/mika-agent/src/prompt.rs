@@ -1,4 +1,4 @@
-use crate::db::{CORE_MEMORY_SECTIONS, Commitment, CoreMemoryEntry};
+use crate::db::{Commitment, CoreMemoryEntry, core_memory_section_names};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::fmt::Write;
@@ -51,7 +51,7 @@ pub struct PromptContext<'a> {
 }
 
 fn onboarding_prompt() -> String {
-    let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+    let section_names = core_memory_section_names();
     format!(
         "## First Session\n\
          This is your first conversation with the user. Introduce yourself briefly and warmly. \
@@ -120,7 +120,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- You can reset a core memory section to its default value using update_core_memory with the reset action.\n",
     );
-    let section_names: Vec<&str> = CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect();
+    let section_names = core_memory_section_names();
     write!(
         prompt,
         "- You have {} memory blocks ({}),\n  each limited to ~500 tokens. Be concise and prioritize what matters most.\n",
