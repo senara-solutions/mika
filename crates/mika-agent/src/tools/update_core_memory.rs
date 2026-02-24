@@ -12,7 +12,7 @@ const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
 
 pub struct UpdateCoreMemoryTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for UpdateCoreMemoryTool {
     fn name(&self) -> &str {
         "update_core_memory"

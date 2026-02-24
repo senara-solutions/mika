@@ -7,7 +7,7 @@ use super::{Tool, ToolContext, ToolOutput};
 
 pub struct CancelReminderTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for CancelReminderTool {
     fn name(&self) -> &str {
         "cancel_reminder"

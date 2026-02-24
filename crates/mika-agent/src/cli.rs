@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use mika_agent::agent::{self, AgentParams};
+use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{CORE_MEMORY_SECTIONS, Database, core_memory_section_names};
 use mika_agent::scheduler::ReminderScheduler;
@@ -109,15 +109,7 @@ async fn main() -> Result<()> {
 
         // Detect onboarding: user_summary still equals the seed value.
         // Checked each iteration so it updates once the agent populates core memory.
-        let user_summary_default = CORE_MEMORY_SECTIONS
-            .iter()
-            .find(|(k, _)| *k == "user_summary")
-            .map(|(_, v)| *v)
-            .unwrap_or("New user. No information yet.");
-        let is_onboarding = async_db
-            .get_core_memory("user_summary").await?
-            .map(|e| e.value == user_summary_default)
-            .unwrap_or(true);
+        let is_onboarding = check_onboarding(&async_db).await;
 
         if is_onboarding {
             tracing::info!("onboarding mode: first conversation with user");

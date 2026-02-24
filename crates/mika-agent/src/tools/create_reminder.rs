@@ -8,7 +8,7 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct CreateReminderTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for CreateReminderTool {
     fn name(&self) -> &str {
         "create_reminder"

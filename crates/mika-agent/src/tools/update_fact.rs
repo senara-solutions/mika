@@ -11,7 +11,7 @@ const TOOL_ALLOWED_STATUSES: &[&str] = &["completed", "cancelled"];
 
 pub struct UpdateFactTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for UpdateFactTool {
     fn name(&self) -> &str {
         "update_fact"

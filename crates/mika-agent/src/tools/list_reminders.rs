@@ -7,7 +7,7 @@ use super::{Tool, ToolContext, ToolOutput};
 
 pub struct ListRemindersTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for ListRemindersTool {
     fn name(&self) -> &str {
         "list_reminders"

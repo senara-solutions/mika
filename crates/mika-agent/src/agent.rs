@@ -18,6 +18,22 @@ const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 
+/// Check if this is a new user (user_summary still at default value).
+/// Used by both CLI and server to set `is_onboarding` on agent params.
+pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
+    let default = crate::db::CORE_MEMORY_SECTIONS
+        .iter()
+        .find(|(k, _)| *k == "user_summary")
+        .map(|(_, v)| *v)
+        .unwrap_or("New user. No information yet.");
+    db.get_core_memory("user_summary")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value == default)
+        .unwrap_or(true)
+}
+
 /// Parameters for running the agent loop.
 pub struct AgentParams<'a> {
     pub db: &'a AsyncDatabase,

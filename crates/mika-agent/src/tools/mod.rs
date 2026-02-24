@@ -32,7 +32,7 @@ pub struct ToolContext<'a> {
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique tool name (must match what Claude sees in the tool definition).
     fn name(&self) -> &str;

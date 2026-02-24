@@ -7,7 +7,7 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct StoreFactTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for StoreFactTool {
     fn name(&self) -> &str {
         "store_fact"

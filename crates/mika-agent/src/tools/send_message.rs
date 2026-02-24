@@ -8,7 +8,7 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct SendMessageTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for SendMessageTool {
     fn name(&self) -> &str {
         "send_message"
