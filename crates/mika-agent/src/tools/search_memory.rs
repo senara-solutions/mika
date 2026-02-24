@@ -7,7 +7,7 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct SearchMemoryTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for SearchMemoryTool {
     fn name(&self) -> &str {
         "search_memory"
@@ -54,7 +54,7 @@ impl Tool for SearchMemoryTool {
 
         // Search core memory (no LIKE index, still in-memory filter — tiny table)
         if category == "all" || category == "core_memory" {
-            let entries = ctx.db.get_all_core_memory()?;
+            let entries = ctx.db.get_all_core_memory().await?;
             for entry in entries {
                 if entry.key.to_lowercase().contains(&query_lower)
                     || entry.value.to_lowercase().contains(&query_lower)
@@ -66,7 +66,7 @@ impl Tool for SearchMemoryTool {
 
         // Search people (SQL LIKE)
         if category == "all" || category == "person" {
-            let people = ctx.db.search_people(query)?;
+            let people = ctx.db.search_people(query).await?;
             for person in people {
                 let mut desc = format!("[person] {} (id:{})", person.canonical_name, person.id);
                 if let Some(ref rel) = person.relationship {
@@ -81,7 +81,7 @@ impl Tool for SearchMemoryTool {
 
         // Search commitments (SQL LIKE across all statuses)
         if category == "all" || category == "commitment" {
-            let commitments = ctx.db.search_commitments(query)?;
+            let commitments = ctx.db.search_commitments(query).await?;
             for c in commitments {
                 let mut desc = format!(
                     "[commitment] {} (id:{}, status:{})",
@@ -96,7 +96,7 @@ impl Tool for SearchMemoryTool {
 
         // Search preferences (SQL LIKE)
         if category == "all" || category == "preference" {
-            let prefs = ctx.db.search_preferences(query)?;
+            let prefs = ctx.db.search_preferences(query).await?;
             for pref in prefs {
                 results.push(format!("[preference] {}: {}", pref.category, pref.value));
             }
@@ -104,7 +104,7 @@ impl Tool for SearchMemoryTool {
 
         // Search events (SQL LIKE)
         if category == "all" || category == "event" {
-            let events = ctx.db.search_events(query)?;
+            let events = ctx.db.search_events(query).await?;
             for event in events {
                 let mut desc = format!(
                     "[event] {} (id:{}",
@@ -114,13 +114,18 @@ impl Tool for SearchMemoryTool {
                     desc.push_str(&format!(", {date}"));
                 }
                 desc.push(')');
+                if let Some(ref context) = event.context {
+                    if !context.is_empty() {
+                        desc.push_str(&format!(" — {context}"));
+                    }
+                }
                 results.push(desc);
             }
         }
 
         // Search reminders (SQL LIKE)
         if category == "all" || category == "reminder" {
-            let reminders = ctx.db.search_reminders(query)?;
+            let reminders = ctx.db.search_reminders(query).await?;
             for r in reminders {
                 results.push(format!(
                     "[reminder] #{}: \"{}\" at {} (created: {})",
@@ -146,13 +151,14 @@ impl Tool for SearchMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_ctx, test_db};
+    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
     use std::sync::atomic::AtomicU32;
 
     #[tokio::test]
     async fn test_search_finds_person() {
-        let db = test_db();
+        let db = test_async_db();
         db.upsert_person("Alice Chen", Some("CTO"), Some("Likes coffee"))
+            .await
             .unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
@@ -169,8 +175,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_finds_commitment() {
-        let db = test_db();
+        let db = test_async_db();
         db.add_commitment("Review Q4 budget", Some("2026-03-01"), None)
+            .await
             .unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
@@ -187,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_no_results() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = SearchMemoryTool;
@@ -202,9 +209,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_filters_by_category() {
-        let db = test_db();
-        db.upsert_person("Alice", None, None).unwrap();
-        db.add_commitment("Call Alice", None, None).unwrap();
+        let db = test_async_db();
+        db.upsert_person("Alice", None, None).await.unwrap();
+        db.add_commitment("Call Alice", None, None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = SearchMemoryTool;
@@ -223,8 +230,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_core_memory() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = SearchMemoryTool;
@@ -242,10 +249,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_finds_preference_by_value_substring() {
-        let db = test_db();
+        let db = test_async_db();
         db.set_preference("Food", "No shellfish, prefers sushi")
+            .await
             .unwrap();
         db.set_preference("Meeting time", "Morning, before 10am")
+            .await
             .unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
@@ -274,13 +283,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_event_includes_context() {
+        let db = test_async_db();
+        db.add_event(
+            "Team offsite in Bali",
+            Some("2026-06-01"),
+            Some("annual planning retreat"),
+        )
+        .await
+        .unwrap();
+        let counter = AtomicU32::new(0);
+        let ctx = test_ctx(&db, &counter);
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(serde_json::json!({"query": "Bali"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Team offsite in Bali"));
+        assert!(result.content.contains("annual planning retreat"));
+    }
+
+    #[tokio::test]
     async fn test_search_finds_event_by_description() {
-        let db = test_db();
+        let db = test_async_db();
         db.add_event(
             "Board meeting with investors",
             Some("2026-03-15"),
             Some("quarterly review"),
         )
+        .await
         .unwrap();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);

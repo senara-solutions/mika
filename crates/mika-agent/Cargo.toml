@@ -8,6 +8,10 @@ license.workspace = true
 name = "mika-cli"
 path = "src/cli.rs"
 
+[[bin]]
+name = "mika-server"
+path = "src/bin/mika-server.rs"
+
 [dependencies]
 mika-common.workspace = true
 tokio.workspace = true
@@ -21,8 +25,14 @@ toml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 async-trait.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true

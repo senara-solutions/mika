@@ -8,7 +8,7 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct CreateReminderTool;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Tool for CreateReminderTool {
     fn name(&self) -> &str {
         "create_reminder"
@@ -73,7 +73,7 @@ impl Tool for CreateReminderTool {
             return Ok(ToolOutput::error("Reminder time must be in the future."));
         }
 
-        let id = ctx.db.add_reminder(fire_at, message)?;
+        let id = ctx.db.add_reminder(fire_at, message).await?;
 
         ctx.db.log_memory_event(
             ctx.session_id,
@@ -82,7 +82,7 @@ impl Tool for CreateReminderTool {
             None,
             &format!("{fire_at} — {message}"),
             None,
-        )?;
+        ).await?;
 
         Ok(ToolOutput::success(format!(
             "Reminder #{id} scheduled for {fire_at}."
@@ -93,12 +93,12 @@ impl Tool for CreateReminderTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{test_ctx, test_db};
+    use crate::test_utils::test_helpers::{test_async_db, test_ctx};
     use std::sync::atomic::AtomicU32;
 
     #[tokio::test]
     async fn test_create_reminder_valid() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = CreateReminderTool;
@@ -116,14 +116,14 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("scheduled"));
 
-        let reminders = db.get_pending_reminders().unwrap();
+        let reminders = db.get_pending_reminders().await.unwrap();
         assert_eq!(reminders.len(), 1);
         assert_eq!(reminders[0].message, "Year-end review");
     }
 
     #[tokio::test]
     async fn test_create_reminder_past_time() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = CreateReminderTool;
@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_reminder_invalid_datetime() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = CreateReminderTool;
@@ -165,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_reminder_missing_fields() {
-        let db = test_db();
+        let db = test_async_db();
         let counter = AtomicU32::new(0);
         let ctx = test_ctx(&db, &counter);
         let tool = CreateReminderTool;

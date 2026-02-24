@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use mika_common::claude::{ClaudeClient, Message, MessageContent, MessagesRequest};
 use tracing::{debug, info, warn};
 
-use crate::db::{ConversationMessage, Database};
+use crate::async_db::AsyncDatabase;
+use crate::db::ConversationMessage;
 
 const COMPACTION_THRESHOLD: usize = 50;
 const CONTEXT_WINDOW: usize = 20;
@@ -19,8 +20,8 @@ If there is an existing summary, merge it with the new information.";
 
 /// Check if compaction is needed and perform it if so.
 /// Called after each agent turn completes.
-pub async fn maybe_compact(db: &Database, claude: &ClaudeClient) -> Result<()> {
-    let total = db.count_messages()?;
+pub async fn maybe_compact(db: &AsyncDatabase, claude: &ClaudeClient) -> Result<()> {
+    let total = db.count_messages().await?;
     if total <= COMPACTION_THRESHOLD {
         debug!(
             total,
@@ -30,8 +31,8 @@ pub async fn maybe_compact(db: &Database, claude: &ClaudeClient) -> Result<()> {
         return Ok(());
     }
 
-    let existing_summary = db.load_conversation_summary()?;
-    let old_messages = db.load_messages_before_window(CONTEXT_WINDOW)?;
+    let existing_summary = db.load_conversation_summary().await?;
+    let old_messages = db.load_messages_before_window(CONTEXT_WINDOW).await?;
     if old_messages.is_empty() {
         debug!("no messages outside context window to compact");
         return Ok(());
@@ -71,7 +72,7 @@ pub async fn maybe_compact(db: &Database, claude: &ClaudeClient) -> Result<()> {
     }
 
     let highest_id = batch.last().map(|m| m.id).unwrap_or(0);
-    db.replace_with_summary(&summary_text, highest_id)?;
+    db.replace_with_summary(&summary_text, highest_id).await?;
 
     info!(compacted_through_id = highest_id, "compaction complete");
     Ok(())

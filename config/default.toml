@@ -5,3 +5,4 @@ claude_model = "claude-sonnet-4-6"
 claude_max_tokens = 4096
 db_path = "mika.db"
 log_level = "info"
+server_port = 8080

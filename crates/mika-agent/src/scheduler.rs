@@ -1,10 +1,11 @@
 use anyhow::Result;
 use mika_common::claude::ClaudeClient;
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
-use crate::db::Database;
+use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
 use crate::tools::ToolRegistry;
 
@@ -14,15 +15,17 @@ use crate::tools::ToolRegistry;
 /// Future reminders are not timer-scheduled (no persistent runtime in CLI).
 ///
 /// Phase 2 (HTTP server): Will add Tokio timer scheduling for future reminders.
-pub struct ReminderScheduler<'a> {
-    pub db: &'a Database,
-    pub claude: &'a ClaudeClient,
-    pub tools: &'a ToolRegistry,
-    pub home_dir: &'a Path,
-    pub message_sender: Option<&'a dyn MessageSender>,
+///
+/// Owns all dependencies so it can be stored in `Arc<ReminderScheduler>` for AppState.
+pub struct ReminderScheduler {
+    pub db: AsyncDatabase,
+    pub claude: ClaudeClient,
+    pub tools: Arc<ToolRegistry>,
+    pub home_dir: PathBuf,
+    pub message_sender: Option<Arc<dyn MessageSender>>,
 }
 
-impl ReminderScheduler<'_> {
+impl ReminderScheduler {
     /// Recover pending reminders on startup.
     /// - Past-due reminders: fire immediately (max 5 to avoid blocking startup)
     /// - Future reminders: log count (timer scheduling is Phase 2)
@@ -30,18 +33,22 @@ impl ReminderScheduler<'_> {
     /// Also prunes old heartbeat_sends records.
     pub async fn recover(&self) -> Result<()> {
         // Prune heartbeat sends older than 7 days to prevent unbounded growth
-        if let Err(e) = self.db.prune_old_heartbeat_sends(7) {
+        if let Err(e) = self.db.prune_old_heartbeat_sends(7).await {
             warn!(error = %e, "failed to prune old heartbeat sends");
         }
 
         // Compact memory events older than 90 days into monthly summaries
-        if let Err(e) = self.db.compact_old_memory_events(90) {
-            warn!(error = %e, "failed to compact old memory events");
+        match self.db.compact_old_memory_events(90).await {
+            Ok(deleted) if deleted > 0 => {
+                info!(deleted, "compacted old memory events");
+                if let Err(e) = self.db.vacuum().await {
+                    warn!(error = %e, "failed to vacuum database");
+                }
+            }
+            Ok(_) => {} // nothing to compact, skip VACUUM
+            Err(e) => warn!(error = %e, "failed to compact old memory events"),
         }
-        if let Err(e) = self.db.vacuum() {
-            warn!(error = %e, "failed to vacuum database");
-        }
-        match self.db.db_size_bytes() {
+        match self.db.db_size_bytes().await {
             Ok(size) if size > 500_000_000 => {
                 warn!(size_bytes = size, "database size exceeds 500MB");
             }
@@ -49,8 +56,8 @@ impl ReminderScheduler<'_> {
             _ => {}
         }
 
-        let past_due = self.db.get_past_due_reminders()?;
-        let future = self.db.get_future_reminders()?;
+        let past_due = self.db.get_past_due_reminders().await?;
+        let future = self.db.get_future_reminders().await?;
 
         if past_due.is_empty() && future.is_empty() {
             info!("no pending reminders to recover");
@@ -72,7 +79,7 @@ impl ReminderScheduler<'_> {
                     "too many past-due reminders, marking excess as failed"
                 );
                 for skipped in &past_due[MAX_RECOVERY_REMINDERS..] {
-                    let _ = self.db.mark_reminder_failed(skipped.id);
+                    let _ = self.db.mark_reminder_failed(skipped.id).await;
                 }
                 break;
             }
@@ -84,16 +91,16 @@ impl ReminderScheduler<'_> {
             );
             let session_id = format!("reminder-recovery-{}", reminder.id);
             let params = SilentAgentParams {
-                db: self.db,
-                claude: self.claude,
-                tools: self.tools,
+                db: &self.db,
+                claude: &self.claude,
+                tools: &self.tools,
                 trigger: SilentTrigger::Reminder {
                     id: reminder.id,
                     message: reminder.message.clone(),
                 },
-                home_dir: self.home_dir,
+                home_dir: &self.home_dir,
                 session_id: &session_id,
-                message_sender: self.message_sender,
+                message_sender: self.message_sender.clone(),
             };
 
             if let Err(e) = run_silent_agent(&params).await {

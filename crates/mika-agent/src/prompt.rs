@@ -96,9 +96,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "These are your persistent memory blocks. Update them using the update_core_memory tool.\n\n",
     );
 
+    prompt.push_str("<core-memory>\n");
     for entry in ctx.core_memory {
         write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
     }
+    prompt.push_str("</core-memory>\n\n");
 
     // Instructions
     prompt.push_str("## Instructions\n");
@@ -113,6 +115,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     );
     prompt.push_str(
         "- You can list and cancel reminders with list_reminders and cancel_reminder.\n",
+    );
+    prompt.push_str(
+        "- Use search_memory to find stored facts across all categories before asking the user to repeat information.\n",
     );
     prompt.push_str(
         "- Mark commitments as completed or cancelled using the update_fact tool.\n",
@@ -179,18 +184,21 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
 
     // Core Memory
     prompt.push_str("## Core Memory\n");
+    prompt.push_str("<core-memory>\n");
     for entry in ctx.core_memory {
         write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
     }
+    prompt.push_str("</core-memory>\n\n");
 
     // Pending commitments
     if !ctx.pending_commitments.is_empty() {
         prompt.push_str("## Pending Commitments\n");
+        prompt.push_str("<commitments>\n");
         for c in ctx.pending_commitments {
             let due = c.due_date.as_deref().unwrap_or("no due date");
             writeln!(prompt, "- {} (due: {})", c.description, due).unwrap();
         }
-        prompt.push('\n');
+        prompt.push_str("</commitments>\n\n");
     }
 
     // Silent mode instructions
@@ -478,6 +486,69 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("UTC: 2026-02-24T12:00:00Z"));
         assert!(prompt.contains("User timezone: +08:00"));
+    }
+
+    #[test]
+    fn test_prompt_includes_search_memory_instruction() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("search_memory"));
+    }
+
+    #[test]
+    fn test_prompt_wraps_core_memory_in_xml_tags() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("<core-memory>"));
+        assert!(prompt.contains("</core-memory>"));
+    }
+
+    #[test]
+    fn test_silent_prompt_wraps_commitments_in_xml_tags() {
+        use crate::db::Commitment;
+        let identity = test_identity();
+        let commitments = vec![Commitment {
+            id: 1,
+            description: "Review budget".to_string(),
+            status: "pending".to_string(),
+            due_date: Some("2026-03-01".to_string()),
+            person_id: None,
+            created_at: "2026-02-24".to_string(),
+            completed_at: None,
+        }];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &commitments,
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("<commitments>"));
+        assert!(prompt.contains("</commitments>"));
+        assert!(prompt.contains("Review budget"));
     }
 
     #[test]
