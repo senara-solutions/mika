@@ -1,0 +1,32 @@
+customer:
+  id: ""          # Set by provision.sh (UUID)
+  name: ""        # Human-readable name
+  plan: "standard"  # standard | premium
+  timezone: "UTC"   # IANA timezone (e.g., Europe/Berlin)
+
+image:
+  repository: ""  # ECR repo, e.g., 123456789.dkr.ecr.us-east-1.amazonaws.com/mika-agent
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+# imagePullSecrets:
+#   - name: ecr-credentials
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "256Mi"
+    # No CPU limit — agent is I/O-bound (Claude API). CPU limits cause CFS throttling.
+
+persistence:
+  size: "1Gi"
+  storageClass: "gp3"
+
+gateway:
+  url: "http://mika-gateway.mika-system.svc.cluster.local:8080"
+
+logLevel: "info"
+claudeModel: ""  # Empty = use default (sonnet-4-6)
