@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with encrypted SQLite storage. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
+Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with plaintext SQLite storage on K8s encrypted volumes. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
 
 **Current phase:** Phase 1 — agent core with CLI test harness.
 
@@ -35,12 +35,13 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Data at rest:** Plaintext SQLite on K8s encrypted volumes. Per-customer container isolation. Case-insensitive COLLATE NOCASE on unique text columns.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque.
-- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding }`.
+- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding }`. Tool trait uses `#[async_trait(?Send)]`.
+- **Async DB:** `AsyncDatabase` wraps sync `Database` with `Arc<Mutex<Database>>` + `tokio::task::spawn_blocking`. Clone-able, Send+Sync. Not yet integrated into agent loop (Phase 2).
 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (32 tests)
+- `cargo test` — Run all tests (82 tests)
 - `cargo run --bin mika-cli` — Run CLI test harness
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
@@ -63,7 +64,7 @@ See `.env.example` for the full list. Required:
 
 ## Pending Work
 
-- `todos/027-pending-p1-sync-sqlite-blocking-tokio.md` — Wrap sync SQLite in async (needed before Phase 2 HTTP server)
+- `todos/027-ready-p1-sync-sqlite-blocking-tokio.md` — ~~Wrap sync SQLite in async~~ Done: `async_db.rs` created, integration deferred to Phase 2
 
 ## Reference Repositories
 
