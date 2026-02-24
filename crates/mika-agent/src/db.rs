@@ -241,6 +241,10 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_heartbeat_sends_sent_at ON heartbeat_sends(sent_at);
 
+            -- Indexes on conversations for hot-path queries
+            CREATE INDEX IF NOT EXISTS idx_conversations_role ON conversations(role, id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_channel_type ON conversations(channel_type, id);
+
             -- Customer config (timezone, chat_id for outbound)
             CREATE TABLE IF NOT EXISTS customer_config (
                 key TEXT PRIMARY KEY,
@@ -797,9 +801,10 @@ impl Database {
 
     /// Delete heartbeat sends older than `days` days.
     pub fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
+        let modifier = format!("-{days} days");
         self.conn.execute(
-            &format!("DELETE FROM heartbeat_sends WHERE sent_at < datetime('now', '-{days} days')"),
-            [],
+            "DELETE FROM heartbeat_sends WHERE sent_at < datetime('now', ?1)",
+            [&modifier],
         )?;
         Ok(())
     }

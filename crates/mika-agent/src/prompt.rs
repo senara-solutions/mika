@@ -1,4 +1,5 @@
 use crate::db::{CORE_MEMORY_SECTIONS, Commitment, CoreMemoryEntry};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
@@ -45,6 +46,8 @@ pub struct PromptContext<'a> {
     pub identity: &'a Identity,
     pub core_memory: &'a [CoreMemoryEntry],
     pub is_onboarding: bool,
+    pub current_utc: DateTime<Utc>,
+    pub timezone: Option<String>,
 }
 
 fn onboarding_prompt() -> String {
@@ -73,6 +76,19 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
 
     // Identity
     write!(prompt, "## Identity\nYou are {}.\n\n", ctx.identity.name).unwrap();
+
+    // Current Time
+    prompt.push_str("## Current Time\n");
+    writeln!(
+        prompt,
+        "UTC: {}",
+        ctx.current_utc.format("%Y-%m-%dT%H:%M:%SZ")
+    )
+    .unwrap();
+    if let Some(tz) = &ctx.timezone {
+        writeln!(prompt, "User timezone: {tz}").unwrap();
+    }
+    prompt.push('\n');
 
     // Core Memory
     prompt.push_str("## Core Memory\n");
@@ -117,6 +133,8 @@ pub struct SilentPromptContext<'a> {
     pub core_memory: &'a [CoreMemoryEntry],
     pub pending_commitments: &'a [Commitment],
     pub trigger_context: &'a str,
+    pub current_utc: DateTime<Utc>,
+    pub timezone: Option<String>,
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -132,6 +150,19 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
 
     // Identity
     write!(prompt, "## Identity\nYou are {}.\n\n", ctx.identity.name).unwrap();
+
+    // Current Time
+    prompt.push_str("## Current Time\n");
+    writeln!(
+        prompt,
+        "UTC: {}",
+        ctx.current_utc.format("%Y-%m-%dT%H:%M:%SZ")
+    )
+    .unwrap();
+    if let Some(tz) = &ctx.timezone {
+        writeln!(prompt, "User timezone: {tz}").unwrap();
+    }
+    prompt.push('\n');
 
     // Core Memory
     prompt.push_str("## Core Memory\n");
@@ -176,6 +207,10 @@ mod tests {
         }
     }
 
+    fn test_time() -> DateTime<Utc> {
+        "2026-02-24T12:00:00Z".parse().unwrap()
+    }
+
     fn test_core_memory() -> Vec<CoreMemoryEntry> {
         vec![
             CoreMemoryEntry {
@@ -202,6 +237,8 @@ mod tests {
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -217,6 +254,8 @@ mod tests {
             identity: &identity,
             core_memory: &memory,
             is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -237,6 +276,8 @@ mod tests {
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -251,6 +292,8 @@ mod tests {
             identity: &identity,
             core_memory: &[],
             is_onboarding: true,
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -266,6 +309,8 @@ mod tests {
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -302,6 +347,8 @@ mod tests {
             identity: &identity,
             core_memory: &[],
             is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -319,6 +366,8 @@ mod tests {
             core_memory: &memory,
             pending_commitments: &[],
             trigger_context: "This is a HEARTBEAT check-in.",
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -337,6 +386,8 @@ mod tests {
             core_memory: &[],
             pending_commitments: &[],
             trigger_context: "REMINDER: Call the dentist",
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -363,10 +414,66 @@ mod tests {
             core_memory: &[],
             pending_commitments: &commitments,
             trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
         assert!(prompt.contains("Review budget"));
         assert!(prompt.contains("2026-03-01"));
+    }
+
+    #[test]
+    fn test_prompt_includes_current_time() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Current Time"));
+        assert!(prompt.contains("UTC: 2026-02-24T12:00:00Z"));
+        assert!(!prompt.contains("User timezone"));
+    }
+
+    #[test]
+    fn test_prompt_includes_timezone_when_set() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: Some("+08:00".to_string()),
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("UTC: 2026-02-24T12:00:00Z"));
+        assert!(prompt.contains("User timezone: +08:00"));
+    }
+
+    #[test]
+    fn test_silent_prompt_includes_current_time() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: Some("-05:00".to_string()),
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("## Current Time"));
+        assert!(prompt.contains("UTC: 2026-02-24T12:00:00Z"));
+        assert!(prompt.contains("User timezone: -05:00"));
     }
 }

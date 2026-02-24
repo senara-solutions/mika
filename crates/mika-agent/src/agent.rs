@@ -79,12 +79,15 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     let soul_content = std::fs::read_to_string(params.home_dir.join("soul.md")).unwrap_or_default();
     let identity = prompt::load_identity(params.home_dir);
     let core_memory = db.get_all_core_memory()?;
+    let timezone = db.get_customer_config("timezone")?;
 
     let prompt_ctx = prompt::PromptContext {
         soul_content: &soul_content,
         identity: &identity,
         core_memory: &core_memory,
         is_onboarding: params.is_onboarding,
+        current_utc: chrono::Utc::now(),
+        timezone,
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -300,6 +303,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     let identity = prompt::load_identity(params.home_dir);
     let core_memory = db.get_all_core_memory()?;
     let pending_commitments = db.list_commitments("pending")?;
+    let timezone = db.get_customer_config("timezone")?;
 
     let trigger_context = match &params.trigger {
         SilentTrigger::Heartbeat => {
@@ -322,6 +326,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         core_memory: &core_memory,
         pending_commitments: &pending_commitments,
         trigger_context: &trigger_context,
+        current_utc: chrono::Utc::now(),
+        timezone,
     };
     let system = prompt::build_silent_prompt(&silent_ctx);
 
