@@ -1,0 +1,64 @@
+# === Builder stage ===
+FROM rust:1.85-slim AS builder
+
+# Install C compiler for rusqlite bundled SQLite + OpenSSL for reqwest
+RUN apt-get update && apt-get install -y gcc libc-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 1. Copy workspace manifests and lockfile (dependency cache layer)
+COPY Cargo.toml Cargo.lock ./
+COPY crates/mika-common/Cargo.toml crates/mika-common/Cargo.toml
+COPY crates/mika-agent/Cargo.toml crates/mika-agent/Cargo.toml
+COPY crates/mika-gateway/Cargo.toml crates/mika-gateway/Cargo.toml
+
+# 2. Create dummy source files to compile dependencies
+RUN mkdir -p crates/mika-common/src && echo "pub fn _dummy() {}" > crates/mika-common/src/lib.rs \
+    && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs \
+    && mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-server.rs \
+    && echo "" > crates/mika-agent/src/lib.rs \
+    && mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
+    && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
+
+# 3. Build dependencies only (this layer is cached until Cargo.toml/lock changes)
+RUN cargo build --release --bin mika-server -p mika-agent 2>/dev/null || true
+# Clean dummy source and workspace crate artifacts (keep dependency cache)
+RUN rm -rf crates/ \
+    && rm -f target/release/mika-server target/release/mika-cli \
+    && rm -rf target/release/.fingerprint/mika-* \
+    && rm -rf target/release/deps/libmika_* target/release/deps/mika_*
+
+# 4. Copy real source code
+COPY crates/ crates/
+
+# 5. Build the actual binary (dependencies are cached, only workspace crates rebuild)
+RUN cargo build --release --bin mika-server -p mika-agent
+
+# === Runtime stage ===
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user with home directory
+RUN useradd -m -u 1000 -s /bin/false mika
+
+# Copy binary
+COPY --from=builder /app/target/release/mika-server /usr/local/bin/mika-server
+
+# Copy default config (loaded as optional by Settings::load)
+COPY config/default.toml /app/config/default.toml
+
+# Set up home directory structure (bootstrap creates subdirs on first run)
+ENV MIKA_HOME=/home/mika/.mika
+RUN mkdir -p /home/mika/.mika/data /home/mika/.mika/logs \
+    && chown -R mika:mika /home/mika/.mika
+
+WORKDIR /app
+USER mika
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["wget", "-q", "--spider", "http://localhost:8080/health"]
+
+CMD ["mika-server"]

@@ -4,7 +4,7 @@
 
 Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with plaintext SQLite storage on K8s encrypted volumes. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
 
-**Current phase:** Phase 2 — container HTTP server (Axum) with gateway messaging.
+**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, Helm charts + provisioning next).
 
 ## Stack
 
@@ -22,6 +22,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, CLI binary, HTTP server binary
+- `crates/mika-gateway/` — Gateway: Telegram webhook router, customer pairing, outbound relay (Postgres-backed)
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/brainstorms/` — Decision brainstorm documents
 - `docs/plans/` — Implementation plans
@@ -47,6 +48,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
+- `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image
+- `docker build -f Dockerfile.gateway -t mika-gateway:dev .` — Build gateway container image
 
 ## Architecture
 
@@ -66,6 +69,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Heartbeat pre-filter:** Active hours (8-21 local via chrono-tz), rate limits (1/hour, 3/day), skip if user messaged within 2h. All checks before acquiring Mutex.
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 6 (v6 adds: memory_event_summaries table for tiered retention)
+- **mika-gateway:** Telegram webhook router with Postgres customer registry. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (K8s probes). Stateless, env-var-only config.
+- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` (90MB) for shared router. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
 
 ## Environment Variables
 
@@ -78,7 +83,8 @@ Server mode additionally requires:
 
 ## Pending Work
 
-- **Phase 2 — Remaining:** Telegram/WhatsApp channel adapters, timer-based reminder scheduling (create_reminder → tokio timer), gateway routing layer, K8s deployment manifests
+- **Deployment:** Helm charts (mika-customer + mika-gateway), provision.sh + deprovision.sh, AWS Secrets Manager integration, K8s manifests
+- **Future features:** WhatsApp channel adapter, vector search (Layer 3), morning briefings, admin API
 
 ## Reference Repositories
 

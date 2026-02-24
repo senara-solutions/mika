@@ -1,0 +1,11 @@
+target/
+.git/
+.env
+.env.*
+config/local.toml
+docs/
+todos/
+*.md
+!crates/**/*.md
+.claude/
+.github/
