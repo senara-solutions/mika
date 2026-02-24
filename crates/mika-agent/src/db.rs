@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use tracing::{debug, info};
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// Canonical list of core memory section names and their default values.
 /// Used by seed_core_memory, CLI reset, update_core_memory validation, and prompt assembly.
@@ -96,6 +96,9 @@ impl Database {
 
         if version < 4 {
             self.migrate_v4()?;
+        }
+        if version < 5 {
+            self.migrate_v5()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -209,6 +212,60 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v5(&self) -> Result<()> {
+        info!("applying migration v5: compaction, reminders, heartbeat, customer_config");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            -- Compaction support: track which messages a summary covers
+            ALTER TABLE conversations ADD COLUMN compacted_through_id INTEGER;
+
+            -- Reminders (persisted Tokio timer state)
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fire_at TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                delivered_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminders_status_fire_at ON reminders(status, fire_at);
+
+            -- Heartbeat send rate limiting
+            CREATE TABLE IF NOT EXISTS heartbeat_sends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sent_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_heartbeat_sends_sent_at ON heartbeat_sends(sent_at);
+
+            -- Customer config (timezone, chat_id for outbound)
+            CREATE TABLE IF NOT EXISTS customer_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- Failed outbound sends (retry queue for /send failures)
+            CREATE TABLE IF NOT EXISTS failed_sends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                request_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                retry_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO schema_version (version) VALUES (5);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v5")?;
+
+        Ok(())
+    }
+
     // -- Conversations --
 
     /// Save a conversation message.
@@ -223,14 +280,47 @@ impl Database {
     }
 
     /// Load the N most recent messages, oldest first.
-    pub fn load_recent_messages(&self, limit: usize) -> Result<Vec<ConversationMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, created_at
-             FROM conversations ORDER BY id DESC LIMIT ?1",
-        )?;
+    /// If `channel_types` is Some, only messages with matching channel_type are returned.
+    /// If None, all messages are returned (used by compaction).
+    /// Summary rows (role = 'summary') are always excluded — use `load_conversation_summary()`.
+    pub fn load_recent_messages(
+        &self,
+        limit: usize,
+        channel_types: Option<&[&str]>,
+    ) -> Result<Vec<ConversationMessage>> {
+        let (sql, params) = match channel_types {
+            Some(types) if !types.is_empty() => {
+                let placeholders: Vec<String> =
+                    (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
+                let sql = format!(
+                    "SELECT id, role, content, channel_type, created_at
+                     FROM conversations
+                     WHERE role != 'summary' AND channel_type IN ({})
+                     ORDER BY id DESC LIMIT ?1",
+                    placeholders.join(", ")
+                );
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(limit as i64)];
+                for t in types {
+                    params.push(Box::new(t.to_string()));
+                }
+                (sql, params)
+            }
+            _ => {
+                let sql = "SELECT id, role, content, channel_type, created_at
+                     FROM conversations
+                     WHERE role != 'summary'
+                     ORDER BY id DESC LIMIT ?1"
+                    .to_string();
+                let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(limit as i64)];
+                (sql, params)
+            }
+        };
 
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut messages: Vec<ConversationMessage> = stmt
-            .query_map([limit as i64], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok(ConversationMessage {
                     id: row.get(0)?,
                     role: row.get(1)?,
@@ -564,6 +654,364 @@ impl Database {
         Ok(events)
     }
 
+    // -- Reminders --
+
+    /// Add a new reminder. Returns the reminder ID.
+    pub fn add_reminder(&self, fire_at: &str, message: &str) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO reminders (fire_at, message) VALUES (?1, ?2)",
+                rusqlite::params![fire_at, message],
+            )
+            .context("failed to insert reminder")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all pending reminders (any fire_at).
+    pub fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, fire_at, message, status, created_at, delivered_at
+             FROM reminders WHERE status = 'pending' ORDER BY fire_at ASC",
+        )?;
+        let reminders = stmt
+            .query_map([], |row| {
+                Ok(Reminder {
+                    id: row.get(0)?,
+                    fire_at: row.get(1)?,
+                    message: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    delivered_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(reminders)
+    }
+
+    /// Get pending reminders whose fire_at is in the future.
+    pub fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, fire_at, message, status, created_at, delivered_at
+             FROM reminders WHERE status = 'pending' AND fire_at > datetime('now')
+             ORDER BY fire_at ASC",
+        )?;
+        let reminders = stmt
+            .query_map([], |row| {
+                Ok(Reminder {
+                    id: row.get(0)?,
+                    fire_at: row.get(1)?,
+                    message: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    delivered_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(reminders)
+    }
+
+    /// Get pending reminders whose fire_at is at or past now (ready to deliver).
+    pub fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, fire_at, message, status, created_at, delivered_at
+             FROM reminders WHERE status = 'pending' AND fire_at <= datetime('now')
+             ORDER BY fire_at ASC",
+        )?;
+        let reminders = stmt
+            .query_map([], |row| {
+                Ok(Reminder {
+                    id: row.get(0)?,
+                    fire_at: row.get(1)?,
+                    message: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    delivered_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(reminders)
+    }
+
+    /// Mark a reminder as delivered.
+    pub fn mark_reminder_delivered(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reminders SET status = 'delivered', delivered_at = datetime('now') WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a reminder as failed.
+    pub fn mark_reminder_failed(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE reminders SET status = 'failed' WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Cancel a pending reminder. Returns true if a reminder was actually cancelled.
+    pub fn cancel_reminder(&self, id: i64) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE reminders SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'",
+            [id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List all active (pending) reminders.
+    pub fn list_active_reminders(&self) -> Result<Vec<Reminder>> {
+        self.get_pending_reminders()
+    }
+
+    // -- Heartbeat Rate Limiting --
+
+    /// Record a heartbeat send for rate limiting.
+    pub fn record_heartbeat_send(&self) -> Result<()> {
+        self.conn
+            .execute("INSERT INTO heartbeat_sends DEFAULT VALUES", [])?;
+        Ok(())
+    }
+
+    /// Count heartbeat sends in the current day for a given timezone.
+    /// Uses SQLite date functions to compute "today" in the user's timezone.
+    pub fn count_heartbeat_sends_today(&self, timezone_offset: &str) -> Result<u32> {
+        // timezone_offset is like "+08:00" or "-05:00"
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM heartbeat_sends
+             WHERE date(sent_at, ?1) = date('now', ?1)",
+            [timezone_offset],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count heartbeat sends in the last hour (UTC).
+    pub fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM heartbeat_sends
+             WHERE sent_at >= datetime('now', '-1 hour')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Delete heartbeat sends older than `days` days.
+    pub fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
+        self.conn.execute(
+            &format!("DELETE FROM heartbeat_sends WHERE sent_at < datetime('now', '-{days} days')"),
+            [],
+        )?;
+        Ok(())
+    }
+
+    // -- Conversation Compaction --
+
+    /// Save a conversation summary row. Returns the new row ID.
+    pub fn save_conversation_summary(
+        &self,
+        summary: &str,
+        compacted_through_id: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO conversations (role, content, channel_type, compacted_through_id)
+             VALUES ('summary', ?1, 'system', ?2)",
+            rusqlite::params![summary, compacted_through_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Delete messages up to and including `through_id`, excluding summary rows.
+    /// Returns the number of deleted rows.
+    pub fn delete_compacted_messages(&self, through_id: i64) -> Result<u32> {
+        let rows = self.conn.execute(
+            "DELETE FROM conversations WHERE id <= ?1 AND role != 'summary'",
+            [through_id],
+        )?;
+        Ok(rows as u32)
+    }
+
+    /// Load the most recent conversation summary (if any).
+    pub fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
+        let msg = self
+            .conn
+            .query_row(
+                "SELECT id, role, content, channel_type, created_at
+                 FROM conversations WHERE role = 'summary'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(ConversationMessage {
+                        id: row.get(0)?,
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                        channel_type: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(msg)
+    }
+
+    /// Count total non-summary messages.
+    pub fn count_messages(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conversations WHERE role != 'summary'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Load messages older than the most recent `window_size` messages.
+    /// Used by compaction to identify messages to summarize.
+    pub fn load_messages_before_window(
+        &self,
+        window_size: usize,
+    ) -> Result<Vec<ConversationMessage>> {
+        // Get the ID threshold: the oldest message in the "keep" window
+        let threshold_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(id) FROM (
+                    SELECT id FROM conversations
+                    WHERE role != 'summary'
+                    ORDER BY id DESC LIMIT ?1
+                )",
+                [window_size as i64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let Some(threshold_id) = threshold_id else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, channel_type, created_at
+             FROM conversations
+             WHERE role != 'summary' AND id < ?1
+             ORDER BY id ASC",
+        )?;
+        let messages = stmt
+            .query_map([threshold_id], |row| {
+                Ok(ConversationMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    channel_type: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    /// Atomically replace old messages with a summary.
+    /// Deletes messages up to the highest ID in the batch and saves a summary row.
+    pub fn replace_with_summary(&self, summary: &str, compacted_through_id: i64) -> Result<i64> {
+        self.conn.execute("BEGIN", [])?;
+        let result = (|| {
+            // Delete old summary rows (we keep only the latest)
+            self.conn
+                .execute("DELETE FROM conversations WHERE role = 'summary'", [])?;
+            self.delete_compacted_messages(compacted_through_id)?;
+            self.save_conversation_summary(summary, compacted_through_id)
+        })();
+        match &result {
+            Ok(_) => self.conn.execute("COMMIT", [])?,
+            Err(_) => self.conn.execute("ROLLBACK", [])?,
+        };
+        result
+    }
+
+    // -- Customer Config --
+
+    /// Get a customer config value by key.
+    pub fn get_customer_config(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM customer_config WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Set a customer config value.
+    pub fn set_customer_config(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO customer_config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // -- Failed Sends --
+
+    /// Record a failed outbound send for retry.
+    pub fn record_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO failed_sends (text, request_id) VALUES (?1, ?2)",
+            rusqlite::params![text, request_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all failed sends for retry.
+    pub fn get_failed_sends(&self) -> Result<Vec<FailedSend>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, request_id, created_at, retry_count
+             FROM failed_sends ORDER BY created_at ASC",
+        )?;
+        let sends = stmt
+            .query_map([], |row| {
+                Ok(FailedSend {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    request_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    retry_count: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sends)
+    }
+
+    /// Remove a failed send after successful retry.
+    pub fn delete_failed_send(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM failed_sends WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Increment the retry count for a failed send.
+    pub fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE failed_sends SET retry_count = retry_count + 1 WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Get the timestamp of the last user message (for heartbeat staleness check).
+    pub fn last_user_message_time(&self) -> Result<Option<String>> {
+        let time = self
+            .conn
+            .query_row(
+                "SELECT created_at FROM conversations
+                 WHERE role = 'user' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(time)
+    }
+
     // -- Memory Events (Audit Log) --
 
     /// Log a memory mutation event for auditability.
@@ -669,6 +1117,25 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone)]
+pub struct Reminder {
+    pub id: i64,
+    pub fire_at: String,
+    pub message: String,
+    pub status: String,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedSend {
+    pub id: i64,
+    pub text: String,
+    pub request_id: Option<String>,
+    pub created_at: String,
+    pub retry_count: i32,
+}
+
+#[derive(Debug, Clone)]
 pub struct MemoryEvent {
     pub id: i64,
     pub session_id: String,
@@ -696,7 +1163,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -709,7 +1176,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -719,7 +1186,7 @@ mod tests {
         db.save_message("assistant", "Hi! How can I help?", "telegram")
             .unwrap();
 
-        let messages = db.load_recent_messages(10).unwrap();
+        let messages = db.load_recent_messages(10, None).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "Hello Mika!");
@@ -734,7 +1201,7 @@ mod tests {
             db.save_message("user", &format!("Message {i}"), "telegram")
                 .unwrap();
         }
-        let messages = db.load_recent_messages(5).unwrap();
+        let messages = db.load_recent_messages(5, None).unwrap();
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].content, "Message 15");
         assert_eq!(messages[4].content, "Message 19");
@@ -943,5 +1410,384 @@ mod tests {
         // Different session returns empty
         let events = db.get_memory_events("other").unwrap();
         assert!(events.is_empty());
+    }
+
+    // -- v5 migration tests --
+
+    #[test]
+    fn test_v5_tables_exist() {
+        let db = test_db();
+        // Verify all v5 tables exist by querying sqlite_master
+        let tables: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(tables.contains(&"reminders".to_string()));
+        assert!(tables.contains(&"heartbeat_sends".to_string()));
+        assert!(tables.contains(&"customer_config".to_string()));
+        assert!(tables.contains(&"failed_sends".to_string()));
+    }
+
+    #[test]
+    fn test_conversations_has_compacted_through_id() {
+        let db = test_db();
+        // Verify the column exists by inserting a row with it
+        db.conn
+            .execute(
+                "INSERT INTO conversations (role, content, channel_type, compacted_through_id)
+                 VALUES ('summary', 'test', 'system', 42)",
+                [],
+            )
+            .unwrap();
+        let val: i64 = db
+            .conn
+            .query_row(
+                "SELECT compacted_through_id FROM conversations WHERE role = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, 42);
+    }
+
+    // -- Channel type filter tests --
+
+    #[test]
+    fn test_load_messages_channel_filter() {
+        let db = test_db();
+        db.save_message("user", "cli msg", "cli").unwrap();
+        db.save_message("user", "telegram msg", "telegram").unwrap();
+        db.save_message("user", "heartbeat msg", "heartbeat")
+            .unwrap();
+
+        // Filter to only cli + telegram
+        let msgs = db
+            .load_recent_messages(10, Some(&["cli", "telegram"]))
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| m.channel_type != "heartbeat"));
+
+        // No filter returns all
+        let all = db.load_recent_messages(10, None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_load_messages_excludes_summary() {
+        let db = test_db();
+        db.save_message("user", "real msg", "cli").unwrap();
+        db.save_conversation_summary("old summary", 0).unwrap();
+
+        let msgs = db.load_recent_messages(10, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "real msg");
+    }
+
+    // -- Reminder tests --
+
+    #[test]
+    fn test_reminder_lifecycle() {
+        let db = test_db();
+
+        // Create two reminders: one in the past, one in the future
+        let past_id = db
+            .add_reminder("2020-01-01T00:00:00Z", "past reminder")
+            .unwrap();
+        let future_id = db
+            .add_reminder("2099-12-31T23:59:59Z", "future reminder")
+            .unwrap();
+        assert!(past_id > 0);
+        assert!(future_id > past_id);
+
+        // All pending
+        let pending = db.get_pending_reminders().unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // Future only
+        let future = db.get_future_reminders().unwrap();
+        assert_eq!(future.len(), 1);
+        assert_eq!(future[0].message, "future reminder");
+
+        // Past due only
+        let past_due = db.get_past_due_reminders().unwrap();
+        assert_eq!(past_due.len(), 1);
+        assert_eq!(past_due[0].message, "past reminder");
+
+        // Mark past as delivered
+        db.mark_reminder_delivered(past_id).unwrap();
+        let pending = db.get_pending_reminders().unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // Cancel future
+        let cancelled = db.cancel_reminder(future_id).unwrap();
+        assert!(cancelled);
+        let pending = db.get_pending_reminders().unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn test_cancel_nonpending_reminder() {
+        let db = test_db();
+        let id = db
+            .add_reminder("2020-01-01T00:00:00Z", "already delivered")
+            .unwrap();
+        db.mark_reminder_delivered(id).unwrap();
+
+        // Cancelling a delivered reminder returns false
+        let cancelled = db.cancel_reminder(id).unwrap();
+        assert!(!cancelled);
+    }
+
+    #[test]
+    fn test_mark_reminder_failed() {
+        let db = test_db();
+        let id = db
+            .add_reminder("2020-01-01T00:00:00Z", "will fail")
+            .unwrap();
+        db.mark_reminder_failed(id).unwrap();
+
+        let pending = db.get_pending_reminders().unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn test_list_active_reminders() {
+        let db = test_db();
+        db.add_reminder("2099-01-01T00:00:00Z", "active one")
+            .unwrap();
+        let id2 = db
+            .add_reminder("2099-02-01T00:00:00Z", "will cancel")
+            .unwrap();
+        db.cancel_reminder(id2).unwrap();
+
+        let active = db.list_active_reminders().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].message, "active one");
+    }
+
+    // -- Heartbeat rate limiting tests --
+
+    #[test]
+    fn test_heartbeat_send_counting() {
+        let db = test_db();
+
+        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 0);
+
+        db.record_heartbeat_send().unwrap();
+        db.record_heartbeat_send().unwrap();
+
+        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_heartbeat_sends_today() {
+        let db = test_db();
+        db.record_heartbeat_send().unwrap();
+
+        // UTC offset "+00:00" should see the send on "today"
+        let count = db.count_heartbeat_sends_today("+00:00").unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_prune_heartbeat_sends() {
+        let db = test_db();
+        // Insert a send with an old timestamp manually
+        db.conn
+            .execute(
+                "INSERT INTO heartbeat_sends (sent_at) VALUES (datetime('now', '-10 days'))",
+                [],
+            )
+            .unwrap();
+        db.record_heartbeat_send().unwrap(); // recent one
+
+        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 1);
+
+        // Prune sends older than 7 days
+        db.prune_old_heartbeat_sends(7).unwrap();
+
+        // The old one should be gone, but the count_last_hour still sees 1
+        let total: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM heartbeat_sends", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 1);
+    }
+
+    // -- Compaction tests --
+
+    #[test]
+    fn test_save_and_load_summary() {
+        let db = test_db();
+
+        // Initially no summary
+        assert!(db.load_conversation_summary().unwrap().is_none());
+
+        let id = db
+            .save_conversation_summary("Summary of messages 1-10", 10)
+            .unwrap();
+        assert!(id > 0);
+
+        let summary = db.load_conversation_summary().unwrap().unwrap();
+        assert_eq!(summary.role, "summary");
+        assert_eq!(summary.content, "Summary of messages 1-10");
+    }
+
+    #[test]
+    fn test_delete_compacted_messages() {
+        let db = test_db();
+
+        // Insert 5 messages
+        for i in 0..5 {
+            db.save_message("user", &format!("msg {i}"), "cli").unwrap();
+        }
+        let all = db.load_recent_messages(10, None).unwrap();
+        assert_eq!(all.len(), 5);
+        let third_id = all[2].id;
+
+        // Delete messages up to and including the third
+        let deleted = db.delete_compacted_messages(third_id).unwrap();
+        assert_eq!(deleted, 3);
+
+        let remaining = db.load_recent_messages(10, None).unwrap();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[test]
+    fn test_count_messages() {
+        let db = test_db();
+        assert_eq!(db.count_messages().unwrap(), 0);
+
+        db.save_message("user", "one", "cli").unwrap();
+        db.save_message("assistant", "two", "cli").unwrap();
+        assert_eq!(db.count_messages().unwrap(), 2);
+
+        // Summary rows don't count
+        db.save_conversation_summary("summary", 0).unwrap();
+        assert_eq!(db.count_messages().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_load_messages_before_window() {
+        let db = test_db();
+
+        // Insert 10 messages
+        for i in 0..10 {
+            db.save_message("user", &format!("msg {i}"), "cli").unwrap();
+        }
+
+        // Window of 3 keeps the last 3, so 7 should be "before window"
+        let old = db.load_messages_before_window(3).unwrap();
+        assert_eq!(old.len(), 7);
+        assert_eq!(old[0].content, "msg 0");
+        assert_eq!(old[6].content, "msg 6");
+    }
+
+    #[test]
+    fn test_load_messages_before_window_empty() {
+        let db = test_db();
+
+        // Fewer messages than window size
+        db.save_message("user", "only one", "cli").unwrap();
+        let old = db.load_messages_before_window(5).unwrap();
+        assert_eq!(old.len(), 0);
+    }
+
+    #[test]
+    fn test_replace_with_summary() {
+        let db = test_db();
+
+        // Insert 10 messages
+        for i in 0..10 {
+            db.save_message("user", &format!("msg {i}"), "cli").unwrap();
+        }
+        let all = db.load_recent_messages(20, None).unwrap();
+        let seventh_id = all[6].id; // msg 6's id
+
+        // Replace messages 0-6 with a summary
+        let summary_id = db
+            .replace_with_summary("Summary of messages 0-6", seventh_id)
+            .unwrap();
+        assert!(summary_id > 0);
+
+        // Should have 3 real messages remaining
+        let remaining = db.load_recent_messages(20, None).unwrap();
+        assert_eq!(remaining.len(), 3);
+        assert_eq!(remaining[0].content, "msg 7");
+
+        // Summary should be loadable
+        let summary = db.load_conversation_summary().unwrap().unwrap();
+        assert_eq!(summary.content, "Summary of messages 0-6");
+    }
+
+    // -- Customer config tests --
+
+    #[test]
+    fn test_customer_config_crud() {
+        let db = test_db();
+
+        // Initially empty
+        assert!(db.get_customer_config("timezone").unwrap().is_none());
+
+        // Set and get
+        db.set_customer_config("timezone", "+08:00").unwrap();
+        let tz = db.get_customer_config("timezone").unwrap().unwrap();
+        assert_eq!(tz, "+08:00");
+
+        // Upsert
+        db.set_customer_config("timezone", "-05:00").unwrap();
+        let tz = db.get_customer_config("timezone").unwrap().unwrap();
+        assert_eq!(tz, "-05:00");
+    }
+
+    // -- Failed sends tests --
+
+    #[test]
+    fn test_failed_send_lifecycle() {
+        let db = test_db();
+
+        let id = db
+            .record_failed_send("Hello user!", Some("req-123"))
+            .unwrap();
+        assert!(id > 0);
+
+        let sends = db.get_failed_sends().unwrap();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].text, "Hello user!");
+        assert_eq!(sends[0].request_id, Some("req-123".to_string()));
+        assert_eq!(sends[0].retry_count, 0);
+
+        // Increment retry
+        db.increment_failed_send_retry(id).unwrap();
+        let sends = db.get_failed_sends().unwrap();
+        assert_eq!(sends[0].retry_count, 1);
+
+        // Delete after successful retry
+        db.delete_failed_send(id).unwrap();
+        let sends = db.get_failed_sends().unwrap();
+        assert_eq!(sends.len(), 0);
+    }
+
+    // -- Last user message time --
+
+    #[test]
+    fn test_last_user_message_time() {
+        let db = test_db();
+
+        // No messages yet
+        assert!(db.last_user_message_time().unwrap().is_none());
+
+        db.save_message("user", "hello", "cli").unwrap();
+        db.save_message("assistant", "hi", "cli").unwrap();
+
+        // Should return the user message time (not assistant)
+        let time = db.last_user_message_time().unwrap().unwrap();
+        assert!(!time.is_empty());
     }
 }

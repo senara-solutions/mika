@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
 use crate::db::{
-    Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, MemoryEvent, Person,
-    Preference,
+    Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent,
+    Person, Preference, Reminder,
 };
 
 /// Async wrapper around `Database` that delegates all operations to
@@ -36,12 +36,7 @@ impl AsyncDatabase {
 
     // -- Conversations --
 
-    pub async fn save_message(
-        &self,
-        role: &str,
-        content: &str,
-        channel_type: &str,
-    ) -> Result<i64> {
+    pub async fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
         let db = Arc::clone(&self.inner);
         let role = role.to_string();
         let content = content.to_string();
@@ -53,11 +48,23 @@ impl AsyncDatabase {
         .await?
     }
 
-    pub async fn load_recent_messages(&self, limit: usize) -> Result<Vec<ConversationMessage>> {
+    pub async fn load_recent_messages(
+        &self,
+        limit: usize,
+        channel_types: Option<&[&str]>,
+    ) -> Result<Vec<ConversationMessage>> {
         let db = Arc::clone(&self.inner);
+        let channel_types: Option<Vec<String>> =
+            channel_types.map(|ts| ts.iter().map(|s| s.to_string()).collect());
         tokio::task::spawn_blocking(move || {
             let db = db.lock().expect("database mutex poisoned");
-            db.load_recent_messages(limit)
+            match &channel_types {
+                Some(types) => {
+                    let refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
+                    db.load_recent_messages(limit, Some(&refs))
+                }
+                None => db.load_recent_messages(limit, None),
+            }
         })
         .await?
     }
@@ -290,6 +297,262 @@ impl AsyncDatabase {
         })
         .await?
     }
+
+    // -- Reminders --
+
+    pub async fn add_reminder(&self, fire_at: &str, message: &str) -> Result<i64> {
+        let db = Arc::clone(&self.inner);
+        let fire_at = fire_at.to_string();
+        let message = message.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.add_reminder(&fire_at, &message)
+        })
+        .await?
+    }
+
+    pub async fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.get_pending_reminders()
+        })
+        .await?
+    }
+
+    pub async fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.get_future_reminders()
+        })
+        .await?
+    }
+
+    pub async fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.get_past_due_reminders()
+        })
+        .await?
+    }
+
+    pub async fn mark_reminder_delivered(&self, id: i64) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.mark_reminder_delivered(id)
+        })
+        .await?
+    }
+
+    pub async fn mark_reminder_failed(&self, id: i64) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.mark_reminder_failed(id)
+        })
+        .await?
+    }
+
+    pub async fn cancel_reminder(&self, id: i64) -> Result<bool> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.cancel_reminder(id)
+        })
+        .await?
+    }
+
+    pub async fn list_active_reminders(&self) -> Result<Vec<Reminder>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.list_active_reminders()
+        })
+        .await?
+    }
+
+    // -- Heartbeat Rate Limiting --
+
+    pub async fn record_heartbeat_send(&self) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.record_heartbeat_send()
+        })
+        .await?
+    }
+
+    pub async fn count_heartbeat_sends_today(&self, timezone_offset: &str) -> Result<u32> {
+        let db = Arc::clone(&self.inner);
+        let tz = timezone_offset.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.count_heartbeat_sends_today(&tz)
+        })
+        .await?
+    }
+
+    pub async fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.count_heartbeat_sends_last_hour()
+        })
+        .await?
+    }
+
+    pub async fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.prune_old_heartbeat_sends(days)
+        })
+        .await?
+    }
+
+    // -- Conversation Compaction --
+
+    pub async fn save_conversation_summary(
+        &self,
+        summary: &str,
+        compacted_through_id: i64,
+    ) -> Result<i64> {
+        let db = Arc::clone(&self.inner);
+        let summary = summary.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.save_conversation_summary(&summary, compacted_through_id)
+        })
+        .await?
+    }
+
+    pub async fn delete_compacted_messages(&self, through_id: i64) -> Result<u32> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.delete_compacted_messages(through_id)
+        })
+        .await?
+    }
+
+    pub async fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.load_conversation_summary()
+        })
+        .await?
+    }
+
+    pub async fn count_messages(&self) -> Result<usize> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.count_messages()
+        })
+        .await?
+    }
+
+    pub async fn load_messages_before_window(
+        &self,
+        window_size: usize,
+    ) -> Result<Vec<ConversationMessage>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.load_messages_before_window(window_size)
+        })
+        .await?
+    }
+
+    pub async fn replace_with_summary(
+        &self,
+        summary: &str,
+        compacted_through_id: i64,
+    ) -> Result<i64> {
+        let db = Arc::clone(&self.inner);
+        let summary = summary.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.replace_with_summary(&summary, compacted_through_id)
+        })
+        .await?
+    }
+
+    // -- Customer Config --
+
+    pub async fn get_customer_config(&self, key: &str) -> Result<Option<String>> {
+        let db = Arc::clone(&self.inner);
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.get_customer_config(&key)
+        })
+        .await?
+    }
+
+    pub async fn set_customer_config(&self, key: &str, value: &str) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.set_customer_config(&key, &value)
+        })
+        .await?
+    }
+
+    // -- Failed Sends --
+
+    pub async fn record_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
+        let db = Arc::clone(&self.inner);
+        let text = text.to_string();
+        let request_id = request_id.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.record_failed_send(&text, request_id.as_deref())
+        })
+        .await?
+    }
+
+    pub async fn get_failed_sends(&self) -> Result<Vec<FailedSend>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.get_failed_sends()
+        })
+        .await?
+    }
+
+    pub async fn delete_failed_send(&self, id: i64) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.delete_failed_send(id)
+        })
+        .await?
+    }
+
+    pub async fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.increment_failed_send_retry(id)
+        })
+        .await?
+    }
+
+    pub async fn last_user_message_time(&self) -> Result<Option<String>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().expect("database mutex poisoned");
+            db.last_user_message_time()
+        })
+        .await?
+    }
 }
 
 #[cfg(test)]
@@ -313,7 +576,7 @@ mod tests {
         assert!(id1 > 0);
         assert!(id2 > id1);
 
-        let messages = db.load_recent_messages(10).await.unwrap();
+        let messages = db.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "Hello!");
@@ -413,9 +676,16 @@ mod tests {
     async fn test_memory_event_crud() {
         let db = test_async_db();
 
-        db.log_memory_event("sess-1", "store_fact", "person:Alice", None, "Alice — CTO", None)
-            .await
-            .unwrap();
+        db.log_memory_event(
+            "sess-1",
+            "store_fact",
+            "person:Alice",
+            None,
+            "Alice — CTO",
+            None,
+        )
+        .await
+        .unwrap();
 
         let events = db.get_memory_events("sess-1").await.unwrap();
         assert_eq!(events.len(), 1);
@@ -432,7 +702,7 @@ mod tests {
         for _ in 0..10 {
             let db = db.clone();
             handles.push(tokio::spawn(async move {
-                db.load_recent_messages(10).await.unwrap()
+                db.load_recent_messages(10, None).await.unwrap()
             }));
         }
 
@@ -448,7 +718,7 @@ mod tests {
         let db2 = db.clone();
 
         db.save_message("user", "from db1", "cli").await.unwrap();
-        let messages = db2.load_recent_messages(10).await.unwrap();
+        let messages = db2.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "from db1");
     }
@@ -460,7 +730,7 @@ mod tests {
 
         // blocking() should see the same data
         let guard = db.blocking();
-        let messages = guard.load_recent_messages(10).unwrap();
+        let messages = guard.load_recent_messages(10, None).unwrap();
         assert_eq!(messages.len(), 1);
     }
 }

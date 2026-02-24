@@ -1,4 +1,4 @@
-use crate::db::{CORE_MEMORY_SECTIONS, CoreMemoryEntry};
+use crate::db::{CORE_MEMORY_SECTIONS, Commitment, CoreMemoryEntry};
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
@@ -106,6 +106,61 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push_str(&onboarding_prompt());
         prompt.push('\n');
     }
+
+    prompt
+}
+
+/// Context for building a silent mode (heartbeat/reminder) system prompt.
+pub struct SilentPromptContext<'a> {
+    pub soul_content: &'a str,
+    pub identity: &'a Identity,
+    pub core_memory: &'a [CoreMemoryEntry],
+    pub pending_commitments: &'a [Commitment],
+    pub trigger_context: &'a str,
+}
+
+/// Build a system prompt for silent mode (heartbeat/reminder).
+/// The agent's text output is NOT delivered — it must use send_message to contact the user.
+pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
+    let mut prompt = String::with_capacity(4096);
+
+    // Soul content
+    if !ctx.soul_content.is_empty() {
+        prompt.push_str(ctx.soul_content);
+        prompt.push_str("\n\n");
+    }
+
+    // Identity
+    write!(prompt, "## Identity\nYou are {}.\n\n", ctx.identity.name).unwrap();
+
+    // Core Memory
+    prompt.push_str("## Core Memory\n");
+    for entry in ctx.core_memory {
+        write!(prompt, "### {}\n{}\n\n", entry.key, entry.value).unwrap();
+    }
+
+    // Pending commitments
+    if !ctx.pending_commitments.is_empty() {
+        prompt.push_str("## Pending Commitments\n");
+        for c in ctx.pending_commitments {
+            let due = c.due_date.as_deref().unwrap_or("no due date");
+            writeln!(prompt, "- {} (due: {})", c.description, due).unwrap();
+        }
+        prompt.push('\n');
+    }
+
+    // Silent mode instructions
+    prompt.push_str("## Silent Mode\n");
+    prompt.push_str(
+        "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
+         Use the send_message tool to contact the user. If you have nothing worthwhile \
+         to say, simply respond with a brief internal note and do NOT call send_message.\n\n",
+    );
+
+    // Trigger-specific context
+    prompt.push_str("## Trigger\n");
+    prompt.push_str(ctx.trigger_context);
+    prompt.push('\n');
 
     prompt
 }
@@ -252,5 +307,66 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         // Should start directly with Identity section when soul is empty
         assert!(prompt.starts_with("## Identity"));
+    }
+
+    #[test]
+    fn test_silent_prompt_heartbeat() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            pending_commitments: &[],
+            trigger_context: "This is a HEARTBEAT check-in.",
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("## Silent Mode"));
+        assert!(prompt.contains("send_message"));
+        assert!(prompt.contains("HEARTBEAT check-in"));
+        assert!(prompt.contains("## Core Memory"));
+    }
+
+    #[test]
+    fn test_silent_prompt_reminder() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "REMINDER: Call the dentist",
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("Call the dentist"));
+        assert!(prompt.contains("NOT delivered"));
+    }
+
+    #[test]
+    fn test_silent_prompt_includes_commitments() {
+        use crate::db::Commitment;
+        let identity = test_identity();
+        let commitments = vec![Commitment {
+            id: 1,
+            description: "Review budget".to_string(),
+            status: "pending".to_string(),
+            due_date: Some("2026-03-01".to_string()),
+            person_id: None,
+            created_at: "2026-02-24".to_string(),
+            completed_at: None,
+        }];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &commitments,
+            trigger_context: "Heartbeat",
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("Review budget"));
+        assert!(prompt.contains("2026-03-01"));
     }
 }

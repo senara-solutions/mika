@@ -1,4 +1,8 @@
+mod cancel_reminder;
+mod create_reminder;
+mod list_reminders;
 mod search_memory;
+mod send_message;
 mod store_fact;
 mod update_core_memory;
 mod update_fact;
@@ -11,6 +15,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicU32;
 
 use crate::db::Database;
+use crate::messaging::MessageSender;
 
 /// Maximum length (in characters) allowed for any single string input to a tool.
 pub const MAX_INPUT_LEN: usize = 10_000;
@@ -22,6 +27,7 @@ pub struct ToolContext<'a> {
     pub home_dir: &'a Path,
     pub core_memory_edit_count: &'a AtomicU32,
     pub is_onboarding: bool,
+    pub message_sender: Option<&'a dyn MessageSender>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
@@ -99,5 +105,9 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(store_fact::StoreFactTool));
     registry.register(Box::new(search_memory::SearchMemoryTool));
     registry.register(Box::new(update_fact::UpdateFactTool));
+    registry.register(Box::new(create_reminder::CreateReminderTool));
+    registry.register(Box::new(list_reminders::ListRemindersTool));
+    registry.register(Box::new(cancel_reminder::CancelReminderTool));
+    registry.register(Box::new(send_message::SendMessageTool));
     registry
 }

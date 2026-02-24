@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use mika_agent::agent::{self, AgentParams};
 use mika_agent::db::{CORE_MEMORY_SECTIONS, Database};
+use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::tools;
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
@@ -60,6 +61,18 @@ async fn main() -> Result<()> {
     // Generate a session ID for this CLI session (used for audit logging)
     let session_id = Uuid::new_v4().to_string();
     tracing::info!(session_id = %session_id, "starting CLI session");
+
+    // Recover any past-due reminders on startup
+    let scheduler = ReminderScheduler {
+        db: &db,
+        claude: &claude,
+        tools: &tool_registry,
+        home_dir: &home_dir,
+        message_sender: None,
+    };
+    if let Err(e) = scheduler.recover().await {
+        tracing::warn!(error = %e, "reminder recovery failed");
+    }
 
     println!("Mika CLI — type a message and press Enter. Type /help for commands.\n");
 

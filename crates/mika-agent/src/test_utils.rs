@@ -27,6 +27,7 @@ pub mod test_helpers {
             home_dir: std::path::Path::new(HOME_DIR),
             core_memory_edit_count: edit_count,
             is_onboarding,
+            message_sender: None,
         }
     }
 }
