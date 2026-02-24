@@ -1,0 +1,12 @@
+name = "memory"
+description = "Manage persistent memory, core memory blocks, and stored facts"
+
+[triggers]
+keywords = ["remember", "memory", "fact", "person", "commitment", "preference", "event"]
+
+[handler]
+type = "builtin"
+tools = ["update_core_memory", "store_fact", "search_memory", "update_fact"]
+
+[options]
+always_on = true

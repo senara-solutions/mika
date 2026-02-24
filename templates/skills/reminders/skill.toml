@@ -1,0 +1,12 @@
+name = "reminders"
+description = "Create, list, and manage reminders"
+
+[triggers]
+keywords = ["remind", "reminder", "schedule", "alarm", "alert"]
+
+[handler]
+type = "builtin"
+tools = ["create_reminder", "list_reminders", "cancel_reminder"]
+
+[options]
+always_on = true

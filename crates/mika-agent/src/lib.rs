@@ -6,6 +6,7 @@ pub mod messaging;
 pub mod prompt;
 pub mod scheduler;
 pub mod server;
+pub mod skills;
 pub mod startup;
 #[cfg(test)]
 pub mod test_utils;

@@ -1,0 +1,12 @@
+name = "messaging"
+description = "Send messages to the user proactively"
+
+[triggers]
+keywords = ["send", "message", "notify"]
+
+[handler]
+type = "builtin"
+tools = ["send_message"]
+
+[options]
+always_on = true

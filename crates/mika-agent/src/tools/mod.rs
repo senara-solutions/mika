@@ -102,6 +102,15 @@ impl ToolRegistry {
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
     }
+
+    /// Look up a cached tool definition by name.
+    pub fn definition_by_name(&self, name: &str) -> Option<&ToolDefinition> {
+        self.tools
+            .iter()
+            .zip(self.cached_defs.iter())
+            .find(|(tool, _)| tool.name() == name)
+            .map(|(_, def)| def)
+    }
 }
 
 /// Create a registry with all built-in tools.
