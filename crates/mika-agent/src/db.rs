@@ -530,6 +530,26 @@ impl Database {
         Ok(value)
     }
 
+    /// List all preferences (for substring search).
+    pub fn list_preferences(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT category, value FROM preferences ORDER BY category")?;
+        let prefs = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read preference row");
+                    None
+                }
+            })
+            .collect();
+        Ok(prefs)
+    }
+
     // -- Events (Layer 2) --
 
     /// Add an event.

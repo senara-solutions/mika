@@ -82,7 +82,6 @@ pub const DEFAULT_CONFIG: &str = r#"# Mika configuration
 #
 # Secrets MUST be set via environment variables, not in this file:
 #   MIKA_ANTHROPIC_API_KEY — Anthropic API key
-#   MIKA_ENCRYPTION_KEY    — 64 hex chars (32 bytes) for AES-256-GCM
 
 claude_model = "claude-sonnet-4-6"
 claude_max_tokens = 4096

@@ -108,10 +108,12 @@ impl Tool for SearchMemoryTool {
 
         // Search preferences
         if category == "all" || category == "preference" {
-            // We need to scan all preferences — no list method exists yet,
-            // but we can try the specific query as a category key first.
-            if let Some(value) = ctx.db.get_preference(query)? {
-                results.push(format!("[preference] {query}: {value}"));
+            let prefs = ctx.db.list_preferences()?;
+            for (cat, val) in prefs {
+                let searchable = format!("{cat} {val}");
+                if searchable.to_lowercase().contains(&query_lower) {
+                    results.push(format!("[preference] {cat}: {val}"));
+                }
             }
         }
 
@@ -239,5 +241,38 @@ mod tests {
             .unwrap();
         assert!(result.content.contains("[core_memory]"));
         assert!(result.content.contains("user_summary"));
+    }
+
+    #[tokio::test]
+    async fn test_search_finds_preference_by_value_substring() {
+        let db = test_db();
+        db.set_preference("Food", "No shellfish, prefers sushi")
+            .unwrap();
+        db.set_preference("Meeting time", "Morning, before 10am")
+            .unwrap();
+        let counter = AtomicU32::new(0);
+        let ctx = test_ctx(&db, &counter);
+        let tool = SearchMemoryTool;
+
+        // Search by value substring
+        let result = tool
+            .execute(serde_json::json!({"query": "shellfish"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("[preference]"));
+        assert!(result.content.contains("Food"));
+
+        // Search by partial category
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "meeting", "category": "preference"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Meeting time"));
+        assert!(result.content.contains("Morning"));
     }
 }

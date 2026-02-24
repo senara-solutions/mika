@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "056"
 tags: [code-review, bug, config, rust-v2]
@@ -42,3 +42,4 @@ Simply delete the line from the constant.
 | Date | Action | Learnings |
 |------|--------|-----------|
 | 2026-02-24 | Created from encryption-strip code review | Missed in commit eb03ea7 — home.rs was not in the plan's file list |
+| 2026-02-24 | Fixed — removed MIKA_ENCRYPTION_KEY line from DEFAULT_CONFIG | 1-line fix |
