@@ -1,19 +1,15 @@
-pub mod handler;
 pub mod index;
-pub mod loader;
 pub mod manifest;
 pub mod matcher;
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
 
 use mika_common::claude::ToolDefinition;
 
 use crate::tools::ToolRegistry;
 
 use self::index::SkillEntry;
-use self::manifest::Handler;
 
 /// Registry of discovered skills, built once at startup.
 #[derive(Debug)]
@@ -48,72 +44,50 @@ impl SkillRegistry {
     pub fn skills(&self) -> &[SkillEntry] {
         &self.skills
     }
+
+    /// Return all always-on skills (no keyword matching needed).
+    ///
+    /// Used by silent-mode heartbeats where there's no real user message
+    /// to match against.
+    pub fn always_on_skills(&self) -> Vec<&SkillEntry> {
+        self.skills
+            .iter()
+            .filter(|e| e.manifest.options.always_on)
+            .collect()
+    }
 }
 
-/// Resolve matched skills into merged tool definitions and a dispatch map
-/// for external (exec/http) tool handlers.
+/// Resolve matched skills into merged tool definitions.
 ///
 /// For builtin handlers, tool definitions come from the `ToolRegistry`.
-/// For exec/http handlers, tool definitions come from `tools.json`.
-///
-/// Returns:
-/// - `Vec<ToolDefinition>`: all tool defs to send to Claude
-/// - `HashMap<String, (Handler, Duration)>`: external tool name → handler + timeout
-pub async fn resolve_matched_skills(
+/// Deduplicates by tool name across skills.
+pub fn resolve_matched_skills(
     tool_registry: &ToolRegistry,
     matched: &[&SkillEntry],
-) -> (Vec<ToolDefinition>, HashMap<String, (Handler, Duration)>) {
+) -> Vec<ToolDefinition> {
     let mut tool_defs = Vec::new();
-    let mut external_map: HashMap<String, (Handler, Duration)> = HashMap::new();
-    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
 
     for entry in matched {
-        let timeout = Duration::from_secs(entry.manifest.options.timeout_secs);
-
-        match &entry.manifest.handler {
-            Handler::Builtin { tools } => {
-                for tool_name in tools {
-                    if seen_names.contains(tool_name) {
-                        continue;
-                    }
-                    if let Some(def) = tool_registry.definition_by_name(tool_name) {
-                        tool_defs.push(def.clone());
-                        seen_names.insert(tool_name.clone());
-                    }
-                }
+        let manifest::Handler::Builtin { tools } = &entry.manifest.handler;
+        for tool_name in tools {
+            if seen_names.contains(tool_name) {
+                continue;
             }
-            handler @ (Handler::Exec { tools, .. } | Handler::Http { tools, .. }) => {
-                // Load external tool definitions from tools.json
-                let external_defs = match loader::load_tool_definitions(&entry.dir).await {
-                    Ok(defs) => defs,
-                    Err(e) => {
-                        tracing::warn!(
-                            skill = %entry.manifest.name,
-                            error = %e,
-                            "failed to load tools.json"
-                        );
-                        continue;
-                    }
-                };
-
-                for def in external_defs {
-                    if tools.contains(&def.name) && !seen_names.contains(&def.name) {
-                        seen_names.insert(def.name.clone());
-                        external_map.insert(def.name.clone(), (handler.clone(), timeout));
-                        tool_defs.push(def);
-                    }
-                }
+            if let Some(def) = tool_registry.definition_by_name(tool_name) {
+                tool_defs.push(def.clone());
+                seen_names.insert(tool_name.clone());
             }
         }
     }
 
-    (tool_defs, external_map)
+    tool_defs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::manifest::{SkillManifest, SkillOptions, Triggers};
+    use crate::skills::manifest::{Handler, SkillManifest, SkillOptions, Triggers};
     use crate::tools;
     use std::path::PathBuf;
 
@@ -133,6 +107,7 @@ mod tests {
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![],
+            prompt_snippet: String::new(),
         }
     }
 
@@ -150,27 +125,47 @@ mod tests {
         assert!(!registry.has_skills());
     }
 
-    #[tokio::test]
-    async fn test_resolve_builtin_skills() {
+    #[test]
+    fn test_resolve_builtin_skills() {
         let tool_registry = tools::default_tools();
         let entry = make_builtin_entry("memory", &["store_fact", "search_memory"], true);
         let matched: Vec<&SkillEntry> = vec![&entry];
 
-        let (defs, external) = resolve_matched_skills(&tool_registry, &matched).await;
+        let defs = resolve_matched_skills(&tool_registry, &matched);
         assert_eq!(defs.len(), 2);
         assert!(defs.iter().any(|d| d.name == "store_fact"));
         assert!(defs.iter().any(|d| d.name == "search_memory"));
-        assert!(external.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_resolve_deduplicates() {
+    #[test]
+    fn test_always_on_skills() {
+        let registry = SkillRegistry {
+            skills: vec![
+                make_builtin_entry("memory", &["store_fact"], true),
+                make_builtin_entry("reminders", &["create_reminder"], false),
+                make_builtin_entry("messaging", &["send_message"], true),
+            ],
+        };
+        let always_on = registry.always_on_skills();
+        assert_eq!(always_on.len(), 2);
+        assert_eq!(always_on[0].manifest.name, "memory");
+        assert_eq!(always_on[1].manifest.name, "messaging");
+    }
+
+    #[test]
+    fn test_always_on_skills_empty() {
+        let registry = SkillRegistry::empty();
+        assert!(registry.always_on_skills().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_deduplicates() {
         let tool_registry = tools::default_tools();
         let entry1 = make_builtin_entry("memory", &["store_fact"], true);
         let entry2 = make_builtin_entry("memory2", &["store_fact"], true);
         let matched: Vec<&SkillEntry> = vec![&entry1, &entry2];
 
-        let (defs, _) = resolve_matched_skills(&tool_registry, &matched).await;
+        let defs = resolve_matched_skills(&tool_registry, &matched);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "store_fact");
     }

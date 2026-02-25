@@ -1,3 +1,5 @@
+# Builtin skill template — tool names must match mika-agent::tools definitions.
+# See crates/mika-agent/src/tools/ for the canonical tool registry.
 name = "memory"
 description = "Manage persistent memory, core memory blocks, and stored facts"
 

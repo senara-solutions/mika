@@ -21,6 +21,11 @@ pub enum Commands {
     Status,
     /// View or edit configuration
     Config(ConfigArgs),
+    /// List loaded skills or inspect a specific skill
+    Skills {
+        /// Show details for a specific skill by name
+        name: Option<String>,
+    },
     /// Send a message and print the response (non-interactive)
     Ask {
         /// The message to send (use "-" to read from stdin)

@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         Some(Commands::Reminders(args)) => commands::reminders::run(args).await,
         Some(Commands::Status) => commands::status::run().await,
         Some(Commands::Config(args)) => commands::config::run(args).await,
+        Some(Commands::Skills { name }) => commands::skills::run(name).await,
         Some(Commands::Ask { message }) => commands::ask::run(&message).await,
     }
 }

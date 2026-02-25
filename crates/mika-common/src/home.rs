@@ -41,7 +41,13 @@ pub fn bootstrap(home_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Builtin skill template data embedded at compile time.
+/// Default skill templates seeded into ~/.mika/skills/ on first run.
+///
+/// NOTE: These templates reference tool names defined in mika-agent (e.g.,
+/// `update_core_memory`, `store_fact`). This is an intentional coupling:
+/// mika-common owns home directory bootstrap, and these defaults are tightly
+/// bound to the builtin tool set. If tool names change in mika-agent, update
+/// the corresponding templates in `templates/skills/`.
 const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
     (
         "memory",

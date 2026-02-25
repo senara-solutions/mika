@@ -4,4 +4,5 @@ pub mod config;
 pub mod memory;
 pub mod reminders;
 pub mod setup;
+pub mod skills;
 pub mod status;

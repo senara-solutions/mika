@@ -336,8 +336,6 @@ fn handle_skills(app: &App<'_>) -> String {
     for entry in skills {
         let handler_type = match &entry.manifest.handler {
             mika_agent::skills::manifest::Handler::Builtin { .. } => "builtin",
-            mika_agent::skills::manifest::Handler::Exec { .. } => "exec",
-            mika_agent::skills::manifest::Handler::Http { .. } => "http",
         };
         let always_on = if entry.manifest.options.always_on {
             " [always on]"
@@ -370,12 +368,6 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
             let handler_type = match &m.handler {
                 mika_agent::skills::manifest::Handler::Builtin { tools } => {
                     format!("builtin (tools: {})", tools.join(", "))
-                }
-                mika_agent::skills::manifest::Handler::Exec { command, .. } => {
-                    format!("exec (command: {command})")
-                }
-                mika_agent::skills::manifest::Handler::Http { url, .. } => {
-                    format!("http (url: {url})")
                 }
             };
             let keywords = if m.triggers.keywords.is_empty() {
