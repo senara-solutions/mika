@@ -24,6 +24,8 @@ pub fn bootstrap(home_dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}/data/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("logs"))
         .with_context(|| format!("failed to create {}/logs/", home_dir.display()))?;
+    std::fs::create_dir_all(home_dir.join("skills"))
+        .with_context(|| format!("failed to create {}/skills/", home_dir.display()))?;
 
     write_default_if_missing(home_dir, "config.toml", DEFAULT_CONFIG)?;
     write_default_if_missing(home_dir, "identity.toml", DEFAULT_IDENTITY)?;
@@ -31,9 +33,51 @@ pub fn bootstrap(home_dir: &Path) -> Result<()> {
     write_default_if_missing(home_dir, "heartbeat.md", DEFAULT_HEARTBEAT)?;
     write_default_if_missing(home_dir, "user.md", DEFAULT_USER)?;
 
+    seed_default_skills(home_dir)?;
+
     #[cfg(unix)]
     set_permissions(home_dir)?;
 
+    Ok(())
+}
+
+/// Builtin skill template data embedded at compile time.
+const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
+    (
+        "memory",
+        include_str!("../../../templates/skills/memory/skill.toml"),
+        include_str!("../../../templates/skills/memory/system_prompt.md"),
+    ),
+    (
+        "reminders",
+        include_str!("../../../templates/skills/reminders/skill.toml"),
+        include_str!("../../../templates/skills/reminders/system_prompt.md"),
+    ),
+    (
+        "messaging",
+        include_str!("../../../templates/skills/messaging/skill.toml"),
+        include_str!("../../../templates/skills/messaging/system_prompt.md"),
+    ),
+];
+
+/// Seed default builtin skills into `~/.mika/skills/` if they don't already exist.
+fn seed_default_skills(home_dir: &Path) -> Result<()> {
+    let skills_dir = home_dir.join("skills");
+    for (name, skill_toml, system_prompt) in BUILTIN_SKILLS {
+        let skill_dir = skills_dir.join(name);
+        if skill_dir.exists() {
+            continue; // Don't overwrite user-modified skills
+        }
+        std::fs::create_dir_all(&skill_dir)
+            .with_context(|| format!("failed to create skill dir {}", skill_dir.display()))?;
+        std::fs::write(skill_dir.join("skill.toml"), skill_toml)
+            .with_context(|| format!("failed to write {}/skill.toml", skill_dir.display()))?;
+        if !system_prompt.is_empty() {
+            std::fs::write(skill_dir.join("system_prompt.md"), system_prompt).with_context(
+                || format!("failed to write {}/system_prompt.md", skill_dir.display()),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -52,14 +96,12 @@ fn set_permissions(home_dir: &Path) -> Result<()> {
 
     // Directory: 0700
     std::fs::set_permissions(home_dir, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::set_permissions(
-        home_dir.join("data"),
-        std::fs::Permissions::from_mode(0o700),
-    )?;
-    std::fs::set_permissions(
-        home_dir.join("logs"),
-        std::fs::Permissions::from_mode(0o700),
-    )?;
+    for dir_name in &["data", "logs", "skills"] {
+        let dir_path = home_dir.join(dir_name);
+        if dir_path.exists() {
+            std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
 
     // Files: 0600
     for filename in &[

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use mika_agent::agent::{self, AgentParams, check_onboarding};
+use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 
 use crate::init;
@@ -12,6 +13,7 @@ pub async fn run(message: &str) -> Result<()> {
     let ctx = init::init()?;
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
+    let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
 
     // Read message from arg, or from stdin if "-"
     let user_message = if message == "-" {
@@ -32,6 +34,7 @@ pub async fn run(message: &str) -> Result<()> {
         db: &ctx.async_db,
         claude: &ctx.claude,
         tools: &tool_registry,
+        skills: &skill_registry,
         user_message: &user_message,
         channel_type: "cli",
         session_id: &session_id,

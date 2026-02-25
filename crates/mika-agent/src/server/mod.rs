@@ -21,6 +21,7 @@ use crate::async_db::AsyncDatabase;
 use crate::db::Database;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 use crate::scheduler::ReminderScheduler;
+use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::tools;
 
@@ -63,6 +64,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         settings.claude_max_tokens,
     )?;
     let tool_registry = Arc::new(tools::default_tools());
+    let skill_registry = Arc::new(SkillRegistry::from_dir(&home_dir.join("skills")));
     let ready = Arc::new(AtomicBool::new(false));
     let http_client = reqwest::Client::new();
 
@@ -95,6 +97,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         db: async_db.clone(),
         claude: claude.clone(),
         tools: tool_registry.clone(),
+        skills: skill_registry.clone(),
         home_dir: home_dir.to_path_buf(),
         message_sender: Some(scheduler_sender),
     });
@@ -103,6 +106,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         db: async_db,
         claude,
         tools: tool_registry,
+        skills: skill_registry,
         scheduler: scheduler.clone(),
         agent_lock: Arc::new(tokio::sync::Mutex::new(())),
         ready: ready.clone(),
@@ -169,10 +173,12 @@ mod tests {
         )
         .expect("test API key should be valid");
         let tools_reg = Arc::new(tools::default_tools());
+        let skills_reg = Arc::new(SkillRegistry::empty());
         let scheduler = Arc::new(ReminderScheduler {
             db: db.clone(),
             claude: claude.clone(),
             tools: tools_reg.clone(),
+            skills: skills_reg.clone(),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             message_sender: None,
         });
@@ -180,6 +186,7 @@ mod tests {
             db,
             claude,
             tools: tools_reg,
+            skills: skills_reg,
             scheduler,
             agent_lock: Arc::new(tokio::sync::Mutex::new(())),
             ready: Arc::new(AtomicBool::new(false)),

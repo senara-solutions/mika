@@ -12,6 +12,7 @@ use uuid::Uuid;
 use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
+use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 
 use crate::init;
@@ -25,12 +26,14 @@ pub async fn run() -> Result<()> {
     let identity = prompt::load_identity(&ctx.home_dir);
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
+    let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
 
     // Recover reminders on startup
     let scheduler = ReminderScheduler {
         db: ctx.async_db.clone(),
         claude: ctx.claude.clone(),
         tools: tool_registry.clone(),
+        skills: skill_registry.clone(),
         home_dir: ctx.home_dir.clone(),
         message_sender: None,
     };
@@ -46,6 +49,7 @@ pub async fn run() -> Result<()> {
     let worker_db = ctx.async_db.clone();
     let worker_claude = ctx.claude.clone();
     let worker_tools = tool_registry.clone();
+    let worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
     let agent_handle = tokio::spawn(async move {
@@ -57,6 +61,7 @@ pub async fn run() -> Result<()> {
                         db: &worker_db,
                         claude: &worker_claude,
                         tools: &worker_tools,
+                        skills: &worker_skills,
                         user_message: &text,
                         channel_type: "cli",
                         session_id: &worker_session,
@@ -86,13 +91,17 @@ pub async fn run() -> Result<()> {
         }
     });
 
-    // Build app
+    // Build app with shared resources
     let mut app = App::new(
         user_tx,
         agent_rx,
         session_id,
         ctx.settings.claude_model.clone(),
         identity.name.clone(),
+        ctx.async_db.clone(),
+        ctx.claude.clone(),
+        ctx.home_dir.clone(),
+        skill_registry,
     );
 
     // Install panic hook that restores terminal
@@ -126,7 +135,7 @@ pub async fn run() -> Result<()> {
                 app.needs_redraw = true;
             }
             Some(AppEvent::Tick) => {
-                app.tick();
+                app.tick().await;
             }
             Some(AppEvent::Resize) => {
                 app.needs_redraw = true;

@@ -7,6 +7,7 @@ use secrecy::SecretString;
 
 use crate::async_db::AsyncDatabase;
 use crate::scheduler::ReminderScheduler;
+use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 
 /// Shared application state for the Axum HTTP server.
@@ -18,6 +19,7 @@ pub struct AppState {
     pub db: AsyncDatabase,
     pub claude: ClaudeClient,
     pub tools: Arc<ToolRegistry>,
+    pub skills: Arc<SkillRegistry>,
     pub scheduler: Arc<ReminderScheduler>,
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,
     pub ready: Arc<AtomicBool>,

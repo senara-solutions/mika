@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use mika_common::claude::{
     ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
 };
+use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -12,6 +14,8 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::messaging::MessageSender;
 use crate::prompt;
+use crate::skills::manifest::Handler;
+use crate::skills::{self, SkillRegistry};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 
 const MAX_TOOL_STEPS: usize = 10;
@@ -39,6 +43,7 @@ pub struct AgentParams<'a> {
     pub db: &'a AsyncDatabase,
     pub claude: &'a ClaudeClient,
     pub tools: &'a ToolRegistry,
+    pub skills: &'a SkillRegistry,
     pub user_message: &'a str,
     pub channel_type: &'a str,
     pub session_id: &'a str,
@@ -126,8 +131,26 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         system.push_str("\n</context>\n");
     }
 
+    // Match skills and resolve tool definitions
+    let matched = params.skills.match_message(params.user_message);
+
+    let (skill_tool_defs, skill_tool_map) = if !matched.is_empty() {
+        // Lazy-load prompt snippets from matched skills
+        for entry in &matched {
+            let snippet = skills::loader::load_prompt_snippet(&entry.dir).await;
+            if !snippet.is_empty() {
+                write!(system, "\n## {} Skill\n{}\n", entry.manifest.name, snippet).unwrap();
+            }
+        }
+        skills::resolve_matched_skills(tools, &matched).await
+    } else if !params.skills.has_skills() {
+        // Fallback: no skills dir → use all builtin tools (pre-skill behavior)
+        (tools.definitions().to_vec(), HashMap::new())
+    } else {
+        (Vec::new(), HashMap::new())
+    };
+
     let history = db.load_recent_messages(20, None).await?;
-    let tool_defs = tools.definitions();
 
     // Build initial message list from history
     let messages: Vec<Message> = history
@@ -156,10 +179,10 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         max_tokens: claude.max_tokens,
         system: Some(system),
         messages,
-        tools: if tool_defs.is_empty() {
+        tools: if skill_tool_defs.is_empty() {
             None
         } else {
-            Some(tool_defs.to_vec())
+            Some(skill_tool_defs)
         },
     };
 
@@ -185,7 +208,14 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
                 return Ok(text);
             }
             StopReason::ToolUse => {
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
+                process_tool_calls(
+                    response.content,
+                    tools,
+                    &skill_tool_map,
+                    &tool_ctx,
+                    &mut request,
+                )
+                .await;
             }
             StopReason::StopSequence => {
                 let text = response.text();
@@ -210,6 +240,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
 async fn process_tool_calls(
     response_content: Vec<ContentBlock>,
     tools: &ToolRegistry,
+    skill_tool_map: &HashMap<String, (Handler, Duration)>,
     tool_ctx: &ToolContext<'_>,
     request: &mut MessagesRequest,
 ) {
@@ -217,7 +248,7 @@ async fn process_tool_calls(
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
-            let output = execute_tool(tools, name, input.clone(), tool_ctx).await;
+            let output = execute_tool(tools, skill_tool_map, name, input.clone(), tool_ctx).await;
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
                 content: output.content,
@@ -239,33 +270,40 @@ async fn process_tool_calls(
 /// Execute a single tool with timeout.
 async fn execute_tool(
     tools: &ToolRegistry,
+    skill_tool_map: &HashMap<String, (Handler, Duration)>,
     name: &str,
     input: serde_json::Value,
     ctx: &ToolContext<'_>,
 ) -> ToolOutput {
-    let Some(tool) = tools.get(name) else {
-        warn!(tool = %name, "unknown tool requested");
-        return ToolOutput::error(format!("Unknown tool: {name}"));
-    };
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-        tool.execute(input, ctx),
-    )
-    .await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            warn!(tool = %name, error = %e, "tool execution failed");
-            ToolOutput::error(format!("Tool error: {e}"))
-        }
-        Err(_) => {
-            warn!(tool = %name, "tool execution timed out");
-            ToolOutput::error(format!(
-                "Tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
-            ))
-        }
+    // Try builtin tools first
+    if let Some(tool) = tools.get(name) {
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+            tool.execute(input, ctx),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                warn!(tool = %name, error = %e, "tool execution failed");
+                ToolOutput::error(format!("Tool error: {e}"))
+            }
+            Err(_) => {
+                warn!(tool = %name, "tool execution timed out");
+                ToolOutput::error(format!(
+                    "Tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
+                ))
+            }
+        };
     }
+
+    // Try skill handler map (exec/http tools)
+    if let Some((handler, timeout)) = skill_tool_map.get(name) {
+        return skills::handler::execute_skill_tool(handler, name, input, *timeout).await;
+    }
+
+    warn!(tool = %name, "unknown tool requested");
+    ToolOutput::error(format!("Unknown tool: {name}"))
 }
 
 // -- Silent Mode Agent Loop --
@@ -281,6 +319,7 @@ pub struct SilentAgentParams<'a> {
     pub db: &'a AsyncDatabase,
     pub claude: &'a ClaudeClient,
     pub tools: &'a ToolRegistry,
+    pub skills: &'a SkillRegistry,
     pub trigger: SilentTrigger,
     pub home_dir: &'a Path,
     pub session_id: &'a str,
@@ -367,7 +406,29 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         current_utc: chrono::Utc::now(),
         timezone,
     };
-    let system = prompt::build_silent_prompt(&silent_ctx);
+    let mut system = prompt::build_silent_prompt(&silent_ctx);
+
+    // Match skills against trigger context for silent mode
+    let trigger_text = match &params.trigger {
+        SilentTrigger::Heartbeat => "heartbeat check-in send message reminder",
+        SilentTrigger::Reminder { message, .. } => message.as_str(),
+    };
+    let matched = params.skills.match_message(trigger_text);
+
+    let (skill_tool_defs, skill_tool_map) = if !matched.is_empty() {
+        for entry in &matched {
+            let snippet = skills::loader::load_prompt_snippet(&entry.dir).await;
+            if !snippet.is_empty() {
+                write!(system, "\n## {} Skill\n{}\n", entry.manifest.name, snippet).unwrap();
+            }
+        }
+        skills::resolve_matched_skills(tools, &matched).await
+    } else if !params.skills.has_skills() {
+        // Fallback: no skills dir → use all builtin tools
+        (tools.definitions().to_vec(), HashMap::new())
+    } else {
+        (Vec::new(), HashMap::new())
+    };
 
     // For silent mode, provide a brief "trigger" as the user message
     let user_msg = match &params.trigger {
@@ -382,7 +443,6 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         content: MessageContent::Text(user_msg),
     }];
 
-    let tool_defs = tools.definitions();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
@@ -398,10 +458,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         max_tokens: claude.max_tokens,
         system: Some(system),
         messages,
-        tools: if tool_defs.is_empty() {
+        tools: if skill_tool_defs.is_empty() {
             None
         } else {
-            Some(tool_defs.to_vec())
+            Some(skill_tool_defs)
         },
     };
 
@@ -424,7 +484,14 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 return Ok(());
             }
             StopReason::ToolUse => {
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
+                process_tool_calls(
+                    response.content,
+                    tools,
+                    &skill_tool_map,
+                    &tool_ctx,
+                    &mut request,
+                )
+                .await;
             }
         }
     }

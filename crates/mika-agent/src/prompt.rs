@@ -133,24 +133,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
 
     // Instructions
     prompt.push_str("## Instructions\n");
-    prompt.push_str("- Update your core memory when you learn important things about the user.\n");
-    prompt.push_str(
-        "- Track people, commitments, preferences, and events using the appropriate tools.\n",
-    );
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
-    prompt.push_str(
-        "- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC). \
-         Use the current time shown above to compute future times.\n",
-    );
-    prompt
-        .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
-    prompt.push_str(
-        "- Use search_memory to find stored facts across all categories before asking the user to repeat information.\n",
-    );
-    prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
-    prompt.push_str(
-        "- You can reset a core memory section to its default value using update_core_memory with the reset action.\n",
-    );
     let section_names = core_memory_section_names();
     write!(
         prompt,
@@ -208,15 +191,6 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
          Use the send_message tool to contact the user. If you have nothing worthwhile \
          to say, simply respond with a brief internal note and do NOT call send_message.\n\n",
-    );
-
-    // Available tools summary
-    prompt.push_str("## Available Tools\n");
-    prompt.push_str(
-        "You have access to all tools. Use them as appropriate:\n\
-         - search_memory / store_fact / update_core_memory / update_fact: Read and update the user's memory\n\
-         - create_reminder / list_reminders / cancel_reminder: Manage reminders\n\
-         - send_message: Contact the user (required in silent mode for output)\n\n",
     );
 
     // Trigger-specific context
@@ -490,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_includes_search_memory_instruction() {
+    fn test_prompt_base_has_no_tool_instructions() {
         let identity = test_identity();
         let ctx = PromptContext {
             soul_content: "",
@@ -502,7 +476,12 @@ mod tests {
         };
 
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("search_memory"));
+        // Tool-specific instructions are now in skill prompt snippets, not the base prompt
+        assert!(!prompt.contains("search_memory"));
+        assert!(!prompt.contains("create_reminder"));
+        assert!(!prompt.contains("update_fact"));
+        // But the base instruction remains
+        assert!(prompt.contains("Never fabricate information"));
     }
 
     #[test]

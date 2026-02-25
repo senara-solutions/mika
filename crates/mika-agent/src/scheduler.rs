@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use crate::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 
 /// Manages reminder recovery on startup.
@@ -21,6 +22,7 @@ pub struct ReminderScheduler {
     pub db: AsyncDatabase,
     pub claude: ClaudeClient,
     pub tools: Arc<ToolRegistry>,
+    pub skills: Arc<SkillRegistry>,
     pub home_dir: PathBuf,
     pub message_sender: Option<Arc<dyn MessageSender>>,
 }
@@ -94,6 +96,7 @@ impl ReminderScheduler {
                 db: &self.db,
                 claude: &self.claude,
                 tools: &self.tools,
+                skills: &self.skills,
                 trigger: SilentTrigger::Reminder {
                     id: reminder.id,
                     message: reminder.message.clone(),
