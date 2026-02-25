@@ -103,8 +103,8 @@ struct ApiErrorDetail {
 
 #[derive(Error, Debug)]
 pub enum ClaudeApiError {
-    #[error("Claude API HTTP error ({status})")]
-    HttpError { status: u16 },
+    #[error("Claude API HTTP error ({status}): {message}")]
+    HttpError { status: u16, message: String },
     #[error("Claude API request failed")]
     Transport(#[from] reqwest::Error),
     #[error("Claude API response parse error")]
@@ -146,7 +146,8 @@ pub struct ClaudeClient {
 impl ClaudeClient {
     pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self> {
         let api_key = api_key
-            .filter(|k| !k.trim().is_empty())
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow::anyhow!("MIKA_ANTHROPIC_API_KEY is required but not set"))?;
 
         let client = reqwest::Client::builder()
@@ -198,6 +199,11 @@ impl ClaudeClient {
                         last_error = Some(e);
                         continue;
                     }
+                    if matches!(&e, ClaudeApiError::HttpError { status: 401, .. }) {
+                        return Err(anyhow::Error::from(e).context(
+                            "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key.",
+                        ));
+                    }
                     return Err(e.into());
                 }
             }
@@ -233,10 +239,15 @@ impl ClaudeClient {
             let body = response.text().await.unwrap_or_default();
             let message = serde_json::from_str::<ApiErrorResponse>(&body)
                 .map(|e| e.error.message)
-                .unwrap_or(body);
+                .unwrap_or_else(|_| {
+                    // Truncate raw body to avoid leaking proxy/CDN internals
+                    let truncated: String = body.chars().take(200).collect();
+                    format!("unexpected error response (HTTP {status_code}): {truncated}")
+                });
             warn!(status = status_code, error_message = %message, "Claude API error response");
             return Err(ClaudeApiError::HttpError {
                 status: status_code,
+                message,
             });
         }
 
@@ -249,7 +260,7 @@ impl ClaudeClient {
 
 fn is_retryable(error: &ClaudeApiError) -> bool {
     match error {
-        ClaudeApiError::HttpError { status } => matches!(status, 429 | 500 | 529),
+        ClaudeApiError::HttpError { status, .. } => matches!(status, 429 | 500 | 529),
         ClaudeApiError::Transport(e) => e.is_timeout(),
         _ => false,
     }
@@ -305,6 +316,31 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("claude-sonnet"));
         assert!(json.contains("Hello"));
+    }
+
+    #[test]
+    fn test_new_trims_api_key_whitespace() {
+        let client =
+            ClaudeClient::new(Some("  sk-ant-test  ".into()), "model".into(), 100).unwrap();
+        assert_eq!(client.api_key, "sk-ant-test");
+    }
+
+    #[test]
+    fn test_new_rejects_whitespace_only_key() {
+        let result = ClaudeClient::new(Some("   ".into()), "model".into(), 100);
+        let Err(e) = result else {
+            panic!("should reject whitespace-only key");
+        };
+        assert!(e.to_string().contains("required but not set"));
+    }
+
+    #[test]
+    fn test_new_rejects_none_key() {
+        let result = ClaudeClient::new(None, "model".into(), 100);
+        let Err(e) = result else {
+            panic!("should reject None key");
+        };
+        assert!(e.to_string().contains("required but not set"));
     }
 
     #[test]
