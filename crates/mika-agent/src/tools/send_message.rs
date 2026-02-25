@@ -119,6 +119,7 @@ mod tests {
             core_memory_edit_count: &harness.counter,
             is_onboarding: false,
             message_sender: Some(mock.clone()),
+            embedding_client: None,
         };
         let tool = SendMessageTool;
 

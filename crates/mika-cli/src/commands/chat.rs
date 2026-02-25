@@ -14,6 +14,7 @@ use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
+use mika_common::embedding::EmbeddingClient;
 
 use crate::init;
 use crate::tui::app::{AgentRequest, AgentResponse, App};
@@ -28,6 +29,21 @@ pub async fn run() -> Result<()> {
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
 
+    // Create embedding client if OpenAI API key is configured
+    let embedding_client = ctx
+        .settings
+        .openai_api_key
+        .as_ref()
+        .filter(|k| !k.trim().is_empty())
+        .and_then(|key| {
+            EmbeddingClient::new(
+                key.clone(),
+                ctx.settings.embedding_model.clone(),
+                ctx.settings.embedding_dimensions,
+            )
+            .ok()
+        });
+
     // Recover reminders on startup
     let scheduler = ReminderScheduler {
         db: ctx.async_db.clone(),
@@ -36,6 +52,7 @@ pub async fn run() -> Result<()> {
         skills: skill_registry.clone(),
         home_dir: ctx.home_dir.clone(),
         message_sender: None,
+        embedding_client: embedding_client.clone(),
     };
     if let Err(e) = scheduler.recover().await {
         tracing::warn!(error = %e, "reminder recovery failed");
@@ -52,6 +69,7 @@ pub async fn run() -> Result<()> {
     let worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
+    let worker_embedding = embedding_client;
     let agent_handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -69,6 +87,7 @@ pub async fn run() -> Result<()> {
                         is_onboarding,
                         message_sender: None,
                         skip_compaction: false,
+                        embedding_client: worker_embedding.as_ref(),
                     })
                     .await;
 

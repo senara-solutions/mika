@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use mika_common::embedding::EmbeddingClient;
+
 use crate::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
@@ -25,6 +27,7 @@ pub struct ReminderScheduler {
     pub skills: Arc<SkillRegistry>,
     pub home_dir: PathBuf,
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    pub embedding_client: Option<EmbeddingClient>,
 }
 
 impl ReminderScheduler {
@@ -56,6 +59,69 @@ impl ReminderScheduler {
             }
             Err(e) => warn!(error = %e, "failed to check database size"),
             _ => {}
+        }
+
+        // Backfill search index if empty (one-time migration for existing data)
+        match self.db.count_search_content().await {
+            Ok(0) => {
+                match self.db.get_all_facts_for_indexing().await {
+                    Ok(facts) if !facts.is_empty() => {
+                        info!(count = facts.len(), "backfilling search index");
+
+                        // Index into FTS5 and track content_ids for embedding step
+                        let mut content_ids: Vec<(i64, usize)> = Vec::new();
+                        for (i, (source_type, source_id, content)) in facts.iter().enumerate() {
+                            match self
+                                .db
+                                .index_content(source_type, Some(*source_id), content)
+                                .await
+                            {
+                                Ok(content_id) => content_ids.push((content_id, i)),
+                                Err(e) => {
+                                    warn!(error = %e, source_type, "failed to index content during backfill");
+                                }
+                            }
+                        }
+
+                        // Batch-generate embeddings if client is available
+                        if let Some(ref client) = self.embedding_client {
+                            const BATCH_SIZE: usize = 100;
+                            let mut indexed = 0;
+
+                            for chunk in content_ids.chunks(BATCH_SIZE) {
+                                let texts: Vec<&str> = chunk
+                                    .iter()
+                                    .map(|&(_, fact_idx)| facts[fact_idx].2.as_str())
+                                    .collect();
+
+                                match client.embed_batch(&texts).await {
+                                    Ok(embeddings) => {
+                                        for (j, embedding) in embeddings.into_iter().enumerate() {
+                                            let (content_id, _) = chunk[j];
+                                            if let Err(e) =
+                                                self.db.index_embedding(content_id, embedding).await
+                                            {
+                                                warn!(error = %e, content_id, "failed to index embedding during backfill");
+                                            } else {
+                                                indexed += 1;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to generate embeddings batch during backfill");
+                                    }
+                                }
+                            }
+                            info!(indexed, total = facts.len(), "backfill embeddings complete");
+                        }
+                        info!("search index backfill complete");
+                    }
+                    Ok(_) => {} // no facts to index
+                    Err(e) => warn!(error = %e, "failed to get facts for backfill"),
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to check search content count"),
+            _ => {} // index already populated
         }
 
         let past_due = self.db.get_past_due_reminders().await?;
@@ -104,6 +170,7 @@ impl ReminderScheduler {
                 home_dir: &self.home_dir,
                 session_id: &session_id,
                 message_sender: self.message_sender.clone(),
+                embedding_client: self.embedding_client.as_ref(),
             };
 
             if let Err(e) = run_silent_agent(&params).await {

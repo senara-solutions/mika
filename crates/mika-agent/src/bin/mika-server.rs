@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Register sqlite-vec extension before any DB connections are opened.
+    mika_agent::db::init_sqlite_vec();
+
     let home_dir = mika_common::home::resolve_home_dir()?;
 
     if !mika_common::home::is_initialized(&home_dir) {

@@ -1,9 +1,28 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::Once;
 use tracing::{debug, info};
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+/// Register sqlite-vec as an auto-extension so every new connection gets vec0.
+/// Idempotent — uses an internal Once guard so multiple calls are safe.
+pub fn init_sqlite_vec() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // SAFETY: sqlite3_auto_extension requires a function pointer matching
+        // the sqlite3 extension init signature. sqlite_vec::sqlite3_vec_init
+        // is provided by the sqlite-vec crate and matches this signature.
+        // This must run before any DB connections are opened.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(
+                #[allow(clippy::missing_transmute_annotations)]
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
+            ));
+        }
+    });
+}
+
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -117,6 +136,9 @@ impl Database {
         }
         if version < 7 {
             self.migrate_v7()?;
+        }
+        if version < 8 {
+            self.migrate_v8()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -334,6 +356,54 @@ impl Database {
             ",
             )
             .context("failed to apply migration v7")?;
+
+        Ok(())
+    }
+
+    fn migrate_v8(&self) -> Result<()> {
+        info!("applying migration v8: Layer 3 search tables (search_content, vec_search, fts_search)");
+
+        // search_content and fts_search in one transaction
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            -- Unified content table for all searchable text
+            CREATE TABLE search_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_id INTEGER,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_search_content_source ON search_content(source_type, source_id);
+
+            -- FTS5 keyword index (BM25 ranking)
+            CREATE VIRTUAL TABLE fts_search USING fts5(
+                content,
+                content_id UNINDEXED,
+                source_type UNINDEXED,
+                tokenize='porter unicode61'
+            );
+
+            INSERT INTO schema_version (version) VALUES (8);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v8 (search_content + fts_search)")?;
+
+        // vec0 virtual table must be created outside the transaction
+        // (sqlite-vec limitation with virtual tables)
+        self.conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_search USING vec0(
+                    content_id INTEGER PRIMARY KEY,
+                    embedding float[512]
+                );",
+            )
+            .context("failed to create vec_search table")?;
 
         Ok(())
     }
@@ -651,10 +721,23 @@ impl Database {
         Ok(status)
     }
 
+    /// Get the description and due_date of a commitment by id.
+    pub fn get_commitment_details(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT description, due_date FROM commitments WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
     // -- Preferences (Layer 2) --
 
-    /// Upsert a preference (case-insensitive category).
-    pub fn set_preference(&self, category: &str, value: &str) -> Result<()> {
+    /// Upsert a preference (case-insensitive category). Returns the preference ID.
+    pub fn set_preference(&self, category: &str, value: &str) -> Result<i64> {
         self.conn
             .execute(
                 "INSERT INTO preferences (category, value, updated_at)
@@ -665,7 +748,15 @@ impl Database {
                 rusqlite::params![category, value],
             )
             .context("failed to upsert preference")?;
-        Ok(())
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM preferences WHERE category = ?1",
+                [category],
+                |row| row.get(0),
+            )
+            .context("failed to get preference id")?;
+        Ok(id)
     }
 
     /// Get a preference by category (case-insensitive).
@@ -1192,6 +1283,304 @@ impl Database {
         Ok(reminders)
     }
 
+    // -- Layer 3: Search Indexing --
+
+    /// Index content for search: inserts into search_content and fts_search.
+    /// Returns the search_content.id for subsequent vector embedding storage.
+    pub fn index_content(
+        &self,
+        source_type: &str,
+        source_id: Option<i64>,
+        content: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO search_content (source_type, source_id, content) VALUES (?1, ?2, ?3)",
+            rusqlite::params![source_type, source_id, content],
+        )?;
+        let content_id = self.conn.last_insert_rowid();
+
+        self.conn.execute(
+            "INSERT INTO fts_search (content, content_id, source_type) VALUES (?1, ?2, ?3)",
+            rusqlite::params![content, content_id, source_type],
+        )?;
+
+        Ok(content_id)
+    }
+
+    /// Store a vector embedding for a search_content row.
+    pub fn index_embedding(&self, content_id: i64, embedding: &[f32]) -> Result<()> {
+        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(embedding);
+        self.conn.execute(
+            "INSERT INTO vec_search (content_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![content_id, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Delete search index entries for a specific source (for re-indexing on update).
+    pub fn delete_search_content(&self, source_type: &str, source_id: i64) -> Result<()> {
+        let subquery = "SELECT id FROM search_content WHERE source_type = ?1 AND source_id = ?2";
+
+        self.conn.execute(
+            &format!("DELETE FROM vec_search WHERE content_id IN ({subquery})"),
+            rusqlite::params![source_type, source_id],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM fts_search WHERE content_id IN ({subquery})"),
+            rusqlite::params![source_type, source_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM search_content WHERE source_type = ?1 AND source_id = ?2",
+            rusqlite::params![source_type, source_id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Count total rows in search_content (used for backfill detection).
+    pub fn count_search_content(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM search_content",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    // -- Layer 3: Search Queries --
+
+    /// Sanitize a query for FTS5 MATCH by wrapping in double quotes.
+    /// Escapes any embedded double quotes to prevent FTS5 syntax errors
+    /// from special characters (AND, OR, NOT, parentheses, etc.).
+    fn sanitize_fts5_query(query: &str) -> String {
+        let escaped = query.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    }
+
+    /// FTS5-only search (BM25 keyword ranking). Used when no embedding client.
+    pub fn fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let safe_query = Self::sanitize_fts5_query(query);
+
+        let base_sql = "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
+                 FROM fts_search fts
+                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
+                 WHERE fts_search MATCH ?1";
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match source_type_filter
+        {
+            Some(st) => (
+                format!("{base_sql} AND sc.source_type = ?3 ORDER BY fts.rank LIMIT ?2"),
+                vec![
+                    Box::new(safe_query),
+                    Box::new(limit as i64),
+                    Box::new(st.to_string()),
+                ],
+            ),
+            None => (
+                format!("{base_sql} ORDER BY fts.rank LIMIT ?2"),
+                vec![
+                    Box::new(safe_query),
+                    Box::new(limit as i64),
+                ],
+            ),
+        };
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(SearchResult {
+                    id: row.get(0)?,
+                    source_type: row.get(1)?,
+                    source_id: row.get(2)?,
+                    content: row.get(3)?,
+                    score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative, negate
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    /// Vector-only search. Returns content_ids ranked by cosine distance.
+    pub fn vec_search(&self, embedding: &[f32], limit: usize) -> Result<Vec<(i64, f64)>> {
+        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(embedding);
+        let mut stmt = self.conn.prepare(
+            "SELECT content_id, distance
+             FROM vec_search
+             WHERE embedding MATCH ?1 AND k = ?2
+             ORDER BY distance",
+        )?;
+        let results = stmt
+            .query_map(rusqlite::params![bytes, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    /// Hybrid search using Reciprocal Rank Fusion (RRF) of FTS5 + vector results.
+    pub fn hybrid_search(
+        &self,
+        fts_query: &str,
+        embedding: Option<&[f32]>,
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        // Get FTS5 results with rank positions
+        let fts_results = self.fts_search(fts_query, limit * 2, source_type_filter)?;
+
+        // If no embedding provided, return FTS5-only results
+        let vec_results = match embedding {
+            Some(emb) => self.vec_search(emb, limit * 2)?,
+            None => Vec::new(),
+        };
+
+        if vec_results.is_empty() {
+            // FTS5-only: just truncate to limit
+            let mut results = fts_results;
+            results.truncate(limit);
+            return Ok(results);
+        }
+
+        // RRF merge with k=60
+        const RRF_K: f64 = 60.0;
+        let mut scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+
+        for (rank, result) in fts_results.iter().enumerate() {
+            *scores.entry(result.id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+        }
+
+        for (rank, (content_id, _distance)) in vec_results.iter().enumerate() {
+            *scores.entry(*content_id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+        }
+
+        // Sort by RRF score descending
+        let mut scored: Vec<(i64, f64)> = scores.into_iter().collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        // Fetch full content for top results, applying source_type filter for vec results
+        let mut results = Vec::with_capacity(scored.len());
+        for (content_id, score) in scored {
+            if let Ok(result) = self.conn.query_row(
+                "SELECT id, source_type, source_id, content FROM search_content WHERE id = ?1",
+                [content_id],
+                |row| {
+                    Ok(SearchResult {
+                        id: row.get(0)?,
+                        source_type: row.get(1)?,
+                        source_id: row.get(2)?,
+                        content: row.get(3)?,
+                        score,
+                    })
+                },
+            ) {
+                // Filter by source_type if specified (vec results weren't pre-filtered)
+                if let Some(st) = source_type_filter
+                    && result.source_type != st
+                {
+                    continue;
+                }
+                results.push(result);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// List all facts for backfill indexing (returns source_type, source_id, content text).
+    pub fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut facts = Vec::new();
+
+        // People
+        let mut stmt = self.conn.prepare(
+            "SELECT id, canonical_name, relationship, notes FROM people",
+        )?;
+        let people = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let rel: Option<String> = row.get(2)?;
+            let notes: Option<String> = row.get(3)?;
+            let mut content = name.clone();
+            if let Some(r) = rel {
+                content.push_str(&format!(" — {r}"));
+            }
+            if let Some(n) = notes {
+                content.push_str(&format!(". {n}"));
+            }
+            Ok((id, content))
+        })?;
+        for row in people {
+            let (id, content) = row?;
+            facts.push(("person".to_string(), id, content));
+        }
+
+        // Commitments
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, due_date, status FROM commitments",
+        )?;
+        let commits = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let desc: String = row.get(1)?;
+            let due: Option<String> = row.get(2)?;
+            let status: String = row.get(3)?;
+            let mut content = desc;
+            if let Some(d) = due {
+                content.push_str(&format!(" (due: {d})"));
+            }
+            content.push_str(&format!(", status: {status}"));
+            Ok((id, content))
+        })?;
+        for row in commits {
+            let (id, content) = row?;
+            facts.push(("commitment".to_string(), id, content));
+        }
+
+        // Preferences
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, value FROM preferences",
+        )?;
+        let prefs = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let cat: String = row.get(1)?;
+            let val: String = row.get(2)?;
+            Ok((id, format!("{cat}: {val}")))
+        })?;
+        for row in prefs {
+            let (id, content) = row?;
+            facts.push(("preference".to_string(), id, content));
+        }
+
+        // Events
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, event_date, context FROM events",
+        )?;
+        let events = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let desc: String = row.get(1)?;
+            let date: Option<String> = row.get(2)?;
+            let ctx: Option<String> = row.get(3)?;
+            let mut content = desc;
+            if let Some(d) = date {
+                content.push_str(&format!(" on {d}"));
+            }
+            if let Some(c) = ctx {
+                content.push_str(&format!(". {c}"));
+            }
+            Ok((id, content))
+        })?;
+        for row in events {
+            let (id, content) = row?;
+            facts.push(("event".to_string(), id, content));
+        }
+
+        Ok(facts)
+    }
+
     // -- Customer Config --
 
     /// Get a customer config value by key.
@@ -1558,6 +1947,15 @@ pub struct FailedSend {
     pub retry_count: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub id: i64,
+    pub source_type: String,
+    pub source_id: Option<i64>,
+    pub content: String,
+    pub score: f64,
+}
+
 // Bring in rusqlite optional extension
 use rusqlite::OptionalExtension;
 
@@ -1574,7 +1972,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1587,7 +1985,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -2486,5 +2884,218 @@ mod tests {
             index_exists,
             "idx_memory_events_created_at should exist after v7 migration"
         );
+    }
+
+    #[test]
+    fn test_v8_search_tables_exist() {
+        let db = test_db();
+
+        // search_content table exists
+        let sc_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='search_content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sc_exists, "search_content table should exist after v8 migration");
+
+        // fts_search virtual table exists
+        let fts_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='fts_search'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(fts_exists, "fts_search table should exist after v8 migration");
+
+        // vec_search virtual table exists
+        let vec_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_search'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(vec_exists, "vec_search table should exist after v8 migration");
+
+        // Verify vec_search works with a simple insert + query
+        db.conn
+            .execute(
+                "INSERT INTO search_content (source_type, content) VALUES ('test', 'hello world')",
+                [],
+            )
+            .unwrap();
+        let content_id: i64 = db.conn.last_insert_rowid();
+
+        // Insert a dummy 512-dim vector
+        let zeros = vec![0.0f32; 512];
+        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(zeros.as_slice());
+        db.conn
+            .execute(
+                "INSERT INTO vec_search (content_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![content_id, bytes],
+            )
+            .unwrap();
+
+        // FTS5 insert
+        db.conn
+            .execute(
+                "INSERT INTO fts_search (content, content_id, source_type) VALUES ('hello world', ?1, 'test')",
+                rusqlite::params![content_id],
+            )
+            .unwrap();
+
+        // FTS5 query
+        let fts_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_search WHERE fts_search MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 1);
+    }
+
+    #[test]
+    fn test_index_content_and_fts_search() {
+        let db = test_db();
+
+        db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        db.index_content("commitment", Some(2), "Review quarterly budget report").unwrap();
+        db.index_content("event", Some(3), "Team dinner at Italian restaurant").unwrap();
+
+        // FTS5 search for "engineer"
+        let results = db.fts_search("engineer", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_type, "person");
+        assert!(results[0].content.contains("Alice"));
+
+        // FTS5 search for "budget" (stemmed via porter)
+        let results = db.fts_search("budget", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_type, "commitment");
+    }
+
+    #[test]
+    fn test_index_content_with_embedding_and_vec_search() {
+        let db = test_db();
+
+        let cid = db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+
+        // Create a simple embedding (512 dims)
+        let embedding: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
+        db.index_embedding(cid, &embedding).unwrap();
+
+        // Vector search with similar embedding
+        let query_emb: Vec<f32> = (0..512).map(|i| (i as f32 + 0.5) / 512.0).collect();
+        let results = db.vec_search(&query_emb, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, cid);
+    }
+
+    #[test]
+    fn test_hybrid_search_fts_only() {
+        let db = test_db();
+
+        db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        db.index_content("commitment", Some(2), "Review quarterly budget report").unwrap();
+
+        // Hybrid search without embedding (FTS5-only path)
+        let results = db.hybrid_search("engineer", None, 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Alice"));
+    }
+
+    #[test]
+    fn test_hybrid_search_with_vectors() {
+        let db = test_db();
+
+        // Index two items with embeddings
+        let cid1 = db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        let emb1: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
+        db.index_embedding(cid1, &emb1).unwrap();
+
+        let cid2 = db.index_content("commitment", Some(2), "budget report review").unwrap();
+        let emb2: Vec<f32> = (0..512).map(|i| (512 - i) as f32 / 512.0).collect();
+        db.index_embedding(cid2, &emb2).unwrap();
+
+        // Hybrid search: "engineer" should rank cid1 highest via FTS5 + vector
+        let query_emb: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
+        let results = db.hybrid_search("engineer", Some(&query_emb), 10, None).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].source_type, "person");
+    }
+
+    #[test]
+    fn test_delete_search_content() {
+        let db = test_db();
+
+        let cid = db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        let emb: Vec<f32> = vec![0.0; 512];
+        db.index_embedding(cid, &emb).unwrap();
+
+        // Verify content exists
+        assert_eq!(db.count_search_content().unwrap(), 1);
+        assert_eq!(db.fts_search("engineer", 10, None).unwrap().len(), 1);
+
+        // Delete
+        db.delete_search_content("person", 1).unwrap();
+
+        // Verify everything is gone
+        assert_eq!(db.count_search_content().unwrap(), 0);
+        assert_eq!(db.fts_search("engineer", 10, None).unwrap().len(), 0);
+        assert_eq!(db.vec_search(&emb, 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_get_all_facts_for_indexing() {
+        let db = test_db();
+
+        // Add a person, commitment, preference, event
+        db.conn.execute(
+            "INSERT INTO people (canonical_name, relationship, notes) VALUES ('Alice', 'colleague', 'works in engineering')",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO commitments (description, due_date, status) VALUES ('Review budget', '2026-03-01', 'pending')",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO preferences (category, value) VALUES ('coffee', 'oat milk latte')",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO events (description, event_date, context) VALUES ('Team dinner', '2026-02-20', 'Italian restaurant')",
+            [],
+        ).unwrap();
+
+        let facts = db.get_all_facts_for_indexing().unwrap();
+        assert_eq!(facts.len(), 4);
+
+        // Check person content
+        let person = facts.iter().find(|(t, _, _)| t == "person").unwrap();
+        assert!(person.2.contains("Alice"));
+        assert!(person.2.contains("colleague"));
+        assert!(person.2.contains("engineering"));
+
+        // Check commitment content
+        let commit = facts.iter().find(|(t, _, _)| t == "commitment").unwrap();
+        assert!(commit.2.contains("Review budget"));
+
+        // Check preference content
+        let pref = facts.iter().find(|(t, _, _)| t == "preference").unwrap();
+        assert!(pref.2.contains("coffee"));
+        assert!(pref.2.contains("oat milk latte"));
+
+        // Check event content
+        let event = facts.iter().find(|(t, _, _)| t == "event").unwrap();
+        assert!(event.2.contains("Team dinner"));
+        assert!(event.2.contains("Italian restaurant"));
     }
 }

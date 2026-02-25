@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mika_common::claude::ClaudeClient;
+use mika_common::embedding::EmbeddingClient;
 use secrecy::SecretString;
 
 use crate::async_db::AsyncDatabase;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub home_dir: PathBuf,
     pub startup_time: std::time::Instant,
     pub http_client: reqwest::Client,
+    pub embedding_client: Option<EmbeddingClient>,
 }
 
 impl std::fmt::Debug for AppState {

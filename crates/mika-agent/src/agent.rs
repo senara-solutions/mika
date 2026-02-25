@@ -16,6 +16,7 @@ use crate::prompt;
 use crate::skills::index::SkillEntry;
 use crate::skills::{self, SkillRegistry};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
+use mika_common::embedding::EmbeddingClient;
 
 const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
@@ -51,6 +52,8 @@ pub struct AgentParams<'a> {
     pub message_sender: Option<Arc<dyn MessageSender>>,
     /// When true, skip inline post-turn compaction (server mode spawns it separately).
     pub skip_compaction: bool,
+    /// Optional embedding client for Layer 3 vector search.
+    pub embedding_client: Option<&'a EmbeddingClient>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -154,6 +157,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: params.is_onboarding,
         message_sender: params.message_sender.clone(),
+        embedding_client: params.embedding_client,
     };
 
     // Build the request once; only messages changes between iterations.
@@ -294,6 +298,7 @@ pub struct SilentAgentParams<'a> {
     pub home_dir: &'a Path,
     pub session_id: &'a str,
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    pub embedding_client: Option<&'a EmbeddingClient>,
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -408,6 +413,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
         message_sender: params.message_sender.clone(),
+        embedding_client: params.embedding_client,
     };
 
     let mut request = MessagesRequest {

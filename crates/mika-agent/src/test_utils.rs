@@ -7,11 +7,13 @@ pub mod test_helpers {
 
     /// Create an in-memory database for tests (sync — for db module tests).
     pub fn test_db() -> Database {
+        crate::db::init_sqlite_vec();
         Database::open_in_memory().unwrap()
     }
 
     /// Create an async database for tool/agent tests.
     pub fn test_async_db() -> AsyncDatabase {
+        crate::db::init_sqlite_vec();
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new(db)
     }
@@ -35,6 +37,7 @@ pub mod test_helpers {
             core_memory_edit_count: edit_count,
             is_onboarding,
             message_sender: None,
+            embedding_client: None,
         }
     }
 

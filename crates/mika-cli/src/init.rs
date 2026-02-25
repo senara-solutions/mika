@@ -38,6 +38,9 @@ impl Drop for DbContext {
 
 /// Shared initialization: resolve home, ensure initialized, load settings, open DB.
 fn init_base() -> Result<(Settings, AsyncDatabase, PathBuf)> {
+    // Register sqlite-vec extension before any DB connections are opened.
+    mika_agent::db::init_sqlite_vec();
+
     let home_dir = home::resolve_home_dir()?;
     ensure_initialized(&home_dir)?;
 

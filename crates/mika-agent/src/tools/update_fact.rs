@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, index_fact};
 
 /// Tool-level allowed statuses: only terminal states (not "pending").
 /// See also `crate::db::COMMITMENT_STATUSES` for the full DB-level list.
@@ -126,6 +126,16 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
             None,
         )
         .await?;
+
+    // Re-index for search with updated status
+    if let Ok(Some((desc, due_date))) = ctx.db.get_commitment_details(id).await {
+        let mut content = desc;
+        if let Some(d) = due_date {
+            content.push_str(&format!(" (due: {d})"));
+        }
+        content.push_str(&format!(", status: {status}"));
+        index_fact(ctx, "commitment", id, &content).await;
+    }
 
     Ok(ToolOutput::success(format!(
         "Updated commitment (id:{id}) status to '{status}'."

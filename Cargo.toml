@@ -20,6 +20,10 @@ serde_json = "1"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "=0.1.7-alpha.10"
+
+# Zero-copy conversions (f32 slices → bytes for sqlite-vec)
+zerocopy = "0.7"
 
 # Configuration
 config = "0.15"

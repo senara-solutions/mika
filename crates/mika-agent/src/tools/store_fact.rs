@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, index_fact};
 
 pub struct StoreFactTool;
 
@@ -102,7 +102,7 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
     let relationship = input["relationship"].as_str();
     let notes = input["notes"].as_str();
 
-    ctx.db.upsert_person(name, relationship, notes).await?;
+    let person_id = ctx.db.upsert_person(name, relationship, notes).await?;
 
     // Log audit event
     let target = format!("person:{name}");
@@ -114,6 +114,16 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
     ctx.db
         .log_memory_event(ctx.session_id, "store_fact", &target, None, &after, None)
         .await?;
+
+    // Index for search
+    let mut content = name.to_string();
+    if let Some(r) = relationship {
+        content.push_str(&format!(" — {r}"));
+    }
+    if let Some(n) = notes {
+        content.push_str(&format!(". {n}"));
+    }
+    index_fact(ctx, "person", person_id, &content).await;
 
     Ok(ToolOutput::success(format!("Stored person: {name}")))
 }
@@ -138,7 +148,8 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
         None
     };
 
-    ctx.db
+    let commitment_id = ctx
+        .db
         .add_commitment(description, due_date, person_id)
         .await?;
 
@@ -153,6 +164,14 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
             None,
         )
         .await?;
+
+    // Index for search
+    let mut content = description.to_string();
+    if let Some(d) = due_date {
+        content.push_str(&format!(" (due: {d})"));
+    }
+    content.push_str(", status: pending");
+    index_fact(ctx, "commitment", commitment_id, &content).await;
 
     let due_info = due_date.map(|d| format!(" (due: {d})")).unwrap_or_default();
     Ok(ToolOutput::success(format!(
@@ -176,12 +195,16 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
         return Ok(err);
     }
 
-    ctx.db.set_preference(key, value).await?;
+    let pref_id = ctx.db.set_preference(key, value).await?;
 
     let target = format!("preference:{key}");
     ctx.db
         .log_memory_event(ctx.session_id, "store_fact", &target, None, value, None)
         .await?;
+
+    // Index for search
+    let content = format!("{key}: {value}");
+    index_fact(ctx, "preference", pref_id, &content).await;
 
     Ok(ToolOutput::success(format!(
         "Stored preference [{key}]: {value}"
@@ -202,7 +225,7 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
     let event_date = input["event_date"].as_str();
     let notes = input["notes"].as_str();
 
-    ctx.db.add_event(description, event_date, notes).await?;
+    let event_id = ctx.db.add_event(description, event_date, notes).await?;
 
     let target = format!("event:{description}");
     ctx.db
@@ -215,6 +238,16 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
             None,
         )
         .await?;
+
+    // Index for search
+    let mut content = description.to_string();
+    if let Some(d) = event_date {
+        content.push_str(&format!(" on {d}"));
+    }
+    if let Some(n) = notes {
+        content.push_str(&format!(". {n}"));
+    }
+    index_fact(ctx, "event", event_id, &content).await;
 
     Ok(ToolOutput::success(format!(
         "Stored event: \"{description}\""
