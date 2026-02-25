@@ -94,8 +94,12 @@ async fn spawn_agent_worker(
                     .await;
 
                     let response = match result {
-                        Ok(content) => AgentResponse {
-                            content,
+                        Ok(Some(text)) => AgentResponse {
+                            content: text,
+                            is_error: false,
+                        },
+                        Ok(None) => AgentResponse {
+                            content: String::new(),
                             is_error: false,
                         },
                         Err(e) => AgentResponse {

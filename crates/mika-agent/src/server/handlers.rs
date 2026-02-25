@@ -136,13 +136,18 @@ pub async fn handle_message(
             };
 
             match agent::run_agent(&params).await {
-                Ok(response) => {
+                Ok(Some(response)) => {
                     info!("agent loop completed");
                     // Send final agent response to user via gateway
-                    if !response.is_empty() {
-                        if let Err(e) = sender_arc.send(&response).await {
-                            error!(error = %e, "failed to send response");
-                        }
+                    if let Err(e) = sender_arc.send(&response).await {
+                        error!(error = %e, "failed to send response");
+                    }
+                }
+                Ok(None) => {
+                    info!("agent loop completed (no text response)");
+                    // Still send a fallback so the user knows their request was processed
+                    if let Err(e) = sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
+                        error!(error = %e, "failed to send fallback response");
                     }
                 }
                 Err(e) => {

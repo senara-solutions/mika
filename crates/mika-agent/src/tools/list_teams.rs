@@ -82,10 +82,7 @@ mod tests {
             home_dir: tmp.path().to_path_buf(),
         };
 
-        let result = tool
-            .execute(serde_json::json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("No teams configured"));
     }
@@ -124,10 +121,7 @@ max_iterations = 3
             home_dir: tmp.path().to_path_buf(),
         };
 
-        let result = tool
-            .execute(serde_json::json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("dev-team"));
         assert!(result.content.contains("2 agents"));

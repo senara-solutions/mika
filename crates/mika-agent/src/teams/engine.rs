@@ -212,8 +212,7 @@ impl TeamEngine {
     /// after critic rejection. (#261: merged decompose + decompose_with_feedback)
     async fn decompose(&self, feedback: Option<&str>) -> Result<Vec<TaskAssignment>> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
-        let context =
-            prompt::build_orchestrator_context(&self.team, &listing, feedback);
+        let context = prompt::build_orchestrator_context(&self.team, &listing, feedback);
 
         let orchestrator_name = &self.team.team.orchestrator;
 
@@ -267,8 +266,12 @@ impl TeamEngine {
                 .map(|a| a.mandate.as_str())
                 .unwrap_or("Complete the assigned task");
 
-            let context =
-                prompt::build_specialist_context(&task.role, mandate, &task.task, &task.output_file);
+            let context = prompt::build_specialist_context(
+                &task.role,
+                mandate,
+                &task.task,
+                &task.output_file,
+            );
 
             inputs.push(TaskInput {
                 index: i,
@@ -307,7 +310,7 @@ impl TeamEngine {
                     .get(agent_name.as_str())
                     .with_context(|| format!("agent '{}' not found in team resources", agent_name));
 
-                let result = match resources {
+                let result: Result<String> = match resources {
                     Ok(resources) => {
                         let session_id = format!("team-{}-{}", run_id, agent_name);
                         let params = TeamAgentParams {
@@ -321,7 +324,9 @@ impl TeamEngine {
                             session_id: &session_id,
                             embedding_client: resources.embedding_client.as_ref(),
                         };
-                        crate::agent::run_team_agent(&params).await
+                        crate::agent::run_team_agent(&params)
+                            .await
+                            .map(|opt| opt.unwrap_or_default())
                     }
                     Err(e) => Err(e),
                 };
@@ -418,6 +423,8 @@ impl TeamEngine {
     }
 
     /// Run an agent with team context and workspace tools.
+    /// Returns the agent's text response, or an empty string if the agent
+    /// produced no text (tool-use-only turn).
     async fn run_agent(
         &self,
         agent_name: &str,
@@ -443,7 +450,9 @@ impl TeamEngine {
             embedding_client: resources.embedding_client.as_ref(),
         };
 
-        crate::agent::run_team_agent(&params).await
+        Ok(crate::agent::run_team_agent(&params)
+            .await?
+            .unwrap_or_default())
     }
 
     fn report_progress(&self, message: &str) {

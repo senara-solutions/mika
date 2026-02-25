@@ -27,7 +27,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
 
     let chunks = Layout::vertical([
         Constraint::Length(1),            // header
-        Constraint::Min(5),              // messages
+        Constraint::Min(5),               // messages
         Constraint::Length(input_height), // input (dynamic)
         Constraint::Length(1),            // footer
     ])

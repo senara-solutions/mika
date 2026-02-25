@@ -22,6 +22,10 @@ const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 
+/// Fallback message sent when the agent completes without producing text output
+/// (e.g., all work done via tool calls).
+pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
+
 /// Check if this is a new user (user_summary still at default value).
 /// Used by both CLI and server to set `is_onboarding` on agent params.
 pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
@@ -57,8 +61,9 @@ pub struct AgentParams<'a> {
 }
 
 /// Run the agent loop for a single inbound message.
-/// Returns the assistant's text response.
-pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
+/// Returns `Some(text)` when the assistant produced a text response,
+/// or `None` for tool-use-only turns (no text blocks).
+pub async fn run_agent(params: &AgentParams<'_>) -> Result<Option<String>> {
     // Save the user message
     params
         .db
@@ -95,13 +100,13 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<String> {
                 .db
                 .save_message("assistant", fallback, params.channel_type)
                 .await?;
-            Ok(fallback.to_string())
+            Ok(Some(fallback.to_string()))
         }
     }
 }
 
 /// Inner agent loop, separated so the outer function can wrap it in a timeout.
-async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
+async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
     let db = params.db;
     let claude = params.claude;
     let tools = params.tools;
@@ -176,6 +181,9 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         },
     };
 
+    let mut tool_use_occurred = false;
+    let mut follow_up_attempted = false;
+
     for step in 0..MAX_TOOL_STEPS {
         debug!(
             step,
@@ -186,23 +194,40 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         let response = claude.send_message(&request).await?;
 
         match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens => {
+            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 let text = response.text();
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
+                    info!(step, stop_reason = ?response.stop_reason, "agent done");
+                    return Ok(Some(text));
+                }
+
+                // Tool-only turn with no text: re-prompt once for acknowledgment
+                if tool_use_occurred && !follow_up_attempted {
+                    follow_up_attempted = true;
+                    debug!(step, stop_reason = ?response.stop_reason, "injecting follow-up after empty tool response");
+                    request.messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Blocks(response.content),
+                    });
+                    request.messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(
+                            "[Briefly confirm what you just did.]".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+
+                if tool_use_occurred {
+                    warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after follow-up");
                 }
                 info!(step, stop_reason = ?response.stop_reason, "agent done");
-                return Ok(text);
+                return Ok(None);
             }
             StopReason::ToolUse => {
+                tool_use_occurred = true;
                 process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
-            }
-            StopReason::StopSequence => {
-                let text = response.text();
-                if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type).await?;
-                }
-                return Ok(text);
             }
         }
     }
@@ -211,7 +236,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
     warn!("agent loop exceeded {MAX_TOOL_STEPS} steps");
     let fallback = "I need a moment to think about that. Let me get back to you.";
     db.save_message("assistant", fallback, channel_type).await?;
-    Ok(fallback.to_string())
+    Ok(Some(fallback.to_string()))
 }
 
 /// Execute tool-use blocks from a response and push both assistant and
@@ -473,8 +498,9 @@ pub struct TeamAgentParams<'a> {
 /// - Injects team_context into the system prompt after identity
 /// - Uses a single-turn message (just the task — no conversation history)
 /// - Does NOT save messages to DB and does NOT run compaction
-/// - Returns the assistant's text response
-pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<String> {
+/// - Returns `Some(text)` when the assistant produced a text response,
+///   or `None` for tool-use-only turns.
+pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
         run_team_agent_inner(params),
@@ -488,12 +514,14 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<String> {
                 timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
                 "team agent loop total timeout exceeded"
             );
-            Ok("Agent timed out while processing team task.".to_string())
+            Ok(Some(
+                "Agent timed out while processing team task.".to_string(),
+            ))
         }
     }
 }
 
-async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<String> {
+async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let claude = params.claude;
     let tools = params.tools;
 
@@ -555,6 +583,9 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<String> {
         },
     };
 
+    let mut tool_use_occurred = false;
+    let mut follow_up_attempted = false;
+
     for step in 0..MAX_TOOL_STEPS {
         debug!(step, "team agent step");
 
@@ -563,17 +594,46 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<String> {
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 let text = response.text();
+                if !text.is_empty() {
+                    info!(step, "team agent done");
+                    return Ok(Some(text));
+                }
+
+                // Tool-only turn with no text: re-prompt once for acknowledgment
+                if tool_use_occurred && !follow_up_attempted {
+                    follow_up_attempted = true;
+                    debug!(
+                        step,
+                        "team agent: injecting follow-up after empty tool response"
+                    );
+                    request.messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Blocks(response.content),
+                    });
+                    request.messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(
+                            "[Briefly confirm what you just did.]".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+
+                if tool_use_occurred {
+                    warn!(step, "team agent returned empty text after follow-up");
+                }
                 info!(step, "team agent done");
-                return Ok(text);
+                return Ok(None);
             }
             StopReason::ToolUse => {
+                tool_use_occurred = true;
                 process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
             }
         }
     }
 
     warn!("team agent exceeded {MAX_TOOL_STEPS} steps");
-    Ok("Agent exceeded maximum tool steps.".to_string())
+    Ok(Some("Agent exceeded maximum tool steps.".to_string()))
 }
 
 /// Inject matched skill prompt snippets into the system prompt and resolve

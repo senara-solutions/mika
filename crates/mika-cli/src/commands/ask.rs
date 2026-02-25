@@ -46,7 +46,10 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
     })
     .await?;
 
-    println!("{response}");
+    match response {
+        Some(text) => println!("{text}"),
+        None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
+    }
 
     // Database shutdown happens automatically via Drop on ctx
     Ok(())
