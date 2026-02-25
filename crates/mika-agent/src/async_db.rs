@@ -473,9 +473,16 @@ impl AsyncDatabase {
         self.with_db(|db| db.count_search_content()).await
     }
 
-    pub async fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    pub async fn fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let q = query.to_owned();
-        self.with_db(move |db| db.fts_search(&q, limit)).await
+        let st = source_type_filter.map(|s| s.to_owned());
+        self.with_db(move |db| db.fts_search(&q, limit, st.as_deref()))
+            .await
     }
 
     pub async fn hybrid_search(
@@ -483,10 +490,12 @@ impl AsyncDatabase {
         fts_query: &str,
         embedding: Option<Vec<f32>>,
         limit: usize,
+        source_type_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         let q = fts_query.to_owned();
+        let st = source_type_filter.map(|s| s.to_owned());
         self.with_db(move |db| {
-            db.hybrid_search(&q, embedding.as_deref(), limit)
+            db.hybrid_search(&q, embedding.as_deref(), limit, st.as_deref())
         })
         .await
     }

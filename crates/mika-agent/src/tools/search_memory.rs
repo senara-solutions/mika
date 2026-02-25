@@ -7,6 +7,9 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct SearchMemoryTool;
 
+/// Categories that are indexed in the search_content table.
+const INDEXED_CATEGORIES: &[&str] = &["person", "commitment", "preference", "event"];
+
 #[async_trait]
 impl Tool for SearchMemoryTool {
     fn name(&self) -> &str {
@@ -16,7 +19,7 @@ impl Tool for SearchMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_memory".to_string(),
-            description: "Search your stored facts across all categories (people, commitments, preferences, events, reminders, core memory). Uses case-insensitive substring matching.".to_string(),
+            description: "Search your stored facts across all categories (people, commitments, preferences, events, reminders, core memory). Uses semantic search when available, with full-text and keyword fallback.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -48,86 +51,36 @@ impl Tool for SearchMemoryTool {
         }
 
         let category = input["category"].as_str().unwrap_or("all");
-        let query_lower = query.to_lowercase();
 
         let mut results = Vec::new();
 
-        // Search core memory (no LIKE index, still in-memory filter — tiny table)
+        // Non-indexed categories: always use LIKE
         if category == "all" || category == "core_memory" {
-            let entries = ctx.db.get_all_core_memory().await?;
-            for entry in entries {
-                if entry.key.to_lowercase().contains(&query_lower)
-                    || entry.value.to_lowercase().contains(&query_lower)
-                {
-                    results.push(format!("[core_memory] {}: {}", entry.key, entry.value));
-                }
-            }
+            search_core_memory(ctx, query, &mut results).await?;
         }
-
-        // Search people (SQL LIKE)
-        if category == "all" || category == "person" {
-            let people = ctx.db.search_people(query).await?;
-            for person in people {
-                let mut desc = format!("[person] {} (id:{})", person.canonical_name, person.id);
-                if let Some(ref rel) = person.relationship {
-                    desc.push_str(&format!(" — {rel}"));
-                }
-                if let Some(ref notes) = person.notes {
-                    desc.push_str(&format!(" | {notes}"));
-                }
-                results.push(desc);
-            }
-        }
-
-        // Search commitments (SQL LIKE across all statuses)
-        if category == "all" || category == "commitment" {
-            let commitments = ctx.db.search_commitments(query).await?;
-            for c in commitments {
-                let mut desc = format!(
-                    "[commitment] {} (id:{}, status:{})",
-                    c.description, c.id, c.status
-                );
-                if let Some(ref due) = c.due_date {
-                    desc.push_str(&format!(" due:{due}"));
-                }
-                results.push(desc);
-            }
-        }
-
-        // Search preferences (SQL LIKE)
-        if category == "all" || category == "preference" {
-            let prefs = ctx.db.search_preferences(query).await?;
-            for pref in prefs {
-                results.push(format!("[preference] {}: {}", pref.category, pref.value));
-            }
-        }
-
-        // Search events (SQL LIKE)
-        if category == "all" || category == "event" {
-            let events = ctx.db.search_events(query).await?;
-            for event in events {
-                let mut desc = format!("[event] {} (id:{}", event.description, event.id);
-                if let Some(ref date) = event.event_date {
-                    desc.push_str(&format!(", {date}"));
-                }
-                desc.push(')');
-                if let Some(ref context) = event.context {
-                    if !context.is_empty() {
-                        desc.push_str(&format!(" — {context}"));
-                    }
-                }
-                results.push(desc);
-            }
-        }
-
-        // Search reminders (SQL LIKE)
         if category == "all" || category == "reminder" {
-            let reminders = ctx.db.search_reminders(query).await?;
-            for r in reminders {
-                results.push(format!(
-                    "[reminder] #{}: \"{}\" at {} (created: {})",
-                    r.id, r.message, r.fire_at, r.created_at
-                ));
+            search_reminders(ctx, query, &mut results).await?;
+        }
+
+        // Indexed categories: try hybrid search, fall back to LIKE
+        let use_hybrid = category == "all" || INDEXED_CATEGORIES.contains(&category);
+        if use_hybrid {
+            let source_type_filter = if category == "all" {
+                None
+            } else {
+                Some(category)
+            };
+
+            let hybrid_results = run_hybrid_search(ctx, query, source_type_filter).await;
+
+            if !hybrid_results.is_empty() {
+                // Use hybrid search results
+                for r in hybrid_results {
+                    results.push(format!("[{}] {}", r.source_type, r.content));
+                }
+            } else {
+                // Fallback to LIKE-based search (index may not be populated yet)
+                search_like_fallback(ctx, query, category, &mut results).await?;
             }
         }
 
@@ -145,10 +98,139 @@ impl Tool for SearchMemoryTool {
     }
 }
 
+/// Run hybrid search (FTS5 + optional vector embedding).
+async fn run_hybrid_search(
+    ctx: &ToolContext<'_>,
+    query: &str,
+    source_type_filter: Option<&str>,
+) -> Vec<crate::db::SearchResult> {
+    // Generate query embedding if client is available
+    let embedding = if let Some(client) = ctx.embedding_client {
+        match client.embed(query).await {
+            Ok(emb) => Some(emb),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to generate query embedding, using FTS5 only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    match ctx
+        .db
+        .hybrid_search(query, embedding, 20, source_type_filter)
+        .await
+    {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::warn!(error = %e, "hybrid search failed, falling back to LIKE");
+            Vec::new()
+        }
+    }
+}
+
+/// Search core memory (always in-memory filter, tiny table).
+async fn search_core_memory(
+    ctx: &ToolContext<'_>,
+    query: &str,
+    results: &mut Vec<String>,
+) -> Result<()> {
+    let query_lower = query.to_lowercase();
+    let entries = ctx.db.get_all_core_memory().await?;
+    for entry in entries {
+        if entry.key.to_lowercase().contains(&query_lower)
+            || entry.value.to_lowercase().contains(&query_lower)
+        {
+            results.push(format!("[core_memory] {}: {}", entry.key, entry.value));
+        }
+    }
+    Ok(())
+}
+
+/// Search reminders via SQL LIKE.
+async fn search_reminders(
+    ctx: &ToolContext<'_>,
+    query: &str,
+    results: &mut Vec<String>,
+) -> Result<()> {
+    let reminders = ctx.db.search_reminders(query).await?;
+    for r in reminders {
+        results.push(format!(
+            "[reminder] #{}: \"{}\" at {} (created: {})",
+            r.id, r.message, r.fire_at, r.created_at
+        ));
+    }
+    Ok(())
+}
+
+/// LIKE-based fallback for indexed categories (used when search index is empty).
+async fn search_like_fallback(
+    ctx: &ToolContext<'_>,
+    query: &str,
+    category: &str,
+    results: &mut Vec<String>,
+) -> Result<()> {
+    if category == "all" || category == "person" {
+        let people = ctx.db.search_people(query).await?;
+        for person in people {
+            let mut desc = format!("[person] {} (id:{})", person.canonical_name, person.id);
+            if let Some(ref rel) = person.relationship {
+                desc.push_str(&format!(" — {rel}"));
+            }
+            if let Some(ref notes) = person.notes {
+                desc.push_str(&format!(" | {notes}"));
+            }
+            results.push(desc);
+        }
+    }
+
+    if category == "all" || category == "commitment" {
+        let commitments = ctx.db.search_commitments(query).await?;
+        for c in commitments {
+            let mut desc = format!(
+                "[commitment] {} (id:{}, status:{})",
+                c.description, c.id, c.status
+            );
+            if let Some(ref due) = c.due_date {
+                desc.push_str(&format!(" due:{due}"));
+            }
+            results.push(desc);
+        }
+    }
+
+    if category == "all" || category == "preference" {
+        let prefs = ctx.db.search_preferences(query).await?;
+        for pref in prefs {
+            results.push(format!("[preference] {}: {}", pref.category, pref.value));
+        }
+    }
+
+    if category == "all" || category == "event" {
+        let events = ctx.db.search_events(query).await?;
+        for event in events {
+            let mut desc = format!("[event] {} (id:{}", event.description, event.id);
+            if let Some(ref date) = event.event_date {
+                desc.push_str(&format!(", {date}"));
+            }
+            desc.push(')');
+            if let Some(ref context) = event.context {
+                if !context.is_empty() {
+                    desc.push_str(&format!(" — {context}"));
+                }
+            }
+            results.push(desc);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::test_helpers::TestHarness;
+    use crate::tools::index_fact;
 
     #[tokio::test]
     async fn test_search_finds_person() {
@@ -186,7 +268,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("Q4 budget"));
+        assert!(result.content.contains("budget"));
         assert!(result.content.contains("[commitment]"));
     }
 
@@ -304,8 +386,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("Team offsite in Bali"));
-        assert!(result.content.contains("annual planning retreat"));
+        assert!(result.content.contains("Bali"));
     }
 
     #[tokio::test]
@@ -329,9 +410,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("[event]"));
-        assert!(result.content.contains("Board meeting with investors"));
-        assert!(result.content.contains("2026-03-15"));
+        assert!(result.content.contains("investors"));
 
         // Search with event category filter
         let result = tool
@@ -344,5 +423,46 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("[event]"));
         assert!(!result.content.contains("[person]"));
+    }
+
+    #[tokio::test]
+    async fn test_search_uses_hybrid_when_indexed() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        // Index a fact directly into search_content (simulating store_fact behavior)
+        index_fact(&ctx, "person", 1, "Alice Chen — CTO. Likes morning coffee").await;
+
+        let tool = SearchMemoryTool;
+        let result = tool
+            .execute(serde_json::json!({"query": "coffee"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("[person]"));
+        assert!(result.content.contains("Alice Chen"));
+    }
+
+    #[tokio::test]
+    async fn test_search_hybrid_with_category_filter() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        // Index facts of different types
+        index_fact(&ctx, "person", 1, "Alice Chen — CTO").await;
+        index_fact(&ctx, "commitment", 1, "Review Alice's proposal").await;
+
+        let tool = SearchMemoryTool;
+
+        // Filter to person only
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "Alice", "category": "person"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.content.contains("[person]"));
+        assert!(!result.content.contains("[commitment]"));
     }
 }

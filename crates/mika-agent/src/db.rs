@@ -1352,17 +1352,46 @@ impl Database {
     // -- Layer 3: Search Queries --
 
     /// FTS5-only search (BM25 keyword ranking). Used when no embedding client.
-    pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
-             FROM fts_search fts
-             JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
-             WHERE fts_search MATCH ?1
-             ORDER BY fts.rank
-             LIMIT ?2",
-        )?;
+    pub fn fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match source_type_filter
+        {
+            Some(st) => (
+                "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
+                 FROM fts_search fts
+                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
+                 WHERE fts_search MATCH ?1 AND sc.source_type = ?3
+                 ORDER BY fts.rank
+                 LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(query.to_string()),
+                    Box::new(limit as i64),
+                    Box::new(st.to_string()),
+                ],
+            ),
+            None => (
+                "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
+                 FROM fts_search fts
+                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
+                 WHERE fts_search MATCH ?1
+                 ORDER BY fts.rank
+                 LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(query.to_string()),
+                    Box::new(limit as i64),
+                ],
+            ),
+        };
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
         let results = stmt
-            .query_map(rusqlite::params![query, limit as i64], |row| {
+            .query_map(params_refs.as_slice(), |row| {
                 Ok(SearchResult {
                     id: row.get(0)?,
                     source_type: row.get(1)?,
@@ -1398,9 +1427,10 @@ impl Database {
         fts_query: &str,
         embedding: Option<&[f32]>,
         limit: usize,
+        source_type_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         // Get FTS5 results with rank positions
-        let fts_results = self.fts_search(fts_query, limit * 2)?;
+        let fts_results = self.fts_search(fts_query, limit * 2, source_type_filter)?;
 
         // If no embedding provided, return FTS5-only results
         let vec_results = match embedding {
@@ -1432,7 +1462,7 @@ impl Database {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
-        // Fetch full content for top results
+        // Fetch full content for top results, applying source_type filter for vec results
         let mut results = Vec::with_capacity(scored.len());
         for (content_id, score) in scored {
             if let Ok(result) = self.conn.query_row(
@@ -1448,6 +1478,12 @@ impl Database {
                     })
                 },
             ) {
+                // Filter by source_type if specified (vec results weren't pre-filtered)
+                if let Some(st) = source_type_filter {
+                    if result.source_type != st {
+                        continue;
+                    }
+                }
                 results.push(result);
             }
         }
@@ -2934,13 +2970,13 @@ mod tests {
         db.index_content("event", Some(3), "Team dinner at Italian restaurant").unwrap();
 
         // FTS5 search for "engineer"
-        let results = db.fts_search("engineer", 10).unwrap();
+        let results = db.fts_search("engineer", 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source_type, "person");
         assert!(results[0].content.contains("Alice"));
 
         // FTS5 search for "budget" (stemmed via porter)
-        let results = db.fts_search("budget", 10).unwrap();
+        let results = db.fts_search("budget", 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source_type, "commitment");
     }
@@ -2970,7 +3006,7 @@ mod tests {
         db.index_content("commitment", Some(2), "Review quarterly budget report").unwrap();
 
         // Hybrid search without embedding (FTS5-only path)
-        let results = db.hybrid_search("engineer", None, 10).unwrap();
+        let results = db.hybrid_search("engineer", None, 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Alice"));
     }
@@ -2990,7 +3026,7 @@ mod tests {
 
         // Hybrid search: "engineer" should rank cid1 highest via FTS5 + vector
         let query_emb: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
-        let results = db.hybrid_search("engineer", Some(&query_emb), 10).unwrap();
+        let results = db.hybrid_search("engineer", Some(&query_emb), 10, None).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].source_type, "person");
     }
@@ -3005,14 +3041,14 @@ mod tests {
 
         // Verify content exists
         assert_eq!(db.count_search_content().unwrap(), 1);
-        assert_eq!(db.fts_search("engineer", 10).unwrap().len(), 1);
+        assert_eq!(db.fts_search("engineer", 10, None).unwrap().len(), 1);
 
         // Delete
         db.delete_search_content("person", 1).unwrap();
 
         // Verify everything is gone
         assert_eq!(db.count_search_content().unwrap(), 0);
-        assert_eq!(db.fts_search("engineer", 10).unwrap().len(), 0);
+        assert_eq!(db.fts_search("engineer", 10, None).unwrap().len(), 0);
         assert_eq!(db.vec_search(&emb, 10).unwrap().len(), 0);
     }
 
