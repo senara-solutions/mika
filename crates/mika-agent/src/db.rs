@@ -14,7 +14,7 @@ pub fn init_sqlite_vec() {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -128,6 +128,9 @@ impl Database {
         }
         if version < 7 {
             self.migrate_v7()?;
+        }
+        if version < 8 {
+            self.migrate_v8()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -345,6 +348,54 @@ impl Database {
             ",
             )
             .context("failed to apply migration v7")?;
+
+        Ok(())
+    }
+
+    fn migrate_v8(&self) -> Result<()> {
+        info!("applying migration v8: Layer 3 search tables (search_content, vec_search, fts_search)");
+
+        // search_content and fts_search in one transaction
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            -- Unified content table for all searchable text
+            CREATE TABLE search_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_id INTEGER,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_search_content_source ON search_content(source_type, source_id);
+
+            -- FTS5 keyword index (BM25 ranking)
+            CREATE VIRTUAL TABLE fts_search USING fts5(
+                content,
+                content_id UNINDEXED,
+                source_type UNINDEXED,
+                tokenize='porter unicode61'
+            );
+
+            INSERT INTO schema_version (version) VALUES (8);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v8 (search_content + fts_search)")?;
+
+        // vec0 virtual table must be created outside the transaction
+        // (sqlite-vec limitation with virtual tables)
+        self.conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_search USING vec0(
+                    content_id INTEGER PRIMARY KEY,
+                    embedding float[512]
+                );",
+            )
+            .context("failed to create vec_search table")?;
 
         Ok(())
     }
@@ -1585,7 +1636,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1598,7 +1649,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -2497,5 +2548,81 @@ mod tests {
             index_exists,
             "idx_memory_events_created_at should exist after v7 migration"
         );
+    }
+
+    #[test]
+    fn test_v8_search_tables_exist() {
+        let db = test_db();
+
+        // search_content table exists
+        let sc_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='search_content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sc_exists, "search_content table should exist after v8 migration");
+
+        // fts_search virtual table exists
+        let fts_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='fts_search'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(fts_exists, "fts_search table should exist after v8 migration");
+
+        // vec_search virtual table exists
+        let vec_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_search'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(vec_exists, "vec_search table should exist after v8 migration");
+
+        // Verify vec_search works with a simple insert + query
+        db.conn
+            .execute(
+                "INSERT INTO search_content (source_type, content) VALUES ('test', 'hello world')",
+                [],
+            )
+            .unwrap();
+        let content_id: i64 = db.conn.last_insert_rowid();
+
+        // Insert a dummy 512-dim vector
+        let zeros = vec![0.0f32; 512];
+        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(zeros.as_slice());
+        db.conn
+            .execute(
+                "INSERT INTO vec_search (content_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![content_id, bytes],
+            )
+            .unwrap();
+
+        // FTS5 insert
+        db.conn
+            .execute(
+                "INSERT INTO fts_search (content, content_id, source_type) VALUES ('hello world', ?1, 'test')",
+                rusqlite::params![content_id],
+            )
+            .unwrap();
+
+        // FTS5 query
+        let fts_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_search WHERE fts_search MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 1);
     }
 }
