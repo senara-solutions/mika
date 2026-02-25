@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent,
-    Person, Preference, Reminder,
+    Person, Preference, Reminder, SearchResult,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -436,6 +436,60 @@ impl AsyncDatabase {
         let s = session_id.to_owned();
         self.with_db(move |db| db.get_memory_events(&s)).await
     }
+
+    // -- Layer 3: Search Indexing --
+
+    pub async fn index_content(
+        &self,
+        source_type: &str,
+        source_id: Option<i64>,
+        content: &str,
+    ) -> Result<i64> {
+        let (st, sid, c) = (
+            source_type.to_owned(),
+            source_id,
+            content.to_owned(),
+        );
+        self.with_db(move |db| db.index_content(&st, sid, &c))
+            .await
+    }
+
+    pub async fn index_embedding(&self, content_id: i64, embedding: Vec<f32>) -> Result<()> {
+        self.with_db(move |db| db.index_embedding(content_id, &embedding))
+            .await
+    }
+
+    pub async fn delete_search_content(&self, source_type: &str, source_id: i64) -> Result<()> {
+        let st = source_type.to_owned();
+        self.with_db(move |db| db.delete_search_content(&st, source_id))
+            .await
+    }
+
+    pub async fn count_search_content(&self) -> Result<i64> {
+        self.with_db(|db| db.count_search_content()).await
+    }
+
+    pub async fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let q = query.to_owned();
+        self.with_db(move |db| db.fts_search(&q, limit)).await
+    }
+
+    pub async fn hybrid_search(
+        &self,
+        fts_query: &str,
+        embedding: Option<Vec<f32>>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let q = fts_query.to_owned();
+        self.with_db(move |db| {
+            db.hybrid_search(&q, embedding.as_deref(), limit)
+        })
+        .await
+    }
+
+    pub async fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
+        self.with_db(|db| db.get_all_facts_for_indexing()).await
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +498,10 @@ mod tests {
     use crate::db::Database;
 
     fn test_async_db() -> AsyncDatabase {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(crate::db::init_sqlite_vec);
+
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new(db)
     }
