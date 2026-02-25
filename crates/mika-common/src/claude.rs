@@ -239,7 +239,11 @@ impl ClaudeClient {
             let body = response.text().await.unwrap_or_default();
             let message = serde_json::from_str::<ApiErrorResponse>(&body)
                 .map(|e| e.error.message)
-                .unwrap_or(body);
+                .unwrap_or_else(|_| {
+                    // Truncate raw body to avoid leaking proxy/CDN internals
+                    let truncated: String = body.chars().take(200).collect();
+                    format!("unexpected error response (HTTP {status_code}): {truncated}")
+                });
             warn!(status = status_code, error_message = %message, "Claude API error response");
             return Err(ClaudeApiError::HttpError {
                 status: status_code,
