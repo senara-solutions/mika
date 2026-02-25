@@ -1,17 +1,25 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::Once;
 use tracing::{debug, info};
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
-/// Must be called once before opening any database connections.
+/// Idempotent — uses an internal Once guard so multiple calls are safe.
 pub fn init_sqlite_vec() {
-    unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(
-            #[allow(clippy::missing_transmute_annotations)]
-            std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
-        ));
-    }
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // SAFETY: sqlite3_auto_extension requires a function pointer matching
+        // the sqlite3 extension init signature. sqlite_vec::sqlite3_vec_init
+        // is provided by the sqlite-vec crate and matches this signature.
+        // This must run before any DB connections are opened.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(
+                #[allow(clippy::missing_transmute_annotations)]
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
+            ));
+        }
+    });
 }
 
 const CURRENT_SCHEMA_VERSION: i64 = 8;
@@ -1311,26 +1319,16 @@ impl Database {
 
     /// Delete search index entries for a specific source (for re-indexing on update).
     pub fn delete_search_content(&self, source_type: &str, source_id: i64) -> Result<()> {
-        // Get content_ids to delete from vec_search and fts_search
-        let content_ids: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM search_content WHERE source_type = ?1 AND source_id = ?2",
-            )?;
-            stmt.query_map(rusqlite::params![source_type, source_id], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let subquery = "SELECT id FROM search_content WHERE source_type = ?1 AND source_id = ?2";
 
-        for cid in &content_ids {
-            self.conn.execute(
-                "DELETE FROM vec_search WHERE content_id = ?1",
-                [cid],
-            )?;
-            self.conn.execute(
-                "DELETE FROM fts_search WHERE content_id = ?1",
-                [cid],
-            )?;
-        }
-
+        self.conn.execute(
+            &format!("DELETE FROM vec_search WHERE content_id IN ({subquery})"),
+            rusqlite::params![source_type, source_id],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM fts_search WHERE content_id IN ({subquery})"),
+            rusqlite::params![source_type, source_id],
+        )?;
         self.conn.execute(
             "DELETE FROM search_content WHERE source_type = ?1 AND source_id = ?2",
             rusqlite::params![source_type, source_id],
@@ -1351,6 +1349,14 @@ impl Database {
 
     // -- Layer 3: Search Queries --
 
+    /// Sanitize a query for FTS5 MATCH by wrapping in double quotes.
+    /// Escapes any embedded double quotes to prevent FTS5 syntax errors
+    /// from special characters (AND, OR, NOT, parentheses, etc.).
+    fn sanitize_fts5_query(query: &str) -> String {
+        let escaped = query.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    }
+
     /// FTS5-only search (BM25 keyword ranking). Used when no embedding client.
     pub fn fts_search(
         &self,
@@ -1358,32 +1364,27 @@ impl Database {
         limit: usize,
         source_type_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        let safe_query = Self::sanitize_fts5_query(query);
+
+        let base_sql = "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
+                 FROM fts_search fts
+                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
+                 WHERE fts_search MATCH ?1";
+
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match source_type_filter
         {
             Some(st) => (
-                "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
-                 FROM fts_search fts
-                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
-                 WHERE fts_search MATCH ?1 AND sc.source_type = ?3
-                 ORDER BY fts.rank
-                 LIMIT ?2"
-                    .to_string(),
+                format!("{base_sql} AND sc.source_type = ?3 ORDER BY fts.rank LIMIT ?2"),
                 vec![
-                    Box::new(query.to_string()),
+                    Box::new(safe_query),
                     Box::new(limit as i64),
                     Box::new(st.to_string()),
                 ],
             ),
             None => (
-                "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
-                 FROM fts_search fts
-                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
-                 WHERE fts_search MATCH ?1
-                 ORDER BY fts.rank
-                 LIMIT ?2"
-                    .to_string(),
+                format!("{base_sql} ORDER BY fts.rank LIMIT ?2"),
                 vec![
-                    Box::new(query.to_string()),
+                    Box::new(safe_query),
                     Box::new(limit as i64),
                 ],
             ),

@@ -2,7 +2,15 @@ use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use thiserror::Error;
 use tracing::{debug, warn};
+
+/// Error type for embedding API calls that preserves the HTTP status code.
+#[derive(Debug, Error)]
+#[error("embedding API HTTP error ({status_code})")]
+struct EmbeddingApiError {
+    status_code: u16,
+}
 
 const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 const MAX_RETRIES: u32 = 2;
@@ -41,6 +49,16 @@ pub struct EmbeddingClient {
     api_key: String,
     model: String,
     dimensions: u32,
+}
+
+impl std::fmt::Debug for EmbeddingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingClient")
+            .field("model", &self.model)
+            .field("dimensions", &self.dimensions)
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl EmbeddingClient {
@@ -150,8 +168,9 @@ impl EmbeddingClient {
         if !status.is_success() {
             let status_code = status.as_u16();
             let body = response.text().await.unwrap_or_default();
-            warn!(status = status_code, body = %body, "embedding API error response");
-            anyhow::bail!("embedding API HTTP error ({status_code})");
+            let truncated_body: &str = if body.len() > 500 { &body[..500] } else { &body };
+            warn!(status = status_code, body = %truncated_body, "embedding API error response");
+            return Err(EmbeddingApiError { status_code }.into());
         }
 
         let resp: EmbeddingResponse = response
@@ -170,8 +189,11 @@ impl EmbeddingClient {
 }
 
 fn is_retryable_status(error: &anyhow::Error) -> bool {
-    let msg = error.to_string();
-    msg.contains("429") || msg.contains("500") || msg.contains("503")
+    if let Some(e) = error.downcast_ref::<EmbeddingApiError>() {
+        matches!(e.status_code, 429 | 500 | 503)
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

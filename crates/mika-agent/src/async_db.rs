@@ -511,10 +511,7 @@ mod tests {
     use crate::db::Database;
 
     fn test_async_db() -> AsyncDatabase {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(crate::db::init_sqlite_vec);
-
+        crate::db::init_sqlite_vec();
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new(db)
     }

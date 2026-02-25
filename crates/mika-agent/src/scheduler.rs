@@ -67,59 +67,52 @@ impl ReminderScheduler {
                 match self.db.get_all_facts_for_indexing().await {
                     Ok(facts) if !facts.is_empty() => {
                         info!(count = facts.len(), "backfilling search index");
-                        for (source_type, source_id, content) in &facts {
-                            if let Err(e) = self
+
+                        // Index into FTS5 and track content_ids for embedding step
+                        let mut content_ids: Vec<(i64, usize)> = Vec::new();
+                        for (i, (source_type, source_id, content)) in facts.iter().enumerate() {
+                            match self
                                 .db
                                 .index_content(source_type, Some(*source_id), content)
                                 .await
                             {
-                                warn!(error = %e, source_type, "failed to index content during backfill");
-                                continue;
+                                Ok(content_id) => content_ids.push((content_id, i)),
+                                Err(e) => {
+                                    warn!(error = %e, source_type, "failed to index content during backfill");
+                                }
                             }
                         }
 
                         // Batch-generate embeddings if client is available
                         if let Some(ref client) = self.embedding_client {
-                            let texts: Vec<&str> =
-                                facts.iter().map(|(_, _, c)| c.as_str()).collect();
-                            match client.embed_batch(&texts).await {
-                                Ok(embeddings) => {
-                                    let mut indexed = 0;
-                                    for (i, embedding) in embeddings.into_iter().enumerate() {
-                                        let (source_type, source_id, _) = &facts[i];
-                                        // Look up the content_id we just inserted
-                                        if let Ok(results) = self
-                                            .db
-                                            .fts_search(
-                                                &facts[i].2,
-                                                1,
-                                                Some(source_type),
-                                            )
-                                            .await
-                                            && let Some(r) = results.first()
-                                        {
-                                            if let Err(e) = self
-                                                .db
-                                                .index_embedding(r.id, embedding)
-                                                .await
+                            const BATCH_SIZE: usize = 100;
+                            let mut indexed = 0;
+
+                            for chunk in content_ids.chunks(BATCH_SIZE) {
+                                let texts: Vec<&str> = chunk
+                                    .iter()
+                                    .map(|&(_, fact_idx)| facts[fact_idx].2.as_str())
+                                    .collect();
+
+                                match client.embed_batch(&texts).await {
+                                    Ok(embeddings) => {
+                                        for (j, embedding) in embeddings.into_iter().enumerate() {
+                                            let (content_id, _) = chunk[j];
+                                            if let Err(e) =
+                                                self.db.index_embedding(content_id, embedding).await
                                             {
-                                                warn!(
-                                                    error = %e,
-                                                    source_type,
-                                                    source_id,
-                                                    "failed to index embedding during backfill"
-                                                );
+                                                warn!(error = %e, content_id, "failed to index embedding during backfill");
                                             } else {
                                                 indexed += 1;
                                             }
                                         }
                                     }
-                                    info!(indexed, total = facts.len(), "backfill embeddings complete");
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "failed to generate embeddings during backfill");
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to generate embeddings batch during backfill");
+                                    }
                                 }
                             }
+                            info!(indexed, total = facts.len(), "backfill embeddings complete");
                         }
                         info!("search index backfill complete");
                     }
