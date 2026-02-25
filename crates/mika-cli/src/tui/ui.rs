@@ -8,11 +8,21 @@ use crate::tui::app::{AgentStatus, App, ChatRole};
 use crate::tui::markdown;
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
+    // Dynamic input height: grow with content, capped at 6 lines
+    let input_content_len = app.textarea.lines().iter().map(|l| l.len()).sum::<usize>();
+    let available_width = f.area().width.saturating_sub(4) as usize; // borders + "> " prompt
+    let input_lines = if available_width > 0 {
+        ((input_content_len / available_width) + 1).clamp(1, 6) as u16
+    } else {
+        1
+    };
+    let input_height = input_lines + 2; // +2 for top/bottom padding
+
     let chunks = Layout::vertical([
-        Constraint::Length(1), // header
-        Constraint::Min(5),    // messages
-        Constraint::Length(3), // input
-        Constraint::Length(1), // footer
+        Constraint::Length(1),            // header
+        Constraint::Min(5),              // messages
+        Constraint::Length(input_height), // input (dynamic)
+        Constraint::Length(1),            // footer
     ])
     .split(f.area());
 

@@ -217,6 +217,9 @@ impl<'a> App<'a> {
                         rendered: None,
                     });
                     self.status = AgentStatus::Idle;
+                } else if response.content.is_empty() {
+                    // Agent responded with tool-use only (no text) — skip display
+                    self.status = AgentStatus::Idle;
                 } else {
                     self.pending_response = Some(response.content);
                     self.reveal_index = 0;

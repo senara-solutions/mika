@@ -13,10 +13,15 @@ use mika_common::home;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Resolve log directory: ~/.mika/agents/{name}/logs/
+    // We compute this early so file logging starts before any agent init.
+    let log_dir = home::resolve_home_dir().ok().map(|h| h.join("logs"));
+
     // Initialize tracing so structured logs are not silently dropped.
     // All CLI modes use pretty (human-readable) output at warn level.
     // TUI commands write to stderr which ratatui's alternate screen handles.
-    mika_common::logging::init_pretty("warn");
+    // The _log_guard MUST stay alive until the end of main — dropping it stops file logging.
+    let _log_guard = mika_common::logging::init_pretty("warn", log_dir.as_deref());
 
     // Resolve agent name: --agent flag > active_agent file > "main"
     let agent_name = match cli.agent {
