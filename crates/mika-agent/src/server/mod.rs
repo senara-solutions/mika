@@ -9,14 +9,17 @@ use axum::{
     Router, middleware,
     routing::{get, post},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tracing::info;
 
+use mika_common::agent;
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::home;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
@@ -26,7 +29,7 @@ use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::tools;
 
-use state::AppState;
+use state::{AgentState, AppState};
 
 /// Build the Axum router with all routes and middleware.
 ///
@@ -44,20 +47,65 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Initialize a single agent and return its AgentState.
+fn init_agent(
+    agent_name: &str,
+    agent_home: &std::path::Path,
+    claude: &ClaudeClient,
+    tool_registry: &Arc<crate::tools::ToolRegistry>,
+    gateway_url: &str,
+    internal_token: &secrecy::SecretString,
+    http_client: &reqwest::Client,
+    embedding_client: Option<EmbeddingClient>,
+) -> Result<(AgentState, Arc<ReminderScheduler>)> {
+    let db = Database::open(&agent_home.join("data").join("mika.db"))?;
+    startup::seed_core_memory_if_empty(&db, agent_home)?;
+    let async_db = AsyncDatabase::new(db);
+
+    let skill_registry = Arc::new(SkillRegistry::from_dir(&agent_home.join("skills")));
+
+    let scheduler_sender = GatewayMessageSender::new(
+        gateway_url.to_string(),
+        internal_token.clone(),
+        async_db.clone(),
+        http_client.clone(),
+        None,
+    );
+    let scheduler_sender: Arc<dyn MessageSender> = Arc::new(scheduler_sender);
+
+    let scheduler = Arc::new(ReminderScheduler {
+        db: async_db.clone(),
+        claude: claude.clone(),
+        tools: tool_registry.clone(),
+        skills: skill_registry.clone(),
+        home_dir: agent_home.to_path_buf(),
+        message_sender: Some(scheduler_sender),
+        embedding_client: embedding_client.clone(),
+    });
+
+    let agent_state = AgentState {
+        db: async_db,
+        skills: skill_registry,
+        scheduler: scheduler.clone(),
+        agent_lock: Arc::new(tokio::sync::Mutex::new(())),
+        home_dir: agent_home.to_path_buf(),
+        embedding_client,
+    };
+
+    info!(agent = agent_name, home = %agent_home.display(), "initialized agent");
+
+    Ok((agent_state, scheduler))
+}
+
 /// Start the Mika HTTP server.
 ///
-/// Initializes the database, Claude client, tool registry, and scheduler,
+/// Discovers all agents in the home directory, initializes each one,
 /// then binds to the configured port and serves until SIGTERM/Ctrl-C.
 pub async fn run_server(settings: &Settings) -> Result<()> {
-    let home_dir = &settings.home_dir;
+    let global_home = &settings.home_dir;
 
-    // Open and wrap database
-    let db = Database::open(&settings.db_path)?;
-
-    // Seed core memory if empty
-    startup::seed_core_memory_if_empty(&db, home_dir)?;
-
-    let async_db = AsyncDatabase::new(db);
+    // Auto-migrate to multi-agent layout if needed
+    home::migrate_to_multi_agent(global_home)?;
 
     let claude = ClaudeClient::new(
         settings.anthropic_api_key.clone(),
@@ -65,7 +113,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         settings.claude_max_tokens,
     )?;
     let tool_registry = Arc::new(tools::default_tools());
-    let skill_registry = Arc::new(SkillRegistry::from_dir(&home_dir.join("skills")));
     let ready = Arc::new(AtomicBool::new(false));
     let http_client = reqwest::Client::new();
 
@@ -84,57 +131,78 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("MIKA_INTERNAL_TOKEN is required in server mode"))?;
 
-    // Create GatewayMessageSender for the scheduler
-    let scheduler_sender = GatewayMessageSender::new(
-        gateway_url.clone(),
-        internal_token.clone(),
-        async_db.clone(),
-        http_client.clone(),
-        None,
-    );
-    let scheduler_sender: Arc<dyn MessageSender> = Arc::new(scheduler_sender);
-
-    // Create embedding client if OpenAI API key is configured
-    let embedding_client = settings
-        .openai_api_key
-        .as_ref()
-        .filter(|k| !k.trim().is_empty())
-        .and_then(|key| {
-            EmbeddingClient::new(
-                key.clone(),
-                settings.embedding_model.clone(),
-                settings.embedding_dimensions,
-            )
-            .ok()
-        });
+    let embedding_client = settings.make_embedding_client();
     if embedding_client.is_some() {
         info!("Layer 3 vector search enabled (embedding client configured)");
     }
 
-    let scheduler = Arc::new(ReminderScheduler {
-        db: async_db.clone(),
-        claude: claude.clone(),
-        tools: tool_registry.clone(),
-        skills: skill_registry.clone(),
-        home_dir: home_dir.to_path_buf(),
-        message_sender: Some(scheduler_sender),
-        embedding_client: embedding_client.clone(),
-    });
+    // Discover and initialize all agents
+    let mut agents = HashMap::new();
+    let mut schedulers = Vec::new();
+
+    let agent_names = agent::list_agents(global_home);
+
+    if agent_names.is_empty() {
+        // No agents found — initialize default agent via legacy path
+        // (handles server mode on a fresh/legacy install)
+        let agent_home = home::resolve_agent_home(global_home, agent::DEFAULT_AGENT);
+        if !agent_home.join("data").join("mika.db").exists() {
+            // Legacy layout: global_home IS the agent home
+            let (agent_state, scheduler) = init_agent(
+                agent::DEFAULT_AGENT,
+                global_home,
+                &claude,
+                &tool_registry,
+                &gateway_url,
+                &internal_token,
+                &http_client,
+                embedding_client.clone(),
+            )?;
+            agents.insert(agent::DEFAULT_AGENT.to_string(), Arc::new(agent_state));
+            schedulers.push(scheduler);
+        }
+    } else {
+        for name in &agent_names {
+            let agent_home = agent::agent_dir(global_home, name);
+            match init_agent(
+                name,
+                &agent_home,
+                &claude,
+                &tool_registry,
+                &gateway_url,
+                &internal_token,
+                &http_client,
+                embedding_client.clone(),
+            ) {
+                Ok((agent_state, scheduler)) => {
+                    agents.insert(name.clone(), Arc::new(agent_state));
+                    schedulers.push(scheduler);
+                }
+                Err(e) => {
+                    tracing::warn!(agent = name, error = %e, "failed to initialize agent, skipping");
+                }
+            }
+        }
+    }
+
+    let default_agent = home::read_active_agent(global_home);
+    info!(
+        agents = ?agents.keys().collect::<Vec<_>>(),
+        default = %default_agent,
+        "discovered {} agent(s)",
+        agents.len()
+    );
 
     let state = AppState {
-        db: async_db,
+        agents: Arc::new(agents),
+        default_agent,
         claude,
         tools: tool_registry,
-        skills: skill_registry,
-        scheduler: scheduler.clone(),
-        agent_lock: Arc::new(tokio::sync::Mutex::new(())),
         ready: ready.clone(),
         internal_token,
         gateway_url,
-        home_dir: home_dir.to_path_buf(),
         startup_time: std::time::Instant::now(),
         http_client,
-        embedding_client,
     };
 
     let app = build_router(state);
@@ -149,11 +217,13 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     info!("server ready");
 
     // Fire past-due reminders in background (slow, runs agent loops)
-    tokio::spawn(async move {
-        if let Err(e) = scheduler.recover().await {
-            tracing::warn!(error = %e, "reminder recovery failed");
-        }
-    });
+    for scheduler in schedulers {
+        tokio::spawn(async move {
+            if let Err(e) = scheduler.recover().await {
+                tracing::warn!(error = %e, "reminder recovery failed");
+            }
+        });
+    }
 
     // Serve with graceful shutdown
     axum::serve(listener, app)
@@ -203,20 +273,29 @@ mod tests {
             message_sender: None,
             embedding_client: None,
         });
-        AppState {
+
+        let agent_state = AgentState {
             db,
-            claude,
-            tools: tools_reg,
             skills: skills_reg,
             scheduler,
             agent_lock: Arc::new(tokio::sync::Mutex::new(())),
+            home_dir: std::path::PathBuf::from("/tmp/mika-test"),
+            embedding_client: None,
+        };
+
+        let mut agents = HashMap::new();
+        agents.insert("main".to_string(), Arc::new(agent_state));
+
+        AppState {
+            agents: Arc::new(agents),
+            default_agent: "main".to_string(),
+            claude,
+            tools: tools_reg,
             ready: Arc::new(AtomicBool::new(false)),
             internal_token: SecretString::from("test-token-secret"),
             gateway_url: "http://localhost:9999".to_string(),
-            home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             startup_time: std::time::Instant::now(),
             http_client: reqwest::Client::new(),
-            embedding_client: None,
         }
     }
 
@@ -373,7 +452,8 @@ mod tests {
         state.ready.store(true, Ordering::Release);
 
         // Pre-acquire the lock to simulate a busy agent
-        let _guard = state.agent_lock.clone().lock_owned().await;
+        let agent_state = state.agents.get("main").unwrap();
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
 
         let app = test_app(state);
 
@@ -403,7 +483,7 @@ mod tests {
     async fn test_message_stores_chat_id() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.db.clone();
+        let db = state.agents.get("main").unwrap().db.clone();
         let app = test_app(state);
 
         let _resp = app
@@ -455,10 +535,11 @@ mod tests {
         state.ready.store(true, Ordering::Release);
 
         // Set timezone so active-hours check passes
-        let _ = state.db.set_customer_config("timezone", "UTC").await;
+        let agent_state = state.agents.get("main").unwrap();
+        let _ = agent_state.db.set_customer_config("timezone", "UTC").await;
 
         // Pre-acquire the lock to simulate a busy agent
-        let _guard = state.agent_lock.clone().lock_owned().await;
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
 
         let app = test_app(state);
 
@@ -476,5 +557,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_message_with_agent_field() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Send with explicit agent field
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"hi","chat_id":123,"channel":"telegram","request_id":"r-agent","agent":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_message_with_unknown_agent() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"hi","chat_id":123,"channel":"telegram","request_id":"r-bad","agent":"nonexistent"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

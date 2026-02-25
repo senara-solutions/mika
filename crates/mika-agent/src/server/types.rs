@@ -7,6 +7,9 @@ pub struct MessageRequest {
     pub chat_id: i64,
     pub channel: String,
     pub request_id: String,
+    /// Target agent name (defaults to the server's default agent if absent).
+    #[serde(default)]
+    pub agent: String,
 }
 
 /// Accepted response for async processing.
@@ -20,6 +23,9 @@ pub struct AcceptedResponse {
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatRequest {
     pub request_id: String,
+    /// Target agent name (defaults to the server's default agent if absent).
+    #[serde(default)]
+    pub agent: String,
 }
 
 /// Health check response body.

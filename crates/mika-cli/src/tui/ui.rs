@@ -184,7 +184,12 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
 
     let footer = Line::from(vec![
         Span::styled(
-            format!(" {} ", app.model),
+            format!(" {} ", app.agent_name),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} ", app.model),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),

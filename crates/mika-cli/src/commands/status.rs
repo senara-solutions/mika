@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use crate::init;
 
-pub async fn run() -> Result<()> {
-    let ctx = init::init_db_only()?;
+pub async fn run(agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
     let db = &ctx.async_db;
 
     let (db_size, msg_count, people, commitments, preferences, events, last_msg, tokens, version) = tokio::join!(

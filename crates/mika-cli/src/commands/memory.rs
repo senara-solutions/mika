@@ -4,8 +4,8 @@ use mika_agent::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
 use crate::cli::{MemoryArgs, MemoryCommand};
 use crate::init;
 
-pub async fn run(args: MemoryArgs) -> Result<()> {
-    let ctx = init::init_db_only()?;
+pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
     let db = &ctx.async_db;
 
     match args.command {

@@ -89,6 +89,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Show skill details",
         args_hint: Some("<name>"),
     },
+    SlashCommand {
+        name: "switch",
+        aliases: &["agent"],
+        description: "Switch to a different agent",
+        args_hint: Some("<name>"),
+    },
+    SlashCommand {
+        name: "agents",
+        aliases: &[],
+        description: "List all agents",
+        args_hint: None,
+    },
 ];
 
 /// Filter commands by prefix (case-insensitive). Matches command names and aliases.

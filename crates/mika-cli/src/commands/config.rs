@@ -4,8 +4,8 @@ use std::process::Command;
 use crate::cli::{ConfigArgs, ConfigCommand};
 use crate::init;
 
-pub async fn run(args: ConfigArgs) -> Result<()> {
-    let ctx = init::init_db_only()?;
+pub async fn run(args: ConfigArgs, agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
 
     match args.command {
         None => {

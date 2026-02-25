@@ -8,8 +8,7 @@ async fn main() -> Result<()> {
     let home_dir = mika_common::home::resolve_home_dir()?;
 
     if !mika_common::home::is_initialized(&home_dir) {
-        mika_common::home::bootstrap(&home_dir)
-            .with_context(|| format!("failed to initialize {}", home_dir.display()))?;
+        mika_common::home::bootstrap_fresh_install(&home_dir)?;
     }
 
     let settings = mika_common::config::Settings::load(&home_dir)

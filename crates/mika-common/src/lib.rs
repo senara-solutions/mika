@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod claude;
 pub mod config;
 pub mod embedding;

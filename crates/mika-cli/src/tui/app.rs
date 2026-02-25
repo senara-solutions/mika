@@ -90,6 +90,14 @@ pub struct App<'a> {
     // Slash command state
     pub autocomplete: AutocompleteState,
     pub pending_command: Option<String>,
+
+    // Agent info
+    pub agent_name: String,
+    /// The global Mika home directory (e.g. ~/.mika/).
+    pub global_home: PathBuf,
+
+    /// If set, the chat loop should switch to this agent after the current worker stops.
+    pub pending_switch: Option<String>,
 }
 
 impl<'a> App<'a> {
@@ -104,6 +112,8 @@ impl<'a> App<'a> {
         claude: ClaudeClient,
         home_dir: PathBuf,
         skills: Arc<SkillRegistry>,
+        agent_name: String,
+        global_home: PathBuf,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -132,6 +142,9 @@ impl<'a> App<'a> {
             skills,
             autocomplete: AutocompleteState::new(),
             pending_command: None,
+            agent_name,
+            global_home,
+            pending_switch: None,
         }
     }
 

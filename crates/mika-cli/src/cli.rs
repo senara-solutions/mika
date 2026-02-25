@@ -3,6 +3,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "mika", about = "Mika — AI Executive Assistant")]
 pub struct Cli {
+    /// Agent to use (overrides active agent)
+    #[arg(long, global = true)]
+    pub agent: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -30,6 +34,45 @@ pub enum Commands {
     Ask {
         /// The message to send (use "-" to read from stdin)
         message: String,
+    },
+    /// Manage agents
+    Agents(AgentsArgs),
+}
+
+#[derive(clap::Args)]
+pub struct AgentsArgs {
+    #[command(subcommand)]
+    pub command: AgentsCommand,
+}
+
+#[derive(Subcommand)]
+pub enum AgentsCommand {
+    /// List all agents
+    List,
+    /// Create a new agent
+    Create {
+        /// Name for the new agent (lowercase, alphanumeric, hyphens)
+        name: String,
+    },
+    /// Delete an agent (cannot delete "main")
+    Delete {
+        /// Name of the agent to delete
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Switch the active agent
+    Switch {
+        /// Name of the agent to switch to
+        name: String,
+    },
+    /// Clone an agent's personality (soul, identity, config) into a new agent
+    Clone {
+        /// Source agent to clone from
+        source: String,
+        /// Name for the new agent
+        name: String,
     },
 }
 

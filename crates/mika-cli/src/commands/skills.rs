@@ -2,9 +2,11 @@ use anyhow::Result;
 use mika_agent::skills::SkillRegistry;
 use mika_common::home;
 
-pub async fn run(name: Option<String>) -> Result<()> {
-    let home_dir = home::resolve_home_dir()?;
-    let skills_dir = home_dir.join("skills");
+pub async fn run(name: Option<String>, agent_name: &str) -> Result<()> {
+    let global_home = home::resolve_home_dir()?;
+    home::migrate_to_multi_agent(&global_home)?;
+    let agent_home = home::resolve_agent_home(&global_home, agent_name);
+    let skills_dir = agent_home.join("skills");
     let registry = SkillRegistry::from_dir(&skills_dir);
 
     if let Some(name) = name {

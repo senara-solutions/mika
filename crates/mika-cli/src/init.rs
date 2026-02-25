@@ -28,6 +28,9 @@ pub struct DbContext {
     pub settings: Settings,
     pub async_db: AsyncDatabase,
     pub home_dir: PathBuf,
+    /// The global Mika home directory (e.g. ~/.mika/).
+    /// In multi-agent mode this differs from `home_dir` (which is the agent's dir).
+    pub global_home: PathBuf,
 }
 
 impl Drop for DbContext {
@@ -36,27 +39,32 @@ impl Drop for DbContext {
     }
 }
 
-/// Shared initialization: resolve home, ensure initialized, load settings, open DB.
-fn init_base() -> Result<(Settings, AsyncDatabase, PathBuf)> {
+/// Shared initialization for an agent: migrate, resolve agent home, load config, open DB.
+fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, PathBuf, PathBuf)> {
     // Register sqlite-vec extension before any DB connections are opened.
     mika_agent::db::init_sqlite_vec();
 
-    let home_dir = home::resolve_home_dir()?;
-    ensure_initialized(&home_dir)?;
+    let global_home = home::resolve_home_dir()?;
 
-    let settings =
-        Settings::load(&home_dir).context("Failed to load config (run `mika setup` first).")?;
+    // Auto-migrate legacy layout to multi-agent on every startup
+    home::migrate_to_multi_agent(&global_home)?;
+
+    let agent_home = home::resolve_agent_home(&global_home, agent_name);
+    ensure_initialized_for_agent(&global_home, &agent_home, agent_name)?;
+
+    let settings = Settings::load_for_agent(&global_home, &agent_home)
+        .context("Failed to load config (run `mika setup` first).")?;
 
     let db = open_db(&settings)?;
-    startup::seed_core_memory_if_empty(&db, &home_dir)?;
+    startup::seed_core_memory_if_empty(&db, &agent_home)?;
     let async_db = AsyncDatabase::new(db);
 
-    Ok((settings, async_db, home_dir))
+    Ok((settings, async_db, agent_home, global_home))
 }
 
-/// Initialize full context (for chat).
-pub fn init() -> Result<AppContext> {
-    let db_ctx = init_db_only()?;
+/// Initialize full context for a named agent (for chat).
+pub fn init_for_agent(agent_name: &str) -> Result<AppContext> {
+    let db_ctx = init_db_only_for_agent(agent_name)?;
 
     let claude = ClaudeClient::new(
         db_ctx.settings.anthropic_api_key.clone(),
@@ -67,18 +75,36 @@ pub fn init() -> Result<AppContext> {
     Ok(AppContext { db_ctx, claude })
 }
 
-/// Initialize database-only context (for memory, reminders, status, config).
-pub fn init_db_only() -> Result<DbContext> {
-    let (settings, async_db, home_dir) = init_base()?;
+/// Initialize database-only context for a named agent.
+pub fn init_db_only_for_agent(agent_name: &str) -> Result<DbContext> {
+    let (settings, async_db, home_dir, global_home) = init_base_for_agent(agent_name)?;
     Ok(DbContext {
         settings,
         async_db,
         home_dir,
+        global_home,
     })
 }
 
-fn ensure_initialized(home_dir: &Path) -> Result<()> {
-    if !home::is_initialized(home_dir) {
+/// Resolve the active agent name from the home directory.
+pub fn resolve_active_agent() -> Result<String> {
+    let global_home = home::resolve_home_dir()?;
+    Ok(home::read_active_agent(&global_home))
+}
+
+fn ensure_initialized_for_agent(
+    global_home: &Path,
+    agent_home: &Path,
+    agent_name: &str,
+) -> Result<()> {
+    // In multi-agent layout, check the specific agent's home
+    if home::is_multi_agent_layout(global_home) {
+        if !agent_home.join("data").join("mika.db").exists() {
+            anyhow::bail!(
+                "Agent '{agent_name}' not found. Create it with `mika agents create {agent_name}`."
+            );
+        }
+    } else if !home::is_initialized(global_home) {
         anyhow::bail!(
             "Mika not initialized. Run `mika setup` first, or just run `mika` to auto-setup."
         );

@@ -13,7 +13,7 @@ use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 
 use super::json_extractor::JsonBody;
-use super::state::AppState;
+use super::state::{AgentState, AppState};
 use super::types::{AcceptedResponse, HealthResponse, HeartbeatRequest, MessageRequest};
 
 /// GET /health — K8s liveness/readiness probe (no auth required).
@@ -55,8 +55,23 @@ pub async fn handle_message(
             .into_response();
     }
 
+    // Resolve agent state (Arc clone — cheap atomic increment)
+    let agent_state = match state.resolve_agent(&req.agent) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "request_id": req.request_id,
+                    "error": format!("agent '{}' not found", req.agent)
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Try to acquire the agent lock (non-blocking)
-    let lock = match state.agent_lock.clone().try_lock_owned() {
+    let lock = match agent_state.agent_lock.clone().try_lock_owned() {
         Ok(guard) => guard,
         Err(_) => {
             return (
@@ -71,7 +86,7 @@ pub async fn handle_message(
     };
 
     // Store chat_id on every message (for outbound sends)
-    let _ = state
+    let _ = agent_state
         .db
         .set_customer_config("chat_id", &req.chat_id.to_string())
         .await;
@@ -80,42 +95,44 @@ pub async fn handle_message(
 
     // Spawn flush of previously failed sends in parallel (best-effort, non-blocking)
     let flush_state = state.clone();
+    let flush_agent = agent_state.clone();
     tokio::spawn(async move {
-        flush_failed_sends(&flush_state).await;
+        flush_failed_sends(&flush_state, &flush_agent).await;
     });
 
     // Spawn async agent processing with request_id span for log correlation
     let s = state.clone();
+    let a = agent_state.clone();
     let span = tracing::info_span!("process_message", request_id = %request_id);
     tokio::spawn(
         async move {
             let _lock = lock; // Hold lock for duration of agent loop
 
             let session_id = uuid::Uuid::new_v4().to_string();
-            let is_onboarding = check_onboarding(&s.db).await;
+            let is_onboarding = check_onboarding(&a.db).await;
 
             let sender = GatewayMessageSender::new(
                 s.gateway_url.clone(),
                 s.internal_token.clone(),
-                s.db.clone(),
+                a.db.clone(),
                 s.http_client.clone(),
                 Some(req.request_id.clone()),
             );
             let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
             let params = AgentParams {
-                db: &s.db,
+                db: &a.db,
                 claude: &s.claude,
                 tools: &s.tools,
-                skills: &s.skills,
+                skills: &a.skills,
                 user_message: &req.text,
                 channel_type: &req.channel,
                 session_id: &session_id,
-                home_dir: &s.home_dir,
+                home_dir: &a.home_dir,
                 is_onboarding,
                 message_sender: Some(sender_arc.clone()),
                 skip_compaction: true,
-                embedding_client: s.embedding_client.as_ref(),
+                embedding_client: a.embedding_client.as_ref(),
             };
 
             match agent::run_agent(&params).await {
@@ -138,7 +155,7 @@ pub async fn handle_message(
 
             // Spawn compaction outside the lock
             drop(_lock);
-            let db = s.db.clone();
+            let db = a.db.clone();
             let claude = s.claude.clone();
             tokio::spawn(async move {
                 if let Err(e) = compaction::maybe_compact(&db, &claude).await {
@@ -169,20 +186,30 @@ pub async fn handle_heartbeat(
 ) -> impl IntoResponse {
     info!(request_id = %req.request_id, "heartbeat received");
 
+    // Resolve agent state (Arc clone — cheap atomic increment)
+    let agent_state = match state.resolve_agent(&req.agent) {
+        Some(a) => a,
+        None => {
+            info!(request_id = %req.request_id, agent = %req.agent, "heartbeat for unknown agent, skipping");
+            return StatusCode::NO_CONTENT;
+        }
+    };
+
     // Pre-filter: check if heartbeat should run (no Mutex, no Claude call)
-    if !heartbeat_should_run(&state.db).await {
+    if !heartbeat_should_run(&agent_state.db).await {
         info!(request_id = %req.request_id, "heartbeat skipped by pre-filter");
         return StatusCode::NO_CONTENT;
     }
 
     // try_lock — heartbeat is skippable if agent is busy
-    let lock = match state.agent_lock.clone().try_lock_owned() {
+    let lock = match agent_state.agent_lock.clone().try_lock_owned() {
         Ok(guard) => guard,
         Err(_) => return StatusCode::NO_CONTENT,
     };
 
     // Spawn silent agent loop
     let s = state.clone();
+    let a = agent_state.clone();
     tokio::spawn(async move {
         let _lock = lock;
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -190,22 +217,22 @@ pub async fn handle_heartbeat(
         let sender = GatewayMessageSender::new(
             s.gateway_url.clone(),
             s.internal_token.clone(),
-            s.db.clone(),
+            a.db.clone(),
             s.http_client.clone(),
             Some(req.request_id.clone()),
         );
         let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
         let params = SilentAgentParams {
-            db: &s.db,
+            db: &a.db,
             claude: &s.claude,
             tools: &s.tools,
-            skills: &s.skills,
+            skills: &a.skills,
             trigger: SilentTrigger::Heartbeat,
-            home_dir: &s.home_dir,
+            home_dir: &a.home_dir,
             session_id: &session_id,
             message_sender: Some(sender_arc),
-            embedding_client: s.embedding_client.as_ref(),
+            embedding_client: a.embedding_client.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -213,7 +240,7 @@ pub async fn handle_heartbeat(
         }
 
         // Record the heartbeat send for rate limiting
-        if let Err(e) = s.db.record_heartbeat_send().await {
+        if let Err(e) = a.db.record_heartbeat_send().await {
             warn!(error = %e, "failed to record heartbeat send");
         }
     });
@@ -222,8 +249,8 @@ pub async fn handle_heartbeat(
 }
 
 /// Flush previously failed outbound sends (best-effort, up to 5).
-async fn flush_failed_sends(state: &AppState) {
-    let sends = match state.db.get_pending_failed_sends(5).await {
+async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
+    let sends = match agent_state.db.get_pending_failed_sends(5).await {
         Ok(s) if !s.is_empty() => s,
         _ => return,
     };
@@ -231,7 +258,7 @@ async fn flush_failed_sends(state: &AppState) {
     let sender = GatewayMessageSender::new(
         state.gateway_url.clone(),
         state.internal_token.clone(),
-        state.db.clone(),
+        agent_state.db.clone(),
         state.http_client.clone(),
         None,
     );
@@ -239,11 +266,11 @@ async fn flush_failed_sends(state: &AppState) {
     for send in sends {
         match sender.send(&send.text).await {
             Ok(()) => {
-                let _ = state.db.delete_failed_send(send.id).await;
+                let _ = agent_state.db.delete_failed_send(send.id).await;
                 info!(id = send.id, "flushed failed send");
             }
             Err(_) => {
-                let _ = state.db.increment_failed_send_retry(send.id).await;
+                let _ = agent_state.db.increment_failed_send_retry(send.id).await;
             }
         }
     }

@@ -9,8 +9,8 @@ use mika_agent::tools;
 
 use crate::init;
 
-pub async fn run(message: &str) -> Result<()> {
-    let ctx = init::init()?;
+pub async fn run(message: &str, agent_name: &str) -> Result<()> {
+    let ctx = init::init_for_agent(agent_name)?;
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));

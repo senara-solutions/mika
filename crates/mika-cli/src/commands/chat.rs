@@ -7,6 +7,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use mika_agent::agent::{self, AgentParams, check_onboarding};
@@ -14,55 +15,56 @@ use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
-use mika_common::embedding::EmbeddingClient;
-
-use crate::init;
-use crate::tui::app::{AgentRequest, AgentResponse, App};
+use crate::init::{self, AppContext};
+use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole};
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
 
-pub async fn run() -> Result<()> {
-    let ctx = init::init()?;
+/// Holds the agent worker task handle and the AppContext (for DB shutdown).
+struct AgentWorker {
+    handle: JoinHandle<()>,
+    _ctx: AppContext,
+}
+
+/// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
+async fn spawn_agent_worker(
+    ctx: AppContext,
+    _agent_name: &str,
+) -> Result<(
+    AgentWorker,
+    mpsc::UnboundedSender<AgentRequest>,
+    mpsc::UnboundedReceiver<AgentResponse>,
+    String,          // session_id
+    String,          // model
+    String,          // identity_name
+    Arc<SkillRegistry>,
+)> {
     let identity = prompt::load_identity(&ctx.home_dir);
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
-
-    // Create embedding client if OpenAI API key is configured
-    let embedding_client = ctx
-        .settings
-        .openai_api_key
-        .as_ref()
-        .filter(|k| !k.trim().is_empty())
-        .and_then(|key| {
-            EmbeddingClient::new(
-                key.clone(),
-                ctx.settings.embedding_model.clone(),
-                ctx.settings.embedding_dimensions,
-            )
-            .ok()
-        });
+    let embedding_client = ctx.settings.make_embedding_client();
 
     // Recover reminders on startup
-    let scheduler = ReminderScheduler {
-        db: ctx.async_db.clone(),
-        claude: ctx.claude.clone(),
-        tools: tool_registry.clone(),
-        skills: skill_registry.clone(),
-        home_dir: ctx.home_dir.clone(),
-        message_sender: None,
-        embedding_client: embedding_client.clone(),
-    };
-    if let Err(e) = scheduler.recover().await {
-        tracing::warn!(error = %e, "reminder recovery failed");
+    {
+        let scheduler = ReminderScheduler {
+            db: ctx.async_db.clone(),
+            claude: ctx.claude.clone(),
+            tools: tool_registry.clone(),
+            skills: skill_registry.clone(),
+            home_dir: ctx.home_dir.clone(),
+            message_sender: None,
+            embedding_client: embedding_client.clone(),
+        };
+        if let Err(e) = scheduler.recover().await {
+            tracing::warn!(error = %e, "reminder recovery failed");
+        }
     }
 
-    // Channels between TUI and agent worker
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
 
-    // Spawn agent worker task
     let worker_db = ctx.async_db.clone();
     let worker_claude = ctx.claude.clone();
     let worker_tools = tool_registry.clone();
@@ -70,7 +72,7 @@ pub async fn run() -> Result<()> {
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
     let worker_embedding = embedding_client;
-    let agent_handle = tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
                 AgentRequest::Message(text) => {
@@ -110,17 +112,40 @@ pub async fn run() -> Result<()> {
         }
     });
 
+    let model = ctx.settings.claude_model.clone();
+    let identity_name = identity.name.clone();
+
+    let worker = AgentWorker { handle, _ctx: ctx };
+
+    Ok((
+        worker,
+        user_tx,
+        agent_rx,
+        session_id,
+        model,
+        identity_name,
+        skill_registry,
+    ))
+}
+
+pub async fn run(agent_name: &str) -> Result<()> {
+    let ctx = init::init_for_agent(agent_name)?;
+    let (mut worker, user_tx, agent_rx, session_id, model, identity_name, skill_registry) =
+        spawn_agent_worker(ctx, agent_name).await?;
+
     // Build app with shared resources
     let mut app = App::new(
         user_tx,
         agent_rx,
         session_id,
-        ctx.settings.claude_model.clone(),
-        identity.name.clone(),
-        ctx.async_db.clone(),
-        ctx.claude.clone(),
-        ctx.home_dir.clone(),
+        model,
+        identity_name,
+        worker._ctx.async_db.clone(),
+        worker._ctx.claude.clone(),
+        worker._ctx.home_dir.clone(),
         skill_registry,
+        agent_name.to_string(),
+        worker._ctx.global_home.clone(),
     );
 
     // Install panic hook that restores terminal
@@ -162,6 +187,61 @@ pub async fn run() -> Result<()> {
             None => break,
         }
 
+        // Handle agent switch
+        if let Some(target_name) = app.pending_switch.take() {
+            // Wait for the old worker to stop (with timeout)
+            let old_handle = std::mem::replace(
+                &mut worker.handle,
+                tokio::spawn(async {}), // placeholder
+            );
+            let _ = tokio::time::timeout(Duration::from_secs(2), old_handle).await;
+
+            // Initialize the new agent
+            match init::init_for_agent(&target_name) {
+                Ok(new_ctx) => {
+                    match spawn_agent_worker(new_ctx, &target_name).await {
+                        Ok((new_worker, new_tx, new_rx, new_session, new_model, new_identity, new_skills)) => {
+                            // Update app fields
+                            app.agent_tx = new_tx;
+                            app.agent_rx = new_rx;
+                            app.session_id = new_session;
+                            app.model = new_model.clone();
+                            app.identity_name = new_identity;
+                            app.db = new_worker._ctx.async_db.clone();
+                            app.claude = new_worker._ctx.claude.clone();
+                            app.home_dir = new_worker._ctx.home_dir.clone();
+                            app.skills = new_skills;
+                            app.agent_name = target_name.clone();
+
+                            worker = new_worker;
+
+                            app.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                content: format!("Switched to agent '{target_name}' ({new_model})."),
+                                rendered: None,
+                            });
+                        }
+                        Err(e) => {
+                            app.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                content: format!("Failed to switch agent: {e:#}"),
+                                rendered: None,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: format!("Failed to switch agent: {e:#}"),
+                        rendered: None,
+                    });
+                }
+            }
+            app.scroll_offset = 0;
+            app.needs_redraw = true;
+        }
+
         if app.should_quit {
             let _ = app.agent_tx.send(AgentRequest::Quit);
             break;
@@ -175,15 +255,15 @@ pub async fn run() -> Result<()> {
     events.shutdown();
 
     // Check agent worker for panics
-    if agent_handle.is_finished() {
-        if let Err(e) = agent_handle.await {
+    if worker.handle.is_finished() {
+        if let Err(e) = worker.handle.await {
             eprintln!("Agent worker error: {e}");
         }
     } else {
-        agent_handle.abort();
+        worker.handle.abort();
     }
 
-    // Database shutdown happens automatically via Drop on ctx
+    // Database shutdown happens automatically via Drop on worker._ctx
     Ok(())
 }
 
