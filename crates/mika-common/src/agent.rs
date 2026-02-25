@@ -46,7 +46,7 @@ pub fn agent_exists(home_dir: &Path, name: &str) -> bool {
 }
 
 /// List all agents in `{home_dir}/agents/`, returning sorted names
-/// of directories that contain a database file.
+/// of directories that have been bootstrapped (contain a config file).
 pub fn list_agents(home_dir: &Path) -> Vec<String> {
     let agents_dir = home_dir.join("agents");
     let Ok(entries) = std::fs::read_dir(&agents_dir) else {

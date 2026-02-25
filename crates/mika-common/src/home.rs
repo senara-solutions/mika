@@ -19,7 +19,7 @@ pub fn is_initialized(home_dir: &Path) -> bool {
     if home_dir.join("data").join("mika.db").exists() {
         return true;
     }
-    // Multi-agent layout: at least one agent with a DB
+    // Multi-agent layout: at least one bootstrapped agent
     !crate::agent::list_agents(home_dir).is_empty()
 }
 
