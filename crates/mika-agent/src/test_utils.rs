@@ -45,6 +45,7 @@ pub mod test_helpers {
             core_memory_edit_count: edit_count,
             is_onboarding,
             message_sender: None,
+            embedding_client: None,
         }
     }
 

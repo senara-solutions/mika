@@ -42,6 +42,7 @@ pub async fn run(message: &str) -> Result<()> {
         is_onboarding,
         message_sender: None,
         skip_compaction: false,
+        embedding_client: None,
     })
     .await?;
 

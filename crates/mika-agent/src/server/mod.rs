@@ -16,6 +16,7 @@ use tracing::info;
 
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
+use mika_common::embedding::EmbeddingClient;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
@@ -93,6 +94,23 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     );
     let scheduler_sender: Arc<dyn MessageSender> = Arc::new(scheduler_sender);
 
+    // Create embedding client if OpenAI API key is configured
+    let embedding_client = settings
+        .openai_api_key
+        .as_ref()
+        .filter(|k| !k.trim().is_empty())
+        .and_then(|key| {
+            EmbeddingClient::new(
+                key.clone(),
+                settings.embedding_model.clone(),
+                settings.embedding_dimensions,
+            )
+            .ok()
+        });
+    if embedding_client.is_some() {
+        info!("Layer 3 vector search enabled (embedding client configured)");
+    }
+
     let scheduler = Arc::new(ReminderScheduler {
         db: async_db.clone(),
         claude: claude.clone(),
@@ -100,6 +118,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         skills: skill_registry.clone(),
         home_dir: home_dir.to_path_buf(),
         message_sender: Some(scheduler_sender),
+        embedding_client: embedding_client.clone(),
     });
 
     let state = AppState {
@@ -115,6 +134,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         home_dir: home_dir.to_path_buf(),
         startup_time: std::time::Instant::now(),
         http_client,
+        embedding_client,
     };
 
     let app = build_router(state);
@@ -181,6 +201,7 @@ mod tests {
             skills: skills_reg.clone(),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             message_sender: None,
+            embedding_client: None,
         });
         AppState {
             db,
@@ -195,6 +216,7 @@ mod tests {
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             startup_time: std::time::Instant::now(),
             http_client: reqwest::Client::new(),
+            embedding_client: None,
         }
     }
 

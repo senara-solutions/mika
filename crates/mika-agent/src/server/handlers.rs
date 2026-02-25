@@ -115,6 +115,7 @@ pub async fn handle_message(
                 is_onboarding,
                 message_sender: Some(sender_arc.clone()),
                 skip_compaction: true,
+                embedding_client: s.embedding_client.as_ref(),
             };
 
             match agent::run_agent(&params).await {
@@ -204,6 +205,7 @@ pub async fn handle_heartbeat(
             home_dir: &s.home_dir,
             session_id: &session_id,
             message_sender: Some(sender_arc),
+            embedding_client: s.embedding_client.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use mika_common::embedding::EmbeddingClient;
+
 use crate::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
@@ -25,6 +27,7 @@ pub struct ReminderScheduler {
     pub skills: Arc<SkillRegistry>,
     pub home_dir: PathBuf,
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    pub embedding_client: Option<EmbeddingClient>,
 }
 
 impl ReminderScheduler {
@@ -104,6 +107,7 @@ impl ReminderScheduler {
                 home_dir: &self.home_dir,
                 session_id: &session_id,
                 message_sender: self.message_sender.clone(),
+                embedding_client: self.embedding_client.as_ref(),
             };
 
             if let Err(e) = run_silent_agent(&params).await {

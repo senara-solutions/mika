@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicU32;
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use mika_common::embedding::EmbeddingClient;
 
 /// Maximum length (in characters) allowed for any single string input to a tool.
 pub const MAX_INPUT_LEN: usize = 10_000;
@@ -29,6 +30,7 @@ pub struct ToolContext<'a> {
     pub core_memory_edit_count: &'a AtomicU32,
     pub is_onboarding: bool,
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    pub embedding_client: Option<&'a EmbeddingClient>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
