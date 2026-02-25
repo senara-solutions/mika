@@ -44,7 +44,15 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => commands::status::run(&agent_name).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills { name }) => commands::skills::run(name, &agent_name).await,
-        Some(Commands::Ask { message }) => commands::ask::run(&message, &agent_name).await,
+        Some(Commands::Ask { message }) => {
+            match commands::ask::run(&message, &agent_name).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Commands::Agents(args)) => commands::agents::run(args).await,
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
     }
