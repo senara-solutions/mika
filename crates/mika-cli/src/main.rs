@@ -48,9 +48,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "warn".to_string());
 
     // Initialize tracing with correct agent-specific directory and configured level.
-    // TUI commands write to stderr which ratatui's alternate screen handles.
+    // Suppress stderr in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
+    // so stderr output would corrupt the TUI display.
     // The _log_guard MUST stay alive until the end of main — dropping it stops file logging.
-    let _log_guard = mika_common::logging::init_pretty(&log_level, log_dir.as_deref());
+    let is_tui = matches!(cli.command, None | Some(Commands::Chat));
+    let _log_guard = mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), is_tui);
 
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat
