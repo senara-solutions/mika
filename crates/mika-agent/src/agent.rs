@@ -122,6 +122,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         is_onboarding: params.is_onboarding,
         current_utc: chrono::Utc::now(),
         timezone,
+        global_home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -517,6 +518,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<String> {
         is_onboarding: false,
         current_utc: chrono::Utc::now(),
         timezone,
+        global_home_dir: None, // Team agents don't need team discovery in their prompt
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 

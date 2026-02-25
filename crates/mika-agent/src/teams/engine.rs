@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use mika_common::agent;
@@ -38,10 +39,10 @@ pub struct TeamEngine {
     run: TeamRun,
     workspace_dir: PathBuf,
     history_dir: PathBuf,
-    agents: HashMap<String, AgentResources>,
+    agents: Arc<HashMap<String, AgentResources>>,
     claude: ClaudeClient,
-    tool_registry: ToolRegistry,
-    progress: Option<ProgressCallback>,
+    tool_registry: Arc<ToolRegistry>,
+    progress: Option<Arc<ProgressCallback>>,
 }
 
 impl TeamEngine {
@@ -118,10 +119,10 @@ impl TeamEngine {
             run,
             workspace_dir,
             history_dir,
-            agents,
+            agents: Arc::new(agents),
             claude,
-            tool_registry,
-            progress,
+            tool_registry: Arc::new(tool_registry),
+            progress: progress.map(Arc::new),
         })
     }
 
@@ -146,7 +147,7 @@ impl TeamEngine {
         }
 
         // Shutdown all AsyncDatabase instances to avoid thread leaks (#256)
-        for (_, resources) in &self.agents {
+        for resources in self.agents.values() {
             resources.db.shutdown();
         }
 
@@ -232,40 +233,137 @@ impl TeamEngine {
         parse_task_assignments(&response, &self.team)
     }
 
-    /// Execute all tasks by delegating to specialist agents.
+    /// Execute all tasks by delegating to specialist agents concurrently.
+    ///
+    /// Uses `tokio::task::JoinSet` to run all specialist agents in parallel.
+    /// Each agent has its own AsyncDatabase and the workspace is shared via
+    /// the filesystem, so there are no shared mutable state concerns.
     async fn execute_tasks(&mut self) -> Result<()> {
-        for i in 0..self.run.tasks.len() {
-            // Clone values from task before mutating
-            let agent_name = self.run.tasks[i].agent.clone();
-            let role = self.run.tasks[i].role.clone();
-            let task_desc = self.run.tasks[i].task.clone();
-            let output_file = self.run.tasks[i].output_file.clone();
+        // Prepare shared resources that will be moved into spawned tasks.
+        let agents = Arc::clone(&self.agents);
+        let claude = self.claude.clone();
+        let tool_registry = Arc::clone(&self.tool_registry);
+        let run_id = self.run.run_id.clone();
+        let progress = self.progress.clone();
+        let team_name = self.run.team_name.clone();
 
-            self.report_progress(&format!("Running {agent_name}..."));
-            self.run.tasks[i].status = TaskStatus::Running;
+        // Build per-task parameters upfront from self (avoids borrowing self in spawned tasks).
+        struct TaskInput {
+            index: usize,
+            agent_name: String,
+            task_desc: String,
+            context: String,
+        }
+
+        let mut inputs = Vec::with_capacity(self.run.tasks.len());
+        for (i, task) in self.run.tasks.iter_mut().enumerate() {
+            task.status = TaskStatus::Running;
 
             let mandate = self
                 .team
                 .agents
                 .iter()
-                .find(|a| a.name == agent_name)
+                .find(|a| a.name == task.agent)
                 .map(|a| a.mandate.as_str())
                 .unwrap_or("Complete the assigned task");
 
             let context =
-                prompt::build_specialist_context(&role, mandate, &task_desc, &output_file);
+                prompt::build_specialist_context(&task.role, mandate, &task.task, &task.output_file);
 
-            match self.run_agent(&agent_name, &task_desc, &context).await {
-                Ok(_response) => {
-                    self.run.tasks[i].status = TaskStatus::Completed;
-                    info!(agent = %agent_name, "task completed");
+            inputs.push(TaskInput {
+                index: i,
+                agent_name: task.agent.clone(),
+                task_desc: task.task.clone(),
+                context,
+            });
+        }
+
+        self.report_progress(&format!(
+            "Running {} specialist agents in parallel...",
+            inputs.len()
+        ));
+
+        // Spawn all tasks concurrently via JoinSet.
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for input in inputs {
+            let agents = Arc::clone(&agents);
+            let claude = claude.clone();
+            let tool_registry = Arc::clone(&tool_registry);
+            let run_id = run_id.clone();
+            let progress = progress.clone();
+            let team_name = team_name.clone();
+
+            join_set.spawn(async move {
+                let agent_name = &input.agent_name;
+
+                // Report that this agent is starting.
+                info!(team = %team_name, "Running {agent_name}...");
+                if let Some(ref cb) = progress {
+                    cb(&format!("Running {agent_name}..."));
                 }
-                Err(e) => {
-                    self.run.tasks[i].status = TaskStatus::Failed(e.to_string());
-                    warn!(agent = %agent_name, error = %e, "task failed");
+
+                let resources = agents
+                    .get(agent_name.as_str())
+                    .with_context(|| format!("agent '{}' not found in team resources", agent_name));
+
+                let result = match resources {
+                    Ok(resources) => {
+                        let session_id = format!("team-{}-{}", run_id, agent_name);
+                        let params = TeamAgentParams {
+                            db: &resources.db,
+                            claude: &claude,
+                            tools: &tool_registry,
+                            skills: &resources.skills,
+                            home_dir: &resources.home_dir,
+                            task_message: &input.task_desc,
+                            team_context: &input.context,
+                            session_id: &session_id,
+                            embedding_client: resources.embedding_client.as_ref(),
+                        };
+                        crate::agent::run_team_agent(&params).await
+                    }
+                    Err(e) => Err(e),
+                };
+
+                // Report completion/failure for this agent.
+                match &result {
+                    Ok(_) => {
+                        info!(agent = %agent_name, "task completed");
+                        if let Some(ref cb) = progress {
+                            cb(&format!("{agent_name} completed"));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent = %agent_name, error = %e, "task failed");
+                        if let Some(ref cb) = progress {
+                            cb(&format!("{agent_name} failed: {e}"));
+                        }
+                    }
+                }
+
+                (input.index, input.agent_name, result)
+            });
+        }
+
+        // Collect results as tasks complete and update statuses.
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((index, _agent_name, result)) => match result {
+                    Ok(_) => {
+                        self.run.tasks[index].status = TaskStatus::Completed;
+                    }
+                    Err(e) => {
+                        self.run.tasks[index].status = TaskStatus::Failed(e.to_string());
+                    }
+                },
+                Err(join_error) => {
+                    // A JoinError means the task panicked or was cancelled.
+                    warn!(error = %join_error, "spawned task failed unexpectedly");
                 }
             }
         }
+
         Ok(())
     }
 

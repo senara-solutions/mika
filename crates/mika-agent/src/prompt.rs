@@ -1,5 +1,6 @@
 use crate::db::{Commitment, CoreMemoryEntry, core_memory_section_names};
 use chrono::{DateTime, Utc};
+use mika_common::team;
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
@@ -58,6 +59,9 @@ pub struct PromptContext<'a> {
     pub is_onboarding: bool,
     pub current_utc: DateTime<Utc>,
     pub timezone: Option<String>,
+    /// Global home directory, used to discover teams.
+    /// When `None`, the teams section is omitted from the prompt.
+    pub global_home_dir: Option<&'a Path>,
 }
 
 fn onboarding_prompt() -> String {
@@ -148,6 +152,27 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push('\n');
         prompt.push_str(&onboarding_prompt());
         prompt.push('\n');
+    }
+
+    // Teams section (only if teams are configured)
+    if let Some(home_dir) = ctx.global_home_dir {
+        let teams = team::list_teams(home_dir);
+        if !teams.is_empty() {
+            prompt.push_str("\n## Teams\n");
+            prompt.push_str(
+                "You can run team workflows using the `run_team` tool. Available teams:\n",
+            );
+            for name in &teams {
+                match team::load_team(home_dir, name) {
+                    Ok(def) => {
+                        writeln!(prompt, "- {} ({} agents)", name, def.agents.len()).unwrap();
+                    }
+                    Err(_) => {
+                        writeln!(prompt, "- {} (unable to load)", name).unwrap();
+                    }
+                }
+            }
+        }
     }
 
     prompt
@@ -244,6 +269,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -261,6 +287,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -283,6 +310,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -299,6 +327,7 @@ mod tests {
             is_onboarding: true,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -316,6 +345,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -354,6 +384,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -438,6 +469,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -456,6 +488,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: Some("+08:00".to_string()),
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -473,6 +506,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -495,6 +529,7 @@ mod tests {
             is_onboarding: false,
             current_utc: test_time(),
             timezone: None,
+            global_home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -548,5 +583,85 @@ mod tests {
         assert!(prompt.contains("## Current Time"));
         assert!(prompt.contains("UTC: 2026-02-24T12:00:00Z"));
         assert!(prompt.contains("User timezone: -05:00"));
+    }
+
+    #[test]
+    fn test_prompt_includes_teams_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_dir = tmp.path().join("teams").join("dev-team");
+        std::fs::create_dir_all(&team_dir).unwrap();
+        std::fs::write(
+            team_dir.join("team.toml"),
+            r#"
+[team]
+name = "dev-team"
+orchestrator = "planner"
+
+[[agents]]
+name = "planner"
+role = "orchestrator"
+mandate = "Plan tasks"
+
+[[agents]]
+name = "coder"
+role = "specialist"
+mandate = "Write code"
+
+[flow]
+max_iterations = 3
+"#,
+        )
+        .unwrap();
+
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: Some(tmp.path()),
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Teams"));
+        assert!(prompt.contains("run_team"));
+        assert!(prompt.contains("dev-team (2 agents)"));
+    }
+
+    #[test]
+    fn test_prompt_omits_teams_when_none_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: Some(tmp.path()),
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Teams"));
+    }
+
+    #[test]
+    fn test_prompt_omits_teams_when_home_dir_none() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Teams"));
     }
 }

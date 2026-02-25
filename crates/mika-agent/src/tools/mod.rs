@@ -1,8 +1,10 @@
 mod cancel_reminder;
 mod create_reminder;
 mod list_reminders;
+mod list_teams;
 mod list_workspace;
 mod read_workspace;
+mod run_team;
 mod search_memory;
 mod send_message;
 mod store_fact;
@@ -13,6 +15,7 @@ mod write_workspace;
 use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
+use mika_common::config::Settings;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -186,4 +189,20 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
     registry.register(Box::new(send_message::SendMessageTool));
     registry
+}
+
+/// Create team-related tools (list_teams + run_team).
+///
+/// These are separate from `default_tools()` so they can be conditionally
+/// added only when teams are configured.
+pub fn team_agent_tools(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(list_teams::ListTeamsTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
+        Box::new(run_team::RunTeamTool {
+            home_dir: home_dir.to_path_buf(),
+            settings: settings.clone(),
+        }),
+    ]
 }
