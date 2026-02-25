@@ -47,22 +47,6 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Create an EmbeddingClient if OpenAI API key is configured.
-fn make_embedding_client(settings: &Settings) -> Option<EmbeddingClient> {
-    settings
-        .openai_api_key
-        .as_ref()
-        .filter(|k| !k.trim().is_empty())
-        .and_then(|key| {
-            EmbeddingClient::new(
-                key.clone(),
-                settings.embedding_model.clone(),
-                settings.embedding_dimensions,
-            )
-            .ok()
-        })
-}
-
 /// Initialize a single agent and return its AgentState.
 fn init_agent(
     agent_name: &str,
@@ -147,7 +131,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("MIKA_INTERNAL_TOKEN is required in server mode"))?;
 
-    let embedding_client = make_embedding_client(settings);
+    let embedding_client = settings.make_embedding_client();
     if embedding_client.is_some() {
         info!("Layer 3 vector search enabled (embedding client configured)");
     }
@@ -174,7 +158,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
             )?;
-            agents.insert(agent::DEFAULT_AGENT.to_string(), agent_state);
+            agents.insert(agent::DEFAULT_AGENT.to_string(), Arc::new(agent_state));
             schedulers.push(scheduler);
         }
     } else {
@@ -191,7 +175,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 embedding_client.clone(),
             ) {
                 Ok((agent_state, scheduler)) => {
-                    agents.insert(name.clone(), agent_state);
+                    agents.insert(name.clone(), Arc::new(agent_state));
                     schedulers.push(scheduler);
                 }
                 Err(e) => {
@@ -300,7 +284,7 @@ mod tests {
         };
 
         let mut agents = HashMap::new();
-        agents.insert("main".to_string(), agent_state);
+        agents.insert("main".to_string(), Arc::new(agent_state));
 
         AppState {
             agents: Arc::new(agents),

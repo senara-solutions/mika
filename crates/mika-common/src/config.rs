@@ -87,6 +87,21 @@ fn default_embedding_dimensions() -> u32 {
 }
 
 impl Settings {
+    /// Create an EmbeddingClient if OpenAI API key is configured.
+    pub fn make_embedding_client(&self) -> Option<crate::embedding::EmbeddingClient> {
+        self.openai_api_key
+            .as_ref()
+            .filter(|k| !k.trim().is_empty())
+            .and_then(|key| {
+                crate::embedding::EmbeddingClient::new(
+                    key.clone(),
+                    self.embedding_model.clone(),
+                    self.embedding_dimensions,
+                )
+                .ok()
+            })
+    }
+
     /// Load settings from config files + environment variables.
     ///
     /// Config cascade (lowest to highest priority):

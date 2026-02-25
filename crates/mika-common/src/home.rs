@@ -33,6 +33,20 @@ pub fn is_legacy_layout(home_dir: &Path) -> bool {
     home_dir.join("data").join("mika.db").exists() && !is_multi_agent_layout(home_dir)
 }
 
+/// Bootstrap a fresh installation with multi-agent layout.
+///
+/// Creates the `agents/` directory, initializes the default agent,
+/// sets it as active, and writes the root-level global config.
+pub fn bootstrap_fresh_install(home_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(home_dir.join("agents"))
+        .with_context(|| format!("failed to create {}/agents/", home_dir.display()))?;
+    bootstrap_agent(home_dir, crate::agent::DEFAULT_AGENT)
+        .with_context(|| "failed to initialize default agent".to_string())?;
+    write_active_agent(home_dir, crate::agent::DEFAULT_AGENT)?;
+    write_default_if_missing(home_dir, "config.toml", DEFAULT_GLOBAL_CONFIG)?;
+    Ok(())
+}
+
 /// Bootstrap a named agent under the multi-agent layout.
 /// Validates the name, creates `{home_dir}/agents/{name}/`, and calls `bootstrap()`.
 pub fn bootstrap_agent(home_dir: &Path, name: &str) -> Result<()> {
@@ -71,18 +85,24 @@ pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&agent)
         .with_context(|| format!("failed to create {}", agent.display()))?;
 
-    // Move directories
+    // Move directories (fault-tolerant: NotFound means another process already moved it)
     for dir_name in &["data", "logs", "skills", "exports"] {
         let src = home_dir.join(dir_name);
         if src.is_dir() {
             let dst = agent.join(dir_name);
-            std::fs::rename(&src, &dst).with_context(|| {
-                format!("failed to move {} to {}", src.display(), dst.display())
-            })?;
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // already moved
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to move {} to {}", src.display(), dst.display())
+                    });
+                }
+            }
         }
     }
 
-    // Move files
+    // Move files (fault-tolerant: NotFound means another process already moved it)
     for filename in &[
         "config.toml",
         "identity.toml",
@@ -93,9 +113,15 @@ pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
         let src = home_dir.join(filename);
         if src.is_file() {
             let dst = agent.join(filename);
-            std::fs::rename(&src, &dst).with_context(|| {
-                format!("failed to move {} to {}", src.display(), dst.display())
-            })?;
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // already moved
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to move {} to {}", src.display(), dst.display())
+                    });
+                }
+            }
         }
     }
 
@@ -135,13 +161,6 @@ pub const DEFAULT_GLOBAL_CONFIG: &str = r#"# Mika global configuration (shared a
 #   MIKA_OPENAI_API_KEY   — OpenAI API key (optional, for vector search)
 
 log_level = "info"
-"#;
-
-/// Default per-agent config template.
-pub const DEFAULT_AGENT_CONFIG: &str = r#"# Per-agent config overrides.
-# API keys inherited from env vars.
-# claude_model = "claude-sonnet-4-6"
-# claude_max_tokens = 4096
 "#;
 
 /// Create the ~/.mika/ directory structure with default files.
@@ -214,7 +233,7 @@ fn seed_default_skills(home_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_default_if_missing(dir: &Path, filename: &str, content: &str) -> Result<()> {
+pub fn write_default_if_missing(dir: &Path, filename: &str, content: &str) -> Result<()> {
     let path = dir.join(filename);
     if !path.exists() {
         std::fs::write(&path, content)
@@ -223,10 +242,6 @@ fn write_default_if_missing(dir: &Path, filename: &str, content: &str) -> Result
     Ok(())
 }
 
-/// Public variant for external callers (e.g., setup command).
-pub fn write_default_if_missing_pub(dir: &Path, filename: &str, content: &str) -> Result<()> {
-    write_default_if_missing(dir, filename, content)
-}
 
 #[cfg(unix)]
 fn set_permissions(home_dir: &Path) -> Result<()> {
@@ -586,5 +601,31 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("active_agent"), "  \n").unwrap();
         assert_eq!(read_active_agent(tmp.path()), "main");
+    }
+
+    #[test]
+    fn test_bootstrap_fresh_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        bootstrap_fresh_install(home).unwrap();
+
+        // Multi-agent layout created
+        assert!(is_multi_agent_layout(home));
+
+        // Default agent bootstrapped
+        let main_agent = home.join("agents").join("main");
+        assert!(main_agent.join("data").is_dir());
+        assert!(main_agent.join("logs").is_dir());
+        assert!(main_agent.join("skills").is_dir());
+        assert!(main_agent.join("config.toml").is_file());
+        assert!(main_agent.join("soul.md").is_file());
+
+        // Active agent set to "main"
+        assert_eq!(read_active_agent(home), "main");
+
+        // Root-level global config written
+        let root_config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(root_config.contains("global"));
     }
 }

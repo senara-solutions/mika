@@ -8,17 +8,7 @@ async fn main() -> Result<()> {
     let home_dir = mika_common::home::resolve_home_dir()?;
 
     if !mika_common::home::is_initialized(&home_dir) {
-        // Bootstrap as multi-agent layout from the start
-        std::fs::create_dir_all(home_dir.join("agents"))
-            .with_context(|| format!("failed to create {}/agents/", home_dir.display()))?;
-        mika_common::home::bootstrap_agent(&home_dir, mika_common::agent::DEFAULT_AGENT)
-            .with_context(|| format!("failed to initialize default agent"))?;
-        mika_common::home::write_active_agent(&home_dir, mika_common::agent::DEFAULT_AGENT)?;
-        mika_common::home::write_default_if_missing_pub(
-            &home_dir,
-            "config.toml",
-            mika_common::home::DEFAULT_GLOBAL_CONFIG,
-        )?;
+        mika_common::home::bootstrap_fresh_install(&home_dir)?;
     }
 
     let settings = mika_common::config::Settings::load(&home_dir)

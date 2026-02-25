@@ -12,17 +12,14 @@ pub async fn run(agent_name: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Bootstrap as multi-agent layout directly: create agents/{name}/
-    std::fs::create_dir_all(home_dir.join("agents"))
-        .with_context(|| format!("failed to create {}/agents/", home_dir.display()))?;
+    home::bootstrap_fresh_install(&home_dir)?;
 
-    home::bootstrap_agent(&home_dir, agent_name)
-        .with_context(|| format!("failed to initialize agent '{agent_name}'"))?;
-
-    home::write_active_agent(&home_dir, agent_name)?;
-
-    // Write root-level shared config
-    home::write_default_if_missing_pub(&home_dir, "config.toml", home::DEFAULT_GLOBAL_CONFIG)?;
+    // If a custom agent name was requested, bootstrap it and set as active
+    if agent_name != mika_common::agent::DEFAULT_AGENT {
+        home::bootstrap_agent(&home_dir, agent_name)
+            .with_context(|| format!("failed to initialize agent '{agent_name}'"))?;
+        home::write_active_agent(&home_dir, agent_name)?;
+    }
 
     let agent_home = home::resolve_agent_home(&home_dir, agent_name);
     println!(

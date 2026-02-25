@@ -55,9 +55,9 @@ pub async fn handle_message(
             .into_response();
     }
 
-    // Resolve agent state
+    // Resolve agent state (Arc clone — cheap atomic increment)
     let agent_state = match state.resolve_agent(&req.agent) {
-        Some(a) => a.clone(),
+        Some(a) => a,
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -186,9 +186,9 @@ pub async fn handle_heartbeat(
 ) -> impl IntoResponse {
     info!(request_id = %req.request_id, "heartbeat received");
 
-    // Resolve agent state
+    // Resolve agent state (Arc clone — cheap atomic increment)
     let agent_state = match state.resolve_agent(&req.agent) {
-        Some(a) => a.clone(),
+        Some(a) => a,
         None => {
             info!(request_id = %req.request_id, agent = %req.agent, "heartbeat for unknown agent, skipping");
             return StatusCode::NO_CONTENT;

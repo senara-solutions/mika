@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use mika_common::agent;
 use mika_common::claude::ClaudeClient;
 use mika_common::embedding::EmbeddingClient;
 use secrecy::SecretString;
@@ -30,7 +31,9 @@ pub struct AgentState {
 #[derive(Clone)]
 pub struct AppState {
     /// Per-agent state, keyed by agent name (e.g. "main", "work").
-    pub agents: Arc<HashMap<String, AgentState>>,
+    /// Each AgentState is Arc-wrapped so handler clones are a cheap atomic increment
+    /// instead of 3 heap allocations (PathBuf + EmbeddingClient strings).
+    pub agents: Arc<HashMap<String, Arc<AgentState>>>,
     /// Default agent name (resolved from active_agent file).
     pub default_agent: String,
     pub claude: ClaudeClient,
@@ -45,13 +48,16 @@ pub struct AppState {
 impl AppState {
     /// Resolve the AgentState for a given agent name.
     /// Falls back to the default agent if the name is empty.
-    pub fn resolve_agent(&self, name: &str) -> Option<&AgentState> {
+    /// Returns an Arc clone (cheap atomic increment) instead of a reference,
+    /// so callers don't need to clone the inner AgentState.
+    pub fn resolve_agent(&self, name: &str) -> Option<Arc<AgentState>> {
         let effective = if name.is_empty() {
             &self.default_agent
         } else {
             name
         };
-        self.agents.get(effective)
+        let normalized = agent::normalize_agent_name(effective);
+        self.agents.get(&normalized).cloned()
     }
 }
 

@@ -135,7 +135,7 @@ fn clone(global_home: &std::path::Path, source: &str, target: &str) -> Result<()
     // Copy skills directory
     let src_skills = src_dir.join("skills");
     if src_skills.is_dir() {
-        copy_dir_recursive(&src_skills, &dst_dir.join("skills"))?;
+        copy_dir_recursive(&src_skills, &dst_dir.join("skills"), 0)?;
     }
 
     println!("\n  Cloned '{source}' personality into new agent '{target}'.");
@@ -143,14 +143,20 @@ fn clone(global_home: &std::path::Path, source: &str, target: &str) -> Result<()
     Ok(())
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path, depth: u32) -> Result<()> {
+    if depth > 10 {
+        bail!("directory nesting too deep while copying {}", src.display());
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            continue;
+        }
         let dst_path = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
+            copy_dir_recursive(&entry.path(), &dst_path, depth + 1)?;
         } else {
             std::fs::copy(entry.path(), &dst_path)?;
         }

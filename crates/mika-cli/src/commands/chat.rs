@@ -15,8 +15,6 @@ use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
-use mika_common::embedding::EmbeddingClient;
-
 use crate::init::{self, AppContext};
 use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole};
 use crate::tui::event::{AppEvent, EventReader};
@@ -29,25 +27,10 @@ struct AgentWorker {
     _ctx: AppContext,
 }
 
-fn make_embedding_client(ctx: &AppContext) -> Option<EmbeddingClient> {
-    ctx.settings
-        .openai_api_key
-        .as_ref()
-        .filter(|k| !k.trim().is_empty())
-        .and_then(|key| {
-            EmbeddingClient::new(
-                key.clone(),
-                ctx.settings.embedding_model.clone(),
-                ctx.settings.embedding_dimensions,
-            )
-            .ok()
-        })
-}
-
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
 async fn spawn_agent_worker(
     ctx: AppContext,
-    agent_name: &str,
+    _agent_name: &str,
 ) -> Result<(
     AgentWorker,
     mpsc::UnboundedSender<AgentRequest>,
@@ -61,7 +44,7 @@ async fn spawn_agent_worker(
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
-    let embedding_client = make_embedding_client(&ctx);
+    let embedding_client = ctx.settings.make_embedding_client();
 
     // Recover reminders on startup
     {
@@ -131,7 +114,6 @@ async fn spawn_agent_worker(
 
     let model = ctx.settings.claude_model.clone();
     let identity_name = identity.name.clone();
-    let _agent_name = agent_name.to_string();
 
     let worker = AgentWorker { handle, _ctx: ctx };
 
