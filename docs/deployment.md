@@ -4,23 +4,6 @@ Operator-focused documentation for deploying Mika in hosted mode on Kubernetes.
 
 ---
 
-## Table of Contents
-
-1. [Architecture Overview](#1-architecture-overview)
-2. [Prerequisites](#2-prerequisites)
-3. [Building Docker Images](#3-building-docker-images)
-4. [Setting Up Telegram Bot](#4-setting-up-telegram-bot)
-5. [Deploying the Gateway](#5-deploying-the-gateway)
-6. [Provisioning a Customer](#6-provisioning-a-customer)
-7. [Customer Pairing Flow](#7-customer-pairing-flow)
-8. [Heartbeat CronJob](#8-heartbeat-cronjob)
-9. [Deprovisioning](#9-deprovisioning)
-10. [Helm Values Reference](#10-helm-values-reference)
-11. [Security](#11-security)
-12. [Troubleshooting](#12-troubleshooting)
-
----
-
 ## 1. Architecture Overview
 
 Mika uses a hub-and-spoke architecture with per-customer container isolation.
@@ -185,11 +168,11 @@ Save the bot username (without the `@` prefix). You will need this for:
 
 ### Step 3: Generate the Webhook Secret
 
-Generate a 64-character hex secret for validating inbound Telegram webhooks:
+Generate a 64-character hex token for validating inbound Telegram webhooks (see
+[Token Generation](#token-generation) for the command):
 
 ```bash
-export MIKA_TELEGRAM_WEBHOOK_SECRET=$(openssl rand -hex 32)
-echo "$MIKA_TELEGRAM_WEBHOOK_SECRET"
+export MIKA_TELEGRAM_WEBHOOK_SECRET=<generated-token>
 ```
 
 Save this value. It will be used in `setup-gateway.sh` and when registering the webhook with Telegram.
@@ -220,11 +203,12 @@ curl "https://api.telegram.org/bot${MIKA_TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 
 ### Step 1: Generate the Internal Token
 
-The internal token authenticates communication between the gateway and customer containers. It must be a 64-character hex string (32 random bytes):
+The internal token authenticates communication between the gateway and customer
+containers. Generate a 64-character hex token as described in
+[Token Generation](#token-generation):
 
 ```bash
-export MIKA_INTERNAL_TOKEN=$(openssl rand -hex 32)
-echo "$MIKA_INTERNAL_TOKEN"
+export MIKA_INTERNAL_TOKEN=<generated-token>
 ```
 
 Save this token securely. Every customer container and the gateway must share the same internal token.
@@ -297,29 +281,21 @@ kubectl logs -n mika-system deploy/mika-gateway
 
 ### Gateway Endpoints
 
-| Method | Path | Auth | Purpose |
-|--------|------|------|---------|
-| POST | `/webhook/telegram` | X-Telegram-Bot-Api-Secret-Token header | Receive Telegram updates |
-| POST | `/send` | Bearer token | Relay outbound messages to Telegram |
-| GET | `/health` | None | Alias for `/readyz` |
-| GET | `/readyz` | None | Readiness probe (checks ready flag + Postgres) |
-| GET | `/livez` | None | Liveness probe (always 200) |
+The gateway exposes `/webhook/telegram` (inbound from Telegram), `/send`
+(outbound relay from containers), and health probe endpoints (`/health`,
+`/readyz`, `/livez`). See the
+[Gateway Endpoints](architecture.md#endpoints) table in the architecture
+document for full details including auth requirements.
 
 ### Gateway Environment Variables
 
-The gateway loads all configuration from `MIKA_`-prefixed environment variables:
+The gateway requires `MIKA_DATABASE_URL`, `MIKA_TELEGRAM_BOT_TOKEN`,
+`MIKA_TELEGRAM_WEBHOOK_SECRET`, `MIKA_TELEGRAM_WEBHOOK_URL`, and
+`MIKA_INTERNAL_TOKEN`. Both token variables are validated at startup to be
+exactly 64 hex characters.
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `MIKA_DATABASE_URL` | Yes | -- | Postgres connection string |
-| `MIKA_TELEGRAM_BOT_TOKEN` | Yes | -- | Telegram Bot API token |
-| `MIKA_TELEGRAM_WEBHOOK_SECRET` | Yes | -- | 64-char hex, webhook validation |
-| `MIKA_TELEGRAM_WEBHOOK_URL` | Yes | -- | Public webhook URL |
-| `MIKA_INTERNAL_TOKEN` | Yes | -- | 64-char hex, bearer auth |
-| `MIKA_GATEWAY_PORT` | No | `8080` | Listen port |
-| `MIKA_LOG_LEVEL` | No | `info` | Log level |
-
-All secret values have `[REDACTED]` in Debug output. Both `MIKA_INTERNAL_TOKEN` and `MIKA_TELEGRAM_WEBHOOK_SECRET` are validated at startup to be exactly 64 hex characters.
+See [Gateway Environment Variables](configuration.md#gateway) for the complete
+reference table.
 
 ---
 
@@ -604,8 +580,8 @@ Done. Succeeded: 4, Failed: 1
 ```
 
 Failed heartbeats are logged with the customer ID and HTTP status code. Common non-error status codes:
-- **202:** Heartbeat accepted, agent will process.
-- **204/200:** Heartbeat skipped by pre-filter (outside active hours, rate limited, etc.).
+- **200:** Heartbeat accepted, agent will process.
+- **204:** Heartbeat skipped by pre-filter (outside active hours, rate limited, etc.).
 - **429:** Agent is busy processing another request.
 
 ---
@@ -787,40 +763,11 @@ This applies to:
 
 ### Constant-Time Comparison
 
-All token comparisons use the `subtle` crate's `ConstantTimeEq` trait to prevent timing attacks:
-
-```rust
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
-}
-```
-
-Both the webhook secret header and Bearer token middleware use this function. Token length is validated at startup (must be exactly 64 hex chars) to eliminate length-based timing leaks from `ct_eq`.
+All token comparisons use the `subtle` crate's `ConstantTimeEq` trait to prevent timing attacks. Both the webhook secret header and Bearer token middleware use the `constant_time_eq` helper (see `crates/mika-gateway/src/routes.rs:449`). Token length is validated at startup (must be exactly 64 hex chars) to eliminate length-based timing leaks from `ct_eq`.
 
 ### Non-Root Containers
 
-Both images run as user `mika` (UID 1000). The Helm charts enforce this with pod security context:
-
-```yaml
-securityContext:
-  runAsUser: 1000
-  runAsGroup: 1000
-  runAsNonRoot: true
-  fsGroup: 1000
-  seccompProfile:
-    type: RuntimeDefault
-```
-
-Container-level security context:
-
-```yaml
-securityContext:
-  allowPrivilegeEscalation: false
-  capabilities:
-    drop:
-      - ALL
-  readOnlyRootFilesystem: true
-```
+Both images run as user `mika` (UID 1000). The Helm charts enforce this with pod security context: `runAsUser/runAsGroup: 1000`, `runAsNonRoot: true`, `fsGroup: 1000`, and `seccompProfile: RuntimeDefault`. Container-level security context sets `allowPrivilegeEscalation: false`, drops all capabilities, and enables `readOnlyRootFilesystem: true`. See the Helm chart templates in `helm/mika-customer/` and `helm/mika-gateway/` for the exact YAML.
 
 ### Read-Only Root Filesystem
 
@@ -838,15 +785,7 @@ Data at rest is encrypted at the cloud provider level. SQLite databases are stor
 
 ### SSRF Prevention
 
-Container URLs are computed deterministically from the customer UUID in gateway code:
-
-```rust
-fn container_url(customer_id: &Uuid) -> String {
-    format!("http://mika-{customer_id}.mika-agents.svc.cluster.local:8080")
-}
-```
-
-No user-controlled input influences the URL. The gateway never forwards to arbitrary destinations.
+Container URLs are computed deterministically from the customer UUID via the `container_url()` function (see `crates/mika-gateway/src/routes.rs:163`). No user-controlled input influences the URL. The gateway never forwards to arbitrary destinations.
 
 ### Request Body Limits
 

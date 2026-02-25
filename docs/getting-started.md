@@ -123,49 +123,19 @@ Remember that Sarah Chen is my CTO and prefers async communication.
 Remind me to review the Q3 budget next Monday at 9am.
 ```
 
-Inside the chat TUI, slash commands are available. Type `/help` to see them all:
-
-| Command                   | Aliases         | Description                       |
-|---------------------------|-----------------|-----------------------------------|
-| `/help`                   | `/h`, `/?`      | List available commands           |
-| `/clear [--all]`          |                 | Clear chat display (--all for DB) |
-| `/exit`                   | `/quit`, `/q`   | Quit mika                         |
-| `/compact`                |                 | Compact conversation history      |
-| `/memory [search <query>]`| `/mem`          | Show core memory blocks           |
-| `/reminders`              | `/remind`       | List active reminders             |
-| `/status`                 | `/stat`         | Show system health info           |
-| `/soul`                   |                 | Display current soul.md           |
-| `/config`                 | `/cfg`          | Show current config               |
-| `/model`                  |                 | Show active model                 |
-| `/export`                 |                 | Export conversation to markdown   |
-| `/skills`                 |                 | List loaded skills                |
-| `/skill <name>`           |                 | Show skill details                |
-
-Slash commands autocomplete as you type -- press Tab or arrow keys to navigate
-suggestions.
+Inside the chat TUI, slash commands are available. Key commands include `/help`
+(list all commands), `/status` (system health), and `/memory` (inspect stored
+memory). Slash commands autocomplete as you type -- press Tab or arrow keys to
+navigate suggestions. See [Slash Commands Reference](slash-commands.md) for the
+complete list.
 
 ---
 
 ## 6. Directory structure
 
-After initialization, `~/.mika/` contains:
-
-```
-~/.mika/
-  config.toml      -- Config overrides (model, max tokens, log level)
-  identity.toml    -- Agent name ("Mika") and display emoji
-  soul.md          -- Personality definition (editable)
-  heartbeat.md     -- Heartbeat checklist for proactive behaviors
-  user.md          -- Your self-description (edit to seed Mika's knowledge)
-  data/
-    mika.db        -- SQLite database (conversations, memory, reminders)
-  logs/
-  skills/          -- Skill registry (3 builtin skills seeded on setup)
-    memory/        -- Memory management skill
-    reminders/     -- Reminder management skill
-    messaging/     -- Outbound messaging skill
-  exports/         -- Conversation exports (created by /export)
-```
+After initialization, Mika creates its home directory at `~/.mika/` containing
+configuration files, the SQLite database, skill definitions, and logs. See
+[Directory Layout](configuration.md#directory-layout) for the full structure.
 
 **Customizing Mika's personality:** Edit `~/.mika/soul.md` to change how Mika
 communicates. You can also run `mika config soul` to print the current soul
@@ -178,27 +148,16 @@ and preferences. This seeds Mika's initial understanding on a fresh database.
 
 ## 7. CLI commands reference
 
-All commands are accessible from your shell. Run `mika --help` for the full list.
+The most commonly used commands:
 
-| Command                                    | Description                                    |
-|--------------------------------------------|------------------------------------------------|
-| `mika`                                     | Auto-setup if needed, then open interactive chat |
-| `mika chat`                                | Open interactive chat (requires prior setup)    |
-| `mika setup`                               | Run first-time bootstrap                        |
-| `mika status`                              | Show health info (messages, DB size, schema)    |
-| `mika memory`                              | Inspect stored core memory                      |
-| `mika memory search <query>`               | Search across all memory types                  |
-| `mika memory people`                       | List tracked people                             |
-| `mika memory commitments [--status pending]`| List commitments (default: pending)            |
-| `mika memory preferences`                  | List stored preferences                         |
-| `mika memory events`                       | List tracked events                             |
-| `mika memory reset <block>`                | Reset a core memory block to its default        |
-| `mika reminders`                           | List active reminders                           |
-| `mika reminders cancel <id>`               | Cancel a reminder by its ID                     |
-| `mika config`                              | View current configuration                      |
-| `mika config edit`                         | Open identity.toml in $EDITOR                  |
-| `mika config soul`                         | Print soul.md to stdout                         |
-| `mika ask "<message>"`                     | Send a message non-interactively                |
+| Command                      | Description                                      |
+|------------------------------|--------------------------------------------------|
+| `mika`                       | Auto-setup if needed, then open interactive chat  |
+| `mika status`                | Show health info (messages, DB size, schema)      |
+| `mika memory`                | Inspect stored core memory                        |
+| `mika ask "<message>"`       | Send a message non-interactively                  |
+
+Run `mika --help` for the complete list of commands and options.
 
 ---
 

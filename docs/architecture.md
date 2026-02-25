@@ -196,18 +196,7 @@ All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 in server handlers). Each tool validates inputs: empty string check + 10,000 character
 maximum (`MAX_INPUT_LEN`).
 
-**ToolContext** provided to every tool execution:
-
-```rust
-pub struct ToolContext<'a> {
-    pub db: &'a AsyncDatabase,
-    pub session_id: &'a str,
-    pub home_dir: &'a Path,
-    pub core_memory_edit_count: &'a AtomicU32,
-    pub is_onboarding: bool,
-    pub message_sender: Option<Arc<dyn MessageSender>>,
-}
-```
+**ToolContext** provided to every tool execution contains references to the async database, session ID, home directory path, core memory edit counter, an onboarding flag, and an optional message sender. See `crates/mika-agent/src/tools/mod.rs:25` for the full struct definition.
 
 
 ## 7. Conversation Compaction
@@ -353,15 +342,7 @@ The silent prompt includes:
 
 ### Trigger Types
 
-```rust
-pub enum SilentTrigger {
-    Heartbeat,
-    Reminder { id: i64, message: String },
-}
-```
-
-For reminders, the agent loop marks the reminder as `delivered` on success or `failed`
-on error/timeout.
+`SilentTrigger` is an enum with two variants: `Heartbeat` (no data) and `Reminder { id, message }`. For reminders, the agent loop marks the reminder as `delivered` on success or `failed` on error/timeout. See `crates/mika-agent/src/agent.rs:312` for the definition.
 
 
 ## 11. Gateway Architecture
@@ -482,15 +463,7 @@ message processing path.
 
 ### Schema
 
-```sql
-CREATE TABLE failed_sends (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    text TEXT NOT NULL,
-    request_id TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    retry_count INTEGER NOT NULL DEFAULT 0
-);
-```
+The `failed_sends` table stores the message text, an optional request ID, a creation timestamp (defaults to current UTC), and a retry counter (defaults to 0). See `crates/mika-agent/src/db.rs:273` for the full CREATE TABLE statement.
 
 
 ## Appendix: Database Schema
@@ -517,10 +490,4 @@ CREATE TABLE failed_sends (
 
 ### SQLite Pragmas
 
-```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
-PRAGMA auto_vacuum = INCREMENTAL;
-```
+The database is initialized with WAL journal mode, NORMAL synchronous level, foreign keys enabled, a 5-second busy timeout, and incremental auto-vacuum. See `crates/mika-agent/src/db.rs:46` for the full PRAGMA list.

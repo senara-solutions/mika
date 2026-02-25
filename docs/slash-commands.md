@@ -48,29 +48,9 @@ Selection wraps around in both directions.
 
 List all available commands with their aliases, argument hints, and descriptions.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | `/h`, `/?`               |
-| Arguments   | None                     |
+**Aliases:** `/h`, `/?` | **Arguments:** None
 
-**Example output:**
-
-```
-Available commands:
-  /help (h, ?) — List available commands
-  /clear [--all] — Clear chat display (--all for DB)
-  /exit (quit, q) — Quit mika
-  /compact — Compact conversation history
-  /memory (mem) [search <query>] — Show core memory blocks
-  /reminders (remind) — List active reminders
-  /status (stat) — Show system health info
-  /soul — Display current soul.md
-  /config (cfg) — Show current config
-  /model — Show active model
-  /export — Export conversation to markdown
-  /skills — List loaded skills
-  /skill <name> — Show skill details
-```
+Example: `Available commands: /help (h, ?) -- List available commands ...`
 
 ---
 
@@ -78,20 +58,9 @@ Available commands:
 
 Clear all messages from the chat display and reset the scroll position.
 
-| Detail      | Value                       |
-|-------------|-----------------------------|
-| Aliases     | None                        |
-| Arguments   | `[--all]` (optional)        |
+**Aliases:** None | **Arguments:** None
 
-**Behavior:** Empties the in-memory message list and resets `scroll_offset` to 0.
-The display is cleared immediately; the underlying database conversation is not
-affected unless `--all` is passed.
-
-**Example output:**
-
-```
-Chat display cleared.
-```
+Empties the in-memory message list and resets `scroll_offset` to 0. The underlying database conversation is not affected. A `--all` flag to also clear the database is planned but not yet implemented.
 
 ---
 
@@ -99,41 +68,17 @@ Chat display cleared.
 
 Quit the Mika TUI. Sets `should_quit = true` and produces no output.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | `/quit`, `/q`            |
-| Arguments   | None                     |
+**Aliases:** `/quit`, `/q` | **Arguments:** None
 
 ---
 
 ### /compact
 
-Manually trigger conversation compaction. The agent's conversation history is
-summarized and trimmed to reduce token usage.
+Manually trigger conversation compaction. Summarizes and trims history to reduce token usage.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | None                     |
-| Arguments   | None                     |
+**Aliases:** None | **Arguments:** None
 
-**Requirements:**
-
-- The agent must be idle (not processing a turn).
-- The conversation must have more than 50 messages.
-
-**Possible outputs:**
-
-```
-Compacted conversation (73 messages).
-```
-
-```
-Nothing to compact (12/50 messages).
-```
-
-```
-Cannot compact while agent is busy.
-```
+Requires the agent to be idle and the conversation to have more than 50 messages. Outputs `Compacted conversation (N messages).`, `Nothing to compact (N/50 messages).`, or `Cannot compact while agent is busy.`
 
 ---
 
@@ -141,48 +86,16 @@ Cannot compact while agent is busy.
 
 Show core memory blocks or search across all structured memory layers.
 
-| Detail      | Value                             |
-|-------------|-----------------------------------|
-| Aliases     | `/mem`                            |
-| Arguments   | `[search <query>]` (optional)     |
+**Aliases:** `/mem` | **Arguments:** `[search <query>]` (optional)
 
-**Without arguments** -- displays all core memory entries with their keys, values,
-and token counts, plus the total token usage against the 2000-token limit:
+**Without arguments** -- displays all core memory entries with keys, values, and token counts, plus total usage against the 2000-token limit.
 
-```
-Core Memory:
-  [user_name] Sami (12 tokens)
-  [user_role] CTO at Senara Solutions (18 tokens)
-  [personality] Direct, technical, prefers concise answers (22 tokens)
-
-Total: 52/2000 tokens
-```
-
-**With `search <query>`** -- searches across all Layer 2 memory tables (People,
-Commitments, Preferences, Events) concurrently and displays results grouped by
-category:
+**With `search <query>`** -- searches across all Layer 2 tables (People, Commitments, Preferences, Events) concurrently and displays results grouped by category.
 
 ```
 /memory search meeting
-```
-
-```
-Commitments:
-  [active] Review Q4 roadmap with team (due: 2026-03-01)
-Events:
-  Board meeting with investors (2026-03-15)
-```
-
-If no results match:
-
-```
-No results for 'meeting'.
-```
-
-Missing search query:
-
-```
-Usage: /memory search <query>
+→ Commitments: [active] Review Q4 roadmap with team (due: 2026-03-01)
+→ Events: Board meeting with investors (2026-03-15)
 ```
 
 ---
@@ -191,112 +104,47 @@ Usage: /memory search <query>
 
 List all active reminders, split into pending (past-due) and upcoming (future).
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | `/remind`                |
-| Arguments   | None                     |
-
-**Example output:**
+**Aliases:** `/remind` | **Arguments:** None
 
 ```
 Pending reminders:
   #3: Follow up with Alice on contract (due: 2026-02-24T10:00:00Z)
 Upcoming reminders:
   #5: Weekly team standup (fires: 2026-02-26T09:00:00Z)
-  #7: Send invoice to client (fires: 2026-02-28T14:00:00Z)
-```
-
-If there are no reminders:
-
-```
-No active reminders.
 ```
 
 ---
 
 ### /status
 
-Show system health information including message count, database size, core memory
-usage, schema version, active model, and session ID.
+Show system health information: message count, database size, core memory usage, schema version, active model, and session ID. All four DB queries run concurrently via `tokio::join!`.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | `/stat`                  |
-| Arguments   | None                     |
-
-All four database queries (message count, DB size, core memory tokens, schema
-version) run concurrently via `tokio::join!`.
-
-**Example output:**
+**Aliases:** `/stat` | **Arguments:** None
 
 ```
-Status:
-  Messages: 142
-  DB size: 384 KB
-  Core memory: 52/2000 tokens
-  Schema: v6
-  Model: claude-sonnet-4-6
-  Session: a1b2c3d4
+Status: Messages: 142 | DB size: 384 KB | Core memory: 52/2000 tokens | Schema: v6 | Model: claude-sonnet-4-6 | Session: a1b2c3d4
 ```
 
 ---
 
 ### /soul
 
-Display the contents of the user's `soul.md` file, which provides personality and
-behavioral guidance injected into the agent's system prompt.
+Display the contents of `~/.mika/soul.md` (personality and behavioral guidance injected into the system prompt).
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | None                     |
-| Arguments   | None                     |
+**Aliases:** None | **Arguments:** None
 
-**Possible outputs:**
-
-If `~/.mika/soul.md` exists and has content, its full text is displayed.
-
-If the file is empty:
-
-```
-soul.md is empty.
-```
-
-If the file does not exist:
-
-```
-No soul.md found. Create one at ~/.mika/soul.md
-```
+Shows the file contents, or `soul.md is empty.` / `No soul.md found. Create one at ~/.mika/soul.md` as appropriate.
 
 ---
 
 ### /config
 
-Show the current configuration summary. Does not dump file contents (which may
-contain secrets) -- only shows key settings and the config file path.
+Show the current configuration summary (key settings and config file path). Does not dump file contents (which may contain secrets).
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | `/cfg`                   |
-| Arguments   | None                     |
-
-**Example output:**
+**Aliases:** `/cfg` | **Arguments:** None
 
 ```
-Configuration:
-  Model: claude-sonnet-4-6
-  Home: /home/sami/.mika
-  Session: a1b2c3d4
-  Config file: /home/sami/.mika/config/local.toml
-```
-
-If no local config file exists:
-
-```
-Configuration:
-  Model: claude-sonnet-4-6
-  Home: /home/sami/.mika
-  Session: a1b2c3d4
-  Config file: (using defaults)
+Configuration: Model: claude-sonnet-4-6 | Home: /home/sami/.mika | Session: a1b2c3d4 | Config file: /home/sami/.mika/config/local.toml
 ```
 
 ---
@@ -305,16 +153,9 @@ Configuration:
 
 Show the currently active Claude model.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | None                     |
-| Arguments   | None                     |
+**Aliases:** None | **Arguments:** None
 
-**Example output:**
-
-```
-Current model: claude-sonnet-4-6
-```
+Output: `Current model: claude-sonnet-4-6`
 
 ---
 
@@ -322,31 +163,9 @@ Current model: claude-sonnet-4-6
 
 Export the current conversation to a Markdown file in `~/.mika/exports/`.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | None                     |
-| Arguments   | None                     |
+**Aliases:** None | **Arguments:** None
 
-**Behavior:**
-
-- Creates the `exports/` directory if it does not exist.
-- Generates a filename using the session ID prefix and UTC timestamp:
-  `session-a1b2c3d4-2026-02-25-143022.md`
-- Writes User, Assistant, and System messages. Command output (from slash commands)
-  is intentionally excluded as ephemeral.
-- Uses `create_new` to prevent overwriting existing files (symlink-attack safe).
-
-**Example output:**
-
-```
-Exported to /home/sami/.mika/exports/session-a1b2c3d4-2026-02-25-143022.md
-```
-
-If the chat is empty:
-
-```
-Nothing to export.
-```
+Creates the `exports/` directory if needed. Generates a filename using session ID prefix and UTC timestamp (e.g., `session-a1b2c3d4-2026-02-25-143022.md`). Writes User, Assistant, and System messages; command output is excluded as ephemeral. Uses `create_new` to prevent overwrites (symlink-attack safe). Output: `Exported to /home/sami/.mika/exports/session-a1b2c3d4-2026-02-25-143022.md` or `Nothing to export.`
 
 ---
 
@@ -354,68 +173,33 @@ Nothing to export.
 
 List all loaded skills from the filesystem-based skill registry.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | None                     |
-| Arguments   | None                     |
+**Aliases:** None | **Arguments:** None
 
-Each skill shows its name, handler type (`builtin`, `exec`, or `http`), description,
-and whether it is marked as always-on.
-
-**Example output:**
+Each skill shows its name, handler type (`builtin`, `exec`, or `http`), description, and whether it is always-on.
 
 ```
 Loaded skills:
   web_search (builtin) — Search the web for current information
   calendar (exec) — Manage calendar events and scheduling [always on]
-  code_review (http) — Review code and suggest improvements
-```
-
-If no skills are loaded:
-
-```
-No skills loaded.
 ```
 
 ---
 
 ### /skill
 
-Show detailed information about a specific loaded skill.
+Show detailed information about a specific loaded skill. Lookup is case-insensitive.
 
-| Detail      | Value                    |
-|-------------|--------------------------|
-| Aliases     | None                     |
-| Arguments   | `<name>` (required)      |
-
-Skill lookup is case-insensitive.
-
-**Example output:**
-
-```
-/skill web_search
-```
+**Aliases:** None | **Arguments:** `<name>` (required)
 
 ```
 Skill: web_search
   Description: Search the web for current information
   Handler: builtin (tools: web_search, browse_url)
-  Always on: false
-  Keywords: search, look up, find online
+  Always on: false | Keywords: search, look up, find online
   Path: /home/sami/.mika/skills/web_search
 ```
 
-If the name is omitted:
-
-```
-Usage: /skill <name>
-```
-
-If no matching skill is found:
-
-```
-No skill found with name 'foo'. Use /skills to list all loaded skills.
-```
+Errors: `Usage: /skill <name>` or `No skill found with name 'foo'. Use /skills to list all loaded skills.`
 
 ## Keyboard Shortcuts
 

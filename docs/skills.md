@@ -2,22 +2,6 @@
 
 Skills are Mika's extensibility mechanism. Each skill is a filesystem-based bundle that packages related tools, prompt instructions, and dispatch configuration into a single directory. Skills control which tools are available to the agent on each turn, how those tools are executed, and what additional system prompt context the agent receives.
 
-## Table of Contents
-
-1. [What Are Skills?](#what-are-skills)
-2. [Directory Structure](#directory-structure)
-3. [Manifest Reference (skill.toml)](#manifest-reference-skilltoml)
-4. [Handler Types](#handler-types)
-5. [Trigger Matching](#trigger-matching)
-6. [Prompt Snippets (system_prompt.md)](#prompt-snippets-system_promptmd)
-7. [Tool Definitions (tools.json)](#tool-definitions-toolsjson)
-8. [Built-in Skills Reference](#built-in-skills-reference)
-9. [Creating a Custom Skill](#creating-a-custom-skill)
-10. [Customizing Built-in Skills](#customizing-built-in-skills)
-11. [Security Considerations](#security-considerations)
-
----
-
 ## What Are Skills?
 
 A skill is a directory under `~/.mika/skills/<name>/` that contains:
@@ -421,7 +405,7 @@ Create `~/.mika/skills/timezone/system_prompt.md`:
 
 ### Step 6: Test it
 
-No restart is needed. Skills are scanned at startup, so restart Mika (or the mika-server process) and send a message like:
+A restart is required for Mika to discover new skill directories, because `skill.toml` manifests are scanned once at startup. After restarting Mika (or the mika-server process), send a message like:
 
 ```
 What time is it in Tokyo when it's 3 PM in New York?
@@ -451,7 +435,7 @@ Edit `~/.mika/skills/reminders/skill.toml` and change:
 always_on = false
 ```
 
-Now the reminders tools will only be available when the user's message contains one of the trigger keywords (remind, reminder, schedule, alarm, alert).
+Restart Mika for the manifest change to take effect. The reminders tools will then only be available when the user's message contains one of the trigger keywords (remind, reminder, schedule, alarm, alert).
 
 ### Example: Add keywords to a skill
 
@@ -462,6 +446,8 @@ Edit `~/.mika/skills/memory/skill.toml` and add keywords:
 keywords = ["remember", "memory", "fact", "person", "commitment", "preference", "event", "note", "important"]
 ```
 
+Restart Mika for the manifest change to take effect.
+
 ### Example: Change the prompt snippet
 
 Edit `~/.mika/skills/memory/system_prompt.md` to add custom instructions:
@@ -471,6 +457,8 @@ Edit `~/.mika/skills/memory/system_prompt.md` to add custom instructions:
 - Always confirm with the user before storing sensitive personal information.
 - Prefer search_memory before asking the user to repeat something.
 ```
+
+Prompt snippet changes take effect on the next message (no restart needed), because `system_prompt.md` is lazy-loaded from disk each turn.
 
 ### Resetting to defaults
 
