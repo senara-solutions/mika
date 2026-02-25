@@ -310,7 +310,7 @@ impl TeamEngine {
                     .get(agent_name.as_str())
                     .with_context(|| format!("agent '{}' not found in team resources", agent_name));
 
-                let result = match resources {
+                let result: Result<String> = match resources {
                     Ok(resources) => {
                         let session_id = format!("team-{}-{}", run_id, agent_name);
                         let params = TeamAgentParams {
@@ -324,7 +324,9 @@ impl TeamEngine {
                             session_id: &session_id,
                             embedding_client: resources.embedding_client.as_ref(),
                         };
-                        crate::agent::run_team_agent(&params).await
+                        crate::agent::run_team_agent(&params)
+                            .await
+                            .map(|opt| opt.unwrap_or_default())
                     }
                     Err(e) => Err(e),
                 };
@@ -421,6 +423,8 @@ impl TeamEngine {
     }
 
     /// Run an agent with team context and workspace tools.
+    /// Returns the agent's text response, or an empty string if the agent
+    /// produced no text (tool-use-only turn).
     async fn run_agent(
         &self,
         agent_name: &str,
@@ -446,7 +450,9 @@ impl TeamEngine {
             embedding_client: resources.embedding_client.as_ref(),
         };
 
-        crate::agent::run_team_agent(&params).await
+        Ok(crate::agent::run_team_agent(&params)
+            .await?
+            .unwrap_or_default())
     }
 
     fn report_progress(&self, message: &str) {
