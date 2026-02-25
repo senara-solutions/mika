@@ -148,6 +148,27 @@ pub async fn run(agent_name: &str) -> Result<()> {
         worker._ctx.global_home.clone(),
     );
 
+    // Load recent conversation history so the user sees prior messages on restart
+    if let Ok(history) = worker
+        ._ctx
+        .async_db
+        .load_recent_messages(20, Some(vec!["cli".to_string()]))
+        .await
+    {
+        for msg in history {
+            let role = match msg.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => continue,
+            };
+            app.messages.push(ChatMessage {
+                role,
+                content: msg.content,
+                rendered: None,
+            });
+        }
+    }
+
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
