@@ -212,8 +212,7 @@ impl TeamEngine {
     /// after critic rejection. (#261: merged decompose + decompose_with_feedback)
     async fn decompose(&self, feedback: Option<&str>) -> Result<Vec<TaskAssignment>> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
-        let context =
-            prompt::build_orchestrator_context(&self.team, &listing, feedback);
+        let context = prompt::build_orchestrator_context(&self.team, &listing, feedback);
 
         let orchestrator_name = &self.team.team.orchestrator;
 
@@ -267,8 +266,12 @@ impl TeamEngine {
                 .map(|a| a.mandate.as_str())
                 .unwrap_or("Complete the assigned task");
 
-            let context =
-                prompt::build_specialist_context(&task.role, mandate, &task.task, &task.output_file);
+            let context = prompt::build_specialist_context(
+                &task.role,
+                mandate,
+                &task.task,
+                &task.output_file,
+            );
 
             inputs.push(TaskInput {
                 index: i,

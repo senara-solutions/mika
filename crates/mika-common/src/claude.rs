@@ -238,9 +238,8 @@ impl ClaudeClient {
         Err(last_error
             .map(|e| match &e {
                 ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
-                    anyhow::Error::from(e).context(
-                        "Claude API is temporarily unavailable. Please try again shortly.",
-                    )
+                    anyhow::Error::from(e)
+                        .context("Claude API is temporarily unavailable. Please try again shortly.")
                 }
                 _ => anyhow::Error::from(e)
                     .context("Claude API is busy. Please wait a moment and try again."),

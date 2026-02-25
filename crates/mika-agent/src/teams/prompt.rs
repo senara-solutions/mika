@@ -209,9 +209,7 @@ mod tests {
                     mandate: "Review quality".to_string(),
                 },
             ],
-            flow: TeamFlow {
-                max_iterations: 3,
-            },
+            flow: TeamFlow { max_iterations: 3 },
         }
     }
 
