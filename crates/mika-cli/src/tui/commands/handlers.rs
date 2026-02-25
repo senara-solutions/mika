@@ -110,8 +110,15 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
     let mut out = String::new();
     let mut found = false;
 
-    // Search across all memory layers
-    if let Ok(people) = app.db.search_people(query).await {
+    // Search across all memory layers concurrently
+    let (people, commitments, preferences, events) = tokio::join!(
+        app.db.search_people(query),
+        app.db.search_commitments(query),
+        app.db.search_preferences(query),
+        app.db.search_events(query),
+    );
+
+    if let Ok(people) = people {
         if !people.is_empty() {
             found = true;
             let _ = writeln!(out, "People:");
@@ -121,7 +128,7 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
             }
         }
     }
-    if let Ok(commitments) = app.db.search_commitments(query).await {
+    if let Ok(commitments) = commitments {
         if !commitments.is_empty() {
             found = true;
             let _ = writeln!(out, "Commitments:");
@@ -131,7 +138,7 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
             }
         }
     }
-    if let Ok(preferences) = app.db.search_preferences(query).await {
+    if let Ok(preferences) = preferences {
         if !preferences.is_empty() {
             found = true;
             let _ = writeln!(out, "Preferences:");
@@ -140,7 +147,7 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
             }
         }
     }
-    if let Ok(events) = app.db.search_events(query).await {
+    if let Ok(events) = events {
         if !events.is_empty() {
             found = true;
             let _ = writeln!(out, "Events:");
@@ -192,17 +199,25 @@ async fn handle_reminders(app: &mut App<'_>) -> String {
 async fn handle_status(app: &mut App<'_>) -> String {
     let mut out = String::from("Status:\n");
 
-    if let Ok(count) = app.db.count_messages().await {
+    // Run all DB queries concurrently
+    let (count, size, tokens, version) = tokio::join!(
+        app.db.count_messages(),
+        app.db.db_size_bytes(),
+        app.db.total_core_memory_tokens(),
+        app.db.schema_version(),
+    );
+
+    if let Ok(count) = count {
         let _ = writeln!(out, "  Messages: {count}");
     }
-    if let Ok(size) = app.db.db_size_bytes().await {
+    if let Ok(size) = size {
         let size_kb = size / 1024;
         let _ = writeln!(out, "  DB size: {size_kb} KB");
     }
-    if let Ok(tokens) = app.db.total_core_memory_tokens().await {
+    if let Ok(tokens) = tokens {
         let _ = writeln!(out, "  Core memory: {tokens}/2000 tokens");
     }
-    if let Ok(version) = app.db.schema_version().await {
+    if let Ok(version) = version {
         let _ = writeln!(out, "  Schema: v{version}");
     }
     let _ = writeln!(out, "  Model: {}", app.model);
@@ -226,27 +241,21 @@ async fn handle_soul(app: &mut App<'_>) -> String {
 
 async fn handle_config(app: &mut App<'_>) -> String {
     let config_path = app.home_dir.join("config").join("local.toml");
-    let default_path = app.home_dir.join("config").join("default.toml");
 
     let mut out = String::from("Configuration:\n");
     let _ = writeln!(out, "  Model: {}", app.model);
     let _ = writeln!(out, "  Home: {}", app.home_dir.display());
+    let _ = writeln!(
+        out,
+        "  Session: {}",
+        &app.session_id[..8.min(app.session_id.len())]
+    );
 
-    // Try to show local config
-    if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
-        let _ = writeln!(
-            out,
-            "\nLocal config ({}):\n{}",
-            config_path.display(),
-            content
-        );
-    } else if let Ok(content) = tokio::fs::read_to_string(&default_path).await {
-        let _ = writeln!(
-            out,
-            "\nDefault config ({}):\n{}",
-            default_path.display(),
-            content
-        );
+    // Show config file path without dumping contents (may contain secrets)
+    if tokio::fs::metadata(&config_path).await.is_ok() {
+        let _ = writeln!(out, "  Config file: {}", config_path.display());
+    } else {
+        let _ = writeln!(out, "  Config file: (using defaults)");
     }
 
     out
@@ -293,13 +302,26 @@ async fn handle_export(app: &mut App<'_>) -> String {
                 let _ = writeln!(content, "*System: {}*\n", msg.content);
             }
             ChatRole::Command => {
-                // Skip command output in export
+                // Command output is ephemeral (status, help text, etc.)
+                // and not part of the conversation — intentionally excluded.
             }
         }
     }
 
-    match tokio::fs::write(&filepath, content).await {
-        Ok(()) => format!("Exported to {}", filepath.display()),
+    // Use create_new to prevent symlink attacks (atomic, fails if path exists)
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&filepath)
+        .await
+    {
+        Ok(mut file) => {
+            use tokio::io::AsyncWriteExt;
+            match file.write_all(content.as_bytes()).await {
+                Ok(()) => format!("Exported to {}", filepath.display()),
+                Err(e) => format!("Export failed: {e}"),
+            }
+        }
         Err(e) => format!("Export failed: {e}"),
     }
 }

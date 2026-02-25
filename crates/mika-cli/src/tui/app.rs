@@ -227,7 +227,8 @@ impl<'a> App<'a> {
         }
 
         // Advance progressive reveal
-        if let Some(ref full) = self.pending_response.clone() {
+        if self.pending_response.is_some() {
+            let full = self.pending_response.as_ref().unwrap();
             let len = full.len();
             if self.reveal_index < len {
                 // Reveal in chunks for smooth appearance.
@@ -236,14 +237,14 @@ impl<'a> App<'a> {
                 self.status = AgentStatus::Responding(self.reveal_index);
                 self.needs_redraw = true;
             } else {
-                // Reveal complete — add full message with pre-rendered markdown
-                let rendered = markdown::render(full);
+                // Reveal complete — take ownership (no clone) and add full message
+                let full = self.pending_response.take().unwrap();
+                let rendered = markdown::render(&full);
                 self.messages.push(ChatMessage {
                     role: ChatRole::Assistant,
-                    content: full.clone(),
+                    content: full,
                     rendered: Some(rendered),
                 });
-                self.pending_response = None;
                 self.reveal_index = 0;
                 self.status = AgentStatus::Idle;
                 // Auto-scroll to bottom
