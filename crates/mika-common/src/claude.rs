@@ -225,7 +225,11 @@ impl ClaudeClient {
                                 "Received an unexpected response from Claude API.",
                             )
                         }
-                        _ => e.into(),
+                        ClaudeApiError::HttpError { .. } => {
+                            anyhow::Error::from(e).context(
+                                "Claude API returned an unexpected error. Please try again.",
+                            )
+                        }
                     });
                 }
             }
