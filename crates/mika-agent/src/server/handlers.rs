@@ -145,6 +145,10 @@ pub async fn handle_message(
                 }
                 Ok(None) => {
                     info!("agent loop completed (no text response)");
+                    // Still send a fallback so the user knows their request was processed
+                    if let Err(e) = sender_arc.send("Done.").await {
+                        error!(error = %e, "failed to send fallback response");
+                    }
                 }
                 Err(e) => {
                     error!(error = %e, "agent loop failed");

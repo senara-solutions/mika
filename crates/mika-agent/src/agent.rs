@@ -190,7 +190,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
         let response = claude.send_message(&request).await?;
 
         match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens => {
+            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 let text = response.text();
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
@@ -201,7 +201,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
                 // Tool-only turn with no text: re-prompt once for acknowledgment
                 if tool_use_occurred && !follow_up_attempted {
                     follow_up_attempted = true;
-                    debug!(step, "injecting follow-up after empty tool response");
+                    debug!(step, stop_reason = ?response.stop_reason, "injecting follow-up after empty tool response");
                     request.messages.push(Message {
                         role: "assistant".to_string(),
                         content: MessageContent::Blocks(response.content),
@@ -224,38 +224,6 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
             StopReason::ToolUse => {
                 tool_use_occurred = true;
                 process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
-            }
-            StopReason::StopSequence => {
-                let text = response.text();
-                if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type).await?;
-                    return Ok(Some(text));
-                }
-
-                // Same follow-up logic for StopSequence
-                if tool_use_occurred && !follow_up_attempted {
-                    follow_up_attempted = true;
-                    debug!(
-                        step,
-                        "injecting follow-up after empty tool response (stop_sequence)"
-                    );
-                    request.messages.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::Blocks(response.content),
-                    });
-                    request.messages.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Text(
-                            "[Briefly confirm what you just did.]".to_string(),
-                        ),
-                    });
-                    continue;
-                }
-
-                if tool_use_occurred {
-                    warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after follow-up");
-                }
-                return Ok(None);
             }
         }
     }

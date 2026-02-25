@@ -87,11 +87,12 @@ async fn main() -> Result<()> {
 /// handles comments, sections, and avoids prefix-matching false positives.
 fn parse_log_level(content: &str) -> Option<String> {
     let table: toml::Table = content.parse().ok()?;
-    table
-        .get("log_level")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let level = table.get("log_level")?.as_str().filter(|s| !s.is_empty())?;
+    // Only accept standard tracing levels to prevent filter directive injection
+    match level {
+        "trace" | "debug" | "info" | "warn" | "error" | "off" => Some(level.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +126,15 @@ mod tests {
     #[test]
     fn test_parse_log_level_empty_value() {
         assert_eq!(parse_log_level("log_level = \"\"\n"), None);
+    }
+
+    #[test]
+    fn test_parse_log_level_rejects_filter_directive() {
+        // Complex tracing filter directives should be rejected — only simple levels allowed
+        assert_eq!(
+            parse_log_level("log_level = \"mika_agent::server=trace\"\n"),
+            None
+        );
     }
 
     #[test]

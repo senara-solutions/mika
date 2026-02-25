@@ -21,6 +21,10 @@ pub fn init(default_level: &str) {
 ///
 /// When `suppress_stderr` is true (TUI mode), the stderr pretty layer is omitted
 /// to avoid corrupting ratatui's alternate screen (which only covers stdout).
+///
+/// Note: the four match arms below look duplicative, but tracing_subscriber's
+/// type-level layer composition creates distinct types for each combination,
+/// preventing extraction of shared setup code.
 pub fn init_pretty(
     default_level: &str,
     log_dir: Option<&Path>,
