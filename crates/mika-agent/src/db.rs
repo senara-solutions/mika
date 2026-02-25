@@ -3,6 +3,17 @@ use rusqlite::Connection;
 use std::path::Path;
 use tracing::{debug, info};
 
+/// Register sqlite-vec as an auto-extension so every new connection gets vec0.
+/// Must be called once before opening any database connections.
+pub fn init_sqlite_vec() {
+    unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(
+            #[allow(clippy::missing_transmute_annotations)]
+            std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
+        ));
+    }
+}
+
 const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// Canonical list of valid commitment statuses at the database level.

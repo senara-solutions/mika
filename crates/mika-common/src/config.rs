@@ -41,6 +41,18 @@ pub struct Settings {
     #[serde(default)]
     pub internal_token: Option<SecretString>,
 
+    /// OpenAI API key for embeddings (optional; enables Layer 3 vector search)
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+
+    /// Embedding model ID (default: text-embedding-3-small)
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+
+    /// Embedding dimensions (default: 512)
+    #[serde(default = "default_embedding_dimensions")]
+    pub embedding_dimensions: u32,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -64,6 +76,14 @@ fn default_log_level() -> String {
 
 fn default_server_port() -> u16 {
     8080
+}
+
+fn default_embedding_model() -> String {
+    "text-embedding-3-small".to_string()
+}
+
+fn default_embedding_dimensions() -> u32 {
+    512
 }
 
 impl Settings {
@@ -131,6 +151,12 @@ impl std::fmt::Debug for Settings {
                 "internal_token",
                 &self.internal_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "openai_api_key",
+                &self.openai_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_dimensions", &self.embedding_dimensions)
             .field("home_dir", &self.home_dir)
             .finish()
     }

@@ -6,3 +6,7 @@ claude_max_tokens = 4096
 db_path = "mika.db"
 log_level = "info"
 server_port = 8080
+
+# Layer 3 vector search (embedding API key set via MIKA_OPENAI_API_KEY env var)
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 512
