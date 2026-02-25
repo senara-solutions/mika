@@ -61,6 +61,76 @@ impl ReminderScheduler {
             _ => {}
         }
 
+        // Backfill search index if empty (one-time migration for existing data)
+        match self.db.count_search_content().await {
+            Ok(0) => {
+                match self.db.get_all_facts_for_indexing().await {
+                    Ok(facts) if !facts.is_empty() => {
+                        info!(count = facts.len(), "backfilling search index");
+                        for (source_type, source_id, content) in &facts {
+                            if let Err(e) = self
+                                .db
+                                .index_content(source_type, Some(*source_id), content)
+                                .await
+                            {
+                                warn!(error = %e, source_type, "failed to index content during backfill");
+                                continue;
+                            }
+                        }
+
+                        // Batch-generate embeddings if client is available
+                        if let Some(ref client) = self.embedding_client {
+                            let texts: Vec<&str> =
+                                facts.iter().map(|(_, _, c)| c.as_str()).collect();
+                            match client.embed_batch(&texts).await {
+                                Ok(embeddings) => {
+                                    let mut indexed = 0;
+                                    for (i, embedding) in embeddings.into_iter().enumerate() {
+                                        let (source_type, source_id, _) = &facts[i];
+                                        // Look up the content_id we just inserted
+                                        if let Ok(results) = self
+                                            .db
+                                            .fts_search(
+                                                &facts[i].2,
+                                                1,
+                                                Some(source_type),
+                                            )
+                                            .await
+                                            && let Some(r) = results.first()
+                                        {
+                                            if let Err(e) = self
+                                                .db
+                                                .index_embedding(r.id, embedding)
+                                                .await
+                                            {
+                                                warn!(
+                                                    error = %e,
+                                                    source_type,
+                                                    source_id,
+                                                    "failed to index embedding during backfill"
+                                                );
+                                            } else {
+                                                indexed += 1;
+                                            }
+                                        }
+                                    }
+                                    info!(indexed, total = facts.len(), "backfill embeddings complete");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "failed to generate embeddings during backfill");
+                                }
+                            }
+                        }
+                        info!("search index backfill complete");
+                    }
+                    Ok(_) => {} // no facts to index
+                    Err(e) => warn!(error = %e, "failed to get facts for backfill"),
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to check search content count"),
+            _ => {} // index already populated
+        }
+
         let past_due = self.db.get_past_due_reminders().await?;
         let future = self.db.get_future_reminders().await?;
 

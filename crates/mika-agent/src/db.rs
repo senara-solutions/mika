@@ -1479,10 +1479,10 @@ impl Database {
                 },
             ) {
                 // Filter by source_type if specified (vec results weren't pre-filtered)
-                if let Some(st) = source_type_filter {
-                    if result.source_type != st {
-                        continue;
-                    }
+                if let Some(st) = source_type_filter
+                    && result.source_type != st
+                {
+                    continue;
                 }
                 results.push(result);
             }

@@ -38,13 +38,13 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Data at rest:** Plaintext SQLite on K8s encrypted volumes. Per-customer container isolation. Case-insensitive COLLATE NOCASE on unique text columns.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque.
-- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender }`. Tool trait uses `#[async_trait]` (Send futures, required for `tokio::spawn` in server handlers).
+- **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender, embedding_client }`. Tool trait uses `#[async_trait]` (Send futures, required for `tokio::spawn` in server handlers).
 - **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `mpsc` channel (closure-based dispatch). Clone-able, Send+Sync. Integrated into agent loop, tools, and scheduler.
 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (147 tests)
+- `cargo test` — Run all tests (~236 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
@@ -58,7 +58,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Three-layer memory model:**
   - Layer 1: Core memory (always in system prompt, agent-editable via `update_core_memory` tool, 2000 token limit)
   - Layer 2: Structured facts (People, Commitments, Preferences, Events — plaintext). Managed via `store_fact`, `update_fact`, `search_memory` tools.
-  - Layer 3: Vector search (sqlite-vec + FTS5 hybrid — not yet implemented)
+  - Layer 3: Hybrid search (FTS5 full-text + sqlite-vec cosine similarity via Reciprocal Rank Fusion). Optional OpenAI embeddings (text-embedding-3-small, 512 dims). Graceful degradation: hybrid → FTS5-only → LIKE fallback. Indexed on store_fact/update_fact, backfilled on startup.
 - **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
 - **Audit log:** `memory_events` table tracks all memory mutations per session
@@ -69,7 +69,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **HTTP server (mika-server):** Axum-based with 3 endpoints: `/health` (no auth, K8s probes), `/message` (Bearer auth, 202 async), `/heartbeat` (Bearer auth, CronJob trigger). `AppState` is Clone via Arc-wrapped deps. Agent lock (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock` (429 if busy).
 - **Heartbeat pre-filter:** Active hours (8-21 local via chrono-tz), rate limits (1/hour, 3/day), skip if user messaged within 2h. All checks before acquiring Mutex.
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
-- **Schema version:** 6 (v6 adds: memory_event_summaries table for tiered retention)
+- **Schema version:** 8 (v7 adds: skills system tables; v8 adds: search_content, fts_search FTS5, vec_search vec0 for Layer 3)
 - **mika-gateway:** Telegram webhook router with Postgres customer registry. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (K8s probes). Stateless, env-var-only config.
 - **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` (90MB) for shared router. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
 
@@ -78,6 +78,9 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 See `.env.example` for the full list. Required:
 - `MIKA_ANTHROPIC_API_KEY` — Anthropic API key
 
+Optional (Layer 3 vector search):
+- `MIKA_OPENAI_API_KEY` — OpenAI API key for embedding generation (enables vector similarity in hybrid search)
+
 Server mode additionally requires:
 - `MIKA_ROUTING_URL` — Gateway URL for outbound message delivery
 - `MIKA_INTERNAL_TOKEN` — Shared secret for Bearer auth between gateway and agent
@@ -85,7 +88,7 @@ Server mode additionally requires:
 ## Pending Work
 
 - **Deployment:** Helm charts (mika-customer + mika-gateway), provision.sh + deprovision.sh, AWS Secrets Manager integration, K8s manifests
-- **Future features:** WhatsApp channel adapter, vector search (Layer 3), morning briefings, admin API
+- **Future features:** WhatsApp channel adapter, morning briefings, admin API
 
 ## Reference Repositories
 

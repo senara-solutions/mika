@@ -214,10 +214,10 @@ async fn search_like_fallback(
                 desc.push_str(&format!(", {date}"));
             }
             desc.push(')');
-            if let Some(ref context) = event.context {
-                if !context.is_empty() {
-                    desc.push_str(&format!(" — {context}"));
-                }
+            if let Some(ref context) = event.context
+                && !context.is_empty()
+            {
+                desc.push_str(&format!(" — {context}"));
             }
             results.push(desc);
         }
