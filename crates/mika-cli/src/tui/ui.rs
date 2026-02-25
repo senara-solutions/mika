@@ -88,10 +88,12 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             }
             ChatRole::System => {
                 lines.push(Line::default());
-                lines.push(Line::from(vec![Span::styled(
-                    msg.content.clone(),
-                    Style::default().fg(Color::Red),
-                )]));
+                for line in msg.content.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::Red),
+                    )]));
+                }
             }
             ChatRole::Command => {
                 lines.push(Line::default());

@@ -99,7 +99,7 @@ async fn spawn_agent_worker(
                             is_error: false,
                         },
                         Err(e) => AgentResponse {
-                            content: format!("{e:#}"),
+                            content: format!("{e}"),
                             is_error: true,
                         },
                     };
@@ -234,7 +234,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                         Err(e) => {
                             app.messages.push(ChatMessage {
                                 role: ChatRole::System,
-                                content: format!("Failed to switch agent: {e:#}"),
+                                content: format!("Failed to switch agent: {e}"),
                                 rendered: None,
                             });
                         }
@@ -243,7 +243,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                 Err(e) => {
                     app.messages.push(ChatMessage {
                         role: ChatRole::System,
-                        content: format!("Failed to switch agent: {e:#}"),
+                        content: format!("Failed to switch agent: {e}"),
                         rendered: None,
                     });
                 }
