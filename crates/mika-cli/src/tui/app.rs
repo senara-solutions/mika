@@ -221,7 +221,7 @@ impl<'a> App<'a> {
                     // Agent responded with tool-use only (no text) — show feedback
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
-                        content: "Agent processed your request.".to_string(),
+                        content: mika_agent::agent::EMPTY_RESPONSE_FALLBACK.to_string(),
                         rendered: None,
                     });
                     self.status = AgentStatus::Idle;

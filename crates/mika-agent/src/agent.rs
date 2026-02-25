@@ -22,6 +22,10 @@ const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 
+/// Fallback message sent when the agent completes without producing text output
+/// (e.g., all work done via tool calls).
+pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
+
 /// Check if this is a new user (user_summary still at default value).
 /// Used by both CLI and server to set `is_onboarding` on agent params.
 pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
@@ -579,6 +583,9 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         },
     };
 
+    let mut tool_use_occurred = false;
+    let mut follow_up_attempted = false;
+
     for step in 0..MAX_TOOL_STEPS {
         debug!(step, "team agent step");
 
@@ -587,14 +594,39 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 let text = response.text();
+                if !text.is_empty() {
+                    info!(step, "team agent done");
+                    return Ok(Some(text));
+                }
+
+                // Tool-only turn with no text: re-prompt once for acknowledgment
+                if tool_use_occurred && !follow_up_attempted {
+                    follow_up_attempted = true;
+                    debug!(
+                        step,
+                        "team agent: injecting follow-up after empty tool response"
+                    );
+                    request.messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Blocks(response.content),
+                    });
+                    request.messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(
+                            "[Briefly confirm what you just did.]".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+
+                if tool_use_occurred {
+                    warn!(step, "team agent returned empty text after follow-up");
+                }
                 info!(step, "team agent done");
-                return if text.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(text))
-                };
+                return Ok(None);
             }
             StopReason::ToolUse => {
+                tool_use_occurred = true;
                 process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
             }
         }

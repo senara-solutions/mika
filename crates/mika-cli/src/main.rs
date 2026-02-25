@@ -8,6 +8,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use mika_common::agent;
 use mika_common::home;
+use mika_common::logging::LogOutput;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,10 +35,20 @@ async fn main() -> Result<()> {
 
     // Read log_level from agent config. Uses toml crate (already a dependency)
     // rather than full config-rs which needs DB.
-    let log_level = agent_home
-        .as_ref()
-        .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
-        .and_then(|content| parse_log_level(&content))
+    let log_level = std::env::var("MIKA_LOG_LEVEL")
+        .ok()
+        .filter(|s| {
+            matches!(
+                s.as_str(),
+                "trace" | "debug" | "info" | "warn" | "error" | "off"
+            )
+        })
+        .or_else(|| {
+            agent_home
+                .as_ref()
+                .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
+                .and_then(|content| parse_log_level(&content))
+        })
         .or_else(|| {
             // Fall back to global config
             global_home
@@ -48,11 +59,16 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "warn".to_string());
 
     // Initialize tracing with correct agent-specific directory and configured level.
-    // Suppress stderr in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
+    // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
     // so stderr output would corrupt the TUI display.
     // The _log_guard MUST stay alive until the end of main — dropping it stops file logging.
     let is_tui = matches!(cli.command, None | Some(Commands::Chat));
-    let _log_guard = mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), is_tui);
+    let log_output = if is_tui {
+        LogOutput::FileOnly
+    } else {
+        LogOutput::PrettyAndFile
+    };
+    let _log_guard = mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), log_output);
 
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat
@@ -155,5 +171,21 @@ mod tests {
 
         let log_dir = home::resolve_agent_home(home, "main").join("logs");
         assert_eq!(log_dir, home.join("logs"));
+    }
+
+    #[test]
+    fn test_env_var_log_level_allowlist() {
+        // Validates the same allowlist used for MIKA_LOG_LEVEL env var
+        let valid = ["trace", "debug", "info", "warn", "error", "off"];
+        for level in valid {
+            assert!(
+                matches!(level, "trace" | "debug" | "info" | "warn" | "error" | "off"),
+                "Expected {level} to match allowlist"
+            );
+        }
+        assert!(!matches!(
+            "mika_agent=trace",
+            "trace" | "debug" | "info" | "warn" | "error" | "off"
+        ));
     }
 }
