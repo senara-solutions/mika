@@ -37,6 +37,8 @@ pub enum Commands {
     },
     /// Manage agents
     Agents(AgentsArgs),
+    /// Manage teams
+    Teams(TeamsArgs),
 }
 
 #[derive(clap::Args)]
@@ -73,6 +75,48 @@ pub enum AgentsCommand {
         source: String,
         /// Name for the new agent
         name: String,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct TeamsArgs {
+    #[command(subcommand)]
+    pub command: TeamsCommand,
+}
+
+#[derive(Subcommand)]
+pub enum TeamsCommand {
+    /// List all teams
+    List,
+    /// Create a new team (interactive)
+    Create {
+        /// Name for the new team (lowercase, alphanumeric, hyphens)
+        name: String,
+    },
+    /// Run a team workflow
+    Run {
+        /// Name of the team to run
+        name: String,
+        /// The goal or task for the team
+        goal: String,
+    },
+    /// Show team definition and latest run status
+    Status {
+        /// Name of the team
+        name: String,
+    },
+    /// Show execution history
+    Log {
+        /// Name of the team
+        name: String,
+    },
+    /// Delete a team and all its data
+    Delete {
+        /// Name of the team to delete
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 }
 

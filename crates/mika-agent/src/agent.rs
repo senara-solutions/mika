@@ -456,6 +456,133 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     Ok(())
 }
 
+// -- Team Agent Loop --
+
+/// Parameters for running an agent within a team execution context.
+pub struct TeamAgentParams<'a> {
+    pub db: &'a AsyncDatabase,
+    pub claude: &'a ClaudeClient,
+    pub tools: &'a ToolRegistry,
+    pub skills: &'a SkillRegistry,
+    pub home_dir: &'a Path,
+    pub task_message: &'a str,
+    pub team_context: &'a str,
+    pub session_id: &'a str,
+    pub embedding_client: Option<&'a EmbeddingClient>,
+}
+
+/// Run an agent within a team execution context.
+///
+/// This is a simplified variant of `run_agent_inner` that:
+/// - Loads soul, identity, core_memory from the agent's home (retains personality)
+/// - Injects team_context into the system prompt after identity
+/// - Uses a single-turn message (just the task — no conversation history)
+/// - Does NOT save messages to DB and does NOT run compaction
+/// - Returns the assistant's text response
+pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<String> {
+    let timeout_result = tokio::time::timeout(
+        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
+        run_team_agent_inner(params),
+    )
+    .await;
+
+    match timeout_result {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            warn!(
+                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
+                "team agent loop total timeout exceeded"
+            );
+            Ok("Agent timed out while processing team task.".to_string())
+        }
+    }
+}
+
+async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<String> {
+    let claude = params.claude;
+    let tools = params.tools;
+
+    // Load context from agent's home
+    let soul_content = tokio::fs::read_to_string(params.home_dir.join("soul.md"))
+        .await
+        .unwrap_or_default();
+    let identity = prompt::load_identity_async(params.home_dir).await;
+    let core_memory = params.db.get_all_core_memory().await?;
+    let timezone = params.db.get_customer_config("timezone").await?;
+
+    let prompt_ctx = prompt::PromptContext {
+        soul_content: &soul_content,
+        identity: &identity,
+        core_memory: &core_memory,
+        is_onboarding: false,
+        current_utc: chrono::Utc::now(),
+        timezone,
+    };
+    let mut system = prompt::build_system_prompt(&prompt_ctx);
+
+    // Inject team context after the base system prompt
+    system.push_str("\n## Team Context\n");
+    system.push_str(params.team_context);
+    system.push('\n');
+
+    // Match skills and resolve tool definitions
+    let matched = params.skills.match_message(params.task_message);
+    let skill_tool_defs =
+        inject_skills_and_resolve_tools(&matched, params.skills, tools, &mut system);
+
+    // Single-turn: just the task message, no history
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: MessageContent::Text(params.task_message.to_string()),
+    }];
+
+    let core_memory_edit_count = AtomicU32::new(0);
+    let tool_ctx = ToolContext {
+        db: params.db,
+        session_id: params.session_id,
+        home_dir: params.home_dir,
+        core_memory_edit_count: &core_memory_edit_count,
+        is_onboarding: false,
+        message_sender: None,
+        embedding_client: params.embedding_client,
+    };
+
+    let mut request = MessagesRequest {
+        model: claude.model.clone(),
+        max_tokens: claude.max_tokens,
+        system: Some(system),
+        messages,
+        tools: if skill_tool_defs.is_empty() {
+            None
+        } else {
+            Some(skill_tool_defs)
+        },
+    };
+
+    for step in 0..MAX_TOOL_STEPS {
+        debug!(step, "team agent step");
+
+        let response = claude
+            .send_message(&request)
+            .await
+            .context("Claude API call failed in team agent")?;
+
+        match response.stop_reason {
+            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                let text = response.text();
+                info!(step, "team agent done");
+                return Ok(text);
+            }
+            StopReason::ToolUse => {
+                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
+            }
+        }
+    }
+
+    warn!("team agent exceeded {MAX_TOOL_STEPS} steps");
+    Ok("Agent exceeded maximum tool steps.".to_string())
+}
+
 /// Inject matched skill prompt snippets into the system prompt and resolve
 /// tool definitions. Shared between conversation and silent agent loops.
 fn inject_skills_and_resolve_tools(

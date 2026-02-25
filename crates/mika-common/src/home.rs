@@ -242,7 +242,6 @@ pub fn write_default_if_missing(dir: &Path, filename: &str, content: &str) -> Re
     Ok(())
 }
 
-
 #[cfg(unix)]
 fn set_permissions(home_dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use mika_common::agent;
 use mika_common::home;
+use mika_common::team;
 
 use crate::tui::app::{AgentRequest, AgentStatus, App, ChatRole};
 use crate::tui::commands::{COMMANDS, parse_command};
@@ -29,6 +30,8 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "skill" => Some(handle_skill(app, args)),
         "switch" | "agent" => Some(handle_switch(app, args)),
         "agents" => Some(handle_agents(app)),
+        "teams" => Some(handle_teams(app)),
+        "team" => Some(handle_team(args)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -443,6 +446,45 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
             format!("No skill found with name '{name}'. Use /skills to list all loaded skills.")
         }
     }
+}
+
+fn handle_teams(app: &App<'_>) -> String {
+    let teams = team::list_teams(&app.global_home);
+
+    if teams.is_empty() {
+        return "No teams found. Use `mika teams create <name>` to create one.".to_string();
+    }
+
+    let mut out = String::from("Teams:\n");
+    for name in &teams {
+        let agent_count = match team::load_team(&app.global_home, name) {
+            Ok(def) => def.agents.len(),
+            Err(_) => 0,
+        };
+        let _ = writeln!(out, "  {name} ({agent_count} agents)");
+    }
+    out
+}
+
+fn handle_team(args: &str) -> String {
+    if args.is_empty() {
+        return "Usage: /team <name> \"<goal>\"".to_string();
+    }
+
+    // Parse: /team <name> <goal>
+    let (name, goal) = match args.split_once(char::is_whitespace) {
+        Some((n, g)) => (n.trim(), g.trim().trim_matches('"')),
+        None => return "Usage: /team <name> \"<goal>\"".to_string(),
+    };
+
+    if goal.is_empty() {
+        return "Usage: /team <name> \"<goal>\"".to_string();
+    }
+
+    format!(
+        "Team runs are long-running operations. Use the CLI instead: \
+         mika teams run {name} \"{goal}\""
+    )
 }
 
 #[cfg(test)]

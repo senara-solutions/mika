@@ -125,7 +125,13 @@ fn clone(global_home: &std::path::Path, source: &str, target: &str) -> Result<()
     let dst_dir = agent::agent_dir(global_home, &target);
 
     // Copy personality files (overwrite the defaults)
-    for filename in &["soul.md", "identity.toml", "config.toml", "heartbeat.md", "user.md"] {
+    for filename in &[
+        "soul.md",
+        "identity.toml",
+        "config.toml",
+        "heartbeat.md",
+        "user.md",
+    ] {
         let src = src_dir.join(filename);
         if src.is_file() {
             std::fs::copy(&src, dst_dir.join(filename))?;

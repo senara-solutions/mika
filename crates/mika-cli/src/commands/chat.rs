@@ -10,16 +10,16 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use mika_agent::agent::{self, AgentParams, check_onboarding};
-use mika_agent::prompt;
-use mika_agent::scheduler::ReminderScheduler;
-use mika_agent::skills::SkillRegistry;
-use mika_agent::tools;
 use crate::init::{self, AppContext};
 use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole};
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
+use mika_agent::agent::{self, AgentParams, check_onboarding};
+use mika_agent::prompt;
+use mika_agent::scheduler::ReminderScheduler;
+use mika_agent::skills::SkillRegistry;
+use mika_agent::tools;
 
 /// Holds the agent worker task handle and the AppContext (for DB shutdown).
 struct AgentWorker {
@@ -35,9 +35,9 @@ async fn spawn_agent_worker(
     AgentWorker,
     mpsc::UnboundedSender<AgentRequest>,
     mpsc::UnboundedReceiver<AgentResponse>,
-    String,          // session_id
-    String,          // model
-    String,          // identity_name
+    String, // session_id
+    String, // model
+    String, // identity_name
     Arc<SkillRegistry>,
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
@@ -200,7 +200,15 @@ pub async fn run(agent_name: &str) -> Result<()> {
             match init::init_for_agent(&target_name) {
                 Ok(new_ctx) => {
                     match spawn_agent_worker(new_ctx, &target_name).await {
-                        Ok((new_worker, new_tx, new_rx, new_session, new_model, new_identity, new_skills)) => {
+                        Ok((
+                            new_worker,
+                            new_tx,
+                            new_rx,
+                            new_session,
+                            new_model,
+                            new_identity,
+                            new_skills,
+                        )) => {
                             // Update app fields
                             app.agent_tx = new_tx;
                             app.agent_rx = new_rx;
@@ -217,7 +225,9 @@ pub async fn run(agent_name: &str) -> Result<()> {
 
                             app.messages.push(ChatMessage {
                                 role: ChatRole::System,
-                                content: format!("Switched to agent '{target_name}' ({new_model})."),
+                                content: format!(
+                                    "Switched to agent '{target_name}' ({new_model})."
+                                ),
                                 rendered: None,
                             });
                         }

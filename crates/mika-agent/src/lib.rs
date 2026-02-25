@@ -8,6 +8,7 @@ pub mod scheduler;
 pub mod server;
 pub mod skills;
 pub mod startup;
+pub mod teams;
 #[cfg(test)]
 pub mod test_utils;
 pub mod tools;
