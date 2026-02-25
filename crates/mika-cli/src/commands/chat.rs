@@ -91,13 +91,17 @@ pub async fn run() -> Result<()> {
         }
     });
 
-    // Build app
+    // Build app with shared resources
     let mut app = App::new(
         user_tx,
         agent_rx,
         session_id,
         ctx.settings.claude_model.clone(),
         identity.name.clone(),
+        ctx.async_db.clone(),
+        ctx.claude.clone(),
+        ctx.home_dir.clone(),
+        skill_registry,
     );
 
     // Install panic hook that restores terminal
@@ -131,7 +135,7 @@ pub async fn run() -> Result<()> {
                 app.needs_redraw = true;
             }
             Some(AppEvent::Tick) => {
-                app.tick();
+                app.tick().await;
             }
             Some(AppEvent::Resize) => {
                 app.needs_redraw = true;

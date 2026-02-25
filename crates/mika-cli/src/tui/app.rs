@@ -1,7 +1,16 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use ratatui::text::Line;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
+use mika_agent::async_db::AsyncDatabase;
+use mika_agent::skills::SkillRegistry;
+use mika_common::claude::ClaudeClient;
+
+use crate::tui::commands;
+use crate::tui::commands::autocomplete::AutocompleteState;
 use crate::tui::markdown;
 
 /// Agent processing status.
@@ -27,6 +36,7 @@ pub enum ChatRole {
     User,
     Assistant,
     System,
+    Command,
 }
 
 /// Messages flowing between the TUI and the agent worker.
@@ -70,15 +80,30 @@ pub struct App<'a> {
 
     /// Whether the UI needs to be redrawn (set true on state changes).
     pub needs_redraw: bool,
+
+    // Shared resources for slash commands
+    pub db: AsyncDatabase,
+    pub claude: ClaudeClient,
+    pub home_dir: PathBuf,
+    pub skills: Arc<SkillRegistry>,
+
+    // Slash command state
+    pub autocomplete: AutocompleteState,
+    pub pending_command: Option<String>,
 }
 
 impl<'a> App<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_tx: mpsc::UnboundedSender<AgentRequest>,
         agent_rx: mpsc::UnboundedReceiver<AgentResponse>,
         session_id: String,
         model: String,
         identity_name: String,
+        db: AsyncDatabase,
+        claude: ClaudeClient,
+        home_dir: PathBuf,
+        skills: Arc<SkillRegistry>,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -101,14 +126,30 @@ impl<'a> App<'a> {
             identity_name,
             tick_count: 0,
             needs_redraw: true,
+            db,
+            claude,
+            home_dir,
+            skills,
+            autocomplete: AutocompleteState::new(),
+            pending_command: None,
         }
     }
 
-    /// Submit the current input to the agent.
+    /// Submit the current input to the agent, or queue a slash command.
     pub fn send_message(&mut self) {
         let text: String = self.textarea.lines().join("\n");
         let text = text.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+
+        self.autocomplete.dismiss();
+
+        if text.starts_with('/') {
+            // Queue slash command for async processing in tick()
+            self.reset_textarea();
+            self.pending_command = Some(text);
+            self.needs_redraw = true;
             return;
         }
 
@@ -128,19 +169,30 @@ impl<'a> App<'a> {
         self.status = AgentStatus::Thinking;
 
         // Clear input
-        self.textarea = TextArea::default();
-        self.textarea
-            .set_cursor_line_style(ratatui::style::Style::default());
-        self.textarea.set_placeholder_text("Type a message...");
+        self.reset_textarea();
 
         // Auto-scroll to bottom
         self.scroll_offset = 0;
         self.needs_redraw = true;
     }
 
-    /// Called on each tick to advance progressive reveal and check for agent responses.
-    pub fn tick(&mut self) {
+    /// Called on each tick to advance progressive reveal, check for agent responses,
+    /// and process pending slash commands.
+    pub async fn tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
+
+        // Process pending slash command
+        if let Some(cmd) = self.pending_command.take() {
+            if let Some(output) = commands::handlers::dispatch(self, &cmd).await {
+                self.messages.push(ChatMessage {
+                    role: ChatRole::Command,
+                    content: output,
+                    rendered: None,
+                });
+                self.scroll_offset = 0;
+            }
+            self.needs_redraw = true;
+        }
 
         // Check for agent response
         match self.agent_rx.try_recv() {
@@ -242,10 +294,7 @@ impl<'a> App<'a> {
             Some(i) => {
                 if i + 1 >= self.input_history.len() {
                     self.history_index = None;
-                    self.textarea = TextArea::default();
-                    self.textarea
-                        .set_cursor_line_style(ratatui::style::Style::default());
-                    self.textarea.set_placeholder_text("Type a message...");
+                    self.reset_textarea();
                 } else {
                     self.history_index = Some(i + 1);
                     let text = self.input_history[i + 1].clone();
@@ -256,5 +305,17 @@ impl<'a> App<'a> {
                 }
             }
         }
+    }
+
+    /// Get current input text from the textarea.
+    pub fn input_text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    fn reset_textarea(&mut self) {
+        self.textarea = TextArea::default();
+        self.textarea
+            .set_cursor_line_style(ratatui::style::Style::default());
+        self.textarea.set_placeholder_text("Type a message...");
     }
 }

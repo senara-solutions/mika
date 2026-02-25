@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::tui::app::{AgentStatus, App, ChatRole};
 use crate::tui::markdown;
@@ -20,6 +20,11 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     draw_messages(f, app, chunks[1]);
     draw_input(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
+
+    // Autocomplete popup (rendered last to overlay)
+    if app.autocomplete.visible && !app.autocomplete.items.is_empty() {
+        draw_autocomplete(f, app, chunks[2]);
+    }
 }
 
 fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
@@ -87,6 +92,16 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                     msg.content.clone(),
                     Style::default().fg(Color::Red),
                 )]));
+            }
+            ChatRole::Command => {
+                lines.push(Line::default());
+                // Render each line of command output in cyan
+                for line in msg.content.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )]));
+                }
             }
         }
     }
@@ -178,7 +193,53 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/ commands", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::styled("Ctrl+C quit", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(footer), area);
+}
+
+fn draw_autocomplete(f: &mut Frame<'_>, app: &App<'_>, input_area: Rect) {
+    let item_count = app.autocomplete.items.len().min(10);
+    let popup_height = item_count as u16 + 2; // +2 for border
+
+    let popup_area = Rect {
+        x: input_area.x + 2,
+        y: input_area.y.saturating_sub(popup_height),
+        width: 50.min(input_area.width.saturating_sub(2)),
+        height: popup_height,
+    };
+
+    // Clear the area behind the popup
+    f.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem<'_>> = app
+        .autocomplete
+        .items
+        .iter()
+        .take(10)
+        .enumerate()
+        .map(|(i, cmd)| {
+            let args = cmd.args_hint.unwrap_or("");
+            let text = format!("/{} {} — {}", cmd.name, args, cmd.description);
+            let style = if i == app.autocomplete.selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(vec![Span::styled(text, style)]))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Commands "),
+    );
+
+    f.render_widget(list, popup_area);
 }
