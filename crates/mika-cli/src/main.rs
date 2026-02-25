@@ -27,16 +27,16 @@ async fn main() -> Result<()> {
     // Resolve log directory: ~/.mika/agents/{name}/logs/
     // Uses agent-specific home so logs land in the correct agent directory.
     let global_home = home::resolve_home_dir().ok();
-    let log_dir = global_home
+    let agent_home = global_home
         .as_ref()
-        .map(|h| home::resolve_agent_home(h, &agent_name).join("logs"));
+        .map(|h| home::resolve_agent_home(h, &agent_name));
+    let log_dir = agent_home.as_ref().map(|h| h.join("logs"));
 
-    // Read log_level from agent config. Lightweight parse — avoids loading full
-    // Settings (which needs DB) before tracing is ready.
-    let log_level = log_dir
+    // Read log_level from agent config. Uses toml crate (already a dependency)
+    // rather than full config-rs which needs DB.
+    let log_level = agent_home
         .as_ref()
-        .and_then(|d| d.parent()) // agent home dir
-        .and_then(|agent_home| std::fs::read_to_string(agent_home.join("config.toml")).ok())
+        .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
         .and_then(|content| parse_log_level(&content))
         .or_else(|| {
             // Fall back to global config
@@ -81,20 +81,15 @@ async fn main() -> Result<()> {
 }
 
 /// Extract `log_level` value from a TOML config string.
-/// Lightweight parser — avoids pulling in full config-rs before tracing is ready.
+/// Uses the `toml` crate (already a dependency) for correct parsing —
+/// handles comments, sections, and avoids prefix-matching false positives.
 fn parse_log_level(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("log_level")
-            && let Some(value) = trimmed.split('=').nth(1)
-        {
-            let v = value.trim().trim_matches('"').trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    let table: toml::Table = content.parse().ok()?;
+    table
+        .get("log_level")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

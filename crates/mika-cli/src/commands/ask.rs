@@ -46,7 +46,11 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
     })
     .await?;
 
-    println!("{response}");
+    if response.is_empty() {
+        eprintln!("(Agent processed your request — no text response)");
+    } else {
+        println!("{response}");
+    }
 
     // Database shutdown happens automatically via Drop on ctx
     Ok(())

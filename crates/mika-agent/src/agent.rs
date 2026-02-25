@@ -176,6 +176,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
         },
     };
 
+    let mut tool_use_occurred = false;
+
     for step in 0..MAX_TOOL_STEPS {
         debug!(
             step,
@@ -190,24 +192,22 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
                 let text = response.text();
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
-                } else if step > 0 {
+                } else if tool_use_occurred {
                     warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after tool use");
                 }
                 info!(step, stop_reason = ?response.stop_reason, "agent done");
                 return Ok(text);
             }
             StopReason::ToolUse => {
+                tool_use_occurred = true;
                 process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
             }
             StopReason::StopSequence => {
                 let text = response.text();
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
-                } else if step > 0 {
-                    warn!(
-                        step,
-                        "agent returned empty text on StopSequence after tool use"
-                    );
+                } else if tool_use_occurred {
+                    warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after tool use");
                 }
                 return Ok(text);
             }
