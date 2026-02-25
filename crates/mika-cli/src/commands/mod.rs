@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod ask;
 pub mod chat;
 pub mod config;

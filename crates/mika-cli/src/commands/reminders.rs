@@ -3,8 +3,8 @@ use anyhow::Result;
 use crate::cli::{ReminderArgs, ReminderCommand};
 use crate::init;
 
-pub async fn run(args: ReminderArgs) -> Result<()> {
-    let ctx = init::init_db_only()?;
+pub async fn run(args: ReminderArgs, agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
     let db = &ctx.async_db;
 
     match args.command {

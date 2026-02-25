@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use mika_common::home;
 
-pub async fn run() -> Result<()> {
+pub async fn run(agent_name: &str) -> Result<()> {
     let home_dir = home::resolve_home_dir()?;
 
     if home::is_initialized(&home_dir) {
@@ -12,12 +12,23 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    home::bootstrap(&home_dir)
-        .with_context(|| format!("failed to initialize {}", home_dir.display()))?;
+    // Bootstrap as multi-agent layout directly: create agents/{name}/
+    std::fs::create_dir_all(home_dir.join("agents"))
+        .with_context(|| format!("failed to create {}/agents/", home_dir.display()))?;
+
+    home::bootstrap_agent(&home_dir, agent_name)
+        .with_context(|| format!("failed to initialize agent '{agent_name}'"))?;
+
+    home::write_active_agent(&home_dir, agent_name)?;
+
+    // Write root-level shared config
+    home::write_default_if_missing_pub(&home_dir, "config.toml", home::DEFAULT_GLOBAL_CONFIG)?;
+
+    let agent_home = home::resolve_agent_home(&home_dir, agent_name);
     println!(
         "\n  {} Mika initialized at {}\n",
         '\u{2726}',
-        home_dir.display()
+        agent_home.display()
     );
 
     Ok(())

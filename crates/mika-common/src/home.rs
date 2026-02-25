@@ -13,9 +13,136 @@ pub fn resolve_home_dir() -> Result<PathBuf> {
 }
 
 /// Check if Mika has been initialized (database exists).
+/// Supports both legacy layout (data/mika.db at root) and multi-agent layout.
 pub fn is_initialized(home_dir: &Path) -> bool {
-    home_dir.join("data").join("mika.db").exists()
+    // Legacy layout
+    if home_dir.join("data").join("mika.db").exists() {
+        return true;
+    }
+    // Multi-agent layout: at least one agent with a DB
+    !crate::agent::list_agents(home_dir).is_empty()
 }
+
+/// Check if the home directory uses the multi-agent layout (has `agents/` dir).
+pub fn is_multi_agent_layout(home_dir: &Path) -> bool {
+    home_dir.join("agents").is_dir()
+}
+
+/// Check if the home directory uses the legacy layout (has `data/mika.db` at root, no `agents/` dir).
+pub fn is_legacy_layout(home_dir: &Path) -> bool {
+    home_dir.join("data").join("mika.db").exists() && !is_multi_agent_layout(home_dir)
+}
+
+/// Bootstrap a named agent under the multi-agent layout.
+/// Validates the name, creates `{home_dir}/agents/{name}/`, and calls `bootstrap()`.
+pub fn bootstrap_agent(home_dir: &Path, name: &str) -> Result<()> {
+    crate::agent::validate_agent_name(name)?;
+    let dir = crate::agent::agent_dir(home_dir, name);
+    bootstrap(&dir)
+}
+
+/// Resolve the effective home directory for a named agent.
+/// - Multi-agent layout: returns `{home_dir}/agents/{name}/`
+/// - Legacy layout (no `agents/` dir): returns `home_dir` unchanged (backward compat)
+pub fn resolve_agent_home(home_dir: &Path, agent_name: &str) -> PathBuf {
+    if is_multi_agent_layout(home_dir) {
+        crate::agent::agent_dir(home_dir, agent_name)
+    } else {
+        home_dir.to_path_buf()
+    }
+}
+
+/// Migrate a legacy layout to multi-agent layout (idempotent).
+///
+/// If already multi-agent layout → no-op.
+/// If legacy layout: creates `agents/main/`, moves data/, logs/, skills/, exports/,
+/// config.toml, identity.toml, soul.md, heartbeat.md, user.md into it.
+/// Writes `active_agent` file with "main".
+/// Creates a root-level config.toml with shared settings.
+pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
+    if is_multi_agent_layout(home_dir) {
+        return Ok(()); // Already migrated
+    }
+    if !is_legacy_layout(home_dir) {
+        return Ok(()); // Nothing to migrate (fresh install)
+    }
+
+    let agent = crate::agent::agent_dir(home_dir, crate::agent::DEFAULT_AGENT);
+    std::fs::create_dir_all(&agent)
+        .with_context(|| format!("failed to create {}", agent.display()))?;
+
+    // Move directories
+    for dir_name in &["data", "logs", "skills", "exports"] {
+        let src = home_dir.join(dir_name);
+        if src.is_dir() {
+            let dst = agent.join(dir_name);
+            std::fs::rename(&src, &dst).with_context(|| {
+                format!("failed to move {} to {}", src.display(), dst.display())
+            })?;
+        }
+    }
+
+    // Move files
+    for filename in &[
+        "config.toml",
+        "identity.toml",
+        "soul.md",
+        "heartbeat.md",
+        "user.md",
+    ] {
+        let src = home_dir.join(filename);
+        if src.is_file() {
+            let dst = agent.join(filename);
+            std::fs::rename(&src, &dst).with_context(|| {
+                format!("failed to move {} to {}", src.display(), dst.display())
+            })?;
+        }
+    }
+
+    // Write active_agent file
+    write_active_agent(home_dir, crate::agent::DEFAULT_AGENT)?;
+
+    // Write root-level shared config
+    write_default_if_missing(home_dir, "config.toml", DEFAULT_GLOBAL_CONFIG)?;
+
+    Ok(())
+}
+
+/// Read the active agent name from `{home_dir}/active_agent`.
+/// Returns DEFAULT_AGENT ("main") if file doesn't exist or is empty.
+pub fn read_active_agent(home_dir: &Path) -> String {
+    let path = home_dir.join("active_agent");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::agent::DEFAULT_AGENT.to_string())
+}
+
+/// Write the active agent name to `{home_dir}/active_agent`.
+pub fn write_active_agent(home_dir: &Path, name: &str) -> Result<()> {
+    let path = home_dir.join("active_agent");
+    std::fs::write(&path, name).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Default global config (shared settings at the root level).
+pub const DEFAULT_GLOBAL_CONFIG: &str = r#"# Mika global configuration (shared across all agents).
+# Override with MIKA_* environment variables (highest priority).
+#
+# Secrets MUST be set via environment variables, not in this file:
+#   MIKA_ANTHROPIC_API_KEY — Anthropic API key
+#   MIKA_OPENAI_API_KEY   — OpenAI API key (optional, for vector search)
+
+log_level = "info"
+"#;
+
+/// Default per-agent config template.
+pub const DEFAULT_AGENT_CONFIG: &str = r#"# Per-agent config overrides.
+# API keys inherited from env vars.
+# claude_model = "claude-sonnet-4-6"
+# claude_max_tokens = 4096
+"#;
 
 /// Create the ~/.mika/ directory structure with default files.
 /// Sets permissions to 0700 for directories, 0600 for files on Unix.
@@ -94,6 +221,11 @@ fn write_default_if_missing(dir: &Path, filename: &str, content: &str) -> Result
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Public variant for external callers (e.g., setup command).
+pub fn write_default_if_missing_pub(dir: &Path, filename: &str, content: &str) -> Result<()> {
+    write_default_if_missing(dir, filename, content)
 }
 
 #[cfg(unix)]
@@ -280,5 +412,179 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(file_perms, 0o600);
+    }
+
+    #[test]
+    fn test_is_multi_agent_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_multi_agent_layout(tmp.path()));
+
+        fs::create_dir_all(tmp.path().join("agents")).unwrap();
+        assert!(is_multi_agent_layout(tmp.path()));
+    }
+
+    #[test]
+    fn test_is_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No DB at all
+        assert!(!is_legacy_layout(tmp.path()));
+
+        // Legacy: data/mika.db exists, no agents/ dir
+        fs::create_dir_all(tmp.path().join("data")).unwrap();
+        fs::write(tmp.path().join("data").join("mika.db"), "fake").unwrap();
+        assert!(is_legacy_layout(tmp.path()));
+
+        // Multi-agent: also has agents/ dir
+        fs::create_dir_all(tmp.path().join("agents")).unwrap();
+        assert!(!is_legacy_layout(tmp.path()));
+    }
+
+    #[test]
+    fn test_bootstrap_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        bootstrap_agent(tmp.path(), "work").unwrap();
+
+        let agent = tmp.path().join("agents").join("work");
+        assert!(agent.join("data").is_dir());
+        assert!(agent.join("logs").is_dir());
+        assert!(agent.join("skills").is_dir());
+        assert!(agent.join("config.toml").is_file());
+        assert!(agent.join("soul.md").is_file());
+        assert!(agent.join("identity.toml").is_file());
+    }
+
+    #[test]
+    fn test_bootstrap_agent_rejects_invalid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(bootstrap_agent(tmp.path(), "INVALID").is_err());
+        assert!(bootstrap_agent(tmp.path(), "").is_err());
+        assert!(bootstrap_agent(tmp.path(), "-bad").is_err());
+    }
+
+    #[test]
+    fn test_resolve_agent_home_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No agents/ dir → legacy layout → returns home_dir
+        let resolved = resolve_agent_home(tmp.path(), "main");
+        assert_eq!(resolved, tmp.path());
+    }
+
+    #[test]
+    fn test_resolve_agent_home_multi_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("agents")).unwrap();
+        let resolved = resolve_agent_home(tmp.path(), "work");
+        assert_eq!(resolved, tmp.path().join("agents").join("work"));
+    }
+
+    #[test]
+    fn test_is_initialized_multi_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_initialized(tmp.path()));
+
+        // Create a multi-agent layout with one agent
+        let agent = tmp.path().join("agents").join("main");
+        fs::create_dir_all(agent.join("data")).unwrap();
+        fs::write(agent.join("data").join("mika.db"), "fake").unwrap();
+        assert!(is_initialized(tmp.path()));
+    }
+
+    #[test]
+    fn test_migrate_to_multi_agent_from_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Set up legacy layout
+        bootstrap(home).unwrap();
+        // Write a marker into the DB so we can verify it moved
+        fs::write(home.join("data").join("mika.db"), "test-db-content").unwrap();
+        fs::write(home.join("soul.md"), "custom soul").unwrap();
+
+        assert!(is_legacy_layout(home));
+
+        // Migrate
+        migrate_to_multi_agent(home).unwrap();
+
+        // Verify multi-agent layout
+        assert!(is_multi_agent_layout(home));
+        assert!(!is_legacy_layout(home));
+
+        // Data moved to agents/main/
+        let main_agent = home.join("agents").join("main");
+        assert_eq!(
+            fs::read_to_string(main_agent.join("data").join("mika.db")).unwrap(),
+            "test-db-content"
+        );
+        assert_eq!(
+            fs::read_to_string(main_agent.join("soul.md")).unwrap(),
+            "custom soul"
+        );
+        assert!(main_agent.join("identity.toml").is_file());
+        assert!(main_agent.join("config.toml").is_file());
+        assert!(main_agent.join("skills").is_dir());
+
+        // Root-level data/ should no longer exist
+        assert!(!home.join("data").is_dir());
+
+        // active_agent file should exist
+        assert_eq!(read_active_agent(home), "main");
+
+        // Root config.toml should be the global one
+        let root_config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(root_config.contains("global"));
+    }
+
+    #[test]
+    fn test_migrate_to_multi_agent_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Set up legacy layout and migrate
+        bootstrap(home).unwrap();
+        fs::write(home.join("data").join("mika.db"), "test-db").unwrap();
+        migrate_to_multi_agent(home).unwrap();
+
+        // Migrate again — should be no-op
+        migrate_to_multi_agent(home).unwrap();
+
+        // Still works
+        assert!(is_multi_agent_layout(home));
+        let main_agent = home.join("agents").join("main");
+        assert_eq!(
+            fs::read_to_string(main_agent.join("data").join("mika.db")).unwrap(),
+            "test-db"
+        );
+    }
+
+    #[test]
+    fn test_migrate_to_multi_agent_noop_on_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No legacy layout, nothing to migrate
+        migrate_to_multi_agent(tmp.path()).unwrap();
+        // agents/ dir should not be created
+        assert!(!is_multi_agent_layout(tmp.path()));
+    }
+
+    #[test]
+    fn test_read_write_active_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Default when no file
+        assert_eq!(read_active_agent(tmp.path()), "main");
+
+        // Write and read back
+        write_active_agent(tmp.path(), "work").unwrap();
+        assert_eq!(read_active_agent(tmp.path()), "work");
+
+        // Overwrite
+        write_active_agent(tmp.path(), "code").unwrap();
+        assert_eq!(read_active_agent(tmp.path()), "code");
+    }
+
+    #[test]
+    fn test_read_active_agent_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("active_agent"), "  \n").unwrap();
+        assert_eq!(read_active_agent(tmp.path()), "main");
     }
 }

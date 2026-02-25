@@ -1,6 +1,9 @@
 use std::fmt::Write;
 
-use crate::tui::app::{AgentStatus, App, ChatRole};
+use mika_common::agent;
+use mika_common::home;
+
+use crate::tui::app::{AgentRequest, AgentStatus, App, ChatRole};
 use crate::tui::commands::{COMMANDS, parse_command};
 
 /// Dispatch a slash command string to the appropriate handler.
@@ -24,6 +27,8 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "export" => Some(handle_export(app).await),
         "skills" => Some(handle_skills(app)),
         "skill" => Some(handle_skill(app, args)),
+        "switch" | "agent" => Some(handle_switch(app, args)),
+        "agents" => Some(handle_agents(app)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -347,6 +352,56 @@ fn handle_skills(app: &App<'_>) -> String {
             "  {} ({}) — {}{}",
             entry.manifest.name, handler_type, entry.manifest.description, always_on
         );
+    }
+    out
+}
+
+fn handle_switch(app: &mut App<'_>, args: &str) -> String {
+    let name = agent::normalize_agent_name(args);
+    if name.is_empty() {
+        return "Usage: /switch <agent-name>".to_string();
+    }
+    if let Err(e) = agent::validate_agent_name(&name) {
+        return format!("Invalid agent name: {e}");
+    }
+    if name == app.agent_name {
+        return format!("Already using agent '{name}'.");
+    }
+
+    if !agent::agent_exists(&app.global_home, &name) {
+        return format!(
+            "Agent '{name}' not found. Create it with `mika agents create {name}` first."
+        );
+    }
+
+    if app.status != AgentStatus::Idle {
+        return "Cannot switch while agent is busy. Wait for the current response to finish."
+            .to_string();
+    }
+
+    // Signal the current worker to stop
+    let _ = app.agent_tx.send(AgentRequest::Quit);
+    app.pending_switch = Some(name.clone());
+    format!("Switching to agent '{name}'...")
+}
+
+fn handle_agents(app: &App<'_>) -> String {
+    let agents = agent::list_agents(&app.global_home);
+    let active = home::read_active_agent(&app.global_home);
+
+    if agents.is_empty() {
+        return "No agents found.".to_string();
+    }
+
+    let mut out = String::from("Agents:\n");
+    for name in &agents {
+        let current = if *name == app.agent_name {
+            " (current)"
+        } else {
+            ""
+        };
+        let default = if *name == active { " (default)" } else { "" };
+        let _ = writeln!(out, "  {name}{current}{default}");
     }
     out
 }

@@ -229,7 +229,8 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
             "text": text,
             "chat_id": chat_id,
             "channel": "telegram",
-            "request_id": request_id
+            "request_id": request_id,
+            "agent": "main"
         }))
         .timeout(Duration::from_secs(2))
         .send()
@@ -309,7 +310,8 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
                     "text": "Hello!",
                     "chat_id": chat_id,
                     "channel": "telegram",
-                    "request_id": request_id
+                    "request_id": request_id,
+                    "agent": "main"
                 }))
                 .timeout(Duration::from_secs(2))
                 .send()
