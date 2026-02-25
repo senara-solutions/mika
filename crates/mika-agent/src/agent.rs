@@ -190,6 +190,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
                 let text = response.text();
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
+                } else if step > 0 {
+                    warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after tool use");
                 }
                 info!(step, stop_reason = ?response.stop_reason, "agent done");
                 return Ok(text);
@@ -201,6 +203,11 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
                 let text = response.text();
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
+                } else if step > 0 {
+                    warn!(
+                        step,
+                        "agent returned empty text on StopSequence after tool use"
+                    );
                 }
                 return Ok(text);
             }

@@ -1513,6 +1513,7 @@ dependencies = [
  "mika-agent",
  "mika-common",
  "ratatui",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

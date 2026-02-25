@@ -218,7 +218,12 @@ impl<'a> App<'a> {
                     });
                     self.status = AgentStatus::Idle;
                 } else if response.content.is_empty() {
-                    // Agent responded with tool-use only (no text) — skip display
+                    // Agent responded with tool-use only (no text) — show feedback
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: "Agent processed your request.".to_string(),
+                        rendered: None,
+                    });
                     self.status = AgentStatus::Idle;
                 } else {
                     self.pending_response = Some(response.content);
