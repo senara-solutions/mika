@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -55,9 +55,23 @@ impl Tool for WriteWorkspaceTool {
             )));
         }
 
-        // Prevent path traversal
-        if path.contains("..") {
-            return Ok(ToolOutput::error("Path traversal ('..') is not allowed."));
+        // Reject absolute paths
+        if std::path::Path::new(path).is_absolute() {
+            return Ok(ToolOutput::error(
+                "Absolute paths are not allowed. Use a relative path within the workspace.",
+            ));
+        }
+
+        // Prevent path traversal using component inspection
+        for component in std::path::Path::new(path).components() {
+            match component {
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Ok(ToolOutput::error(
+                        "Path traversal components ('..', root, or prefix) are not allowed.",
+                    ));
+                }
+                _ => {}
+            }
         }
 
         let full_path = self.workspace_dir.join(path);
@@ -69,21 +83,49 @@ impl Tool for WriteWorkspaceTool {
             )));
         }
 
-        // Create parent directories if needed
+        // Create parent directories if needed, then verify containment via canonicalize
         if let Some(parent) = full_path.parent() {
-            // Verify parent is within workspace (using string prefix check before dirs exist)
-            let workspace_str = self.workspace_dir.to_string_lossy();
-            let parent_str = parent.to_string_lossy();
-            if !parent_str.starts_with(workspace_str.as_ref()) {
-                return Ok(ToolOutput::error(
-                    "Path resolves outside the workspace directory.",
-                ));
-            }
-
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return Ok(ToolOutput::error(format!(
                     "Failed to create parent directories: {e}"
                 )));
+            }
+
+            // Check for symlinks in the parent chain
+            match tokio::fs::symlink_metadata(parent).await {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Ok(ToolOutput::error(
+                            "Symbolic links are not allowed in the workspace.",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Ok(ToolOutput::error(format!(
+                        "Failed to verify parent directory: {e}"
+                    )));
+                }
+            }
+
+            // Verify containment using canonicalize (parent now exists)
+            let canonical_parent = match parent.canonicalize() {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(ToolOutput::error(format!(
+                        "Failed to resolve parent directory: {e}"
+                    )));
+                }
+            };
+            let workspace_canonical = match self.workspace_dir.canonicalize() {
+                Ok(c) => c,
+                Err(_) => {
+                    return Ok(ToolOutput::error("Workspace directory does not exist."));
+                }
+            };
+            if !canonical_parent.starts_with(&workspace_canonical) {
+                return Ok(ToolOutput::error(
+                    "Path resolves outside the workspace directory.",
+                ));
             }
         }
 
@@ -212,5 +254,69 @@ mod tests {
 
         let written = fs::read_to_string(workspace.join("file.md")).unwrap();
         assert_eq!(written, "new content");
+    }
+
+    #[tokio::test]
+    async fn test_write_absolute_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+
+        let tool = WriteWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "/tmp/evil.txt", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Absolute paths are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_write_symlink_parent_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // Create a symlink directory inside workspace pointing outside
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("linked_dir")).unwrap();
+
+        let tool = WriteWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "linked_dir/file.md", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        // Should be caught by either symlink check or canonicalize containment check
+        assert!(
+            output.content.contains("Symbolic links")
+                || output.content.contains("outside the workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_double_dot_in_filename_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+
+        let tool = WriteWorkspaceTool {
+            workspace_dir: workspace.clone(),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "file..v2.md", "content": "version 2" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("bytes"));
+
+        let written = fs::read_to_string(workspace.join("file..v2.md")).unwrap();
+        assert_eq!(written, "version 2");
     }
 }

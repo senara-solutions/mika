@@ -1,14 +1,14 @@
 mod cancel_reminder;
 mod create_reminder;
 mod list_reminders;
-pub mod list_workspace;
-pub mod read_workspace;
+mod list_workspace;
+mod read_workspace;
 mod search_memory;
 mod send_message;
 mod store_fact;
 mod update_core_memory;
 mod update_fact;
-pub mod write_workspace;
+mod write_workspace;
 
 use anyhow::Result;
 use async_trait::async_trait;

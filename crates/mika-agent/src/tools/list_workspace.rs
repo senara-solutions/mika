@@ -35,7 +35,7 @@ impl Tool for ListWorkspaceTool {
         }
 
         let mut files = Vec::new();
-        collect_files(&self.workspace_dir, &self.workspace_dir, &mut files);
+        collect_files(&self.workspace_dir, &self.workspace_dir, &mut files, 0);
 
         if files.is_empty() {
             return Ok(ToolOutput::success("Workspace is empty (no files yet)."));
@@ -52,17 +52,46 @@ impl Tool for ListWorkspaceTool {
     }
 }
 
+/// Maximum recursion depth for workspace listing.
+const MAX_DEPTH: usize = 10;
+/// Maximum number of files to collect.
+const MAX_FILES: usize = 500;
+
 /// Recursively collect files with their relative paths and human-readable sizes.
-fn collect_files(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+/// Skips symlinks, respects depth and file count limits.
+fn collect_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, String)>,
+    depth: usize,
+) {
+    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        return;
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
 
     for entry in entries.flatten() {
+        if out.len() >= MAX_FILES {
+            return;
+        }
+
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        // Skip symlinks entirely
+        if ft.is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
-        if path.is_dir() {
-            collect_files(base, &path, out);
-        } else if path.is_file() {
+        if ft.is_dir() {
+            collect_files(base, &path, out, depth + 1);
+        } else if ft.is_file() {
             let relative = path
                 .strip_prefix(base)
                 .map(|p| p.to_string_lossy().to_string())
@@ -155,5 +184,71 @@ mod tests {
         assert_eq!(format_size(1024), "1.0 KB");
         assert_eq!(format_size(1536), "1.5 KB");
         assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[tokio::test]
+    async fn test_list_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("real.md"), "real file").unwrap();
+
+        // Create a symlink to a file outside workspace
+        let outside = tmp.path().join("secret.txt");
+        fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link.md")).unwrap();
+
+        let tool = ListWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let output = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("real.md"));
+        assert!(!output.content.contains("link.md"));
+    }
+
+    #[test]
+    fn test_collect_files_depth_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+
+        // Create a directory tree deeper than MAX_DEPTH
+        let mut deep_path = workspace.clone();
+        for i in 0..=MAX_DEPTH + 2 {
+            deep_path = deep_path.join(format!("level{i}"));
+        }
+        fs::create_dir_all(&deep_path).unwrap();
+        fs::write(deep_path.join("deep_file.md"), "deep").unwrap();
+
+        // Also create a file at a shallow level
+        fs::write(workspace.join("shallow.md"), "shallow").unwrap();
+
+        let mut files = Vec::new();
+        collect_files(&workspace, &workspace, &mut files, 0);
+
+        // Shallow file should be found
+        assert!(files.iter().any(|(p, _)| p == "shallow.md"));
+        // Deep file beyond MAX_DEPTH should NOT be found
+        assert!(!files.iter().any(|(p, _)| p.contains("deep_file.md")));
+    }
+
+    #[test]
+    fn test_collect_files_count_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // Create more files than MAX_FILES
+        for i in 0..MAX_FILES + 10 {
+            fs::write(workspace.join(format!("file_{i:04}.txt")), "data").unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_files(&workspace, &workspace, &mut files, 0);
+
+        assert_eq!(files.len(), MAX_FILES);
     }
 }

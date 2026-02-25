@@ -7,7 +7,6 @@ pub struct TeamRun {
     pub team_name: String,
     pub goal: String,
     pub status: RunStatus,
-    pub current_step: String,
     pub iteration: u32,
     pub max_iterations: u32,
     pub tasks: Vec<TaskAssignment>,
@@ -43,17 +42,6 @@ pub enum TaskStatus {
     Failed(String),
 }
 
-/// Summary of a past run (used by list_runs).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct TeamRunSummary {
-    pub run_id: String,
-    pub team_name: String,
-    pub goal: String,
-    pub status: RunStatus,
-    pub started_at: String,
-    pub ended_at: Option<String>,
-}
-
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -86,7 +74,6 @@ mod tests {
             team_name: "dev-team".to_string(),
             goal: "Research Rust patterns".to_string(),
             status: RunStatus::Completed,
-            current_step: "deliver".to_string(),
             iteration: 1,
             max_iterations: 3,
             tasks: vec![TaskAssignment {

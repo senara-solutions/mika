@@ -15,6 +15,7 @@ use crate::db::Database;
 use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::tools;
+use crate::tools::ToolRegistry;
 
 use super::history;
 use super::prompt;
@@ -39,6 +40,7 @@ pub struct TeamEngine {
     history_dir: PathBuf,
     agents: HashMap<String, AgentResources>,
     claude: ClaudeClient,
+    tool_registry: ToolRegistry,
     progress: Option<ProgressCallback>,
 }
 
@@ -92,12 +94,17 @@ impl TeamEngine {
             settings.claude_max_tokens,
         )?;
 
+        // Build tool registry once with base tools + workspace tools (#255)
+        let mut tool_registry = tools::default_tools();
+        for tool in tools::team_tools(&workspace_dir) {
+            tool_registry.register(tool);
+        }
+
         let run = TeamRun {
             run_id,
             team_name: team_name.clone(),
             goal: goal.to_string(),
             status: RunStatus::Running,
-            current_step: "initialize".to_string(),
             iteration: 0,
             max_iterations: team.flow.max_iterations,
             tasks: Vec::new(),
@@ -113,6 +120,7 @@ impl TeamEngine {
             history_dir,
             agents,
             claude,
+            tool_registry,
             progress,
         })
     }
@@ -137,6 +145,11 @@ impl TeamEngine {
             warn!(error = %e, "failed to save team run history");
         }
 
+        // Shutdown all AsyncDatabase instances to avoid thread leaks (#256)
+        for (_, resources) in &self.agents {
+            resources.db.shutdown();
+        }
+
         match result {
             Ok(_) => Ok(self.run),
             Err(e) => {
@@ -148,22 +161,19 @@ impl TeamEngine {
     }
 
     async fn execute_inner(&mut self) -> Result<()> {
-        // Step 1: Decompose — orchestrator produces task assignments
+        // Step 1: Decompose -- orchestrator produces task assignments
         self.report_progress("Decomposing goal...");
-        self.run.current_step = "decompose".to_string();
-        let tasks = self.decompose().await?;
+        let tasks = self.decompose(None).await?;
         self.run.tasks = tasks;
 
-        // Iterate: execute → review → (retry if rejected)
+        // Iterate: execute -> review -> (retry if rejected)
         loop {
             self.run.iteration += 1;
 
-            // Step 2: Execute — run each specialist
-            self.run.current_step = "execute".to_string();
+            // Step 2: Execute -- run each specialist
             self.execute_tasks().await?;
 
-            // Step 3: Review — critic evaluates outputs
-            self.run.current_step = "review".to_string();
+            // Step 3: Review -- critic evaluates outputs
             let (approved, feedback) = self.review().await?;
 
             if approved {
@@ -184,12 +194,11 @@ impl TeamEngine {
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
             ));
-            let tasks = self.decompose_with_feedback(&feedback).await?;
+            let tasks = self.decompose(Some(&feedback)).await?;
             self.run.tasks = tasks;
         }
 
-        // Step 4: Deliver — produce final output
-        self.run.current_step = "deliver".to_string();
+        // Step 4: Deliver -- produce final output
         self.report_progress("Producing final deliverable...");
         let deliverable = self.deliver().await?;
         self.run.deliverable = Some(deliverable);
@@ -198,30 +207,27 @@ impl TeamEngine {
     }
 
     /// Ask the orchestrator to decompose the goal into tasks.
-    async fn decompose(&self) -> Result<Vec<TaskAssignment>> {
-        let listing = prompt::workspace_listing(&self.workspace_dir);
-        let context = prompt::build_orchestrator_context(&self.team, "decompose", &listing, None);
-
-        let orchestrator_name = &self.team.team.orchestrator;
-        let response = self
-            .run_agent(orchestrator_name, &self.run.goal, &context)
-            .await?;
-
-        parse_task_assignments(&response, &self.team)
-    }
-
-    /// Re-decompose with feedback from the critic.
-    async fn decompose_with_feedback(&self, feedback: &str) -> Result<Vec<TaskAssignment>> {
+    /// Pass `None` for first decomposition, `Some(feedback)` for re-decomposition
+    /// after critic rejection. (#261: merged decompose + decompose_with_feedback)
+    async fn decompose(&self, feedback: Option<&str>) -> Result<Vec<TaskAssignment>> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
         let context =
-            prompt::build_orchestrator_context(&self.team, "execute", &listing, Some(feedback));
+            prompt::build_orchestrator_context(&self.team, &listing, feedback);
 
         let orchestrator_name = &self.team.team.orchestrator;
-        let msg = format!(
-            "The previous attempt was rejected by the critic. Revise the task assignments.\n\nOriginal goal: {}",
-            self.run.goal
-        );
-        let response = self.run_agent(orchestrator_name, &msg, &context).await?;
+
+        let message = if feedback.is_some() {
+            format!(
+                "The previous attempt was rejected by the critic. Revise the task assignments.\n\nOriginal goal: {}",
+                self.run.goal
+            )
+        } else {
+            self.run.goal.clone()
+        };
+
+        let response = self
+            .run_agent(orchestrator_name, &message, &context)
+            .await?;
 
         parse_task_assignments(&response, &self.team)
     }
@@ -275,7 +281,7 @@ impl TeamEngine {
         let critic_name = match critic {
             Some(a) => a.name.clone(),
             None => {
-                // No critic — auto-approve
+                // No critic -- auto-approve
                 info!("no critic agent, auto-approving");
                 return Ok((true, String::new()));
             }
@@ -325,17 +331,12 @@ impl TeamEngine {
             .get(agent_name)
             .with_context(|| format!("agent '{}' not found in team resources", agent_name))?;
 
-        // Build a tool registry with base tools + workspace tools
-        let mut registry = tools::default_tools();
-        for tool in tools::team_tools(&self.workspace_dir) {
-            registry.register(tool);
-        }
-
+        // Use the pre-built tool registry (#255)
         let session_id = format!("team-{}-{}", self.run.run_id, agent_name);
         let params = TeamAgentParams {
             db: &resources.db,
             claude: &self.claude,
-            tools: &registry,
+            tools: &self.tool_registry,
             skills: &resources.skills,
             home_dir: &resources.home_dir,
             task_message,
@@ -357,11 +358,13 @@ impl TeamEngine {
 
 /// Parse the orchestrator's JSON response into task assignments.
 fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Vec<TaskAssignment>> {
-    // Try to extract JSON array from the response
-    let json_str = extract_json_array(response).unwrap_or(response);
+    // Try to extract JSON array from the response (#257: unified extract_json)
+    let json_str = extract_json(response, '[', ']').unwrap_or(response);
 
     let parsed: Vec<serde_json::Value> = serde_json::from_str(json_str)
         .with_context(|| format!("failed to parse orchestrator task assignments: {response}"))?;
+
+    let agent_names: Vec<&str> = team.agents.iter().map(|a| a.name.as_str()).collect();
 
     let mut tasks = Vec::new();
     for item in parsed {
@@ -375,6 +378,26 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Vec<T
         if agent_name.is_empty() || task.is_empty() {
             continue;
         }
+
+        // #252: Validate agent exists in team
+        if !agent_names.contains(&agent_name.as_str()) {
+            warn!(agent = %agent_name, "orchestrator assigned task to unknown agent, skipping");
+            continue;
+        }
+
+        // #252: Validate output_file (no path traversal or absolute paths)
+        if output_file.contains("..") || output_file.starts_with('/') {
+            warn!(output_file = %output_file, agent = %agent_name, "invalid output_file path, skipping");
+            continue;
+        }
+
+        // #252: Enforce task length limit (5000 chars)
+        let task = if task.len() > 5000 {
+            warn!(agent = %agent_name, len = task.len(), "task description exceeds 5000 chars, truncating");
+            task[..5000].to_string()
+        } else {
+            task
+        };
 
         // Look up the role from the team definition
         let role = team
@@ -402,38 +425,41 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Vec<T
 
 /// Parse the critic's JSON response.
 fn parse_review_response(response: &str) -> Result<(bool, String)> {
-    // Try to extract JSON object from the response
-    let json_str = extract_json_object(response).unwrap_or(response);
+    // Try to extract JSON object from the response (#257: unified extract_json)
+    let json_str = extract_json(response, '{', '}').unwrap_or(response);
 
     match serde_json::from_str::<serde_json::Value>(json_str) {
         Ok(parsed) => {
-            let approved = parsed["approved"].as_bool().unwrap_or(true);
+            // #251: Default to false (reject) when approved field is missing
+            let approved = parsed["approved"].as_bool().unwrap_or(false);
             let feedback = parsed["feedback"].as_str().unwrap_or("").to_string();
             Ok((approved, feedback))
         }
         Err(_) => {
-            // If we can't parse JSON, treat it as approved with the text as feedback
-            warn!("could not parse critic JSON, auto-approving");
-            Ok((true, response.to_string()))
+            // #251: Auto-reject on parse failure instead of auto-approve
+            warn!("could not parse critic JSON, auto-rejecting");
+            Ok((
+                false,
+                format!("Critic response was not parseable JSON: {response}"),
+            ))
         }
     }
 }
 
-/// Extract a JSON array from text that may contain surrounding prose.
-fn extract_json_array(text: &str) -> Option<&str> {
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    if start < end {
-        Some(&text[start..=end])
-    } else {
-        None
-    }
-}
+/// Extract a JSON structure from text that may contain surrounding prose.
+///
+/// Uses smarter start patterns to avoid matching brackets in prose:
+/// - For arrays (`[`/`]`): looks for `[{` as the start pattern
+/// - For objects (`{`/`}`): looks for `{"` as the start pattern
+/// Then searches backwards from the end for the matching close bracket. (#257)
+fn extract_json(text: &str, open: char, close: char) -> Option<&str> {
+    // Build a smarter start pattern to reduce false positives
+    let start_pattern = if open == '[' { "[{" } else { "{\"" };
 
-/// Extract a JSON object from text that may contain surrounding prose.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
+    let start = text.find(start_pattern)?;
+
+    // Search backwards from end for the matching close bracket
+    let end = text.rfind(close)?;
     if start < end {
         Some(&text[start..=end])
     } else {
@@ -464,10 +490,7 @@ mod tests {
                     mandate: "Work".to_string(),
                 },
             ],
-            flow: TeamFlow {
-                steps: vec!["decompose".to_string(), "execute".to_string()],
-                max_iterations: 3,
-            },
+            flow: TeamFlow { max_iterations: 3 },
         }
     }
 
@@ -510,6 +533,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_task_assignments_unknown_agent_skipped() {
+        // #252: Tasks assigned to agents not in the team should be skipped
+        let response = r#"[{"agent": "unknown", "task": "Do something", "output_file": "out.md"}]"#;
+        let team = test_team();
+        let result = parse_task_assignments(response, &team);
+        assert!(result.is_err()); // No valid tasks remain
+    }
+
+    #[test]
+    fn test_parse_task_assignments_path_traversal_skipped() {
+        // #252: output_file with ".." should be skipped
+        let response =
+            r#"[{"agent": "worker", "task": "Do research", "output_file": "../etc/passwd"}]"#;
+        let team = test_team();
+        let result = parse_task_assignments(response, &team);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_task_assignments_absolute_path_skipped() {
+        // #252: output_file starting with "/" should be skipped
+        let response =
+            r#"[{"agent": "worker", "task": "Do research", "output_file": "/tmp/evil.md"}]"#;
+        let team = test_team();
+        let result = parse_task_assignments(response, &team);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_task_assignments_long_task_truncated() {
+        // #252: Tasks longer than 5000 chars get truncated
+        let long_task = "x".repeat(6000);
+        let response =
+            format!(r#"[{{"agent": "worker", "task": "{long_task}", "output_file": "out.md"}}]"#);
+        let team = test_team();
+        let tasks = parse_task_assignments(&response, &team).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task.len(), 5000);
+    }
+
+    #[test]
     fn test_parse_review_approved() {
         let response = r#"{"approved": true, "feedback": "Looks great!"}"#;
         let (approved, feedback) = parse_review_response(response).unwrap();
@@ -533,27 +597,49 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_review_invalid_json_auto_approves() {
+    fn test_parse_review_invalid_json_rejects() {
+        // #251: Parse failure should auto-reject, not auto-approve
         let response = "This is just text, not JSON.";
+        let (approved, feedback) = parse_review_response(response).unwrap();
+        assert!(!approved);
+        assert!(feedback.contains("not parseable JSON"));
+    }
+
+    #[test]
+    fn test_parse_review_missing_approved_field_rejects() {
+        // #251: Missing approved field should default to false
+        let response = r#"{"feedback": "some feedback"}"#;
         let (approved, _) = parse_review_response(response).unwrap();
-        assert!(approved);
+        assert!(!approved);
     }
 
     #[test]
     fn test_extract_json_array() {
         assert_eq!(
-            extract_json_array("prefix [{\"a\":1}] suffix"),
+            extract_json("prefix [{\"a\":1}] suffix", '[', ']'),
             Some("[{\"a\":1}]")
         );
-        assert_eq!(extract_json_array("no array here"), None);
+        assert_eq!(extract_json("no array here", '[', ']'), None);
     }
 
     #[test]
     fn test_extract_json_object() {
         assert_eq!(
-            extract_json_object("prefix {\"a\":1} suffix"),
+            extract_json("prefix {\"a\":1} suffix", '{', '}'),
             Some("{\"a\":1}")
         );
-        assert_eq!(extract_json_object("no object here"), None);
+        assert_eq!(extract_json("no object here", '{', '}'), None);
+    }
+
+    #[test]
+    fn test_extract_json_avoids_prose_brackets() {
+        // The smarter patterns should skip brackets that don't look like JSON
+        // e.g., a lone "[" in prose without a following "{"
+        assert_eq!(extract_json("see [1] for details", '[', ']'), None);
+        // But should still find actual JSON arrays
+        assert_eq!(
+            extract_json("result: [{\"x\":1}]", '[', ']'),
+            Some("[{\"x\":1}]")
+        );
     }
 }

@@ -7,80 +7,65 @@ use super::types::TeamRun;
 
 /// Build the team context injected into the orchestrator's system prompt.
 ///
-/// Includes: team definition, current step, workspace state, instructions
-/// for producing task assignments, and any previous review feedback.
+/// Includes: team definition, workspace state, instructions for producing
+/// task assignments, and any previous review feedback.
 pub fn build_orchestrator_context(
     def: &TeamDefinition,
-    current_step: &str,
     workspace_listing: &str,
     previous_feedback: Option<&str>,
 ) -> String {
-    let mut ctx = String::with_capacity(2048);
-
-    writeln!(ctx, "You are the ORCHESTRATOR of team '{}'.", def.team.name).unwrap();
-    writeln!(ctx).unwrap();
-
-    writeln!(ctx, "## Team Members").unwrap();
+    let mut members = String::new();
     for agent in &def.agents {
         if agent.name == def.team.orchestrator {
             continue;
         }
-        writeln!(
-            ctx,
+        let _ = writeln!(
+            members,
             "- **{}** (role: {}): {}",
             agent.name, agent.role, agent.mandate
-        )
-        .unwrap();
+        );
     }
-    writeln!(ctx).unwrap();
 
-    writeln!(ctx, "## Flow").unwrap();
-    writeln!(ctx, "Steps: {}", def.flow.steps.join(" -> ")).unwrap();
-    writeln!(ctx, "Current step: {current_step}").unwrap();
-    writeln!(ctx).unwrap();
+    let feedback_section = match previous_feedback {
+        Some(feedback) => format!(
+            "\n## Previous Review Feedback\n\
+             The critic rejected the previous iteration:\n\
+             {feedback}\n"
+        ),
+        None => String::new(),
+    };
 
-    writeln!(ctx, "## Workspace State").unwrap();
-    if workspace_listing.is_empty() {
-        writeln!(ctx, "Workspace is empty (no files yet).").unwrap();
+    let workspace_section = if workspace_listing.is_empty() {
+        "Workspace is empty (no files yet).".to_string()
     } else {
-        writeln!(ctx, "{workspace_listing}").unwrap();
-    }
-    writeln!(ctx).unwrap();
+        workspace_listing.to_string()
+    };
 
-    if let Some(feedback) = previous_feedback {
-        writeln!(ctx, "## Previous Review Feedback").unwrap();
-        writeln!(ctx, "The critic rejected the previous iteration:").unwrap();
-        writeln!(ctx, "{feedback}").unwrap();
-        writeln!(ctx).unwrap();
-    }
-
-    writeln!(ctx, "## Instructions").unwrap();
-    writeln!(
-        ctx,
-        "Decompose the goal into tasks for your team members. \
-         Respond with a JSON array of task assignments. Each assignment has:"
+    format!(
+        "You are the ORCHESTRATOR of team '{team_name}'.\n\
+         \n\
+         ## Team Members\n\
+         {members}\n\
+         ## Flow\n\
+         Max iterations: {mi}\n\
+         \n\
+         ## Workspace State\n\
+         {workspace_section}\n\
+         {feedback_section}\n\
+         ## Instructions\n\
+         Decompose the goal into tasks for your team members. \
+         Respond with a JSON array of task assignments. Each assignment has:\n\
+         - \"agent\": the team member's name\n\
+         - \"task\": a clear, specific description of what to do\n\
+         - \"output_file\": the workspace filename where results should be written\n\
+         \n\
+         Use `list_workspace` to check the current workspace state before planning.\n\
+         \n\
+         Respond ONLY with the JSON array. Example:\n\
+         [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
+        team_name = def.team.name,
+        mi = def.flow.max_iterations,
     )
-    .unwrap();
-    writeln!(ctx, "- \"agent\": the team member's name").unwrap();
-    writeln!(
-        ctx,
-        "- \"task\": a clear, specific description of what to do"
-    )
-    .unwrap();
-    writeln!(
-        ctx,
-        "- \"output_file\": the workspace filename where results should be written"
-    )
-    .unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "Respond ONLY with the JSON array. Example:").unwrap();
-    writeln!(
-        ctx,
-        r#"[{{"agent": "researcher", "task": "Research X and write findings", "output_file": "research.md"}}]"#
-    )
-    .unwrap();
-
-    ctx
 }
 
 /// Build the team context injected into a specialist agent's system prompt.
@@ -92,132 +77,79 @@ pub fn build_specialist_context(
     task: &str,
     output_file: &str,
 ) -> String {
-    let mut ctx = String::with_capacity(1024);
-
-    writeln!(ctx, "You are working as part of a TEAM.").unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Your Role").unwrap();
-    writeln!(ctx, "Role: {role}").unwrap();
-    writeln!(ctx, "Mandate: {mandate}").unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Your Task").unwrap();
-    writeln!(ctx, "{task}").unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Instructions").unwrap();
-    writeln!(
-        ctx,
-        "1. Use `list_workspace` to see what shared files are available."
+    format!(
+        "You are working as part of a TEAM.\n\
+         \n\
+         ## Your Role\n\
+         Role: {role}\n\
+         Mandate: {mandate}\n\
+         \n\
+         ## Your Task\n\
+         {task}\n\
+         \n\
+         ## Instructions\n\
+         1. Use `list_workspace` to see what shared files are available.\n\
+         2. Use `read_workspace` to read any relevant context from other team members.\n\
+         3. Do your work and write your results to `{output_file}` using `write_workspace`.\n\
+         4. Respond with a brief summary of what you accomplished.\n"
     )
-    .unwrap();
-    writeln!(
-        ctx,
-        "2. Use `read_workspace` to read any relevant context from other team members."
-    )
-    .unwrap();
-    writeln!(
-        ctx,
-        "3. Do your work and write your results to `{output_file}` using `write_workspace`."
-    )
-    .unwrap();
-    writeln!(
-        ctx,
-        "4. Respond with a brief summary of what you accomplished."
-    )
-    .unwrap();
-
-    ctx
 }
 
 /// Build the team context injected into the critic/QA agent's system prompt.
 ///
 /// Includes: review criteria and instructions for approve/reject JSON output.
 pub fn build_critic_context(def: &TeamDefinition, run: &TeamRun) -> String {
-    let mut ctx = String::with_capacity(1024);
-
-    writeln!(
-        ctx,
-        "You are the CRITIC/QA reviewer for team '{}'.",
-        def.team.name
-    )
-    .unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Goal").unwrap();
-    writeln!(ctx, "The team is working on: {}", run.goal).unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Tasks Completed").unwrap();
+    let mut tasks_section = String::new();
     for task in &run.tasks {
-        writeln!(
-            ctx,
+        let _ = writeln!(
+            tasks_section,
             "- **{}** ({}): {} -> {}",
             task.agent, task.role, task.task, task.output_file
-        )
-        .unwrap();
+        );
     }
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Instructions").unwrap();
-    writeln!(ctx, "1. Use `list_workspace` to see all output files.").unwrap();
-    writeln!(ctx, "2. Use `read_workspace` to read each output file.").unwrap();
-    writeln!(
-        ctx,
-        "3. Evaluate whether the outputs collectively achieve the goal."
-    )
-    .unwrap();
-    writeln!(ctx, "4. Respond with a JSON object:").unwrap();
-    writeln!(
-        ctx,
-        r#"   {{"approved": true/false, "feedback": "your detailed feedback"}}"#
-    )
-    .unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Review Criteria").unwrap();
-    writeln!(ctx, "- Completeness: Does the work address the full goal?").unwrap();
-    writeln!(
-        ctx,
-        "- Quality: Is the output well-structured and accurate?"
-    )
-    .unwrap();
-    writeln!(
-        ctx,
-        "- Coherence: Do the outputs from different agents fit together?"
-    )
-    .unwrap();
-    writeln!(ctx, "Iteration: {}/{}", run.iteration, run.max_iterations).unwrap();
 
-    ctx
+    format!(
+        "You are the CRITIC/QA reviewer for team '{team_name}'.\n\
+         \n\
+         ## Goal\n\
+         The team is working on: {goal}\n\
+         \n\
+         ## Tasks Completed\n\
+         {tasks_section}\n\
+         ## Instructions\n\
+         1. Use `list_workspace` to see all output files.\n\
+         2. Use `read_workspace` to read each output file.\n\
+         3. Evaluate whether the outputs collectively achieve the goal.\n\
+         4. Respond with a JSON object:\n\
+         \x20  {{\"approved\": true/false, \"feedback\": \"your detailed feedback\"}}\n\
+         \n\
+         ## Review Criteria\n\
+         - Completeness: Does the work address the full goal?\n\
+         - Quality: Is the output well-structured and accurate?\n\
+         - Coherence: Do the outputs from different agents fit together?\n\
+         Iteration: {iteration}/{max_iterations}\n",
+        team_name = def.team.name,
+        goal = run.goal,
+        iteration = run.iteration,
+        max_iterations = run.max_iterations,
+    )
 }
 
 /// Build context for the deliverable step (final synthesis).
 pub fn build_deliverable_context(run: &TeamRun) -> String {
-    let mut ctx = String::with_capacity(1024);
-
-    writeln!(
-        ctx,
-        "You are producing the FINAL DELIVERABLE for a team run."
+    format!(
+        "You are producing the FINAL DELIVERABLE for a team run.\n\
+         \n\
+         ## Goal\n\
+         {goal}\n\
+         \n\
+         ## Instructions\n\
+         1. Use `list_workspace` and `read_workspace` to review all team outputs.\n\
+         2. Synthesize the outputs into a clear, cohesive final deliverable.\n\
+         3. Write the final deliverable to `deliverable.md` using `write_workspace`.\n\
+         4. Respond with the deliverable content directly.\n",
+        goal = run.goal,
     )
-    .unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Goal").unwrap();
-    writeln!(ctx, "{}", run.goal).unwrap();
-    writeln!(ctx).unwrap();
-    writeln!(ctx, "## Instructions").unwrap();
-    writeln!(
-        ctx,
-        "1. Use `list_workspace` and `read_workspace` to review all team outputs."
-    )
-    .unwrap();
-    writeln!(
-        ctx,
-        "2. Synthesize the outputs into a clear, cohesive final deliverable."
-    )
-    .unwrap();
-    writeln!(
-        ctx,
-        "3. Write the final deliverable to `deliverable.md` using `write_workspace`."
-    )
-    .unwrap();
-    writeln!(ctx, "4. Respond with the deliverable content directly.").unwrap();
-
-    ctx
 }
 
 /// Get a simple listing of workspace files for prompt injection.
@@ -278,11 +210,6 @@ mod tests {
                 },
             ],
             flow: TeamFlow {
-                steps: vec![
-                    "decompose".to_string(),
-                    "execute".to_string(),
-                    "review".to_string(),
-                ],
                 max_iterations: 3,
             },
         }
@@ -291,7 +218,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_includes_team_members() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "decompose", "", None);
+        let ctx = build_orchestrator_context(&def, "", None);
         assert!(ctx.contains("ORCHESTRATOR"));
         assert!(ctx.contains("researcher"));
         assert!(ctx.contains("Research topics"));
@@ -302,7 +229,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_with_feedback() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "execute", "", Some("Needs more detail"));
+        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"));
         assert!(ctx.contains("Previous Review Feedback"));
         assert!(ctx.contains("Needs more detail"));
     }
@@ -329,7 +256,6 @@ mod tests {
             team_name: "dev-team".to_string(),
             goal: "Research Rust".to_string(),
             status: RunStatus::Running,
-            current_step: "review".to_string(),
             iteration: 1,
             max_iterations: 3,
             tasks: vec![TaskAssignment {
@@ -359,7 +285,6 @@ mod tests {
             team_name: "dev-team".to_string(),
             goal: "Write summary".to_string(),
             status: RunStatus::Running,
-            current_step: "deliver".to_string(),
             iteration: 1,
             max_iterations: 3,
             tasks: vec![],

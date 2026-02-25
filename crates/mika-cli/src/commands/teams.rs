@@ -130,14 +130,7 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
             orchestrator,
         },
         agents: team_agents,
-        flow: mika_common::team::TeamFlow {
-            steps: vec![
-                "decompose".to_string(),
-                "execute".to_string(),
-                "review".to_string(),
-            ],
-            max_iterations: 3,
-        },
+        flow: mika_common::team::TeamFlow { max_iterations: 3 },
     };
 
     // Write team.toml
@@ -227,7 +220,6 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
             agent.name, agent.role, agent.mandate
         );
     }
-    println!("  Flow: {}", def.flow.steps.join(" -> "));
     println!("  Max iterations: {}", def.flow.max_iterations);
 
     // Show latest run if available

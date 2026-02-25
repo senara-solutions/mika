@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use super::types::{TeamRun, TeamRunSummary};
+use super::types::TeamRun;
 
 /// Save a team run to the history directory as a TOML file.
 ///
@@ -41,13 +41,13 @@ pub fn load_latest_run(history_dir: &Path) -> Result<Option<TeamRun>> {
     Ok(Some(run))
 }
 
-/// List all runs in the history directory as summaries.
-pub fn list_runs(history_dir: &Path) -> Result<Vec<TeamRunSummary>> {
+/// List all runs in the history directory.
+pub fn list_runs(history_dir: &Path) -> Result<Vec<TeamRun>> {
     let mut files = list_run_files(history_dir)?;
     files.sort();
     files.reverse(); // most recent first
 
-    let mut summaries = Vec::new();
+    let mut runs = Vec::new();
     for filename in files {
         let path = history_dir.join(&filename);
         let content = match std::fs::read_to_string(&path) {
@@ -58,17 +58,10 @@ pub fn list_runs(history_dir: &Path) -> Result<Vec<TeamRunSummary>> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        summaries.push(TeamRunSummary {
-            run_id: run.run_id,
-            team_name: run.team_name,
-            goal: run.goal,
-            status: run.status,
-            started_at: run.started_at,
-            ended_at: run.ended_at,
-        });
+        runs.push(run);
     }
 
-    Ok(summaries)
+    Ok(runs)
 }
 
 fn list_run_files(history_dir: &Path) -> Result<Vec<String>> {
@@ -97,7 +90,7 @@ fn list_run_files(history_dir: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::teams::types::{RunStatus, TaskAssignment, TaskStatus};
+    use crate::teams::types::{RunStatus, TaskAssignment, TaskStatus, TeamRun};
 
     fn test_run() -> TeamRun {
         TeamRun {
@@ -105,7 +98,6 @@ mod tests {
             team_name: "dev-team".to_string(),
             goal: "Test goal".to_string(),
             status: RunStatus::Completed,
-            current_step: "deliver".to_string(),
             iteration: 1,
             max_iterations: 3,
             tasks: vec![TaskAssignment {
@@ -159,17 +151,17 @@ mod tests {
         run2.started_at = "2026-02-25T10:00:00Z".to_string();
         save_run(&history, &run2).unwrap();
 
-        let summaries = list_runs(&history).unwrap();
-        assert_eq!(summaries.len(), 2);
+        let runs = list_runs(&history).unwrap();
+        assert_eq!(runs.len(), 2);
         // Most recent first
-        assert_eq!(summaries[0].run_id, "bbbb2222");
-        assert_eq!(summaries[1].run_id, "aaaa1111");
+        assert_eq!(runs[0].run_id, "bbbb2222");
+        assert_eq!(runs[1].run_id, "aaaa1111");
     }
 
     #[test]
     fn test_list_runs_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let summaries = list_runs(tmp.path()).unwrap();
-        assert!(summaries.is_empty());
+        let runs = list_runs(tmp.path()).unwrap();
+        assert!(runs.is_empty());
     }
 }

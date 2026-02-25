@@ -2,9 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 /// Maximum file size that can be read from the workspace (100 KB).
 const MAX_READ_SIZE: u64 = 100 * 1024;
@@ -42,12 +42,47 @@ impl Tool for ReadWorkspaceTool {
             return Ok(ToolOutput::error("'path' is required and cannot be empty."));
         }
 
-        // Prevent path traversal
-        if path.contains("..") {
-            return Ok(ToolOutput::error("Path traversal ('..') is not allowed."));
+        // Validate path length
+        if path.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Path exceeds maximum length of {MAX_INPUT_LEN} characters."
+            )));
+        }
+
+        // Reject absolute paths
+        if std::path::Path::new(path).is_absolute() {
+            return Ok(ToolOutput::error(
+                "Absolute paths are not allowed. Use a relative path within the workspace.",
+            ));
+        }
+
+        // Prevent path traversal using component inspection
+        for component in std::path::Path::new(path).components() {
+            match component {
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Ok(ToolOutput::error(
+                        "Path traversal components ('..', root, or prefix) are not allowed.",
+                    ));
+                }
+                _ => {}
+            }
         }
 
         let full_path = self.workspace_dir.join(path);
+
+        // Reject symlinks (check before canonicalize to prevent TOCTOU via symlink)
+        match tokio::fs::symlink_metadata(&full_path).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Ok(ToolOutput::error(
+                        "Symbolic links are not allowed in the workspace.",
+                    ));
+                }
+            }
+            Err(_) => {
+                return Ok(ToolOutput::error(format!("File not found: {path}")));
+            }
+        }
 
         // Verify the resolved path is still within the workspace
         match full_path.canonicalize() {
@@ -188,5 +223,84 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(!output.is_error);
         assert_eq!(output.content, "nested content");
+    }
+
+    #[tokio::test]
+    async fn test_read_absolute_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "/etc/passwd" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Absolute paths are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_read_symlink_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // Create a real file outside workspace and symlink to it
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&secret, "top secret").unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.join("link.md")).unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "link.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Symbolic links are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_read_path_length_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let long_path = "a".repeat(MAX_INPUT_LEN + 1);
+        let input = serde_json::json!({ "path": long_path });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("exceeds maximum length"));
+    }
+
+    #[tokio::test]
+    async fn test_read_double_dot_in_filename_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("file..v2.md"), "version 2 content").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "file..v2.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, "version 2 content");
     }
 }

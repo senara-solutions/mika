@@ -34,7 +34,6 @@ pub struct TeamAgent {
 /// Flow configuration for the team orchestration.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct TeamFlow {
-    pub steps: Vec<String>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
 }
@@ -307,7 +306,6 @@ max_iterations = 2
         assert_eq!(def.agents.len(), 2);
         assert_eq!(def.agents[0].name, "planner");
         assert_eq!(def.agents[1].role, "specialist");
-        assert_eq!(def.flow.steps.len(), 3);
         assert_eq!(def.flow.max_iterations, 2);
     }
 
@@ -371,10 +369,7 @@ steps = ["decompose", "execute"]
                     mandate: "Research".to_string(),
                 },
             ],
-            flow: TeamFlow {
-                steps: vec!["decompose".to_string()],
-                max_iterations: 3,
-            },
+            flow: TeamFlow { max_iterations: 3 },
         };
 
         assert!(validate_team(tmp.path(), &def).is_ok());
@@ -405,10 +400,7 @@ steps = ["decompose", "execute"]
                     mandate: "Research".to_string(),
                 },
             ],
-            flow: TeamFlow {
-                steps: vec!["decompose".to_string()],
-                max_iterations: 3,
-            },
+            flow: TeamFlow { max_iterations: 3 },
         };
 
         let err = validate_team(tmp.path(), &def).unwrap_err();
@@ -435,10 +427,7 @@ steps = ["decompose", "execute"]
                 role: "specialist".to_string(),
                 mandate: "Work".to_string(),
             }],
-            flow: TeamFlow {
-                steps: vec!["execute".to_string()],
-                max_iterations: 3,
-            },
+            flow: TeamFlow { max_iterations: 3 },
         };
 
         let err = validate_team(tmp.path(), &def).unwrap_err();
@@ -459,10 +448,7 @@ steps = ["decompose", "execute"]
                 role: "orchestrator".to_string(),
                 mandate: "Plan".to_string(),
             }],
-            flow: TeamFlow {
-                steps: vec!["decompose".to_string()],
-                max_iterations: 3,
-            },
+            flow: TeamFlow { max_iterations: 3 },
         };
 
         let err = validate_team(tmp.path(), &def).unwrap_err();
