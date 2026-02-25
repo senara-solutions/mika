@@ -152,7 +152,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     if let Ok(history) = worker
         ._ctx
         .async_db
-        .load_recent_messages(50, Some(vec!["cli".to_string()]))
+        .load_recent_messages(20, Some(vec!["cli".to_string()]))
         .await
     {
         for msg in history {

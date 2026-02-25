@@ -8,11 +8,18 @@ use crate::tui::app::{AgentStatus, App, ChatRole};
 use crate::tui::markdown;
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
-    // Dynamic input height: grow with content, capped at 6 lines
-    let input_content_len = app.textarea.lines().iter().map(|l| l.len()).sum::<usize>();
+    // Dynamic input height: grow with content, capped at 6 lines.
+    // Account for both wrapped lines (long lines) and explicit newlines (pasted text).
     let available_width = f.area().width.saturating_sub(4) as usize; // borders + "> " prompt
     let input_lines = if available_width > 0 {
-        ((input_content_len / available_width) + 1).clamp(1, 6) as u16
+        let wrapped: usize = app
+            .textarea
+            .lines()
+            .iter()
+            .map(|l| (l.len() / available_width) + 1)
+            .sum();
+        let line_count = app.textarea.lines().len();
+        wrapped.max(line_count).clamp(1, 6) as u16
     } else {
         1
     };
