@@ -242,6 +242,10 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_commitment_status(id)).await
     }
 
+    pub async fn get_commitment_details(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
+        self.with_db(move |db| db.get_commitment_details(id)).await
+    }
+
     pub async fn search_commitments(&self, query: &str) -> Result<Vec<Commitment>> {
         let q = query.to_owned();
         self.with_db(move |db| db.search_commitments(&q)).await
@@ -249,7 +253,7 @@ impl AsyncDatabase {
 
     // -- Preferences --
 
-    pub async fn set_preference(&self, category: &str, value: &str) -> Result<()> {
+    pub async fn set_preference(&self, category: &str, value: &str) -> Result<i64> {
         let (c, v) = (category.to_owned(), value.to_owned());
         self.with_db(move |db| db.set_preference(&c, &v)).await
     }

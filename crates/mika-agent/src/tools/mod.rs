@@ -69,6 +69,38 @@ impl ToolOutput {
     }
 }
 
+/// Index a fact into the search system (FTS5 + optional vector embedding).
+///
+/// Best-effort: logs warnings on failure but never propagates errors,
+/// since search indexing should not block tool responses.
+pub(crate) async fn index_fact(ctx: &ToolContext<'_>, source_type: &str, source_id: i64, content: &str) {
+    // Delete any existing index entry for this source (handles upserts)
+    let _ = ctx.db.delete_search_content(source_type, source_id).await;
+
+    // Index into FTS5
+    let content_id = match ctx.db.index_content(source_type, Some(source_id), content).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(source_type, source_id, error = %e, "failed to index content for search");
+            return;
+        }
+    };
+
+    // Generate and store embedding if client is available
+    if let Some(client) = ctx.embedding_client {
+        match client.embed(content).await {
+            Ok(embedding) => {
+                if let Err(e) = ctx.db.index_embedding(content_id, embedding).await {
+                    tracing::warn!(source_type, source_id, error = %e, "failed to index embedding");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(source_type, source_id, error = %e, "failed to generate embedding");
+            }
+        }
+    }
+}
+
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,

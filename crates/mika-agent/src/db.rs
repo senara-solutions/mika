@@ -713,10 +713,23 @@ impl Database {
         Ok(status)
     }
 
+    /// Get the description and due_date of a commitment by id.
+    pub fn get_commitment_details(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT description, due_date FROM commitments WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
     // -- Preferences (Layer 2) --
 
-    /// Upsert a preference (case-insensitive category).
-    pub fn set_preference(&self, category: &str, value: &str) -> Result<()> {
+    /// Upsert a preference (case-insensitive category). Returns the preference ID.
+    pub fn set_preference(&self, category: &str, value: &str) -> Result<i64> {
         self.conn
             .execute(
                 "INSERT INTO preferences (category, value, updated_at)
@@ -727,7 +740,15 @@ impl Database {
                 rusqlite::params![category, value],
             )
             .context("failed to upsert preference")?;
-        Ok(())
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM preferences WHERE category = ?1",
+                [category],
+                |row| row.get(0),
+            )
+            .context("failed to get preference id")?;
+        Ok(id)
     }
 
     /// Get a preference by category (case-insensitive).
