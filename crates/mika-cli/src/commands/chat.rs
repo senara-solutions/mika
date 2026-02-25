@@ -99,7 +99,7 @@ async fn spawn_agent_worker(
                             is_error: false,
                         },
                         Err(e) => AgentResponse {
-                            content: format!("{e:#}"),
+                            content: format!("{e}"),
                             is_error: true,
                         },
                     };

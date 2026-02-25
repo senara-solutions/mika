@@ -199,18 +199,43 @@ impl ClaudeClient {
                         last_error = Some(e);
                         continue;
                     }
-                    if matches!(&e, ClaudeApiError::HttpError { status: 401, .. }) {
-                        return Err(anyhow::Error::from(e).context(
-                            "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key.",
-                        ));
-                    }
-                    return Err(e.into());
+                    return Err(match &e {
+                        ClaudeApiError::HttpError { status: 401, .. } => {
+                            anyhow::Error::from(e).context(
+                                "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key.",
+                            )
+                        }
+                        ClaudeApiError::HttpError { status: 429, .. } => {
+                            anyhow::Error::from(e).context(
+                                "Claude API is busy. Please wait a moment and try again.",
+                            )
+                        }
+                        ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
+                            anyhow::Error::from(e).context(
+                                "Claude API is temporarily unavailable. Please try again shortly.",
+                            )
+                        }
+                        ClaudeApiError::Transport(_) => {
+                            anyhow::Error::from(e).context(
+                                "Could not connect to Claude API. Check your internet connection.",
+                            )
+                        }
+                        ClaudeApiError::ParseError(_) => {
+                            anyhow::Error::from(e).context(
+                                "Received an unexpected response from Claude API.",
+                            )
+                        }
+                        _ => e.into(),
+                    });
                 }
             }
         }
 
         Err(last_error
-            .map(anyhow::Error::from)
+            .map(|e| {
+                anyhow::Error::from(e)
+                    .context("Claude API is busy. Please wait a moment and try again.")
+            })
             .unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
     }
 

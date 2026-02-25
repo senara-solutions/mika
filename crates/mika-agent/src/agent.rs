@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mika_common::claude::{
     ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
 };
@@ -183,10 +183,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<String> {
             "agent loop step"
         );
 
-        let response = claude
-            .send_message(&request)
-            .await
-            .context("Claude API call failed")?;
+        let response = claude.send_message(&request).await?;
 
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens => {
@@ -432,10 +429,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     for step in 0..MAX_TOOL_STEPS {
         debug!(step, channel_type, "silent agent step");
 
-        let response = claude
-            .send_message(&request)
-            .await
-            .context("Claude API call failed in silent mode")?;
+        let response = claude.send_message(&request).await?;
 
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
@@ -564,10 +558,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<String> {
     for step in 0..MAX_TOOL_STEPS {
         debug!(step, "team agent step");
 
-        let response = claude
-            .send_message(&request)
-            .await
-            .context("Claude API call failed in team agent")?;
+        let response = claude.send_message(&request).await?;
 
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {

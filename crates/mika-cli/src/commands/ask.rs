@@ -30,7 +30,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
 
     let is_onboarding = check_onboarding(&ctx.async_db).await;
 
-    let response = agent::run_agent(&AgentParams {
+    let response = match agent::run_agent(&AgentParams {
         db: &ctx.async_db,
         claude: &ctx.claude,
         tools: &tool_registry,
@@ -44,7 +44,14 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         skip_compaction: false,
         embedding_client: None,
     })
-    .await?;
+    .await
+    {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     println!("{response}");
 
