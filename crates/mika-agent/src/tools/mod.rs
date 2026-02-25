@@ -1,11 +1,14 @@
 mod cancel_reminder;
 mod create_reminder;
 mod list_reminders;
+pub mod list_workspace;
+pub mod read_workspace;
 mod search_memory;
 mod send_message;
 mod store_fact;
 mod update_core_memory;
 mod update_fact;
+pub mod write_workspace;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -73,12 +76,21 @@ impl ToolOutput {
 ///
 /// Best-effort: logs warnings on failure but never propagates errors,
 /// since search indexing should not block tool responses.
-pub(crate) async fn index_fact(ctx: &ToolContext<'_>, source_type: &str, source_id: i64, content: &str) {
+pub(crate) async fn index_fact(
+    ctx: &ToolContext<'_>,
+    source_type: &str,
+    source_id: i64,
+    content: &str,
+) {
     // Delete any existing index entry for this source (handles upserts)
     let _ = ctx.db.delete_search_content(source_type, source_id).await;
 
     // Index into FTS5
-    let content_id = match ctx.db.index_content(source_type, Some(source_id), content).await {
+    let content_id = match ctx
+        .db
+        .index_content(source_type, Some(source_id), content)
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(source_type, source_id, error = %e, "failed to index content for search");
@@ -145,6 +157,21 @@ impl ToolRegistry {
             .find(|(tool, _)| tool.name() == name)
             .map(|(_, def)| def)
     }
+}
+
+/// Create a registry with workspace tools for team execution.
+pub fn team_tools(workspace_dir: &Path) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(read_workspace::ReadWorkspaceTool {
+            workspace_dir: workspace_dir.to_path_buf(),
+        }),
+        Box::new(write_workspace::WriteWorkspaceTool {
+            workspace_dir: workspace_dir.to_path_buf(),
+        }),
+        Box::new(list_workspace::ListWorkspaceTool {
+            workspace_dir: workspace_dir.to_path_buf(),
+        }),
+    ]
 }
 
 /// Create a registry with all built-in tools.

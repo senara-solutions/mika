@@ -126,7 +126,11 @@ impl EmbeddingClient {
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                warn!(attempt, delay_ms = delay.as_millis(), "retrying embedding API call");
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "retrying embedding API call"
+                );
                 tokio::time::sleep(delay).await;
             }
 
@@ -168,7 +172,11 @@ impl EmbeddingClient {
         if !status.is_success() {
             let status_code = status.as_u16();
             let body = response.text().await.unwrap_or_default();
-            let truncated_body: &str = if body.len() > 500 { &body[..500] } else { &body };
+            let truncated_body: &str = if body.len() > 500 {
+                &body[..500]
+            } else {
+                &body
+            };
             warn!(status = status_code, body = %truncated_body, "embedding API error response");
             return Err(EmbeddingApiError { status_code }.into());
         }

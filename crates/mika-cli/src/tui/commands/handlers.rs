@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use mika_common::agent;
 use mika_common::home;
+use mika_common::team;
 
 use crate::tui::app::{AgentRequest, AgentStatus, App, ChatRole};
 use crate::tui::commands::{COMMANDS, parse_command};
@@ -29,6 +30,8 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "skill" => Some(handle_skill(app, args)),
         "switch" | "agent" => Some(handle_switch(app, args)),
         "agents" => Some(handle_agents(app)),
+        "teams" => Some(handle_teams(app)),
+        "team" => Some(handle_team(app, args).await),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -442,6 +445,79 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
         None => {
             format!("No skill found with name '{name}'. Use /skills to list all loaded skills.")
         }
+    }
+}
+
+fn handle_teams(app: &App<'_>) -> String {
+    let teams = team::list_teams(&app.global_home);
+
+    if teams.is_empty() {
+        return "No teams found. Use `mika teams create <name>` to create one.".to_string();
+    }
+
+    let mut out = String::from("Teams:\n");
+    for name in &teams {
+        let agent_count = match team::load_team(&app.global_home, name) {
+            Ok(def) => def.agents.len(),
+            Err(_) => 0,
+        };
+        let _ = writeln!(out, "  {name} ({agent_count} agents)");
+    }
+    out
+}
+
+async fn handle_team(app: &mut App<'_>, args: &str) -> String {
+    if args.is_empty() {
+        return "Usage: /team <name> \"<goal>\"".to_string();
+    }
+
+    // Parse: /team <name> <goal>
+    let (name, goal) = match args.split_once(char::is_whitespace) {
+        Some((n, g)) => (n.trim(), g.trim().trim_matches('"')),
+        None => return "Usage: /team <name> \"<goal>\"".to_string(),
+    };
+
+    if goal.is_empty() {
+        return "Usage: /team <name> \"<goal>\"".to_string();
+    }
+
+    let name = team::normalize_team_name(name);
+    if !team::team_exists(&app.global_home, &name) {
+        return format!("Team '{name}' not found. Use /teams to list available teams.");
+    }
+
+    if app.status != AgentStatus::Idle {
+        return "Cannot run team while agent is busy.".to_string();
+    }
+
+    // Load settings
+    let settings = match mika_common::config::Settings::load(&app.global_home) {
+        Ok(s) => s,
+        Err(e) => return format!("Failed to load settings: {e}"),
+    };
+
+    // Run the team (this blocks the TUI — in a real implementation you'd spawn this)
+    app.messages.push(crate::tui::app::ChatMessage {
+        role: ChatRole::System,
+        content: format!("Running team '{name}' with goal: {goal}"),
+        rendered: None,
+    });
+
+    match mika_agent::teams::run_team(&name, goal, &app.global_home, &settings, None).await {
+        Ok(run) => {
+            let mut out = String::new();
+            let _ = writeln!(
+                out,
+                "Team run completed (ID: {})",
+                run.run_id.get(..8).unwrap_or(&run.run_id)
+            );
+            let _ = writeln!(out, "Status: {}", run.status);
+            if let Some(deliverable) = &run.deliverable {
+                let _ = writeln!(out, "\n{deliverable}");
+            }
+            out
+        }
+        Err(e) => format!("Team run failed: {e}"),
     }
 }
 

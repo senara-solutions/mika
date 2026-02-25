@@ -361,7 +361,9 @@ impl Database {
     }
 
     fn migrate_v8(&self) -> Result<()> {
-        info!("applying migration v8: Layer 3 search tables (search_content, vec_search, fts_search)");
+        info!(
+            "applying migration v8: Layer 3 search tables (search_content, vec_search, fts_search)"
+        );
 
         // search_content and fts_search in one transaction
         self.conn
@@ -1339,11 +1341,9 @@ impl Database {
 
     /// Count total rows in search_content (used for backfill detection).
     pub fn count_search_content(&self) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM search_content",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM search_content", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -1383,13 +1383,11 @@ impl Database {
             ),
             None => (
                 format!("{base_sql} ORDER BY fts.rank LIMIT ?2"),
-                vec![
-                    Box::new(safe_query),
-                    Box::new(limit as i64),
-                ],
+                vec![Box::new(safe_query), Box::new(limit as i64)],
             ),
         };
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
         let results = stmt
             .query_map(params_refs.as_slice(), |row| {
@@ -1497,9 +1495,9 @@ impl Database {
         let mut facts = Vec::new();
 
         // People
-        let mut stmt = self.conn.prepare(
-            "SELECT id, canonical_name, relationship, notes FROM people",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, canonical_name, relationship, notes FROM people")?;
         let people = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let name: String = row.get(1)?;
@@ -1520,9 +1518,9 @@ impl Database {
         }
 
         // Commitments
-        let mut stmt = self.conn.prepare(
-            "SELECT id, description, due_date, status FROM commitments",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, description, due_date, status FROM commitments")?;
         let commits = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let desc: String = row.get(1)?;
@@ -1541,9 +1539,9 @@ impl Database {
         }
 
         // Preferences
-        let mut stmt = self.conn.prepare(
-            "SELECT id, category, value FROM preferences",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, category, value FROM preferences")?;
         let prefs = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let cat: String = row.get(1)?;
@@ -1556,9 +1554,9 @@ impl Database {
         }
 
         // Events
-        let mut stmt = self.conn.prepare(
-            "SELECT id, description, event_date, context FROM events",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, description, event_date, context FROM events")?;
         let events = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let desc: String = row.get(1)?;
@@ -2899,7 +2897,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(sc_exists, "search_content table should exist after v8 migration");
+        assert!(
+            sc_exists,
+            "search_content table should exist after v8 migration"
+        );
 
         // fts_search virtual table exists
         let fts_exists: bool = db
@@ -2910,7 +2911,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(fts_exists, "fts_search table should exist after v8 migration");
+        assert!(
+            fts_exists,
+            "fts_search table should exist after v8 migration"
+        );
 
         // vec_search virtual table exists
         let vec_exists: bool = db
@@ -2921,7 +2925,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(vec_exists, "vec_search table should exist after v8 migration");
+        assert!(
+            vec_exists,
+            "vec_search table should exist after v8 migration"
+        );
 
         // Verify vec_search works with a simple insert + query
         db.conn
@@ -2966,9 +2973,12 @@ mod tests {
     fn test_index_content_and_fts_search() {
         let db = test_db();
 
-        db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
-        db.index_content("commitment", Some(2), "Review quarterly budget report").unwrap();
-        db.index_content("event", Some(3), "Team dinner at Italian restaurant").unwrap();
+        db.index_content("person", Some(1), "Alice is a software engineer")
+            .unwrap();
+        db.index_content("commitment", Some(2), "Review quarterly budget report")
+            .unwrap();
+        db.index_content("event", Some(3), "Team dinner at Italian restaurant")
+            .unwrap();
 
         // FTS5 search for "engineer"
         let results = db.fts_search("engineer", 10, None).unwrap();
@@ -2986,7 +2996,9 @@ mod tests {
     fn test_index_content_with_embedding_and_vec_search() {
         let db = test_db();
 
-        let cid = db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        let cid = db
+            .index_content("person", Some(1), "Alice is a software engineer")
+            .unwrap();
 
         // Create a simple embedding (512 dims)
         let embedding: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
@@ -3003,8 +3015,10 @@ mod tests {
     fn test_hybrid_search_fts_only() {
         let db = test_db();
 
-        db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
-        db.index_content("commitment", Some(2), "Review quarterly budget report").unwrap();
+        db.index_content("person", Some(1), "Alice is a software engineer")
+            .unwrap();
+        db.index_content("commitment", Some(2), "Review quarterly budget report")
+            .unwrap();
 
         // Hybrid search without embedding (FTS5-only path)
         let results = db.hybrid_search("engineer", None, 10, None).unwrap();
@@ -3017,17 +3031,23 @@ mod tests {
         let db = test_db();
 
         // Index two items with embeddings
-        let cid1 = db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        let cid1 = db
+            .index_content("person", Some(1), "Alice is a software engineer")
+            .unwrap();
         let emb1: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
         db.index_embedding(cid1, &emb1).unwrap();
 
-        let cid2 = db.index_content("commitment", Some(2), "budget report review").unwrap();
+        let cid2 = db
+            .index_content("commitment", Some(2), "budget report review")
+            .unwrap();
         let emb2: Vec<f32> = (0..512).map(|i| (512 - i) as f32 / 512.0).collect();
         db.index_embedding(cid2, &emb2).unwrap();
 
         // Hybrid search: "engineer" should rank cid1 highest via FTS5 + vector
         let query_emb: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
-        let results = db.hybrid_search("engineer", Some(&query_emb), 10, None).unwrap();
+        let results = db
+            .hybrid_search("engineer", Some(&query_emb), 10, None)
+            .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].source_type, "person");
     }
@@ -3036,7 +3056,9 @@ mod tests {
     fn test_delete_search_content() {
         let db = test_db();
 
-        let cid = db.index_content("person", Some(1), "Alice is a software engineer").unwrap();
+        let cid = db
+            .index_content("person", Some(1), "Alice is a software engineer")
+            .unwrap();
         let emb: Vec<f32> = vec![0.0; 512];
         db.index_embedding(cid, &emb).unwrap();
 
@@ -3066,10 +3088,12 @@ mod tests {
             "INSERT INTO commitments (description, due_date, status) VALUES ('Review budget', '2026-03-01', 'pending')",
             [],
         ).unwrap();
-        db.conn.execute(
-            "INSERT INTO preferences (category, value) VALUES ('coffee', 'oat milk latte')",
-            [],
-        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO preferences (category, value) VALUES ('coffee', 'oat milk latte')",
+                [],
+            )
+            .unwrap();
         db.conn.execute(
             "INSERT INTO events (description, event_date, context) VALUES ('Team dinner', '2026-02-20', 'Italian restaurant')",
             [],

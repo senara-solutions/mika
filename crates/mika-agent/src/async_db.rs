@@ -242,7 +242,10 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_commitment_status(id)).await
     }
 
-    pub async fn get_commitment_details(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
+    pub async fn get_commitment_details(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, Option<String>)>> {
         self.with_db(move |db| db.get_commitment_details(id)).await
     }
 
@@ -449,13 +452,8 @@ impl AsyncDatabase {
         source_id: Option<i64>,
         content: &str,
     ) -> Result<i64> {
-        let (st, sid, c) = (
-            source_type.to_owned(),
-            source_id,
-            content.to_owned(),
-        );
-        self.with_db(move |db| db.index_content(&st, sid, &c))
-            .await
+        let (st, sid, c) = (source_type.to_owned(), source_id, content.to_owned());
+        self.with_db(move |db| db.index_content(&st, sid, &c)).await
     }
 
     pub async fn index_embedding(&self, content_id: i64, embedding: Vec<f32>) -> Result<()> {
@@ -494,10 +492,8 @@ impl AsyncDatabase {
     ) -> Result<Vec<SearchResult>> {
         let q = fts_query.to_owned();
         let st = source_type_filter.map(|s| s.to_owned());
-        self.with_db(move |db| {
-            db.hybrid_search(&q, embedding.as_deref(), limit, st.as_deref())
-        })
-        .await
+        self.with_db(move |db| db.hybrid_search(&q, embedding.as_deref(), limit, st.as_deref()))
+            .await
     }
 
     pub async fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {

@@ -101,6 +101,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "List all agents",
         args_hint: None,
     },
+    SlashCommand {
+        name: "teams",
+        aliases: &[],
+        description: "List all teams",
+        args_hint: None,
+    },
+    SlashCommand {
+        name: "team",
+        aliases: &[],
+        description: "Run a team workflow",
+        args_hint: Some("<name> \"<goal>\""),
+    },
 ];
 
 /// Filter commands by prefix (case-insensitive). Matches command names and aliases.
