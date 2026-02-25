@@ -496,10 +496,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!is_initialized(tmp.path()));
 
-        // Create a multi-agent layout with one agent
+        // Create a multi-agent layout with one bootstrapped agent
         let agent = tmp.path().join("agents").join("main");
-        fs::create_dir_all(agent.join("data")).unwrap();
-        fs::write(agent.join("data").join("mika.db"), "fake").unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("config.toml"), "# config").unwrap();
         assert!(is_initialized(tmp.path()));
     }
 

@@ -99,7 +99,7 @@ fn ensure_initialized_for_agent(
 ) -> Result<()> {
     // In multi-agent layout, check the specific agent's home
     if home::is_multi_agent_layout(global_home) {
-        if !agent_home.join("data").join("mika.db").exists() {
+        if !agent_home.join("config.toml").exists() {
             anyhow::bail!(
                 "Agent '{agent_name}' not found. Create it with `mika agents create {agent_name}`."
             );

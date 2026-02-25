@@ -347,9 +347,9 @@ steps = ["decompose", "execute"]
         let tmp = tempfile::tempdir().unwrap();
         // Create agents with DB files
         for name in &["planner", "researcher"] {
-            let agent = tmp.path().join("agents").join(name).join("data");
+            let agent = tmp.path().join("agents").join(name);
             fs::create_dir_all(&agent).unwrap();
-            fs::write(agent.join("mika.db"), "fake").unwrap();
+            fs::write(agent.join("config.toml"), "# config").unwrap();
         }
 
         let def = TeamDefinition {
@@ -379,9 +379,9 @@ steps = ["decompose", "execute"]
     fn test_validate_team_missing_agent() {
         let tmp = tempfile::tempdir().unwrap();
         // Only create planner
-        let agent = tmp.path().join("agents").join("planner").join("data");
+        let agent = tmp.path().join("agents").join("planner");
         fs::create_dir_all(&agent).unwrap();
-        fs::write(agent.join("mika.db"), "fake").unwrap();
+        fs::write(agent.join("config.toml"), "# config").unwrap();
 
         let def = TeamDefinition {
             team: TeamMeta {
@@ -412,9 +412,9 @@ steps = ["decompose", "execute"]
         let tmp = tempfile::tempdir().unwrap();
         // Create both agents
         for name in &["planner", "worker"] {
-            let agent = tmp.path().join("agents").join(name).join("data");
+            let agent = tmp.path().join("agents").join(name);
             fs::create_dir_all(&agent).unwrap();
-            fs::write(agent.join("mika.db"), "fake").unwrap();
+            fs::write(agent.join("config.toml"), "# config").unwrap();
         }
 
         let def = TeamDefinition {

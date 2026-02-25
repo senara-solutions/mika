@@ -40,12 +40,9 @@ pub fn agent_dir(home_dir: &Path, name: &str) -> PathBuf {
     home_dir.join("agents").join(name)
 }
 
-/// Check if a named agent exists (has a database file).
+/// Check if a named agent exists (has been bootstrapped with config).
 pub fn agent_exists(home_dir: &Path, name: &str) -> bool {
-    agent_dir(home_dir, name)
-        .join("data")
-        .join("mika.db")
-        .exists()
+    agent_dir(home_dir, name).join("config.toml").exists()
 }
 
 /// List all agents in `{home_dir}/agents/`, returning sorted names
@@ -61,7 +58,7 @@ pub fn list_agents(home_dir: &Path) -> Vec<String> {
         .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if e.path().join("data").join("mika.db").exists() {
+            if e.path().join("config.toml").exists() {
                 Some(name)
             } else {
                 None
@@ -138,19 +135,19 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_exists_true_when_db_present() {
+    fn test_agent_exists_true_when_bootstrapped() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = agent_dir(tmp.path(), "main");
-        fs::create_dir_all(agent.join("data")).unwrap();
-        fs::write(agent.join("data").join("mika.db"), "fake").unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("config.toml"), "# config").unwrap();
         assert!(agent_exists(tmp.path(), "main"));
     }
 
     #[test]
-    fn test_agent_exists_false_when_dir_but_no_db() {
+    fn test_agent_exists_false_when_dir_but_no_config() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = agent_dir(tmp.path(), "main");
-        fs::create_dir_all(agent.join("data")).unwrap();
+        fs::create_dir_all(&agent).unwrap();
         assert!(!agent_exists(tmp.path(), "main"));
     }
 
@@ -166,22 +163,22 @@ mod tests {
         // Create agents out of order
         for name in &["work", "main", "code"] {
             let agent = agent_dir(tmp.path(), name);
-            fs::create_dir_all(agent.join("data")).unwrap();
-            fs::write(agent.join("data").join("mika.db"), "fake").unwrap();
+            fs::create_dir_all(&agent).unwrap();
+            fs::write(agent.join("config.toml"), "# config").unwrap();
         }
         assert_eq!(list_agents(tmp.path()), vec!["code", "main", "work"]);
     }
 
     #[test]
-    fn test_list_agents_skips_dirs_without_db() {
+    fn test_list_agents_skips_dirs_without_config() {
         let tmp = tempfile::tempdir().unwrap();
-        // Agent with DB
+        // Agent with config (bootstrapped)
         let main = agent_dir(tmp.path(), "main");
-        fs::create_dir_all(main.join("data")).unwrap();
-        fs::write(main.join("data").join("mika.db"), "fake").unwrap();
-        // Agent without DB (incomplete)
+        fs::create_dir_all(&main).unwrap();
+        fs::write(main.join("config.toml"), "# config").unwrap();
+        // Agent without config (incomplete)
         let incomplete = agent_dir(tmp.path(), "incomplete");
-        fs::create_dir_all(incomplete.join("data")).unwrap();
+        fs::create_dir_all(&incomplete).unwrap();
 
         assert_eq!(list_agents(tmp.path()), vec!["main"]);
     }
