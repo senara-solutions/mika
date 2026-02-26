@@ -178,7 +178,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     if let Ok(history) = worker
         ._ctx
         .async_db
-        .load_recent_messages(20, Some(vec!["cli".to_string()]))
+        .load_recent_messages(20, Some(vec!["cli".to_string(), "telegram".to_string()]))
         .await
     {
         for msg in history {
@@ -187,10 +187,16 @@ pub async fn run(agent_name: &str) -> Result<()> {
                 "assistant" => ChatRole::Assistant,
                 _ => continue,
             };
+            let channel = if msg.channel_type == "cli" {
+                None
+            } else {
+                Some(msg.channel_type.clone())
+            };
             app.messages.push(ChatMessage {
                 role,
                 content: msg.content,
                 rendered: None,
+                channel,
             });
         }
     }
@@ -280,6 +286,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                                     "Switched to agent '{target_name}' ({new_model})."
                                 ),
                                 rendered: None,
+                                channel: None,
                             });
                         }
                         Err(e) => {
@@ -287,6 +294,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                                 role: ChatRole::System,
                                 content: format!("Failed to switch agent: {e}"),
                                 rendered: None,
+                                channel: None,
                             });
                         }
                     }
@@ -296,6 +304,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                         role: ChatRole::System,
                         content: format!("Failed to switch agent: {e}"),
                         rendered: None,
+                        channel: None,
                     });
                 }
             }

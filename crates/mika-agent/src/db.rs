@@ -1604,6 +1604,82 @@ impl Database {
         Ok(())
     }
 
+    /// List all customer config entries.
+    pub fn list_customer_config(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM customer_config ORDER BY key")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // -- Cross-Channel Queries --
+
+    /// Load messages with id > after_id, optionally filtered by channel type.
+    /// Returns messages in ascending id order.
+    pub fn load_messages_after(
+        &self,
+        after_id: i64,
+        channel_types: Option<&[&str]>,
+    ) -> Result<Vec<ConversationMessage>> {
+        let (sql, params) = match channel_types {
+            Some(types) if !types.is_empty() => {
+                let placeholders: Vec<String> =
+                    (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
+                let sql = format!(
+                    "SELECT id, role, content, channel_type, created_at
+                     FROM conversations
+                     WHERE id > ?1 AND role != 'summary' AND channel_type IN ({})
+                     ORDER BY id ASC",
+                    placeholders.join(", ")
+                );
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
+                for t in types {
+                    params.push(Box::new(t.to_string()));
+                }
+                (sql, params)
+            }
+            _ => {
+                let sql = "SELECT id, role, content, channel_type, created_at
+                     FROM conversations
+                     WHERE id > ?1 AND role != 'summary'
+                     ORDER BY id ASC"
+                    .to_string();
+                let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
+                (sql, params)
+            }
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let messages: Vec<ConversationMessage> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(ConversationMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    channel_type: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(messages)
+    }
+
+    /// Get the maximum message id in the conversations table.
+    /// Returns 0 if the table is empty.
+    pub fn max_message_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM conversations",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     // -- Memory Events (Audit Log) --
 
     /// Log a memory mutation event for auditability.

@@ -305,12 +305,21 @@ async fn handle_export(app: &mut App<'_>) -> String {
     let _ = writeln!(content, "---\n");
 
     for msg in &app.messages {
+        let channel_prefix = msg
+            .channel
+            .as_ref()
+            .map(|ch| format!("[{ch}] "))
+            .unwrap_or_default();
         match msg.role {
             ChatRole::User => {
-                let _ = writeln!(content, "**You:** {}\n", msg.content);
+                let _ = writeln!(content, "**{channel_prefix}You:** {}\n", msg.content);
             }
             ChatRole::Assistant => {
-                let _ = writeln!(content, "**{}:** {}\n", app.identity_name, msg.content);
+                let _ = writeln!(
+                    content,
+                    "**{channel_prefix}{}:** {}\n",
+                    app.identity_name, msg.content
+                );
             }
             ChatRole::System => {
                 let _ = writeln!(content, "*System: {}*\n", msg.content);
@@ -524,6 +533,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
             role: ChatRole::Command,
             content: "Usage: /think [low|medium|high] <prompt>  (default: medium)".to_string(),
             rendered: None,
+            channel: None,
         });
         return;
     }
@@ -532,6 +542,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
             role: ChatRole::Command,
             content: "Agent is busy. Wait for the current response to finish.".to_string(),
             rendered: None,
+            channel: None,
         });
         return;
     }
@@ -552,6 +563,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
             role: ChatRole::Command,
             content: "Usage: /think [low|medium|high] <prompt>".to_string(),
             rendered: None,
+            channel: None,
         });
         return;
     }
@@ -561,6 +573,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
         role: ChatRole::User,
         content: format!("[think:{level}] {prompt}"),
         rendered: None,
+        channel: None,
     });
 
     // Drain any pending images

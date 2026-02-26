@@ -30,6 +30,8 @@ pub struct ChatMessage {
     pub content: String,
     /// Pre-rendered markdown lines (cached to avoid re-parsing every frame).
     pub rendered: Option<Vec<Line<'static>>>,
+    /// Source channel: None = CLI (local), Some("telegram") = Telegram, etc.
+    pub channel: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +219,7 @@ impl<'a> App<'a> {
             role: ChatRole::User,
             content: display,
             rendered: None,
+            channel: None,
         });
 
         // Drain pending images
@@ -250,6 +253,7 @@ impl<'a> App<'a> {
                     role: ChatRole::Command,
                     content: output,
                     rendered: None,
+                    channel: None,
                 });
                 self.scroll_offset = 0;
             }
@@ -269,6 +273,7 @@ impl<'a> App<'a> {
                         role: ChatRole::System,
                         content: format!("Error: {}", response.content),
                         rendered: None,
+                        channel: None,
                     });
                     self.status = AgentStatus::Idle;
                 } else {
@@ -279,6 +284,7 @@ impl<'a> App<'a> {
                             role: ChatRole::Thinking,
                             content: thinking,
                             rendered: Some(rendered),
+                            channel: None,
                         });
                     }
 
@@ -288,6 +294,7 @@ impl<'a> App<'a> {
                             role: ChatRole::System,
                             content: mika_agent::agent::EMPTY_RESPONSE_FALLBACK.to_string(),
                             rendered: None,
+                            channel: None,
                         });
                         self.status = AgentStatus::Idle;
                     } else {
@@ -305,6 +312,7 @@ impl<'a> App<'a> {
                         role: ChatRole::System,
                         content: "Agent worker stopped unexpectedly.".to_string(),
                         rendered: None,
+                        channel: None,
                     });
                     self.status = AgentStatus::Idle;
                     self.needs_redraw = true;
@@ -341,6 +349,7 @@ impl<'a> App<'a> {
                     role: ChatRole::Assistant,
                     content: full,
                     rendered: Some(rendered),
+                    channel: None,
                 });
                 self.reveal_index = 0;
                 self.status = AgentStatus::Idle;

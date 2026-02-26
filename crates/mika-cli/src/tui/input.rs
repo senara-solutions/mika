@@ -73,6 +73,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
                 role: crate::tui::app::ChatRole::System,
                 content: err,
                 rendered: None,
+                channel: None,
             });
         }
         return;

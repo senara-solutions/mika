@@ -414,6 +414,30 @@ impl AsyncDatabase {
         self.with_db(move |db| db.set_customer_config(&k, &v)).await
     }
 
+    pub async fn list_customer_config(&self) -> Result<Vec<(String, String)>> {
+        self.with_db(|db| db.list_customer_config()).await
+    }
+
+    // -- Cross-Channel Queries --
+
+    pub async fn load_messages_after(
+        &self,
+        after_id: i64,
+        channel_types: Option<Vec<String>>,
+    ) -> Result<Vec<crate::db::ConversationMessage>> {
+        self.with_db(move |db| {
+            let refs: Option<Vec<&str>> = channel_types
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
+            db.load_messages_after(after_id, refs.as_deref())
+        })
+        .await
+    }
+
+    pub async fn max_message_id(&self) -> Result<i64> {
+        self.with_db(|db| db.max_message_id()).await
+    }
+
     // -- Audit --
 
     pub async fn log_memory_event(
