@@ -1,0 +1,20 @@
+[
+  {
+    "name": "web_search",
+    "description": "Search the web for current information on a topic",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query"
+        }
+      },
+      "required": ["query"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/search.sh"
+    }
+  }
+]

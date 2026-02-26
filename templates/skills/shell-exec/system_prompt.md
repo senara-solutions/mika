@@ -1,0 +1,5 @@
+- SECURITY WARNING: This skill executes arbitrary shell commands. Use with extreme caution.
+- Never execute commands that could damage the system, delete data, or expose secrets.
+- Always confirm destructive commands (rm, mv, chmod, etc.) with the user before executing.
+- Prefer read-only commands (ls, cat, grep, find, etc.) when possible.
+- Do not pipe secrets or credentials into commands.

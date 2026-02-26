@@ -1,0 +1,9 @@
+[skill]
+name = "file-reader"
+description = "Read files from the local filesystem"
+version = "0.1.0"
+always_on = false
+timeout_secs = 10
+
+[triggers]
+keywords = ["read file", "show file", "cat", "file contents"]

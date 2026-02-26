@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
         Some(Commands::Reminders(args)) => commands::reminders::run(args, &agent_name).await,
         Some(Commands::Status) => commands::status::run(&agent_name).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
-        Some(Commands::Skills { name }) => commands::skills::run(name, &agent_name).await,
+        Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
         Some(Commands::Ask { message }) => match commands::ask::run(&message, &agent_name).await {
             Ok(()) => Ok(()),
             Err(e) => {

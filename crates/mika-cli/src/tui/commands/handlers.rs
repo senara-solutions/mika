@@ -342,18 +342,22 @@ fn handle_skills(app: &App<'_>) -> String {
 
     let mut out = String::from("Loaded skills:\n");
     for entry in skills {
-        let handler_type = match &entry.manifest.handler {
-            mika_agent::skills::manifest::Handler::Builtin { .. } => "builtin",
+        let tool_count = entry.skill_tools.len();
+        let handler_desc = if tool_count > 0 {
+            format!("{} tools", tool_count)
+        } else {
+            "no tools".to_string()
         };
-        let always_on = if entry.manifest.options.always_on {
+        let always_on = if entry.manifest.skill.always_on {
             " [always on]"
         } else {
             ""
         };
+        let enabled = if entry.enabled { "" } else { " [disabled]" };
         let _ = writeln!(
             out,
-            "  {} ({}) — {}{}",
-            entry.manifest.name, handler_type, entry.manifest.description, always_on
+            "  {} ({}) — {}{}{}",
+            entry.manifest.skill.name, handler_desc, entry.manifest.skill.description, always_on, enabled
         );
     }
     out
@@ -418,27 +422,28 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
     let skills = app.skills.skills();
     let found = skills
         .iter()
-        .find(|s| s.manifest.name.eq_ignore_ascii_case(name));
+        .find(|s| s.manifest.skill.name.eq_ignore_ascii_case(name));
 
     match found {
         Some(entry) => {
             let m = &entry.manifest;
-            let handler_type = match &m.handler {
-                mika_agent::skills::manifest::Handler::Builtin { tools } => {
-                    format!("builtin (tools: {})", tools.join(", "))
-                }
-            };
             let keywords = if m.triggers.keywords.is_empty() {
                 "none".to_string()
             } else {
                 m.triggers.keywords.join(", ")
             };
             let mut out = String::new();
-            let _ = writeln!(out, "Skill: {}", m.name);
-            let _ = writeln!(out, "  Description: {}", m.description);
-            let _ = writeln!(out, "  Handler: {handler_type}");
-            let _ = writeln!(out, "  Always on: {}", m.options.always_on);
+            let _ = writeln!(out, "Skill: {}", m.skill.name);
+            let _ = writeln!(out, "  Description: {}", m.skill.description);
+            let _ = writeln!(out, "  Version: {}", if m.skill.version.is_empty() { "unset" } else { &m.skill.version });
+            let _ = writeln!(out, "  Always on: {}", m.skill.always_on);
+            let _ = writeln!(out, "  Enabled: {}", entry.enabled);
+            let _ = writeln!(out, "  Timeout: {}s", m.skill.timeout_secs);
             let _ = writeln!(out, "  Keywords: {keywords}");
+            if !entry.skill_tools.is_empty() {
+                let tool_names: Vec<&str> = entry.skill_tools.iter().map(|t| t.definition.name.as_str()).collect();
+                let _ = writeln!(out, "  Tools: {}", tool_names.join(", "));
+            }
             let _ = writeln!(out, "  Path: {}", entry.dir.display());
             out
         }

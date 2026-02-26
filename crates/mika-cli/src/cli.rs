@@ -25,11 +25,8 @@ pub enum Commands {
     Status,
     /// View or edit configuration
     Config(ConfigArgs),
-    /// List loaded skills or inspect a specific skill
-    Skills {
-        /// Show details for a specific skill by name
-        name: Option<String>,
-    },
+    /// Manage skills
+    Skills(SkillsArgs),
     /// Send a message and print the response (non-interactive)
     Ask {
         /// The message to send (use "-" to read from stdin)
@@ -117,6 +114,48 @@ pub enum TeamsCommand {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: Option<SkillsCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum SkillsCommand {
+    /// List all skills
+    List,
+    /// Show details for a specific skill
+    Info {
+        /// Skill name
+        name: String,
+    },
+    /// Create a new skill from template
+    Create {
+        /// Name for the new skill
+        name: String,
+    },
+    /// Test a skill tool with sample input
+    Test {
+        /// Skill name
+        skill: String,
+        /// Tool name within the skill
+        tool: String,
+        /// JSON input (default: {})
+        #[arg(long, default_value = "{}")]
+        input: String,
+    },
+    /// Enable a disabled skill
+    Enable {
+        /// Skill name
+        name: String,
+    },
+    /// Disable a skill
+    Disable {
+        /// Skill name
+        name: String,
     },
 }
 

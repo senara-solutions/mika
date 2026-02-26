@@ -1,0 +1,3 @@
+- Use list_events to check the user's schedule before suggesting meeting times.
+- When creating events, always confirm the time and title with the user first.
+- Convert times to the user's timezone when presenting them.

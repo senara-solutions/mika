@@ -2,6 +2,7 @@ use anyhow::Result;
 use mika_common::claude::{
     ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
 };
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,8 +14,9 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::messaging::MessageSender;
 use crate::prompt;
-use crate::skills::index::SkillEntry;
-use crate::skills::{self, SkillRegistry};
+use crate::skills::SkillRegistry;
+use crate::skills::executor;
+use crate::skills::index::{ResolvedSkillTool, SkillEntry};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::embedding::EmbeddingClient;
 
@@ -142,7 +144,9 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.user_message);
     let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, params.skills, tools, &mut system);
+        inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let skill_tool_map = build_skill_tool_map(&matched);
+    let skill_timeout = max_skill_timeout(&matched);
 
     let history = db.load_recent_messages(20, None).await?;
 
@@ -227,7 +231,15 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
             }
             StopReason::ToolUse => {
                 tool_use_occurred = true;
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
+                process_tool_calls(
+                    response.content,
+                    tools,
+                    &skill_tool_map,
+                    skill_timeout,
+                    &tool_ctx,
+                    &mut request,
+                )
+                .await;
             }
         }
     }
@@ -245,6 +257,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
 async fn process_tool_calls(
     response_content: Vec<ContentBlock>,
     tools: &ToolRegistry,
+    skill_tools: &HashMap<String, &ResolvedSkillTool>,
+    skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
     request: &mut MessagesRequest,
 ) {
@@ -252,7 +266,9 @@ async fn process_tool_calls(
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
-            let output = execute_tool(tools, name, input.clone(), tool_ctx).await;
+            let output =
+                execute_tool(tools, skill_tools, name, input.clone(), tool_ctx, skill_timeout)
+                    .await;
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
                 content: output.content,
@@ -272,12 +288,18 @@ async fn process_tool_calls(
 }
 
 /// Execute a single tool with timeout.
+///
+/// Routing: builtin tools (from ToolRegistry) first, then skill-defined tools,
+/// then "unknown tool" error.
 async fn execute_tool(
     tools: &ToolRegistry,
+    skill_tools: &HashMap<String, &ResolvedSkillTool>,
     name: &str,
     input: serde_json::Value,
     ctx: &ToolContext<'_>,
+    skill_timeout: u64,
 ) -> ToolOutput {
+    // 1. Try builtin tool
     if let Some(tool) = tools.get(name) {
         return match tokio::time::timeout(
             std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
@@ -297,6 +319,11 @@ async fn execute_tool(
                 ))
             }
         };
+    }
+
+    // 2. Try skill-defined tool
+    if let Some(skill_tool) = skill_tools.get(name) {
+        return executor::execute_skill_tool(skill_tool, input, skill_timeout).await;
     }
 
     warn!(tool = %name, "unknown tool requested");
@@ -413,7 +440,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         SilentTrigger::Reminder { message, .. } => params.skills.match_message(message),
     };
     let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, params.skills, tools, &mut system);
+        inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let skill_tool_map = build_skill_tool_map(&matched);
+    let skill_timeout = max_skill_timeout(&matched);
 
     // For silent mode, provide a brief "trigger" as the user message
     let user_msg = match &params.trigger {
@@ -467,7 +496,15 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 return Ok(());
             }
             StopReason::ToolUse => {
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
+                process_tool_calls(
+                    response.content,
+                    tools,
+                    &skill_tool_map,
+                    skill_timeout,
+                    &tool_ctx,
+                    &mut request,
+                )
+                .await;
             }
         }
     }
@@ -552,7 +589,9 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.task_message);
     let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, params.skills, tools, &mut system);
+        inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let skill_tool_map = build_skill_tool_map(&matched);
+    let skill_timeout = max_skill_timeout(&matched);
 
     // Single-turn: just the task message, no history
     let messages = vec![Message {
@@ -627,7 +666,15 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
             }
             StopReason::ToolUse => {
                 tool_use_occurred = true;
-                process_tool_calls(response.content, tools, &tool_ctx, &mut request).await;
+                process_tool_calls(
+                    response.content,
+                    tools,
+                    &skill_tool_map,
+                    skill_timeout,
+                    &tool_ctx,
+                    &mut request,
+                )
+                .await;
             }
         }
     }
@@ -636,30 +683,53 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
     Ok(Some("Agent exceeded maximum tool steps.".to_string()))
 }
 
+/// Build a lookup map from tool name → ResolvedSkillTool for matched skills.
+fn build_skill_tool_map<'a>(matched: &[&'a SkillEntry]) -> HashMap<String, &'a ResolvedSkillTool> {
+    matched
+        .iter()
+        .flat_map(|e| e.skill_tools.iter())
+        .map(|st| (st.definition.name.clone(), st))
+        .collect()
+}
+
+/// Compute the maximum timeout across matched skills (for skill tool execution).
+/// Falls back to TOOL_TIMEOUT_SECS if no skills matched.
+fn max_skill_timeout(matched: &[&SkillEntry]) -> u64 {
+    matched
+        .iter()
+        .map(|e| e.manifest.skill.timeout_secs)
+        .max()
+        .unwrap_or(TOOL_TIMEOUT_SECS)
+}
+
 /// Inject matched skill prompt snippets into the system prompt and resolve
-/// tool definitions. Shared between conversation and silent agent loops.
+/// tool definitions. Always includes all builtin tools plus skill-defined tools.
 fn inject_skills_and_resolve_tools(
     matched: &[&SkillEntry],
-    skills: &SkillRegistry,
     tools: &ToolRegistry,
     system: &mut String,
 ) -> Vec<mika_common::claude::ToolDefinition> {
-    if !matched.is_empty() {
-        for entry in matched {
-            if !entry.prompt_snippet.is_empty() {
-                write!(
-                    system,
-                    "\n<context type=\"skill\" trust=\"local\">\n## {} Skill\n{}\n</context>\n",
-                    entry.manifest.name, entry.prompt_snippet
-                )
-                .unwrap();
+    // Always include ALL builtin tools
+    let mut tool_defs = tools.definitions().to_vec();
+    let mut seen: std::collections::HashSet<String> =
+        tool_defs.iter().map(|d| d.name.clone()).collect();
+
+    // Add skill prompt snippets and skill-defined tools from matched skills
+    for entry in matched {
+        if !entry.prompt_snippet.is_empty() {
+            write!(
+                system,
+                "\n<context type=\"skill\" trust=\"local\">\n## {} Skill\n{}\n</context>\n",
+                entry.manifest.skill.name, entry.prompt_snippet
+            )
+            .unwrap();
+        }
+        for st in &entry.skill_tools {
+            if seen.insert(st.definition.name.clone()) {
+                tool_defs.push(st.definition.clone());
             }
         }
-        skills::resolve_matched_skills(tools, matched)
-    } else if !skills.has_skills() {
-        // Fallback: no skills dir → use all builtin tools (pre-skill behavior)
-        tools.definitions().to_vec()
-    } else {
-        Vec::new()
     }
+
+    tool_defs
 }

@@ -175,6 +175,15 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         }
     }
 
+    // Tool usage instructions (builtin tools are always available)
+    prompt.push_str("\n## Tool Usage\n");
+    prompt.push_str("- Update your core memory when you learn important things about the user.\n");
+    prompt.push_str("- Track people, commitments, preferences, and events using the appropriate tools.\n");
+    prompt.push_str("- Use search_memory to find stored facts before asking the user to repeat information.\n");
+    prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
+    prompt.push_str("- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC).\n");
+    prompt.push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
+
     prompt
 }
 
@@ -497,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_base_has_no_tool_instructions() {
+    fn test_prompt_includes_tool_usage_section() {
         let identity = test_identity();
         let ctx = PromptContext {
             soul_content: "",
@@ -510,11 +519,12 @@ mod tests {
         };
 
         let prompt = build_system_prompt(&ctx);
-        // Tool-specific instructions are now in skill prompt snippets, not the base prompt
-        assert!(!prompt.contains("search_memory"));
-        assert!(!prompt.contains("create_reminder"));
-        assert!(!prompt.contains("update_fact"));
-        // But the base instruction remains
+        // Builtin tool instructions are always in the base prompt
+        assert!(prompt.contains("## Tool Usage"));
+        assert!(prompt.contains("search_memory"));
+        assert!(prompt.contains("create_reminder"));
+        assert!(prompt.contains("update_fact"));
+        // Base instruction also present
         assert!(prompt.contains("Never fabricate information"));
     }
 

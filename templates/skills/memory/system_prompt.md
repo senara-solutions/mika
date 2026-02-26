@@ -1,5 +1,0 @@
-- Update your core memory when you learn important things about the user.
-- Track people, commitments, preferences, and events using the appropriate tools.
-- Use search_memory to find stored facts across all categories before asking the user to repeat information.
-- Mark commitments as completed or cancelled using the update_fact tool.
-- You can reset a core memory section to its default value using update_core_memory with the reset action.

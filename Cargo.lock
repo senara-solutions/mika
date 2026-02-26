@@ -1513,6 +1513,7 @@ dependencies = [
  "mika-agent",
  "mika-common",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

@@ -1,2 +1,0 @@
-- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC). Use the current time shown above to compute future times.
-- You can list and cancel reminders with list_reminders and cancel_reminder.
