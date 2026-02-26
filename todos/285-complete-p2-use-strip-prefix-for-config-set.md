@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: 285
 tags: [code-review, quality, consistency]
