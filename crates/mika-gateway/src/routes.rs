@@ -87,7 +87,17 @@ pub fn build_router(state: AppState) -> Router {
 ///
 /// Validates the X-Telegram-Bot-Api-Secret-Token header using constant-time comparison.
 /// Returns 200 to Telegram immediately, then processes asynchronously.
-async fn handle_webhook(
+/// Request body is a Telegram Update JSON object (see Telegram Bot API docs).
+#[utoipa::path(
+    post,
+    path = "/webhook/telegram",
+    responses(
+        (status = 200, description = "Update accepted"),
+        (status = 401, description = "Invalid webhook secret"),
+        (status = 503, description = "At capacity, Telegram will retry"),
+    )
+)]
+pub(crate) async fn handle_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(update): Json<TelegramUpdate>,
@@ -377,7 +387,21 @@ async fn require_bearer_token(
 /// POST /send — containers deliver outbound messages to Telegram.
 ///
 /// Authenticated via `require_bearer_token` middleware.
-async fn handle_send(
+#[utoipa::path(
+    post,
+    path = "/send",
+    request_body = SendPayload,
+    responses(
+        (status = 200, description = "Message sent to Telegram"),
+        (status = 400, description = "Invalid payload (empty or oversized text)"),
+        (status = 401, description = "Missing or invalid Bearer token"),
+        (status = 410, description = "Bot blocked by user"),
+        (status = 429, description = "Telegram rate limit exceeded"),
+        (status = 502, description = "Telegram API error"),
+    ),
+    security(("bearer" = []))
+)]
+pub(crate) async fn handle_send(
     State(state): State<AppState>,
     Json(payload): Json<SendPayload>,
 ) -> impl IntoResponse {
@@ -418,8 +442,8 @@ async fn handle_send(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SendPayload {
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct SendPayload {
     chat_id: i64,
     text: String,
     #[serde(default)]
@@ -432,14 +456,29 @@ struct SendPayload {
 ///
 /// Returns 200 unconditionally — the fact that HTTP is responding proves liveness.
 /// Readiness (ready flag + DB) is checked by /readyz.
-async fn handle_liveness() -> StatusCode {
+#[utoipa::path(
+    get,
+    path = "/livez",
+    responses(
+        (status = 200, description = "Process is alive"),
+    )
+)]
+pub(crate) async fn handle_liveness() -> StatusCode {
     StatusCode::OK
 }
 
 /// GET /readyz, /health — K8s readiness probe (no auth).
 ///
 /// Returns 200 if ready and Postgres is reachable, 503 otherwise.
-async fn handle_readiness(State(state): State<AppState>) -> StatusCode {
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    responses(
+        (status = 200, description = "Ready and database reachable"),
+        (status = 503, description = "Not ready or database unreachable"),
+    )
+)]
+pub(crate) async fn handle_readiness(State(state): State<AppState>) -> StatusCode {
     if !state.ready.load(Ordering::Acquire) {
         return StatusCode::SERVICE_UNAVAILABLE;
     }

@@ -56,6 +56,9 @@ pub enum ToolHandler {
         #[serde(default = "default_http_method")]
         method: String,
     },
+    Builtin {
+        function: String,
+    },
 }
 
 fn default_http_method() -> String {
@@ -192,6 +195,15 @@ mod tests {
             }
             _ => panic!("expected Http handler"),
         }
+    }
+
+    #[test]
+    fn test_tool_handler_builtin_deserialize() {
+        let json = r#"{"type": "builtin", "function": "get_cli_reference"}"#;
+        let handler: ToolHandler = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(handler, ToolHandler::Builtin { function } if function == "get_cli_reference")
+        );
     }
 
     #[test]

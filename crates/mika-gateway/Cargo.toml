@@ -26,6 +26,7 @@ tower-http = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 config = { workspace = true }
+utoipa.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true }

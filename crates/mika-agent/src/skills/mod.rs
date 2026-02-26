@@ -1,3 +1,4 @@
+pub mod builtin_handlers;
 pub mod executor;
 pub mod index;
 pub mod manifest;

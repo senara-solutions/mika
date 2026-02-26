@@ -21,19 +21,19 @@ pub enum TelegramApiError {
 
 // -- Telegram Update types (minimal, only what we need) --
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TelegramMessage {
     pub chat: TelegramChat,
     pub text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TelegramChat {
     pub id: i64,
 }

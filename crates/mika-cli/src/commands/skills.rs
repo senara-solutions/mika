@@ -109,6 +109,9 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str) {
                         mika_agent::skills::manifest::ToolHandler::Http { url, method } => {
                             format!("{method} {url}")
                         }
+                        mika_agent::skills::manifest::ToolHandler::Builtin { function } => {
+                            format!("builtin: {function}")
+                        }
                     };
                     println!("      - {} ({})", st.definition.name, handler_type);
                 }

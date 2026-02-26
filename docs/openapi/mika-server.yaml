@@ -1,0 +1,149 @@
+openapi: 3.1.0
+info:
+  title: Mika Agent API (mika-server)
+  description: Per-customer agent container HTTP API. Receives messages from the gateway, runs the agent loop, and delivers responses asynchronously.
+  license:
+    name: MIT
+    identifier: MIT
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      tags:
+      - handlers
+      summary: GET /health — K8s liveness/readiness probe (no auth required).
+      operationId: handle_health
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Server is starting up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /heartbeat:
+    post:
+      tags:
+      - handlers
+      summary: POST /heartbeat — K8s CronJob triggers proactive check-in.
+      description: |-
+        Pre-filters (active hours, rate limits) without acquiring Mutex.
+        Returns 204 if skipped, 200 if accepted for processing.
+      operationId: handle_heartbeat
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequest'
+        required: true
+      responses:
+        '200':
+          description: Heartbeat accepted for processing
+        '204':
+          description: Heartbeat skipped (rate limit, inactive hours, or agent busy)
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
+  /message:
+    post:
+      tags:
+      - handlers
+      summary: POST /message — gateway forwards a user message for async processing.
+      description: |-
+        Returns 202 Accepted immediately, then spawns the agent loop in background.
+        Agent responses are delivered outbound via GatewayMessageSender.
+      operationId: handle_message
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageRequest'
+        required: true
+      responses:
+        '202':
+          description: Message accepted for async processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedResponse'
+        '400':
+          description: Invalid request (empty or oversized text)
+        '401':
+          description: Missing or invalid Bearer token
+        '404':
+          description: Agent not found
+        '429':
+          description: Agent is busy processing another message
+      security:
+      - bearer: []
+components:
+  schemas:
+    AcceptedResponse:
+      type: object
+      description: Accepted response for async processing.
+      required:
+      - request_id
+      - status
+      properties:
+        request_id:
+          type: string
+        status:
+          type: string
+    HealthResponse:
+      type: object
+      description: Health check response body.
+      required:
+      - status
+      properties:
+        status:
+          type: string
+        uptime_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+    HeartbeatRequest:
+      type: object
+      description: Inbound heartbeat trigger from the gateway/K8s CronJob.
+      required:
+      - request_id
+      properties:
+        agent:
+          type: string
+          description: Target agent name (defaults to the server's default agent if absent).
+        request_id:
+          type: string
+    MessageRequest:
+      type: object
+      description: Inbound message from the gateway.
+      required:
+      - text
+      - chat_id
+      - channel
+      - request_id
+      properties:
+        agent:
+          type: string
+          description: Target agent name (defaults to the server's default agent if absent).
+        channel:
+          type: string
+        chat_id:
+          type: integer
+          format: int64
+        request_id:
+          type: string
+        text:
+          type: string
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: Shared secret between gateway and agent container (MIKA_INTERNAL_TOKEN)

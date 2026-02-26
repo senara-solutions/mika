@@ -15,8 +15,10 @@ use crate::compaction;
 use crate::messaging::MessageSender;
 use crate::prompt;
 use crate::skills::SkillRegistry;
+use crate::skills::builtin_handlers;
 use crate::skills::executor;
 use crate::skills::index::{ResolvedSkillTool, SkillEntry};
+use crate::skills::manifest::ToolHandler;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::embedding::EmbeddingClient;
 
@@ -406,6 +408,23 @@ async fn execute_tool(
 
     // 2. Try skill-defined tool
     if let Some(skill_tool) = skill_tools.get(name) {
+        // Builtin skill handlers dispatch to Rust functions with ToolContext access
+        if let ToolHandler::Builtin { function } = &skill_tool.handler {
+            return match tokio::time::timeout(
+                std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+                builtin_handlers::execute(function, input, ctx),
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(_) => {
+                    warn!(tool = %name, "builtin handler timed out");
+                    ToolOutput::error(format!(
+                        "Builtin tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
+                    ))
+                }
+            };
+        }
         return executor::execute_skill_tool(skill_tool, input, skill_timeout).await;
     }
 

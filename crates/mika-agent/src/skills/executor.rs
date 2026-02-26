@@ -51,6 +51,11 @@ async fn execute_inner(
     match &skill_tool.handler {
         ToolHandler::Exec { command } => execute_exec(command, &skill_tool.skill_dir, input).await,
         ToolHandler::Http { url, method } => execute_http(url, method, input).await,
+        ToolHandler::Builtin { .. } => {
+            // Builtin handlers are dispatched directly from agent.rs, not through executor.
+            // This path should never be reached.
+            bail!("Builtin handlers must be dispatched from the agent loop, not the executor")
+        }
     }
 }
 

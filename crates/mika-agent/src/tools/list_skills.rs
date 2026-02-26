@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use crate::bundled_skills::is_bundled_skill;
 use super::{Tool, ToolContext, ToolOutput};
+use crate::bundled_skills::is_bundled_skill;
 
 pub struct ListSkillsTool;
 
@@ -158,7 +158,11 @@ mod tests {
         let tool = ListSkillsTool;
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("[built-in]"), "expected [built-in] tag in: {}", result.content);
+        assert!(
+            result.content.contains("[built-in]"),
+            "expected [built-in] tag in: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -184,7 +188,11 @@ mod tests {
         let tool = ListSkillsTool;
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("[custom]"), "expected [custom] tag in: {}", result.content);
+        assert!(
+            result.content.contains("[custom]"),
+            "expected [custom] tag in: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

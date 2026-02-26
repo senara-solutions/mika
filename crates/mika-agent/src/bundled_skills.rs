@@ -89,6 +89,12 @@ static CALENDAR_SKILL: BundledSkill = skill!("calendar", [
     ("tools.json" => "../../../templates/skills/calendar/tools.json"),
 ]);
 
+static SELF_KNOWLEDGE_SKILL: BundledSkill = skill!("self-knowledge", [
+    ("skill.toml" => "../../../templates/skills/self-knowledge/skill.toml"),
+    ("system_prompt.md" => "../../../templates/skills/self-knowledge/system_prompt.md"),
+    ("tools.json" => "../../../templates/skills/self-knowledge/tools.json"),
+]);
+
 /// All bundled skills.
 static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &TMUX_SKILL,
@@ -96,6 +102,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &WEB_SEARCH_SKILL,
     &FILE_READER_SKILL,
     &CALENDAR_SKILL,
+    &SELF_KNOWLEDGE_SKILL,
 ];
 
 /// Check whether a skill name matches a bundled (built-in) skill.

@@ -1,3 +1,4 @@
+pub mod openapi;
 mod routes;
 mod settings;
 mod telegram;

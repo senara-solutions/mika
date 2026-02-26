@@ -1,6 +1,7 @@
 mod auth;
 mod handlers;
 pub mod json_extractor;
+pub mod openapi;
 pub mod state;
 pub mod types;
 

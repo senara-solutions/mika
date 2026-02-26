@@ -3,6 +3,7 @@ use tracing::warn;
 
 use mika_common::claude::ToolDefinition;
 
+use super::builtin_handlers::KNOWN_BUILTINS;
 use super::manifest::{SkillManifest, SkillToolDef, ToolHandler};
 
 /// Maximum size for skill.toml files (64 KB).
@@ -192,6 +193,20 @@ fn load_tools_json(skill_dir: &Path) -> Vec<ResolvedSkillTool> {
 
     tool_defs
         .into_iter()
+        .filter(|def| {
+            if let ToolHandler::Builtin { function } = &def.handler
+                && !KNOWN_BUILTINS.contains(&function.as_str())
+            {
+                warn!(
+                    path = %tools_path.display(),
+                    function = %function,
+                    tool = %def.name,
+                    "unknown builtin function, skipping tool"
+                );
+                return false;
+            }
+            true
+        })
         .map(|def| ResolvedSkillTool {
             definition: ToolDefinition {
                 name: def.name,
@@ -517,6 +532,45 @@ mod tests {
         let entries = scan_skills_dir(tmp.path());
         assert_eq!(entries.len(), 1);
         assert!(entries[0].skill_tools.is_empty());
+    }
+
+    #[test]
+    fn test_tools_json_unknown_builtin_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("bad-builtin");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "bad-builtin"
+            description = "Has unknown builtin"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[
+                {
+                    "name": "valid_tool",
+                    "description": "Valid builtin",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "handler": {"type": "builtin", "function": "get_api_spec"}
+                },
+                {
+                    "name": "bad_tool",
+                    "description": "Unknown builtin",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "handler": {"type": "builtin", "function": "get_clii_reference"}
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        let entries = scan_skills_dir(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].skill_tools.len(), 1, "unknown builtin should be filtered out");
+        assert_eq!(entries[0].skill_tools[0].definition.name, "valid_tool");
     }
 
     #[test]

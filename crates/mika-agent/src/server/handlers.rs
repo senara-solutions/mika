@@ -17,6 +17,14 @@ use super::state::{AgentState, AppState};
 use super::types::{AcceptedResponse, HealthResponse, HeartbeatRequest, MessageRequest};
 
 /// GET /health — K8s liveness/readiness probe (no auth required).
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Server is healthy", body = HealthResponse),
+        (status = 503, description = "Server is starting up", body = HealthResponse),
+    )
+)]
 pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     if !state.ready.load(Ordering::Acquire) {
         return (
@@ -40,6 +48,19 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// Returns 202 Accepted immediately, then spawns the agent loop in background.
 /// Agent responses are delivered outbound via GatewayMessageSender.
+#[utoipa::path(
+    post,
+    path = "/message",
+    request_body = MessageRequest,
+    responses(
+        (status = 202, description = "Message accepted for async processing", body = AcceptedResponse),
+        (status = 400, description = "Invalid request (empty or oversized text)"),
+        (status = 401, description = "Missing or invalid Bearer token"),
+        (status = 404, description = "Agent not found"),
+        (status = 429, description = "Agent is busy processing another message"),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn handle_message(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<MessageRequest>,
@@ -186,6 +207,17 @@ pub async fn handle_message(
 ///
 /// Pre-filters (active hours, rate limits) without acquiring Mutex.
 /// Returns 204 if skipped, 200 if accepted for processing.
+#[utoipa::path(
+    post,
+    path = "/heartbeat",
+    request_body = HeartbeatRequest,
+    responses(
+        (status = 200, description = "Heartbeat accepted for processing"),
+        (status = 204, description = "Heartbeat skipped (rate limit, inactive hours, or agent busy)"),
+        (status = 401, description = "Missing or invalid Bearer token"),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn handle_heartbeat(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<HeartbeatRequest>,

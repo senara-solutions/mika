@@ -4,7 +4,7 @@ mod init;
 mod tui;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
 use mika_common::agent;
 use mika_common::home;
@@ -32,6 +32,20 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|h| home::resolve_agent_home(h, &agent_name));
     let log_dir = agent_home.as_ref().map(|h| h.join("logs"));
+
+    // Generate CLI reference markdown in the agent home directory.
+    // Used by the self-knowledge skill so the agent can discover its own commands.
+    // Only writes when content changes to avoid unnecessary fs writes.
+    if let Some(ref home) = agent_home {
+        let cmd = Cli::command();
+        let markdown = clap_markdown::help_markdown_command(&cmd);
+        let reference_path = home.join("cli-reference.md");
+        let should_write =
+            std::fs::read_to_string(&reference_path).ok().as_deref() != Some(&markdown);
+        if should_write {
+            let _ = std::fs::write(&reference_path, &markdown);
+        }
+    }
 
     // Read log_level from agent config. Uses toml crate (already a dependency)
     // rather than full config-rs which needs DB.
@@ -189,34 +203,29 @@ mod tests {
         ));
     }
 
-    /// Drift-detection test: ensures the CLI Reference section in the system prompt
-    /// mentions all top-level CLI command names. If you add a new top-level command
-    /// to the `Commands` enum in cli.rs, update `write_cli_section` in
-    /// crates/mika-agent/src/prompt.rs and add the command name here.
+    /// Verify clap-markdown output contains all top-level command names.
+    /// If you add a new top-level command to the `Commands` enum in cli.rs,
+    /// this test will catch it.
     #[test]
-    fn test_cli_prompt_mentions_top_level_commands() {
-        use chrono::Utc;
-        use mika_agent::prompt::{build_system_prompt, Identity, PromptContext};
-
-        let identity = Identity::default();
-        let ctx = PromptContext {
-            soul_content: "",
-            identity: &identity,
-            core_memory: &[],
-            is_onboarding: false,
-            current_utc: Utc::now(),
-            timezone: None,
-            global_home_dir: None,
-            channel_type: Some("cli"),
-            telegram_configured: false,
-        };
-        let prompt = build_system_prompt(&ctx);
-        for cmd in [
-            "ask", "status", "memory", "reminders", "skills", "config", "agents", "teams",
+    fn test_clap_markdown_contains_all_commands() {
+        use clap::CommandFactory;
+        let cmd = crate::cli::Cli::command();
+        let markdown = clap_markdown::help_markdown_command(&cmd);
+        for name in [
+            "chat",
+            "setup",
+            "memory",
+            "reminders",
+            "status",
+            "config",
+            "skills",
+            "ask",
+            "agents",
+            "teams",
         ] {
             assert!(
-                prompt.contains(cmd),
-                "CLI Reference missing command: {cmd}"
+                markdown.contains(name),
+                "clap-markdown output missing command: {name}"
             );
         }
     }

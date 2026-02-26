@@ -1,0 +1,6 @@
+[skill]
+name = "self-knowledge"
+description = "Look up Mika's own CLI commands, API endpoints, and architecture"
+version = "0.1.0"
+always_on = true
+timeout_secs = 10
