@@ -12,6 +12,13 @@ const MAX_RETRIES: u32 = 3;
 // -- Request types --
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum ThinkingConfig {
+    #[serde(rename = "enabled")]
+    Enabled { budget_tokens: u32 },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,
@@ -20,6 +27,8 @@ pub struct MessagesRequest {
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +62,34 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ImageSource {
+    /// Create an ImageSource from raw PNG bytes (base64-encodes them).
+    pub fn from_png_bytes(bytes: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +122,10 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 // -- Error response --
@@ -124,6 +165,23 @@ impl MessagesResponse {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// Extract thinking text from the response, joining all thinking blocks.
+    pub fn thinking(&self) -> Option<String> {
+        let thinking: Vec<&str> = self
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        if thinking.is_empty() {
+            None
+        } else {
+            Some(thinking.join("\n\n"))
+        }
     }
 
     /// Extract tool use blocks from the response.
@@ -257,6 +315,14 @@ impl ClaudeClient {
         headers.insert("x-api-key", api_key_header);
         headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
 
+        // Extended thinking requires the beta header
+        if request.thinking.is_some() {
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+            );
+        }
+
         let response = self
             .client
             .post(API_URL)
@@ -345,6 +411,7 @@ mod tests {
                 content: MessageContent::Text("Hello".into()),
             }],
             tools: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("claude-sonnet"));
@@ -391,5 +458,132 @@ mod tests {
         };
         let json = serde_json::to_value(&tool).unwrap();
         assert_eq!(json["name"], "search_memory");
+    }
+
+    #[test]
+    fn test_serialize_thinking_config() {
+        let config = ThinkingConfig::Enabled {
+            budget_tokens: 10_000,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["type"], "enabled");
+        assert_eq!(json["budget_tokens"], 10_000);
+    }
+
+    #[test]
+    fn test_serialize_request_with_thinking() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 16384,
+            system: None,
+            messages: vec![],
+            tools: None,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"thinking\""));
+        assert!(json.contains("\"budget_tokens\":10000"));
+    }
+
+    #[test]
+    fn test_serialize_request_without_thinking_omits_field() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            tools: None,
+            thinking: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("thinking"));
+    }
+
+    #[test]
+    fn test_deserialize_thinking_block() {
+        let json = r#"{
+            "id": "msg_03",
+            "content": [
+                {"type": "thinking", "thinking": "Let me reason about this...", "signature": "sig123"},
+                {"type": "text", "text": "The answer is 42."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 50}
+        }"#;
+        let resp: MessagesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.text(), "The answer is 42.");
+        assert_eq!(
+            resp.thinking().unwrap(),
+            "Let me reason about this..."
+        );
+    }
+
+    #[test]
+    fn test_thinking_returns_none_when_no_thinking_blocks() {
+        let json = r#"{
+            "id": "msg_04",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let resp: MessagesResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.thinking().is_none());
+    }
+
+    #[test]
+    fn test_deserialize_usage_with_cache_fields() {
+        let json = r#"{
+            "id": "msg_05",
+            "content": [{"type": "text", "text": "Hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 80
+            }
+        }"#;
+        let resp: MessagesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.usage.cache_creation_input_tokens, Some(200));
+        assert_eq!(resp.usage.cache_read_input_tokens, Some(80));
+    }
+
+    #[test]
+    fn test_deserialize_usage_without_cache_fields() {
+        let json = r#"{
+            "id": "msg_06",
+            "content": [{"type": "text", "text": "Hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let resp: MessagesResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.cache_creation_input_tokens.is_none());
+        assert!(resp.usage.cache_read_input_tokens.is_none());
+    }
+
+    #[test]
+    fn test_serialize_image_content_block() {
+        let block = ContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".into(),
+                media_type: "image/png".into(),
+                data: "iVBOR...".into(),
+            },
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["type"], "base64");
+        assert_eq!(json["source"]["media_type"], "image/png");
+    }
+
+    #[test]
+    fn test_image_source_from_png_bytes() {
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47]; // PNG header bytes
+        let source = ImageSource::from_png_bytes(&bytes);
+        assert_eq!(source.source_type, "base64");
+        assert_eq!(source.media_type, "image/png");
+        assert!(!source.data.is_empty());
     }
 }

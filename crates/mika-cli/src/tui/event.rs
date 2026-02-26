@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Paste(String),
     Tick,
     Resize,
 }
@@ -30,6 +31,11 @@ impl EventReader {
                         match event::read() {
                             Ok(CrosstermEvent::Key(key)) => {
                                 if tx.send(AppEvent::Key(key)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(CrosstermEvent::Paste(text)) => {
+                                if tx.send(AppEvent::Paste(text)).is_err() {
                                     return;
                                 }
                             }

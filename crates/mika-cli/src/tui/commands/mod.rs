@@ -113,6 +113,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Run a team workflow",
         args_hint: Some("<name> \"<goal>\""),
     },
+    SlashCommand {
+        name: "think",
+        aliases: &["t"],
+        description: "Ask with extended thinking",
+        args_hint: Some("<prompt>"),
+    },
+    SlashCommand {
+        name: "attach",
+        aliases: &["img"],
+        description: "Attach an image file",
+        args_hint: Some("<path>"),
+    },
 ];
 
 /// Filter commands by prefix (case-insensitive). Matches command names and aliases.

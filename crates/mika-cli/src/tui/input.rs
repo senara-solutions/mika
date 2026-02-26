@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::Path;
 
 use crate::tui::app::{AgentStatus, App};
+use crate::tui::attachment::ImageAttachment;
 
 /// Handle a key event with autocomplete-aware dispatch.
 pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
@@ -61,8 +63,21 @@ fn handle_key_autocomplete(app: &mut App<'_>, key: KeyEvent) {
 
 /// Key handling when autocomplete is NOT visible (normal mode).
 fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
-    // Esc clears input
+    // Ctrl+V: check clipboard for image first, else fall through to normal paste
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('v')
+        && let Some(attachment) = try_clipboard_image()
+    {
+        app.attach_image(attachment);
+        return;
+    }
+
+    // Esc: clear attachments first, then input
     if key.code == KeyCode::Esc {
+        if app.has_attachments() {
+            app.clear_attachments();
+            return;
+        }
         app.textarea = tui_textarea::TextArea::default();
         app.textarea
             .set_cursor_line_style(ratatui::style::Style::default());
@@ -117,5 +132,170 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
     let input = app.input_text();
     if input.starts_with('/') && !input[1..].contains(' ') {
         app.autocomplete.update(&input);
+    }
+}
+
+/// Handle a bracketed paste event — insert multiline text into the textarea.
+pub fn handle_paste(app: &mut App<'_>, text: &str) {
+    // Insert each line into the textarea. tui-textarea handles multiline via successive inserts.
+    // The simplest approach: replace the textarea with current lines + pasted text.
+    let mut current: Vec<String> = app.textarea.lines().to_vec();
+    let paste_lines: Vec<&str> = text.lines().collect();
+
+    if let Some(last) = current.last_mut() {
+        if let Some((first, rest)) = paste_lines.split_first() {
+            last.push_str(first);
+            for line in rest {
+                current.push(line.to_string());
+            }
+        }
+    } else {
+        for line in &paste_lines {
+            current.push(line.to_string());
+        }
+    }
+
+    app.textarea = tui_textarea::TextArea::from(current);
+    app.textarea
+        .set_cursor_line_style(ratatui::style::Style::default());
+    app.needs_redraw = true;
+}
+
+/// Try to read an image from the system clipboard.
+/// Returns None if no image is available or clipboard is not accessible (e.g., SSH).
+pub fn try_clipboard_image() -> Option<ImageAttachment> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+
+    // Encode as PNG
+    let mut png_data = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_data, img.width as u32, img.height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&img.bytes).ok()?;
+    }
+
+    let size_bytes = png_data.len();
+    // 10MB limit
+    if size_bytes > 10 * 1024 * 1024 {
+        return None;
+    }
+
+    use base64::Engine;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&png_data);
+
+    Some(ImageAttachment {
+        base64_data,
+        media_type: "image/png".to_string(),
+        size_bytes,
+        label: format!("clipboard image {}", format_size(size_bytes)),
+    })
+}
+
+/// Try to load an image from a file path.
+/// Supports png, jpg, gif, webp. Max 10MB.
+pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
+    let path = Path::new(path);
+    if !path.is_file() {
+        return None;
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+    let media_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+
+    let data = std::fs::read(path).ok()?;
+    if data.len() > 10 * 1024 * 1024 {
+        return None;
+    }
+
+    let size_bytes = data.len();
+    use base64::Engine;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image");
+
+    Some(ImageAttachment {
+        base64_data,
+        media_type: media_type.to_string(),
+        size_bytes,
+        label: filename.to_string(),
+    })
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1}MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{}KB", bytes / 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_load_image_file_nonexistent() {
+        assert!(try_load_image_file("/tmp/nonexistent-mika-test.png").is_none());
+    }
+
+    #[test]
+    fn test_try_load_image_file_unsupported_extension() {
+        // Create a temp file with unsupported extension
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "not an image").unwrap();
+        assert!(try_load_image_file(path.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_try_load_image_file_valid_png() {
+        // Create a minimal valid-looking PNG file (just bytes, not valid PNG structure,
+        // but try_load_image_file doesn't validate content — it just base64-encodes)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n test data").unwrap();
+        let result = try_load_image_file(path.to_str().unwrap());
+        assert!(result.is_some());
+        let attachment = result.unwrap();
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!(attachment.label, "test.png");
+        assert!(attachment.size_bytes > 0);
+    }
+
+    #[test]
+    fn test_try_load_image_file_jpg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"\xFF\xD8\xFF test jpeg").unwrap();
+        let result = try_load_image_file(path.to_str().unwrap());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().media_type, "image/jpeg");
+    }
+
+    #[test]
+    fn test_format_size_kilobytes() {
+        assert_eq!(format_size(1024), "1KB");
+        assert_eq!(format_size(245 * 1024), "245KB");
+    }
+
+    #[test]
+    fn test_format_size_megabytes() {
+        assert_eq!(format_size(1_048_576), "1.0MB");
+        assert_eq!(format_size(5 * 1_048_576), "5.0MB");
     }
 }

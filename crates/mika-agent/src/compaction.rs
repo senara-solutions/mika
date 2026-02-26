@@ -125,6 +125,7 @@ async fn summarize_messages(
             content: MessageContent::Text(user_prompt),
         }],
         tools: None,
+        thinking: None,
     };
 
     let response = claude

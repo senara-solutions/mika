@@ -21,6 +21,8 @@ secrecy.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+base64.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

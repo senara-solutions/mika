@@ -133,21 +133,22 @@ pub async fn handle_message(
                 message_sender: Some(sender_arc.clone()),
                 skip_compaction: true,
                 embedding_client: a.embedding_client.as_ref(),
+                thinking: None,
+                user_images: &[],
             };
 
             match agent::run_agent(&params).await {
-                Ok(Some(response)) => {
-                    info!("agent loop completed");
-                    // Send final agent response to user via gateway
-                    if let Err(e) = sender_arc.send(&response).await {
-                        error!(error = %e, "failed to send response");
-                    }
-                }
-                Ok(None) => {
-                    info!("agent loop completed (no text response)");
-                    // Still send a fallback so the user knows their request was processed
-                    if let Err(e) = sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
-                        error!(error = %e, "failed to send fallback response");
+                Ok(output) => {
+                    if let Some(response) = output.text {
+                        info!("agent loop completed");
+                        if let Err(e) = sender_arc.send(&response).await {
+                            error!(error = %e, "failed to send response");
+                        }
+                    } else {
+                        info!("agent loop completed (no text response)");
+                        if let Err(e) = sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
+                            error!(error = %e, "failed to send fallback response");
+                        }
                     }
                 }
                 Err(e) => {

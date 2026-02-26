@@ -28,6 +28,13 @@ const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 /// (e.g., all work done via tool calls).
 pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 
+/// Output from the agent loop, including text response, thinking, and usage.
+pub struct AgentOutput {
+    pub text: Option<String>,
+    pub thinking: Option<String>,
+    pub usage: Option<mika_common::claude::Usage>,
+}
+
 /// Check if this is a new user (user_summary still at default value).
 /// Used by both CLI and server to set `is_onboarding` on agent params.
 pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
@@ -60,16 +67,28 @@ pub struct AgentParams<'a> {
     pub skip_compaction: bool,
     /// Optional embedding client for Layer 3 vector search.
     pub embedding_client: Option<&'a EmbeddingClient>,
+    /// Extended thinking configuration (None = disabled).
+    pub thinking: Option<mika_common::claude::ThinkingConfig>,
+    /// User-attached images to include with the message.
+    pub user_images: &'a [mika_common::claude::ImageSource],
 }
 
 /// Run the agent loop for a single inbound message.
-/// Returns `Some(text)` when the assistant produced a text response,
-/// or `None` for tool-use-only turns (no text blocks).
-pub async fn run_agent(params: &AgentParams<'_>) -> Result<Option<String>> {
-    // Save the user message
+/// Returns `AgentOutput` with text response, thinking, and usage info.
+pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
+    // Save the user message (with image annotation if images attached)
+    let save_text = if params.user_images.is_empty() {
+        params.user_message.to_string()
+    } else {
+        format!(
+            "[{} image(s) attached]\n{}",
+            params.user_images.len(),
+            params.user_message
+        )
+    };
     params
         .db
-        .save_message("user", params.user_message, params.channel_type)
+        .save_message("user", &save_text, params.channel_type)
         .await?;
 
     let timeout_result = tokio::time::timeout(
@@ -79,7 +98,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<Option<String>> {
     .await;
 
     match timeout_result {
-        Ok(Ok(response)) => {
+        Ok(Ok(output)) => {
             // Post-turn compaction: summarize old messages if threshold exceeded.
             // Runs inline (not spawned) — acceptable latency for CLI mode.
             // Server mode sets skip_compaction=true and spawns compaction outside the agent lock.
@@ -88,7 +107,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<Option<String>> {
                     warn!(error = %e, "post-turn compaction failed");
                 }
             }
-            Ok(response)
+            Ok(output)
         }
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
@@ -102,13 +121,17 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<Option<String>> {
                 .db
                 .save_message("assistant", fallback, params.channel_type)
                 .await?;
-            Ok(Some(fallback.to_string()))
+            Ok(AgentOutput {
+                text: Some(fallback.to_string()),
+                thinking: None,
+                usage: None,
+            })
         }
     }
 }
 
 /// Inner agent loop, separated so the outer function can wrap it in a timeout.
-async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
+async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let db = params.db;
     let claude = params.claude;
     let tools = params.tools;
@@ -150,14 +173,36 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
 
     let history = db.load_recent_messages(20, None).await?;
 
-    // Build initial message list from history
-    let messages: Vec<Message> = history
+    // Build initial message list from history.
+    // The last message in history is the user message we just saved.
+    // If user_images is non-empty, replace the last message with a multi-block version.
+    let mut messages: Vec<Message> = history
         .iter()
         .map(|msg| Message {
             role: msg.role.clone(),
             content: MessageContent::Text(msg.content.clone()),
         })
         .collect();
+
+    // Attach images to the last user message if present
+    if let Some(last) = messages
+        .last_mut()
+        .filter(|m| m.role == "user" && !params.user_images.is_empty())
+    {
+        let text = match &last.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Blocks(_) => String::new(),
+        };
+        let mut blocks: Vec<ContentBlock> = params
+            .user_images
+            .iter()
+            .map(|img| ContentBlock::Image {
+                source: img.clone(),
+            })
+            .collect();
+        blocks.push(ContentBlock::Text { text });
+        last.content = MessageContent::Blocks(blocks);
+    }
 
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
@@ -170,12 +215,21 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
         embedding_client: params.embedding_client,
     };
 
+    // Auto-adjust max_tokens when thinking is enabled
+    let max_tokens = if let Some(mika_common::claude::ThinkingConfig::Enabled { budget_tokens }) =
+        &params.thinking
+    {
+        claude.max_tokens.max(budget_tokens + 4096)
+    } else {
+        claude.max_tokens
+    };
+
     // Build the request once; only messages changes between iterations.
     // send_message takes a reference, so we push new messages directly onto
     // the original to avoid rebuilding system (~4KB) and tool_defs each iteration.
     let mut request = MessagesRequest {
         model: claude.model.clone(),
-        max_tokens: claude.max_tokens,
+        max_tokens,
         system: Some(system),
         messages,
         tools: if skill_tool_defs.is_empty() {
@@ -183,10 +237,13 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
         } else {
             Some(skill_tool_defs)
         },
+        thinking: params.thinking.clone(),
     };
 
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
+    let mut last_usage = None;
+    let mut thinking_text = None;
 
     for step in 0..MAX_TOOL_STEPS {
         debug!(
@@ -196,6 +253,12 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
         );
 
         let response = claude.send_message(&request).await?;
+        last_usage = Some(response.usage.clone());
+
+        // Capture thinking from first response only (subsequent steps are tool-use follow-ups)
+        if step == 0 {
+            thinking_text = response.thinking();
+        }
 
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
@@ -203,7 +266,11 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
                 if !text.is_empty() {
                     db.save_message("assistant", &text, channel_type).await?;
                     info!(step, stop_reason = ?response.stop_reason, "agent done");
-                    return Ok(Some(text));
+                    return Ok(AgentOutput {
+                        text: Some(text),
+                        thinking: thinking_text,
+                        usage: last_usage,
+                    });
                 }
 
                 // Tool-only turn with no text: re-prompt once for acknowledgment
@@ -227,7 +294,11 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
                     warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after follow-up");
                 }
                 info!(step, stop_reason = ?response.stop_reason, "agent done");
-                return Ok(None);
+                return Ok(AgentOutput {
+                    text: None,
+                    thinking: thinking_text,
+                    usage: last_usage,
+                });
             }
             StopReason::ToolUse => {
                 tool_use_occurred = true;
@@ -248,7 +319,11 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<Option<String>> {
     warn!("agent loop exceeded {MAX_TOOL_STEPS} steps");
     let fallback = "I need a moment to think about that. Let me get back to you.";
     db.save_message("assistant", fallback, channel_type).await?;
-    Ok(Some(fallback.to_string()))
+    Ok(AgentOutput {
+        text: Some(fallback.to_string()),
+        thinking: thinking_text,
+        usage: last_usage,
+    })
 }
 
 /// Execute tool-use blocks from a response and push both assistant and
@@ -478,6 +553,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         } else {
             Some(skill_tool_defs)
         },
+        thinking: None,
     };
 
     for step in 0..MAX_TOOL_STEPS {
@@ -620,6 +696,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         } else {
             Some(skill_tool_defs)
         },
+        thinking: None,
     };
 
     let mut tool_use_occurred = false;

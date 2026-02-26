@@ -23,7 +23,8 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     } else {
         1
     };
-    let input_height = input_lines + 2; // +2 for top/bottom padding
+    let attachment_lines: u16 = if app.has_attachments() { 1 } else { 0 };
+    let input_height = input_lines + 2 + attachment_lines; // +2 for top/bottom padding
 
     let chunks = Layout::vertical([
         Constraint::Length(1),            // header
@@ -112,6 +113,27 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                     )]));
                 }
             }
+            ChatRole::Thinking => {
+                lines.push(Line::default());
+                lines.push(Line::from(vec![Span::styled(
+                    "thinking:",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+                )]));
+                for line in msg.content.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {line}"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )]));
+                }
+                lines.push(Line::from(vec![Span::styled(
+                    "  ---",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
             ChatRole::Command => {
                 lines.push(Line::default());
                 // Render each line of command output in cyan
@@ -181,17 +203,51 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Prefix "> " before the textarea
-    let chunks = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+    let has_attachments = app.has_attachments();
 
-    let prompt = Paragraph::new(Span::styled(
-        "> ",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    f.render_widget(prompt, chunks[0]);
-    f.render_widget(&app.textarea, chunks[1]);
+    if has_attachments {
+        // Split: attachment indicator on top, then prompt
+        let chunks =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+
+        let labels: Vec<String> = app
+            .pending_images
+            .iter()
+            .map(|img| format!("[{} {}]", img.label, img.size_display()))
+            .collect();
+        let indicator = Line::from(vec![
+            Span::styled("Attached: ", Style::default().fg(Color::Yellow)),
+            Span::styled(labels.join(" "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                " (Esc to clear)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(indicator), chunks[0]);
+
+        let input_chunks =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(chunks[1]);
+        let prompt = Paragraph::new(Span::styled(
+            "> ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        f.render_widget(prompt, input_chunks[0]);
+        f.render_widget(&app.textarea, input_chunks[1]);
+    } else {
+        // Normal: just prompt
+        let chunks =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+        let prompt = Paragraph::new(Span::styled(
+            "> ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        f.render_widget(prompt, chunks[0]);
+        f.render_widget(&app.textarea, chunks[1]);
+    }
 }
 
 fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
@@ -201,7 +257,7 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         AgentStatus::Responding(_) => "responding...",
     };
 
-    let footer = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {} ", app.agent_name),
             Style::default().fg(Color::DarkGray),
@@ -213,14 +269,43 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         ),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{status_text}"),
+            status_text.to_string(),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled("/ commands", Style::default().fg(Color::DarkGray)),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Ctrl+C quit", Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+
+    // Context usage indicator
+    if let Some(tokens) = app.context_tokens {
+        let limit = app.model_context_limit;
+        let pct = (tokens as f64 / limit as f64 * 100.0) as u32;
+        let tokens_k = tokens / 1000;
+        let limit_k = limit / 1000;
+        let color = if pct > 80 {
+            Color::Red
+        } else if pct > 50 {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("ctx: {tokens_k}k/{limit_k}k ({pct}%)"),
+            Style::default().fg(color),
+        ));
+    }
+
+    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "/ commands",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "Ctrl+C quit",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let footer = Line::from(spans);
     f.render_widget(Paragraph::new(footer), area);
 }
 

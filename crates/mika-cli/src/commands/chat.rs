@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{event::DisableMouseCapture, execute};
 use ratatui::Terminal;
@@ -20,6 +21,7 @@ use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
+use mika_common::claude::{ImageSource, ThinkingConfig};
 
 /// Holds the agent worker task handle and the AppContext (for DB shutdown).
 struct AgentWorker {
@@ -75,7 +77,24 @@ async fn spawn_agent_worker(
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
-                AgentRequest::Message(text) => {
+                AgentRequest::Message {
+                    text,
+                    images,
+                    thinking_budget,
+                } => {
+                    let thinking = thinking_budget
+                        .map(|budget| ThinkingConfig::Enabled { budget_tokens: budget });
+
+                    // Convert ImageAttachments to ImageSources
+                    let image_sources: Vec<ImageSource> = images
+                        .into_iter()
+                        .map(|img| ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: img.media_type,
+                            data: img.base64_data,
+                        })
+                        .collect();
+
                     let is_onboarding = check_onboarding(&worker_db).await;
                     let result = agent::run_agent(&AgentParams {
                         db: &worker_db,
@@ -90,21 +109,25 @@ async fn spawn_agent_worker(
                         message_sender: None,
                         skip_compaction: false,
                         embedding_client: worker_embedding.as_ref(),
+                        thinking,
+                        user_images: &image_sources,
                     })
                     .await;
 
                     let response = match result {
-                        Ok(Some(text)) => AgentResponse {
-                            content: text,
+                        Ok(output) => AgentResponse {
+                            content: output.text.unwrap_or_default(),
                             is_error: false,
-                        },
-                        Ok(None) => AgentResponse {
-                            content: String::new(),
-                            is_error: false,
+                            thinking: output.thinking,
+                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens),
+                            output_tokens: output.usage.as_ref().map(|u| u.output_tokens),
                         },
                         Err(e) => AgentResponse {
                             content: format!("{e}"),
                             is_error: true,
+                            thinking: None,
+                            input_tokens: None,
+                            output_tokens: None,
                         },
                     };
                     if agent_tx.send(response).is_err() {
@@ -183,7 +206,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     // Enter TUI mode
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -201,6 +224,10 @@ pub async fn run(agent_name: &str) -> Result<()> {
         match events.next().await {
             Some(AppEvent::Key(key)) => {
                 input::handle_key(&mut app, key);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Paste(text)) => {
+                input::handle_paste(&mut app, &text);
                 app.needs_redraw = true;
             }
             Some(AppEvent::Tick) => {
@@ -304,6 +331,11 @@ pub async fn run(agent_name: &str) -> Result<()> {
 
 fn restore_terminal() -> Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     Ok(())
 }

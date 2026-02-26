@@ -70,6 +70,13 @@ ratatui = "0.29"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
 crossterm = "0.28"
 
+# Encoding
+base64 = "0.22"
+
+# Clipboard & Image encoding
+arboard = { version = "3", features = ["image-data"] }
+png = "0.17"
+
 # Utilities
 rand = "0.9"
 hex = "0.4"

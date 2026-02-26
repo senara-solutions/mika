@@ -9,6 +9,7 @@ use mika_agent::async_db::AsyncDatabase;
 use mika_agent::skills::SkillRegistry;
 use mika_common::claude::ClaudeClient;
 
+use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands;
 use crate::tui::commands::autocomplete::AutocompleteState;
 use crate::tui::markdown;
@@ -37,17 +38,26 @@ pub enum ChatRole {
     Assistant,
     System,
     Command,
+    Thinking,
 }
 
 /// Messages flowing between the TUI and the agent worker.
 pub enum AgentRequest {
-    Message(String),
+    Message {
+        text: String,
+        images: Vec<ImageAttachment>,
+        thinking_budget: Option<u32>,
+    },
     Quit,
 }
 
+#[allow(dead_code)] // output_tokens reserved for future use in footer display
 pub struct AgentResponse {
     pub content: String,
     pub is_error: bool,
+    pub thinking: Option<String>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
 }
 
 /// Main application state.
@@ -98,6 +108,13 @@ pub struct App<'a> {
 
     /// If set, the chat loop should switch to this agent after the current worker stops.
     pub pending_switch: Option<String>,
+
+    // Image attachments pending send
+    pub pending_images: Vec<ImageAttachment>,
+
+    // Context usage tracking
+    pub context_tokens: Option<u32>,
+    pub model_context_limit: u32,
 }
 
 impl<'a> App<'a> {
@@ -145,20 +162,28 @@ impl<'a> App<'a> {
             agent_name,
             global_home,
             pending_switch: None,
+            pending_images: Vec::new(),
+            context_tokens: None,
+            model_context_limit: 200_000,
         }
     }
 
     /// Submit the current input to the agent, or queue a slash command.
     pub fn send_message(&mut self) {
+        self.send_message_with_thinking(None);
+    }
+
+    /// Submit the current input with optional thinking budget.
+    pub fn send_message_with_thinking(&mut self, thinking_budget: Option<u32>) {
         let text: String = self.textarea.lines().join("\n");
         let text = text.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
 
         self.autocomplete.dismiss();
 
-        if text.starts_with('/') {
+        if text.starts_with('/') && self.pending_images.is_empty() {
             // Queue slash command for async processing in tick()
             self.reset_textarea();
             self.pending_command = Some(text);
@@ -167,18 +192,43 @@ impl<'a> App<'a> {
         }
 
         // Save to history
-        self.input_history.push(text.clone());
+        if !text.is_empty() {
+            self.input_history.push(text.clone());
+        }
         self.history_index = None;
+
+        // Build display message with attachment info
+        let display = if self.pending_images.is_empty() {
+            text.clone()
+        } else {
+            let labels: Vec<String> = self
+                .pending_images
+                .iter()
+                .map(|img| format!("[{}]", img.label))
+                .collect();
+            if text.is_empty() {
+                labels.join(" ")
+            } else {
+                format!("{} {text}", labels.join(" "))
+            }
+        };
 
         // Add user message to display (no markdown rendering needed for user messages)
         self.messages.push(ChatMessage {
             role: ChatRole::User,
-            content: text.clone(),
+            content: display,
             rendered: None,
         });
 
+        // Drain pending images
+        let images = std::mem::take(&mut self.pending_images);
+
         // Send to agent worker
-        let _ = self.agent_tx.send(AgentRequest::Message(text));
+        let _ = self.agent_tx.send(AgentRequest::Message {
+            text,
+            images,
+            thinking_budget,
+        });
         self.status = AgentStatus::Thinking;
 
         // Clear input
@@ -210,6 +260,11 @@ impl<'a> App<'a> {
         // Check for agent response
         match self.agent_rx.try_recv() {
             Ok(response) => {
+                // Update context token tracking
+                if let Some(tokens) = response.input_tokens {
+                    self.context_tokens = Some(tokens);
+                }
+
                 if response.is_error {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
@@ -217,18 +272,29 @@ impl<'a> App<'a> {
                         rendered: None,
                     });
                     self.status = AgentStatus::Idle;
-                } else if response.content.is_empty() {
-                    // Agent responded with tool-use only (no text) — show feedback
-                    self.messages.push(ChatMessage {
-                        role: ChatRole::System,
-                        content: mika_agent::agent::EMPTY_RESPONSE_FALLBACK.to_string(),
-                        rendered: None,
-                    });
-                    self.status = AgentStatus::Idle;
                 } else {
-                    self.pending_response = Some(response.content);
-                    self.reveal_index = 0;
-                    self.status = AgentStatus::Responding(0);
+                    // Show thinking block (instantly, not progressively revealed)
+                    if let Some(thinking) = response.thinking {
+                        self.messages.push(ChatMessage {
+                            role: ChatRole::Thinking,
+                            content: thinking,
+                            rendered: None,
+                        });
+                    }
+
+                    if response.content.is_empty() {
+                        // Agent responded with tool-use only (no text) — show feedback
+                        self.messages.push(ChatMessage {
+                            role: ChatRole::System,
+                            content: mika_agent::agent::EMPTY_RESPONSE_FALLBACK.to_string(),
+                            rendered: None,
+                        });
+                        self.status = AgentStatus::Idle;
+                    } else {
+                        self.pending_response = Some(response.content);
+                        self.reveal_index = 0;
+                        self.status = AgentStatus::Responding(0);
+                    }
                 }
                 self.needs_redraw = true;
             }
@@ -332,6 +398,20 @@ impl<'a> App<'a> {
     /// Get current input text from the textarea.
     pub fn input_text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    pub fn attach_image(&mut self, attachment: ImageAttachment) {
+        self.pending_images.push(attachment);
+        self.needs_redraw = true;
+    }
+
+    pub fn clear_attachments(&mut self) {
+        self.pending_images.clear();
+        self.needs_redraw = true;
+    }
+
+    pub fn has_attachments(&self) -> bool {
+        !self.pending_images.is_empty()
     }
 
     fn reset_textarea(&mut self) {

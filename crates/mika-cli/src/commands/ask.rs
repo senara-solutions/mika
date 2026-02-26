@@ -30,7 +30,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
 
     let is_onboarding = check_onboarding(&ctx.async_db).await;
 
-    let response = agent::run_agent(&AgentParams {
+    let output = agent::run_agent(&AgentParams {
         db: &ctx.async_db,
         claude: &ctx.claude,
         tools: &tool_registry,
@@ -43,10 +43,12 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         message_sender: None,
         skip_compaction: false,
         embedding_client: None,
+        thinking: None,
+        user_images: &[],
     })
     .await?;
 
-    match response {
+    match output.text {
         Some(text) => println!("{text}"),
         None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
     }

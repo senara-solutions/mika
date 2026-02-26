@@ -4,8 +4,9 @@ use mika_common::agent;
 use mika_common::home;
 use mika_common::team;
 
-use crate::tui::app::{AgentRequest, AgentStatus, App, ChatRole};
+use crate::tui::app::{AgentRequest, AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::commands::{COMMANDS, parse_command};
+use crate::tui::input;
 
 /// Dispatch a slash command string to the appropriate handler.
 /// Returns Some(output) for commands that produce output, None for commands like /exit.
@@ -32,6 +33,11 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "agents" => Some(handle_agents(app)),
         "teams" => Some(handle_teams(app)),
         "team" => Some(handle_team(args)),
+        "think" | "t" => {
+            handle_think(app, args);
+            None
+        }
+        "attach" | "img" => Some(handle_attach(app, args)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -309,6 +315,9 @@ async fn handle_export(app: &mut App<'_>) -> String {
             ChatRole::System => {
                 let _ = writeln!(content, "*System: {}*\n", msg.content);
             }
+            ChatRole::Thinking => {
+                // Thinking is ephemeral — not exported.
+            }
             ChatRole::Command => {
                 // Command output is ephemeral (status, help text, etc.)
                 // and not part of the conversation — intentionally excluded.
@@ -492,6 +501,63 @@ fn handle_team(args: &str) -> String {
     )
 }
 
+fn handle_think(app: &mut App<'_>, args: &str) {
+    let prompt = args.trim();
+    if prompt.is_empty() {
+        app.messages.push(ChatMessage {
+            role: ChatRole::Command,
+            content: "Usage: /think <prompt>".to_string(),
+            rendered: None,
+        });
+        return;
+    }
+    if app.status != AgentStatus::Idle {
+        app.messages.push(ChatMessage {
+            role: ChatRole::Command,
+            content: "Agent is busy. Wait for the current response to finish.".to_string(),
+            rendered: None,
+        });
+        return;
+    }
+
+    // Display user message with [think] prefix
+    app.messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: format!("[think] {prompt}"),
+        rendered: None,
+    });
+
+    // Drain any pending images
+    let images = std::mem::take(&mut app.pending_images);
+
+    let _ = app.agent_tx.send(AgentRequest::Message {
+        text: prompt.to_string(),
+        images,
+        thinking_budget: Some(10_000),
+    });
+    app.status = AgentStatus::Thinking;
+    app.scroll_offset = 0;
+    app.needs_redraw = true;
+}
+
+fn handle_attach(app: &mut App<'_>, args: &str) -> String {
+    let path = args.trim();
+    if path.is_empty() {
+        return "Usage: /attach <path-to-image>".to_string();
+    }
+    match input::try_load_image_file(path) {
+        Some(attachment) => {
+            let label = attachment.label.clone();
+            let size = attachment.size_display();
+            app.attach_image(attachment);
+            format!("Attached: {label} ({size})")
+        }
+        None => {
+            "Failed to load image. Supported formats: png, jpg, gif, webp (max 10MB).".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +578,12 @@ mod tests {
         // We can't easily construct an App in tests, so just test the format
         let output = format!("Current model: {}", "claude-sonnet-4-6");
         assert!(output.contains("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_handle_help_contains_new_commands() {
+        let output = handle_help();
+        assert!(output.contains("/think"));
+        assert!(output.contains("/attach"));
     }
 }
