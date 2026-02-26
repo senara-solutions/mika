@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
+use crate::bundled_skills::is_bundled_skill;
 use super::{Tool, ToolContext, ToolOutput};
 
 pub struct ListSkillsTool;
@@ -48,11 +49,17 @@ impl Tool for ListSkillsTool {
                 ""
             };
             let tools_count = entry.skill_tools.len();
+            let origin = if is_bundled_skill(&entry.manifest.skill.name) {
+                " [built-in]"
+            } else {
+                " [custom]"
+            };
 
             output.push_str(&format!(
-                "- {} ({}) — {}{}\n  Keywords: {}\n  Tools: {}\n",
+                "- {} ({}){} — {}{}\n  Keywords: {}\n  Tools: {}\n",
                 entry.manifest.skill.name,
                 status,
+                origin,
                 entry.manifest.skill.description,
                 always_on,
                 keywords,
@@ -126,6 +133,58 @@ mod tests {
         assert!(result.content.contains("web-search"));
         assert!(result.content.contains("enabled"));
         assert!(result.content.contains("search, find"));
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_tags_builtin() {
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
+
+        // Create a skill with a bundled name
+        let skill_dir = tmp.path().join("skills/tmux");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "tmux"
+            description = "Terminal multiplexer"
+            [triggers]
+            keywords = ["tmux"]
+            "#,
+        )
+        .unwrap();
+
+        let tool = ListSkillsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("[built-in]"), "expected [built-in] tag in: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_tags_custom() {
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
+
+        // Create a skill with a non-bundled name
+        let skill_dir = tmp.path().join("skills/my-custom-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "my-custom-skill"
+            description = "A custom skill"
+            [triggers]
+            keywords = ["custom"]
+            "#,
+        )
+        .unwrap();
+
+        let tool = ListSkillsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("[custom]"), "expected [custom] tag in: {}", result.content);
     }
 
     #[tokio::test]

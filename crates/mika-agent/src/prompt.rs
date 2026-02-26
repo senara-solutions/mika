@@ -159,6 +159,25 @@ fn write_cli_section(prompt: &mut String, channel_type: Option<&str>) {
     );
 }
 
+/// Write the API Reference section (only for API channel).
+/// Guides integrators on how the Mika HTTP API and gateway work.
+fn write_api_section(prompt: &mut String, channel_type: Option<&str>) {
+    if channel_type != Some("api") {
+        return;
+    }
+    prompt.push_str(
+        "## API Reference\n\
+         You are being accessed via the Mika HTTP API. Architecture:\n\
+         - **Gateway** receives webhooks (Telegram, WhatsApp) and forwards to per-customer agent containers.\n\
+         - **Agent API** (this container): `POST /message` (202 async), `POST /heartbeat` (200/204), `GET /health`.\n\
+         - Auth: Bearer token in `Authorization` header (gateway ↔ agent shared secret).\n\
+         - `POST /message` body: `{\"text\": \"...\", \"chat_id\": N, \"channel\": \"telegram\", \"request_id\": \"...\"}`\n\
+         - Responses are delivered asynchronously via the gateway's `POST /send` endpoint.\n\
+         - Telegram pairing: user sends `/start` to bot → gateway creates customer record → provisions agent container.\n\
+         Never invent API endpoints. Refer only to those listed above.\n\n",
+    );
+}
+
 /// Write the core memory section with `<core-memory>` XML delimiters.
 /// An optional `description` is inserted between the heading and the data block.
 fn write_core_memory_section(
@@ -187,6 +206,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, ctx.channel_type, ctx.telegram_configured);
     write_cli_section(&mut prompt, ctx.channel_type);
+    write_api_section(&mut prompt, ctx.channel_type);
     write_core_memory_section(
         &mut prompt,
         ctx.core_memory,
@@ -252,6 +272,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
     prompt.push_str(
         "- You can create new skills using create_skill to extend your capabilities with custom prompt snippets.\n",
+    );
+    prompt.push_str(
+        "- You have built-in skills (use list_skills to see which). Built-in skills cannot be overwritten.\n",
+    );
+    prompt.push_str(
+        "- You can enable or disable skills with toggle_skill.\n",
     );
 
     prompt
@@ -620,6 +646,10 @@ mod tests {
         assert!(prompt.contains("update_fact"));
         // Base instruction also present
         assert!(prompt.contains("Never fabricate information"));
+        // Skill awareness line
+        assert!(prompt.contains("built-in skills"));
+        assert!(prompt.contains("list_skills"));
+        assert!(prompt.contains("toggle_skill"));
     }
 
     #[test]
@@ -917,6 +947,67 @@ max_iterations = 3
 
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## CLI Reference"));
+    }
+
+    #[test]
+    fn test_prompt_includes_api_section_for_api_channel() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("api"),
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## API Reference"));
+        assert!(prompt.contains("POST /message"));
+        assert!(prompt.contains("POST /heartbeat"));
+        assert!(prompt.contains("GET /health"));
+        assert!(prompt.contains("Never invent API endpoints"));
+    }
+
+    #[test]
+    fn test_prompt_omits_api_section_for_cli() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("cli"),
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## API Reference"));
+    }
+
+    #[test]
+    fn test_prompt_omits_api_section_for_telegram() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("telegram"),
+            telegram_configured: true,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## API Reference"));
     }
 
     #[test]

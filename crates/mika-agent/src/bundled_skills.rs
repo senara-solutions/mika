@@ -98,6 +98,11 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &CALENDAR_SKILL,
 ];
 
+/// Check whether a skill name matches a bundled (built-in) skill.
+pub fn is_bundled_skill(name: &str) -> bool {
+    BUNDLED_SKILLS.iter().any(|s| s.name == name)
+}
+
 /// Seed bundled skills into the given skills directory.
 ///
 /// For each bundled skill, if its directory already exists, it is skipped (never overwritten).
