@@ -24,7 +24,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "reminders" | "remind" => Some(handle_reminders(app).await),
         "status" | "stat" => Some(handle_status(app).await),
         "soul" => Some(handle_soul(app).await),
-        "config" | "cfg" => Some(handle_config(app).await),
+        "config" | "cfg" => Some(handle_config(app, args).await),
         "model" => Some(handle_model(app)),
         "export" => Some(handle_export(app).await),
         "skills" => Some(handle_skills(app)),
@@ -253,7 +253,14 @@ async fn handle_soul(app: &mut App<'_>) -> String {
     }
 }
 
-async fn handle_config(app: &mut App<'_>) -> String {
+/// Config keys that users may set via `/config set`.
+const SETTABLE_CONFIG_KEYS: &[&str] = &["chat_id", "timezone"];
+
+async fn handle_config(app: &mut App<'_>, args: &str) -> String {
+    if let Some(rest) = args.strip_prefix("set") {
+        return handle_config_set(app, rest.trim()).await;
+    }
+
     let config_path = app.home_dir.join("config").join("local.toml");
 
     let mut out = String::from("Configuration:\n");
@@ -272,7 +279,60 @@ async fn handle_config(app: &mut App<'_>) -> String {
         let _ = writeln!(out, "  Config file: (using defaults)");
     }
 
+    // Show customer config entries
+    if let Ok(configs) = app.db.list_customer_config().await {
+        if !configs.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Customer settings:");
+            for (key, value) in &configs {
+                let _ = writeln!(out, "  {key}: {value}");
+            }
+        }
+    }
+
     out
+}
+
+async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
+    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    if parts.len() < 2 || parts[0].is_empty() || parts[1].trim().is_empty() {
+        return format!(
+            "Usage: /config set <key> <value>\nSettable keys: {}",
+            SETTABLE_CONFIG_KEYS.join(", ")
+        );
+    }
+    let key = parts[0];
+    let value = parts[1].trim();
+
+    if !SETTABLE_CONFIG_KEYS.contains(&key) {
+        return format!(
+            "Unknown config key: {key}\nSettable keys: {}",
+            SETTABLE_CONFIG_KEYS.join(", ")
+        );
+    }
+
+    if value.len() > 1000 {
+        return "Config value too long (max 1000 characters)".to_string();
+    }
+
+    // Validate chat_id as integer (Telegram chat IDs are i64)
+    if key == "chat_id" && value.parse::<i64>().is_err() {
+        return format!(
+            "Invalid chat_id: {value}\nchat_id must be a numeric Telegram chat ID"
+        );
+    }
+
+    // Validate timezone values
+    if key == "timezone" && value.parse::<chrono_tz::Tz>().is_err() {
+        return format!(
+            "Invalid timezone: {value}\nExample: Asia/Singapore, America/New_York, Europe/London"
+        );
+    }
+
+    match app.db.set_customer_config(key, value).await {
+        Ok(()) => format!("Set {key} = {value}"),
+        Err(e) => format!("Failed to set {key}: {e}"),
+    }
 }
 
 fn handle_model(app: &App<'_>) -> String {
@@ -305,12 +365,21 @@ async fn handle_export(app: &mut App<'_>) -> String {
     let _ = writeln!(content, "---\n");
 
     for msg in &app.messages {
+        let channel_prefix = msg
+            .channel
+            .as_ref()
+            .map(|ch| format!("[{ch}] "))
+            .unwrap_or_default();
         match msg.role {
             ChatRole::User => {
-                let _ = writeln!(content, "**You:** {}\n", msg.content);
+                let _ = writeln!(content, "**{channel_prefix}You:** {}\n", msg.content);
             }
             ChatRole::Assistant => {
-                let _ = writeln!(content, "**{}:** {}\n", app.identity_name, msg.content);
+                let _ = writeln!(
+                    content,
+                    "**{channel_prefix}{}:** {}\n",
+                    app.identity_name, msg.content
+                );
             }
             ChatRole::System => {
                 let _ = writeln!(content, "*System: {}*\n", msg.content);
@@ -524,6 +593,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
             role: ChatRole::Command,
             content: "Usage: /think [low|medium|high] <prompt>  (default: medium)".to_string(),
             rendered: None,
+            channel: None,
         });
         return;
     }
@@ -532,6 +602,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
             role: ChatRole::Command,
             content: "Agent is busy. Wait for the current response to finish.".to_string(),
             rendered: None,
+            channel: None,
         });
         return;
     }
@@ -552,6 +623,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
             role: ChatRole::Command,
             content: "Usage: /think [low|medium|high] <prompt>".to_string(),
             rendered: None,
+            channel: None,
         });
         return;
     }
@@ -561,6 +633,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
         role: ChatRole::User,
         content: format!("[think:{level}] {prompt}"),
         rendered: None,
+        channel: None,
     });
 
     // Drain any pending images
@@ -623,5 +696,20 @@ mod tests {
         let output = handle_help();
         assert!(output.contains("/think"));
         assert!(output.contains("/attach"));
+    }
+
+    #[test]
+    fn test_handle_help_contains_config_args() {
+        let output = handle_help();
+        assert!(output.contains("/config"));
+        assert!(output.contains("set <key> <value>"));
+    }
+
+    #[test]
+    fn test_settable_config_keys_allowlist() {
+        assert!(SETTABLE_CONFIG_KEYS.contains(&"chat_id"));
+        assert!(SETTABLE_CONFIG_KEYS.contains(&"timezone"));
+        assert!(!SETTABLE_CONFIG_KEYS.contains(&"api_key"));
+        assert!(!SETTABLE_CONFIG_KEYS.contains(&"db_path"));
     }
 }

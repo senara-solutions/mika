@@ -1604,6 +1604,84 @@ impl Database {
         Ok(())
     }
 
+    /// List all customer config entries.
+    pub fn list_customer_config(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM customer_config ORDER BY key")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // -- Cross-Channel Queries --
+
+    /// Load messages with id > after_id, optionally filtered by channel type.
+    /// Returns messages in ascending id order.
+    pub fn load_messages_after(
+        &self,
+        after_id: i64,
+        channel_types: Option<&[&str]>,
+    ) -> Result<Vec<ConversationMessage>> {
+        let (sql, params) = match channel_types {
+            Some(types) if !types.is_empty() => {
+                let placeholders: Vec<String> =
+                    (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
+                let sql = format!(
+                    "SELECT id, role, content, channel_type, created_at
+                     FROM conversations
+                     WHERE id > ?1 AND role != 'summary' AND channel_type IN ({})
+                     ORDER BY id ASC",
+                    placeholders.join(", ")
+                );
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
+                for t in types {
+                    params.push(Box::new(t.to_string()));
+                }
+                (sql, params)
+            }
+            _ => {
+                let sql = "SELECT id, role, content, channel_type, created_at
+                     FROM conversations
+                     WHERE id > ?1 AND role != 'summary'
+                     ORDER BY id ASC"
+                    .to_string();
+                let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
+                (sql, params)
+            }
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let messages: Vec<ConversationMessage> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(ConversationMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    channel_type: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(messages)
+    }
+
+    /// Get the maximum message id in the conversations table.
+    /// Returns 0 if the table is empty.
+    pub fn max_message_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM conversations",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     // -- Memory Events (Audit Log) --
 
     /// Log a memory mutation event for auditability.
@@ -3121,5 +3199,100 @@ mod tests {
         let event = facts.iter().find(|(t, _, _)| t == "event").unwrap();
         assert!(event.2.contains("Team dinner"));
         assert!(event.2.contains("Italian restaurant"));
+    }
+
+    // -- Cross-channel query tests --
+
+    #[test]
+    fn test_load_messages_after_basic() {
+        let db = test_db();
+        let id1 = db.save_message("user", "msg1", "telegram").unwrap();
+        let id2 = db.save_message("assistant", "msg2", "telegram").unwrap();
+        let _id3 = db.save_message("user", "msg3", "cli").unwrap();
+
+        // Load after id1 — should get msg2 and msg3
+        let msgs = db.load_messages_after(id1, None).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].id, id2);
+        assert_eq!(msgs[0].content, "msg2");
+
+        // Load after id1 with telegram filter — should get only msg2
+        let msgs = db.load_messages_after(id1, Some(&["telegram"])).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "msg2");
+
+        // Load after id2 with telegram filter — should be empty
+        let msgs = db.load_messages_after(id2, Some(&["telegram"])).unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_load_messages_after_excludes_summary() {
+        let db = test_db();
+        db.save_message("user", "msg1", "cli").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO conversations (role, content, channel_type) VALUES ('summary', 'sum', 'system')",
+                [],
+            )
+            .unwrap();
+        db.save_message("user", "msg2", "telegram").unwrap();
+
+        let msgs = db.load_messages_after(0, None).unwrap();
+        assert!(msgs.iter().all(|m| m.role != "summary"));
+    }
+
+    #[test]
+    fn test_load_messages_after_ascending_order() {
+        let db = test_db();
+        let id1 = db.save_message("user", "first", "telegram").unwrap();
+        let id2 = db.save_message("user", "second", "telegram").unwrap();
+        let id3 = db.save_message("user", "third", "telegram").unwrap();
+
+        let msgs = db.load_messages_after(0, None).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0].id < msgs[1].id);
+        assert!(msgs[1].id < msgs[2].id);
+        assert_eq!(msgs[0].id, id1);
+        assert_eq!(msgs[1].id, id2);
+        assert_eq!(msgs[2].id, id3);
+    }
+
+    #[test]
+    fn test_max_message_id_empty() {
+        let db = test_db();
+        assert_eq!(db.max_message_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_max_message_id_populated() {
+        let db = test_db();
+        db.save_message("user", "msg1", "cli").unwrap();
+        let id2 = db.save_message("user", "msg2", "telegram").unwrap();
+        assert_eq!(db.max_message_id().unwrap(), id2);
+    }
+
+    #[test]
+    fn test_list_customer_config_empty() {
+        let db = test_db();
+        let configs = db.list_customer_config().unwrap();
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_list_customer_config_populated() {
+        let db = test_db();
+        db.set_customer_config("timezone", "Asia/Singapore")
+            .unwrap();
+        db.set_customer_config("chat_id", "12345").unwrap();
+
+        let configs = db.list_customer_config().unwrap();
+        assert_eq!(configs.len(), 2);
+        // Ordered by key
+        assert_eq!(configs[0], ("chat_id".to_string(), "12345".to_string()));
+        assert_eq!(
+            configs[1],
+            ("timezone".to_string(), "Asia/Singapore".to_string())
+        );
     }
 }

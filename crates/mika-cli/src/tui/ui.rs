@@ -7,6 +7,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph
 use crate::tui::app::{AgentStatus, App, ChatRole};
 use crate::tui::markdown;
 
+/// Build a yellow `[channel] ` prefix span for non-CLI messages.
+fn channel_prefix_span(channel: &Option<String>) -> Option<Span<'static>> {
+    channel
+        .as_ref()
+        .map(|ch| Span::styled(format!("[{ch}] "), Style::default().fg(Color::Yellow)))
+}
+
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     // Dynamic input height: grow with content, capped at 6 lines.
     // Account for both wrapped lines (long lines) and explicit newlines (pasted text).
@@ -79,23 +86,30 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         match msg.role {
             ChatRole::User => {
                 lines.push(Line::default());
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "You: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(msg.content.clone()),
-                ]));
+                let mut spans = Vec::new();
+                if let Some(span) = channel_prefix_span(&msg.channel) {
+                    spans.push(span);
+                }
+                spans.push(Span::styled(
+                    "You: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(msg.content.clone()));
+                lines.push(Line::from(spans));
             }
             ChatRole::Assistant => {
                 lines.push(Line::default());
-                let prefix = Line::from(vec![Span::styled(
+                let mut prefix_spans = Vec::new();
+                if let Some(span) = channel_prefix_span(&msg.channel) {
+                    prefix_spans.push(span);
+                }
+                prefix_spans.push(Span::styled(
                     format!("{}: ", app.identity_name),
                     Style::default().add_modifier(Modifier::BOLD),
-                )]);
-                lines.push(prefix);
+                ));
+                lines.push(Line::from(prefix_spans));
                 // Use cached rendered lines if available, otherwise render now
                 if let Some(ref cached) = msg.rendered {
                     lines.extend(cached.clone());

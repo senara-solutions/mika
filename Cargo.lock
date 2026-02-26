@@ -1662,6 +1662,7 @@ dependencies = [
  "arboard",
  "base64",
  "chrono",
+ "chrono-tz",
  "clap",
  "crossterm",
  "mika-agent",

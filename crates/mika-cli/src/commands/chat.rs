@@ -178,7 +178,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     if let Ok(history) = worker
         ._ctx
         .async_db
-        .load_recent_messages(20, Some(vec!["cli".to_string()]))
+        .load_recent_messages(20, Some(vec!["cli".to_string(), "telegram".to_string()]))
         .await
     {
         for msg in history {
@@ -187,13 +187,22 @@ pub async fn run(agent_name: &str) -> Result<()> {
                 "assistant" => ChatRole::Assistant,
                 _ => continue,
             };
+            let channel = if msg.channel_type == "cli" {
+                None
+            } else {
+                Some(msg.channel_type.clone())
+            };
             app.messages.push(ChatMessage {
                 role,
                 content: msg.content,
                 rendered: None,
+                channel,
             });
         }
     }
+
+    // Initialize cross-channel polling watermark
+    app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
 
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
@@ -280,6 +289,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                                     "Switched to agent '{target_name}' ({new_model})."
                                 ),
                                 rendered: None,
+                                channel: None,
                             });
                         }
                         Err(e) => {
@@ -287,6 +297,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                                 role: ChatRole::System,
                                 content: format!("Failed to switch agent: {e}"),
                                 rendered: None,
+                                channel: None,
                             });
                         }
                     }
@@ -296,6 +307,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                         role: ChatRole::System,
                         content: format!("Failed to switch agent: {e}"),
                         rendered: None,
+                        channel: None,
                     });
                 }
             }

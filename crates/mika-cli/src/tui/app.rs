@@ -30,6 +30,8 @@ pub struct ChatMessage {
     pub content: String,
     /// Pre-rendered markdown lines (cached to avoid re-parsing every frame).
     pub rendered: Option<Vec<Line<'static>>>,
+    /// Source channel: None = CLI (local), Some("telegram") = Telegram, etc.
+    pub channel: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,10 +114,17 @@ pub struct App<'a> {
 
     // Context usage tracking
     pub context_tokens: Option<u32>,
+
+    // Cross-channel polling
+    /// Watermark: highest message id seen (used to avoid re-fetching).
+    pub last_seen_msg_id: i64,
 }
 
 /// Context window limit for the model (Claude's 200K context).
 pub const MODEL_CONTEXT_LIMIT: u32 = 200_000;
+
+/// Poll interval for cross-channel messages in ticks (~5 seconds at 30ms tick rate).
+const POLL_INTERVAL_TICKS: u64 = 167;
 
 impl<'a> App<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -164,6 +173,7 @@ impl<'a> App<'a> {
             pending_switch: None,
             pending_images: Vec::new(),
             context_tokens: None,
+            last_seen_msg_id: 0,
         }
     }
 
@@ -217,6 +227,7 @@ impl<'a> App<'a> {
             role: ChatRole::User,
             content: display,
             rendered: None,
+            channel: None,
         });
 
         // Drain pending images
@@ -250,6 +261,7 @@ impl<'a> App<'a> {
                     role: ChatRole::Command,
                     content: output,
                     rendered: None,
+                    channel: None,
                 });
                 self.scroll_offset = 0;
             }
@@ -269,6 +281,7 @@ impl<'a> App<'a> {
                         role: ChatRole::System,
                         content: format!("Error: {}", response.content),
                         rendered: None,
+                        channel: None,
                     });
                     self.status = AgentStatus::Idle;
                 } else {
@@ -279,6 +292,7 @@ impl<'a> App<'a> {
                             role: ChatRole::Thinking,
                             content: thinking,
                             rendered: Some(rendered),
+                            channel: None,
                         });
                     }
 
@@ -288,6 +302,7 @@ impl<'a> App<'a> {
                             role: ChatRole::System,
                             content: mika_agent::agent::EMPTY_RESPONSE_FALLBACK.to_string(),
                             rendered: None,
+                            channel: None,
                         });
                         self.status = AgentStatus::Idle;
                     } else {
@@ -305,6 +320,7 @@ impl<'a> App<'a> {
                         role: ChatRole::System,
                         content: "Agent worker stopped unexpectedly.".to_string(),
                         rendered: None,
+                        channel: None,
                     });
                     self.status = AgentStatus::Idle;
                     self.needs_redraw = true;
@@ -341,13 +357,24 @@ impl<'a> App<'a> {
                     role: ChatRole::Assistant,
                     content: full,
                     rendered: Some(rendered),
+                    channel: None,
                 });
                 self.reveal_index = 0;
                 self.status = AgentStatus::Idle;
                 // Auto-scroll to bottom
                 self.scroll_offset = 0;
                 self.needs_redraw = true;
+                // Update watermark to avoid re-polling our own messages
+                if let Ok(max_id) = self.db.max_message_id().await {
+                    self.last_seen_msg_id = max_id;
+                }
             }
+        }
+
+        // Cross-channel polling: check for new messages from other channels every ~5 seconds.
+        // Only poll when idle to avoid visual confusion during agent processing.
+        if self.tick_count % POLL_INTERVAL_TICKS == 0 && self.status == AgentStatus::Idle {
+            self.poll_cross_channel_messages().await;
         }
 
         // Thinking animation needs redraw every tick while active
@@ -471,6 +498,47 @@ impl<'a> App<'a> {
             Style::default().fg(Color::DarkGray),
         )]));
         lines
+    }
+
+    /// Poll for new messages from non-CLI channels (e.g. Telegram).
+    async fn poll_cross_channel_messages(&mut self) {
+        let channels = vec!["telegram".to_string()];
+        let new_msgs = match self
+            .db
+            .load_messages_after(self.last_seen_msg_id, Some(channels))
+            .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::warn!("cross-channel poll failed: {e}");
+                return;
+            }
+        };
+
+        if new_msgs.is_empty() {
+            return;
+        }
+
+        for msg in &new_msgs {
+            let role = match msg.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => continue,
+            };
+            self.messages.push(ChatMessage {
+                role,
+                content: msg.content.clone(),
+                rendered: None,
+                channel: Some(msg.channel_type.clone()),
+            });
+        }
+
+        // Update watermark
+        if let Some(last) = new_msgs.last() {
+            self.last_seen_msg_id = last.id;
+        }
+        // Auto-scroll: stays at bottom if scroll_offset == 0; preserves position otherwise.
+        self.needs_redraw = true;
     }
 
     fn reset_textarea(&mut self) {
