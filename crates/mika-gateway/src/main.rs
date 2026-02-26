@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         // Capacity budget: 30 permits * 2 queries/task = 60 peak connection acquisitions.
         // Pool of 20 connections provides sufficient headroom.
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
+        agent_base_url: settings.agent_base_url.clone(),
     };
 
     let app = build_router(state);

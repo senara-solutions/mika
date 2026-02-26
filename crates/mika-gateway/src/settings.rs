@@ -27,6 +27,12 @@ pub struct GatewaySettings {
     /// Log level (default: "info")
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Optional override for agent container base URL (for local E2E testing).
+    /// When set, all messages route to this URL instead of K8s DNS.
+    /// Example: "http://localhost:8080"
+    #[serde(default)]
+    pub agent_base_url: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -82,6 +88,7 @@ impl std::fmt::Debug for GatewaySettings {
             .field("internal_token", &"[REDACTED]")
             .field("gateway_port", &self.gateway_port)
             .field("log_level", &self.log_level)
+            .field("agent_base_url", &self.agent_base_url)
             .finish()
     }
 }
@@ -102,6 +109,7 @@ mod tests {
                 internal_token: SecretString::from("b".repeat(64)),
                 gateway_port: 8080,
                 log_level: "info".to_string(),
+                agent_base_url: None,
             }
         );
         assert!(!debug.contains("pass"));

@@ -35,6 +35,8 @@ pub struct AppState {
     pub webhook_secret: SecretString,
     pub ready: Arc<AtomicBool>,
     pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Optional override for agent container base URL (local E2E testing).
+    pub agent_base_url: Option<String>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -42,6 +44,7 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("internal_token", &"[REDACTED]")
             .field("webhook_secret", &"[REDACTED]")
+            .field("agent_base_url", &self.agent_base_url)
             .finish_non_exhaustive()
     }
 }
@@ -159,9 +162,13 @@ async fn handle_webhook(
 // -- Text message routing --
 
 /// Compute container URL deterministically from customer ID.
-/// Eliminates SSRF — no user-controlled URLs.
-fn container_url(customer_id: &Uuid) -> String {
-    format!("http://mika-{customer_id}.mika-agents.svc.cluster.local:8080")
+/// When `agent_base_url` is set, routes all traffic there (local E2E testing).
+/// Otherwise uses K8s DNS — no user-controlled URLs (SSRF-safe).
+fn container_url(customer_id: &Uuid, agent_base_url: &Option<String>) -> String {
+    match agent_base_url {
+        Some(base) => base.clone(),
+        None => format!("http://mika-{customer_id}.mika-agents.svc.cluster.local:8080"),
+    }
 }
 
 /// Route a text message to the correct customer container.
@@ -217,7 +224,7 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
         }
     }
 
-    let url = container_url(&row.id);
+    let url = container_url(&row.id, &state.agent_base_url);
     let request_id = Uuid::new_v4().to_string();
 
     // Forward to container
@@ -298,7 +305,7 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
             info!(customer_id = %row.id, chat_id, "customer paired successfully");
 
             // Forward synthetic "Hello!" to container for onboarding
-            let url = container_url(&row.id);
+            let url = container_url(&row.id, &state.agent_base_url);
             let request_id = Uuid::new_v4().to_string();
 
             let _ = state
@@ -523,12 +530,19 @@ mod tests {
     }
 
     #[test]
-    fn test_container_url() {
+    fn test_container_url_k8s_default() {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        let url = container_url(&id);
+        let url = container_url(&id, &None);
         assert_eq!(
             url,
             "http://mika-12345678-1234-1234-1234-123456789abc.mika-agents.svc.cluster.local:8080"
         );
+    }
+
+    #[test]
+    fn test_container_url_override() {
+        let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let url = container_url(&id, &Some("http://localhost:8080".to_string()));
+        assert_eq!(url, "http://localhost:8080");
     }
 }
