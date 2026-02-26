@@ -24,7 +24,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "reminders" | "remind" => Some(handle_reminders(app).await),
         "status" | "stat" => Some(handle_status(app).await),
         "soul" => Some(handle_soul(app).await),
-        "config" | "cfg" => Some(handle_config(app).await),
+        "config" | "cfg" => Some(handle_config(app, args).await),
         "model" => Some(handle_model(app)),
         "export" => Some(handle_export(app).await),
         "skills" => Some(handle_skills(app)),
@@ -253,7 +253,14 @@ async fn handle_soul(app: &mut App<'_>) -> String {
     }
 }
 
-async fn handle_config(app: &mut App<'_>) -> String {
+/// Config keys that users may set via `/config set`.
+const SETTABLE_CONFIG_KEYS: &[&str] = &["chat_id", "timezone"];
+
+async fn handle_config(app: &mut App<'_>, args: &str) -> String {
+    if args.starts_with("set") {
+        return handle_config_set(app, args[3..].trim()).await;
+    }
+
     let config_path = app.home_dir.join("config").join("local.toml");
 
     let mut out = String::from("Configuration:\n");
@@ -272,7 +279,51 @@ async fn handle_config(app: &mut App<'_>) -> String {
         let _ = writeln!(out, "  Config file: (using defaults)");
     }
 
+    // Show customer config entries
+    if let Ok(configs) = app.db.list_customer_config().await {
+        if !configs.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Customer settings:");
+            for (key, value) in &configs {
+                let _ = writeln!(out, "  {key}: {value}");
+            }
+        }
+    }
+
     out
+}
+
+async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
+    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    if parts.len() < 2 || parts[0].is_empty() || parts[1].trim().is_empty() {
+        return format!(
+            "Usage: /config set <key> <value>\nSettable keys: {}",
+            SETTABLE_CONFIG_KEYS.join(", ")
+        );
+    }
+    let key = parts[0];
+    let value = parts[1].trim();
+
+    if !SETTABLE_CONFIG_KEYS.contains(&key) {
+        return format!(
+            "Unknown config key: {key}\nSettable keys: {}",
+            SETTABLE_CONFIG_KEYS.join(", ")
+        );
+    }
+
+    // Validate timezone values
+    if key == "timezone" {
+        if value.parse::<chrono_tz::Tz>().is_err() {
+            return format!(
+                "Invalid timezone: {value}\nExample: Asia/Singapore, America/New_York, Europe/London"
+            );
+        }
+    }
+
+    match app.db.set_customer_config(key, value).await {
+        Ok(()) => format!("Set {key} = {value}"),
+        Err(e) => format!("Failed to set {key}: {e}"),
+    }
 }
 
 fn handle_model(app: &App<'_>) -> String {

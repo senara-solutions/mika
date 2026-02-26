@@ -201,6 +201,14 @@ pub async fn run(agent_name: &str) -> Result<()> {
         }
     }
 
+    // Initialize cross-channel polling watermark
+    app.last_seen_msg_id = worker
+        ._ctx
+        .async_db
+        .max_message_id()
+        .await
+        .unwrap_or(0);
+
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

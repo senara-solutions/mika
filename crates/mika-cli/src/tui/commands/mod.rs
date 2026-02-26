@@ -62,8 +62,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "config",
         aliases: &["cfg"],
-        description: "Show current config",
-        args_hint: None,
+        description: "Show or set config",
+        args_hint: Some("[set <key> <value>]"),
     },
     SlashCommand {
         name: "model",
