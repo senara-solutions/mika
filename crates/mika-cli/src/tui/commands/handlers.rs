@@ -257,8 +257,8 @@ async fn handle_soul(app: &mut App<'_>) -> String {
 const SETTABLE_CONFIG_KEYS: &[&str] = &["chat_id", "timezone"];
 
 async fn handle_config(app: &mut App<'_>, args: &str) -> String {
-    if args.starts_with("set") {
-        return handle_config_set(app, args[3..].trim()).await;
+    if let Some(rest) = args.strip_prefix("set") {
+        return handle_config_set(app, rest.trim()).await;
     }
 
     let config_path = app.home_dir.join("config").join("local.toml");
@@ -308,6 +308,17 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
         return format!(
             "Unknown config key: {key}\nSettable keys: {}",
             SETTABLE_CONFIG_KEYS.join(", ")
+        );
+    }
+
+    if value.len() > 1000 {
+        return "Config value too long (max 1000 characters)".to_string();
+    }
+
+    // Validate chat_id as integer (Telegram chat IDs are i64)
+    if key == "chat_id" && value.parse::<i64>().is_err() {
+        return format!(
+            "Invalid chat_id: {value}\nchat_id must be a numeric Telegram chat ID"
         );
     }
 

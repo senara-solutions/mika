@@ -509,7 +509,10 @@ impl<'a> App<'a> {
             .await
         {
             Ok(msgs) => msgs,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("cross-channel poll failed: {e}");
+                return;
+            }
         };
 
         if new_msgs.is_empty() {
@@ -534,10 +537,7 @@ impl<'a> App<'a> {
         if let Some(last) = new_msgs.last() {
             self.last_seen_msg_id = last.id;
         }
-        // Don't auto-scroll if user is reading history
-        if self.scroll_offset == 0 {
-            // Already at bottom, stay there
-        }
+        // Auto-scroll: stays at bottom if scroll_offset == 0; preserves position otherwise.
         self.needs_redraw = true;
     }
 

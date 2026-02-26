@@ -7,6 +7,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph
 use crate::tui::app::{AgentStatus, App, ChatRole};
 use crate::tui::markdown;
 
+/// Build a yellow `[channel] ` prefix span for non-CLI messages.
+fn channel_prefix_span(channel: &Option<String>) -> Option<Span<'static>> {
+    channel
+        .as_ref()
+        .map(|ch| Span::styled(format!("[{ch}] "), Style::default().fg(Color::Yellow)))
+}
+
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     // Dynamic input height: grow with content, capped at 6 lines.
     // Account for both wrapped lines (long lines) and explicit newlines (pasted text).
@@ -80,11 +87,8 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             ChatRole::User => {
                 lines.push(Line::default());
                 let mut spans = Vec::new();
-                if let Some(ref ch) = msg.channel {
-                    spans.push(Span::styled(
-                        format!("[{ch}] "),
-                        Style::default().fg(Color::Yellow),
-                    ));
+                if let Some(span) = channel_prefix_span(&msg.channel) {
+                    spans.push(span);
                 }
                 spans.push(Span::styled(
                     "You: ",
@@ -98,11 +102,8 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             ChatRole::Assistant => {
                 lines.push(Line::default());
                 let mut prefix_spans = Vec::new();
-                if let Some(ref ch) = msg.channel {
-                    prefix_spans.push(Span::styled(
-                        format!("[{ch}] "),
-                        Style::default().fg(Color::Yellow),
-                    ));
+                if let Some(span) = channel_prefix_span(&msg.channel) {
+                    prefix_spans.push(span);
                 }
                 prefix_spans.push(Span::styled(
                     format!("{}: ", app.identity_name),
