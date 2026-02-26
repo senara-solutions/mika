@@ -1669,6 +1669,8 @@ dependencies = [
  "mika-common",
  "png 0.17.16",
  "ratatui",
+ "reqwest",
+ "secrecy",
  "serde_json",
  "tempfile",
  "tokio",

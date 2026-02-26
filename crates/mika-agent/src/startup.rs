@@ -22,3 +22,14 @@ pub fn seed_core_memory_if_empty(db: &Database, home_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Seed bundled skills into `{home_dir}/skills/` if the directory exists.
+///
+/// Shared between CLI and server startup paths. Only writes skills whose
+/// directories don't already exist (never overwrites user customizations).
+pub fn seed_bundled_skills_if_needed(home_dir: &Path) {
+    let skills_dir = home_dir.join("skills");
+    if skills_dir.is_dir() {
+        crate::bundled_skills::seed_bundled_skills(&skills_dir);
+    }
+}

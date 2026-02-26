@@ -33,6 +33,7 @@ struct AgentWorker {
 async fn spawn_agent_worker(
     ctx: AppContext,
     _agent_name: &str,
+    http_client: &reqwest::Client,
 ) -> Result<(
     AgentWorker,
     mpsc::UnboundedSender<AgentRequest>,
@@ -47,6 +48,8 @@ async fn spawn_agent_worker(
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
     let embedding_client = ctx.settings.make_embedding_client();
+    let message_sender =
+        crate::init::make_message_sender(&ctx.settings, &ctx.async_db, http_client);
 
     // Recover reminders on startup
     {
@@ -56,7 +59,7 @@ async fn spawn_agent_worker(
             tools: tool_registry.clone(),
             skills: skill_registry.clone(),
             home_dir: ctx.home_dir.clone(),
-            message_sender: None,
+            message_sender: message_sender.clone(),
             embedding_client: embedding_client.clone(),
         };
         if let Err(e) = scheduler.recover().await {
@@ -74,6 +77,7 @@ async fn spawn_agent_worker(
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
     let worker_embedding = embedding_client;
+    let worker_sender = message_sender;
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -107,7 +111,7 @@ async fn spawn_agent_worker(
                         session_id: &worker_session,
                         home_dir: &worker_home,
                         is_onboarding,
-                        message_sender: None,
+                        message_sender: worker_sender.clone(),
                         skip_compaction: false,
                         embedding_client: worker_embedding.as_ref(),
                         thinking,
@@ -156,8 +160,9 @@ async fn spawn_agent_worker(
 
 pub async fn run(agent_name: &str) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
+    let http_client = reqwest::Client::new();
     let (mut worker, user_tx, agent_rx, session_id, model, identity_name, skill_registry) =
-        spawn_agent_worker(ctx, agent_name).await?;
+        spawn_agent_worker(ctx, agent_name, &http_client).await?;
 
     // Build app with shared resources
     let mut app = App::new(
@@ -178,7 +183,15 @@ pub async fn run(agent_name: &str) -> Result<()> {
     if let Ok(history) = worker
         ._ctx
         .async_db
-        .load_recent_messages(20, Some(vec!["cli".to_string(), "telegram".to_string()]))
+        .load_recent_messages(
+            20,
+            Some(
+                std::iter::once("cli")
+                    .chain(crate::tui::app::POLLED_CHANNELS.iter().copied())
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        )
         .await
     {
         for msg in history {
@@ -259,7 +272,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
                 Ok(new_ctx) => {
-                    match spawn_agent_worker(new_ctx, &target_name).await {
+                    match spawn_agent_worker(new_ctx, &target_name, &http_client).await {
                         Ok((
                             new_worker,
                             new_tx,

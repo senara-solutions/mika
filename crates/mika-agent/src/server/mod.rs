@@ -60,6 +60,7 @@ fn init_agent(
 ) -> Result<(AgentState, Arc<ReminderScheduler>)> {
     let db = Database::open(&agent_home.join("data").join("mika.db"))?;
     startup::seed_core_memory_if_empty(&db, agent_home)?;
+    startup::seed_bundled_skills_if_needed(agent_home);
     let async_db = AsyncDatabase::new(db);
 
     let skill_registry = Arc::new(SkillRegistry::from_dir(&agent_home.join("skills")));
@@ -122,9 +123,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("MIKA_ROUTING_URL is required in server mode"))?;
 
-    // Validate gateway URL is well-formed
-    reqwest::Url::parse(&gateway_url)
+    // Validate gateway URL is well-formed and uses http(s) scheme
+    let parsed_url = reqwest::Url::parse(&gateway_url)
         .map_err(|e| anyhow!("MIKA_ROUTING_URL is not a valid URL: {e}"))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err(anyhow!("MIKA_ROUTING_URL must use http or https scheme"));
+    }
 
     let internal_token = settings
         .internal_token

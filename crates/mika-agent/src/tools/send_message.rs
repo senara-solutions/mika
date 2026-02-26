@@ -56,7 +56,9 @@ impl Tool for SendMessageTool {
             }
             None => {
                 info!("send_message (CLI mode, no sender configured)");
-                Ok(ToolOutput::success("Message delivered (CLI)."))
+                Ok(ToolOutput::success(
+                    "Message logged locally (no outbound sender configured).",
+                ))
             }
         }
     }
@@ -105,7 +107,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("CLI"));
+        assert!(result.content.contains("logged locally"));
     }
 
     #[tokio::test]

@@ -14,6 +14,10 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
+    let http_client = reqwest::Client::new();
+    let message_sender =
+        crate::init::make_message_sender(&ctx.settings, &ctx.async_db, &http_client);
+    let embedding_client = ctx.settings.make_embedding_client();
 
     // Read message from arg, or from stdin if "-"
     let user_message = if message == "-" {
@@ -40,9 +44,9 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         session_id: &session_id,
         home_dir: &ctx.home_dir,
         is_onboarding,
-        message_sender: None,
+        message_sender,
         skip_compaction: false,
-        embedding_client: None,
+        embedding_client: embedding_client.as_ref(),
         thinking: None,
         user_images: &[],
     })

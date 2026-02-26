@@ -123,6 +123,9 @@ pub struct App<'a> {
 /// Context window limit for the model (Claude's 200K context).
 pub const MODEL_CONTEXT_LIMIT: u32 = 200_000;
 
+/// Non-CLI channels to poll for cross-channel messages.
+pub const POLLED_CHANNELS: &[&str] = &["telegram"];
+
 /// Poll interval for cross-channel messages in ticks (~5 seconds at 30ms tick rate).
 const POLL_INTERVAL_TICKS: u64 = 167;
 
@@ -502,7 +505,7 @@ impl<'a> App<'a> {
 
     /// Poll for new messages from non-CLI channels (e.g. Telegram).
     async fn poll_cross_channel_messages(&mut self) {
-        let channels = vec!["telegram".to_string()];
+        let channels: Vec<String> = POLLED_CHANNELS.iter().map(|s| s.to_string()).collect();
         let new_msgs = match self
             .db
             .load_messages_after(self.last_seen_msg_id, Some(channels))
