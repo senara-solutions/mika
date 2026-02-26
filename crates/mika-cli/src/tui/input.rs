@@ -220,7 +220,10 @@ pub fn try_clipboard_image() -> Option<ImageAttachment> {
         base64_data,
         media_type: "image/png".to_string(),
         size_bytes,
-        label: format!("clipboard image ({})", ImageAttachment::format_size(size_bytes)),
+        label: format!(
+            "clipboard image ({})",
+            ImageAttachment::format_size(size_bytes)
+        ),
     })
 }
 
@@ -264,10 +267,7 @@ pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
     use base64::Engine;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("image");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
 
     Some(ImageAttachment {
         base64_data,
@@ -276,7 +276,6 @@ pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
         label: filename.to_string(),
     })
 }
-
 
 #[cfg(test)]
 mod tests {

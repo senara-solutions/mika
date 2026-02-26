@@ -373,11 +373,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        fs::write(
-            skill_dir.join("system_prompt.md"),
-            "Use web search wisely.",
-        )
-        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Use web search wisely.").unwrap();
 
         let entries = scan_skills_dir(tmp.path());
         assert_eq!(entries.len(), 1);

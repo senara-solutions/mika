@@ -187,7 +187,24 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
 
     // Calculate scroll: show the bottom of messages by default.
     // Use usize for all arithmetic to avoid u16 truncation on long conversations.
-    let total_lines = lines.len();
+    // Account for line wrapping: Paragraph::scroll() + Wrap operates on *wrapped* visual
+    // rows, so we must count how many rows each Line occupies after wrapping at viewport width.
+    let viewport_width = inner.width as usize;
+    let total_lines: usize = if viewport_width == 0 {
+        lines.len()
+    } else {
+        lines
+            .iter()
+            .map(|line| {
+                let w = line.width();
+                if w == 0 {
+                    1
+                } else {
+                    (w.saturating_sub(1) / viewport_width) + 1
+                }
+            })
+            .sum()
+    };
     let visible_height = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset);
@@ -210,8 +227,7 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
 
     // Determine the area for the prompt+textarea
     let prompt_area = if app.has_attachments() {
-        let chunks =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
 
         let labels: Vec<String> = app
             .pending_images
@@ -221,10 +237,7 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
         let indicator = Line::from(vec![
             Span::styled("Attached: ", Style::default().fg(Color::Yellow)),
             Span::styled(labels.join(" "), Style::default().fg(Color::Yellow)),
-            Span::styled(
-                " (Esc to clear)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" (Esc to clear)", Style::default().fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(indicator), chunks[0]);
         chunks[1]

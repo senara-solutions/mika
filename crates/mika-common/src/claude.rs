@@ -502,10 +502,7 @@ mod tests {
         }"#;
         let resp: MessagesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.text(), "The answer is 42.");
-        assert_eq!(
-            resp.thinking().unwrap(),
-            "Let me reason about this..."
-        );
+        assert_eq!(resp.thinking().unwrap(), "Let me reason about this...");
     }
 
     #[test]
@@ -565,5 +562,4 @@ mod tests {
         assert_eq!(json["source"]["type"], "base64");
         assert_eq!(json["source"]["media_type"], "image/png");
     }
-
 }

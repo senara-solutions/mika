@@ -366,7 +366,11 @@ fn handle_skills(app: &App<'_>) -> String {
         let _ = writeln!(
             out,
             "  {} ({}) — {}{}{}",
-            entry.manifest.skill.name, handler_desc, entry.manifest.skill.description, always_on, enabled
+            entry.manifest.skill.name,
+            handler_desc,
+            entry.manifest.skill.description,
+            always_on,
+            enabled
         );
     }
     out
@@ -444,13 +448,25 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
             let mut out = String::new();
             let _ = writeln!(out, "Skill: {}", m.skill.name);
             let _ = writeln!(out, "  Description: {}", m.skill.description);
-            let _ = writeln!(out, "  Version: {}", if m.skill.version.is_empty() { "unset" } else { &m.skill.version });
+            let _ = writeln!(
+                out,
+                "  Version: {}",
+                if m.skill.version.is_empty() {
+                    "unset"
+                } else {
+                    &m.skill.version
+                }
+            );
             let _ = writeln!(out, "  Always on: {}", m.skill.always_on);
             let _ = writeln!(out, "  Enabled: {}", entry.enabled);
             let _ = writeln!(out, "  Timeout: {}s", m.skill.timeout_secs);
             let _ = writeln!(out, "  Keywords: {keywords}");
             if !entry.skill_tools.is_empty() {
-                let tool_names: Vec<&str> = entry.skill_tools.iter().map(|t| t.definition.name.as_str()).collect();
+                let tool_names: Vec<&str> = entry
+                    .skill_tools
+                    .iter()
+                    .map(|t| t.definition.name.as_str())
+                    .collect();
                 let _ = writeln!(out, "  Tools: {}", tool_names.join(", "));
             }
             let _ = writeln!(out, "  Path: {}", entry.dir.display());
@@ -506,8 +522,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
     if args.is_empty() {
         app.messages.push(ChatMessage {
             role: ChatRole::Command,
-            content: "Usage: /think [budget] <prompt>  (budget: 1024-100000, default 10000)"
-                .to_string(),
+            content: "Usage: /think [low|medium|high] <prompt>  (default: medium)".to_string(),
             rendered: None,
         });
         return;
@@ -521,19 +536,21 @@ fn handle_think(app: &mut App<'_>, args: &str) {
         return;
     }
 
-    // Parse optional budget: if first word is a number, use it as budget
-    let (budget, prompt) = match args.split_once(char::is_whitespace) {
-        Some((first, rest)) if first.parse::<u32>().is_ok() => {
-            let b = first.parse::<u32>().unwrap().clamp(1024, 100_000);
-            (b, rest.trim())
-        }
-        _ => (10_000, args),
+    // Parse optional level: if first word is low/medium/high, use it
+    let (budget, level, prompt) = match args.split_once(char::is_whitespace) {
+        Some((first, rest)) => match first.to_lowercase().as_str() {
+            "low" => (5_000, "low", rest.trim()),
+            "medium" => (10_000, "medium", rest.trim()),
+            "high" => (50_000, "high", rest.trim()),
+            _ => (10_000, "medium", args),
+        },
+        None => (10_000, "medium", args),
     };
 
     if prompt.is_empty() {
         app.messages.push(ChatMessage {
             role: ChatRole::Command,
-            content: "Usage: /think [budget] <prompt>".to_string(),
+            content: "Usage: /think [low|medium|high] <prompt>".to_string(),
             rendered: None,
         });
         return;
@@ -542,7 +559,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
     // Display user message with [think] prefix
     app.messages.push(ChatMessage {
         role: ChatRole::User,
-        content: format!("[think:{budget}] {prompt}"),
+        content: format!("[think:{level}] {prompt}"),
         rendered: None,
     });
 

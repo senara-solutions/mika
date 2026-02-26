@@ -82,8 +82,9 @@ async fn spawn_agent_worker(
                     images,
                     thinking_budget,
                 } => {
-                    let thinking = thinking_budget
-                        .map(|budget| ThinkingConfig::Enabled { budget_tokens: budget });
+                    let thinking = thinking_budget.map(|budget| ThinkingConfig::Enabled {
+                        budget_tokens: budget,
+                    });
 
                     // Convert ImageAttachments to ImageSources
                     let image_sources: Vec<ImageSource> = images

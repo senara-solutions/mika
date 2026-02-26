@@ -62,6 +62,11 @@ pub struct PromptContext<'a> {
     /// Global home directory, used to discover teams.
     /// When `None`, the teams section is omitted from the prompt.
     pub global_home_dir: Option<&'a Path>,
+    /// The channel this message arrived on (e.g., "telegram", "cli").
+    /// When `None`, the channel section is omitted (team agents, tests).
+    pub channel_type: Option<&'a str>,
+    /// Whether Telegram integration is configured (chat_id exists in customer_config).
+    pub telegram_configured: bool,
 }
 
 fn onboarding_prompt() -> String {
@@ -101,6 +106,34 @@ fn write_time_section(prompt: &mut String, current_utc: DateTime<Utc>, timezone:
     prompt.push('\n');
 }
 
+/// Write the communication channel section.
+/// Informs the agent which channel the conversation is on and which integrations are active.
+/// Known valid channel types. Unknown channels are silently skipped to prevent
+/// prompt injection via a compromised gateway sending arbitrary channel strings.
+const VALID_CHANNELS: &[&str] = &["cli", "telegram", "whatsapp", "api"];
+
+fn write_channel_section(
+    prompt: &mut String,
+    channel_type: Option<&str>,
+    telegram_configured: bool,
+) {
+    // Only include recognized channels
+    let valid_channel = channel_type.filter(|ch| VALID_CHANNELS.contains(ch));
+    if valid_channel.is_none() && !telegram_configured {
+        return;
+    }
+    prompt.push_str("## Communication Channel\n");
+    if let Some(ch) = valid_channel {
+        writeln!(prompt, "This conversation is happening via: {ch}").unwrap();
+    }
+    if telegram_configured {
+        prompt.push_str(
+            "Telegram integration is active. You can reach the user via Telegram using send_message.\n",
+        );
+    }
+    prompt.push('\n');
+}
+
 /// Write the core memory section with `<core-memory>` XML delimiters.
 /// An optional `description` is inserted between the heading and the data block.
 fn write_core_memory_section(
@@ -127,6 +160,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     write_soul_section(&mut prompt, ctx.soul_content);
     write_identity_section(&mut prompt, ctx.identity);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
+    write_channel_section(&mut prompt, ctx.channel_type, ctx.telegram_configured);
     write_core_memory_section(
         &mut prompt,
         ctx.core_memory,
@@ -178,11 +212,21 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // Tool usage instructions (builtin tools are always available)
     prompt.push_str("\n## Tool Usage\n");
     prompt.push_str("- Update your core memory when you learn important things about the user.\n");
-    prompt.push_str("- Track people, commitments, preferences, and events using the appropriate tools.\n");
-    prompt.push_str("- Use search_memory to find stored facts before asking the user to repeat information.\n");
+    prompt.push_str(
+        "- Track people, commitments, preferences, and events using the appropriate tools.\n",
+    );
+    prompt.push_str(
+        "- Use search_memory to find stored facts before asking the user to repeat information.\n",
+    );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
-    prompt.push_str("- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC).\n");
-    prompt.push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
+    prompt.push_str(
+        "- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC).\n",
+    );
+    prompt
+        .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
+    prompt.push_str(
+        "- You can create new skills using create_skill to extend your capabilities with custom prompt snippets.\n",
+    );
 
     prompt
 }
@@ -196,6 +240,8 @@ pub struct SilentPromptContext<'a> {
     pub trigger_context: &'a str,
     pub current_utc: DateTime<Utc>,
     pub timezone: Option<String>,
+    /// Whether Telegram integration is configured for outbound delivery.
+    pub telegram_configured: bool,
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -206,6 +252,7 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     write_soul_section(&mut prompt, ctx.soul_content);
     write_identity_section(&mut prompt, ctx.identity);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
+    write_channel_section(&mut prompt, None, ctx.telegram_configured);
     write_core_memory_section(&mut prompt, ctx.core_memory, None);
 
     // Pending commitments
@@ -279,6 +326,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -297,6 +346,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -320,6 +371,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -337,6 +390,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -355,6 +410,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -394,6 +451,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -413,6 +472,7 @@ mod tests {
             trigger_context: "This is a HEARTBEAT check-in.",
             current_utc: test_time(),
             timezone: None,
+            telegram_configured: false,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -433,6 +493,7 @@ mod tests {
             trigger_context: "REMINDER: Call the dentist",
             current_utc: test_time(),
             timezone: None,
+            telegram_configured: false,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -461,6 +522,7 @@ mod tests {
             trigger_context: "Heartbeat",
             current_utc: test_time(),
             timezone: None,
+            telegram_configured: false,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -479,6 +541,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -498,6 +562,8 @@ mod tests {
             current_utc: test_time(),
             timezone: Some("+08:00".to_string()),
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -516,6 +582,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -540,6 +608,8 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -568,6 +638,7 @@ mod tests {
             trigger_context: "Heartbeat",
             current_utc: test_time(),
             timezone: None,
+            telegram_configured: false,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -587,6 +658,7 @@ mod tests {
             trigger_context: "Heartbeat",
             current_utc: test_time(),
             timezone: Some("-05:00".to_string()),
+            telegram_configured: false,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -632,6 +704,8 @@ max_iterations = 3
             current_utc: test_time(),
             timezone: None,
             global_home_dir: Some(tmp.path()),
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -652,6 +726,8 @@ max_iterations = 3
             current_utc: test_time(),
             timezone: None,
             global_home_dir: Some(tmp.path()),
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -669,9 +745,108 @@ max_iterations = 3
             current_utc: test_time(),
             timezone: None,
             global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
         };
 
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Teams"));
+    }
+
+    #[test]
+    fn test_prompt_includes_channel_section_for_telegram() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("telegram"),
+            telegram_configured: true,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Communication Channel"));
+        assert!(prompt.contains("This conversation is happening via: telegram"));
+        assert!(prompt.contains("Telegram integration is active"));
+    }
+
+    #[test]
+    fn test_prompt_includes_channel_section_for_cli() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("cli"),
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Communication Channel"));
+        assert!(prompt.contains("This conversation is happening via: cli"));
+        assert!(!prompt.contains("Telegram integration is active"));
+    }
+
+    #[test]
+    fn test_prompt_omits_channel_section_when_none() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Communication Channel"));
+    }
+
+    #[test]
+    fn test_silent_prompt_includes_telegram_when_configured() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: true,
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("Telegram integration is active"));
+    }
+
+    #[test]
+    fn test_silent_prompt_omits_channel_when_no_telegram() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(!prompt.contains("## Communication Channel"));
     }
 }

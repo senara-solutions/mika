@@ -174,9 +174,8 @@ keywords = ["{name}"]
     std::fs::write(skill_dir.join("tools.json"), &tools_json)?;
 
     // Write system_prompt.md
-    let prompt = format!(
-        "Use the {name} tools when the user asks about topics related to {name}.\n"
-    );
+    let prompt =
+        format!("Use the {name} tools when the user asks about topics related to {name}.\n");
     std::fs::write(skill_dir.join("system_prompt.md"), &prompt)?;
 
     // Write handler script
@@ -212,7 +211,10 @@ echo "TODO: implement handler for query: $QUERY"
     println!("    system_prompt.md — prompt snippet");
     println!("    handlers/run.sh  — handler script");
     println!();
-    println!("  Test with: mika skills test {name} {}_action", name.replace('-', "_"));
+    println!(
+        "  Test with: mika skills test {name} {}_action",
+        name.replace('-', "_")
+    );
     println!();
     Ok(())
 }
