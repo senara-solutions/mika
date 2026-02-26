@@ -1610,7 +1610,9 @@ impl Database {
             .conn
             .prepare("SELECT key, value FROM customer_config ORDER BY key")?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -3197,5 +3199,100 @@ mod tests {
         let event = facts.iter().find(|(t, _, _)| t == "event").unwrap();
         assert!(event.2.contains("Team dinner"));
         assert!(event.2.contains("Italian restaurant"));
+    }
+
+    // -- Cross-channel query tests --
+
+    #[test]
+    fn test_load_messages_after_basic() {
+        let db = test_db();
+        let id1 = db.save_message("user", "msg1", "telegram").unwrap();
+        let id2 = db.save_message("assistant", "msg2", "telegram").unwrap();
+        let _id3 = db.save_message("user", "msg3", "cli").unwrap();
+
+        // Load after id1 — should get msg2 and msg3
+        let msgs = db.load_messages_after(id1, None).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].id, id2);
+        assert_eq!(msgs[0].content, "msg2");
+
+        // Load after id1 with telegram filter — should get only msg2
+        let msgs = db.load_messages_after(id1, Some(&["telegram"])).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "msg2");
+
+        // Load after id2 with telegram filter — should be empty
+        let msgs = db.load_messages_after(id2, Some(&["telegram"])).unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_load_messages_after_excludes_summary() {
+        let db = test_db();
+        db.save_message("user", "msg1", "cli").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO conversations (role, content, channel_type) VALUES ('summary', 'sum', 'system')",
+                [],
+            )
+            .unwrap();
+        db.save_message("user", "msg2", "telegram").unwrap();
+
+        let msgs = db.load_messages_after(0, None).unwrap();
+        assert!(msgs.iter().all(|m| m.role != "summary"));
+    }
+
+    #[test]
+    fn test_load_messages_after_ascending_order() {
+        let db = test_db();
+        let id1 = db.save_message("user", "first", "telegram").unwrap();
+        let id2 = db.save_message("user", "second", "telegram").unwrap();
+        let id3 = db.save_message("user", "third", "telegram").unwrap();
+
+        let msgs = db.load_messages_after(0, None).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0].id < msgs[1].id);
+        assert!(msgs[1].id < msgs[2].id);
+        assert_eq!(msgs[0].id, id1);
+        assert_eq!(msgs[1].id, id2);
+        assert_eq!(msgs[2].id, id3);
+    }
+
+    #[test]
+    fn test_max_message_id_empty() {
+        let db = test_db();
+        assert_eq!(db.max_message_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_max_message_id_populated() {
+        let db = test_db();
+        db.save_message("user", "msg1", "cli").unwrap();
+        let id2 = db.save_message("user", "msg2", "telegram").unwrap();
+        assert_eq!(db.max_message_id().unwrap(), id2);
+    }
+
+    #[test]
+    fn test_list_customer_config_empty() {
+        let db = test_db();
+        let configs = db.list_customer_config().unwrap();
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_list_customer_config_populated() {
+        let db = test_db();
+        db.set_customer_config("timezone", "Asia/Singapore")
+            .unwrap();
+        db.set_customer_config("chat_id", "12345").unwrap();
+
+        let configs = db.list_customer_config().unwrap();
+        assert_eq!(configs.len(), 2);
+        // Ordered by key
+        assert_eq!(configs[0], ("chat_id".to_string(), "12345".to_string()));
+        assert_eq!(
+            configs[1],
+            ("timezone".to_string(), "Asia/Singapore".to_string())
+        );
     }
 }

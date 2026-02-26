@@ -312,12 +312,10 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
     }
 
     // Validate timezone values
-    if key == "timezone" {
-        if value.parse::<chrono_tz::Tz>().is_err() {
-            return format!(
-                "Invalid timezone: {value}\nExample: Asia/Singapore, America/New_York, Europe/London"
-            );
-        }
+    if key == "timezone" && value.parse::<chrono_tz::Tz>().is_err() {
+        return format!(
+            "Invalid timezone: {value}\nExample: Asia/Singapore, America/New_York, Europe/London"
+        );
     }
 
     match app.db.set_customer_config(key, value).await {
@@ -687,5 +685,20 @@ mod tests {
         let output = handle_help();
         assert!(output.contains("/think"));
         assert!(output.contains("/attach"));
+    }
+
+    #[test]
+    fn test_handle_help_contains_config_args() {
+        let output = handle_help();
+        assert!(output.contains("/config"));
+        assert!(output.contains("set <key> <value>"));
+    }
+
+    #[test]
+    fn test_settable_config_keys_allowlist() {
+        assert!(SETTABLE_CONFIG_KEYS.contains(&"chat_id"));
+        assert!(SETTABLE_CONFIG_KEYS.contains(&"timezone"));
+        assert!(!SETTABLE_CONFIG_KEYS.contains(&"api_key"));
+        assert!(!SETTABLE_CONFIG_KEYS.contains(&"db_path"));
     }
 }
