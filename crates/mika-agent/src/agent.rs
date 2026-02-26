@@ -145,6 +145,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
 
+    let chat_id = db.get_customer_config("chat_id").await?;
     let prompt_ctx = prompt::PromptContext {
         soul_content: &soul_content,
         identity: &identity,
@@ -153,6 +154,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         current_utc: chrono::Utc::now(),
         timezone,
         global_home_dir: Some(params.home_dir),
+        channel_type: Some(params.channel_type),
+        telegram_configured: chat_id.is_some(),
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -166,8 +169,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.user_message);
-    let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched);
 
@@ -341,9 +343,15 @@ async fn process_tool_calls(
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
-            let output =
-                execute_tool(tools, skill_tools, name, input.clone(), tool_ctx, skill_timeout)
-                    .await;
+            let output = execute_tool(
+                tools,
+                skill_tools,
+                name,
+                input.clone(),
+                tool_ctx,
+                skill_timeout,
+            )
+            .await;
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
                 content: output.content,
@@ -497,6 +505,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         }
     };
 
+    let chat_id = db.get_customer_config("chat_id").await?;
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &soul_content,
         identity: &identity,
@@ -505,6 +514,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         trigger_context: &trigger_context,
         current_utc: chrono::Utc::now(),
         timezone,
+        telegram_configured: chat_id.is_some(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -514,8 +524,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         SilentTrigger::Heartbeat => params.skills.always_on_skills(),
         SilentTrigger::Reminder { message, .. } => params.skills.match_message(message),
     };
-    let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched);
 
@@ -654,6 +663,8 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         current_utc: chrono::Utc::now(),
         timezone,
         global_home_dir: None, // Team agents don't need team discovery in their prompt
+        channel_type: None,
+        telegram_configured: false,
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -664,8 +675,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.task_message);
-    let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched);
 

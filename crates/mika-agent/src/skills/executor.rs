@@ -113,11 +113,7 @@ async fn execute_exec(
 ///
 /// - POST/PUT: sends input as JSON body
 /// - GET: sends input as query parameters
-async fn execute_http(
-    url: &str,
-    method: &str,
-    input: serde_json::Value,
-) -> Result<ToolOutput> {
+async fn execute_http(url: &str, method: &str, input: serde_json::Value) -> Result<ToolOutput> {
     let client = reqwest::Client::new();
 
     let request = match method.to_uppercase().as_str() {
@@ -216,8 +212,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "handlers/handler.sh");
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("hello from handler"));
     }
@@ -231,8 +226,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "fail.sh");
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
         assert!(output.is_error);
         assert!(output.content.contains("exit"));
         assert!(output.content.contains("error msg"));
@@ -242,8 +236,7 @@ mod tests {
     async fn test_exec_handler_missing_command() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_exec_tool(tmp.path(), "nonexistent.sh");
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
         assert!(output.is_error);
         assert!(output.content.contains("not found"));
     }
@@ -251,12 +244,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_exec_handler_timeout() {
         let tmp = tempfile::tempdir().unwrap();
-        write_script(&tmp.path().join("slow.sh"), "#!/bin/sh\nsleep 60\necho done");
+        write_script(
+            &tmp.path().join("slow.sh"),
+            "#!/bin/sh\nsleep 60\necho done",
+        );
 
         let tool = make_exec_tool(tmp.path(), "slow.sh");
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({}), 2).await;
-        assert!(output.is_error, "expected timeout error, got: {}", output.content);
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 2).await;
+        assert!(
+            output.is_error,
+            "expected timeout error, got: {}",
+            output.content
+        );
         assert!(output.content.contains("timed out"));
     }
 
@@ -298,8 +297,7 @@ mod tests {
             },
             skill_dir: PathBuf::from("/tmp"),
         };
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({}), 5).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 5).await;
         assert!(output.is_error);
         assert!(output.content.contains("unsupported HTTP method"));
     }

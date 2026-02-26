@@ -94,7 +94,10 @@ mod tests {
         assert_eq!(manifest.skill.version, "0.1.0");
         assert!(!manifest.skill.always_on);
         assert_eq!(manifest.skill.timeout_secs, 60);
-        assert_eq!(manifest.triggers.keywords, vec!["search", "look up", "find"]);
+        assert_eq!(
+            manifest.triggers.keywords,
+            vec!["search", "look up", "find"]
+        );
     }
 
     #[test]

@@ -1,0 +1,419 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use mika_common::claude::ToolDefinition;
+use serde_json::{Value, json};
+use std::fmt::Write;
+
+use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+
+pub struct CreateSkillTool;
+
+/// Maximum allowed length for skill name.
+const MAX_SKILL_NAME_LEN: usize = 50;
+
+/// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
+fn validate_skill_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Skill name cannot be empty.".to_string());
+    }
+    if name.len() > MAX_SKILL_NAME_LEN {
+        return Err(format!(
+            "Skill name too long ({} chars, max {MAX_SKILL_NAME_LEN}).",
+            name.len()
+        ));
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err("Skill name cannot contain path separators or '..'".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "Skill name must contain only alphanumeric characters, hyphens, or underscores."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl Tool for CreateSkillTool {
+    fn name(&self) -> &str {
+        "create_skill"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "create_skill".to_string(),
+            description: "Create a new skill with a manifest and system prompt snippet. \
+                Skills extend your capabilities by injecting context into your system prompt \
+                when triggered by keywords. The skill will be available after restarting \
+                the conversation. Note: this creates the skill scaffold only (manifest + prompt). \
+                To add custom tools with executable handlers, the user must edit the files manually."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name (alphanumeric + hyphens/underscores, max 50 chars). Example: 'claude-relay'"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Brief description of what the skill does"
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Keywords that trigger this skill when they appear in the user's message"
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": "The prompt snippet injected into the system prompt when this skill is active. This is the core of the skill — it tells you how to behave when the skill triggers."
+                    },
+                    "always_on": {
+                        "type": "boolean",
+                        "description": "If true, this skill is always active regardless of keywords. Default: false"
+                    }
+                },
+                "required": ["name", "description", "keywords", "system_prompt"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+        let name = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let description = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let system_prompt = input
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let always_on = input
+            .get("always_on")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let keywords: Vec<String> = input
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Validate name
+        if let Err(e) = validate_skill_name(name) {
+            return Ok(ToolOutput::error(e));
+        }
+
+        // Validate inputs not empty
+        if description.is_empty() {
+            return Ok(ToolOutput::error("Description cannot be empty."));
+        }
+        if system_prompt.is_empty() {
+            return Ok(ToolOutput::error("System prompt cannot be empty."));
+        }
+        if keywords.is_empty() && !always_on {
+            return Ok(ToolOutput::error(
+                "At least one keyword is required (or set always_on to true).",
+            ));
+        }
+
+        // Validate input lengths
+        if description.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "Description too long ({} chars, max {MAX_INPUT_LEN}).",
+                description.len()
+            )));
+        }
+        if system_prompt.len() > MAX_INPUT_LEN {
+            return Ok(ToolOutput::error(format!(
+                "System prompt too long ({} chars, max {MAX_INPUT_LEN}).",
+                system_prompt.len()
+            )));
+        }
+
+        let skills_dir = ctx.home_dir.join("skills");
+        let skill_dir = skills_dir.join(name);
+
+        // Check for existing skill
+        if skill_dir.exists() {
+            return Ok(ToolOutput::error(format!(
+                "Skill '{name}' already exists at {}. Choose a different name.",
+                skill_dir.display()
+            )));
+        }
+
+        // Create skill directory
+        if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+            return Ok(ToolOutput::error(format!(
+                "Failed to create skill directory: {e}"
+            )));
+        }
+
+        // Build keywords TOML array
+        let keywords_toml: Vec<String> = keywords.iter().map(|k| format!("\"{k}\"")).collect();
+
+        // Write skill.toml
+        let skill_toml = format!(
+            r#"[skill]
+name = "{name}"
+description = "{description}"
+version = "0.1.0"
+always_on = {always_on}
+timeout_secs = 30
+
+[triggers]
+keywords = [{keywords}]
+"#,
+            keywords = keywords_toml.join(", ")
+        );
+
+        if let Err(e) = std::fs::write(skill_dir.join("skill.toml"), &skill_toml) {
+            // Clean up on failure
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Ok(ToolOutput::error(format!(
+                "Failed to write skill.toml: {e}"
+            )));
+        }
+
+        // Write system_prompt.md
+        if let Err(e) = std::fs::write(skill_dir.join("system_prompt.md"), system_prompt) {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Ok(ToolOutput::error(format!(
+                "Failed to write system_prompt.md: {e}"
+            )));
+        }
+
+        let mut result = String::new();
+        let _ = writeln!(result, "Created skill '{name}' at {}", skill_dir.display());
+        let _ = writeln!(result, "Files: skill.toml, system_prompt.md");
+        let _ = writeln!(
+            result,
+            "The skill will be available after restarting the conversation."
+        );
+        let _ = writeln!(
+            result,
+            "To add custom tools, create a tools.json file in the skill directory."
+        );
+
+        Ok(ToolOutput::success(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_db::AsyncDatabase;
+    use crate::db::Database;
+    use std::sync::atomic::AtomicU32;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, ToolContext<'static>) {
+        let tmp = TempDir::new().unwrap();
+        // Create skills directory
+        std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+
+        // We need a DB for ToolContext but create_skill doesn't use it.
+        // Use a leaked reference to avoid lifetime issues in tests.
+        let db_path = tmp.path().join("data");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let db = Database::open(&db_path.join("test.db")).unwrap();
+        let async_db = AsyncDatabase::new(db);
+        let async_db: &'static AsyncDatabase = Box::leak(Box::new(async_db));
+        let edit_count: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let path: &'static std::path::Path = Box::leak(tmp.path().to_path_buf().into_boxed_path());
+
+        let ctx = ToolContext {
+            db: async_db,
+            session_id: "test-session",
+            home_dir: path,
+            core_memory_edit_count: edit_count,
+            is_onboarding: false,
+            message_sender: None,
+            embedding_client: None,
+        };
+
+        (tmp, ctx)
+    }
+
+    fn valid_input() -> Value {
+        json!({
+            "name": "test-skill",
+            "description": "A test skill",
+            "keywords": ["test", "example"],
+            "system_prompt": "You are testing the skill system."
+        })
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_success() {
+        let (tmp, ctx) = setup();
+        let tool = CreateSkillTool;
+        let output = tool.execute(valid_input(), &ctx).await.unwrap();
+
+        assert!(
+            !output.is_error,
+            "Expected success, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("Created skill 'test-skill'"));
+
+        // Verify files exist
+        let skill_dir = tmp.path().join("skills/test-skill");
+        assert!(skill_dir.join("skill.toml").exists());
+        assert!(skill_dir.join("system_prompt.md").exists());
+
+        // Verify skill.toml is valid
+        let toml_content = std::fs::read_to_string(skill_dir.join("skill.toml")).unwrap();
+        let manifest: toml::Value = toml::from_str(&toml_content).unwrap();
+        assert_eq!(manifest["skill"]["name"].as_str().unwrap(), "test-skill");
+        assert_eq!(
+            manifest["skill"]["description"].as_str().unwrap(),
+            "A test skill"
+        );
+
+        // Verify system_prompt.md content
+        let prompt = std::fs::read_to_string(skill_dir.join("system_prompt.md")).unwrap();
+        assert_eq!(prompt, "You are testing the skill system.");
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_loadable_by_scanner() {
+        let (tmp, ctx) = setup();
+        let tool = CreateSkillTool;
+        tool.execute(valid_input(), &ctx).await.unwrap();
+
+        // Verify the created skill is loadable by scan_skills_dir
+        let entries = crate::skills::index::scan_skills_dir(&tmp.path().join("skills"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].manifest.skill.name, "test-skill");
+        assert_eq!(entries[0].keywords_lower, vec!["test", "example"]);
+        assert_eq!(
+            entries[0].prompt_snippet,
+            "You are testing the skill system."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_duplicate_name() {
+        let (_tmp, ctx) = setup();
+        let tool = CreateSkillTool;
+
+        // Create once
+        let output = tool.execute(valid_input(), &ctx).await.unwrap();
+        assert!(!output.is_error);
+
+        // Create again — should fail
+        let output = tool.execute(valid_input(), &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_invalid_names() {
+        let (_tmp, ctx) = setup();
+        let tool = CreateSkillTool;
+
+        // Empty name
+        let input =
+            json!({"name": "", "description": "d", "keywords": ["k"], "system_prompt": "p"});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("empty"));
+
+        // Path traversal
+        let input =
+            json!({"name": "../evil", "description": "d", "keywords": ["k"], "system_prompt": "p"});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("path separators"));
+
+        // Special characters
+        let input =
+            json!({"name": "sk!ll", "description": "d", "keywords": ["k"], "system_prompt": "p"});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("alphanumeric"));
+
+        // Too long
+        let long_name = "a".repeat(51);
+        let input =
+            json!({"name": long_name, "description": "d", "keywords": ["k"], "system_prompt": "p"});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_empty_inputs() {
+        let (_tmp, ctx) = setup();
+        let tool = CreateSkillTool;
+
+        // Empty description
+        let input =
+            json!({"name": "sk", "description": "", "keywords": ["k"], "system_prompt": "p"});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Description cannot be empty"));
+
+        // Empty system_prompt
+        let input =
+            json!({"name": "sk", "description": "d", "keywords": ["k"], "system_prompt": ""});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("System prompt cannot be empty"));
+
+        // Empty keywords (and not always_on)
+        let input = json!({"name": "sk", "description": "d", "keywords": [], "system_prompt": "p"});
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("keyword"));
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_always_on_no_keywords() {
+        let (_tmp, ctx) = setup();
+        let tool = CreateSkillTool;
+
+        // always_on=true should work with empty keywords
+        let input = json!({
+            "name": "always-skill",
+            "description": "Always active",
+            "keywords": [],
+            "system_prompt": "Always present.",
+            "always_on": true
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(
+            !output.is_error,
+            "Expected success, got: {}",
+            output.content
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_name() {
+        assert!(validate_skill_name("web-search").is_ok());
+        assert!(validate_skill_name("my_skill").is_ok());
+        assert!(validate_skill_name("skill123").is_ok());
+        assert!(validate_skill_name("").is_err());
+        assert!(validate_skill_name("../evil").is_err());
+        assert!(validate_skill_name("path/sep").is_err());
+        assert!(validate_skill_name("sp ace").is_err());
+        assert!(validate_skill_name("sp!cial").is_err());
+        assert!(validate_skill_name(&"a".repeat(51)).is_err());
+    }
+}

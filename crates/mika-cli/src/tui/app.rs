@@ -328,7 +328,9 @@ impl<'a> App<'a> {
                 } else {
                     64
                 };
-                self.reveal_index = full.floor_char_boundary(self.reveal_index + increment).min(len);
+                self.reveal_index = full
+                    .floor_char_boundary(self.reveal_index + increment)
+                    .min(len);
                 self.status = AgentStatus::Responding(self.reveal_index);
                 self.needs_redraw = true;
             } else {
