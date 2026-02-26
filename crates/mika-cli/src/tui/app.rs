@@ -51,13 +51,11 @@ pub enum AgentRequest {
     Quit,
 }
 
-#[allow(dead_code)] // output_tokens reserved for future use in footer display
 pub struct AgentResponse {
     pub content: String,
     pub is_error: bool,
     pub thinking: Option<String>,
     pub input_tokens: Option<u32>,
-    pub output_tokens: Option<u32>,
 }
 
 /// Main application state.
@@ -114,8 +112,10 @@ pub struct App<'a> {
 
     // Context usage tracking
     pub context_tokens: Option<u32>,
-    pub model_context_limit: u32,
 }
+
+/// Context window limit for the model (Claude's 200K context).
+pub const MODEL_CONTEXT_LIMIT: u32 = 200_000;
 
 impl<'a> App<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -164,7 +164,6 @@ impl<'a> App<'a> {
             pending_switch: None,
             pending_images: Vec::new(),
             context_tokens: None,
-            model_context_limit: 200_000,
         }
     }
 
@@ -275,10 +274,11 @@ impl<'a> App<'a> {
                 } else {
                     // Show thinking block (instantly, not progressively revealed)
                     if let Some(thinking) = response.thinking {
+                        let rendered = Self::render_thinking(&thinking);
                         self.messages.push(ChatMessage {
                             role: ChatRole::Thinking,
                             content: thinking,
-                            rendered: None,
+                            rendered: Some(rendered),
                         });
                     }
 
@@ -318,9 +318,17 @@ impl<'a> App<'a> {
             let full = self.pending_response.as_ref().unwrap();
             let len = full.len();
             if self.reveal_index < len {
-                // Reveal in chunks for smooth appearance.
+                // Reveal in chunks scaled by response length for smooth appearance.
+                // Small (<1KB): 8 bytes/tick, medium (<4KB): 32, large: 64.
                 // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 chars.
-                self.reveal_index = full.floor_char_boundary(self.reveal_index + 8).min(len);
+                let increment = if len < 1024 {
+                    8
+                } else if len < 4096 {
+                    32
+                } else {
+                    64
+                };
+                self.reveal_index = full.floor_char_boundary(self.reveal_index + increment).min(len);
                 self.status = AgentStatus::Responding(self.reveal_index);
                 self.needs_redraw = true;
             } else {
@@ -400,9 +408,31 @@ impl<'a> App<'a> {
         self.textarea.lines().join("\n")
     }
 
-    pub fn attach_image(&mut self, attachment: ImageAttachment) {
+    /// Attach an image, enforcing attachment count and total size limits.
+    /// Returns an error message if limits are exceeded.
+    pub fn attach_image(&mut self, attachment: ImageAttachment) -> Option<String> {
+        use crate::tui::attachment::{MAX_ATTACHMENTS, MAX_TOTAL_IMAGE_BYTES};
+
+        if self.pending_images.len() >= MAX_ATTACHMENTS {
+            return Some(format!(
+                "Maximum {MAX_ATTACHMENTS} attachments allowed per message."
+            ));
+        }
+        let total_bytes: usize = self
+            .pending_images
+            .iter()
+            .map(|img| img.size_bytes)
+            .sum::<usize>()
+            + attachment.size_bytes;
+        if total_bytes > MAX_TOTAL_IMAGE_BYTES {
+            return Some(format!(
+                "Total attachment size would exceed {}. Remove some images first.",
+                ImageAttachment::format_size(MAX_TOTAL_IMAGE_BYTES)
+            ));
+        }
         self.pending_images.push(attachment);
         self.needs_redraw = true;
+        None
     }
 
     pub fn clear_attachments(&mut self) {
@@ -412,6 +442,33 @@ impl<'a> App<'a> {
 
     pub fn has_attachments(&self) -> bool {
         !self.pending_images.is_empty()
+    }
+
+    /// Pre-render thinking block lines for caching.
+    fn render_thinking(content: &str) -> Vec<Line<'static>> {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![Span::styled(
+            "thinking:",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+        )]));
+        for line in content.lines() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {line}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        }
+        lines.push(Line::from(vec![Span::styled(
+            "  ---",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        lines
     }
 
     fn reset_textarea(&mut self) {

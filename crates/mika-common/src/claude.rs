@@ -80,18 +80,6 @@ pub struct ImageSource {
     pub data: String,
 }
 
-impl ImageSource {
-    /// Create an ImageSource from raw PNG bytes (base64-encodes them).
-    pub fn from_png_bytes(bytes: &[u8]) -> Self {
-        use base64::Engine;
-        Self {
-            source_type: "base64".to_string(),
-            media_type: "image/png".to_string(),
-            data: base64::engine::general_purpose::STANDARD.encode(bytes),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -578,12 +566,4 @@ mod tests {
         assert_eq!(json["source"]["media_type"], "image/png");
     }
 
-    #[test]
-    fn test_image_source_from_png_bytes() {
-        let bytes = vec![0x89, 0x50, 0x4E, 0x47]; // PNG header bytes
-        let source = ImageSource::from_png_bytes(&bytes);
-        assert_eq!(source.source_type, "base64");
-        assert_eq!(source.media_type, "image/png");
-        assert!(!source.data.is_empty());
-    }
 }

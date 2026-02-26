@@ -36,9 +36,17 @@ if [ -n "$TEXT" ]; then
     sleep 0.1
 fi
 
+# Allowlisted special keys to prevent arbitrary key injection
+ALLOWED_KEYS="Enter|Escape|Tab|Space|C-c|C-d|C-z|C-l|Up|Down|Left|Right|BSpace|Home|End|PageUp|PageDown"
+
 # Send special key or Enter
 if [ -n "$SPECIAL_KEY" ]; then
-    tmux send-keys -t "$SESSION" "$SPECIAL_KEY"
+    if echo "$SPECIAL_KEY" | grep -qE "^($ALLOWED_KEYS)$"; then
+        tmux send-keys -t "$SESSION" "$SPECIAL_KEY"
+    else
+        echo "Error: special key '$SPECIAL_KEY' is not allowed. Permitted: $ALLOWED_KEYS" >&2
+        exit 1
+    fi
 elif [ "$NO_ENTER" != "true" ] && [ -n "$TEXT" ]; then
     tmux send-keys -t "$SESSION" Enter
 fi

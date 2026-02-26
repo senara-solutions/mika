@@ -1,3 +1,8 @@
+/// Maximum number of image attachments per message.
+pub const MAX_ATTACHMENTS: usize = 10;
+/// Maximum total image bytes across all attachments (20MB).
+pub const MAX_TOTAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 /// An image attachment pending send with the next message.
 #[derive(Clone)]
 pub struct ImageAttachment {
@@ -10,10 +15,15 @@ pub struct ImageAttachment {
 impl ImageAttachment {
     /// Human-readable size (e.g., "245KB").
     pub fn size_display(&self) -> String {
-        if self.size_bytes >= 1_048_576 {
-            format!("{:.1}MB", self.size_bytes as f64 / 1_048_576.0)
+        Self::format_size(self.size_bytes)
+    }
+
+    /// Format a byte count as a human-readable size string.
+    pub fn format_size(bytes: usize) -> String {
+        if bytes >= 1_048_576 {
+            format!("{:.1}MB", bytes as f64 / 1_048_576.0)
         } else {
-            format!("{}KB", self.size_bytes / 1024)
+            format!("{}KB", bytes / 1024)
         }
     }
 }

@@ -219,7 +219,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let max_tokens = if let Some(mika_common::claude::ThinkingConfig::Enabled { budget_tokens }) =
         &params.thinking
     {
-        claude.max_tokens.max(budget_tokens + 4096)
+        claude.max_tokens.max(budget_tokens.saturating_add(4096))
     } else {
         claude.max_tokens
     };

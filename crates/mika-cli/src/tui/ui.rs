@@ -115,24 +115,29 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             }
             ChatRole::Thinking => {
                 lines.push(Line::default());
-                lines.push(Line::from(vec![Span::styled(
-                    "thinking:",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC | Modifier::BOLD),
-                )]));
-                for line in msg.content.lines() {
+                // Use cached rendered lines if available
+                if let Some(ref cached) = msg.rendered {
+                    lines.extend(cached.clone());
+                } else {
                     lines.push(Line::from(vec![Span::styled(
-                        format!("  {line}"),
+                        "thinking:",
                         Style::default()
                             .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
+                            .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+                    )]));
+                    for line in msg.content.lines() {
+                        lines.push(Line::from(vec![Span::styled(
+                            format!("  {line}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )]));
+                    }
+                    lines.push(Line::from(vec![Span::styled(
+                        "  ---",
+                        Style::default().fg(Color::DarkGray),
                     )]));
                 }
-                lines.push(Line::from(vec![Span::styled(
-                    "  ---",
-                    Style::default().fg(Color::DarkGray),
-                )]));
             }
             ChatRole::Command => {
                 lines.push(Line::default());
@@ -203,10 +208,8 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let has_attachments = app.has_attachments();
-
-    if has_attachments {
-        // Split: attachment indicator on top, then prompt
+    // Determine the area for the prompt+textarea
+    let prompt_area = if app.has_attachments() {
         let chunks =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
 
@@ -224,30 +227,22 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
             ),
         ]);
         f.render_widget(Paragraph::new(indicator), chunks[0]);
-
-        let input_chunks =
-            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(chunks[1]);
-        let prompt = Paragraph::new(Span::styled(
-            "> ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(prompt, input_chunks[0]);
-        f.render_widget(&app.textarea, input_chunks[1]);
+        chunks[1]
     } else {
-        // Normal: just prompt
-        let chunks =
-            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner);
-        let prompt = Paragraph::new(Span::styled(
-            "> ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(prompt, chunks[0]);
-        f.render_widget(&app.textarea, chunks[1]);
-    }
+        inner
+    };
+
+    // Render the "> " prompt and textarea
+    let input_chunks =
+        Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(prompt_area);
+    let prompt = Paragraph::new(Span::styled(
+        "> ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(prompt, input_chunks[0]);
+    f.render_widget(&app.textarea, input_chunks[1]);
 }
 
 fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
@@ -276,7 +271,7 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
 
     // Context usage indicator
     if let Some(tokens) = app.context_tokens {
-        let limit = app.model_context_limit;
+        let limit = crate::tui::app::MODEL_CONTEXT_LIMIT;
         let pct = (tokens as f64 / limit as f64 * 100.0) as u32;
         let tokens_k = tokens / 1000;
         let limit_k = limit / 1000;

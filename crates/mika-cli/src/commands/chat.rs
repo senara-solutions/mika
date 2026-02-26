@@ -120,14 +120,12 @@ async fn spawn_agent_worker(
                             is_error: false,
                             thinking: output.thinking,
                             input_tokens: output.usage.as_ref().map(|u| u.input_tokens),
-                            output_tokens: output.usage.as_ref().map(|u| u.output_tokens),
                         },
                         Err(e) => AgentResponse {
                             content: format!("{e}"),
                             is_error: true,
                             thinking: None,
                             input_tokens: None,
-                            output_tokens: None,
                         },
                     };
                     if agent_tx.send(response).is_err() {

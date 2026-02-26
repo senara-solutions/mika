@@ -117,7 +117,7 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "think",
         aliases: &["t"],
         description: "Ask with extended thinking",
-        args_hint: Some("<prompt>"),
+        args_hint: Some("[budget] <prompt>"),
     },
     SlashCommand {
         name: "attach",

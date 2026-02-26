@@ -23,19 +23,24 @@ if [ -z "$NAME" ]; then
     NAME="mika-$(date +%s)"
 fi
 
+# Validate session name: only allow alphanumeric, dash, underscore, dot
+if ! echo "$NAME" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+    echo "Error: invalid session name '$NAME' (only alphanumeric, dash, underscore, dot allowed)" >&2
+    exit 1
+fi
+
 # Check if session already exists
 if tmux has-session -t "$NAME" 2>/dev/null; then
     echo "Session '$NAME' already exists"
     exit 0
 fi
 
-# Build create command
-ARGS="-d -s $NAME"
+# Create session with properly quoted arguments
 if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
-    ARGS="$ARGS -c $WORKDIR"
+    tmux new-session -d -s "$NAME" -c "$WORKDIR" 2>&1 || { echo "Error: failed to create session '$NAME'" >&2; exit 1; }
+else
+    tmux new-session -d -s "$NAME" 2>&1 || { echo "Error: failed to create session '$NAME'" >&2; exit 1; }
 fi
-
-tmux new-session $ARGS 2>&1 || { echo "Error: failed to create session '$NAME'" >&2; exit 1; }
 
 # Run command if provided
 if [ -n "$COMMAND" ]; then

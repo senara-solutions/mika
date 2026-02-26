@@ -502,11 +502,12 @@ fn handle_team(args: &str) -> String {
 }
 
 fn handle_think(app: &mut App<'_>, args: &str) {
-    let prompt = args.trim();
-    if prompt.is_empty() {
+    let args = args.trim();
+    if args.is_empty() {
         app.messages.push(ChatMessage {
             role: ChatRole::Command,
-            content: "Usage: /think <prompt>".to_string(),
+            content: "Usage: /think [budget] <prompt>  (budget: 1024-100000, default 10000)"
+                .to_string(),
             rendered: None,
         });
         return;
@@ -520,10 +521,28 @@ fn handle_think(app: &mut App<'_>, args: &str) {
         return;
     }
 
+    // Parse optional budget: if first word is a number, use it as budget
+    let (budget, prompt) = match args.split_once(char::is_whitespace) {
+        Some((first, rest)) if first.parse::<u32>().is_ok() => {
+            let b = first.parse::<u32>().unwrap().clamp(1024, 100_000);
+            (b, rest.trim())
+        }
+        _ => (10_000, args),
+    };
+
+    if prompt.is_empty() {
+        app.messages.push(ChatMessage {
+            role: ChatRole::Command,
+            content: "Usage: /think [budget] <prompt>".to_string(),
+            rendered: None,
+        });
+        return;
+    }
+
     // Display user message with [think] prefix
     app.messages.push(ChatMessage {
         role: ChatRole::User,
-        content: format!("[think] {prompt}"),
+        content: format!("[think:{budget}] {prompt}"),
         rendered: None,
     });
 
@@ -533,7 +552,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
     let _ = app.agent_tx.send(AgentRequest::Message {
         text: prompt.to_string(),
         images,
-        thinking_budget: Some(10_000),
+        thinking_budget: Some(budget),
     });
     app.status = AgentStatus::Thinking;
     app.scroll_offset = 0;
@@ -549,7 +568,9 @@ fn handle_attach(app: &mut App<'_>, args: &str) -> String {
         Some(attachment) => {
             let label = attachment.label.clone();
             let size = attachment.size_display();
-            app.attach_image(attachment);
+            if let Some(err) = app.attach_image(attachment) {
+                return err;
+            }
             format!("Attached: {label} ({size})")
         }
         None => {

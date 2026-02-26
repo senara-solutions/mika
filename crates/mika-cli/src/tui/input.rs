@@ -68,7 +68,13 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
         && key.code == KeyCode::Char('v')
         && let Some(attachment) = try_clipboard_image()
     {
-        app.attach_image(attachment);
+        if let Some(err) = app.attach_image(attachment) {
+            app.messages.push(crate::tui::app::ChatMessage {
+                role: crate::tui::app::ChatRole::System,
+                content: err,
+                rendered: None,
+            });
+        }
         return;
     }
 
@@ -161,16 +167,38 @@ pub fn handle_paste(app: &mut App<'_>, text: &str) {
     app.needs_redraw = true;
 }
 
+/// Maximum pixels allowed for clipboard images (20 megapixels).
+const MAX_IMAGE_PIXELS: usize = 20_000_000;
+/// Maximum image dimension in either axis.
+const MAX_IMAGE_DIMENSION: u32 = 8192;
+/// Maximum file size for image loading (10MB).
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Try to read an image from the system clipboard.
 /// Returns None if no image is available or clipboard is not accessible (e.g., SSH).
 pub fn try_clipboard_image() -> Option<ImageAttachment> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
 
-    // Encode as PNG
-    let mut png_data = Vec::new();
+    // Validate dimensions with safe u32 conversion
+    let width = u32::try_from(img.width).ok()?;
+    let height = u32::try_from(img.height).ok()?;
+
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return None;
+    }
+
+    // Reject images exceeding pixel count limit
+    let pixel_count = img.width.checked_mul(img.height)?;
+    if pixel_count > MAX_IMAGE_PIXELS {
+        return None;
+    }
+
+    // Estimate PNG size and pre-allocate (RGBA data compresses roughly 2:1)
+    let estimated_size = img.bytes.len() / 2;
+    let mut png_data = Vec::with_capacity(estimated_size);
     {
-        let mut encoder = png::Encoder::new(&mut png_data, img.width as u32, img.height as u32);
+        let mut encoder = png::Encoder::new(&mut png_data, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().ok()?;
@@ -178,10 +206,12 @@ pub fn try_clipboard_image() -> Option<ImageAttachment> {
     }
 
     let size_bytes = png_data.len();
-    // 10MB limit
-    if size_bytes > 10 * 1024 * 1024 {
+    if size_bytes > MAX_IMAGE_BYTES {
         return None;
     }
+
+    // Drop the raw image data before base64 encoding to reduce peak memory
+    drop(img);
 
     use base64::Engine;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -190,7 +220,7 @@ pub fn try_clipboard_image() -> Option<ImageAttachment> {
         base64_data,
         media_type: "image/png".to_string(),
         size_bytes,
-        label: format!("clipboard image {}", format_size(size_bytes)),
+        label: format!("clipboard image ({})", ImageAttachment::format_size(size_bytes)),
     })
 }
 
@@ -198,6 +228,9 @@ pub fn try_clipboard_image() -> Option<ImageAttachment> {
 /// Supports png, jpg, gif, webp. Max 10MB.
 pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
     let path = Path::new(path);
+
+    // Canonicalize to resolve symlinks and prevent path traversal
+    let path = path.canonicalize().ok()?;
     if !path.is_file() {
         return None;
     }
@@ -206,16 +239,24 @@ pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())?;
-    let media_type = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
+    let (media_type, magic_bytes): (&str, &[u8]) = match ext.as_str() {
+        "png" => ("image/png", b"\x89PNG"),
+        "jpg" | "jpeg" => ("image/jpeg", b"\xFF\xD8\xFF"),
+        "gif" => ("image/gif", b"GIF"),
+        "webp" => ("image/webp", b"RIFF"),
         _ => return None,
     };
 
-    let data = std::fs::read(path).ok()?;
-    if data.len() > 10 * 1024 * 1024 {
+    // Check file size via metadata BEFORE reading contents
+    let metadata = std::fs::metadata(&path).ok()?;
+    if metadata.len() > MAX_IMAGE_BYTES as u64 {
+        return None;
+    }
+
+    let data = std::fs::read(&path).ok()?;
+
+    // Validate magic bytes match claimed extension
+    if data.len() < magic_bytes.len() || &data[..magic_bytes.len()] != magic_bytes {
         return None;
     }
 
@@ -236,13 +277,6 @@ pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
     })
 }
 
-fn format_size(bytes: usize) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1}MB", bytes as f64 / 1_048_576.0)
-    } else {
-        format!("{}KB", bytes / 1024)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -264,8 +298,7 @@ mod tests {
 
     #[test]
     fn test_try_load_image_file_valid_png() {
-        // Create a minimal valid-looking PNG file (just bytes, not valid PNG structure,
-        // but try_load_image_file doesn't validate content — it just base64-encodes)
+        // File must start with PNG magic bytes to pass validation
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.png");
         std::fs::write(&path, b"\x89PNG\r\n\x1a\n test data").unwrap();
@@ -288,14 +321,23 @@ mod tests {
     }
 
     #[test]
+    fn test_try_load_image_file_wrong_magic_bytes() {
+        // PNG extension but JPEG magic bytes — should be rejected
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.png");
+        std::fs::write(&path, b"\xFF\xD8\xFF not a png").unwrap();
+        assert!(try_load_image_file(path.to_str().unwrap()).is_none());
+    }
+
+    #[test]
     fn test_format_size_kilobytes() {
-        assert_eq!(format_size(1024), "1KB");
-        assert_eq!(format_size(245 * 1024), "245KB");
+        assert_eq!(ImageAttachment::format_size(1024), "1KB");
+        assert_eq!(ImageAttachment::format_size(245 * 1024), "245KB");
     }
 
     #[test]
     fn test_format_size_megabytes() {
-        assert_eq!(format_size(1_048_576), "1.0MB");
-        assert_eq!(format_size(5 * 1_048_576), "5.0MB");
+        assert_eq!(ImageAttachment::format_size(1_048_576), "1.0MB");
+        assert_eq!(ImageAttachment::format_size(5 * 1_048_576), "5.0MB");
     }
 }
