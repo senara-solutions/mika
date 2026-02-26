@@ -123,8 +123,10 @@ pub struct App<'a> {
 /// Context window limit for the model (Claude's 200K context).
 pub const MODEL_CONTEXT_LIMIT: u32 = 200_000;
 
-/// Non-CLI channels to poll for cross-channel messages.
-pub const POLLED_CHANNELS: &[&str] = &["telegram"];
+/// Channels to poll for cross-channel messages (includes "cli" for messages
+/// from other CLI processes like `mika ask`; the TUI's own messages are
+/// excluded via the watermark which is bumped after each send).
+pub const POLLED_CHANNELS: &[&str] = &["telegram", "cli"];
 
 /// Poll interval for cross-channel messages in ticks (~5 seconds at 30ms tick rate).
 const POLL_INTERVAL_TICKS: u64 = 167;
@@ -503,7 +505,7 @@ impl<'a> App<'a> {
         lines
     }
 
-    /// Poll for new messages from non-CLI channels (e.g. Telegram).
+    /// Poll for new messages from other channels/processes (e.g. Telegram, `mika ask`).
     async fn poll_cross_channel_messages(&mut self) {
         let channels: Vec<String> = POLLED_CHANNELS.iter().map(|s| s.to_string()).collect();
         let new_msgs = match self
@@ -528,11 +530,18 @@ impl<'a> App<'a> {
                 "assistant" => ChatRole::Assistant,
                 _ => continue,
             };
+            // CLI messages from other processes don't need a channel badge
+            // (same channel as the TUI), matching the history loader behavior.
+            let channel = if msg.channel_type == "cli" {
+                None
+            } else {
+                Some(msg.channel_type.clone())
+            };
             self.messages.push(ChatMessage {
                 role,
                 content: msg.content.clone(),
                 rendered: None,
-                channel: Some(msg.channel_type.clone()),
+                channel,
             });
         }
 

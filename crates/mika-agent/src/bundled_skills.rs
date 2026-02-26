@@ -1,11 +1,11 @@
 //! Compile-time embedded skill templates, seeded into agent skill directories on startup.
 //!
 //! Each skill is a set of files (skill.toml, tools.json, optional system_prompt.md,
-//! optional handler scripts) embedded via `include_str!`. On first run, these are
-//! written to `{agent_home}/skills/{skill_name}/` if the directory doesn't already exist.
+//! optional handler scripts) embedded via `include_str!`. On startup, these are
+//! written (or updated) to `{agent_home}/skills/{skill_name}/`.
 
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// A single file within a bundled skill.
 struct SkillFile {
@@ -112,19 +112,25 @@ pub fn is_bundled_skill(name: &str) -> bool {
 
 /// Seed bundled skills into the given skills directory.
 ///
-/// For each bundled skill, if its directory already exists, it is skipped (never overwritten).
-/// On partial failure, the partially created directory is removed and the next skill is attempted.
+/// Always writes bundled skill files, updating existing installs to match the
+/// current templates. This ensures template changes (e.g. removing a tool)
+/// propagate to existing installs. User-created skills (non-bundled) are never
+/// touched. Extra files in bundled skill directories that aren't part of the
+/// bundle are left in place.
+///
+/// On first-time creation failure, the partially created directory is removed.
 pub fn seed_bundled_skills(skills_dir: &Path) {
     for skill in BUNDLED_SKILLS {
         let skill_dir = skills_dir.join(skill.name);
-
-        if skill_dir.exists() {
-            continue;
-        }
+        let is_update = skill_dir.exists();
 
         if let Err(e) = write_skill(&skill_dir, skill) {
-            warn!(skill = skill.name, error = %e, "failed to seed bundled skill, removing partial dir");
-            let _ = std::fs::remove_dir_all(&skill_dir);
+            warn!(skill = skill.name, error = %e, "failed to seed bundled skill");
+            if !is_update {
+                let _ = std::fs::remove_dir_all(&skill_dir);
+            }
+        } else if is_update {
+            debug!(skill = skill.name, "updated bundled skill");
         } else {
             info!(skill = skill.name, "seeded bundled skill");
         }
@@ -133,11 +139,33 @@ pub fn seed_bundled_skills(skills_dir: &Path) {
 
 /// Write all files for a single skill into the given directory.
 fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
+    // Refuse to write into symlinked skill directories (defense-in-depth).
+    // An attacker could replace a bundled skill directory with a symlink to
+    // redirect writes (including executable handler scripts) to an arbitrary
+    // location.
+    if skill_dir.exists() && skill_dir.symlink_metadata()?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "skill directory is a symlink, refusing to write",
+        ));
+    }
+
     for file in skill.files {
         let file_path = skill_dir.join(file.path);
 
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+
+        // Refuse to overwrite a file that is a symlink (same defense-in-depth).
+        if file_path.exists() && file_path.symlink_metadata()?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "file '{}' is a symlink, refusing to write",
+                    file.path
+                ),
+            ));
         }
 
         std::fs::write(&file_path, file.content)?;
@@ -185,22 +213,42 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_does_not_overwrite_existing() {
+    fn test_seed_updates_existing_bundled_skills() {
         let tmp = tempfile::tempdir().unwrap();
         let skills_dir = tmp.path();
 
         // Seed once
         seed_bundled_skills(skills_dir);
 
-        // Modify a file in the tmux skill
+        // Modify a bundled file
         let marker = skills_dir.join("tmux").join("skill.toml");
         std::fs::write(&marker, "custom content").unwrap();
 
-        // Seed again — should not overwrite
+        // Seed again — should overwrite with bundled content
         seed_bundled_skills(skills_dir);
 
         let content = std::fs::read_to_string(&marker).unwrap();
-        assert_eq!(content, "custom content");
+        assert_ne!(content, "custom content", "bundled file should be updated");
+        assert!(!content.is_empty(), "bundled file should have content");
+    }
+
+    #[test]
+    fn test_seed_preserves_extra_files_in_bundled_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        // Seed once
+        seed_bundled_skills(skills_dir);
+
+        // Add an extra file not in the bundle
+        let extra = skills_dir.join("tmux").join("my_notes.txt");
+        std::fs::write(&extra, "user notes").unwrap();
+
+        // Seed again — extra file should survive
+        seed_bundled_skills(skills_dir);
+
+        let content = std::fs::read_to_string(&extra).unwrap();
+        assert_eq!(content, "user notes");
     }
 
     #[test]
@@ -216,6 +264,64 @@ mod tests {
         for skill in BUNDLED_SKILLS {
             assert!(skills_dir.join(skill.name).is_dir());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_skill_dir_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        // Seed once so all normal skills exist
+        seed_bundled_skills(skills_dir);
+
+        // Replace a bundled skill directory with a symlink to an external target
+        let target_dir = tempfile::tempdir().unwrap();
+        let tmux_dir = skills_dir.join("tmux");
+        std::fs::remove_dir_all(&tmux_dir).unwrap();
+        std::os::unix::fs::symlink(target_dir.path(), &tmux_dir).unwrap();
+
+        // Seed again — the symlinked "tmux" dir should be skipped without crashing
+        seed_bundled_skills(skills_dir);
+
+        // The target directory should NOT contain any bundled files
+        assert!(
+            std::fs::read_dir(target_dir.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "symlink target should remain empty — write_skill must refuse to follow it",
+        );
+
+        // Other bundled skills should still be updated normally
+        assert!(skills_dir.join("shell-exec").join("skill.toml").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_file_inside_skill_dir_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        // Seed once so all normal skills exist
+        seed_bundled_skills(skills_dir);
+
+        // Replace a single file inside a bundled skill directory with a symlink
+        let target_file = tmp.path().join("evil_target.txt");
+        std::fs::write(&target_file, "original").unwrap();
+        let skill_toml = skills_dir.join("tmux").join("skill.toml");
+        std::fs::remove_file(&skill_toml).unwrap();
+        std::os::unix::fs::symlink(&target_file, &skill_toml).unwrap();
+
+        // Seed again — tmux should fail because skill.toml is a symlink
+        seed_bundled_skills(skills_dir);
+
+        // The symlink target file should not have been overwritten
+        let content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            content, "original",
+            "symlinked file target must not be overwritten",
+        );
     }
 
     #[cfg(unix)]

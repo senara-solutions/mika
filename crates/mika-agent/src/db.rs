@@ -1634,7 +1634,8 @@ impl Database {
                     "SELECT id, role, content, channel_type, created_at
                      FROM conversations
                      WHERE id > ?1 AND role != 'summary' AND channel_type IN ({})
-                     ORDER BY id ASC",
+                     ORDER BY id ASC
+                     LIMIT 100",
                     placeholders.join(", ")
                 );
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
@@ -1647,7 +1648,8 @@ impl Database {
                 let sql = "SELECT id, role, content, channel_type, created_at
                      FROM conversations
                      WHERE id > ?1 AND role != 'summary'
-                     ORDER BY id ASC"
+                     ORDER BY id ASC
+                     LIMIT 100"
                     .to_string();
                 let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
                 (sql, params)

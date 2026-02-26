@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use mika_agent::config_keys::{is_settable_key, settable_keys_display, validate_config_value};
 use mika_common::agent;
 use mika_common::home;
 use mika_common::team;
@@ -253,9 +254,6 @@ async fn handle_soul(app: &mut App<'_>) -> String {
     }
 }
 
-/// Config keys that users may set via `/config set`.
-const SETTABLE_CONFIG_KEYS: &[&str] = &["chat_id", "timezone"];
-
 async fn handle_config(app: &mut App<'_>, args: &str) -> String {
     if let Some(rest) = args.strip_prefix("set") {
         return handle_config_set(app, rest.trim()).await;
@@ -298,33 +296,21 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
     if parts.len() < 2 || parts[0].is_empty() || parts[1].trim().is_empty() {
         return format!(
             "Usage: /config set <key> <value>\nSettable keys: {}",
-            SETTABLE_CONFIG_KEYS.join(", ")
+            settable_keys_display()
         );
     }
     let key = parts[0];
     let value = parts[1].trim();
 
-    if !SETTABLE_CONFIG_KEYS.contains(&key) {
+    if !is_settable_key(key) {
         return format!(
             "Unknown config key: {key}\nSettable keys: {}",
-            SETTABLE_CONFIG_KEYS.join(", ")
+            settable_keys_display()
         );
     }
 
-    if value.len() > 1000 {
-        return "Config value too long (max 1000 characters)".to_string();
-    }
-
-    // Validate chat_id as integer (Telegram chat IDs are i64)
-    if key == "chat_id" && value.parse::<i64>().is_err() {
-        return format!("Invalid chat_id: {value}\nchat_id must be a numeric Telegram chat ID");
-    }
-
-    // Validate timezone values
-    if key == "timezone" && value.parse::<chrono_tz::Tz>().is_err() {
-        return format!(
-            "Invalid timezone: {value}\nExample: Asia/Singapore, America/New_York, Europe/London"
-        );
+    if let Err(msg) = validate_config_value(key, value) {
+        return msg;
     }
 
     match app.db.set_customer_config(key, value).await {
@@ -705,9 +691,11 @@ mod tests {
 
     #[test]
     fn test_settable_config_keys_allowlist() {
-        assert!(SETTABLE_CONFIG_KEYS.contains(&"chat_id"));
-        assert!(SETTABLE_CONFIG_KEYS.contains(&"timezone"));
-        assert!(!SETTABLE_CONFIG_KEYS.contains(&"api_key"));
-        assert!(!SETTABLE_CONFIG_KEYS.contains(&"db_path"));
+        // Validation now lives in mika_agent::config_keys (shared module).
+        // Verify we can still call the shared helpers from the CLI.
+        assert!(is_settable_key("chat_id"));
+        assert!(is_settable_key("timezone"));
+        assert!(!is_settable_key("api_key"));
+        assert!(!is_settable_key("db_path"));
     }
 }

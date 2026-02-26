@@ -2,6 +2,7 @@ pub mod agent;
 pub mod async_db;
 pub mod bundled_skills;
 pub mod compaction;
+pub mod config_keys;
 pub mod db;
 pub mod messaging;
 pub mod prompt;

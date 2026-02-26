@@ -186,8 +186,8 @@ pub async fn run(agent_name: &str) -> Result<()> {
         .load_recent_messages(
             20,
             Some(
-                std::iter::once("cli")
-                    .chain(crate::tui::app::POLLED_CHANNELS.iter().copied())
+                crate::tui::app::POLLED_CHANNELS
+                    .iter()
                     .map(|s| s.to_string())
                     .collect(),
             ),
