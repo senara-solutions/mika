@@ -188,4 +188,36 @@ mod tests {
             "trace" | "debug" | "info" | "warn" | "error" | "off"
         ));
     }
+
+    /// Drift-detection test: ensures the CLI Reference section in the system prompt
+    /// mentions all top-level CLI command names. If you add a new top-level command
+    /// to the `Commands` enum in cli.rs, update `write_cli_section` in
+    /// crates/mika-agent/src/prompt.rs and add the command name here.
+    #[test]
+    fn test_cli_prompt_mentions_top_level_commands() {
+        use chrono::Utc;
+        use mika_agent::prompt::{build_system_prompt, Identity, PromptContext};
+
+        let identity = Identity::default();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("cli"),
+            telegram_configured: false,
+        };
+        let prompt = build_system_prompt(&ctx);
+        for cmd in [
+            "ask", "status", "memory", "reminders", "skills", "config", "agents", "teams",
+        ] {
+            assert!(
+                prompt.contains(cmd),
+                "CLI Reference missing command: {cmd}"
+            );
+        }
+    }
 }

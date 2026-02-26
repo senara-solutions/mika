@@ -134,6 +134,31 @@ fn write_channel_section(
     prompt.push('\n');
 }
 
+/// Write the CLI Reference section (only for CLI channel).
+/// Tells the agent exactly which commands exist so it never invents fake ones.
+// Keep command list in sync with crates/mika-cli/src/cli.rs Commands enum.
+fn write_cli_section(prompt: &mut String, channel_type: Option<&str>) {
+    if channel_type != Some("cli") {
+        return;
+    }
+    prompt.push_str(
+        "## CLI Reference\n\
+         The user interacts with you through the `mika` CLI. Common commands:\n\
+         - `mika` — interactive chat (default)\n\
+         - `mika ask \"message\"` — send a single message, print response (use `-` for stdin)\n\
+         - `mika status` — health info\n\
+         - `mika memory search \"query\"` — search stored facts\n\
+         - `mika reminders` — list reminders\n\
+         - `mika skills list` — list installed skills\n\
+         - `mika config edit` — edit identity config\n\
+         - `mika config soul` — print personality file\n\
+         - `mika agents list/switch/create` — manage agents\n\
+         - `mika teams list/run` — team workflows\n\
+         In interactive chat: Shift+Enter for newlines, PageUp/PageDown to scroll, Tab after / for slash commands.\n\
+         Never invent CLI commands. These are the most common; other subcommands may exist.\n\n",
+    );
+}
+
 /// Write the core memory section with `<core-memory>` XML delimiters.
 /// An optional `description` is inserted between the heading and the data block.
 fn write_core_memory_section(
@@ -161,6 +186,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     write_identity_section(&mut prompt, ctx.identity);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, ctx.channel_type, ctx.telegram_configured);
+    write_cli_section(&mut prompt, ctx.channel_type);
     write_core_memory_section(
         &mut prompt,
         ctx.core_memory,
@@ -830,6 +856,67 @@ max_iterations = 3
 
         let prompt = build_silent_prompt(&ctx);
         assert!(prompt.contains("Telegram integration is active"));
+    }
+
+    #[test]
+    fn test_prompt_includes_cli_section_for_cli_channel() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("cli"),
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## CLI Reference"));
+        assert!(prompt.contains("mika ask"));
+        assert!(prompt.contains("Shift+Enter"));
+        assert!(prompt.contains("Never invent CLI commands"));
+        assert!(prompt.contains("Common commands:"));
+    }
+
+    #[test]
+    fn test_prompt_omits_cli_section_for_telegram() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: Some("telegram"),
+            telegram_configured: true,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## CLI Reference"));
+    }
+
+    #[test]
+    fn test_prompt_omits_cli_section_when_no_channel() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## CLI Reference"));
     }
 
     #[test]

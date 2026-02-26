@@ -78,6 +78,7 @@ static WEB_SEARCH_SKILL: BundledSkill = skill!("web-search", [
 
 static FILE_READER_SKILL: BundledSkill = skill!("file-reader", [
     ("skill.toml" => "../../../templates/skills/file-reader/skill.toml"),
+    ("system_prompt.md" => "../../../templates/skills/file-reader/system_prompt.md"),
     ("tools.json" => "../../../templates/skills/file-reader/tools.json"),
     ("handlers/read.sh" => "../../../templates/skills/file-reader/handlers/read.sh", +x),
 ]);

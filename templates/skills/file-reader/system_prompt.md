@@ -1,0 +1,3 @@
+- Use `read_file` when the user asks to see, read, or examine the contents of a file.
+- The `path` parameter accepts absolute or relative paths. Expand `~` to the user's home directory.
+- For binary files or very large files, warn the user that output may be truncated or unreadable.
