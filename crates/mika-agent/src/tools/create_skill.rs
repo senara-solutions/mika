@@ -2,14 +2,20 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::{Value, json};
-use std::fmt::Write;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
 
 pub struct CreateSkillTool;
 
 /// Maximum allowed length for skill name.
 const MAX_SKILL_NAME_LEN: usize = 50;
+
+/// Maximum number of keywords per skill.
+const MAX_KEYWORDS: usize = 50;
+
+/// Maximum length of a single keyword.
+const MAX_KEYWORD_LEN: usize = 100;
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
 fn validate_skill_name(name: &str) -> Result<(), String> {
@@ -83,28 +89,12 @@ impl Tool for CreateSkillTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        let name = input
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let description = input
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let system_prompt = input
-            .get("system_prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let always_on = input
-            .get("always_on")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let keywords: Vec<String> = input
-            .get("keywords")
-            .and_then(|v| v.as_array())
+        let name = input["name"].as_str().unwrap_or("").trim();
+        let description = input["description"].as_str().unwrap_or("").trim();
+        let system_prompt = input["system_prompt"].as_str().unwrap_or("").trim();
+        let always_on = input["always_on"].as_bool().unwrap_or(false);
+        let keywords: Vec<String> = input["keywords"]
+            .as_array()
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -145,6 +135,20 @@ impl Tool for CreateSkillTool {
             )));
         }
 
+        // Validate keyword count and individual lengths
+        if keywords.len() > MAX_KEYWORDS {
+            return Ok(ToolOutput::error(format!(
+                "Too many keywords ({}, max {MAX_KEYWORDS}).",
+                keywords.len()
+            )));
+        }
+        if let Some(long) = keywords.iter().find(|k| k.len() > MAX_KEYWORD_LEN) {
+            return Ok(ToolOutput::error(format!(
+                "Keyword too long ({} chars, max {MAX_KEYWORD_LEN}).",
+                long.len()
+            )));
+        }
+
         let skills_dir = ctx.home_dir.join("skills");
         let skill_dir = skills_dir.join(name);
 
@@ -156,30 +160,34 @@ impl Tool for CreateSkillTool {
             )));
         }
 
-        // Create skill directory
-        if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        // Create skill directory (only the leaf; skills_dir should already exist)
+        if let Err(e) = std::fs::create_dir(&skill_dir) {
             return Ok(ToolOutput::error(format!(
                 "Failed to create skill directory: {e}"
             )));
         }
 
-        // Build keywords TOML array
-        let keywords_toml: Vec<String> = keywords.iter().map(|k| format!("\"{k}\"")).collect();
+        // Build manifest struct and serialize to TOML (avoids string interpolation injection)
+        let manifest = SkillManifest {
+            skill: SkillInfo {
+                name: name.to_string(),
+                description: description.to_string(),
+                version: "0.1.0".to_string(),
+                always_on,
+                timeout_secs: 30,
+            },
+            triggers: Triggers { keywords },
+        };
 
-        // Write skill.toml
-        let skill_toml = format!(
-            r#"[skill]
-name = "{name}"
-description = "{description}"
-version = "0.1.0"
-always_on = {always_on}
-timeout_secs = 30
-
-[triggers]
-keywords = [{keywords}]
-"#,
-            keywords = keywords_toml.join(", ")
-        );
+        let skill_toml = match toml::to_string_pretty(&manifest) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&skill_dir);
+                return Ok(ToolOutput::error(format!(
+                    "Failed to serialize skill manifest: {e}"
+                )));
+            }
+        };
 
         if let Err(e) = std::fs::write(skill_dir.join("skill.toml"), &skill_toml) {
             // Clean up on failure
@@ -197,56 +205,40 @@ keywords = [{keywords}]
             )));
         }
 
-        let mut result = String::new();
-        let _ = writeln!(result, "Created skill '{name}' at {}", skill_dir.display());
-        let _ = writeln!(result, "Files: skill.toml, system_prompt.md");
-        let _ = writeln!(
-            result,
-            "The skill will be available after restarting the conversation."
-        );
-        let _ = writeln!(
-            result,
-            "To add custom tools, create a tools.json file in the skill directory."
-        );
-
-        Ok(ToolOutput::success(result))
+        Ok(ToolOutput::success(format!(
+            "Created skill '{name}' at {}\n\
+             Files: skill.toml, system_prompt.md\n\
+             The skill will be available after restarting the conversation.\n\
+             To add custom tools, create a tools.json file in the skill directory.",
+            skill_dir.display()
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_db::AsyncDatabase;
-    use crate::db::Database;
-    use std::sync::atomic::AtomicU32;
+    use crate::test_utils::test_helpers::TestHarness;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, ToolContext<'static>) {
+    fn setup() -> (TempDir, TestHarness) {
         let tmp = TempDir::new().unwrap();
-        // Create skills directory
+        // Create skills directory (parent must exist for create_dir in the tool)
         std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+        let harness = TestHarness::new();
+        (tmp, harness)
+    }
 
-        // We need a DB for ToolContext but create_skill doesn't use it.
-        // Use a leaked reference to avoid lifetime issues in tests.
-        let db_path = tmp.path().join("data");
-        std::fs::create_dir_all(&db_path).unwrap();
-        let db = Database::open(&db_path.join("test.db")).unwrap();
-        let async_db = AsyncDatabase::new(db);
-        let async_db: &'static AsyncDatabase = Box::leak(Box::new(async_db));
-        let edit_count: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let path: &'static std::path::Path = Box::leak(tmp.path().to_path_buf().into_boxed_path());
-
-        let ctx = ToolContext {
-            db: async_db,
+    fn ctx_with_home<'a>(harness: &'a TestHarness, home: &'a std::path::Path) -> ToolContext<'a> {
+        ToolContext {
+            db: &harness.db,
             session_id: "test-session",
-            home_dir: path,
-            core_memory_edit_count: edit_count,
+            home_dir: home,
+            core_memory_edit_count: &harness.counter,
             is_onboarding: false,
             message_sender: None,
             embedding_client: None,
-        };
-
-        (tmp, ctx)
+        }
     }
 
     fn valid_input() -> Value {
@@ -260,7 +252,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_skill_success() {
-        let (tmp, ctx) = setup();
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
         let tool = CreateSkillTool;
         let output = tool.execute(valid_input(), &ctx).await.unwrap();
 
@@ -276,14 +269,11 @@ mod tests {
         assert!(skill_dir.join("skill.toml").exists());
         assert!(skill_dir.join("system_prompt.md").exists());
 
-        // Verify skill.toml is valid
+        // Verify skill.toml is valid TOML and roundtrips correctly
         let toml_content = std::fs::read_to_string(skill_dir.join("skill.toml")).unwrap();
-        let manifest: toml::Value = toml::from_str(&toml_content).unwrap();
-        assert_eq!(manifest["skill"]["name"].as_str().unwrap(), "test-skill");
-        assert_eq!(
-            manifest["skill"]["description"].as_str().unwrap(),
-            "A test skill"
-        );
+        let manifest: SkillManifest = toml::from_str(&toml_content).unwrap();
+        assert_eq!(manifest.skill.name, "test-skill");
+        assert_eq!(manifest.skill.description, "A test skill");
 
         // Verify system_prompt.md content
         let prompt = std::fs::read_to_string(skill_dir.join("system_prompt.md")).unwrap();
@@ -292,7 +282,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_skill_loadable_by_scanner() {
-        let (tmp, ctx) = setup();
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
         let tool = CreateSkillTool;
         tool.execute(valid_input(), &ctx).await.unwrap();
 
@@ -309,7 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_skill_duplicate_name() {
-        let (_tmp, ctx) = setup();
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
         let tool = CreateSkillTool;
 
         // Create once
@@ -324,7 +316,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_skill_invalid_names() {
-        let (_tmp, ctx) = setup();
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
         let tool = CreateSkillTool;
 
         // Empty name
@@ -359,7 +352,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_skill_empty_inputs() {
-        let (_tmp, ctx) = setup();
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
         let tool = CreateSkillTool;
 
         // Empty description
@@ -385,7 +379,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_skill_always_on_no_keywords() {
-        let (_tmp, ctx) = setup();
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
         let tool = CreateSkillTool;
 
         // always_on=true should work with empty keywords
@@ -401,6 +396,36 @@ mod tests {
             !output.is_error,
             "Expected success, got: {}",
             output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_description_with_quotes() {
+        let (tmp, harness) = setup();
+        let ctx = ctx_with_home(&harness, tmp.path());
+        let tool = CreateSkillTool;
+
+        // Description with TOML-special characters should not break serialization
+        let input = json!({
+            "name": "quote-skill",
+            "description": "She said \"hello\" and it's fine",
+            "keywords": ["test"],
+            "system_prompt": "Handle quotes."
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(
+            !output.is_error,
+            "Expected success, got: {}",
+            output.content
+        );
+
+        // Verify roundtrip: the TOML should parse back correctly
+        let skill_dir = tmp.path().join("skills/quote-skill");
+        let toml_content = std::fs::read_to_string(skill_dir.join("skill.toml")).unwrap();
+        let manifest: SkillManifest = toml::from_str(&toml_content).unwrap();
+        assert_eq!(
+            manifest.skill.description,
+            "She said \"hello\" and it's fine"
         );
     }
 

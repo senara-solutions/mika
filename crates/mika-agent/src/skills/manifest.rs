@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// [triggers]
 /// keywords = ["search", "look up"]
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillManifest {
     pub skill: SkillInfo,
     #[serde(default)]
@@ -21,7 +21,7 @@ pub struct SkillManifest {
 }
 
 /// Core skill metadata from the `[skill]` section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
@@ -34,7 +34,7 @@ pub struct SkillInfo {
 }
 
 /// Keyword triggers that control when a skill is injected into a turn.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Triggers {
     #[serde(default)]
     pub keywords: Vec<String>,

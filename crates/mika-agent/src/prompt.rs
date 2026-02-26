@@ -108,16 +108,22 @@ fn write_time_section(prompt: &mut String, current_utc: DateTime<Utc>, timezone:
 
 /// Write the communication channel section.
 /// Informs the agent which channel the conversation is on and which integrations are active.
+/// Known valid channel types. Unknown channels are silently skipped to prevent
+/// prompt injection via a compromised gateway sending arbitrary channel strings.
+const VALID_CHANNELS: &[&str] = &["cli", "telegram", "whatsapp", "api"];
+
 fn write_channel_section(
     prompt: &mut String,
     channel_type: Option<&str>,
     telegram_configured: bool,
 ) {
-    if channel_type.is_none() && !telegram_configured {
+    // Only include recognized channels
+    let valid_channel = channel_type.filter(|ch| VALID_CHANNELS.contains(ch));
+    if valid_channel.is_none() && !telegram_configured {
         return;
     }
     prompt.push_str("## Communication Channel\n");
-    if let Some(ch) = channel_type {
+    if let Some(ch) = valid_channel {
         writeln!(prompt, "This conversation is happening via: {ch}").unwrap();
     }
     if telegram_configured {
