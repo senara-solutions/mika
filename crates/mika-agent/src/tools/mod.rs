@@ -2,6 +2,7 @@ mod cancel_reminder;
 mod create_reminder;
 mod create_skill;
 mod list_reminders;
+mod list_skills;
 mod list_teams;
 mod list_workspace;
 mod read_workspace;
@@ -9,6 +10,7 @@ mod run_team;
 mod search_memory;
 mod send_message;
 mod store_fact;
+mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod write_workspace;
@@ -190,6 +192,8 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
     registry.register(Box::new(send_message::SendMessageTool));
     registry.register(Box::new(create_skill::CreateSkillTool));
+    registry.register(Box::new(list_skills::ListSkillsTool));
+    registry.register(Box::new(toggle_skill::ToggleSkillTool));
     registry
 }
 

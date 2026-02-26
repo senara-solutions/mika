@@ -224,6 +224,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     );
     prompt
         .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
+    prompt.push_str(
+        "- You can create new skills using create_skill to extend your capabilities with custom prompt snippets.\n",
+    );
 
     prompt
 }

@@ -18,7 +18,7 @@ const MAX_KEYWORDS: usize = 50;
 const MAX_KEYWORD_LEN: usize = 100;
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
-fn validate_skill_name(name: &str) -> Result<(), String> {
+pub(super) fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Skill name cannot be empty.".to_string());
     }
@@ -165,6 +165,25 @@ impl Tool for CreateSkillTool {
             return Ok(ToolOutput::error(format!(
                 "Failed to create skill directory: {e}"
             )));
+        }
+
+        // Symlink guard: verify the created directory is actually inside skills_dir
+        match (skills_dir.canonicalize(), skill_dir.canonicalize()) {
+            (Ok(canonical_parent), Ok(canonical_child)) => {
+                if !canonical_child.starts_with(&canonical_parent) {
+                    let _ = std::fs::remove_dir_all(&skill_dir);
+                    return Ok(ToolOutput::error(
+                        "Skill directory escaped skills root (possible symlink attack).",
+                    ));
+                }
+            }
+            _ => {
+                // If canonicalize fails, the directory doesn't exist as expected
+                let _ = std::fs::remove_dir_all(&skill_dir);
+                return Ok(ToolOutput::error(
+                    "Failed to verify skill directory location.",
+                ));
+            }
         }
 
         // Build manifest struct and serialize to TOML (avoids string interpolation injection)
