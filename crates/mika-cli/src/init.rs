@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
+use mika_agent::messaging::{GatewayMessageSender, MessageSender};
 use mika_agent::startup;
 use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::home;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Full application context for commands that need the Claude client.
 /// Dropping this shuts down the async database automatically.
@@ -57,6 +59,7 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
 
     let db = open_db(&settings)?;
     startup::seed_core_memory_if_empty(&db, &agent_home)?;
+    startup::seed_bundled_skills_if_needed(&agent_home);
     let async_db = AsyncDatabase::new(db);
 
     Ok((settings, async_db, agent_home, global_home))
@@ -119,4 +122,40 @@ fn open_db(settings: &Settings) -> Result<Database> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     Database::open(db_path).context("failed to open database")
+}
+
+/// Build a `GatewayMessageSender` if both `routing_url` and `internal_token` are configured.
+/// Returns `None` otherwise, preserving CLI-only behavior.
+pub fn make_message_sender(
+    settings: &Settings,
+    db: &AsyncDatabase,
+    http_client: &reqwest::Client,
+) -> Option<Arc<dyn MessageSender>> {
+    let url = settings.routing_url.as_deref()?;
+    let token = settings.internal_token.clone()?;
+
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid routing_url, skipping gateway message sender");
+            return None;
+        }
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        tracing::warn!(
+            scheme = parsed.scheme(),
+            "routing_url must use http or https scheme"
+        );
+        return None;
+    }
+
+    let sender = GatewayMessageSender::new(
+        url.to_string(),
+        token,
+        db.clone(),
+        http_client.clone(),
+        None,
+    );
+    Some(Arc::new(sender))
 }

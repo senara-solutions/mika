@@ -317,9 +317,7 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
 
     // Validate chat_id as integer (Telegram chat IDs are i64)
     if key == "chat_id" && value.parse::<i64>().is_err() {
-        return format!(
-            "Invalid chat_id: {value}\nchat_id must be a numeric Telegram chat ID"
-        );
+        return format!("Invalid chat_id: {value}\nchat_id must be a numeric Telegram chat ID");
     }
 
     // Validate timezone values

@@ -52,6 +52,10 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
 
     home::bootstrap_agent(global_home, &name)?;
 
+    // Seed bundled skills into the new agent's skills directory
+    let agent_home = mika_common::agent::agent_dir(global_home, &name);
+    mika_agent::startup::seed_bundled_skills_if_needed(&agent_home);
+
     println!("\n  Created agent '{name}'.");
     println!("  Use `mika --agent {name}` or `mika agents switch {name}` to use it.\n");
     Ok(())
