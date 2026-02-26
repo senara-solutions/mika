@@ -199,36 +199,18 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         )]));
     }
 
-    // Calculate scroll: show the bottom of messages by default.
-    // Use usize for all arithmetic to avoid u16 truncation on long conversations.
-    // Account for line wrapping: Paragraph::scroll() + Wrap operates on *wrapped* visual
-    // rows, so we must count how many rows each Line occupies after wrapping at viewport width.
-    let viewport_width = inner.width as usize;
-    let total_lines: usize = if viewport_width == 0 {
-        lines.len()
-    } else {
-        lines
-            .iter()
-            .map(|line| {
-                let w = line.width();
-                if w == 0 {
-                    1
-                } else {
-                    (w.saturating_sub(1) / viewport_width) + 1
-                }
-            })
-            .sum()
-    };
+    // Build paragraph with wrapping first, then use ratatui's accurate line counting
+    // to calculate scroll. This avoids the discrepancy between our manual character-count
+    // estimation and ratatui's word-boundary wrapping (WordWrapper), which can produce
+    // more visual rows when words straddle line boundaries.
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total_lines = paragraph.line_count(inner.width);
     let visible_height = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset);
 
-    // Clamp to u16::MAX at the ratatui call site (Paragraph::scroll takes u16)
     let scroll_u16 = effective_scroll.min(u16::MAX as usize) as u16;
-
-    let paragraph = Paragraph::new(lines)
-        .scroll((scroll_u16, 0))
-        .wrap(Wrap { trim: false });
+    let paragraph = paragraph.scroll((scroll_u16, 0));
     f.render_widget(paragraph, inner);
 }
 

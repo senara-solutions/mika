@@ -70,7 +70,8 @@ utoipa = { version = "5", features = ["axum_extras", "yaml"] }
 # CLI / TUI
 clap = { version = "4", features = ["derive"] }
 clap-markdown = "0.1"
-ratatui = "0.29"
+# unstable-rendered-line-info: enables Paragraph::line_count() for accurate scroll (stable in practice since 0.25)
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 tui-textarea = { version = "0.7", features = ["crossterm"] }
 crossterm = "0.28"
 
