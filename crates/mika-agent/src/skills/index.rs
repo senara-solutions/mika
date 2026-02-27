@@ -569,7 +569,11 @@ mod tests {
 
         let entries = scan_skills_dir(tmp.path());
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].skill_tools.len(), 1, "unknown builtin should be filtered out");
+        assert_eq!(
+            entries[0].skill_tools.len(),
+            1,
+            "unknown builtin should be filtered out"
+        );
         assert_eq!(entries[0].skill_tools[0].definition.name, "valid_tool");
     }
 

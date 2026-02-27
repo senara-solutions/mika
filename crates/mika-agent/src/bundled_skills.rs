@@ -161,10 +161,7 @@ fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
         if file_path.exists() && file_path.symlink_metadata()?.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!(
-                    "file '{}' is a symlink, refusing to write",
-                    file.path
-                ),
+                format!("file '{}' is a symlink, refusing to write", file.path),
             ));
         }
 

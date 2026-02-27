@@ -97,9 +97,7 @@ impl Tool for UpdateSkillTool {
             let toml_content = match std::fs::read_to_string(&toml_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    return Ok(ToolOutput::error(format!(
-                        "Failed to read skill.toml: {e}"
-                    )));
+                    return Ok(ToolOutput::error(format!("Failed to read skill.toml: {e}")));
                 }
             };
             let mut manifest: SkillManifest = match toml::from_str(&toml_content) {
@@ -266,7 +264,10 @@ keywords = ["original"]
             .unwrap();
         assert!(!output.is_error, "Got: {}", output.content);
         assert!(output.content.contains("system_prompt"));
-        assert_eq!(read_prompt(&tmp, "test-skill"), "New system prompt content.");
+        assert_eq!(
+            read_prompt(&tmp, "test-skill"),
+            "New system prompt content."
+        );
         // Manifest should be unchanged
         let manifest = read_manifest(&tmp, "test-skill");
         assert_eq!(manifest.skill.description, "Original description");
@@ -412,10 +413,7 @@ keywords = ["original"]
         let tool = UpdateSkillTool;
 
         let output = tool
-            .execute(
-                json!({"name": "../evil", "description": "nope"}),
-                &ctx,
-            )
+            .execute(json!({"name": "../evil", "description": "nope"}), &ctx)
             .await
             .unwrap();
         assert!(output.is_error);
@@ -429,10 +427,7 @@ keywords = ["original"]
         let tool = UpdateSkillTool;
 
         let output = tool
-            .execute(
-                json!({"name": "test-skill", "system_prompt": ""}),
-                &ctx,
-            )
+            .execute(json!({"name": "test-skill", "system_prompt": ""}), &ctx)
             .await
             .unwrap();
         assert!(output.is_error);
@@ -446,10 +441,7 @@ keywords = ["original"]
         let tool = UpdateSkillTool;
 
         let output = tool
-            .execute(
-                json!({"name": "test-skill", "description": "  "}),
-                &ctx,
-            )
+            .execute(json!({"name": "test-skill", "description": "  "}), &ctx)
             .await
             .unwrap();
         assert!(output.is_error);

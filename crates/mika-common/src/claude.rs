@@ -265,10 +265,8 @@ impl ClaudeClient {
             AnthropicAuth::ApiKey(k) => {
                 HeaderValue::from_str(k).context("invalid API key characters")?
             }
-            AnthropicAuth::OAuthBearer(t) => {
-                HeaderValue::from_str(&format!("Bearer {t}"))
-                    .context("invalid OAuth token characters")?
-            }
+            AnthropicAuth::OAuthBearer(t) => HeaderValue::from_str(&format!("Bearer {t}"))
+                .context("invalid OAuth token characters")?,
         };
 
         let mut last_error = None;
@@ -310,31 +308,20 @@ impl ClaudeClient {
                             };
                             anyhow::Error::from(e).context(hint)
                         }
-                        ClaudeApiError::HttpError { status: 429, .. } => {
-                            anyhow::Error::from(e).context(
-                                "Claude API is busy. Please wait a moment and try again.",
-                            )
-                        }
+                        ClaudeApiError::HttpError { status: 429, .. } => anyhow::Error::from(e)
+                            .context("Claude API is busy. Please wait a moment and try again."),
                         ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
                             anyhow::Error::from(e).context(
                                 "Claude API is temporarily unavailable. Please try again shortly.",
                             )
                         }
-                        ClaudeApiError::Transport(_) => {
-                            anyhow::Error::from(e).context(
-                                "Could not connect to Claude API. Check your internet connection.",
-                            )
-                        }
-                        ClaudeApiError::ParseError(_) => {
-                            anyhow::Error::from(e).context(
-                                "Received an unexpected response from Claude API.",
-                            )
-                        }
-                        ClaudeApiError::HttpError { .. } => {
-                            anyhow::Error::from(e).context(
-                                "Claude API returned an unexpected error. Please try again.",
-                            )
-                        }
+                        ClaudeApiError::Transport(_) => anyhow::Error::from(e).context(
+                            "Could not connect to Claude API. Check your internet connection.",
+                        ),
+                        ClaudeApiError::ParseError(_) => anyhow::Error::from(e)
+                            .context("Received an unexpected response from Claude API."),
+                        ClaudeApiError::HttpError { .. } => anyhow::Error::from(e)
+                            .context("Claude API returned an unexpected error. Please try again."),
                     });
                 }
             }
@@ -532,23 +519,15 @@ mod tests {
 
     #[test]
     fn test_new_with_oauth_token() {
-        let client = ClaudeClient::new(
-            Some("sk-ant-oat01-test-token".into()),
-            "model".into(),
-            100,
-        )
-        .unwrap();
+        let client =
+            ClaudeClient::new(Some("sk-ant-oat01-test-token".into()), "model".into(), 100).unwrap();
         assert!(client.auth.is_oauth());
     }
 
     #[test]
     fn test_new_with_api_key() {
-        let client = ClaudeClient::new(
-            Some("sk-ant-api03-test-key".into()),
-            "model".into(),
-            100,
-        )
-        .unwrap();
+        let client =
+            ClaudeClient::new(Some("sk-ant-api03-test-key".into()), "model".into(), 100).unwrap();
         assert!(!client.auth.is_oauth());
     }
 
@@ -558,10 +537,7 @@ mod tests {
         betas.push("oauth-2025-04-20");
         betas.push("interleaved-thinking-2025-05-14");
         let combined = betas.join(",");
-        assert_eq!(
-            combined,
-            "oauth-2025-04-20,interleaved-thinking-2025-05-14"
-        );
+        assert_eq!(combined, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
         assert!(HeaderValue::from_str(&combined).is_ok());
     }
 
