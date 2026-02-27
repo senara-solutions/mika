@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::{debug, warn};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -55,9 +55,10 @@ impl Tool for SendMessageTool {
                 Ok(ToolOutput::success("Message sent."))
             }
             None => {
-                info!("send_message (CLI mode, no sender configured)");
+                warn!("send_message called but no outbound sender configured");
                 Ok(ToolOutput::success(
-                    "Message logged locally (no outbound sender configured).",
+                    "No outbound sender configured — message was NOT delivered. \
+                     To enable Telegram delivery, set MIKA_ROUTING_URL and MIKA_INTERNAL_TOKEN.",
                 ))
             }
         }
@@ -107,7 +108,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("logged locally"));
+        assert!(result.content.contains("NOT delivered"));
     }
 
     #[tokio::test]
