@@ -45,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~475 tests)
+- `cargo test` — Run all tests (~478 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
@@ -64,7 +64,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
 - **Audit log:** `memory_events` table tracks all memory mutations per session
 - **Conversation compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt (not message history). Runs inline post-turn in CLI.
-- **Silent mode agent loop:** Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
+- **Silent mode agent loop:** Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`. Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handler skills (e.g., tmux, shell-exec) for security — only builtin-handler skills are available in autonomous background runs. Silent prompt conditionally includes `send_message` guidance only when a message sender is configured.
 - **MessageSender trait:** `#[async_trait]` with `Send + Sync` bounds for `Arc<dyn MessageSender>`. CLI prints to stdout. Server uses `GatewayMessageSender` (POST to gateway `/send` with retry + failed_sends fallback).
 - **Reminder scheduler:** `ReminderScheduler` uses owned types (no lifetime params). `recover()` fires past-due reminders on startup via silent agent.
 - **HTTP server (mika-server):** Axum-based with 3 endpoints: `/health` (no auth, K8s probes), `/message` (Bearer auth, 202 async), `/heartbeat` (Bearer auth, CronJob trigger). `AppState` is Clone via Arc-wrapped deps. Agent lock (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock` (429 if busy).
