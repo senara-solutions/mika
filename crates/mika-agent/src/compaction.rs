@@ -94,7 +94,9 @@ async fn summarize_messages(
     let mut char_count = 0usize;
     let mut included = 0usize;
     for msg in messages {
-        let msg_chars = msg.role.len() + 2 + msg.content.len() + 1; // "role: content\n"
+        // Append tool names from metadata so summaries mention tool usage
+        let tool_suffix = extract_tool_names(&msg.metadata);
+        let msg_chars = msg.role.len() + 2 + msg.content.len() + tool_suffix.len() + 1;
         if char_count + msg_chars > MAX_COMPACTION_INPUT_CHARS {
             break;
         }
@@ -103,6 +105,9 @@ async fn summarize_messages(
         user_prompt.push_str(&msg.role);
         user_prompt.push_str(": ");
         user_prompt.push_str(&msg.content);
+        if !tool_suffix.is_empty() {
+            user_prompt.push_str(&tool_suffix);
+        }
         user_prompt.push('\n');
     }
     if included < messages.len() {
@@ -134,6 +139,34 @@ async fn summarize_messages(
         .context("summarization API call failed")?;
 
     Ok(response.text())
+}
+
+/// Extract tool names from metadata JSON for inclusion in compaction input.
+/// Returns a short suffix like " [used: search_memory, store_fact]" or empty string.
+fn extract_tool_names(metadata: &Option<String>) -> String {
+    let Some(json) = metadata else {
+        return String::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+        return String::new();
+    };
+    let Some(calls) = parsed.get("tool_calls").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if calls.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = calls
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    // Deduplicate while preserving order
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<&str> = names.into_iter().filter(|n| seen.insert(*n)).collect();
+    format!(" [used: {}]", unique.join(", "))
 }
 
 #[cfg(test)]
@@ -232,5 +265,41 @@ mod tests {
         // Summary is the latest one
         let summary = db.load_conversation_summary().unwrap().unwrap();
         assert_eq!(summary.content, "Merged summary");
+    }
+
+    #[test]
+    fn extract_tool_names_none_metadata() {
+        assert_eq!(extract_tool_names(&None), "");
+    }
+
+    #[test]
+    fn extract_tool_names_invalid_json() {
+        assert_eq!(extract_tool_names(&Some("not json".to_string())), "");
+    }
+
+    #[test]
+    fn extract_tool_names_empty_calls() {
+        assert_eq!(
+            extract_tool_names(&Some(r#"{"tool_calls":[]}"#.to_string())),
+            ""
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_single_tool() {
+        let meta = r#"{"tool_calls":[{"name":"search_memory","step":0}]}"#;
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: search_memory]"
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_deduplicates() {
+        let meta = r#"{"tool_calls":[{"name":"search_memory","step":0},{"name":"search_memory","step":1},{"name":"store_fact","step":2}]}"#;
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: search_memory, store_fact]"
+        );
     }
 }
