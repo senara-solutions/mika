@@ -118,6 +118,23 @@ impl AsyncDatabase {
         self.with_db(move |db| db.save_message(&r, &c, &ct)).await
     }
 
+    pub async fn save_message_with_metadata(
+        &self,
+        role: &str,
+        content: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<i64> {
+        let (r, c, ct, m) = (
+            role.to_owned(),
+            content.to_owned(),
+            channel_type.to_owned(),
+            metadata.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.save_message_with_metadata(&r, &c, &ct, m.as_deref()))
+            .await
+    }
+
     pub async fn load_recent_messages(
         &self,
         limit: usize,

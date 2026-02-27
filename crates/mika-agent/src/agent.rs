@@ -99,12 +99,120 @@ impl LoopMode<'_> {
     }
 }
 
+/// Summary of a single tool call for persistence in conversation metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallSummary {
+    pub step: u32,
+    pub name: String,
+    pub input_summary: String,
+    pub output_summary: String,
+    pub success: bool,
+}
+
+/// Maximum characters for tool call input summary.
+/// Sized so that MAX_TOOL_STEPS entries fit within TOOL_METADATA_MAX in a single pass.
+const TOOL_INPUT_SUMMARY_MAX: usize = 120;
+/// Maximum characters for tool call output summary.
+/// Sized so that MAX_TOOL_STEPS entries fit within TOOL_METADATA_MAX in a single pass.
+const TOOL_OUTPUT_SUMMARY_MAX: usize = 180;
+/// Maximum total characters for serialized tool call metadata.
+const TOOL_METADATA_MAX: usize = 4000;
+
+/// Truncate a string to approximately `max_len` bytes, appending "..." if truncated.
+/// Always cuts at a valid UTF-8 char boundary to avoid panics on multi-byte input.
+fn truncate_summary(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let cut = max_len.saturating_sub(3);
+        // Walk back to a valid char boundary
+        let mut boundary = cut;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}...", &s[..boundary])
+    }
+}
+
+/// Serialize tool call summaries to JSON metadata string, capped at [`TOOL_METADATA_MAX`].
+///
+/// With `TOOL_INPUT_SUMMARY_MAX=120` and `TOOL_OUTPUT_SUMMARY_MAX=180`, a single pass
+/// fits within the cap for up to `MAX_TOOL_STEPS` entries. If the result still exceeds
+/// the cap (e.g., many entries from a pathological case), entries are dropped from the
+/// tail until the size fits.
+pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String> {
+    if summaries.is_empty() {
+        return None;
+    }
+    let wrapper = serde_json::json!({ "tool_calls": summaries });
+    let json = serde_json::to_string(&wrapper).ok()?;
+    if json.len() <= TOOL_METADATA_MAX {
+        return Some(json);
+    }
+    // Drop entries from the tail until under the cap
+    for count in (1..summaries.len()).rev() {
+        let wrapper = serde_json::json!({ "tool_calls": &summaries[..count] });
+        if let Ok(json) = serde_json::to_string(&wrapper) {
+            if json.len() <= TOOL_METADATA_MAX {
+                return Some(json);
+            }
+        }
+    }
+    None
+}
+
+/// Format tool call metadata into a concise summary block for injection into history.
+///
+/// Includes truncated input so the agent can introspect what arguments it passed
+/// (e.g., "what command did you send?") and output for result context.
+/// Malformed entries are skipped rather than causing the entire block to be dropped.
+pub fn format_tool_summary_block(metadata_json: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let calls = parsed.get("tool_calls")?.as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = calls
+        .iter()
+        .filter_map(|call| {
+            let name = call.get("name")?.as_str()?;
+            let input = call
+                .get("input_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let output = call
+                .get("output_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let success = call
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let status = if success { "" } else { " [FAILED]" };
+            let short_input = truncate_summary(input, 60);
+            let short_output = truncate_summary(output, 80);
+            if short_input.is_empty() {
+                Some(format!("{name}{status} → {short_output}"))
+            } else {
+                Some(format!("{name}({short_input}){status} → {short_output}"))
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("\n[Tools used: {}]", parts.join("; ")))
+}
+
 /// Result from the shared tool-step loop.
 struct LoopResult {
     text: Option<String>,
     thinking: Option<String>,
     usage: Option<mika_common::claude::Usage>,
     max_steps_exceeded: bool,
+    /// Accumulated tool call summaries from all loop steps.
+    /// Used by the `max_steps_exceeded` fallback path to persist metadata.
+    tool_call_summaries: Vec<ToolCallSummary>,
 }
 
 /// Shared tool-step loop used by all three agent variants.
@@ -126,6 +234,7 @@ async fn run_loop(
     let mut follow_up_attempted = false;
     let mut last_usage = None;
     let mut thinking_text = None;
+    let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
     let channel_type = mode.channel_type();
 
     for step in 0..MAX_TOOL_STEPS {
@@ -153,7 +262,9 @@ async fn run_loop(
 
                 if !text.is_empty() {
                     if let Some(ct) = channel_type {
-                        db.save_message("assistant", &text, ct).await?;
+                        let metadata = tool_calls_metadata_json(&all_tool_summaries);
+                        db.save_message_with_metadata("assistant", &text, ct, metadata.as_deref())
+                            .await?;
                     }
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), channel_type, "agent done");
                     return Ok(LoopResult {
@@ -161,6 +272,7 @@ async fn run_loop(
                         thinking: thinking_text,
                         usage: last_usage,
                         max_steps_exceeded: false,
+                        tool_call_summaries: all_tool_summaries,
                     });
                 }
 
@@ -171,6 +283,7 @@ async fn run_loop(
                         thinking: None,
                         usage: None,
                         max_steps_exceeded: false,
+                        tool_call_summaries: all_tool_summaries,
                     });
                 }
 
@@ -211,19 +324,22 @@ async fn run_loop(
                     thinking: thinking_text,
                     usage: last_usage,
                     max_steps_exceeded: false,
+                    tool_call_summaries: all_tool_summaries,
                 });
             }
             StopReason::ToolUse => {
                 tool_use_occurred = true;
-                process_tool_calls(
+                let step_summaries = process_tool_calls(
                     response.content,
                     tools,
                     skill_tool_map,
                     skill_timeout,
                     tool_ctx,
                     request,
+                    step as u32,
                 )
                 .await;
+                all_tool_summaries.extend(step_summaries);
             }
         }
     }
@@ -237,6 +353,7 @@ async fn run_loop(
         thinking: thinking_text,
         usage: last_usage,
         max_steps_exceeded: true,
+        tool_call_summaries: all_tool_summaries,
     })
 }
 
@@ -379,11 +496,28 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     // Build initial message list from history.
     // The last message in history is the user message we just saved.
     // If user_images is non-empty, replace the last message with a multi-block version.
+    // For assistant messages with tool call metadata, append a summary block so the agent
+    // can introspect what tools it used in previous turns.
     let mut messages: Vec<Message> = history
         .iter()
-        .map(|msg| Message {
-            role: msg.role.clone(),
-            content: MessageContent::Text(msg.content.clone()),
+        .map(|msg| {
+            let content = if msg.role == "assistant" {
+                if let Some(ref meta) = msg.metadata {
+                    if let Some(summary) = format_tool_summary_block(meta) {
+                        format!("{}{}", msg.content, summary)
+                    } else {
+                        msg.content.clone()
+                    }
+                } else {
+                    msg.content.clone()
+                }
+            } else {
+                msg.content.clone()
+            };
+            Message {
+                role: msg.role.clone(),
+                content: MessageContent::Text(content),
+            }
         })
         .collect();
 
@@ -455,7 +589,9 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
 
     if result.max_steps_exceeded {
         let fallback = "I need a moment to think about that. Let me get back to you.";
-        db.save_message("assistant", fallback, channel_type).await?;
+        let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
+        db.save_message_with_metadata("assistant", fallback, channel_type, metadata.as_deref())
+            .await?;
         return Ok(AgentOutput {
             text: Some(fallback.to_string()),
             thinking: result.thinking,
@@ -471,8 +607,8 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
 }
 
 /// Execute tool-use blocks from a response and push both assistant and
-/// tool-result messages onto the request. Shared between conversation and
-/// silent agent loops.
+/// tool-result messages onto the request. Returns summaries of each tool call
+/// for persistence in conversation metadata.
 async fn process_tool_calls(
     response_content: Vec<ContentBlock>,
     tools: &ToolRegistry,
@@ -480,11 +616,14 @@ async fn process_tool_calls(
     skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
     request: &mut MessagesRequest,
-) {
+    step: u32,
+) -> Vec<ToolCallSummary> {
     let mut tool_results = Vec::new();
+    let mut summaries = Vec::new();
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
+            let input_summary = truncate_summary(&input.to_string(), TOOL_INPUT_SUMMARY_MAX);
             let output = execute_tool(
                 tools,
                 skill_tools,
@@ -494,6 +633,13 @@ async fn process_tool_calls(
                 skill_timeout,
             )
             .await;
+            summaries.push(ToolCallSummary {
+                step,
+                name: name.clone(),
+                input_summary,
+                output_summary: truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX),
+                success: !output.is_error,
+            });
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
                 content: output.content,
@@ -510,6 +656,7 @@ async fn process_tool_calls(
         role: "user".to_string(),
         content: MessageContent::Blocks(tool_results),
     });
+    summaries
 }
 
 /// Execute a single tool with timeout.
@@ -671,6 +818,14 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         has_message_sender: params.message_sender.is_some(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
+
+    // Inject conversation summary so heartbeat/reminder agents have recent context
+    if let Some(summary) = db.load_conversation_summary().await? {
+        system.push_str("\n## Conversation Summary\n");
+        system.push_str("<context type=\"summary\" trust=\"data\">\n");
+        system.push_str(&summary.content);
+        system.push_str("\n</context>\n");
+    }
 
     // Match skills: heartbeat uses safe always-on skills (no exec/http handlers),
     // reminders use keyword matching against the reminder message.
@@ -1123,5 +1278,171 @@ mod tests {
         // Should NOT add skill context section when snippet is empty
         assert!(!system.contains("quiet Skill"));
         assert_eq!(system, "Base.");
+    }
+
+    // -- ToolCallSummary and metadata tests --
+
+    #[test]
+    fn truncate_summary_no_op_for_short_strings() {
+        assert_eq!(truncate_summary("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_summary_truncates_long_strings() {
+        let long = "a".repeat(300);
+        let result = truncate_summary(&long, 200);
+        assert!(result.len() <= 200);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_summary_exact_length_not_truncated() {
+        let exact = "a".repeat(200);
+        assert_eq!(truncate_summary(&exact, 200), exact);
+    }
+
+    #[test]
+    fn truncate_summary_safe_with_multibyte_chars() {
+        // Euro sign is 3 bytes: \xe2\x82\xac
+        let s = "\u{20AC}".repeat(100); // 300 bytes, 100 chars
+        let result = truncate_summary(&s, 10);
+        assert!(result.ends_with("..."));
+        // Must not panic and must be valid UTF-8
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_summary_safe_with_emoji() {
+        // Emoji is 4 bytes
+        let s = "Hello \u{1F600} world! More text here to exceed the limit easily.";
+        let result = truncate_summary(&s, 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 13); // 10 bytes + "..."
+    }
+
+    #[test]
+    fn tool_calls_metadata_json_empty_returns_none() {
+        assert!(tool_calls_metadata_json(&[]).is_none());
+    }
+
+    #[test]
+    fn tool_calls_metadata_json_single_call() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "search_memory".to_string(),
+            input_summary: r#"{"query":"meetings"}"#.to_string(),
+            output_summary: "Found 3 results".to_string(),
+            success: true,
+        }];
+        let json = tool_calls_metadata_json(&summaries).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let calls = parsed["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "search_memory");
+        assert_eq!(calls[0]["success"], true);
+    }
+
+    #[test]
+    fn tool_calls_metadata_json_respects_max_size() {
+        // Create many tool calls with large outputs to exceed TOOL_METADATA_MAX
+        let summaries: Vec<ToolCallSummary> = (0..50)
+            .map(|i| ToolCallSummary {
+                step: i,
+                name: format!("tool_{i}"),
+                input_summary: "x".repeat(TOOL_INPUT_SUMMARY_MAX),
+                output_summary: "y".repeat(TOOL_OUTPUT_SUMMARY_MAX),
+                success: true,
+            })
+            .collect();
+        let json = tool_calls_metadata_json(&summaries).unwrap();
+        // Must produce valid JSON within the size cap
+        assert!(
+            json.len() <= TOOL_METADATA_MAX,
+            "metadata exceeded TOOL_METADATA_MAX: {} chars",
+            json.len()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!parsed["tool_calls"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn format_tool_summary_block_valid_json() {
+        let json = r#"{"tool_calls":[{"step":0,"name":"tmux_send_command","input_summary":"{\"session\":\"mika\",\"text\":\"cargo test\"}","output_summary":"Command sent","success":true}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(block.contains("tmux_send_command"));
+        assert!(block.contains("cargo test")); // input is now surfaced
+        assert!(block.contains("Command sent"));
+        assert!(block.starts_with("\n[Tools used:"));
+    }
+
+    #[test]
+    fn format_tool_summary_block_failed_tool() {
+        let json = r#"{"tool_calls":[{"step":0,"name":"bad_tool","input_summary":"","output_summary":"error","success":false}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(block.contains("[FAILED]"));
+    }
+
+    #[test]
+    fn format_tool_summary_block_skips_malformed_entries() {
+        // One good entry, one missing name — should produce partial result
+        let json = r#"{"tool_calls":[{"step":0,"name":"good_tool","input_summary":"","output_summary":"ok","success":true},{"step":1,"output_summary":"no name"}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(block.contains("good_tool"));
+        // The malformed entry should be skipped, not cause None
+    }
+
+    #[test]
+    fn format_tool_summary_block_empty_calls_returns_none() {
+        let json = r#"{"tool_calls":[]}"#;
+        assert!(format_tool_summary_block(json).is_none());
+    }
+
+    #[test]
+    fn format_tool_summary_block_invalid_json_returns_none() {
+        assert!(format_tool_summary_block("not json").is_none());
+    }
+
+    // -- DB metadata integration tests --
+
+    #[tokio::test]
+    async fn save_and_load_message_with_metadata() {
+        let db = test_async_db();
+        let metadata = r#"{"tool_calls":[{"step":0,"name":"search_memory","input_summary":"q","output_summary":"found","success":true}]}"#;
+        db.save_message_with_metadata(
+            "assistant",
+            "I searched your memory.",
+            "cli",
+            Some(metadata),
+        )
+        .await
+        .unwrap();
+
+        let messages = db.load_recent_messages(10, None).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "I searched your memory.");
+        assert_eq!(messages[0].metadata.as_deref(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn save_message_without_metadata_loads_as_none() {
+        let db = test_async_db();
+        db.save_message("user", "Hello", "cli").await.unwrap();
+
+        let messages = db.load_recent_messages(10, None).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_message_with_null_metadata() {
+        let db = test_async_db();
+        db.save_message_with_metadata("assistant", "No tools used.", "cli", None)
+            .await
+            .unwrap();
+
+        let messages = db.load_recent_messages(10, None).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].metadata.is_none());
     }
 }

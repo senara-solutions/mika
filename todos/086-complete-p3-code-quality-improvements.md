@@ -46,3 +46,10 @@ Address items individually as time permits. Highest value:
 **Actions:**
 - Verified reminder query duplication already resolved via `ReminderFilter` enum + `query_reminders()` helper (db.rs:848-877)
 - Added 13 unit tests to agent.rs `#[cfg(test)]` module covering: LoopMode variant properties (3 tests), check_onboarding async behavior (3 tests), build_skill_tool_map (2 tests), max_skill_timeout (2 tests), inject_skills_and_resolve_tools (3 tests including deduplication and empty snippet handling)
+
+### 2026-02-27 - Findings 9 & 10
+**By:** Claude Code
+**Actions:**
+- **Finding 9:** Injected conversation summary into silent mode agent loop (agent.rs:675-680), mirroring existing pattern from run_agent_inner. Heartbeat/reminder agents now have recent conversation context for relevance.
+- **Finding 10:** Removed hardcoded `AND channel_type IN ('cli', 'telegram')` from `last_user_message_time()` SQL (db.rs:991). The `role = 'user'` predicate is sufficient — WhatsApp and API messages are now correctly detected for heartbeat pre-filter skip logic.
+- Updated `test_last_user_message_time` to verify WhatsApp and API channel messages are found.

@@ -45,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~491 tests)
+- `cargo test` — Run all tests (~512 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
@@ -60,7 +60,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
   - Layer 1: Core memory (always in system prompt, agent-editable via `update_core_memory` tool, 2000 token limit)
   - Layer 2: Structured facts (People, Commitments, Preferences, Events — plaintext). Managed via `store_fact`, `update_fact`, `search_memory` tools.
   - Layer 3: Hybrid search (FTS5 full-text + sqlite-vec cosine similarity via Reciprocal Rank Fusion). Optional OpenAI embeddings (text-embedding-3-small, 512 dims). Graceful degradation: hybrid → FTS5-only → LIKE fallback. Indexed on store_fact/update_fact, backfilled on startup.
-- **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout
+- **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout. Tool call summaries (name, truncated input/output, success) persisted in `conversations.metadata` JSON column for cross-turn introspection. History builder appends `[Tools used: ...]` blocks to assistant messages. Compaction includes tool names in summarization.
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
 - **Audit log:** `memory_events` table tracks all memory mutations per session
 - **Conversation compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt (not message history). Runs inline post-turn in CLI.

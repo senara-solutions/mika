@@ -414,12 +414,23 @@ impl Database {
 
     /// Save a conversation message.
     pub fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
+        self.save_message_with_metadata(role, content, channel_type, None)
+    }
+
+    /// Save a conversation message with optional JSON metadata (e.g., tool call summaries).
+    pub fn save_message_with_metadata(
+        &self,
+        role: &str,
+        content: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO conversations (role, content, channel_type) VALUES (?1, ?2, ?3)",
-                rusqlite::params![role, content, channel_type],
+                "INSERT INTO conversations (role, content, channel_type, metadata) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![role, content, channel_type, metadata],
             )
-            .context("failed to insert conversation")?;
+            .context("failed to insert conversation with metadata")?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -437,7 +448,7 @@ impl Database {
                 let placeholders: Vec<String> =
                     (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
                 let sql = format!(
-                    "SELECT id, role, content, channel_type, created_at
+                    "SELECT id, role, content, channel_type, metadata, created_at
                      FROM conversations
                      WHERE role != 'summary' AND channel_type IN ({})
                      ORDER BY id DESC LIMIT ?1",
@@ -450,7 +461,7 @@ impl Database {
                 (sql, params)
             }
             _ => {
-                let sql = "SELECT id, role, content, channel_type, created_at
+                let sql = "SELECT id, role, content, channel_type, metadata, created_at
                      FROM conversations
                      WHERE role != 'summary'
                      ORDER BY id DESC LIMIT ?1"
@@ -470,7 +481,8 @@ impl Database {
                     role: row.get(1)?,
                     content: row.get(2)?,
                     channel_type: row.get(3)?,
-                    created_at: row.get(4)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -988,7 +1000,7 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT created_at FROM conversations \
-                 WHERE role = 'user' AND channel_type IN ('cli', 'telegram') \
+                 WHERE role = 'user' \
                  ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
@@ -1077,7 +1089,7 @@ impl Database {
         let msg = self
             .conn
             .query_row(
-                "SELECT id, role, content, channel_type, created_at
+                "SELECT id, role, content, channel_type, metadata, created_at
                  FROM conversations WHERE role = 'summary'
                  ORDER BY id DESC LIMIT 1",
                 [],
@@ -1087,7 +1099,8 @@ impl Database {
                         role: row.get(1)?,
                         content: row.get(2)?,
                         channel_type: row.get(3)?,
-                        created_at: row.get(4)?,
+                        metadata: row.get(4)?,
+                        created_at: row.get(5)?,
                     })
                 },
             )
@@ -1131,7 +1144,7 @@ impl Database {
         };
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, created_at
+            "SELECT id, role, content, channel_type, metadata, created_at
              FROM conversations
              WHERE role != 'summary' AND id < ?1
              ORDER BY id ASC",
@@ -1143,7 +1156,8 @@ impl Database {
                     role: row.get(1)?,
                     content: row.get(2)?,
                     channel_type: row.get(3)?,
-                    created_at: row.get(4)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1631,7 +1645,7 @@ impl Database {
                 let placeholders: Vec<String> =
                     (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
                 let sql = format!(
-                    "SELECT id, role, content, channel_type, created_at
+                    "SELECT id, role, content, channel_type, metadata, created_at
                      FROM conversations
                      WHERE id > ?1 AND role != 'summary' AND channel_type IN ({})
                      ORDER BY id ASC
@@ -1645,7 +1659,7 @@ impl Database {
                 (sql, params)
             }
             _ => {
-                let sql = "SELECT id, role, content, channel_type, created_at
+                let sql = "SELECT id, role, content, channel_type, metadata, created_at
                      FROM conversations
                      WHERE id > ?1 AND role != 'summary'
                      ORDER BY id ASC
@@ -1666,7 +1680,8 @@ impl Database {
                     role: row.get(1)?,
                     content: row.get(2)?,
                     channel_type: row.get(3)?,
-                    created_at: row.get(4)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1947,6 +1962,7 @@ pub struct ConversationMessage {
     pub role: String,
     pub content: String,
     pub channel_type: String,
+    pub metadata: Option<String>,
     pub created_at: String,
 }
 
@@ -2523,6 +2539,13 @@ mod tests {
         db.save_message("assistant", "hi", "heartbeat").unwrap();
         let ts2 = db.last_user_message_time().unwrap();
         assert_eq!(ts, ts2); // same as before
+
+        // WhatsApp and API user messages should count (no hardcoded channel filter)
+        db.save_message("user", "hi from whatsapp", "whatsapp")
+            .unwrap();
+        assert!(db.last_user_message_time().unwrap().is_some());
+        db.save_message("user", "hi from api", "api").unwrap();
+        assert!(db.last_user_message_time().unwrap().is_some());
     }
 
     #[test]
