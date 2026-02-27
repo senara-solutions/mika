@@ -231,6 +231,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- You have built-in skills (use list_skills to see which). Built-in skills cannot be overwritten.\n",
     );
     prompt.push_str("- You can enable or disable skills with toggle_skill.\n");
+    prompt.push_str("- You can update existing skill descriptions, keywords, prompts, or always_on settings with update_skill.\n");
     prompt.push_str(
         "- You can read and update customer config (timezone, chat_id) with get_config and set_config.\n",
     );
@@ -619,6 +620,7 @@ mod tests {
         assert!(prompt.contains("built-in skills"));
         assert!(prompt.contains("list_skills"));
         assert!(prompt.contains("toggle_skill"));
+        assert!(prompt.contains("update_skill"));
     }
 
     #[test]

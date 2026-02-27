@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::{Value, json};
 
+use std::path::Path;
+
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
 
@@ -16,6 +18,63 @@ pub(super) const MAX_KEYWORDS: usize = 50;
 
 /// Maximum length of a single keyword.
 pub(super) const MAX_KEYWORD_LEN: usize = 100;
+
+/// Verify that a skill directory is actually inside the skills root.
+/// Guards against symlink attacks where a skill name resolves outside the expected directory.
+pub(super) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(), String> {
+    match (skills_dir.canonicalize(), skill_dir.canonicalize()) {
+        (Ok(parent), Ok(child)) if child.starts_with(&parent) => Ok(()),
+        (Ok(_), Ok(_)) => {
+            Err("Skill directory escaped skills root (possible symlink attack).".into())
+        }
+        _ => Err("Failed to verify skill directory location.".into()),
+    }
+}
+
+/// Validate a skill description: non-empty and within length limit.
+pub(super) fn validate_description(desc: &str) -> Result<(), String> {
+    if desc.is_empty() {
+        return Err("Description cannot be empty.".to_string());
+    }
+    if desc.len() > MAX_INPUT_LEN {
+        return Err(format!(
+            "Description too long ({} chars, max {MAX_INPUT_LEN}).",
+            desc.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a system prompt: non-empty and within length limit.
+pub(super) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
+    if prompt.is_empty() {
+        return Err("System prompt cannot be empty.".to_string());
+    }
+    if prompt.len() > MAX_INPUT_LEN {
+        return Err(format!(
+            "System prompt too long ({} chars, max {MAX_INPUT_LEN}).",
+            prompt.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate keywords: count and individual length limits.
+pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
+    if keywords.len() > MAX_KEYWORDS {
+        return Err(format!(
+            "Too many keywords ({}, max {MAX_KEYWORDS}).",
+            keywords.len()
+        ));
+    }
+    if let Some(long) = keywords.iter().find(|k| k.len() > MAX_KEYWORD_LEN) {
+        return Err(format!(
+            "Keyword too long ({} chars, max {MAX_KEYWORD_LEN}).",
+            long.len()
+        ));
+    }
+    Ok(())
+}
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
 pub(super) fn validate_skill_name(name: &str) -> Result<(), String> {
@@ -108,45 +167,20 @@ impl Tool for CreateSkillTool {
             return Ok(ToolOutput::error(e));
         }
 
-        // Validate inputs not empty
-        if description.is_empty() {
-            return Ok(ToolOutput::error("Description cannot be empty."));
+        // Validate inputs
+        if let Err(e) = validate_description(description) {
+            return Ok(ToolOutput::error(e));
         }
-        if system_prompt.is_empty() {
-            return Ok(ToolOutput::error("System prompt cannot be empty."));
+        if let Err(e) = validate_system_prompt(system_prompt) {
+            return Ok(ToolOutput::error(e));
         }
         if keywords.is_empty() && !always_on {
             return Ok(ToolOutput::error(
                 "At least one keyword is required (or set always_on to true).",
             ));
         }
-
-        // Validate input lengths
-        if description.len() > MAX_INPUT_LEN {
-            return Ok(ToolOutput::error(format!(
-                "Description too long ({} chars, max {MAX_INPUT_LEN}).",
-                description.len()
-            )));
-        }
-        if system_prompt.len() > MAX_INPUT_LEN {
-            return Ok(ToolOutput::error(format!(
-                "System prompt too long ({} chars, max {MAX_INPUT_LEN}).",
-                system_prompt.len()
-            )));
-        }
-
-        // Validate keyword count and individual lengths
-        if keywords.len() > MAX_KEYWORDS {
-            return Ok(ToolOutput::error(format!(
-                "Too many keywords ({}, max {MAX_KEYWORDS}).",
-                keywords.len()
-            )));
-        }
-        if let Some(long) = keywords.iter().find(|k| k.len() > MAX_KEYWORD_LEN) {
-            return Ok(ToolOutput::error(format!(
-                "Keyword too long ({} chars, max {MAX_KEYWORD_LEN}).",
-                long.len()
-            )));
+        if let Err(e) = validate_keywords(&keywords) {
+            return Ok(ToolOutput::error(e));
         }
 
         let skills_dir = ctx.home_dir.join("skills");
@@ -155,8 +189,7 @@ impl Tool for CreateSkillTool {
         // Check for existing skill
         if skill_dir.exists() {
             return Ok(ToolOutput::error(format!(
-                "Skill '{name}' already exists at {}. Choose a different name.",
-                skill_dir.display()
+                "Skill '{name}' already exists. Choose a different name.",
             )));
         }
 
@@ -168,22 +201,9 @@ impl Tool for CreateSkillTool {
         }
 
         // Symlink guard: verify the created directory is actually inside skills_dir
-        match (skills_dir.canonicalize(), skill_dir.canonicalize()) {
-            (Ok(canonical_parent), Ok(canonical_child)) => {
-                if !canonical_child.starts_with(&canonical_parent) {
-                    let _ = std::fs::remove_dir_all(&skill_dir);
-                    return Ok(ToolOutput::error(
-                        "Skill directory escaped skills root (possible symlink attack).",
-                    ));
-                }
-            }
-            _ => {
-                // If canonicalize fails, the directory doesn't exist as expected
-                let _ = std::fs::remove_dir_all(&skill_dir);
-                return Ok(ToolOutput::error(
-                    "Failed to verify skill directory location.",
-                ));
-            }
+        if let Err(e) = verify_skill_path(&skills_dir, &skill_dir) {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Ok(ToolOutput::error(e));
         }
 
         // Build manifest struct and serialize to TOML (avoids string interpolation injection)
@@ -225,11 +245,10 @@ impl Tool for CreateSkillTool {
         }
 
         Ok(ToolOutput::success(format!(
-            "Created skill '{name}' at {}\n\
+            "Created skill '{name}'.\n\
              Files: skill.toml, system_prompt.md\n\
              The skill will be available after restarting the conversation.\n\
              To add custom tools, create a tools.json file in the skill directory.",
-            skill_dir.display()
         )))
     }
 }
@@ -248,18 +267,6 @@ mod tests {
         (tmp, harness)
     }
 
-    fn ctx_with_home<'a>(harness: &'a TestHarness, home: &'a std::path::Path) -> ToolContext<'a> {
-        ToolContext {
-            db: &harness.db,
-            session_id: "test-session",
-            home_dir: home,
-            core_memory_edit_count: &harness.counter,
-            is_onboarding: false,
-            message_sender: None,
-            embedding_client: None,
-        }
-    }
-
     fn valid_input() -> Value {
         json!({
             "name": "test-skill",
@@ -272,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_success() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
         let output = tool.execute(valid_input(), &ctx).await.unwrap();
 
@@ -281,7 +288,7 @@ mod tests {
             "Expected success, got: {}",
             output.content
         );
-        assert!(output.content.contains("Created skill 'test-skill'"));
+        assert!(output.content.contains("Created skill 'test-skill'"), "Got: {}", output.content);
 
         // Verify files exist
         let skill_dir = tmp.path().join("skills/test-skill");
@@ -302,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_loadable_by_scanner() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
         tool.execute(valid_input(), &ctx).await.unwrap();
 
@@ -320,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_duplicate_name() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
 
         // Create once
@@ -336,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_invalid_names() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
 
         // Empty name
@@ -372,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_empty_inputs() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
 
         // Empty description
@@ -399,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_always_on_no_keywords() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
 
         // always_on=true should work with empty keywords
@@ -421,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_skill_description_with_quotes() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = CreateSkillTool;
 
         // Description with TOML-special characters should not break serialization

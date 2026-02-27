@@ -66,5 +66,18 @@ pub mod test_helpers {
         pub fn ctx_with_onboarding(&self, is_onboarding: bool) -> ToolContext<'_> {
             test_ctx_with_onboarding(&self.db, &self.counter, is_onboarding)
         }
+
+        /// Create a ToolContext with a custom home directory.
+        pub fn ctx_with_home<'a>(&'a self, home: &'a std::path::Path) -> ToolContext<'a> {
+            ToolContext {
+                db: &self.db,
+                session_id: "test-session",
+                home_dir: home,
+                core_memory_edit_count: &self.counter,
+                is_onboarding: false,
+                message_sender: None,
+                embedding_client: None,
+            }
+        }
     }
 }

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::create_skill::validate_skill_name;
+use super::create_skill::{validate_skill_name, verify_skill_path};
 use super::{Tool, ToolContext, ToolOutput};
 
 pub struct ToggleSkillTool;
@@ -49,12 +49,15 @@ impl Tool for ToggleSkillTool {
             return Ok(ToolOutput::error(e));
         }
 
-        let skill_dir = ctx.home_dir.join("skills").join(name);
+        let skills_dir = ctx.home_dir.join("skills");
+        let skill_dir = skills_dir.join(name);
         if !skill_dir.exists() {
-            return Ok(ToolOutput::error(format!(
-                "Skill '{name}' not found at {}.",
-                skill_dir.display()
-            )));
+            return Ok(ToolOutput::error(format!("Skill '{name}' not found.")));
+        }
+
+        // Symlink guard: verify skill dir is actually inside skills_dir
+        if let Err(e) = verify_skill_path(&skills_dir, &skill_dir) {
+            return Ok(ToolOutput::error(e));
         }
 
         let disabled_marker = skill_dir.join(".disabled");
@@ -118,22 +121,10 @@ mod tests {
         (tmp, harness)
     }
 
-    fn ctx_with_home<'a>(harness: &'a TestHarness, home: &'a std::path::Path) -> ToolContext<'a> {
-        ToolContext {
-            db: &harness.db,
-            session_id: "test-session",
-            home_dir: home,
-            core_memory_edit_count: &harness.counter,
-            is_onboarding: false,
-            message_sender: None,
-            embedding_client: None,
-        }
-    }
-
     #[tokio::test]
     async fn test_disable_skill() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = ToggleSkillTool;
 
         let result = tool
@@ -154,7 +145,7 @@ mod tests {
         // Pre-disable the skill
         std::fs::write(tmp.path().join("skills/my-skill/.disabled"), "").unwrap();
 
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = ToggleSkillTool;
 
         let result = tool
@@ -172,7 +163,7 @@ mod tests {
     #[tokio::test]
     async fn test_already_enabled() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = ToggleSkillTool;
 
         let result = tool
@@ -189,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonexistent_skill() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = ToggleSkillTool;
 
         let result = tool
@@ -203,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_name() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = ToggleSkillTool;
 
         let result = tool

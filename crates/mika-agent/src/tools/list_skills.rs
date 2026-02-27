@@ -84,22 +84,10 @@ mod tests {
         (tmp, harness)
     }
 
-    fn ctx_with_home<'a>(harness: &'a TestHarness, home: &'a std::path::Path) -> ToolContext<'a> {
-        ToolContext {
-            db: &harness.db,
-            session_id: "test-session",
-            home_dir: home,
-            core_memory_edit_count: &harness.counter,
-            is_onboarding: false,
-            message_sender: None,
-            embedding_client: None,
-        }
-    }
-
     #[tokio::test]
     async fn test_list_skills_empty() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = ListSkillsTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
@@ -110,7 +98,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_shows_entries() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
 
         // Create a skill
         let skill_dir = tmp.path().join("skills/web-search");
@@ -138,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_tags_builtin() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
 
         // Create a skill with a bundled name
         let skill_dir = tmp.path().join("skills/tmux");
@@ -168,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_tags_custom() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
 
         // Create a skill with a non-bundled name
         let skill_dir = tmp.path().join("skills/my-custom-skill");
@@ -198,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_shows_disabled() {
         let (tmp, harness) = setup();
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
 
         let skill_dir = tmp.path().join("skills/disabled-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();

@@ -3,8 +3,11 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::{Value, json};
 
-use super::create_skill::{MAX_KEYWORDS, MAX_KEYWORD_LEN, validate_skill_name};
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::create_skill::{
+    validate_description, validate_keywords, validate_skill_name, validate_system_prompt,
+    verify_skill_path,
+};
+use super::{Tool, ToolContext, ToolOutput};
 use crate::skills::manifest::SkillManifest;
 
 pub struct UpdateSkillTool;
@@ -78,26 +81,12 @@ impl Tool for UpdateSkillTool {
 
         // Check skill exists
         if !skill_dir.exists() {
-            return Ok(ToolOutput::error(format!(
-                "Skill '{name}' not found at {}.",
-                skill_dir.display()
-            )));
+            return Ok(ToolOutput::error(format!("Skill '{name}' not found.")));
         }
 
         // Symlink guard: verify skill dir is actually inside skills_dir
-        match (skills_dir.canonicalize(), skill_dir.canonicalize()) {
-            (Ok(canonical_parent), Ok(canonical_child)) => {
-                if !canonical_child.starts_with(&canonical_parent) {
-                    return Ok(ToolOutput::error(
-                        "Skill directory escaped skills root (possible symlink attack).",
-                    ));
-                }
-            }
-            _ => {
-                return Ok(ToolOutput::error(
-                    "Failed to verify skill directory location.",
-                ));
-            }
+        if let Err(e) = verify_skill_path(&skills_dir, &skill_dir) {
+            return Ok(ToolOutput::error(e));
         }
 
         let mut updated = Vec::new();
@@ -124,14 +113,8 @@ impl Tool for UpdateSkillTool {
 
             if has_description {
                 let desc = input["description"].as_str().unwrap_or("").trim();
-                if desc.is_empty() {
-                    return Ok(ToolOutput::error("Description cannot be empty."));
-                }
-                if desc.len() > MAX_INPUT_LEN {
-                    return Ok(ToolOutput::error(format!(
-                        "Description too long ({} chars, max {MAX_INPUT_LEN}).",
-                        desc.len()
-                    )));
+                if let Err(e) = validate_description(desc) {
+                    return Ok(ToolOutput::error(e));
                 }
                 manifest.skill.description = desc.to_string();
                 updated.push("description");
@@ -143,22 +126,14 @@ impl Tool for UpdateSkillTool {
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str())
-                            .map(|s| s.to_string())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
                             .collect()
                     })
                     .unwrap_or_default();
 
-                if keywords.len() > MAX_KEYWORDS {
-                    return Ok(ToolOutput::error(format!(
-                        "Too many keywords ({}, max {MAX_KEYWORDS}).",
-                        keywords.len()
-                    )));
-                }
-                if let Some(long) = keywords.iter().find(|k| k.len() > MAX_KEYWORD_LEN) {
-                    return Ok(ToolOutput::error(format!(
-                        "Keyword too long ({} chars, max {MAX_KEYWORD_LEN}).",
-                        long.len()
-                    )));
+                if let Err(e) = validate_keywords(&keywords) {
+                    return Ok(ToolOutput::error(e));
                 }
 
                 manifest.triggers.keywords = keywords;
@@ -174,6 +149,14 @@ impl Tool for UpdateSkillTool {
                 };
                 manifest.skill.always_on = always_on;
                 updated.push("always_on");
+            }
+
+            // Validate post-update state: must have trigger mechanism
+            if manifest.triggers.keywords.is_empty() && !manifest.skill.always_on {
+                return Ok(ToolOutput::error(
+                    "Skill would have no trigger mechanism. \
+                     Either provide keywords or set always_on to true.",
+                ));
             }
 
             let new_toml = match toml::to_string_pretty(&manifest) {
@@ -194,14 +177,8 @@ impl Tool for UpdateSkillTool {
         // Update system_prompt.md if provided
         if has_system_prompt {
             let prompt = input["system_prompt"].as_str().unwrap_or("").trim();
-            if prompt.is_empty() {
-                return Ok(ToolOutput::error("System prompt cannot be empty."));
-            }
-            if prompt.len() > MAX_INPUT_LEN {
-                return Ok(ToolOutput::error(format!(
-                    "System prompt too long ({} chars, max {MAX_INPUT_LEN}).",
-                    prompt.len()
-                )));
+            if let Err(e) = validate_system_prompt(prompt) {
+                return Ok(ToolOutput::error(e));
             }
             if let Err(e) = std::fs::write(skill_dir.join("system_prompt.md"), prompt) {
                 return Ok(ToolOutput::error(format!(
@@ -254,18 +231,6 @@ keywords = ["original"]
         (tmp, harness)
     }
 
-    fn ctx_with_home<'a>(harness: &'a TestHarness, home: &'a std::path::Path) -> ToolContext<'a> {
-        ToolContext {
-            db: &harness.db,
-            session_id: "test-session",
-            home_dir: home,
-            core_memory_edit_count: &harness.counter,
-            is_onboarding: false,
-            message_sender: None,
-            embedding_client: None,
-        }
-    }
-
     fn read_manifest(tmp: &TempDir, name: &str) -> SkillManifest {
         let toml_content =
             std::fs::read_to_string(tmp.path().join("skills").join(name).join("skill.toml"))
@@ -286,7 +251,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_update_system_prompt_only() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -310,7 +275,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_update_description_only() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -334,7 +299,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_update_keywords_only() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -356,7 +321,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_update_always_on() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -377,7 +342,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_update_multiple_fields() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -409,7 +374,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_error_skill_not_found() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -429,7 +394,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_error_no_fields_provided() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -443,7 +408,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_error_invalid_skill_name() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -460,7 +425,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_error_empty_system_prompt() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -477,7 +442,7 @@ keywords = ["original"]
     #[tokio::test]
     async fn test_error_empty_description() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         let output = tool
@@ -492,9 +457,114 @@ keywords = ["original"]
     }
 
     #[tokio::test]
+    async fn test_error_empty_keywords_on_non_always_on() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "keywords": []
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("no trigger mechanism"));
+    }
+
+    #[tokio::test]
+    async fn test_error_whitespace_only_keywords_filtered() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        // All whitespace-only keywords should be filtered, leaving empty list
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "keywords": ["", "  ", "\t"]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("no trigger mechanism"));
+    }
+
+    #[tokio::test]
+    async fn test_empty_keywords_allowed_when_always_on() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "keywords": [],
+                    "always_on": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+        let manifest = read_manifest(&tmp, "test-skill");
+        assert!(manifest.triggers.keywords.is_empty());
+        assert!(manifest.skill.always_on);
+    }
+
+    #[tokio::test]
+    async fn test_error_disable_always_on_with_no_keywords() {
+        // Start with always_on=true and no keywords
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("skills").join("ao-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"[skill]
+name = "ao-skill"
+description = "Always on skill"
+version = "0.1.0"
+always_on = true
+timeout_secs = 30
+
+[triggers]
+keywords = []
+"#,
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "prompt").unwrap();
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        // Setting always_on=false should fail since keywords are empty
+        let output = tool
+            .execute(
+                json!({
+                    "name": "ao-skill",
+                    "always_on": false
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("no trigger mechanism"));
+    }
+
+    #[tokio::test]
     async fn test_toml_roundtrip_preserves_fields() {
         let (tmp, harness) = setup_with_skill("test-skill");
-        let ctx = ctx_with_home(&harness, tmp.path());
+        let ctx = harness.ctx_with_home(tmp.path());
         let tool = UpdateSkillTool;
 
         // Update only description — version, timeout_secs, name should survive

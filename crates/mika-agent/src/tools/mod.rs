@@ -14,8 +14,8 @@ mod set_config;
 mod store_fact;
 mod toggle_skill;
 mod update_core_memory;
-mod update_skill;
 mod update_fact;
+mod update_skill;
 mod write_workspace;
 
 use anyhow::Result;
