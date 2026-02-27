@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -8,6 +8,42 @@ use tracing::{debug, warn};
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const MAX_RETRIES: u32 = 3;
+const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+
+// -- Auth --
+
+/// Anthropic authentication method, auto-detected from token prefix.
+#[derive(Clone)]
+pub enum AnthropicAuth {
+    ApiKey(String),
+    OAuthBearer(String),
+}
+
+impl AnthropicAuth {
+    /// Auto-detect auth method from token prefix.
+    /// Tokens starting with `sk-ant-oat` are OAuth bearer tokens (subscription);
+    /// everything else is treated as a standard API key.
+    pub fn from_token(token: String) -> Self {
+        if token.starts_with(OAUTH_TOKEN_PREFIX) {
+            Self::OAuthBearer(token)
+        } else {
+            Self::ApiKey(token)
+        }
+    }
+
+    /// Return the raw credential string.
+    fn credential(&self) -> &str {
+        match self {
+            Self::ApiKey(k) => k,
+            Self::OAuthBearer(t) => t,
+        }
+    }
+
+    /// Whether this is an OAuth bearer token.
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuthBearer(_))
+    }
+}
 
 // -- Request types --
 
@@ -184,17 +220,24 @@ impl MessagesResponse {
 #[derive(Clone)]
 pub struct ClaudeClient {
     client: reqwest::Client,
-    api_key: String,
+    auth: AnthropicAuth,
     pub model: String,
     pub max_tokens: u32,
 }
 
 impl ClaudeClient {
     pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self> {
-        let api_key = api_key
+        let credential = api_key
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("MIKA_ANTHROPIC_API_KEY is required but not set"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MIKA_ANTHROPIC_API_KEY is required but not set. \
+                     Set it to an API key (sk-ant-api03-...) or OAuth token (sk-ant-oat01-...)."
+                )
+            })?;
+
+        let auth = AnthropicAuth::from_token(credential);
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -203,7 +246,7 @@ impl ClaudeClient {
 
         Ok(Self {
             client,
-            api_key,
+            auth,
             model,
             max_tokens,
         })
@@ -211,10 +254,10 @@ impl ClaudeClient {
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
-        // Validate API key header value upfront (non-retryable configuration error).
-        // Use an opaque message to avoid leaking the actual key value.
-        let api_key_header =
-            HeaderValue::from_str(&self.api_key).context("invalid API key characters")?;
+        // Validate credential header value upfront (non-retryable configuration error).
+        // Use an opaque message to avoid leaking the actual key/token value.
+        let credential_header = HeaderValue::from_str(self.auth.credential())
+            .context("invalid API key/token characters")?;
 
         let mut last_error = None;
 
@@ -229,7 +272,7 @@ impl ClaudeClient {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.send_once(request, api_key_header.clone()).await {
+            match self.send_once(request, credential_header.clone()).await {
                 Ok(response) => {
                     debug!(
                         input_tokens = response.usage.input_tokens,
@@ -247,9 +290,13 @@ impl ClaudeClient {
                     }
                     return Err(match &e {
                         ClaudeApiError::HttpError { status: 401, .. } => {
-                            anyhow::Error::from(e).context(
-                                "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key.",
-                            )
+                            let hint = if self.auth.is_oauth() {
+                                "Authentication failed. Your OAuth token may have expired. \
+                                 Run `claude setup-token` to get a new one, then update MIKA_ANTHROPIC_API_KEY."
+                            } else {
+                                "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key."
+                            };
+                            anyhow::Error::from(e).context(hint)
                         }
                         ClaudeApiError::HttpError { status: 429, .. } => {
                             anyhow::Error::from(e).context(
@@ -296,18 +343,39 @@ impl ClaudeClient {
     async fn send_once(
         &self,
         request: &MessagesRequest,
-        api_key_header: HeaderValue,
+        credential_header: HeaderValue,
     ) -> std::result::Result<MessagesResponse, ClaudeApiError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert("x-api-key", api_key_header);
         headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
 
-        // Extended thinking requires the beta header
+        // Auth headers — OAuth uses Bearer + beta flag; API key uses x-api-key
+        match &self.auth {
+            AnthropicAuth::ApiKey(_) => {
+                headers.insert("x-api-key", credential_header);
+            }
+            AnthropicAuth::OAuthBearer(_) => {
+                let bearer_value =
+                    format!("Bearer {}", self.auth.credential());
+                let bearer = HeaderValue::from_str(&bearer_value)
+                    .expect("already validated credential characters");
+                headers.insert(AUTHORIZATION, bearer);
+            }
+        }
+
+        // Beta headers — collect all needed betas, then set once (avoids insert-replace bug)
+        let mut betas: Vec<&str> = Vec::new();
+        if self.auth.is_oauth() {
+            betas.push("oauth-2025-04-20");
+        }
         if request.thinking.is_some() {
+            betas.push("interleaved-thinking-2025-05-14");
+        }
+        if !betas.is_empty() {
+            let beta_value = betas.join(",");
             headers.insert(
                 "anthropic-beta",
-                HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+                HeaderValue::from_str(&beta_value).expect("static beta values are valid"),
             );
         }
 
@@ -410,7 +478,8 @@ mod tests {
     fn test_new_trims_api_key_whitespace() {
         let client =
             ClaudeClient::new(Some("  sk-ant-test  ".into()), "model".into(), 100).unwrap();
-        assert_eq!(client.api_key, "sk-ant-test");
+        assert_eq!(client.auth.credential(), "sk-ant-test");
+        assert!(!client.auth.is_oauth());
     }
 
     #[test]
@@ -429,6 +498,64 @@ mod tests {
             panic!("should reject None key");
         };
         assert!(e.to_string().contains("required but not set"));
+    }
+
+    // -- AnthropicAuth tests --
+
+    #[test]
+    fn test_auth_auto_detect_api_key() {
+        let auth = AnthropicAuth::from_token("sk-ant-api03-abc123".into());
+        assert!(matches!(auth, AnthropicAuth::ApiKey(_)));
+        assert!(!auth.is_oauth());
+    }
+
+    #[test]
+    fn test_auth_auto_detect_oauth_token() {
+        let auth = AnthropicAuth::from_token("sk-ant-oat01-abc123def456".into());
+        assert!(matches!(auth, AnthropicAuth::OAuthBearer(_)));
+        assert!(auth.is_oauth());
+    }
+
+    #[test]
+    fn test_auth_unknown_prefix_falls_back_to_api_key() {
+        let auth = AnthropicAuth::from_token("some-random-key".into());
+        assert!(matches!(auth, AnthropicAuth::ApiKey(_)));
+        assert!(!auth.is_oauth());
+    }
+
+    #[test]
+    fn test_new_with_oauth_token() {
+        let client = ClaudeClient::new(
+            Some("sk-ant-oat01-test-token".into()),
+            "model".into(),
+            100,
+        )
+        .unwrap();
+        assert!(client.auth.is_oauth());
+    }
+
+    #[test]
+    fn test_new_with_api_key() {
+        let client = ClaudeClient::new(
+            Some("sk-ant-api03-test-key".into()),
+            "model".into(),
+            100,
+        )
+        .unwrap();
+        assert!(!client.auth.is_oauth());
+    }
+
+    #[test]
+    fn test_beta_headers_combine_oauth_and_thinking() {
+        let mut betas: Vec<&str> = Vec::new();
+        betas.push("oauth-2025-04-20");
+        betas.push("interleaved-thinking-2025-05-14");
+        let combined = betas.join(",");
+        assert_eq!(
+            combined,
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14"
+        );
+        assert!(HeaderValue::from_str(&combined).is_ok());
     }
 
     #[test]

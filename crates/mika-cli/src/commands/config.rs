@@ -16,14 +16,14 @@ pub async fn run(args: ConfigArgs, agent_name: &str) -> Result<()> {
             println!("  Max tokens: {}", ctx.settings.claude_max_tokens);
             println!("  Log level:  {}", ctx.settings.log_level);
             println!("  DB path:    {}", ctx.settings.db_path.display());
-            println!(
-                "  API key:    {}",
-                if ctx.settings.anthropic_api_key.is_some() {
-                    "[REDACTED]"
-                } else {
-                    "[NOT SET]"
+            let auth_display = match &ctx.settings.anthropic_api_key {
+                Some(key) if key.trim_start().starts_with("sk-ant-oat") => {
+                    "OAuth token [REDACTED]"
                 }
-            );
+                Some(_) => "API key [REDACTED]",
+                None => "[NOT SET]",
+            };
+            println!("  Auth:       {}", auth_display);
             println!();
         }
         Some(ConfigCommand::Edit) => {

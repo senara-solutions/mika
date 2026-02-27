@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     }
 
     let settings = mika_common::config::Settings::load(&home_dir)
-        .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY and MIKA_INTERNAL_TOKEN.")?;
+        .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY (API key or OAuth token) and MIKA_INTERNAL_TOKEN.")?;
 
     // Server mode uses structured JSON logging
     mika_common::logging::init(&settings.log_level);
