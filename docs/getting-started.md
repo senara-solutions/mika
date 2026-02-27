@@ -20,7 +20,8 @@ This guide walks you through installation, first run, and everyday usage.
   The repository includes a `rust-toolchain.toml` that pins the channel to `1.93`,
   so `cargo` will use it automatically.
 
-- **Anthropic API key:** You need a valid API key from [Anthropic](https://console.anthropic.com/).
+- **Anthropic credential:** You need either an API key from [Anthropic](https://console.anthropic.com/)
+  or a Claude subscription OAuth token (see [Setting up your credentials](#3-setting-up-your-credentials) below).
 
 - **Platform:** Linux or macOS. File permissions (0700 dirs, 0600 files) are
   applied automatically on Unix systems.
@@ -51,20 +52,57 @@ cargo install --path crates/mika-cli
 
 ---
 
-## 3. Setting up your API key
+## 3. Setting up your credentials
 
-Mika reads the Anthropic API key from the `MIKA_ANTHROPIC_API_KEY` environment variable.
-Do NOT put your key in `config.toml` -- it must be set as an environment variable.
+Mika supports two authentication methods. Both use the same environment variable --
+Mika auto-detects which type you provided based on the token prefix.
+
+### Option A: Anthropic API key (default)
+
+Get an API key from [console.anthropic.com](https://console.anthropic.com/). Usage
+is billed to your Anthropic account.
 
 ```sh
-export MIKA_ANTHROPIC_API_KEY="sk-ant-..."
+export MIKA_ANTHROPIC_API_KEY="sk-ant-api03-..."
 ```
 
-Add this to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so it persists:
+### Option B: Claude subscription OAuth token
+
+If you have a Claude Pro/Team/Enterprise subscription, you can use your subscription
+quota instead of a paid API key. This requires the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code).
+
+1. Generate an OAuth token:
+
+   ```sh
+   claude setup-token
+   ```
+
+2. Set the token (it starts with `sk-ant-oat`):
+
+   ```sh
+   export MIKA_ANTHROPIC_API_KEY="sk-ant-oat01-..."
+   ```
+
+OAuth tokens expire periodically. When Mika reports an authentication error,
+re-run `claude setup-token` to get a fresh token.
+
+### Persisting your credential
+
+Do NOT put your credential in `config.toml` -- it must be set as an environment variable.
+Add it to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so it persists:
 
 ```sh
 echo 'export MIKA_ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
+```
+
+### Verifying
+
+Run `mika config` to confirm Mika sees your credential:
+
+```
+anthropic_api_key: OAuth token [REDACTED]   # subscription token
+anthropic_api_key: API key [REDACTED]       # API key
 ```
 
 ---

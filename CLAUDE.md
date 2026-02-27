@@ -76,7 +76,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Environment Variables
 
 See `.env.example` for the full list. Required:
-- `MIKA_ANTHROPIC_API_KEY` — Anthropic API key
+- `MIKA_ANTHROPIC_API_KEY` — Anthropic API key or OAuth subscription token. Auto-detected from prefix: `sk-ant-oat*` → OAuth bearer auth, otherwise → standard API key auth.
 
 Optional (Layer 3 vector search):
 - `MIKA_OPENAI_API_KEY` — OpenAI API key for embedding generation (enables vector similarity in hybrid search)

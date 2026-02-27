@@ -52,7 +52,7 @@ git clone https://github.com/senara-solutions/mika.git
 cd mika
 cargo build --release
 
-# Set your API key
+# Set your Anthropic credential (API key or Claude subscription token)
 export MIKA_ANTHROPIC_API_KEY=sk-ant-...
 
 # Run (auto-setup on first launch)

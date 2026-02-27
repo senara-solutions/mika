@@ -227,7 +227,7 @@ pub const DEFAULT_CONFIG: &str = r#"# Mika configuration
 # Override with MIKA_* environment variables (highest priority).
 #
 # Secrets MUST be set via environment variables, not in this file:
-#   MIKA_ANTHROPIC_API_KEY — Anthropic API key
+#   MIKA_ANTHROPIC_API_KEY — Anthropic API key or OAuth token (sk-ant-oat01-...)
 
 claude_model = "claude-sonnet-4-6"
 claude_max_tokens = 4096
