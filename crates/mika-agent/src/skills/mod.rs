@@ -54,6 +54,26 @@ impl SkillRegistry {
             .filter(|e| e.enabled && e.manifest.skill.always_on)
             .collect()
     }
+
+    /// Return always-on skills that are safe for silent/background mode.
+    ///
+    /// Filters out skills whose tools use `Exec` or `Http` handlers
+    /// (e.g., tmux, shell-exec) since those should not run autonomously
+    /// in heartbeat or reminder contexts without user interaction.
+    pub fn safe_always_on_skills(&self) -> Vec<&SkillEntry> {
+        use crate::skills::manifest::ToolHandler;
+
+        self.skills
+            .iter()
+            .filter(|e| {
+                e.enabled
+                    && e.manifest.skill.always_on
+                    && !e.skill_tools.iter().any(|t| {
+                        matches!(t.handler, ToolHandler::Exec { .. } | ToolHandler::Http { .. })
+                    })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +148,71 @@ mod tests {
     fn test_always_on_skills_empty() {
         let registry = SkillRegistry::empty();
         assert!(registry.always_on_skills().is_empty());
+    }
+
+    #[test]
+    fn test_safe_always_on_skills_filters_exec_and_http() {
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let dummy_def = ToolDefinition {
+            name: "dummy".to_string(),
+            description: "dummy".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        // A safe always-on skill with only builtin tools
+        let mut safe_entry = make_entry("memory", true, true);
+        safe_entry.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Builtin {
+                function: "get_api_spec".to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/memory"),
+        }];
+
+        // An unsafe always-on skill with an exec handler
+        let mut exec_entry = make_entry("tmux", true, true);
+        exec_entry.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Exec {
+                command: "./run.sh".to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/tmux"),
+        }];
+
+        // An unsafe always-on skill with an http handler
+        let mut http_entry = make_entry("webhook", true, true);
+        http_entry.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Http {
+                url: "https://example.com".to_string(),
+                method: "POST".to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/webhook"),
+        }];
+
+        // A safe always-on skill with no tools (prompt-only)
+        let prompt_only = make_entry("guidelines", true, true);
+
+        let registry = SkillRegistry {
+            skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
+        };
+
+        // always_on_skills returns all 4
+        assert_eq!(registry.always_on_skills().len(), 4);
+
+        // safe_always_on_skills filters out exec and http
+        let safe = registry.safe_always_on_skills();
+        assert_eq!(safe.len(), 2);
+        assert_eq!(safe[0].manifest.skill.name, "memory");
+        assert_eq!(safe[1].manifest.skill.name, "guidelines");
+    }
+
+    #[test]
+    fn test_safe_always_on_skills_empty() {
+        let registry = SkillRegistry::empty();
+        assert!(registry.safe_always_on_skills().is_empty());
     }
 }

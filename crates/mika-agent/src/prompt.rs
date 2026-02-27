@@ -249,6 +249,9 @@ pub struct SilentPromptContext<'a> {
     pub timezone: Option<String>,
     /// Whether Telegram integration is configured for outbound delivery.
     pub telegram_configured: bool,
+    /// Whether a message sender is available for outbound delivery.
+    /// When false, the prompt omits instructions to use `send_message`.
+    pub has_message_sender: bool,
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -275,11 +278,19 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
 
     // Silent mode instructions
     prompt.push_str("## Silent Mode\n");
-    prompt.push_str(
-        "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
-         Use the send_message tool to contact the user. If you have nothing worthwhile \
-         to say, simply respond with a brief internal note and do NOT call send_message.\n\n",
-    );
+    if ctx.has_message_sender {
+        prompt.push_str(
+            "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
+             Use the send_message tool to contact the user. If you have nothing worthwhile \
+             to say, simply respond with a brief internal note and do NOT call send_message.\n\n",
+        );
+    } else {
+        prompt.push_str(
+            "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
+             No outbound messaging channel is configured, so you cannot contact the user.\n\
+             Perform any background maintenance (memory updates, fact storage) silently.\n\n",
+        );
+    }
 
     // Trigger-specific context
     prompt.push_str("## Trigger\n");
@@ -480,6 +491,7 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             telegram_configured: false,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -501,6 +513,7 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             telegram_configured: false,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -530,6 +543,7 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             telegram_configured: false,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -650,6 +664,7 @@ mod tests {
             current_utc: test_time(),
             timezone: None,
             telegram_configured: false,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -670,6 +685,7 @@ mod tests {
             current_utc: test_time(),
             timezone: Some("-05:00".to_string()),
             telegram_configured: false,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -837,6 +853,7 @@ max_iterations = 3
             current_utc: test_time(),
             timezone: None,
             telegram_configured: true,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -855,9 +872,32 @@ max_iterations = 3
             current_utc: test_time(),
             timezone: None,
             telegram_configured: false,
+            has_message_sender: true,
         };
 
         let prompt = build_silent_prompt(&ctx);
         assert!(!prompt.contains("## Communication Channel"));
+    }
+
+    #[test]
+    fn test_silent_prompt_omits_send_message_when_no_sender() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: false,
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("## Silent Mode"));
+        assert!(prompt.contains("NOT delivered"));
+        assert!(!prompt.contains("Use the send_message tool"));
+        assert!(prompt.contains("No outbound messaging channel is configured"));
     }
 }

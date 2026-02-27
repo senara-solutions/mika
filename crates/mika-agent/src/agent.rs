@@ -668,13 +668,14 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         current_utc: chrono::Utc::now(),
         timezone: ctx.timezone,
         telegram_configured: chat_id.is_some(),
+        has_message_sender: params.message_sender.is_some(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
-    // Match skills: heartbeat uses always-on skills directly (no fake trigger text),
+    // Match skills: heartbeat uses safe always-on skills (no exec/http handlers),
     // reminders use keyword matching against the reminder message.
     let matched = match &params.trigger {
-        SilentTrigger::Heartbeat => params.skills.always_on_skills(),
+        SilentTrigger::Heartbeat => params.skills.safe_always_on_skills(),
         SilentTrigger::Reminder { message, .. } => params.skills.match_message(message),
     };
     let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
