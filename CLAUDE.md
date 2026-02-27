@@ -28,6 +28,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/brainstorms/` — Decision brainstorm documents
 - `docs/plans/` — Implementation plans
 - `todos/` — Code review findings (tracked as markdown files)
+- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow with doc audit)
 
 ## Conventions
 
@@ -44,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~236 tests)
+- `cargo test` — Run all tests (~475 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
