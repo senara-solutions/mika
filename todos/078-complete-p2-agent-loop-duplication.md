@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "078"
 tags: [code-review, architecture, quality]
@@ -28,10 +28,20 @@ Keep loops separate, extract `prepare_agent_context()` for common setup.
 **Effort:** 45 minutes | **Risk:** Low
 
 ## Acceptance Criteria
-- [ ] No duplicated tool-dispatch loop logic
-- [ ] Both agent modes share the same core loop
-- [ ] Tests pass
+- [x] No duplicated tool-dispatch loop logic
+- [x] Both agent modes share the same core loop
+- [x] Tests pass
 
 ## Work Log
 ### 2026-02-24 - Discovery
 **By:** Claude Code (multi-agent review)
+
+### 2026-02-27 - Implementation
+**By:** Claude Code
+**Actions:** Extracted shared helpers from 3 duplicated agent loops:
+- `AgentContext` struct + `load_agent_context()` — replaces duplicated soul/identity/core_memory/timezone loading
+- `LoopMode` enum (Conversation/Silent/Team) — parameterizes behavioral differences (thinking, usage tracking, follow-up, DB saves)
+- `LoopResult` struct — unified return type from the shared loop
+- `run_loop()` — single tool-step loop used by all 3 variants
+- Each `_inner` function reduced to thin dispatcher: load context → build prompt → call `run_loop` → map result
+- 842 → 738 lines (~12% reduction), all 475 tests pass, clippy clean on agent.rs

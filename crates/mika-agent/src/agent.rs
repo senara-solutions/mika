@@ -37,6 +37,211 @@ pub struct AgentOutput {
     pub usage: Option<mika_common::claude::Usage>,
 }
 
+// -- Shared helpers --
+
+/// Shared context loaded from the agent's home directory and database.
+struct AgentContext {
+    soul_content: String,
+    identity: prompt::Identity,
+    core_memory: Vec<crate::db::CoreMemoryEntry>,
+    timezone: Option<String>,
+}
+
+async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
+    let soul_content = tokio::fs::read_to_string(home_dir.join("soul.md"))
+        .await
+        .unwrap_or_default();
+    let identity = prompt::load_identity_async(home_dir).await;
+    let core_memory = db.get_all_core_memory().await?;
+    let timezone = db.get_customer_config("timezone").await?;
+    Ok(AgentContext {
+        soul_content,
+        identity,
+        core_memory,
+        timezone,
+    })
+}
+
+/// Parameterizes behavioral differences between the three agent loop variants.
+enum LoopMode<'a> {
+    /// Standard conversation: captures thinking, tracks usage, saves to DB, follows up on empty.
+    Conversation { channel_type: &'a str },
+    /// Silent background task: saves to DB but no thinking/usage/follow-up.
+    Silent { channel_type: &'a str },
+    /// Team sub-agent: follows up on empty but no thinking/usage/DB saves.
+    Team,
+}
+
+impl LoopMode<'_> {
+    fn capture_thinking(&self) -> bool {
+        matches!(self, Self::Conversation { .. })
+    }
+
+    fn track_usage(&self) -> bool {
+        matches!(self, Self::Conversation { .. })
+    }
+
+    fn follow_up_on_empty(&self) -> bool {
+        matches!(self, Self::Conversation { .. } | Self::Team)
+    }
+
+    fn channel_type(&self) -> Option<&str> {
+        match self {
+            Self::Conversation { channel_type } | Self::Silent { channel_type } => {
+                Some(channel_type)
+            }
+            Self::Team => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Conversation { .. } => "agent",
+            Self::Silent { .. } => "silent agent",
+            Self::Team => "team agent",
+        }
+    }
+}
+
+/// Result from the shared tool-step loop.
+struct LoopResult {
+    text: Option<String>,
+    thinking: Option<String>,
+    usage: Option<mika_common::claude::Usage>,
+    max_steps_exceeded: bool,
+}
+
+/// Shared tool-step loop used by all three agent variants.
+///
+/// Iterates up to `MAX_TOOL_STEPS`, dispatching tool calls and collecting the
+/// final text response. Behavior is parameterized by `LoopMode`.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    claude: &ClaudeClient,
+    tools: &ToolRegistry,
+    skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
+    skill_timeout: u64,
+    tool_ctx: &ToolContext<'_>,
+    request: &mut MessagesRequest,
+    mode: &LoopMode<'_>,
+    db: &AsyncDatabase,
+) -> Result<LoopResult> {
+    let mut tool_use_occurred = false;
+    let mut follow_up_attempted = false;
+    let mut last_usage = None;
+    let mut thinking_text = None;
+
+    for step in 0..MAX_TOOL_STEPS {
+        debug!(
+            step,
+            label = mode.label(),
+            messages_len = request.messages.len(),
+            "agent loop step"
+        );
+
+        let response = claude.send_message(request).await?;
+
+        if mode.track_usage() {
+            last_usage = Some(response.usage.clone());
+        }
+
+        if mode.capture_thinking() && step == 0 {
+            thinking_text = response.thinking();
+        }
+
+        match response.stop_reason {
+            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                let text = response.text();
+
+                if !text.is_empty() {
+                    if let Some(ct) = mode.channel_type() {
+                        db.save_message("assistant", &text, ct).await?;
+                    }
+                    info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
+                    return Ok(LoopResult {
+                        text: Some(text),
+                        thinking: thinking_text,
+                        usage: last_usage,
+                        max_steps_exceeded: false,
+                    });
+                }
+
+                if !mode.follow_up_on_empty() {
+                    info!(step, label = mode.label(), "agent done");
+                    return Ok(LoopResult {
+                        text: None,
+                        thinking: None,
+                        usage: None,
+                        max_steps_exceeded: false,
+                    });
+                }
+
+                // Tool-only turn with no text: re-prompt once for acknowledgment
+                if tool_use_occurred && !follow_up_attempted {
+                    follow_up_attempted = true;
+                    debug!(
+                        step,
+                        stop_reason = ?response.stop_reason,
+                        label = mode.label(),
+                        "injecting follow-up after empty tool response"
+                    );
+                    request.messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Blocks(response.content),
+                    });
+                    request.messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(
+                            "[Briefly confirm what you just did.]".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+
+                if tool_use_occurred {
+                    warn!(
+                        step,
+                        label = mode.label(),
+                        "agent returned empty text after follow-up"
+                    );
+                }
+                info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
+                return Ok(LoopResult {
+                    text: None,
+                    thinking: thinking_text,
+                    usage: last_usage,
+                    max_steps_exceeded: false,
+                });
+            }
+            StopReason::ToolUse => {
+                tool_use_occurred = true;
+                process_tool_calls(
+                    response.content,
+                    tools,
+                    skill_tool_map,
+                    skill_timeout,
+                    tool_ctx,
+                    request,
+                )
+                .await;
+            }
+        }
+    }
+
+    warn!(
+        label = mode.label(),
+        "agent exceeded {MAX_TOOL_STEPS} steps"
+    );
+    Ok(LoopResult {
+        text: None,
+        thinking: thinking_text,
+        usage: last_usage,
+        max_steps_exceeded: true,
+    })
+}
+
+// -- Conversation Agent Loop --
+
 /// Check if this is a new user (user_summary still at default value).
 /// Used by both CLI and server to set `is_onboarding` on agent params.
 pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
@@ -104,10 +309,10 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
             // Post-turn compaction: summarize old messages if threshold exceeded.
             // Runs inline (not spawned) — acceptable latency for CLI mode.
             // Server mode sets skip_compaction=true and spawns compaction outside the agent lock.
-            if !params.skip_compaction {
-                if let Err(e) = compaction::maybe_compact(params.db, params.claude).await {
-                    warn!(error = %e, "post-turn compaction failed");
-                }
+            if !params.skip_compaction
+                && let Err(e) = compaction::maybe_compact(params.db, params.claude).await
+            {
+                warn!(error = %e, "post-turn compaction failed");
             }
             Ok(output)
         }
@@ -139,22 +344,16 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let tools = params.tools;
     let channel_type = params.channel_type;
 
-    // Load context: soul, identity, core memory → build system prompt
-    let soul_content = tokio::fs::read_to_string(params.home_dir.join("soul.md"))
-        .await
-        .unwrap_or_default();
-    let identity = prompt::load_identity_async(params.home_dir).await;
-    let core_memory = db.get_all_core_memory().await?;
-    let timezone = db.get_customer_config("timezone").await?;
+    let ctx = load_agent_context(db, params.home_dir).await?;
 
     let chat_id = db.get_customer_config("chat_id").await?;
     let prompt_ctx = prompt::PromptContext {
-        soul_content: &soul_content,
-        identity: &identity,
-        core_memory: &core_memory,
+        soul_content: &ctx.soul_content,
+        identity: &ctx.identity,
+        core_memory: &ctx.core_memory,
         is_onboarding: params.is_onboarding,
         current_utc: chrono::Utc::now(),
-        timezone,
+        timezone: ctx.timezone,
         global_home_dir: Some(params.home_dir),
         channel_type: Some(params.channel_type),
         telegram_configured: chat_id.is_some(),
@@ -228,9 +427,6 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         claude.max_tokens
     };
 
-    // Build the request once; only messages changes between iterations.
-    // send_message takes a reference, so we push new messages directly onto
-    // the original to avoid rebuilding system (~4KB) and tool_defs each iteration.
     let mut request = MessagesRequest {
         model: claude.model.clone(),
         max_tokens,
@@ -244,89 +440,33 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         thinking: params.thinking.clone(),
     };
 
-    let mut tool_use_occurred = false;
-    let mut follow_up_attempted = false;
-    let mut last_usage = None;
-    let mut thinking_text = None;
+    let mode = LoopMode::Conversation { channel_type };
+    let result = run_loop(
+        claude,
+        tools,
+        &skill_tool_map,
+        skill_timeout,
+        &tool_ctx,
+        &mut request,
+        &mode,
+        db,
+    )
+    .await?;
 
-    for step in 0..MAX_TOOL_STEPS {
-        debug!(
-            step,
-            messages_len = request.messages.len(),
-            "agent loop step"
-        );
-
-        let response = claude.send_message(&request).await?;
-        last_usage = Some(response.usage.clone());
-
-        // Capture thinking from first response only (subsequent steps are tool-use follow-ups)
-        if step == 0 {
-            thinking_text = response.thinking();
-        }
-
-        match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                let text = response.text();
-                if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type).await?;
-                    info!(step, stop_reason = ?response.stop_reason, "agent done");
-                    return Ok(AgentOutput {
-                        text: Some(text),
-                        thinking: thinking_text,
-                        usage: last_usage,
-                    });
-                }
-
-                // Tool-only turn with no text: re-prompt once for acknowledgment
-                if tool_use_occurred && !follow_up_attempted {
-                    follow_up_attempted = true;
-                    debug!(step, stop_reason = ?response.stop_reason, "injecting follow-up after empty tool response");
-                    request.messages.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::Blocks(response.content),
-                    });
-                    request.messages.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Text(
-                            "[Briefly confirm what you just did.]".to_string(),
-                        ),
-                    });
-                    continue;
-                }
-
-                if tool_use_occurred {
-                    warn!(step, stop_reason = ?response.stop_reason, "agent returned empty text after follow-up");
-                }
-                info!(step, stop_reason = ?response.stop_reason, "agent done");
-                return Ok(AgentOutput {
-                    text: None,
-                    thinking: thinking_text,
-                    usage: last_usage,
-                });
-            }
-            StopReason::ToolUse => {
-                tool_use_occurred = true;
-                process_tool_calls(
-                    response.content,
-                    tools,
-                    &skill_tool_map,
-                    skill_timeout,
-                    &tool_ctx,
-                    &mut request,
-                )
-                .await;
-            }
-        }
+    if result.max_steps_exceeded {
+        let fallback = "I need a moment to think about that. Let me get back to you.";
+        db.save_message("assistant", fallback, channel_type).await?;
+        return Ok(AgentOutput {
+            text: Some(fallback.to_string()),
+            thinking: result.thinking,
+            usage: result.usage,
+        });
     }
 
-    // Exceeded max steps
-    warn!("agent loop exceeded {MAX_TOOL_STEPS} steps");
-    let fallback = "I need a moment to think about that. Let me get back to you.";
-    db.save_message("assistant", fallback, channel_type).await?;
     Ok(AgentOutput {
-        text: Some(fallback.to_string()),
-        thinking: thinking_text,
-        usage: last_usage,
+        text: result.text,
+        thinking: result.thinking,
+        usage: result.usage,
     })
 }
 
@@ -499,14 +639,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     let claude = params.claude;
     let tools = params.tools;
 
-    // Build silent-mode system prompt
-    let soul_content = tokio::fs::read_to_string(params.home_dir.join("soul.md"))
-        .await
-        .unwrap_or_default();
-    let identity = prompt::load_identity_async(params.home_dir).await;
-    let core_memory = db.get_all_core_memory().await?;
+    let ctx = load_agent_context(db, params.home_dir).await?;
     let pending_commitments = db.list_commitments("pending").await?;
-    let timezone = db.get_customer_config("timezone").await?;
 
     let trigger_context = match &params.trigger {
         SilentTrigger::Heartbeat => {
@@ -526,13 +660,13 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
 
     let chat_id = db.get_customer_config("chat_id").await?;
     let silent_ctx = prompt::SilentPromptContext {
-        soul_content: &soul_content,
-        identity: &identity,
-        core_memory: &core_memory,
+        soul_content: &ctx.soul_content,
+        identity: &ctx.identity,
+        core_memory: &ctx.core_memory,
         pending_commitments: &pending_commitments,
         trigger_context: &trigger_context,
         current_utc: chrono::Utc::now(),
-        timezone,
+        timezone: ctx.timezone,
         telegram_configured: chat_id.is_some(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
@@ -584,36 +718,19 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         thinking: None,
     };
 
-    for step in 0..MAX_TOOL_STEPS {
-        debug!(step, channel_type, "silent agent step");
+    let mode = LoopMode::Silent { channel_type };
+    run_loop(
+        claude,
+        tools,
+        &skill_tool_map,
+        skill_timeout,
+        &tool_ctx,
+        &mut request,
+        &mode,
+        db,
+    )
+    .await?;
 
-        let response = claude.send_message(&request).await?;
-
-        match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                // Save the assistant's internal text (not delivered to user)
-                let text = response.text();
-                if !text.is_empty() {
-                    db.save_message("assistant", &text, channel_type).await?;
-                }
-                info!(step, channel_type, "silent agent done");
-                return Ok(());
-            }
-            StopReason::ToolUse => {
-                process_tool_calls(
-                    response.content,
-                    tools,
-                    &skill_tool_map,
-                    skill_timeout,
-                    &tool_ctx,
-                    &mut request,
-                )
-                .await;
-            }
-        }
-    }
-
-    warn!(channel_type, "silent agent exceeded {MAX_TOOL_STEPS} steps");
     Ok(())
 }
 
@@ -666,21 +783,15 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
     let claude = params.claude;
     let tools = params.tools;
 
-    // Load context from agent's home
-    let soul_content = tokio::fs::read_to_string(params.home_dir.join("soul.md"))
-        .await
-        .unwrap_or_default();
-    let identity = prompt::load_identity_async(params.home_dir).await;
-    let core_memory = params.db.get_all_core_memory().await?;
-    let timezone = params.db.get_customer_config("timezone").await?;
+    let ctx = load_agent_context(params.db, params.home_dir).await?;
 
     let prompt_ctx = prompt::PromptContext {
-        soul_content: &soul_content,
-        identity: &identity,
-        core_memory: &core_memory,
+        soul_content: &ctx.soul_content,
+        identity: &ctx.identity,
+        core_memory: &ctx.core_memory,
         is_onboarding: false,
         current_utc: chrono::Utc::now(),
-        timezone,
+        timezone: ctx.timezone,
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
         telegram_configured: false,
@@ -728,66 +839,27 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         thinking: None,
     };
 
-    let mut tool_use_occurred = false;
-    let mut follow_up_attempted = false;
+    let mode = LoopMode::Team;
+    let result = run_loop(
+        claude,
+        tools,
+        &skill_tool_map,
+        skill_timeout,
+        &tool_ctx,
+        &mut request,
+        &mode,
+        params.db,
+    )
+    .await?;
 
-    for step in 0..MAX_TOOL_STEPS {
-        debug!(step, "team agent step");
-
-        let response = claude.send_message(&request).await?;
-
-        match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                let text = response.text();
-                if !text.is_empty() {
-                    info!(step, "team agent done");
-                    return Ok(Some(text));
-                }
-
-                // Tool-only turn with no text: re-prompt once for acknowledgment
-                if tool_use_occurred && !follow_up_attempted {
-                    follow_up_attempted = true;
-                    debug!(
-                        step,
-                        "team agent: injecting follow-up after empty tool response"
-                    );
-                    request.messages.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::Blocks(response.content),
-                    });
-                    request.messages.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Text(
-                            "[Briefly confirm what you just did.]".to_string(),
-                        ),
-                    });
-                    continue;
-                }
-
-                if tool_use_occurred {
-                    warn!(step, "team agent returned empty text after follow-up");
-                }
-                info!(step, "team agent done");
-                return Ok(None);
-            }
-            StopReason::ToolUse => {
-                tool_use_occurred = true;
-                process_tool_calls(
-                    response.content,
-                    tools,
-                    &skill_tool_map,
-                    skill_timeout,
-                    &tool_ctx,
-                    &mut request,
-                )
-                .await;
-            }
-        }
+    if result.max_steps_exceeded {
+        return Ok(Some("Agent exceeded maximum tool steps.".to_string()));
     }
 
-    warn!("team agent exceeded {MAX_TOOL_STEPS} steps");
-    Ok(Some("Agent exceeded maximum tool steps.".to_string()))
+    Ok(result.text)
 }
+
+// -- Skill helpers --
 
 /// Build a lookup map from tool name → ResolvedSkillTool for matched skills.
 fn build_skill_tool_map<'a>(matched: &[&'a SkillEntry]) -> HashMap<String, &'a ResolvedSkillTool> {
