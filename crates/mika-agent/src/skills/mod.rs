@@ -69,7 +69,10 @@ impl SkillRegistry {
                 e.enabled
                     && e.manifest.skill.always_on
                     && !e.skill_tools.iter().any(|t| {
-                        matches!(t.handler, ToolHandler::Exec { .. } | ToolHandler::Http { .. })
+                        matches!(
+                            t.handler,
+                            ToolHandler::Exec { .. } | ToolHandler::Http { .. }
+                        )
                     })
             })
             .collect()

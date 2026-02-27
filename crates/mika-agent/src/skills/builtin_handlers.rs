@@ -48,9 +48,7 @@ pub async fn execute(
 fn truncate_output(output: &mut ToolOutput) {
     if output.content.len() > MAX_OUTPUT_LEN {
         output.content.truncate(MAX_OUTPUT_LEN);
-        output
-            .content
-            .push_str("\n... (truncated at 10000 chars)");
+        output.content.push_str("\n... (truncated at 10000 chars)");
     }
 }
 

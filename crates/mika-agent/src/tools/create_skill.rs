@@ -288,7 +288,11 @@ mod tests {
             "Expected success, got: {}",
             output.content
         );
-        assert!(output.content.contains("Created skill 'test-skill'"), "Got: {}", output.content);
+        assert!(
+            output.content.contains("Created skill 'test-skill'"),
+            "Got: {}",
+            output.content
+        );
 
         // Verify files exist
         let skill_dir = tmp.path().join("skills/test-skill");

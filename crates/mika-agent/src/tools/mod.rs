@@ -1,6 +1,7 @@
 mod cancel_reminder;
 mod create_reminder;
 mod create_skill;
+mod delete_skill;
 mod get_config;
 mod list_reminders;
 mod list_skills;
@@ -195,6 +196,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
     registry.register(Box::new(send_message::SendMessageTool));
     registry.register(Box::new(create_skill::CreateSkillTool));
+    registry.register(Box::new(delete_skill::DeleteSkillTool));
     registry.register(Box::new(list_skills::ListSkillsTool));
     registry.register(Box::new(toggle_skill::ToggleSkillTool));
     registry.register(Box::new(update_skill::UpdateSkillTool));
