@@ -7,7 +7,7 @@ Slash commands are client-side actions executed directly in the Mika TUI. They a
 database and renders output in-place, while typing a regular message (no `/` prefix)
 sends it to the Claude-backed agent loop as usual.
 
-All 13 commands are defined in a single `COMMANDS` array
+All 19 commands are defined in a single `COMMANDS` array
 (`crates/mika-cli/src/tui/commands/mod.rs`), dispatched through pattern matching in
 `handlers.rs`, and surfaced via an autocomplete popup driven by `autocomplete.rs`.
 
@@ -23,7 +23,7 @@ The TUI provides a filtered autocomplete popup for slash commands.
 
 **How it works:**
 
-1. Type `/` -- a popup appears listing all 13 commands.
+1. Type `/` -- a popup appears listing all 19 commands.
 2. Continue typing to narrow the list. For example, `/me` narrows to `/memory`.
    Matching works on both command names and aliases (e.g., typing `/q` matches
    `/exit` via its `q` alias).
@@ -151,11 +151,25 @@ Configuration: Model: claude-sonnet-4-6 | Home: /home/sami/.mika | Session: a1b2
 
 ### /model
 
-Show the currently active Claude model.
+Show or switch the currently active Claude model. Without arguments, displays the
+current model. With an argument, switches to that model immediately.
 
-**Aliases:** None | **Arguments:** None
+**Aliases:** None | **Arguments:** `[sonnet|opus|haiku]` (optional)
 
-Output: `Current model: claude-sonnet-4-6`
+**Show current model:**
+```
+/model
+→ Current model: claude-sonnet-4-6
+```
+
+**Switch model:**
+```
+/model opus
+→ Switched to claude-opus-4-6.
+```
+
+Recognized shortcuts: `sonnet` = `claude-sonnet-4-6`, `opus` = `claude-opus-4-6`,
+`haiku` = `claude-haiku-4-5`. Full model IDs (e.g., `claude-sonnet-4-6`) also work.
 
 ---
 
@@ -201,6 +215,104 @@ Skill: web_search
 
 Errors: `Usage: /skill <name>` or `No skill found with name 'foo'. Use /skills to list all loaded skills.`
 
+---
+
+### /switch
+
+Switch to a different agent by name. Tears down the current agent worker and
+initializes a new one. Conversation history is preserved across switches.
+
+**Aliases:** `/agent` | **Arguments:** `<name>` (required)
+
+```
+/switch work
+→ Switched to agent 'work' (claude-sonnet-4-6).
+```
+
+Errors: `Usage: /switch <agent_name>` or `Failed to switch agent: ...`
+
+---
+
+### /agents
+
+List all available agents (subdirectories of `~/.mika/agents/`).
+
+**Aliases:** None | **Arguments:** None
+
+---
+
+### /teams
+
+List all available team workflows (subdirectories of `~/.mika/teams/`).
+
+**Aliases:** None | **Arguments:** None
+
+---
+
+### /team
+
+Run a team workflow with a specified goal. Dispatches to the team engine for
+multi-agent orchestrated execution.
+
+**Aliases:** None | **Arguments:** `<name> "<goal>"` (required)
+
+---
+
+### /think
+
+Set the extended thinking level for the current session. Without arguments, shows
+the current level. With `off`, disables thinking. With a level and optional prompt,
+either sets a persistent level or triggers a single thinking turn.
+
+**Aliases:** `/t` | **Arguments:** `[low|medium|high|off] [prompt]` (optional)
+
+**Show current level:**
+```
+/think
+→ Thinking: off
+```
+
+**Set persistent level:**
+```
+/think high
+→ Thinking set to high (16000 tokens). All future messages will use this level.
+```
+
+**Think once with a prompt:**
+```
+/think medium What is the meaning of life?
+```
+This sends the prompt with the specified thinking level but does not change the
+persistent setting.
+
+**Disable thinking:**
+```
+/think off
+→ Thinking disabled.
+```
+
+Budget tokens by level: `low` = 4000, `medium` = 10000, `high` = 16000.
+
+---
+
+### /attach
+
+Attach an image file to the next message. Supports PNG, JPG, GIF, and WEBP formats
+up to 10MB. Magic bytes are validated against the file extension.
+
+**Aliases:** `/img` | **Arguments:** `<path>` (required)
+
+```
+/attach ~/photos/screenshot.png
+→ Attached: screenshot.png (245KB)
+```
+
+Errors: `Usage: /attach <file_path>` or `Failed to load image: ...`
+
+Images can also be pasted from the clipboard via Ctrl+V. The TUI tries arboard
+first, then falls back to xclip/wl-paste on Linux. If the clipboard has no image,
+a system message suggests using `/attach` instead.
+
 ## Keyboard Shortcuts
 
 Complete key bindings for the Mika TUI. These apply regardless of slash commands.
@@ -223,6 +335,7 @@ Complete key bindings for the Mika TUI. These apply regardless of slash commands
 | PageDown    | Scroll message history down (5 lines)                  |
 | Up          | Previous input history entry (when input is empty)     |
 | Down        | Next input history entry (when input is empty)         |
+| Ctrl+V      | Paste image from clipboard (falls back to text paste)  |
 
 Note: Enter and slash commands only execute when the agent status is Idle. If the
 agent is busy processing a turn, Enter has no effect.
