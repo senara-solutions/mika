@@ -80,7 +80,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
-| `anthropic_api_key` | `Option<String>` | None | `MIKA_ANTHROPIC_API_KEY` | Anthropic API key. Required for any command that calls the Claude API. |
+| `anthropic_api_key` | `Option<String>` | None | `MIKA_ANTHROPIC_API_KEY` | Anthropic API key or OAuth subscription token. Auto-detected from prefix (`sk-ant-oat` = OAuth, otherwise = API key). Required for any command that calls the Claude API. |
 | `claude_model` | `String` | `claude-sonnet-4-6` | `MIKA_CLAUDE_MODEL` | Claude model ID to use for inference. |
 | `claude_max_tokens` | `u32` | `4096` | `MIKA_CLAUDE_MAX_TOKENS` | Maximum tokens for Claude responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
@@ -97,7 +97,12 @@ defaults to `~/.mika/`.
 ### Security notes
 
 - `anthropic_api_key` and `internal_token` are redacted in `Debug` output
-  (printed as `[REDACTED]`).
+  (printed as `[REDACTED]`). The `mika config` command distinguishes between
+  credential types: `OAuth token [REDACTED]` or `API key [REDACTED]`.
+- `anthropic_api_key` accepts both standard API keys and OAuth subscription
+  tokens. Mika detects the type from the `sk-ant-oat` prefix and adjusts the
+  HTTP auth scheme automatically (Bearer + `anthropic-beta` header for OAuth,
+  `x-api-key` header for standard keys).
 - Secrets should be set via environment variables, never committed to config files.
 - `internal_token` is validated on load: if present, it must be exactly 64
   hex characters. Invalid values cause an immediate startup error.
@@ -233,7 +238,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key or OAuth subscription token |
 | `MIKA_CLAUDE_MODEL` | No | Override model (default: `claude-sonnet-4-6`) |
 | `MIKA_CLAUDE_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
 | `MIKA_DB_PATH` | No | Override database path |
@@ -247,7 +252,7 @@ are required for inter-service communication:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key or OAuth subscription token |
 | `MIKA_ROUTING_URL` | Yes | Gateway URL for outbound message delivery |
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for gateway auth |
 | `MIKA_CUSTOMER_ID` | Yes | Customer identifier for this container |
