@@ -912,3 +912,216 @@ fn inject_skills_and_resolve_tools(
 
     tool_defs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::index::{ResolvedSkillTool, SkillEntry};
+    use crate::skills::manifest::{SkillInfo, SkillManifest, ToolHandler, Triggers};
+    use crate::test_utils::test_helpers::test_async_db;
+    use mika_common::claude::ToolDefinition;
+    use std::path::PathBuf;
+
+    // -- LoopMode tests --
+
+    #[test]
+    fn loop_mode_conversation_properties() {
+        let mode = LoopMode::Conversation {
+            channel_type: "cli",
+        };
+        assert!(mode.is_conversation());
+        assert!(mode.follow_up_on_empty());
+        assert_eq!(mode.channel_type(), Some("cli"));
+        assert_eq!(mode.label(), "agent");
+    }
+
+    #[test]
+    fn loop_mode_silent_properties() {
+        let mode = LoopMode::Silent {
+            channel_type: "heartbeat",
+        };
+        assert!(!mode.is_conversation());
+        assert!(!mode.follow_up_on_empty());
+        assert_eq!(mode.channel_type(), Some("heartbeat"));
+        assert_eq!(mode.label(), "silent agent");
+    }
+
+    #[test]
+    fn loop_mode_team_properties() {
+        let mode = LoopMode::Team;
+        assert!(!mode.is_conversation());
+        assert!(mode.follow_up_on_empty());
+        assert_eq!(mode.channel_type(), None);
+        assert_eq!(mode.label(), "team agent");
+    }
+
+    // -- check_onboarding tests --
+
+    #[tokio::test]
+    async fn check_onboarding_true_when_no_core_memory() {
+        let db = test_async_db();
+        // Fresh DB has no core memory — should be onboarding
+        assert!(check_onboarding(&db).await);
+    }
+
+    #[tokio::test]
+    async fn check_onboarding_true_when_default_value() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        // Seeded with defaults — still onboarding
+        assert!(check_onboarding(&db).await);
+    }
+
+    #[tokio::test]
+    async fn check_onboarding_false_when_customized() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        db.set_core_memory("user_summary", "Sam, software engineer")
+            .await
+            .unwrap();
+        assert!(!check_onboarding(&db).await);
+    }
+
+    // -- Skill helper tests --
+
+    fn make_skill_entry(name: &str, timeout: u64, tool_names: &[&str]) -> SkillEntry {
+        SkillEntry {
+            manifest: SkillManifest {
+                skill: SkillInfo {
+                    name: name.to_string(),
+                    description: format!("{name} skill"),
+                    version: "0.1.0".to_string(),
+                    always_on: false,
+                    timeout_secs: timeout,
+                },
+                triggers: Triggers {
+                    keywords: vec![name.to_string()],
+                },
+            },
+            dir: PathBuf::from(format!("/skills/{name}")),
+            keywords_lower: vec![name.to_lowercase()],
+            prompt_snippet: String::new(),
+            skill_tools: tool_names
+                .iter()
+                .map(|tn| ResolvedSkillTool {
+                    definition: ToolDefinition {
+                        name: tn.to_string(),
+                        description: format!("{tn} tool"),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    handler: ToolHandler::Builtin {
+                        function: tn.to_string(),
+                    },
+                    skill_dir: PathBuf::from(format!("/skills/{name}")),
+                })
+                .collect(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn build_skill_tool_map_collects_all_tools() {
+        let s1 = make_skill_entry("search", 30, &["web_search"]);
+        let s2 = make_skill_entry("calc", 10, &["calculate", "convert"]);
+        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        let map = build_skill_tool_map(&matched);
+
+        assert_eq!(map.len(), 3);
+        assert!(map.contains_key("web_search"));
+        assert!(map.contains_key("calculate"));
+        assert!(map.contains_key("convert"));
+    }
+
+    #[test]
+    fn build_skill_tool_map_empty_when_no_skills() {
+        let matched: Vec<&SkillEntry> = vec![];
+        let map = build_skill_tool_map(&matched);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn max_skill_timeout_returns_largest() {
+        let s1 = make_skill_entry("fast", 10, &[]);
+        let s2 = make_skill_entry("slow", 120, &[]);
+        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        assert_eq!(max_skill_timeout(&matched), 120);
+    }
+
+    #[test]
+    fn max_skill_timeout_fallback_when_empty() {
+        let matched: Vec<&SkillEntry> = vec![];
+        assert_eq!(max_skill_timeout(&matched), TOOL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn inject_skills_appends_prompt_and_tool_defs() {
+        let tools = ToolRegistry::new();
+        let mut entry = make_skill_entry("test", 30, &["test_tool"]);
+        entry.prompt_snippet = "Use this skill to test things.".to_string();
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = "Base prompt.".to_string();
+
+        let defs = inject_skills_and_resolve_tools(&matched, &tools, &mut system);
+
+        // Should append skill snippet to system prompt
+        assert!(system.contains("test Skill"));
+        assert!(system.contains("Use this skill to test things."));
+        // Should include the skill tool definition
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "test_tool");
+    }
+
+    #[test]
+    fn inject_skills_deduplicates_tool_names() {
+        let mut tools = ToolRegistry::new();
+        // Register a builtin tool named "overlap"
+        struct DummyTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for DummyTool {
+            fn name(&self) -> &str {
+                "overlap"
+            }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "overlap".to_string(),
+                    description: "builtin overlap".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &crate::tools::ToolContext<'_>,
+            ) -> Result<crate::tools::ToolOutput> {
+                Ok(crate::tools::ToolOutput::success("ok"))
+            }
+        }
+        tools.register(Box::new(DummyTool));
+
+        // Skill also defines a tool named "overlap"
+        let entry = make_skill_entry("dupe", 30, &["overlap"]);
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = String::new();
+
+        let defs = inject_skills_and_resolve_tools(&matched, &tools, &mut system);
+
+        // "overlap" should appear exactly once (builtin wins)
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].description, "builtin overlap");
+    }
+
+    #[test]
+    fn inject_skills_skips_empty_snippets() {
+        let tools = ToolRegistry::new();
+        let entry = make_skill_entry("quiet", 30, &["quiet_tool"]);
+        // prompt_snippet is empty by default from make_skill_entry
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = "Base.".to_string();
+
+        inject_skills_and_resolve_tools(&matched, &tools, &mut system);
+
+        // Should NOT add skill context section when snippet is empty
+        assert!(!system.contains("quiet Skill"));
+        assert_eq!(system, "Base.");
+    }
+}

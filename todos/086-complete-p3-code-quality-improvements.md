@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p3
 issue_id: "086"
 tags: [code-review, quality]
@@ -33,10 +33,16 @@ Address items individually as time permits. Highest value:
 **Effort:** Various, 30min-2hrs each | **Risk:** Low
 
 ## Acceptance Criteria
-- [ ] At least reminder query duplication addressed
-- [ ] Agent loop has basic test coverage
+- [x] At least reminder query duplication addressed
+- [x] Agent loop has basic test coverage
 
 ## Work Log
 ### 2026-02-24 - Discovery
 **By:** Claude Code (multi-agent review)
 **Actions:** Consolidated 11 minor findings from 7 review agents
+
+### 2026-02-27 - Resolution
+**By:** Claude Code
+**Actions:**
+- Verified reminder query duplication already resolved via `ReminderFilter` enum + `query_reminders()` helper (db.rs:848-877)
+- Added 13 unit tests to agent.rs `#[cfg(test)]` module covering: LoopMode variant properties (3 tests), check_onboarding async behavior (3 tests), build_skill_tool_map (2 tests), max_skill_timeout (2 tests), inject_skills_and_resolve_tools (3 tests including deduplication and empty snippet handling)
