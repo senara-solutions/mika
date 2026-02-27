@@ -652,56 +652,33 @@ fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
         None => (args, ""),
     };
 
-    // If first word is a valid level...
-    if let Some((budget, level)) = resolve_thinking_level(first) {
-        if rest.is_empty() {
-            // /think high — set persistent level (no prompt)
-            app.thinking_level = Some((budget, level));
+    // Resolve budget, level, and prompt text in one step
+    let (budget, level, prompt) = match resolve_thinking_level(first) {
+        Some((b, l)) if rest.is_empty() => {
+            // /think high — set persistent level, no prompt
+            app.thinking_level = Some((b, l));
             return Some(format!(
-                "Thinking level: {level} ({budget} tokens). All messages will use extended thinking."
+                "Thinking level: {l} ({b} tokens). All messages will use extended thinking."
             ));
         }
+        Some((b, l)) => (b, l, rest),
+        None => (10_000, "medium", args),
+    };
 
-        // /think high <prompt> — one-shot with thinking
-        if app.status != AgentStatus::Idle {
-            return Some("Agent is busy. Wait for the current response to finish.".to_string());
-        }
-
-        app.messages.push(ChatMessage {
-            role: ChatRole::User,
-            content: format!("[think:{level}] {rest}"),
-            rendered: None,
-            channel: None,
-        });
-
-        let images = std::mem::take(&mut app.pending_images);
-        let _ = app.agent_tx.send(AgentRequest::Message {
-            text: rest.to_string(),
-            images,
-            thinking_budget: Some(budget),
-        });
-        app.status = AgentStatus::Thinking;
-        app.scroll_offset = 0;
-        app.needs_redraw = true;
-        return None;
-    }
-
-    // No level prefix — use default medium for one-shot
     if app.status != AgentStatus::Idle {
         return Some("Agent is busy. Wait for the current response to finish.".to_string());
     }
 
-    let (budget, level) = (10_000, "medium");
     app.messages.push(ChatMessage {
         role: ChatRole::User,
-        content: format!("[think:{level}] {args}"),
+        content: format!("[think:{level}] {prompt}"),
         rendered: None,
         channel: None,
     });
 
     let images = std::mem::take(&mut app.pending_images);
     let _ = app.agent_tx.send(AgentRequest::Message {
-        text: args.to_string(),
+        text: prompt.to_string(),
         images,
         thinking_budget: Some(budget),
     });

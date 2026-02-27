@@ -282,31 +282,18 @@ fn encode_rgba_to_attachment(bytes: &[u8], width: usize, height: usize) -> Optio
     })
 }
 
-/// Linux fallback: try reading image from clipboard via xclip.
+/// Validate PNG bytes and convert to an `ImageAttachment`.
 #[cfg(target_os = "linux")]
-fn try_xclip_image() -> Option<ImageAttachment> {
-    let output = std::process::Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() || output.stdout.is_empty() {
-        return None;
-    }
-
-    let data = output.stdout;
+fn png_bytes_to_attachment(data: Vec<u8>) -> Option<ImageAttachment> {
     if data.len() > MAX_IMAGE_BYTES || data.len() < 4 {
         return None;
     }
-    // Validate PNG magic
     if &data[..4] != b"\x89PNG" {
         return None;
     }
-
     let size_bytes = data.len();
     use base64::Engine;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-
     Some(ImageAttachment {
         base64_data,
         media_type: "image/png".to_string(),
@@ -318,6 +305,19 @@ fn try_xclip_image() -> Option<ImageAttachment> {
     })
 }
 
+/// Linux fallback: try reading image from clipboard via xclip.
+#[cfg(target_os = "linux")]
+fn try_xclip_image() -> Option<ImageAttachment> {
+    let output = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    png_bytes_to_attachment(output.stdout)
+}
+
 /// Linux fallback: try reading image from clipboard via wl-paste (Wayland).
 #[cfg(target_os = "linux")]
 fn try_wl_paste_image() -> Option<ImageAttachment> {
@@ -325,32 +325,10 @@ fn try_wl_paste_image() -> Option<ImageAttachment> {
         .args(["--type", "image/png"])
         .output()
         .ok()?;
-
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
-
-    let data = output.stdout;
-    if data.len() > MAX_IMAGE_BYTES || data.len() < 4 {
-        return None;
-    }
-    if &data[..4] != b"\x89PNG" {
-        return None;
-    }
-
-    let size_bytes = data.len();
-    use base64::Engine;
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-
-    Some(ImageAttachment {
-        base64_data,
-        media_type: "image/png".to_string(),
-        size_bytes,
-        label: format!(
-            "clipboard image ({})",
-            ImageAttachment::format_size(size_bytes)
-        ),
-    })
+    png_bytes_to_attachment(output.stdout)
 }
 
 /// Try to load an image from a file path.

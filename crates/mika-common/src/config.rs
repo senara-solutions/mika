@@ -45,10 +45,6 @@ pub struct Settings {
     #[serde(default)]
     pub openai_api_key: Option<String>,
 
-    /// Brave Search API key (optional; enables web_search skill)
-    #[serde(default)]
-    pub brave_api_key: Option<String>,
-
     /// Embedding model ID (default: text-embedding-3-small)
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
@@ -199,10 +195,6 @@ impl std::fmt::Debug for Settings {
             .field(
                 "openai_api_key",
                 &self.openai_api_key.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "brave_api_key",
-                &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("embedding_model", &self.embedding_model)
             .field("embedding_dimensions", &self.embedding_dimensions)
