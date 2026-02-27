@@ -22,7 +22,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
-- `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup)
+- `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup). TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux).
 - `crates/mika-gateway/` — Gateway: Telegram webhook router, customer pairing, outbound relay (Postgres-backed)
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/brainstorms/` — Decision brainstorm documents
@@ -45,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~538 tests)
+- `cargo test` — Run all tests (~545 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
@@ -81,6 +81,9 @@ See `.env.example` for the full list. Required:
 
 Optional (Layer 3 vector search):
 - `MIKA_OPENAI_API_KEY` — OpenAI API key for embedding generation (enables vector similarity in hybrid search)
+
+Optional (web search):
+- `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
 
 Server mode additionally requires:
 - `MIKA_ROUTING_URL` — Gateway URL for outbound message delivery
