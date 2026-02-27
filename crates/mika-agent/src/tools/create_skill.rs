@@ -9,13 +9,13 @@ use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
 pub struct CreateSkillTool;
 
 /// Maximum allowed length for skill name.
-const MAX_SKILL_NAME_LEN: usize = 50;
+pub(super) const MAX_SKILL_NAME_LEN: usize = 50;
 
 /// Maximum number of keywords per skill.
-const MAX_KEYWORDS: usize = 50;
+pub(super) const MAX_KEYWORDS: usize = 50;
 
 /// Maximum length of a single keyword.
-const MAX_KEYWORD_LEN: usize = 100;
+pub(super) const MAX_KEYWORD_LEN: usize = 100;
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
 pub(super) fn validate_skill_name(name: &str) -> Result<(), String> {

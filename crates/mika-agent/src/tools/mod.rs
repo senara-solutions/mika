@@ -14,6 +14,7 @@ mod set_config;
 mod store_fact;
 mod toggle_skill;
 mod update_core_memory;
+mod update_skill;
 mod update_fact;
 mod write_workspace;
 
@@ -196,6 +197,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(create_skill::CreateSkillTool));
     registry.register(Box::new(list_skills::ListSkillsTool));
     registry.register(Box::new(toggle_skill::ToggleSkillTool));
+    registry.register(Box::new(update_skill::UpdateSkillTool));
     registry.register(Box::new(get_config::GetConfigTool));
     registry.register(Box::new(set_config::SetConfigTool));
     registry
