@@ -1080,7 +1080,7 @@ mod tests {
     // -- LoopMode tests --
 
     #[test]
-    fn loop_mode_conversation_properties() {
+    fn test_loop_mode_conversation_properties() {
         let mode = LoopMode::Conversation {
             channel_type: "cli",
         };
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_mode_silent_properties() {
+    fn test_loop_mode_silent_properties() {
         let mode = LoopMode::Silent {
             channel_type: "heartbeat",
         };
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_mode_team_properties() {
+    fn test_loop_mode_team_properties() {
         let mode = LoopMode::Team;
         assert!(!mode.is_conversation());
         assert!(mode.follow_up_on_empty());
@@ -1113,14 +1113,14 @@ mod tests {
     // -- check_onboarding tests --
 
     #[tokio::test]
-    async fn check_onboarding_true_when_no_core_memory() {
+    async fn test_check_onboarding_true_when_no_core_memory() {
         let db = test_async_db();
         // Fresh DB has no core memory — should be onboarding
         assert!(check_onboarding(&db).await);
     }
 
     #[tokio::test]
-    async fn check_onboarding_true_when_default_value() {
+    async fn test_check_onboarding_true_when_default_value() {
         let db = test_async_db();
         db.seed_core_memory(None).await.unwrap();
         // Seeded with defaults — still onboarding
@@ -1128,13 +1128,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_onboarding_false_when_customized() {
+    async fn test_check_onboarding_false_when_customized() {
         let db = test_async_db();
         db.seed_core_memory(None).await.unwrap();
         db.set_core_memory("user_summary", "Sam, software engineer")
             .await
             .unwrap();
         assert!(!check_onboarding(&db).await);
+    }
+
+    #[tokio::test]
+    async fn test_check_onboarding_true_even_when_other_sections_customized() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        db.set_core_memory("persona", "Custom persona")
+            .await
+            .unwrap();
+        assert!(check_onboarding(&db).await);
     }
 
     // -- Skill helper tests --
@@ -1175,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_tool_map_collects_all_tools() {
+    fn test_build_skill_tool_map_collects_all_tools() {
         let s1 = make_skill_entry("search", 30, &["web_search"]);
         let s2 = make_skill_entry("calc", 10, &["calculate", "convert"]);
         let matched: Vec<&SkillEntry> = vec![&s1, &s2];
@@ -1188,14 +1198,24 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_tool_map_empty_when_no_skills() {
+    fn test_build_skill_tool_map_empty_when_no_skills() {
         let matched: Vec<&SkillEntry> = vec![];
         let map = build_skill_tool_map(&matched);
         assert!(map.is_empty());
     }
 
     #[test]
-    fn max_skill_timeout_returns_largest() {
+    fn test_build_skill_tool_map_last_skill_wins_on_collision() {
+        let s1 = make_skill_entry("alpha", 10, &["shared_tool"]);
+        let s2 = make_skill_entry("beta", 20, &["shared_tool"]);
+        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        let map = build_skill_tool_map(&matched);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["shared_tool"].skill_dir, PathBuf::from("/skills/beta"));
+    }
+
+    #[test]
+    fn test_max_skill_timeout_returns_largest() {
         let s1 = make_skill_entry("fast", 10, &[]);
         let s2 = make_skill_entry("slow", 120, &[]);
         let matched: Vec<&SkillEntry> = vec![&s1, &s2];
@@ -1203,13 +1223,13 @@ mod tests {
     }
 
     #[test]
-    fn max_skill_timeout_fallback_when_empty() {
+    fn test_max_skill_timeout_fallback_when_empty() {
         let matched: Vec<&SkillEntry> = vec![];
         assert_eq!(max_skill_timeout(&matched), TOOL_TIMEOUT_SECS);
     }
 
     #[test]
-    fn inject_skills_appends_prompt_and_tool_defs() {
+    fn test_inject_skills_appends_prompt_and_tool_defs() {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("test", 30, &["test_tool"]);
         entry.prompt_snippet = "Use this skill to test things.".to_string();
@@ -1227,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_skills_deduplicates_tool_names() {
+    fn test_inject_skills_deduplicates_tool_names() {
         let mut tools = ToolRegistry::new();
         // Register a builtin tool named "overlap"
         struct DummyTool;
@@ -1266,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_skills_skips_empty_snippets() {
+    fn test_inject_skills_skips_empty_snippets() {
         let tools = ToolRegistry::new();
         let entry = make_skill_entry("quiet", 30, &["quiet_tool"]);
         // prompt_snippet is empty by default from make_skill_entry
@@ -1283,12 +1303,12 @@ mod tests {
     // -- ToolCallSummary and metadata tests --
 
     #[test]
-    fn truncate_summary_no_op_for_short_strings() {
+    fn test_truncate_summary_no_op_for_short_strings() {
         assert_eq!(truncate_summary("hello", 10), "hello");
     }
 
     #[test]
-    fn truncate_summary_truncates_long_strings() {
+    fn test_truncate_summary_truncates_long_strings() {
         let long = "a".repeat(300);
         let result = truncate_summary(&long, 200);
         assert!(result.len() <= 200);
@@ -1296,13 +1316,13 @@ mod tests {
     }
 
     #[test]
-    fn truncate_summary_exact_length_not_truncated() {
+    fn test_truncate_summary_exact_length_not_truncated() {
         let exact = "a".repeat(200);
         assert_eq!(truncate_summary(&exact, 200), exact);
     }
 
     #[test]
-    fn truncate_summary_safe_with_multibyte_chars() {
+    fn test_truncate_summary_safe_with_multibyte_chars() {
         // Euro sign is 3 bytes: \xe2\x82\xac
         let s = "\u{20AC}".repeat(100); // 300 bytes, 100 chars
         let result = truncate_summary(&s, 10);
@@ -1312,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_summary_safe_with_emoji() {
+    fn test_truncate_summary_safe_with_emoji() {
         // Emoji is 4 bytes
         let s = "Hello \u{1F600} world! More text here to exceed the limit easily.";
         let result = truncate_summary(&s, 10);
@@ -1321,12 +1341,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_metadata_json_empty_returns_none() {
+    fn test_tool_calls_metadata_json_empty_returns_none() {
         assert!(tool_calls_metadata_json(&[]).is_none());
     }
 
     #[test]
-    fn tool_calls_metadata_json_single_call() {
+    fn test_tool_calls_metadata_json_single_call() {
         let summaries = vec![ToolCallSummary {
             step: 0,
             name: "search_memory".to_string(),
@@ -1343,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_metadata_json_respects_max_size() {
+    fn test_tool_calls_metadata_json_respects_max_size() {
         // Create many tool calls with large outputs to exceed TOOL_METADATA_MAX
         let summaries: Vec<ToolCallSummary> = (0..50)
             .map(|i| ToolCallSummary {
@@ -1366,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_summary_block_valid_json() {
+    fn test_format_tool_summary_block_valid_json() {
         let json = r#"{"tool_calls":[{"step":0,"name":"tmux_send_command","input_summary":"{\"session\":\"mika\",\"text\":\"cargo test\"}","output_summary":"Command sent","success":true}]}"#;
         let block = format_tool_summary_block(json).unwrap();
         assert!(block.contains("tmux_send_command"));
@@ -1376,14 +1396,14 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_summary_block_failed_tool() {
+    fn test_format_tool_summary_block_failed_tool() {
         let json = r#"{"tool_calls":[{"step":0,"name":"bad_tool","input_summary":"","output_summary":"error","success":false}]}"#;
         let block = format_tool_summary_block(json).unwrap();
         assert!(block.contains("[FAILED]"));
     }
 
     #[test]
-    fn format_tool_summary_block_skips_malformed_entries() {
+    fn test_format_tool_summary_block_skips_malformed_entries() {
         // One good entry, one missing name — should produce partial result
         let json = r#"{"tool_calls":[{"step":0,"name":"good_tool","input_summary":"","output_summary":"ok","success":true},{"step":1,"output_summary":"no name"}]}"#;
         let block = format_tool_summary_block(json).unwrap();
@@ -1392,20 +1412,20 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_summary_block_empty_calls_returns_none() {
+    fn test_format_tool_summary_block_empty_calls_returns_none() {
         let json = r#"{"tool_calls":[]}"#;
         assert!(format_tool_summary_block(json).is_none());
     }
 
     #[test]
-    fn format_tool_summary_block_invalid_json_returns_none() {
+    fn test_format_tool_summary_block_invalid_json_returns_none() {
         assert!(format_tool_summary_block("not json").is_none());
     }
 
     // -- DB metadata integration tests --
 
     #[tokio::test]
-    async fn save_and_load_message_with_metadata() {
+    async fn test_save_and_load_message_with_metadata() {
         let db = test_async_db();
         let metadata = r#"{"tool_calls":[{"step":0,"name":"search_memory","input_summary":"q","output_summary":"found","success":true}]}"#;
         db.save_message_with_metadata(
@@ -1425,7 +1445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_message_without_metadata_loads_as_none() {
+    async fn test_save_message_without_metadata_loads_as_none() {
         let db = test_async_db();
         db.save_message("user", "Hello", "cli").await.unwrap();
 
@@ -1435,7 +1455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_message_with_null_metadata() {
+    async fn test_save_message_with_null_metadata() {
         let db = test_async_db();
         db.save_message_with_metadata("assistant", "No tools used.", "cli", None)
             .await
