@@ -102,6 +102,7 @@ mod tests {
             server_port: 8080,
             internal_token: None,
             openai_api_key: None,
+            brave_api_key: None,
             embedding_model: "text-embedding-3-small".to_string(),
             embedding_dimensions: 512,
             home_dir: PathBuf::from("/tmp"),

@@ -278,6 +278,15 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         ),
     ];
 
+    // Thinking level indicator
+    if let Some((_, level)) = app.thinking_level {
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("think: {level}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
     // Context usage indicator
     if let Some(tokens) = app.context_tokens {
         let limit = crate::tui::app::MODEL_CONTEXT_LIMIT;

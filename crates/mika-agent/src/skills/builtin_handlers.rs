@@ -4,6 +4,8 @@
 //! without spawning a subprocess or making an HTTP call. They have access
 //! to `ToolContext` (for home_dir, etc.) and return `ToolOutput`.
 
+use std::fmt::Write;
+
 use crate::tools::{ToolContext, ToolOutput};
 
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
@@ -20,6 +22,7 @@ pub const KNOWN_BUILTINS: &[&str] = &[
     "get_cli_reference",
     "get_api_spec",
     "get_architecture_overview",
+    "web_search",
 ];
 
 /// Maximum output size from a builtin handler (matches executor::MAX_OUTPUT_LEN).
@@ -38,6 +41,7 @@ pub async fn execute(
         "get_cli_reference" => get_cli_reference(ctx).await,
         "get_api_spec" => get_api_spec(&input),
         "get_architecture_overview" => get_architecture_overview(),
+        "web_search" => web_search(&input).await,
         _ => ToolOutput::error(format!("Unknown builtin function: {function}")),
     };
     truncate_output(&mut output);
@@ -86,6 +90,105 @@ fn get_api_spec(input: &serde_json::Value) -> ToolOutput {
 /// Return the embedded architecture overview.
 fn get_architecture_overview() -> ToolOutput {
     ToolOutput::success(ARCHITECTURE_OVERVIEW.to_string())
+}
+
+/// Search the web using the Brave Search API.
+///
+/// Input: `{"query": "search terms"}`
+/// Requires `MIKA_BRAVE_API_KEY` environment variable.
+async fn web_search(input: &serde_json::Value) -> ToolOutput {
+    let query = match input.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q.trim(),
+        _ => return ToolOutput::error("Missing or empty 'query' parameter.".to_string()),
+    };
+
+    // Enforce input length limit (shared tool validation convention)
+    if query.len() > 10_000 {
+        return ToolOutput::error("Query too long (max 10000 characters).".to_string());
+    }
+
+    let api_key = match std::env::var("MIKA_BRAVE_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => {
+            return ToolOutput::error(
+                "Brave Search API key not configured. \
+                 Set MIKA_BRAVE_API_KEY environment variable. \
+                 Get a free key at https://brave.com/search/api/"
+                    .to_string(),
+            );
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .header("X-Subscription-Token", &api_key)
+        .header("Accept", "application/json")
+        .query(&[("q", query), ("count", "5")])
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return ToolOutput::error("Search request timed out (15s).".to_string());
+        }
+        Err(e) => {
+            return ToolOutput::error(format!("Search request failed: {e}"));
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "Invalid API key. Check MIKA_BRAVE_API_KEY.".to_string(),
+            429 => "Search rate limit exceeded. Try again later.".to_string(),
+            _ => format!("Search API returned HTTP {status}."),
+        };
+        return ToolOutput::error(msg);
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::error(format!("Failed to parse search response: {e}")),
+    };
+
+    format_brave_results(&body, query)
+}
+
+/// Format Brave Search API results into concise, LLM-friendly text.
+fn format_brave_results(body: &serde_json::Value, query: &str) -> ToolOutput {
+    let results = body
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(|r| r.as_array());
+
+    let results = match results {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            return ToolOutput::success(format!("No results found for \"{query}\"."));
+        }
+    };
+
+    let mut out = format!("Search results for \"{query}\":\n");
+
+    for (i, result) in results.iter().enumerate().take(5) {
+        let title = result.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let url = result.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let description = result
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}. {}", i + 1, title);
+        let _ = writeln!(out, "   URL: {url}");
+        if !description.is_empty() {
+            let _ = writeln!(out, "   {description}");
+        }
+    }
+
+    ToolOutput::success(out)
 }
 
 #[cfg(test)]
@@ -147,5 +250,69 @@ mod tests {
         truncate_output(&mut output);
         assert!(output.content.contains("truncated"));
         assert!(output.content.len() < MAX_OUTPUT_LEN + 100);
+    }
+
+    #[tokio::test]
+    async fn test_web_search_missing_query() {
+        let output = web_search(&serde_json::json!({})).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing or empty"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_empty_query() {
+        let output = web_search(&serde_json::json!({"query": "  "})).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing or empty"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_query_too_long() {
+        let long_query = "x".repeat(10_001);
+        let output = web_search(&serde_json::json!({"query": long_query})).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("too long"));
+    }
+
+    #[test]
+    fn test_format_brave_results_empty() {
+        let body = serde_json::json!({"web": {"results": []}});
+        let output = format_brave_results(&body, "test");
+        assert!(!output.is_error);
+        assert!(output.content.contains("No results found"));
+    }
+
+    #[test]
+    fn test_format_brave_results_with_data() {
+        let body = serde_json::json!({
+            "web": {
+                "results": [
+                    {
+                        "title": "Test Result",
+                        "url": "https://example.com",
+                        "description": "A test description"
+                    }
+                ]
+            }
+        });
+        let output = format_brave_results(&body, "test query");
+        assert!(!output.is_error);
+        assert!(output.content.contains("Test Result"));
+        assert!(output.content.contains("https://example.com"));
+        assert!(output.content.contains("A test description"));
+        assert!(output.content.contains("test query"));
+    }
+
+    #[test]
+    fn test_format_brave_results_no_web_key() {
+        let body = serde_json::json!({"query": {}});
+        let output = format_brave_results(&body, "test");
+        assert!(!output.is_error);
+        assert!(output.content.contains("No results found"));
+    }
+
+    #[test]
+    fn test_web_search_in_known_builtins() {
+        assert!(KNOWN_BUILTINS.contains(&"web_search"));
     }
 }

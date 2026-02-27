@@ -71,7 +71,7 @@ async fn spawn_agent_worker(
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
 
     let worker_db = ctx.async_db.clone();
-    let worker_claude = ctx.claude.clone();
+    let mut worker_claude = ctx.claude.clone();
     let worker_tools = tool_registry.clone();
     let worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
@@ -136,6 +136,9 @@ async fn spawn_agent_worker(
                     if agent_tx.send(response).is_err() {
                         break;
                     }
+                }
+                AgentRequest::SetModel { model } => {
+                    worker_claude.model = model;
                 }
                 AgentRequest::Quit => break,
             }

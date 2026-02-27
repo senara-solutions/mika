@@ -64,19 +64,27 @@ fn handle_key_autocomplete(app: &mut App<'_>, key: KeyEvent) {
 /// Key handling when autocomplete is NOT visible (normal mode).
 fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
     // Ctrl+V: check clipboard for image first, else fall through to normal paste
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.code == KeyCode::Char('v')
-        && let Some(attachment) = try_clipboard_image()
-    {
-        if let Some(err) = app.attach_image(attachment) {
-            app.messages.push(crate::tui::app::ChatMessage {
-                role: crate::tui::app::ChatRole::System,
-                content: err,
-                rendered: None,
-                channel: None,
-            });
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
+        match try_clipboard_image() {
+            ClipboardResult::Image(attachment) => {
+                if let Some(err) = app.attach_image(attachment) {
+                    app.messages.push(crate::tui::app::ChatMessage {
+                        role: crate::tui::app::ChatRole::System,
+                        content: err,
+                        rendered: None,
+                        channel: None,
+                    });
+                }
+                return;
+            }
+            ClipboardResult::NoImage => {
+                // No image in clipboard — fall through to text paste
+            }
+            ClipboardResult::Error(msg) => {
+                tracing::debug!("clipboard image failed: {msg}");
+                // Fall through to text paste
+            }
         }
-        return;
     }
 
     // Esc: clear attachments first, then input
@@ -175,35 +183,84 @@ const MAX_IMAGE_DIMENSION: u32 = 8192;
 /// Maximum file size for image loading (10MB).
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
-/// Try to read an image from the system clipboard.
-/// Returns None if no image is available or clipboard is not accessible (e.g., SSH).
-pub fn try_clipboard_image() -> Option<ImageAttachment> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let img = clipboard.get_image().ok()?;
+/// Result of attempting to read an image from the clipboard.
+enum ClipboardResult {
+    /// Successfully read an image.
+    Image(ImageAttachment),
+    /// Clipboard accessible but no image content.
+    NoImage,
+    /// Clipboard not accessible or another error.
+    Error(String),
+}
 
-    // Validate dimensions with safe u32 conversion
-    let width = u32::try_from(img.width).ok()?;
-    let height = u32::try_from(img.height).ok()?;
+/// Try to read an image from the system clipboard.
+///
+/// Tries arboard first, then falls back to xclip/wl-paste on Linux.
+fn try_clipboard_image() -> ClipboardResult {
+    // Try arboard first (works on X11, macOS, Windows)
+    match try_arboard_image() {
+        ClipboardResult::Image(img) => return ClipboardResult::Image(img),
+        ClipboardResult::NoImage => return ClipboardResult::NoImage,
+        ClipboardResult::Error(e) => {
+            tracing::debug!("arboard clipboard failed: {e}, trying xclip/wl-paste fallback");
+        }
+    }
+
+    // Linux fallback: try xclip, then wl-paste
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(img) = try_xclip_image() {
+            return ClipboardResult::Image(img);
+        }
+        if let Some(img) = try_wl_paste_image() {
+            return ClipboardResult::Image(img);
+        }
+    }
+
+    ClipboardResult::Error("clipboard image not available".to_string())
+}
+
+/// Try arboard clipboard image reading.
+fn try_arboard_image() -> ClipboardResult {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(e) => return ClipboardResult::Error(format!("clipboard init: {e}")),
+    };
+
+    let img = match clipboard.get_image() {
+        Ok(img) => img,
+        Err(arboard::Error::ContentNotAvailable) => return ClipboardResult::NoImage,
+        Err(e) => return ClipboardResult::Error(format!("get_image: {e}")),
+    };
+
+    match encode_rgba_to_attachment(&img.bytes, img.width, img.height) {
+        Some(att) => ClipboardResult::Image(att),
+        None => ClipboardResult::Error("image too large or invalid".to_string()),
+    }
+}
+
+/// Encode raw RGBA pixel data into a PNG-based ImageAttachment.
+fn encode_rgba_to_attachment(bytes: &[u8], width: usize, height: usize) -> Option<ImageAttachment> {
+    let width = u32::try_from(width).ok()?;
+    let height = u32::try_from(height).ok()?;
 
     if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
         return None;
     }
 
-    // Reject images exceeding pixel count limit
-    let pixel_count = img.width.checked_mul(img.height)?;
+    let pixel_count = (width as usize).checked_mul(height as usize)?;
     if pixel_count > MAX_IMAGE_PIXELS {
         return None;
     }
 
-    // Estimate PNG size and pre-allocate (RGBA data compresses roughly 2:1)
-    let estimated_size = img.bytes.len() / 2;
+    let estimated_size = bytes.len() / 2;
     let mut png_data = Vec::with_capacity(estimated_size);
     {
         let mut encoder = png::Encoder::new(&mut png_data, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().ok()?;
-        writer.write_image_data(&img.bytes).ok()?;
+        writer.write_image_data(bytes).ok()?;
     }
 
     let size_bytes = png_data.len();
@@ -211,11 +268,79 @@ pub fn try_clipboard_image() -> Option<ImageAttachment> {
         return None;
     }
 
-    // Drop the raw image data before base64 encoding to reduce peak memory
-    drop(img);
-
     use base64::Engine;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&png_data);
+
+    Some(ImageAttachment {
+        base64_data,
+        media_type: "image/png".to_string(),
+        size_bytes,
+        label: format!(
+            "clipboard image ({})",
+            ImageAttachment::format_size(size_bytes)
+        ),
+    })
+}
+
+/// Linux fallback: try reading image from clipboard via xclip.
+#[cfg(target_os = "linux")]
+fn try_xclip_image() -> Option<ImageAttachment> {
+    let output = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+
+    let data = output.stdout;
+    if data.len() > MAX_IMAGE_BYTES || data.len() < 4 {
+        return None;
+    }
+    // Validate PNG magic
+    if &data[..4] != b"\x89PNG" {
+        return None;
+    }
+
+    let size_bytes = data.len();
+    use base64::Engine;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    Some(ImageAttachment {
+        base64_data,
+        media_type: "image/png".to_string(),
+        size_bytes,
+        label: format!(
+            "clipboard image ({})",
+            ImageAttachment::format_size(size_bytes)
+        ),
+    })
+}
+
+/// Linux fallback: try reading image from clipboard via wl-paste (Wayland).
+#[cfg(target_os = "linux")]
+fn try_wl_paste_image() -> Option<ImageAttachment> {
+    let output = std::process::Command::new("wl-paste")
+        .args(["--type", "image/png"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+
+    let data = output.stdout;
+    if data.len() > MAX_IMAGE_BYTES || data.len() < 4 {
+        return None;
+    }
+    if &data[..4] != b"\x89PNG" {
+        return None;
+    }
+
+    let size_bytes = data.len();
+    use base64::Engine;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
     Some(ImageAttachment {
         base64_data,
