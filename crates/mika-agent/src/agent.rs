@@ -73,11 +73,7 @@ enum LoopMode<'a> {
 }
 
 impl LoopMode<'_> {
-    fn capture_thinking(&self) -> bool {
-        matches!(self, Self::Conversation { .. })
-    }
-
-    fn track_usage(&self) -> bool {
+    fn is_conversation(&self) -> bool {
         matches!(self, Self::Conversation { .. })
     }
 
@@ -130,22 +126,24 @@ async fn run_loop(
     let mut follow_up_attempted = false;
     let mut last_usage = None;
     let mut thinking_text = None;
+    let channel_type = mode.channel_type();
 
     for step in 0..MAX_TOOL_STEPS {
         debug!(
             step,
             label = mode.label(),
+            channel_type,
             messages_len = request.messages.len(),
             "agent loop step"
         );
 
         let response = claude.send_message(request).await?;
 
-        if mode.track_usage() {
+        if mode.is_conversation() {
             last_usage = Some(response.usage.clone());
         }
 
-        if mode.capture_thinking() && step == 0 {
+        if mode.is_conversation() && step == 0 {
             thinking_text = response.thinking();
         }
 
@@ -154,10 +152,10 @@ async fn run_loop(
                 let text = response.text();
 
                 if !text.is_empty() {
-                    if let Some(ct) = mode.channel_type() {
+                    if let Some(ct) = channel_type {
                         db.save_message("assistant", &text, ct).await?;
                     }
-                    info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
+                    info!(step, stop_reason = ?response.stop_reason, label = mode.label(), channel_type, "agent done");
                     return Ok(LoopResult {
                         text: Some(text),
                         thinking: thinking_text,
@@ -167,7 +165,7 @@ async fn run_loop(
                 }
 
                 if !mode.follow_up_on_empty() {
-                    info!(step, label = mode.label(), "agent done");
+                    info!(step, label = mode.label(), channel_type, "agent done");
                     return Ok(LoopResult {
                         text: None,
                         thinking: None,
@@ -183,6 +181,7 @@ async fn run_loop(
                         step,
                         stop_reason = ?response.stop_reason,
                         label = mode.label(),
+                        channel_type,
                         "injecting follow-up after empty tool response"
                     );
                     request.messages.push(Message {
@@ -202,10 +201,11 @@ async fn run_loop(
                     warn!(
                         step,
                         label = mode.label(),
+                        channel_type,
                         "agent returned empty text after follow-up"
                     );
                 }
-                info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
+                info!(step, stop_reason = ?response.stop_reason, label = mode.label(), channel_type, "agent done");
                 return Ok(LoopResult {
                     text: None,
                     thinking: thinking_text,
@@ -230,7 +230,7 @@ async fn run_loop(
 
     warn!(
         label = mode.label(),
-        "agent exceeded {MAX_TOOL_STEPS} steps"
+        channel_type, "agent exceeded {MAX_TOOL_STEPS} steps"
     );
     Ok(LoopResult {
         text: None,
