@@ -54,6 +54,12 @@ impl Tool for SendMessageTool {
                 debug!("send_message delivered via sender");
                 Ok(ToolOutput::success("Message sent."))
             }
+            // Intentionally returns success, not error. The message was persisted to the
+            // conversation DB (line above), but external delivery was not attempted because
+            // no outbound sender is configured. Using ToolOutput::error here would cause
+            // Claude to retry the tool call in a loop, since the error is permanent and
+            // not fixable by retrying. The warning text gives Claude enough context to
+            // inform the user.
             None => {
                 warn!("send_message called but no outbound sender configured");
                 Ok(ToolOutput::success(
