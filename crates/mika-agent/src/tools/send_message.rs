@@ -129,6 +129,7 @@ mod tests {
             is_onboarding: false,
             message_sender: Some(mock.clone()),
             embedding_client: None,
+            brave_api_key: None,
         };
         let tool = SendMessageTool;
 

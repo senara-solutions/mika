@@ -38,6 +38,7 @@ pub mod test_helpers {
             is_onboarding,
             message_sender: None,
             embedding_client: None,
+            brave_api_key: None,
         }
     }
 
@@ -77,6 +78,7 @@ pub mod test_helpers {
                 is_onboarding: false,
                 message_sender: None,
                 embedding_client: None,
+                brave_api_key: None,
             }
         }
     }

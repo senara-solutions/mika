@@ -395,6 +395,8 @@ pub struct AgentParams<'a> {
     pub thinking: Option<mika_common::claude::ThinkingConfig>,
     /// User-attached images to include with the message.
     pub user_images: &'a [mika_common::claude::ImageSource],
+    /// Brave Search API key (optional; enables web_search builtin skill).
+    pub brave_api_key: Option<&'a str>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -550,6 +552,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         is_onboarding: params.is_onboarding,
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
+        brave_api_key: params.brave_api_key,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -738,6 +741,7 @@ pub struct SilentAgentParams<'a> {
     pub session_id: &'a str,
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<&'a EmbeddingClient>,
+    pub brave_api_key: Option<&'a str>,
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -859,6 +863,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         is_onboarding: false,
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
+        brave_api_key: params.brave_api_key,
     };
 
     let mut request = MessagesRequest {
@@ -903,6 +908,7 @@ pub struct TeamAgentParams<'a> {
     pub team_context: &'a str,
     pub session_id: &'a str,
     pub embedding_client: Option<&'a EmbeddingClient>,
+    pub brave_api_key: Option<&'a str>,
 }
 
 /// Run an agent within a team execution context.
@@ -980,6 +986,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         is_onboarding: false,
         message_sender: None,
         embedding_client: params.embedding_client,
+        brave_api_key: params.brave_api_key,
     };
 
     let mut request = MessagesRequest {

@@ -49,6 +49,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         embedding_client: embedding_client.as_ref(),
         thinking: None,
         user_images: &[],
+        brave_api_key: ctx.settings.brave_api_key.as_deref(),
     })
     .await?;
 

@@ -49,6 +49,7 @@ fn build_router(state: AppState) -> Router {
 }
 
 /// Initialize a single agent and return its AgentState.
+#[allow(clippy::too_many_arguments)]
 fn init_agent(
     agent_name: &str,
     agent_home: &std::path::Path,
@@ -58,6 +59,7 @@ fn init_agent(
     internal_token: &secrecy::SecretString,
     http_client: &reqwest::Client,
     embedding_client: Option<EmbeddingClient>,
+    brave_api_key: Option<String>,
 ) -> Result<(AgentState, Arc<ReminderScheduler>)> {
     let db = Database::open(&agent_home.join("data").join("mika.db"))?;
     startup::seed_core_memory_if_empty(&db, agent_home)?;
@@ -83,6 +85,7 @@ fn init_agent(
         home_dir: agent_home.to_path_buf(),
         message_sender: Some(scheduler_sender),
         embedding_client: embedding_client.clone(),
+        brave_api_key,
     });
 
     let agent_state = AgentState {
@@ -162,6 +165,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &internal_token,
                 &http_client,
                 embedding_client.clone(),
+                settings.brave_api_key.clone(),
             )?;
             agents.insert(agent::DEFAULT_AGENT.to_string(), Arc::new(agent_state));
             schedulers.push(scheduler);
@@ -178,6 +182,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &internal_token,
                 &http_client,
                 embedding_client.clone(),
+                settings.brave_api_key.clone(),
             ) {
                 Ok((agent_state, scheduler)) => {
                     agents.insert(name.clone(), Arc::new(agent_state));
@@ -208,6 +213,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         gateway_url,
         startup_time: std::time::Instant::now(),
         http_client,
+        brave_api_key: settings.brave_api_key.clone(),
     };
 
     let app = build_router(state);
@@ -277,6 +283,7 @@ mod tests {
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             message_sender: None,
             embedding_client: None,
+            brave_api_key: None,
         });
 
         let agent_state = AgentState {
@@ -301,6 +308,7 @@ mod tests {
             gateway_url: "http://localhost:9999".to_string(),
             startup_time: std::time::Instant::now(),
             http_client: reqwest::Client::new(),
+            brave_api_key: None,
         }
     }
 

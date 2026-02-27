@@ -44,6 +44,7 @@ pub struct ToolContext<'a> {
     pub is_onboarding: bool,
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<&'a EmbeddingClient>,
+    pub brave_api_key: Option<&'a str>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

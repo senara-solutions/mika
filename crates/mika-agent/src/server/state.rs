@@ -43,6 +43,7 @@ pub struct AppState {
     pub gateway_url: String,
     pub startup_time: std::time::Instant,
     pub http_client: reqwest::Client,
+    pub brave_api_key: Option<String>,
 }
 
 impl AppState {

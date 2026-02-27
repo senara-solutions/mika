@@ -156,6 +156,7 @@ pub async fn handle_message(
                 embedding_client: a.embedding_client.as_ref(),
                 thinking: None,
                 user_images: &[],
+                brave_api_key: s.brave_api_key.as_deref(),
             };
 
             match agent::run_agent(&params).await {
@@ -271,6 +272,7 @@ pub async fn handle_heartbeat(
             session_id: &session_id,
             message_sender: Some(sender_arc),
             embedding_client: a.embedding_client.as_ref(),
+            brave_api_key: s.brave_api_key.as_deref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {

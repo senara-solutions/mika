@@ -28,6 +28,7 @@ pub struct ReminderScheduler {
     pub home_dir: PathBuf,
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<EmbeddingClient>,
+    pub brave_api_key: Option<String>,
 }
 
 impl ReminderScheduler {
@@ -171,6 +172,7 @@ impl ReminderScheduler {
                 session_id: &session_id,
                 message_sender: self.message_sender.clone(),
                 embedding_client: self.embedding_client.as_ref(),
+                brave_api_key: self.brave_api_key.as_deref(),
             };
 
             if let Err(e) = run_silent_agent(&params).await {

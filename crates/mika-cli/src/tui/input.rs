@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::Path;
 
-use crate::tui::app::{AgentStatus, App};
+use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::attachment::ImageAttachment;
 
 /// Handle a key event with autocomplete-aware dispatch.
@@ -82,7 +82,15 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
             }
             ClipboardResult::Error(msg) => {
                 tracing::debug!("clipboard image failed: {msg}");
-                // Fall through to text paste
+                app.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content:
+                        "Clipboard image not available. Use /attach <path> to attach an image file."
+                            .to_string(),
+                    rendered: None,
+                    channel: None,
+                });
+                return;
             }
         }
     }
@@ -305,30 +313,51 @@ fn png_bytes_to_attachment(data: Vec<u8>) -> Option<ImageAttachment> {
     })
 }
 
+/// Timeout for clipboard subprocess calls (prevents hanging on broken display servers).
+#[cfg(target_os = "linux")]
+const CLIPBOARD_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run a clipboard command with a timeout. Returns None on timeout or failure.
+#[cfg(target_os = "linux")]
+fn run_clipboard_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use std::process::Command;
+
+    let prog = program.to_string();
+    let arg_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Command::new(&prog).args(&arg_vec).output();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(CLIPBOARD_SUBPROCESS_TIMEOUT) {
+        Ok(Ok(output)) if output.status.success() && !output.stdout.is_empty() => {
+            Some(output.stdout)
+        }
+        Ok(_) => None,
+        Err(_) => {
+            tracing::debug!("{program} clipboard read timed out after 3s");
+            None
+        }
+    }
+}
+
 /// Linux fallback: try reading image from clipboard via xclip.
 #[cfg(target_os = "linux")]
 fn try_xclip_image() -> Option<ImageAttachment> {
-    let output = std::process::Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
-        .output()
-        .ok()?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return None;
-    }
-    png_bytes_to_attachment(output.stdout)
+    let data = run_clipboard_command(
+        "xclip",
+        &["-selection", "clipboard", "-t", "image/png", "-o"],
+    )?;
+    png_bytes_to_attachment(data)
 }
 
 /// Linux fallback: try reading image from clipboard via wl-paste (Wayland).
 #[cfg(target_os = "linux")]
 fn try_wl_paste_image() -> Option<ImageAttachment> {
-    let output = std::process::Command::new("wl-paste")
-        .args(["--type", "image/png"])
-        .output()
-        .ok()?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return None;
-    }
-    png_bytes_to_attachment(output.stdout)
+    let data = run_clipboard_command("wl-paste", &["--type", "image/png"])?;
+    png_bytes_to_attachment(data)
 }
 
 /// Try to load an image from a file path.

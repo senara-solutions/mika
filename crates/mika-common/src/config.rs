@@ -53,6 +53,10 @@ pub struct Settings {
     #[serde(default = "default_embedding_dimensions")]
     pub embedding_dimensions: u32,
 
+    /// Brave Search API key (optional; enables web_search builtin skill)
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -198,6 +202,10 @@ impl std::fmt::Debug for Settings {
             )
             .field("embedding_model", &self.embedding_model)
             .field("embedding_dimensions", &self.embedding_dimensions)
+            .field(
+                "brave_api_key",
+                &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("home_dir", &self.home_dir)
             .finish()
     }

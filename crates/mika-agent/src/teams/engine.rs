@@ -43,6 +43,7 @@ pub struct TeamEngine {
     claude: ClaudeClient,
     tool_registry: Arc<ToolRegistry>,
     progress: Option<Arc<ProgressCallback>>,
+    brave_api_key: Option<String>,
 }
 
 impl TeamEngine {
@@ -123,6 +124,7 @@ impl TeamEngine {
             claude,
             tool_registry: Arc::new(tool_registry),
             progress: progress.map(Arc::new),
+            brave_api_key: settings.brave_api_key.clone(),
         })
     }
 
@@ -245,6 +247,7 @@ impl TeamEngine {
         let run_id = self.run.run_id.clone();
         let progress = self.progress.clone();
         let team_name = self.run.team_name.clone();
+        let brave_api_key = self.brave_api_key.clone();
 
         // Build per-task parameters upfront from self (avoids borrowing self in spawned tasks).
         struct TaskInput {
@@ -296,6 +299,7 @@ impl TeamEngine {
             let run_id = run_id.clone();
             let progress = progress.clone();
             let team_name = team_name.clone();
+            let brave_api_key = brave_api_key.clone();
 
             join_set.spawn(async move {
                 let agent_name = &input.agent_name;
@@ -323,6 +327,7 @@ impl TeamEngine {
                             team_context: &input.context,
                             session_id: &session_id,
                             embedding_client: resources.embedding_client.as_ref(),
+                            brave_api_key: brave_api_key.as_deref(),
                         };
                         crate::agent::run_team_agent(&params)
                             .await
@@ -448,6 +453,7 @@ impl TeamEngine {
             team_context,
             session_id: &session_id,
             embedding_client: resources.embedding_client.as_ref(),
+            brave_api_key: self.brave_api_key.as_deref(),
         };
 
         Ok(crate::agent::run_team_agent(&params)

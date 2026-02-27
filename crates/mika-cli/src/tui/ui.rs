@@ -278,13 +278,21 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         ),
     ];
 
-    // Thinking level indicator
-    if let Some((_, level)) = app.thinking_level {
-        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            format!("think: {level}"),
-            Style::default().fg(Color::Magenta),
-        ));
+    // Thinking level indicator (always shown)
+    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    match app.thinking_level {
+        Some((_, level)) => {
+            spans.push(Span::styled(
+                format!("think: {level}"),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        None => {
+            spans.push(Span::styled(
+                "think: off",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
 
     // Context usage indicator
