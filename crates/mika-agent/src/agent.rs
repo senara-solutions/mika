@@ -110,24 +110,36 @@ pub struct ToolCallSummary {
 }
 
 /// Maximum characters for tool call input summary.
-const TOOL_INPUT_SUMMARY_MAX: usize = 200;
+/// Sized so that MAX_TOOL_STEPS entries fit within TOOL_METADATA_MAX in a single pass.
+const TOOL_INPUT_SUMMARY_MAX: usize = 120;
 /// Maximum characters for tool call output summary.
-const TOOL_OUTPUT_SUMMARY_MAX: usize = 300;
+/// Sized so that MAX_TOOL_STEPS entries fit within TOOL_METADATA_MAX in a single pass.
+const TOOL_OUTPUT_SUMMARY_MAX: usize = 180;
 /// Maximum total characters for serialized tool call metadata.
 const TOOL_METADATA_MAX: usize = 4000;
 
-/// Truncate a string to `max_len` characters, appending "..." if truncated.
+/// Truncate a string to approximately `max_len` bytes, appending "..." if truncated.
+/// Always cuts at a valid UTF-8 char boundary to avoid panics on multi-byte input.
 fn truncate_summary(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        let mut truncated = s[..max_len.saturating_sub(3)].to_string();
-        truncated.push_str("...");
-        truncated
+        let cut = max_len.saturating_sub(3);
+        // Walk back to a valid char boundary
+        let mut boundary = cut;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}...", &s[..boundary])
     }
 }
 
 /// Serialize tool call summaries to JSON metadata string, capped at [`TOOL_METADATA_MAX`].
+///
+/// With `TOOL_INPUT_SUMMARY_MAX=120` and `TOOL_OUTPUT_SUMMARY_MAX=180`, a single pass
+/// fits within the cap for up to `MAX_TOOL_STEPS` entries. If the result still exceeds
+/// the cap (e.g., many entries from a pathological case), entries are dropped from the
+/// tail until the size fits.
 pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String> {
     if summaries.is_empty() {
         return None;
@@ -135,45 +147,59 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
     let wrapper = serde_json::json!({ "tool_calls": summaries });
     let json = serde_json::to_string(&wrapper).ok()?;
     if json.len() <= TOOL_METADATA_MAX {
-        Some(json)
-    } else {
-        // Re-serialize with further truncated summaries to fit
-        let trimmed: Vec<ToolCallSummary> = summaries
-            .iter()
-            .map(|s| ToolCallSummary {
-                step: s.step,
-                name: s.name.clone(),
-                input_summary: truncate_summary(&s.input_summary, 80),
-                output_summary: truncate_summary(&s.output_summary, 100),
-                success: s.success,
-            })
-            .collect();
-        let wrapper = serde_json::json!({ "tool_calls": trimmed });
-        serde_json::to_string(&wrapper).ok()
+        return Some(json);
     }
+    // Drop entries from the tail until under the cap
+    for count in (1..summaries.len()).rev() {
+        let wrapper = serde_json::json!({ "tool_calls": &summaries[..count] });
+        if let Ok(json) = serde_json::to_string(&wrapper) {
+            if json.len() <= TOOL_METADATA_MAX {
+                return Some(json);
+            }
+        }
+    }
+    None
 }
 
 /// Format tool call metadata into a concise summary block for injection into history.
+///
+/// Includes truncated input so the agent can introspect what arguments it passed
+/// (e.g., "what command did you send?") and output for result context.
+/// Malformed entries are skipped rather than causing the entire block to be dropped.
 pub fn format_tool_summary_block(metadata_json: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
     let calls = parsed.get("tool_calls")?.as_array()?;
     if calls.is_empty() {
         return None;
     }
-    let mut parts = Vec::new();
-    for call in calls {
-        let name = call.get("name")?.as_str()?;
-        let output = call
-            .get("output_summary")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let success = call
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let status = if success { "" } else { " [FAILED]" };
-        let short_output = truncate_summary(output, 80);
-        parts.push(format!("{name}{status} → {short_output}"));
+    let parts: Vec<String> = calls
+        .iter()
+        .filter_map(|call| {
+            let name = call.get("name")?.as_str()?;
+            let input = call
+                .get("input_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let output = call
+                .get("output_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let success = call
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let status = if success { "" } else { " [FAILED]" };
+            let short_input = truncate_summary(input, 60);
+            let short_output = truncate_summary(output, 80);
+            if short_input.is_empty() {
+                Some(format!("{name}{status} → {short_output}"))
+            } else {
+                Some(format!("{name}({short_input}){status} → {short_output}"))
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
     }
     Some(format!("\n[Tools used: {}]", parts.join("; ")))
 }
@@ -185,9 +211,7 @@ struct LoopResult {
     usage: Option<mika_common::claude::Usage>,
     max_steps_exceeded: bool,
     /// Accumulated tool call summaries from all loop steps.
-    /// Already persisted to DB via `save_message_with_metadata`; available here
-    /// for callers that need post-loop access (e.g., future team coordination).
-    #[allow(dead_code)]
+    /// Used by the `max_steps_exceeded` fallback path to persist metadata.
     tool_call_summaries: Vec<ToolCallSummary>,
 }
 
@@ -565,7 +589,9 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
 
     if result.max_steps_exceeded {
         let fallback = "I need a moment to think about that. Let me get back to you.";
-        db.save_message("assistant", fallback, channel_type).await?;
+        let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
+        db.save_message_with_metadata("assistant", fallback, channel_type, metadata.as_deref())
+            .await?;
         return Ok(AgentOutput {
             text: Some(fallback.to_string()),
             thinking: result.thinking,
@@ -1276,6 +1302,25 @@ mod tests {
     }
 
     #[test]
+    fn truncate_summary_safe_with_multibyte_chars() {
+        // Euro sign is 3 bytes: \xe2\x82\xac
+        let s = "\u{20AC}".repeat(100); // 300 bytes, 100 chars
+        let result = truncate_summary(&s, 10);
+        assert!(result.ends_with("..."));
+        // Must not panic and must be valid UTF-8
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_summary_safe_with_emoji() {
+        // Emoji is 4 bytes
+        let s = "Hello \u{1F600} world! More text here to exceed the limit easily.";
+        let result = truncate_summary(&s, 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 13); // 10 bytes + "..."
+    }
+
+    #[test]
     fn tool_calls_metadata_json_empty_returns_none() {
         assert!(tool_calls_metadata_json(&[]).is_none());
     }
@@ -1310,16 +1355,22 @@ mod tests {
             })
             .collect();
         let json = tool_calls_metadata_json(&summaries).unwrap();
-        // The function should still produce valid JSON even if it had to re-truncate
+        // Must produce valid JSON within the size cap
+        assert!(
+            json.len() <= TOOL_METADATA_MAX,
+            "metadata exceeded TOOL_METADATA_MAX: {} chars",
+            json.len()
+        );
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["tool_calls"].as_array().unwrap().len() == 50);
+        assert!(!parsed["tool_calls"].as_array().unwrap().is_empty());
     }
 
     #[test]
     fn format_tool_summary_block_valid_json() {
-        let json = r#"{"tool_calls":[{"step":0,"name":"tmux_send_command","input_summary":"{\"session\":\"mika\"}","output_summary":"Command sent","success":true}]}"#;
+        let json = r#"{"tool_calls":[{"step":0,"name":"tmux_send_command","input_summary":"{\"session\":\"mika\",\"text\":\"cargo test\"}","output_summary":"Command sent","success":true}]}"#;
         let block = format_tool_summary_block(json).unwrap();
         assert!(block.contains("tmux_send_command"));
+        assert!(block.contains("cargo test")); // input is now surfaced
         assert!(block.contains("Command sent"));
         assert!(block.starts_with("\n[Tools used:"));
     }
@@ -1329,6 +1380,15 @@ mod tests {
         let json = r#"{"tool_calls":[{"step":0,"name":"bad_tool","input_summary":"","output_summary":"error","success":false}]}"#;
         let block = format_tool_summary_block(json).unwrap();
         assert!(block.contains("[FAILED]"));
+    }
+
+    #[test]
+    fn format_tool_summary_block_skips_malformed_entries() {
+        // One good entry, one missing name — should produce partial result
+        let json = r#"{"tool_calls":[{"step":0,"name":"good_tool","input_summary":"","output_summary":"ok","success":true},{"step":1,"output_summary":"no name"}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(block.contains("good_tool"));
+        // The malformed entry should be skipped, not cause None
     }
 
     #[test]

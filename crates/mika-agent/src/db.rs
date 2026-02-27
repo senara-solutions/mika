@@ -414,13 +414,7 @@ impl Database {
 
     /// Save a conversation message.
     pub fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO conversations (role, content, channel_type) VALUES (?1, ?2, ?3)",
-                rusqlite::params![role, content, channel_type],
-            )
-            .context("failed to insert conversation")?;
-        Ok(self.conn.last_insert_rowid())
+        self.save_message_with_metadata(role, content, channel_type, None)
     }
 
     /// Save a conversation message with optional JSON metadata (e.g., tool call summaries).
