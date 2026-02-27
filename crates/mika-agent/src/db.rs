@@ -988,7 +988,7 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT created_at FROM conversations \
-                 WHERE role = 'user' AND channel_type IN ('cli', 'telegram') \
+                 WHERE role = 'user' \
                  ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
@@ -2523,6 +2523,12 @@ mod tests {
         db.save_message("assistant", "hi", "heartbeat").unwrap();
         let ts2 = db.last_user_message_time().unwrap();
         assert_eq!(ts, ts2); // same as before
+
+        // WhatsApp and API user messages should count (no hardcoded channel filter)
+        db.save_message("user", "hi from whatsapp", "whatsapp").unwrap();
+        assert!(db.last_user_message_time().unwrap().is_some());
+        db.save_message("user", "hi from api", "api").unwrap();
+        assert!(db.last_user_message_time().unwrap().is_some());
     }
 
     #[test]

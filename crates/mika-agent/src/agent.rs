@@ -672,6 +672,14 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
+    // Inject conversation summary so heartbeat/reminder agents have recent context
+    if let Some(summary) = db.load_conversation_summary().await? {
+        system.push_str("\n## Conversation Summary\n");
+        system.push_str("<context type=\"summary\" trust=\"data\">\n");
+        system.push_str(&summary.content);
+        system.push_str("\n</context>\n");
+    }
+
     // Match skills: heartbeat uses safe always-on skills (no exec/http handlers),
     // reminders use keyword matching against the reminder message.
     let matched = match &params.trigger {
