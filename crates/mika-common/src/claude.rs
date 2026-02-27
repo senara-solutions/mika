@@ -12,18 +12,30 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 
 // -- Auth --
 
+/// Check whether a credential string is an OAuth subscription token.
+pub fn is_oauth_token(token: &str) -> bool {
+    token.starts_with(OAUTH_TOKEN_PREFIX)
+}
+
 /// Anthropic authentication method, auto-detected from token prefix.
 #[derive(Clone)]
-pub enum AnthropicAuth {
+enum AnthropicAuth {
     ApiKey(String),
     OAuthBearer(String),
 }
 
+impl std::fmt::Debug for AnthropicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => write!(f, "AnthropicAuth::ApiKey([REDACTED])"),
+            Self::OAuthBearer(_) => write!(f, "AnthropicAuth::OAuthBearer([REDACTED])"),
+        }
+    }
+}
+
 impl AnthropicAuth {
     /// Auto-detect auth method from token prefix.
-    /// Tokens starting with `sk-ant-oat` are OAuth bearer tokens (subscription);
-    /// everything else is treated as a standard API key.
-    pub fn from_token(token: String) -> Self {
+    fn from_token(token: String) -> Self {
         if token.starts_with(OAUTH_TOKEN_PREFIX) {
             Self::OAuthBearer(token)
         } else {
@@ -31,16 +43,8 @@ impl AnthropicAuth {
         }
     }
 
-    /// Return the raw credential string.
-    fn credential(&self) -> &str {
-        match self {
-            Self::ApiKey(k) => k,
-            Self::OAuthBearer(t) => t,
-        }
-    }
-
     /// Whether this is an OAuth bearer token.
-    pub fn is_oauth(&self) -> bool {
+    fn is_oauth(&self) -> bool {
         matches!(self, Self::OAuthBearer(_))
     }
 }
@@ -254,10 +258,18 @@ impl ClaudeClient {
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
-        // Validate credential header value upfront (non-retryable configuration error).
-        // Use an opaque message to avoid leaking the actual key/token value.
-        let credential_header = HeaderValue::from_str(self.auth.credential())
-            .context("invalid API key/token characters")?;
+        // Build the final auth header value upfront (non-retryable configuration error).
+        // OAuth needs "Bearer <token>"; API key is the raw value.
+        // Use an opaque error to avoid leaking the actual key/token value.
+        let auth_header = match &self.auth {
+            AnthropicAuth::ApiKey(k) => {
+                HeaderValue::from_str(k).context("invalid API key characters")?
+            }
+            AnthropicAuth::OAuthBearer(t) => {
+                HeaderValue::from_str(&format!("Bearer {t}"))
+                    .context("invalid OAuth token characters")?
+            }
+        };
 
         let mut last_error = None;
 
@@ -272,7 +284,7 @@ impl ClaudeClient {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.send_once(request, credential_header.clone()).await {
+            match self.send_once(request, auth_header.clone()).await {
                 Ok(response) => {
                     debug!(
                         input_tokens = response.usage.input_tokens,
@@ -343,23 +355,19 @@ impl ClaudeClient {
     async fn send_once(
         &self,
         request: &MessagesRequest,
-        credential_header: HeaderValue,
+        auth_header: HeaderValue,
     ) -> std::result::Result<MessagesResponse, ClaudeApiError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
 
-        // Auth headers — OAuth uses Bearer + beta flag; API key uses x-api-key
+        // Auth header — pre-built in send_message() with correct format for each method
         match &self.auth {
             AnthropicAuth::ApiKey(_) => {
-                headers.insert("x-api-key", credential_header);
+                headers.insert("x-api-key", auth_header);
             }
             AnthropicAuth::OAuthBearer(_) => {
-                let bearer_value =
-                    format!("Bearer {}", self.auth.credential());
-                let bearer = HeaderValue::from_str(&bearer_value)
-                    .expect("already validated credential characters");
-                headers.insert(AUTHORIZATION, bearer);
+                headers.insert(AUTHORIZATION, auth_header);
             }
         }
 
@@ -478,8 +486,7 @@ mod tests {
     fn test_new_trims_api_key_whitespace() {
         let client =
             ClaudeClient::new(Some("  sk-ant-test  ".into()), "model".into(), 100).unwrap();
-        assert_eq!(client.auth.credential(), "sk-ant-test");
-        assert!(!client.auth.is_oauth());
+        assert!(matches!(client.auth, AnthropicAuth::ApiKey(ref k) if k == "sk-ant-test"));
     }
 
     #[test]

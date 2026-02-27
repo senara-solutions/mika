@@ -1,4 +1,5 @@
 use anyhow::Result;
+use mika_common::claude::is_oauth_token;
 use std::process::Command;
 
 use crate::cli::{ConfigArgs, ConfigCommand};
@@ -17,10 +18,13 @@ pub async fn run(args: ConfigArgs, agent_name: &str) -> Result<()> {
             println!("  Log level:  {}", ctx.settings.log_level);
             println!("  DB path:    {}", ctx.settings.db_path.display());
             let auth_display = match &ctx.settings.anthropic_api_key {
-                Some(key) if key.trim_start().starts_with("sk-ant-oat") => {
-                    "OAuth token [REDACTED]"
+                Some(key) => {
+                    if is_oauth_token(key.trim()) {
+                        "OAuth token [REDACTED]"
+                    } else {
+                        "API key [REDACTED]"
+                    }
                 }
-                Some(_) => "API key [REDACTED]",
                 None => "[NOT SET]",
             };
             println!("  Auth:       {}", auth_display);
