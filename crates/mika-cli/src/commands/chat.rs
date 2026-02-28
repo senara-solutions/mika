@@ -8,6 +8,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -49,6 +50,7 @@ async fn spawn_agent_worker(
     let session_id = Uuid::new_v4().to_string();
     let tool_registry = Arc::new(tools::default_tools());
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
+    let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
     let message_sender =
         crate::init::make_message_sender(&ctx.settings, &ctx.async_db, http_client);
@@ -78,12 +80,13 @@ async fn spawn_agent_worker(
     let worker_db = ctx.async_db.clone();
     let mut worker_claude = ctx.claude.clone();
     let worker_tools = tool_registry.clone();
-    let worker_skills = skill_registry.clone();
+    let mut worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
     let worker_embedding = embedding_client;
     let worker_brave_key = brave_api_key;
     let worker_sender = message_sender;
+    let worker_dirty = skills_dirty.clone();
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -92,6 +95,15 @@ async fn spawn_agent_worker(
                     images,
                     thinking_budget,
                 } => {
+                    // Hot-reload skills if the dirty flag was set by a previous turn
+                    let mut skills_reloaded = false;
+                    if worker_dirty.load(Ordering::Acquire) {
+                        worker_dirty.store(false, Ordering::Release);
+                        worker_skills =
+                            Arc::new(SkillRegistry::from_dir(&worker_home.join("skills")));
+                        skills_reloaded = true;
+                    }
+
                     let thinking = thinking_budget.map(|budget| ThinkingConfig::Enabled {
                         budget_tokens: budget,
                     });
@@ -123,8 +135,24 @@ async fn spawn_agent_worker(
                         thinking,
                         user_images: &image_sources,
                         brave_api_key: worker_brave_key.as_deref(),
+                        skills_dirty: &worker_dirty,
                     })
                     .await;
+
+                    // If the dirty flag is set after this turn, rebuild now so we
+                    // can send the updated registry to the TUI for autocomplete.
+                    if worker_dirty.load(Ordering::Acquire) {
+                        worker_dirty.store(false, Ordering::Release);
+                        worker_skills =
+                            Arc::new(SkillRegistry::from_dir(&worker_home.join("skills")));
+                        skills_reloaded = true;
+                    }
+
+                    let updated_skills = if skills_reloaded {
+                        Some(worker_skills.clone())
+                    } else {
+                        None
+                    };
 
                     let response = match result {
                         Ok(output) => AgentResponse {
@@ -132,12 +160,14 @@ async fn spawn_agent_worker(
                             is_error: false,
                             thinking: output.thinking,
                             input_tokens: output.usage.as_ref().map(|u| u.input_tokens),
+                            updated_skills,
                         },
                         Err(e) => AgentResponse {
                             content: format!("{e}"),
                             is_error: true,
                             thinking: None,
                             input_tokens: None,
+                            updated_skills,
                         },
                     };
                     if agent_tx.send(response).is_err() {

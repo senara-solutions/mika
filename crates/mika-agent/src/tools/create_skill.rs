@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 use std::path::Path;
 
@@ -113,8 +114,8 @@ impl Tool for CreateSkillTool {
             name: "create_skill".to_string(),
             description: "Create a new skill with a manifest and system prompt snippet. \
                 Skills extend your capabilities by injecting context into your system prompt \
-                when triggered by keywords. The skill will be available after restarting \
-                the conversation. Note: this creates the skill scaffold only (manifest + prompt). \
+                when triggered by keywords. The skill will be available immediately on \
+                the next turn. Note: this creates the skill scaffold only (manifest + prompt). \
                 To add custom tools with executable handlers, the user must edit the files manually."
                 .to_string(),
             input_schema: json!({
@@ -244,10 +245,12 @@ impl Tool for CreateSkillTool {
             )));
         }
 
+        ctx.skills_dirty.store(true, Ordering::Release);
+
         Ok(ToolOutput::success(format!(
             "Created skill '{name}'.\n\
              Files: skill.toml, system_prompt.md\n\
-             The skill will be available after restarting the conversation.\n\
+             The skill will be available immediately on the next turn.\n\
              To add custom tools, create a tools.json file in the skill directory.",
         )))
     }

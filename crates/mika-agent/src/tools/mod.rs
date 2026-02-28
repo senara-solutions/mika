@@ -26,7 +26,7 @@ use mika_common::config::Settings;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
@@ -45,6 +45,10 @@ pub struct ToolContext<'a> {
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
+    /// Shared flag: set to `true` by skill-modifying tools after successful writes.
+    /// The agent loop coordinator checks this before each turn and rebuilds the
+    /// SkillRegistry if set, enabling hot-reload without restart.
+    pub skills_dirty: &'a AtomicBool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

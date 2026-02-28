@@ -2,6 +2,7 @@ use anyhow::Result;
 use mika_common::claude::ClaudeClient;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tracing::{info, warn};
 
 use mika_common::embedding::EmbeddingClient;
@@ -159,6 +160,7 @@ impl ReminderScheduler {
                 "firing past-due reminder"
             );
             let session_id = format!("reminder-recovery-{}", reminder.id);
+            let skills_dirty = AtomicBool::new(false);
             let params = SilentAgentParams {
                 db: &self.db,
                 claude: &self.claude,
@@ -173,6 +175,7 @@ impl ReminderScheduler {
                 message_sender: self.message_sender.clone(),
                 embedding_client: self.embedding_client.as_ref(),
                 brave_api_key: self.brave_api_key.as_deref(),
+                skills_dirty: &skills_dirty,
             };
 
             if let Err(e) = run_silent_agent(&params).await {

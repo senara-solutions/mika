@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 
 use super::create_skill::{validate_skill_name, verify_skill_path};
 use super::{Tool, ToolContext, ToolOutput};
@@ -20,8 +21,8 @@ impl Tool for DeleteSkillTool {
             name: "delete_skill".to_string(),
             description: "Permanently delete a custom skill. Removes the skill directory and \
                 all its files (manifest, prompt, tools, handlers). Built-in skills cannot be \
-                deleted — use toggle_skill to disable them instead. Changes take effect after \
-                restarting the conversation."
+                deleted — use toggle_skill to disable them instead. Changes take effect \
+                immediately on the next turn."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -69,8 +70,10 @@ impl Tool for DeleteSkillTool {
             return Ok(ToolOutput::error(format!("Failed to delete skill: {e}")));
         }
 
+        ctx.skills_dirty.store(true, Ordering::Release);
+
         Ok(ToolOutput::success(format!(
-            "Deleted skill '{name}'.\nChanges take effect after restarting the conversation."
+            "Deleted skill '{name}'.\nChanges take effect immediately on the next turn."
         )))
     }
 }
@@ -115,7 +118,7 @@ keywords = ["test"]
             .unwrap();
         assert!(!result.is_error, "Got: {}", result.content);
         assert!(result.content.contains("Deleted skill 'my-skill'"));
-        assert!(result.content.contains("restarting the conversation"));
+        assert!(result.content.contains("immediately"));
 
         // Verify directory is gone
         assert!(!tmp.path().join("skills/my-skill").exists());

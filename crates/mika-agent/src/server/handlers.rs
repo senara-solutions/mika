@@ -181,6 +181,18 @@ pub async fn handle_message(
         async move {
             let _lock = lock; // Hold lock for duration of agent loop
 
+            // Hot-reload skills if the dirty flag was set by a previous turn
+            let skills = if a.skills_dirty.load(Ordering::Acquire) {
+                a.skills_dirty.store(false, Ordering::Release);
+                let new = Arc::new(crate::skills::SkillRegistry::from_dir(
+                    &a.home_dir.join("skills"),
+                ));
+                *a.skills.lock().unwrap() = new.clone();
+                new
+            } else {
+                a.skills.lock().unwrap().clone()
+            };
+
             let session_id = uuid::Uuid::new_v4().to_string();
             let is_onboarding = check_onboarding(&a.db).await;
 
@@ -197,7 +209,7 @@ pub async fn handle_message(
                 db: &a.db,
                 claude: &s.claude,
                 tools: &s.tools,
-                skills: &a.skills,
+                skills: &skills,
                 user_message: &req.text,
                 channel_type: &req.channel,
                 session_id: &session_id,
@@ -209,6 +221,7 @@ pub async fn handle_message(
                 thinking: None,
                 user_images: &user_images,
                 brave_api_key: s.brave_api_key.as_deref(),
+                skills_dirty: &a.skills_dirty,
             };
 
             match agent::run_agent(&params).await {
@@ -303,6 +316,19 @@ pub async fn handle_heartbeat(
     let a = agent_state.clone();
     tokio::spawn(async move {
         let _lock = lock;
+
+        // Hot-reload skills if the dirty flag was set by a previous turn
+        let skills = if a.skills_dirty.load(Ordering::Acquire) {
+            a.skills_dirty.store(false, Ordering::Release);
+            let new = Arc::new(crate::skills::SkillRegistry::from_dir(
+                &a.home_dir.join("skills"),
+            ));
+            *a.skills.lock().unwrap() = new.clone();
+            new
+        } else {
+            a.skills.lock().unwrap().clone()
+        };
+
         let session_id = uuid::Uuid::new_v4().to_string();
 
         let sender = GatewayMessageSender::new(
@@ -318,13 +344,14 @@ pub async fn handle_heartbeat(
             db: &a.db,
             claude: &s.claude,
             tools: &s.tools,
-            skills: &a.skills,
+            skills: &skills,
             trigger: SilentTrigger::Heartbeat,
             home_dir: &a.home_dir,
             session_id: &session_id,
             message_sender: Some(sender_arc),
             embedding_client: a.embedding_client.as_ref(),
             brave_api_key: s.brave_api_key.as_deref(),
+            skills_dirty: &a.skills_dirty,
         };
 
         if let Err(e) = run_silent_agent(&params).await {

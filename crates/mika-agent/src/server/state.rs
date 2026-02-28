@@ -14,10 +14,11 @@ use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 
 /// Per-agent state bundle. Each agent gets its own DB, skills, scheduler, and lock.
-#[derive(Clone)]
+/// Always used behind `Arc<AgentState>` — does not need Clone.
 pub struct AgentState {
     pub db: AsyncDatabase,
-    pub skills: Arc<SkillRegistry>,
+    pub skills: std::sync::Mutex<Arc<SkillRegistry>>,
+    pub skills_dirty: Arc<AtomicBool>,
     pub scheduler: Arc<ReminderScheduler>,
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,
     pub home_dir: PathBuf,

@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 
 use super::create_skill::{validate_skill_name, verify_skill_path};
 use super::{Tool, ToolContext, ToolOutput};
@@ -18,7 +19,7 @@ impl Tool for ToggleSkillTool {
         ToolDefinition {
             name: "toggle_skill".to_string(),
             description: "Enable or disable a skill. Disabled skills are not loaded on startup. \
-                Changes take effect after restarting the conversation."
+                Changes take effect immediately on the next turn."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -77,8 +78,9 @@ impl Tool for ToggleSkillTool {
                     "Failed to enable skill '{name}': {e}"
                 )));
             }
+            ctx.skills_dirty.store(true, Ordering::Release);
             Ok(ToolOutput::success(format!(
-                "Skill '{name}' enabled. Changes take effect after restarting the conversation."
+                "Skill '{name}' enabled. Changes take effect immediately on the next turn."
             )))
         } else {
             // Create .disabled marker
@@ -87,8 +89,9 @@ impl Tool for ToggleSkillTool {
                     "Failed to disable skill '{name}': {e}"
                 )));
             }
+            ctx.skills_dirty.store(true, Ordering::Release);
             Ok(ToolOutput::success(format!(
-                "Skill '{name}' disabled. Changes take effect after restarting the conversation."
+                "Skill '{name}' disabled. Changes take effect immediately on the next turn."
             )))
         }
     }
