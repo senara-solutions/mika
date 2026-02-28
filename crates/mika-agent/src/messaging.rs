@@ -9,6 +9,14 @@ use crate::async_db::AsyncDatabase;
 /// Trait for sending outbound messages to the user.
 /// CLI mode uses the fallback in send_message tool; HTTP mode will POST to the gateway.
 ///
+/// **Text-only outbound:** This trait accepts only `text: &str` — agent responses
+/// delivered to users are always plain text. Tool-produced images (e.g., from exec
+/// handler scripts returning `__mika_v1` envelopes, or the file-reader skill) are
+/// included in the Claude API `tool_result` content blocks for the LLM's visual
+/// analysis, but are never forwarded to the end user through this trait. If outbound
+/// image delivery is needed in the future, the `send` signature and the gateway
+/// `/send` payload would need to be extended.
+///
 /// Send + Sync bounds allow `Arc<dyn MessageSender>` in AppState and ToolContext.
 #[async_trait]
 pub trait MessageSender: Send + Sync {

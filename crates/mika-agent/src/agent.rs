@@ -207,7 +207,10 @@ pub fn format_tool_summary_block(metadata_json: &str) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    Some(format!("\n[Tools used: {}]", parts.join("; ")))
+    Some(format!(
+        "\n<context type=\"tool_history\" trust=\"metadata\">\n{}\n</context>",
+        parts.join("\n")
+    ))
 }
 
 /// Result from the shared tool-step loop.
@@ -1516,7 +1519,8 @@ mod tests {
         assert!(block.contains("tmux_send_command"));
         assert!(block.contains("cargo test")); // input is now surfaced
         assert!(block.contains("Command sent"));
-        assert!(block.starts_with("\n[Tools used:"));
+        assert!(block.starts_with("\n<context type=\"tool_history\""));
+        assert!(block.contains("</context>"));
     }
 
     #[test]
