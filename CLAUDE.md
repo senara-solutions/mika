@@ -45,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~579 tests)
+- `cargo test` — Run all tests (~582 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
@@ -88,6 +88,9 @@ Optional (web search):
 Server mode additionally requires:
 - `MIKA_ROUTING_URL` — Gateway URL for outbound message delivery
 - `MIKA_INTERNAL_TOKEN` — Shared secret for Bearer auth between gateway and agent
+
+Optional (startup behavior):
+- `MIKA_DISABLE_BUNDLED_SKILLS` — Skip bundled skill re-sync on startup (default: false). WARNING: do not enable in production — prevents security updates to handler scripts.
 
 Optional (log files — logs go to stdout + file when set):
 - `MIKA_SERVER_LOG_FILE` — File path for mika-server log output

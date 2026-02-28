@@ -460,6 +460,28 @@ Edit `~/.mika/skills/memory/system_prompt.md` to add custom instructions:
 
 Prompt snippet changes take effect on the next message (no restart needed), because `system_prompt.md` is lazy-loaded from disk each turn.
 
+### Disabling bundled skill re-sync
+
+By default, Mika re-syncs bundled skill definitions from compiled-in templates on
+every startup, ensuring template updates propagate to existing installations. If
+you are editing handler scripts and want changes to survive restarts, set:
+
+```toml
+# In ~/.mika/config.toml
+disable_bundled_skills = true
+```
+
+Or via environment variable:
+
+```sh
+export MIKA_DISABLE_BUNDLED_SKILLS=true
+```
+
+**Warning:** Do not enable this in production. It prevents security updates to
+handler scripts (e.g., shell-exec, file-reader) from being applied on restart.
+
+The `mika agents create` command always seeds skills regardless of this setting.
+
 ### Resetting to defaults
 
 To reset a built-in skill to its shipped defaults, delete the skill directory and restart Mika. The bootstrap process will recreate it:
