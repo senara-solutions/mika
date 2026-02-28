@@ -83,6 +83,9 @@ bytes = "1"
 arboard = { version = "3", features = ["image-data"] }
 png = "0.17"
 
+# Unicode
+unicode-width = "0.2"
+
 # Utilities
 rand = "0.9"
 hex = "0.4"

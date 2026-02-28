@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     Tick,
     Resize,
@@ -36,6 +37,11 @@ impl EventReader {
                             }
                             Ok(CrosstermEvent::Paste(text)) => {
                                 if tx.send(AppEvent::Paste(text)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(CrosstermEvent::Mouse(mouse)) => {
+                                if tx.send(AppEvent::Mouse(mouse)).is_err() {
                                     return;
                                 }
                             }

@@ -63,6 +63,99 @@ pub struct AgentResponse {
     pub input_tokens: Option<u32>,
 }
 
+/// Result of navigating forward through input history.
+pub enum HistoryNavResult {
+    /// Navigated to a history entry.
+    Entry(String),
+    /// Cycled past newest — restore the saved draft.
+    Draft(String),
+    /// Already past newest / no-op.
+    None,
+}
+
+/// Shell-like input history with draft saving.
+pub struct InputHistory {
+    entries: Vec<String>,
+    index: Option<usize>,
+    saved_draft: Option<String>,
+    max_size: usize,
+}
+
+impl InputHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: None,
+            saved_draft: None,
+            max_size: 500,
+        }
+    }
+
+    /// Add a sent message to history. Resets navigation state.
+    pub fn push(&mut self, entry: String) {
+        if !entry.is_empty() {
+            self.entries.push(entry);
+            if self.entries.len() > self.max_size {
+                self.entries.remove(0);
+            }
+        }
+        self.index = None;
+        self.saved_draft = None;
+    }
+
+    /// Navigate to the previous (older) history entry.
+    /// On first call, saves `current_input` as a draft.
+    /// Returns the history entry text, or None if history is empty.
+    pub fn previous(&mut self, current_input: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let idx = match self.index {
+            None => {
+                // First time entering history — save current input as draft
+                self.saved_draft = Some(current_input.to_string());
+                self.entries.len() - 1
+            }
+            Some(0) => return Some(self.entries[0].clone()), // Already at oldest — stay
+            Some(i) => i - 1,
+        };
+        self.index = Some(idx);
+        Some(self.entries[idx].clone())
+    }
+
+    /// Navigate to the next (newer) history entry.
+    /// Returns Draft when cycling past newest (restores saved draft).
+    pub fn next(&mut self) -> HistoryNavResult {
+        match self.index {
+            None => HistoryNavResult::None,
+            Some(i) => {
+                if i + 1 >= self.entries.len() {
+                    // Past newest — restore draft
+                    self.index = None;
+                    match self.saved_draft.take() {
+                        Some(draft) => HistoryNavResult::Draft(draft),
+                        None => HistoryNavResult::Draft(String::new()),
+                    }
+                } else {
+                    self.index = Some(i + 1);
+                    HistoryNavResult::Entry(self.entries[i + 1].clone())
+                }
+            }
+        }
+    }
+
+    /// Reset navigation state (called on Esc, etc.).
+    pub fn reset(&mut self) {
+        self.index = None;
+        self.saved_draft = None;
+    }
+
+    /// Whether we are currently browsing history.
+    pub fn is_browsing(&self) -> bool {
+        self.index.is_some()
+    }
+}
+
 /// Main application state.
 pub struct App<'a> {
     pub messages: Vec<ChatMessage>,
@@ -80,8 +173,10 @@ pub struct App<'a> {
 
     // Input
     pub textarea: TextArea<'a>,
-    pub input_history: Vec<String>,
-    pub history_index: Option<usize>,
+    pub history: InputHistory,
+
+    // New message indicator (set when content arrives while user is scrolled up)
+    pub has_new_message: bool,
 
     // Display info
     pub session_id: String,
@@ -166,8 +261,8 @@ impl<'a> App<'a> {
             pending_response: None,
             reveal_index: 0,
             textarea,
-            input_history: Vec::new(),
-            history_index: None,
+            history: InputHistory::new(),
+            has_new_message: false,
             session_id,
             model,
             identity_name,
@@ -224,10 +319,7 @@ impl<'a> App<'a> {
         }
 
         // Save to history
-        if !text.is_empty() {
-            self.input_history.push(text.clone());
-        }
-        self.history_index = None;
+        self.history.push(text.clone());
 
         // Build display message with attachment info
         let display = if self.pending_images.is_empty() {
@@ -286,7 +378,7 @@ impl<'a> App<'a> {
                     rendered: None,
                     channel: None,
                 });
-                self.scroll_offset = 0;
+                self.auto_scroll_to_bottom();
             }
             self.needs_redraw = true;
         }
@@ -384,8 +476,8 @@ impl<'a> App<'a> {
                 });
                 self.reveal_index = 0;
                 self.status = AgentStatus::Idle;
-                // Auto-scroll to bottom
-                self.scroll_offset = 0;
+                // Auto-scroll to bottom (only if user hasn't scrolled up)
+                self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
                 // Update watermark to avoid re-polling our own messages
                 if let Ok(max_id) = self.db.max_message_id().await {
@@ -413,45 +505,53 @@ impl<'a> App<'a> {
 
     pub fn scroll_down(&mut self, amount: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+        if self.scroll_offset == 0 {
+            self.has_new_message = false;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Conditionally scroll to bottom: only if already at bottom.
+    /// If user has scrolled up, set new-message flag instead.
+    pub fn auto_scroll_to_bottom(&mut self) {
+        if self.scroll_offset == 0 {
+            return; // Already at bottom
+        }
+        self.has_new_message = true;
         self.needs_redraw = true;
     }
 
     pub fn history_previous(&mut self) {
-        if self.input_history.is_empty() {
-            return;
+        let current = self.input_text();
+        if let Some(text) = self.history.previous(&current) {
+            self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
+            self.textarea
+                .set_cursor_line_style(ratatui::style::Style::default());
+            self.textarea.set_placeholder_text("Type a message...");
         }
-        let idx = match self.history_index {
-            None => self.input_history.len() - 1,
-            Some(i) => {
-                if i == 0 {
-                    return;
-                }
-                i - 1
-            }
-        };
-        self.history_index = Some(idx);
-        let text = self.input_history[idx].clone();
-        self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
-        self.textarea
-            .set_cursor_line_style(ratatui::style::Style::default());
     }
 
     pub fn history_next(&mut self) {
-        match self.history_index {
-            None => {}
-            Some(i) => {
-                if i + 1 >= self.input_history.len() {
-                    self.history_index = None;
+        match self.history.next() {
+            HistoryNavResult::Entry(text) => {
+                self.textarea =
+                    TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
+                self.textarea
+                    .set_cursor_line_style(ratatui::style::Style::default());
+                self.textarea.set_placeholder_text("Type a message...");
+            }
+            HistoryNavResult::Draft(text) => {
+                if text.is_empty() {
                     self.reset_textarea();
                 } else {
-                    self.history_index = Some(i + 1);
-                    let text = self.input_history[i + 1].clone();
                     self.textarea =
                         TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
                     self.textarea
                         .set_cursor_line_style(ratatui::style::Style::default());
+                    self.textarea.set_placeholder_text("Type a message...");
                 }
             }
+            HistoryNavResult::None => {}
         }
     }
 
@@ -576,5 +676,167 @@ impl<'a> App<'a> {
         self.textarea
             .set_cursor_line_style(ratatui::style::Style::default());
         self.textarea.set_placeholder_text("Type a message...");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === InputHistory tests ===
+
+    #[test]
+    fn test_history_empty_previous_returns_none() {
+        let mut h = InputHistory::new();
+        assert!(h.previous("current").is_none());
+    }
+
+    #[test]
+    fn test_history_push_and_previous() {
+        let mut h = InputHistory::new();
+        h.push("first".to_string());
+        h.push("second".to_string());
+
+        assert_eq!(h.previous("").unwrap(), "second");
+        assert_eq!(h.previous("").unwrap(), "first");
+    }
+
+    #[test]
+    fn test_history_cycling_past_oldest_stays() {
+        let mut h = InputHistory::new();
+        h.push("only".to_string());
+
+        assert_eq!(h.previous("").unwrap(), "only");
+        // Calling previous again stays at oldest
+        assert_eq!(h.previous("").unwrap(), "only");
+    }
+
+    #[test]
+    fn test_history_next_restores_draft() {
+        let mut h = InputHistory::new();
+        h.push("entry1".to_string());
+        h.push("entry2".to_string());
+
+        // Navigate into history (saves "my draft" as draft)
+        assert_eq!(h.previous("my draft").unwrap(), "entry2");
+        assert_eq!(h.previous("my draft").unwrap(), "entry1");
+
+        // Navigate forward
+        match h.next() {
+            HistoryNavResult::Entry(s) => assert_eq!(s, "entry2"),
+            _ => panic!("expected Entry"),
+        }
+
+        // Past newest restores draft
+        match h.next() {
+            HistoryNavResult::Draft(s) => assert_eq!(s, "my draft"),
+            _ => panic!("expected Draft"),
+        }
+    }
+
+    #[test]
+    fn test_history_next_empty_draft() {
+        let mut h = InputHistory::new();
+        h.push("entry".to_string());
+
+        // Navigate into history with empty input
+        assert_eq!(h.previous("").unwrap(), "entry");
+
+        // Navigate past newest — draft is empty
+        match h.next() {
+            HistoryNavResult::Draft(s) => assert!(s.is_empty()),
+            _ => panic!("expected Draft"),
+        }
+    }
+
+    #[test]
+    fn test_history_next_when_not_browsing() {
+        let mut h = InputHistory::new();
+        h.push("entry".to_string());
+
+        // next() without previous() is a no-op
+        match h.next() {
+            HistoryNavResult::None => {}
+            _ => panic!("expected None"),
+        }
+    }
+
+    #[test]
+    fn test_history_push_resets_navigation() {
+        let mut h = InputHistory::new();
+        h.push("first".to_string());
+
+        // Enter history
+        h.previous("draft");
+        assert!(h.is_browsing());
+
+        // Push resets
+        h.push("second".to_string());
+        assert!(!h.is_browsing());
+    }
+
+    #[test]
+    fn test_history_max_size_cap() {
+        let mut h = InputHistory::new();
+        for i in 0..510 {
+            h.push(format!("entry{i}"));
+        }
+        // Should be capped at 500
+        assert_eq!(h.entries.len(), 500);
+        // Oldest entries should be trimmed
+        assert_eq!(h.entries[0], "entry10");
+        assert_eq!(h.entries[499], "entry509");
+    }
+
+    #[test]
+    fn test_history_push_empty_string_ignored() {
+        let mut h = InputHistory::new();
+        h.push("".to_string());
+        assert!(h.entries.is_empty());
+    }
+
+    #[test]
+    fn test_history_reset() {
+        let mut h = InputHistory::new();
+        h.push("entry".to_string());
+        h.previous("draft");
+        assert!(h.is_browsing());
+
+        h.reset();
+        assert!(!h.is_browsing());
+    }
+
+    // === Scroll behavior tests ===
+
+    #[test]
+    fn test_visual_line_rows_empty() {
+        use crate::tui::ui::visual_line_rows;
+        assert_eq!(visual_line_rows("", 80), 1);
+    }
+
+    #[test]
+    fn test_visual_line_rows_short() {
+        use crate::tui::ui::visual_line_rows;
+        assert_eq!(visual_line_rows("hello", 80), 1);
+    }
+
+    #[test]
+    fn test_visual_line_rows_exact_width() {
+        use crate::tui::ui::visual_line_rows;
+        // 10 chars in 10 width = 1 row
+        assert_eq!(visual_line_rows("0123456789", 10), 1);
+    }
+
+    #[test]
+    fn test_visual_line_rows_wraps() {
+        use crate::tui::ui::visual_line_rows;
+        // 11 chars in 10 width = 2 rows
+        assert_eq!(visual_line_rows("01234567890", 10), 2);
+    }
+
+    #[test]
+    fn test_visual_line_rows_zero_width() {
+        use crate::tui::ui::visual_line_rows;
+        assert_eq!(visual_line_rows("hello", 0), 1);
     }
 }
