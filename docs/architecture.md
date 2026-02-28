@@ -109,7 +109,15 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
    - `EndTurn` or `MaxTokens` -- save assistant text to DB, return response.
    - `StopSequence` -- save assistant text to DB, return response.
    - `ToolUse` -- execute each tool call with per-tool timeout, push assistant
-     message and tool results onto the request, loop back to step 5.
+     message and tool results onto the request, strip images from prior turns
+     to prevent memory accumulation, loop back to step 5.
+
+   **Multi-modal tool results:** Tools can return images alongside text via
+   `ToolOutput::success_with_images()`. When images are present, the tool result
+   is sent as a multi-block content array (`[{type: "text"}, {type: "image"}]`)
+   matching the Claude API spec. When text-only, the string shorthand is used
+   (backward compatible). Prior-turn images are replaced with
+   `[image(s) from previous turn omitted]` text before each API call.
 
 7. **Post-turn compaction** -- after the agent returns, check if conversation
    compaction is needed (`compaction::maybe_compact()`). In CLI mode this runs
@@ -170,10 +178,12 @@ Stored in dedicated SQLite tables. Managed by the agent via `store_fact`,
 | Preferences | `preferences` | `category` (UNIQUE COLLATE NOCASE), `value` |
 | Events | `events` | `description`, `event_date`, `context` |
 
-### Layer 3: Vector Search (Future)
+### Layer 3: Hybrid Search
 
-Not yet implemented. Planned: `sqlite-vec` + FTS5 hybrid search for long-term
-archival memory retrieval.
+FTS5 full-text + sqlite-vec cosine similarity via Reciprocal Rank Fusion.
+Optional OpenAI embeddings (`text-embedding-3-small`, 512 dims). Graceful
+degradation: hybrid → FTS5-only → LIKE fallback. Indexed on `store_fact`/
+`update_fact`, backfilled on startup.
 
 
 ## 6. Tools
@@ -468,7 +478,7 @@ The `failed_sends` table stores the message text, an optional request ID, a crea
 
 ## Appendix: Database Schema
 
-**Schema version:** 7 (defined as `CURRENT_SCHEMA_VERSION` in `crates/mika-agent/src/db.rs`)
+**Schema version:** 8 (defined as `CURRENT_SCHEMA_VERSION` in `crates/mika-agent/src/db.rs`)
 
 ### Tables
 
@@ -487,6 +497,11 @@ The `failed_sends` table stores the message text, an optional request ID, a crea
 | `customer_config` | Key-value store (timezone, chat_id) | v5 |
 | `failed_sends` | Durable outbox for failed outbound messages | v5 |
 | `memory_event_summaries` | Tiered retention summaries (monthly) | v6 |
+| `skills` | Skill metadata (name, description, builtin flag, enabled) | v7 |
+| `skill_tools` | Tool definitions per skill | v7 |
+| `search_content` | Unified search content for Layer 3 hybrid search | v8 |
+| `fts_search` | FTS5 virtual table for full-text search | v8 |
+| `vec_search` | sqlite-vec virtual table (vec0) for vector similarity | v8 |
 
 ### SQLite Pragmas
 

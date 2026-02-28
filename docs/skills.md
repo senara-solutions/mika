@@ -147,6 +147,48 @@ Execution details:
 
 Exec handlers require a `tools.json` file in the skill directory to define the tool schemas sent to Claude.
 
+#### Returning Images from Exec Handlers
+
+Exec handlers can return images alongside text using the `__mika_v1` envelope protocol. Instead of printing plain text to stdout, the script outputs a JSON object with a sentinel key:
+
+```json
+{"__mika_v1": {"text": "Screenshot saved.", "images": ["/tmp/screenshot.png"]}}
+```
+
+**Envelope schema:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `__mika_v1.text` | String | Yes | The text portion of the tool result |
+| `__mika_v1.images` | Array\<String\> | Yes | Absolute file paths to image files (can be empty) |
+
+**Detection:** The executor checks if stdout starts with `{"__mika_v1"` before attempting JSON parse. Non-matching output is treated as plain text (backward compatible).
+
+**Image validation:** Each image file is validated before inclusion:
+- Path is canonicalized (symlinks resolved)
+- Must be a regular file (not a device, socket, etc.)
+- Maximum 5MB raw file size (checked via metadata before reading)
+- Magic-byte validation: only JPEG (`FF D8 FF`), PNG (`89 50 4E 47`), GIF (`47 49 46 38`), and WebP (`52 49 46 46...57 45 42 50`) are accepted
+- Maximum 5 images per tool result
+
+**Error handling:** If an image file is missing or invalid, an error note is appended to the text portion but the tool call does not fail. The text result is still returned.
+
+**Example: image-returning handler**
+
+```bash
+#!/bin/sh
+# Take a screenshot and return it via envelope
+SCREENSHOT="/tmp/screenshot-$(date +%s).png"
+grim "$SCREENSHOT"
+printf '{"__mika_v1":{"text":"Screenshot captured.","images":["%s"]}}' "$SCREENSHOT"
+```
+
+For safe JSON construction with special characters in paths, use `jq`:
+
+```bash
+jq -n --arg path "$SCREENSHOT" '{"__mika_v1":{"text":"Screenshot captured.","images":[$path]}}'
+```
+
 ### Http
 
 POSTs tool calls to a URL. The request body is JSON with `tool_name` and `input` fields. A 2xx response body is returned as the tool result; non-2xx status codes are reported as errors.
@@ -290,6 +332,8 @@ These three skills are seeded into `~/.mika/skills/` on first bootstrap:
 | messaging  | Yes       | send, message, notify                                          | `send_message`                                                     | No (empty)     |
 
 All three use the `builtin` handler type, so their tools are dispatched through the Rust `ToolRegistry` with full access to the database and agent context. All three are `always_on = true`, meaning they are active on every turn regardless of message content.
+
+Additionally, the **file-reader** bundled skill (exec handler) detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout.
 
 ---
 
