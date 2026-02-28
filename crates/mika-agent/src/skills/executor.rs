@@ -48,6 +48,11 @@ async fn execute_inner(
     skill_tool: &ResolvedSkillTool,
     input: serde_json::Value,
 ) -> Result<ToolOutput> {
+    tracing::info!(
+        tool = %skill_tool.definition.name,
+        input = %input,
+        "executing skill tool"
+    );
     match &skill_tool.handler {
         ToolHandler::Exec { command } => execute_exec(command, &skill_tool.skill_dir, input).await,
         ToolHandler::Http { url, method } => execute_http(url, method, input).await,
