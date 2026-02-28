@@ -103,7 +103,7 @@ docker build -f Dockerfile.agent -t mika-agent:dev .
 
 Build details:
 - **Builder:** `rust:1.85-slim` with gcc, libc-dev, pkg-config, libssl-dev (needed for rusqlite bundled SQLite + OpenSSL)
-- **Runtime:** `debian:bookworm-slim` with ca-certificates and wget
+- **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, and gh (GitHub CLI v2.65.0 with SHA256 checksum verification)
 - **Binary:** `mika-server` (Axum HTTP server)
 - **User:** `mika` (UID 1000), non-root
 - **Port:** 8080

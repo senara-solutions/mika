@@ -94,6 +94,13 @@ static SELF_KNOWLEDGE_SKILL: BundledSkill = skill!("self-knowledge", [
     ("tools.json" => "../../../templates/skills/self-knowledge/tools.json"),
 ]);
 
+static GITHUB_SKILL: BundledSkill = skill!("github", [
+    ("skill.toml" => "../../../templates/skills/github/skill.toml"),
+    ("system_prompt.md" => "../../../templates/skills/github/system_prompt.md"),
+    ("tools.json" => "../../../templates/skills/github/tools.json"),
+    ("handlers/run.sh" => "../../../templates/skills/github/handlers/run.sh", +x),
+]);
+
 /// All bundled skills.
 static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &TMUX_SKILL,
@@ -102,6 +109,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &FILE_READER_SKILL,
     &CALENDAR_SKILL,
     &SELF_KNOWLEDGE_SKILL,
+    &GITHUB_SKILL,
 ];
 
 /// Check whether a skill name matches a bundled (built-in) skill.
