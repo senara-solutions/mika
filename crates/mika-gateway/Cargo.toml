@@ -27,6 +27,8 @@ rand = { workspace = true }
 hex = { workspace = true }
 config = { workspace = true }
 utoipa.workspace = true
+base64.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true }

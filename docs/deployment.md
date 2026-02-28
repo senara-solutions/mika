@@ -945,10 +945,10 @@ curl -v https://mika.example.com/webhook/telegram
 
 ### Unsupported Media Types
 
-**Symptom:** User sends a photo, sticker, or voice message and gets a reply about text-only support.
+**Symptom:** User sends a sticker, voice, or video message and gets a reply about unsupported media.
 
-**Cause:** The gateway currently only supports text messages. Non-text media triggers a friendly error reply:
+**Cause:** The gateway supports text and image messages. Other media types (stickers, voice, video, etc.) trigger a friendly error reply:
 
-> "I can only read text messages right now. Please type your message."
+> "I can read text and image messages. This media type isn't supported yet."
 
 This is expected behavior, not a bug.

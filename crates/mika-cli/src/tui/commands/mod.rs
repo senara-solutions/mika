@@ -127,6 +127,16 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
 ];
 
+/// Resolve a thinking level keyword to (budget_tokens, level_name).
+pub fn resolve_thinking_level(word: &str) -> Option<(u32, &'static str)> {
+    match word.to_lowercase().as_str() {
+        "low" => Some((5_000, "low")),
+        "medium" | "med" => Some((10_000, "medium")),
+        "high" => Some((50_000, "high")),
+        _ => None,
+    }
+}
+
 /// Filter commands by prefix (case-insensitive). Matches command names and aliases.
 pub fn filter_commands(prefix: &str) -> Vec<&'static SlashCommand> {
     let prefix_lower = prefix.to_lowercase();

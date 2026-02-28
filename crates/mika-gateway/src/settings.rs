@@ -33,6 +33,10 @@ pub struct GatewaySettings {
     /// Example: "http://localhost:8080"
     #[serde(default)]
     pub agent_base_url: Option<String>,
+
+    /// Optional log file path for mika-gateway (maps to MIKA_GATEWAY_LOG_FILE)
+    #[serde(default)]
+    pub gateway_log_file: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -89,6 +93,7 @@ impl std::fmt::Debug for GatewaySettings {
             .field("gateway_port", &self.gateway_port)
             .field("log_level", &self.log_level)
             .field("agent_base_url", &self.agent_base_url)
+            .field("gateway_log_file", &self.gateway_log_file)
             .finish()
     }
 }
@@ -110,6 +115,7 @@ mod tests {
                 gateway_port: 8080,
                 log_level: "info".to_string(),
                 agent_base_url: None,
+                gateway_log_file: None,
             }
         );
         assert!(!debug.contains("pass"));

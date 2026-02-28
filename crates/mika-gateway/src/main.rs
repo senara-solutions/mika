@@ -6,6 +6,8 @@ mod telegram;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::path::Path;
+
 use anyhow::Result;
 use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
@@ -19,8 +21,11 @@ use telegram::TelegramClient;
 async fn main() -> Result<()> {
     let settings = GatewaySettings::load()?;
 
-    // Initialize tracing (JSON structured logging for production)
-    mika_common::logging::init(&settings.log_level);
+    // Initialize tracing (JSON structured logging for production, + optional file output)
+    let _log_guard = mika_common::logging::init(
+        &settings.log_level,
+        settings.gateway_log_file.as_deref().map(Path::new),
+    );
     info!(settings = ?settings, "starting mika-gateway");
 
     let ready = Arc::new(AtomicBool::new(false));

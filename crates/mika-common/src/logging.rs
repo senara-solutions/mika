@@ -13,14 +13,52 @@ pub enum LogOutput {
 
 /// Initialize structured JSON logging (for server/production).
 /// Respects RUST_LOG env var, falls back to the provided default level.
-pub fn init(default_level: &str) {
+///
+/// When `log_file` is `Some`, logs are written to both stdout (JSON) and the
+/// specified file (JSON) via `tracing_appender`. Parent directories are created
+/// automatically. Returns `Some(WorkerGuard)` that MUST be held alive for the
+/// duration of the program — dropping it flushes and stops the file writer.
+///
+/// When `log_file` is `None`, logs go to stdout only and returns `None`.
+pub fn init(default_level: &str, log_file: Option<&Path>) -> Option<WorkerGuard> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().json().flatten_event(true))
-        .init();
+    match log_file {
+        Some(path) => {
+            // Create parent directories for the log file
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let file_appender = tracing_appender::rolling::never(
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("mika.log")),
+            );
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().json().flatten_event(true))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .flatten_event(true)
+                        .with_writer(non_blocking),
+                )
+                .init();
+
+            Some(guard)
+        }
+        None => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().json().flatten_event(true))
+                .init();
+
+            None
+        }
+    }
 }
 
 /// Initialize logging with optional stderr output + daily-rotating file log.

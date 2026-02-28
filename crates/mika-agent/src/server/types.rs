@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Image payload forwarded from the gateway.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImagePayload {
+    pub media_type: String,
+    pub data: String,
+}
+
 /// Inbound message from the gateway.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MessageRequest {
@@ -11,6 +18,9 @@ pub struct MessageRequest {
     /// Target agent name (defaults to the server's default agent if absent).
     #[serde(default)]
     pub agent: String,
+    /// Optional images forwarded from the gateway (base64-encoded).
+    #[serde(default)]
+    pub images: Option<Vec<ImagePayload>>,
 }
 
 /// Accepted response for async processing.

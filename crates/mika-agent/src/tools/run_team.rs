@@ -106,6 +106,7 @@ mod tests {
             embedding_dimensions: 512,
             brave_api_key: None,
             home_dir: PathBuf::from("/tmp"),
+            server_log_file: None,
         }
     }
 
