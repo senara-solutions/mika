@@ -53,6 +53,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         user_images: &[],
         brave_api_key: ctx.settings.brave_api_key.as_deref(),
         skills_dirty: &skills_dirty,
+        mcp_manager: None,
     })
     .await?;
 

@@ -331,6 +331,7 @@ impl TeamEngine {
                             embedding_client: resources.embedding_client.as_ref(),
                             brave_api_key: brave_api_key.as_deref(),
                             skills_dirty: &skills_dirty,
+                            mcp_manager: None,
                         };
                         crate::agent::run_team_agent(&params)
                             .await
@@ -459,6 +460,7 @@ impl TeamEngine {
             embedding_client: resources.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &skills_dirty,
+            mcp_manager: None,
         };
 
         Ok(crate::agent::run_team_agent(&params)

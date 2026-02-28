@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
+use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
 use crate::prompt;
 use crate::skills::SkillRegistry;
@@ -283,6 +284,7 @@ async fn run_loop(
     request: &mut MessagesRequest,
     mode: &LoopMode<'_>,
     db: &AsyncDatabase,
+    mcp_manager: Option<&McpManager>,
 ) -> Result<LoopResult> {
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
@@ -396,6 +398,7 @@ async fn run_loop(
                     tool_ctx,
                     request,
                     step as u32,
+                    mcp_manager,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -458,6 +461,8 @@ pub struct AgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
+    /// Optional MCP manager for external tool servers.
+    pub mcp_manager: Option<&'a McpManager>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -550,9 +555,14 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.user_message);
-    let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let mut skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched);
+
+    // Append MCP tool definitions (if any MCP servers are connected)
+    if let Some(mcp) = params.mcp_manager {
+        skill_tool_defs.extend_from_slice(mcp.tool_definitions());
+    }
 
     let history = db.load_recent_messages(20, None).await?;
 
@@ -649,6 +659,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         &mut request,
         &mode,
         db,
+        params.mcp_manager,
     )
     .await?;
 
@@ -682,6 +693,7 @@ async fn process_tool_calls(
     tool_ctx: &ToolContext<'_>,
     request: &mut MessagesRequest,
     step: u32,
+    mcp_manager: Option<&McpManager>,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results = Vec::new();
     let mut summaries = Vec::new();
@@ -697,6 +709,7 @@ async fn process_tool_calls(
                 input.clone(),
                 tool_ctx,
                 skill_timeout,
+                mcp_manager,
             )
             .await;
             let image_count = output.images.len();
@@ -796,6 +809,7 @@ async fn execute_tool(
     input: serde_json::Value,
     ctx: &ToolContext<'_>,
     skill_timeout: u64,
+    mcp_manager: Option<&McpManager>,
 ) -> ToolOutput {
     // 1. Try builtin tool
     if let Some(tool) = tools.get(name) {
@@ -839,6 +853,26 @@ async fn execute_tool(
             };
         }
         return executor::execute_skill_tool(skill_tool, input, skill_timeout).await;
+    }
+
+    // 3. Try MCP tool (external server)
+    if let Some(mcp) = mcp_manager {
+        if mcp.is_mcp_tool(name) {
+            return match tokio::time::timeout(
+                std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+                mcp.call_tool(name, input),
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(_) => {
+                    warn!(tool = %name, "MCP tool execution timed out");
+                    ToolOutput::error(format!(
+                        "MCP tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
+                    ))
+                }
+            };
+        }
     }
 
     warn!(tool = %name, "unknown tool requested");
@@ -1015,6 +1049,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         &mut request,
         &mode,
         db,
+        None, // MCP tools excluded from silent mode
     )
     .await?;
 
@@ -1037,6 +1072,8 @@ pub struct TeamAgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
+    /// Optional MCP manager for external tool servers.
+    pub mcp_manager: Option<&'a McpManager>,
 }
 
 /// Run an agent within a team execution context.
@@ -1095,9 +1132,14 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.task_message);
-    let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
+    let mut skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched);
+
+    // Append MCP tool definitions (if any MCP servers are connected)
+    if let Some(mcp) = params.mcp_manager {
+        skill_tool_defs.extend_from_slice(mcp.tool_definitions());
+    }
 
     // Single-turn: just the task message, no history
     let messages = vec![Message {
@@ -1141,6 +1183,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         &mut request,
         &mode,
         params.db,
+        params.mcp_manager,
     )
     .await?;
 
