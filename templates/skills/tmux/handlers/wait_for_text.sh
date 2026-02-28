@@ -6,18 +6,21 @@
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
 
+# Prevent nested tmux client issues when spawned from within tmux
+unset TMUX TMUX_PANE
+
 INPUT=$(cat)
 
 if command -v jq >/dev/null 2>&1; then
-    SESSION=$(echo "$INPUT" | jq -r '.session // empty')
-    PATTERN=$(echo "$INPUT" | jq -r '.pattern // empty')
-    TIMEOUT=$(echo "$INPUT" | jq -r '.timeout // 15')
-    USE_REGEX=$(echo "$INPUT" | jq -r '.regex // false')
+    SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
+    PATTERN=$(printf '%s\n' "$INPUT" | jq -r '.pattern // empty')
+    TIMEOUT=$(printf '%s\n' "$INPUT" | jq -r '.timeout // 15')
+    USE_REGEX=$(printf '%s\n' "$INPUT" | jq -r '.regex // false')
 else
-    SESSION=$(echo "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
-    PATTERN=$(echo "$INPUT" | grep -o '"pattern":"[^"]*"' | head -1 | cut -d'"' -f4)
-    TIMEOUT=$(echo "$INPUT" | grep -o '"timeout":[0-9]*' | head -1 | cut -d':' -f2)
-    USE_REGEX=$(echo "$INPUT" | grep -o '"regex":true' | head -1)
+    SESSION=$(printf '%s\n' "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
+    PATTERN=$(printf '%s\n' "$INPUT" | grep -o '"pattern":"[^"]*"' | head -1 | cut -d'"' -f4)
+    TIMEOUT=$(printf '%s\n' "$INPUT" | grep -o '"timeout":[0-9]*' | head -1 | cut -d':' -f2)
+    USE_REGEX=$(printf '%s\n' "$INPUT" | grep -o '"regex":true' | head -1)
     if [ -z "$TIMEOUT" ]; then TIMEOUT=15; fi
     if [ -n "$USE_REGEX" ]; then USE_REGEX="true"; else USE_REGEX="false"; fi
 fi
@@ -39,11 +42,11 @@ if [ "$PATTERN_LEN" -gt 200 ]; then
     exit 1
 fi
 
-# Validate timeout as positive integer, clamp to max 60
+# Validate timeout as positive integer, clamp to max 25 (within skill timeout of 30s)
 case "$TIMEOUT" in
     ''|*[!0-9]*) TIMEOUT=15 ;;
 esac
-if [ "$TIMEOUT" -gt 60 ]; then TIMEOUT=60; fi
+if [ "$TIMEOUT" -gt 25 ]; then TIMEOUT=25; fi
 if [ "$TIMEOUT" -lt 1 ]; then TIMEOUT=1; fi
 
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -61,12 +64,19 @@ while true; do
         break
     fi
 
+    # Check pane is still alive — exit early instead of polling stale content
+    PANE_DEAD=$(tmux display-message -t "$SESSION" -p '#{pane_dead}' 2>/dev/null)
+    if [ "$PANE_DEAD" = "1" ]; then
+        echo "Error: pane in session '$SESSION' died while waiting for '$PATTERN'" >&2
+        exit 1
+    fi
+
     OUTPUT=$(tmux capture-pane -t "$SESSION" -p -J)
 
     if [ "$USE_REGEX" = "true" ]; then
-        MATCH=$(echo "$OUTPUT" | timeout 2 grep -E "$PATTERN" | tail -1)
+        MATCH=$(printf '%s\n' "$OUTPUT" | timeout 2 grep -E "$PATTERN" | tail -1)
     else
-        MATCH=$(echo "$OUTPUT" | grep -F "$PATTERN" | tail -1)
+        MATCH=$(printf '%s\n' "$OUTPUT" | grep -F "$PATTERN" | tail -1)
     fi
 
     if [ -n "$MATCH" ]; then

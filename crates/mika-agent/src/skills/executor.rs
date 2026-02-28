@@ -79,7 +79,9 @@ async fn execute_inner(
         "executing skill tool"
     );
     match &skill_tool.handler {
-        ToolHandler::Exec { command } => execute_exec(command, &skill_tool.skill_dir, input).await,
+        ToolHandler::Exec { command } => {
+            execute_exec(command, &skill_tool.skill_dir, &skill_tool.definition.name, input).await
+        }
         ToolHandler::Http { url, method } => execute_http(url, method, input).await,
         ToolHandler::Builtin { .. } => {
             // Builtin handlers are dispatched directly from agent.rs, not through executor.
@@ -221,6 +223,7 @@ async fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec
 async fn execute_exec(
     command: &str,
     skill_dir: &std::path::Path,
+    tool_name: &str,
     input: serde_json::Value,
 ) -> Result<ToolOutput> {
     // Resolve command relative to skill directory
@@ -239,6 +242,8 @@ async fn execute_exec(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .kill_on_drop(true)
         .spawn()?;
 
@@ -258,6 +263,37 @@ async fn execute_exec(
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Log successful output for debugging silent failures
+        // Use char-boundary-safe slicing to avoid panics on multi-byte UTF-8
+        let stdout_end = {
+            let mut b = stdout.len().min(200);
+            while b > 0 && !stdout.is_char_boundary(b) {
+                b -= 1;
+            }
+            b
+        };
+        tracing::debug!(
+            tool = %tool_name,
+            stdout_len = stdout.len(),
+            stdout_preview = %&stdout[..stdout_end],
+            "skill exec succeeded"
+        );
+        if !stderr.trim().is_empty() {
+            let stderr_end = {
+                let mut b = stderr.len().min(500);
+                while b > 0 && !stderr.is_char_boundary(b) {
+                    b -= 1;
+                }
+                b
+            };
+            tracing::debug!(
+                tool = %tool_name,
+                stderr = %&stderr[..stderr_end],
+                "skill exec stderr on success"
+            );
+        }
 
         // Try to parse as __mika_v1 image envelope
         if let Some(envelope) = try_parse_envelope(&stdout) {
@@ -664,5 +700,34 @@ mod tests {
         assert!(!output.is_error);
         assert!(output.content.contains("just plain text"));
         assert!(output.images.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_strips_tmux_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Script that prints the TMUX env var (empty if stripped)
+        write_script(
+            &tmp.path().join("check_env.sh"),
+            "#!/bin/sh\nprintf 'TMUX=%s TMUX_PANE=%s' \"$TMUX\" \"$TMUX_PANE\"",
+        );
+
+        // Set TMUX in the current process environment
+        // Safety: we're in a test with controlled env access
+        unsafe {
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default,12345,0");
+            std::env::set_var("TMUX_PANE", "%0");
+        }
+
+        let tool = make_exec_tool(tmp.path(), "check_env.sh");
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        // Both vars should be empty because env_remove strips them
+        assert_eq!(output.content.trim(), "TMUX= TMUX_PANE=");
+
+        // Clean up env
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("TMUX_PANE");
+        }
     }
 }

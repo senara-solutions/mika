@@ -128,11 +128,7 @@
         },
         "timeout": {
           "type": "integer",
-          "description": "Maximum seconds to wait (default: 15)"
-        },
-        "interval": {
-          "type": "number",
-          "description": "Seconds between polls (default: 0.5)"
+          "description": "Maximum seconds to wait (default: 15, max: 25)"
         },
         "regex": {
           "type": "boolean",
