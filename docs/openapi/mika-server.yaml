@@ -73,7 +73,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/AcceptedResponse'
         '400':
-          description: Invalid request (empty or oversized text)
+          description: Invalid request (empty text without images, oversized text, or unsupported image media_type)
         '401':
           description: Missing or invalid Bearer token
         '404':

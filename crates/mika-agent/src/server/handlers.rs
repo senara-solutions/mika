@@ -18,6 +18,9 @@ use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
 use super::types::{AcceptedResponse, HealthResponse, HeartbeatRequest, MessageRequest};
 
+/// Media types accepted by the Claude API for image content blocks.
+const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
 /// GET /health — K8s liveness/readiness probe (no auth required).
 #[utoipa::path(
     get,
@@ -56,7 +59,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     request_body = MessageRequest,
     responses(
         (status = 202, description = "Message accepted for async processing", body = AcceptedResponse),
-        (status = 400, description = "Invalid request (empty or oversized text)"),
+        (status = 400, description = "Invalid request (empty text without images, oversized text, or unsupported image media_type)"),
         (status = 401, description = "Missing or invalid Bearer token"),
         (status = 404, description = "Agent not found"),
         (status = 429, description = "Agent is busy processing another message"),
@@ -65,17 +68,51 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 )]
 pub async fn handle_message(
     State(state): State<AppState>,
-    JsonBody(req): JsonBody<MessageRequest>,
+    JsonBody(mut req): JsonBody<MessageRequest>,
 ) -> impl IntoResponse {
-    // Validate input
-    if req.text.is_empty() || req.text.len() > 50_000 {
+    // Validate input: text may be empty when images are present (e.g. image-only sends).
+    let has_images = req
+        .images
+        .as_ref()
+        .is_some_and(|imgs| !imgs.is_empty());
+
+    if req.text.is_empty() && !has_images {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "text must be 1-50000 characters"
+                "error": "text must not be empty when no images are provided"
             })),
         )
             .into_response();
+    }
+
+    if req.text.len() > 50_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "text must be at most 50000 characters"
+            })),
+        )
+            .into_response();
+    }
+
+    // Validate image media types against allowlist
+    if let Some(images) = &req.images {
+        for img in images {
+            if !ALLOWED_IMAGE_MEDIA_TYPES.contains(&img.media_type.as_str()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "unsupported media_type '{}'; allowed types: {}",
+                            img.media_type,
+                            ALLOWED_IMAGE_MEDIA_TYPES.join(", ")
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // Resolve agent state (Arc clone — cheap atomic increment)
@@ -116,16 +153,16 @@ pub async fn handle_message(
 
     let request_id = req.request_id.clone();
 
-    // Convert gateway image payloads to Claude API ImageSource
+    // Convert gateway image payloads to Claude API ImageSource (move, not clone)
     let user_images: Vec<ImageSource> = req
         .images
-        .as_deref()
+        .take()
         .unwrap_or_default()
-        .iter()
+        .into_iter()
         .map(|img| ImageSource {
             source_type: "base64".to_string(),
-            media_type: img.media_type.clone(),
-            data: img.data.clone(),
+            media_type: img.media_type,
+            data: img.data,
         })
         .collect();
 

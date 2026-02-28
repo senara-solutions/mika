@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -202,7 +203,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// Result of downloading and validating an image from Telegram.
 #[derive(Debug)]
 pub struct DownloadedImage {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub media_type: String,
 }
 
@@ -352,8 +353,47 @@ impl TelegramClient {
             })
     }
 
+    /// Validate a file_path returned by Telegram's `getFile` API.
+    ///
+    /// Rejects empty paths, leading slashes, path traversal (`..`), and URL
+    /// manipulation characters (`@`, `?`, `#`) that could redirect the download
+    /// request and leak the bot token embedded in the URL.
+    fn validate_file_path(file_path: &str) -> Result<(), TelegramApiError> {
+        if file_path.is_empty() {
+            return Err(TelegramApiError::BadRequest {
+                message: "invalid file_path from Telegram API: empty".to_string(),
+            });
+        }
+        if file_path.starts_with('/') {
+            return Err(TelegramApiError::BadRequest {
+                message: "invalid file_path from Telegram API: starts with /".to_string(),
+            });
+        }
+        if file_path.contains("..") {
+            return Err(TelegramApiError::BadRequest {
+                message: "invalid file_path from Telegram API: contains ..".to_string(),
+            });
+        }
+        for ch in ['@', '?', '#'] {
+            if file_path.contains(ch) {
+                return Err(TelegramApiError::BadRequest {
+                    message: format!(
+                        "invalid file_path from Telegram API: contains '{ch}'"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Download file bytes from Telegram's file server.
-    async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>, TelegramApiError> {
+    ///
+    /// Validates `file_path` against traversal/URL-manipulation attacks, then
+    /// checks the `Content-Length` header before reading the body to reject
+    /// oversized files early (avoids buffering up to 20 MB only to discard).
+    async fn download_file_bytes(&self, file_path: &str) -> Result<Bytes, TelegramApiError> {
+        Self::validate_file_path(file_path)?;
+
         let url = format!(
             "https://api.telegram.org/file/bot{}/{}",
             self.bot_token.expose_secret(),
@@ -369,8 +409,22 @@ impl TelegramClient {
             });
         }
 
+        // Early rejection: check Content-Length header before reading the body.
+        // This avoids downloading files between 5-20 MB just to discard them.
+        if let Some(content_length) = resp.content_length() {
+            if content_length as usize > MAX_IMAGE_BYTES {
+                return Err(TelegramApiError::BadRequest {
+                    message: format!(
+                        "file too large ({:.1} MB, max {} MB)",
+                        content_length as f64 / 1_048_576.0,
+                        MAX_IMAGE_BYTES / 1_048_576
+                    ),
+                });
+            }
+        }
+
         let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Download an image by file_id: resolves path, downloads bytes, validates magic bytes, enforces size limit.
@@ -874,5 +928,59 @@ mod tests {
                 update_id: 502,
             }
         );
+    }
+
+    // -- file_path validation tests --
+
+    #[test]
+    fn test_validate_file_path_accepts_normal_path() {
+        assert!(TelegramClient::validate_file_path("photos/file_1.jpg").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_nested_path() {
+        assert!(TelegramClient::validate_file_path("documents/user/photo.png").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_empty() {
+        let err = TelegramClient::validate_file_path("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_leading_slash() {
+        let err = TelegramClient::validate_file_path("/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("starts with /"));
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_traversal() {
+        let err = TelegramClient::validate_file_path("photos/../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("contains .."));
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_bare_traversal() {
+        let err = TelegramClient::validate_file_path("..").unwrap_err();
+        assert!(err.to_string().contains("contains .."));
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_at_sign() {
+        let err = TelegramClient::validate_file_path("photos/@evil.com/file").unwrap_err();
+        assert!(err.to_string().contains("contains '@'"));
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_question_mark() {
+        let err = TelegramClient::validate_file_path("photos/file?token=leak").unwrap_err();
+        assert!(err.to_string().contains("contains '?'"));
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_hash() {
+        let err = TelegramClient::validate_file_path("photos/file#fragment").unwrap_err();
+        assert!(err.to_string().contains("contains '#'"));
     }
 }

@@ -1722,6 +1722,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "bytes",
  "config",
  "hex",
  "http-body-util",

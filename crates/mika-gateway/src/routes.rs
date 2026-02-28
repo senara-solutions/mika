@@ -170,12 +170,12 @@ pub(crate) async fn handle_webhook(
                     .await;
             }
             ParsedMessage::Unsupported { chat_id } => {
-                // Fire-and-forget reply for non-text media (photo/sticker/voice)
+                // Fire-and-forget reply for non-image media (sticker/voice/video/etc.)
                 let _ = s
                     .telegram
                     .send_message(
                         chat_id,
-                        "I can only read text messages right now. Please type your message.",
+                        "I can read text and image messages. This media type isn't supported yet.",
                     )
                     .await;
             }
@@ -188,7 +188,7 @@ pub(crate) async fn handle_webhook(
     StatusCode::OK
 }
 
-// -- Text message routing --
+// -- Shared routing helpers --
 
 /// Compute container URL deterministically from customer ID.
 /// When `agent_base_url` is set, routes all traffic there (local E2E testing).
@@ -200,17 +200,17 @@ fn container_url(customer_id: &Uuid, agent_base_url: &Option<String>) -> String 
     }
 }
 
-/// Route a text message to the correct customer container.
-async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_id: i64) {
-    // Look up customer by telegram_chat_id (runtime query — no DATABASE_URL needed at build time)
-    let row = match sqlx::query_as::<_, CustomerRow>(
+/// Look up a customer by Telegram chat ID.
+/// Returns the customer row, or None after sending an appropriate reply.
+async fn resolve_customer(state: &AppState, chat_id: i64) -> Option<CustomerRow> {
+    match sqlx::query_as::<_, CustomerRow>(
         "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
     )
     .bind(chat_id)
     .fetch_optional(&state.pool)
     .await
     {
-        Ok(Some(c)) => c,
+        Ok(Some(c)) => Some(c),
         Ok(None) => {
             let _ = state
                 .telegram
@@ -219,13 +219,83 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
                     "Please pair your account first. Use your invite link to get started.",
                 )
                 .await;
-            return;
+            None
         }
         Err(e) => {
             warn!(error = %e, chat_id, "customer lookup failed");
             reply_transient_error(&state.telegram, chat_id).await;
-            return;
+            None
         }
+    }
+}
+
+/// Atomically claim a dedup slot for the given update_id.
+/// Returns true if claimed (proceed to forward), false if already processed or on error.
+async fn claim_dedup(state: &AppState, customer_id: Uuid, update_id: i64) -> bool {
+    let claimed = sqlx::query(
+        "UPDATE customers SET last_update_id = $1 WHERE id = $2 AND last_update_id < $1 RETURNING id",
+    )
+    .bind(update_id)
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match claimed {
+        Ok(Some(_)) => true,  // claimed -- proceed to forward
+        Ok(None) => false,    // already processed by another task
+        Err(e) => {
+            warn!(error = %e, "dedup update failed");
+            false
+        }
+    }
+}
+
+/// Reset the dedup slot on forwarding failure so Telegram retry can succeed.
+/// Uses CAS (compare-and-swap) to prevent incorrect rollback.
+async fn reset_dedup(state: &AppState, customer_id: Uuid, update_id: i64) {
+    let _ = sqlx::query(
+        "UPDATE customers SET last_update_id = last_update_id - 1 WHERE id = $1 AND last_update_id = $2",
+    )
+    .bind(customer_id)
+    .bind(update_id)
+    .execute(&state.pool)
+    .await;
+}
+
+/// Handle the result of forwarding a message to a customer container.
+/// On success: no-op. On error response: warn + reply. On network failure: reset dedup + warn + reply.
+async fn handle_forward_result(
+    state: &AppState,
+    result: Result<reqwest::Response, reqwest::Error>,
+    chat_id: i64,
+    customer_id: Uuid,
+    update_id: i64,
+    msg_kind: &str,
+) {
+    match result {
+        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
+            // Successfully forwarded
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            warn!(status, %customer_id, "container returned error for {msg_kind}");
+            reply_transient_error(&state.telegram, chat_id).await;
+        }
+        Err(e) => {
+            reset_dedup(state, customer_id, update_id).await;
+            warn!(error = %e, %customer_id, "container unreachable for {msg_kind}, dedup reset");
+            reply_transient_error(&state.telegram, chat_id).await;
+        }
+    }
+}
+
+// -- Text message routing --
+
+/// Route a text message to the correct customer container.
+async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_id: i64) {
+    let row = match resolve_customer(state, chat_id).await {
+        Some(r) => r,
+        None => return,
     };
 
     // Suspended customer: silent drop + log
@@ -234,23 +304,9 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
         return;
     }
 
-    // Atomic dedup: claim this update_id before forwarding.
-    // If another task already claimed it, skip silently.
-    let claimed = sqlx::query(
-        "UPDATE customers SET last_update_id = $1 WHERE id = $2 AND last_update_id < $1 RETURNING id",
-    )
-    .bind(update_id)
-    .bind(row.id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    match claimed {
-        Ok(Some(_)) => {}   // claimed — proceed to forward
-        Ok(None) => return, // already processed by another task
-        Err(e) => {
-            warn!(error = %e, "dedup update failed");
-            return;
-        }
+    // Claim dedup before forwarding
+    if !claim_dedup(state, row.id, update_id).await {
+        return;
     }
 
     let url = container_url(&row.id, &state.agent_base_url);
@@ -271,28 +327,7 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
         .send()
         .await;
 
-    match result {
-        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
-            // Successfully forwarded
-        }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            warn!(status, customer_id = %row.id, "container returned error");
-            reply_transient_error(&state.telegram, chat_id).await;
-        }
-        Err(e) => {
-            // Reset dedup so Telegram retry can succeed (CAS prevents incorrect rollback)
-            let _ = sqlx::query(
-                "UPDATE customers SET last_update_id = last_update_id - 1 WHERE id = $1 AND last_update_id = $2",
-            )
-            .bind(row.id)
-            .bind(update_id)
-            .execute(&state.pool)
-            .await;
-            warn!(error = %e, customer_id = %row.id, "container unreachable, dedup reset");
-            reply_transient_error(&state.telegram, chat_id).await;
-        }
-    }
+    handle_forward_result(state, result, chat_id, row.id, update_id, "text").await;
 }
 
 // -- Photo message routing --
@@ -309,30 +344,9 @@ async fn handle_photo_message(
     caption: Option<&str>,
     update_id: i64,
 ) {
-    // Look up customer (same as text messages)
-    let row = match sqlx::query_as::<_, CustomerRow>(
-        "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
-    )
-    .bind(chat_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            let _ = state
-                .telegram
-                .send_message(
-                    chat_id,
-                    "Please pair your account first. Use your invite link to get started.",
-                )
-                .await;
-            return;
-        }
-        Err(e) => {
-            warn!(error = %e, chat_id, "customer lookup failed");
-            reply_transient_error(&state.telegram, chat_id).await;
-            return;
-        }
+    let row = match resolve_customer(state, chat_id).await {
+        Some(r) => r,
+        None => return,
     };
 
     if row.status == "suspended" {
@@ -394,21 +408,8 @@ async fn handle_photo_message(
     );
 
     // Now claim dedup (download succeeded)
-    let claimed = sqlx::query(
-        "UPDATE customers SET last_update_id = $1 WHERE id = $2 AND last_update_id < $1 RETURNING id",
-    )
-    .bind(update_id)
-    .bind(row.id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    match claimed {
-        Ok(Some(_)) => {}
-        Ok(None) => return, // already processed
-        Err(e) => {
-            warn!(error = %e, "dedup update failed");
-            return;
-        }
+    if !claim_dedup(state, row.id, update_id).await {
+        return;
     }
 
     // Use caption or synthetic text for captionless photos
@@ -436,28 +437,7 @@ async fn handle_photo_message(
         .send()
         .await;
 
-    match result {
-        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
-            // Successfully forwarded
-        }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            warn!(status, customer_id = %row.id, "container returned error for photo");
-            reply_transient_error(&state.telegram, chat_id).await;
-        }
-        Err(e) => {
-            // Reset dedup so Telegram retry can succeed
-            let _ = sqlx::query(
-                "UPDATE customers SET last_update_id = last_update_id - 1 WHERE id = $1 AND last_update_id = $2",
-            )
-            .bind(row.id)
-            .bind(update_id)
-            .execute(&state.pool)
-            .await;
-            warn!(error = %e, customer_id = %row.id, "container unreachable for photo, dedup reset");
-            reply_transient_error(&state.telegram, chat_id).await;
-        }
-    }
+    handle_forward_result(state, result, chat_id, row.id, update_id, "photo").await;
 }
 
 // -- Pairing --
