@@ -236,6 +236,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- You can read and update customer config (timezone, chat_id, thinking_level) with get_config and set_config.\n",
     );
+    prompt.push_str(
+        "- Tools may return images (screenshots, image files); you will see and can describe their contents.\n",
+    );
+    prompt.push_str(
+        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_file on that path to view the image contents.\n",
+    );
 
     prompt
 }

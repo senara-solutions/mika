@@ -45,7 +45,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~582 tests)
+- `cargo test` — Run all tests (~609 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
@@ -60,7 +60,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
   - Layer 1: Core memory (always in system prompt, agent-editable via `update_core_memory` tool, 2000 token limit)
   - Layer 2: Structured facts (People, Commitments, Preferences, Events — plaintext). Managed via `store_fact`, `update_fact`, `search_memory` tools.
   - Layer 3: Hybrid search (FTS5 full-text + sqlite-vec cosine similarity via Reciprocal Rank Fusion). Optional OpenAI embeddings (text-embedding-3-small, 512 dims). Graceful degradation: hybrid → FTS5-only → LIKE fallback. Indexed on store_fact/update_fact, backfilled on startup.
-- **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout. Tool call summaries (name, truncated input/output, success) persisted in `conversations.metadata` JSON column for cross-turn introspection. History builder appends `[Tools used: ...]` blocks to assistant messages. Compaction includes tool names in summarization.
+- **Agent loop:** Max 10 tool steps, 5-minute total timeout, 30s per-tool timeout. Tool call summaries (name, truncated input/output, success) persisted in `conversations.metadata` JSON column for cross-turn introspection. History builder appends `[Tools used: ...]` blocks to assistant messages. Compaction includes tool names in summarization. Multi-modal tool results: `ToolOutput` carries optional `images: Vec<ImageData>` (base64-encoded), converted to multi-block `tool_result` content arrays for the Claude API. Prior-turn images are stripped before each API call to prevent unbounded memory growth.
+- **Exec handler image protocol (`__mika_v1`):** Exec handler scripts can return images by outputting a JSON envelope `{"__mika_v1": {"text": "...", "images": ["/path/to/img"]}}`. The executor detects the sentinel key via prefix check, reads and validates image files (canonicalize, regular file check, 5MB limit, magic-byte validation for JPEG/PNG/GIF/WebP), base64-encodes them, and returns them as `ImageData` on `ToolOutput`. File I/O runs in `tokio::spawn_blocking`. Max 5 images per result. The file-reader skill uses this protocol to return image files for visual analysis.
 - **Typed Claude API errors:** `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
 - **Audit log:** `memory_events` table tracks all memory mutations per session
 - **Conversation compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt (not message history). Runs inline post-turn in CLI.
@@ -72,7 +73,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 8 (v7 adds: skills system tables; v8 adds: search_content, fts_search FTS5, vec_search vec0 for Layer 3)
 - **mika-gateway:** Telegram webhook router with Postgres customer registry. Handles text messages and images (photos + image documents). Image pipeline: `getFile` API → download → magic-byte validation (JPEG/PNG/GIF/WebP) → base64 encode → forward to agent with `images` array. 5MB per-image limit, Content-Length pre-check, file_path validation. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (K8s probes). Stateless, env-var-only config.
-- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` (90MB) for shared router. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
+- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq). `Dockerfile.gateway` (90MB) for shared router. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
 
 ## Environment Variables
 

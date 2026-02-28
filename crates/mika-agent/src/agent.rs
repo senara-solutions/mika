@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mika_common::claude::{
-    ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
+    ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, StopReason,
+    ToolResultBlock, ToolResultBody,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -25,6 +26,11 @@ use mika_common::embedding::EmbeddingClient;
 const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Maximum total base64 image bytes across all tool results in a single agent step.
+/// Prevents memory spikes when multiple tools return images in one step.
+/// 5 images at 5 MB each ≈ 33 MB base64 — this caps at ~20 MB to stay within
+/// container memory limits (256 MB target).
+const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024;
 
 /// Fallback message sent when the agent completes without producing text output
 /// (e.g., all work done via tool calls).
@@ -215,6 +221,51 @@ struct LoopResult {
     tool_call_summaries: Vec<ToolCallSummary>,
 }
 
+/// Remove image blocks from prior tool results to prevent unbounded memory
+/// growth across agent loop turns. Only the most recent user message's images
+/// are preserved (those are the current turn's tool results or user-attached images).
+fn strip_prior_images(messages: &mut [Message]) {
+    // Keep the last user message intact — it contains the current turn's tool results
+    let len = messages.len();
+    if len < 2 {
+        return;
+    }
+    // Process all messages except the last one
+    for msg in &mut messages[..len - 1] {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            for block in blocks.iter_mut() {
+                match block {
+                    // Strip images from tool result blocks (Blocks variant only
+                    // exists when images were present at construction time)
+                    ContentBlock::ToolResult { content, .. }
+                        if matches!(content, ToolResultBody::Blocks(_)) =>
+                    {
+                        if let ToolResultBody::Blocks(inner_blocks) = content {
+                            let mut combined: String = inner_blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ToolResultBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            combined.push_str("\n[image(s) from previous turn omitted]");
+                            *content = ToolResultBody::Text(combined);
+                        }
+                    }
+                    // Replace user-attached images with placeholder text
+                    ContentBlock::Image { .. } => {
+                        *block = ContentBlock::Text {
+                            text: "[user image from previous turn omitted]".to_string(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Shared tool-step loop used by all three agent variants.
 ///
 /// Iterates up to `MAX_TOOL_STEPS`, dispatching tool calls and collecting the
@@ -245,6 +296,11 @@ async fn run_loop(
             messages_len = request.messages.len(),
             "agent loop step"
         );
+
+        // Strip images from prior turns to prevent unbounded memory growth
+        if step > 0 {
+            strip_prior_images(&mut request.messages);
+        }
 
         let response = claude.send_message(request).await?;
 
@@ -623,6 +679,7 @@ async fn process_tool_calls(
 ) -> Vec<ToolCallSummary> {
     let mut tool_results = Vec::new();
     let mut summaries = Vec::new();
+    let mut image_bytes_budget = MAX_IMAGE_BYTES_PER_STEP;
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
@@ -636,16 +693,76 @@ async fn process_tool_calls(
                 skill_timeout,
             )
             .await;
+            let image_count = output.images.len();
+            let output_summary = if image_count > 0 {
+                format!(
+                    "{} [+{} image(s)]",
+                    truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX),
+                    image_count
+                )
+            } else {
+                truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX)
+            };
             summaries.push(ToolCallSummary {
                 step,
                 name: name.clone(),
                 input_summary,
-                output_summary: truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX),
+                output_summary,
                 success: !output.is_error,
             });
+
+            let content = if output.images.is_empty() {
+                ToolResultBody::Text(output.content)
+            } else {
+                let mut blocks = vec![ToolResultBlock::Text {
+                    text: output.content,
+                }];
+                let mut included = 0;
+                for img in output.images {
+                    let img_bytes = img.data.len();
+                    if img_bytes > image_bytes_budget {
+                        break;
+                    }
+                    image_bytes_budget -= img_bytes;
+                    included += 1;
+                    blocks.push(ToolResultBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: img.media_type,
+                            data: img.data,
+                        },
+                    });
+                }
+                if included < image_count {
+                    let skipped = image_count - included;
+                    blocks.push(ToolResultBlock::Text {
+                        text: format!("[{skipped} image(s) skipped: step memory budget exceeded]"),
+                    });
+                    warn!(
+                        included,
+                        skipped,
+                        "image budget exceeded, skipped images in tool result"
+                    );
+                }
+                if included == 0 {
+                    // All images skipped — fall back to text-only
+                    ToolResultBody::Text(
+                        blocks
+                            .into_iter()
+                            .filter_map(|b| match b {
+                                ToolResultBlock::Text { text } => Some(text),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                } else {
+                    ToolResultBody::Blocks(blocks)
+                }
+            };
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content: output.content,
+                content,
                 is_error: if output.is_error { Some(true) } else { None },
             });
         }
@@ -1471,5 +1588,214 @@ mod tests {
         let messages = db.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].metadata.is_none());
+    }
+
+    // -- strip_prior_images tests --
+
+    #[test]
+    fn test_strip_prior_images_removes_image_blocks() {
+        use mika_common::claude::*;
+
+        let mut messages = vec![
+            // Prior turn: user message with tool results containing images
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    content: ToolResultBody::Blocks(vec![
+                        ToolResultBlock::Text {
+                            text: "Screenshot taken.".to_string(),
+                        },
+                        ToolResultBlock::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: "image/png".to_string(),
+                                data: "iVBORw0KGgo=".to_string(),
+                            },
+                        },
+                    ]),
+                    is_error: None,
+                }]),
+            },
+            // Prior turn: assistant response
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("I see a desktop.".to_string()),
+            },
+            // Current turn: new tool results (should be preserved)
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_2".to_string(),
+                    content: ToolResultBody::Blocks(vec![
+                        ToolResultBlock::Text {
+                            text: "New screenshot.".to_string(),
+                        },
+                        ToolResultBlock::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: "image/png".to_string(),
+                                data: "iVBORw0KGgo=".to_string(),
+                            },
+                        },
+                    ]),
+                    is_error: None,
+                }]),
+            },
+        ];
+
+        strip_prior_images(&mut messages);
+
+        // First message should have images stripped
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
+                assert!(
+                    matches!(content, ToolResultBody::Text(t) if t.contains("Screenshot taken.") && t.contains("omitted"))
+                );
+            } else {
+                panic!("expected ToolResult");
+            }
+        } else {
+            panic!("expected Blocks");
+        }
+
+        // Last message should still have images
+        if let MessageContent::Blocks(blocks) = &messages[2].content {
+            if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
+                assert!(matches!(content, ToolResultBody::Blocks(_)));
+            } else {
+                panic!("expected ToolResult");
+            }
+        } else {
+            panic!("expected Blocks");
+        }
+    }
+
+    #[test]
+    fn test_strip_prior_images_preserves_text_only() {
+        use mika_common::claude::*;
+
+        let mut messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    content: ToolResultBody::Text("just text".to_string()),
+                    is_error: None,
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("current turn".to_string()),
+            },
+        ];
+
+        strip_prior_images(&mut messages);
+
+        // Text-only tool result should be unchanged
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
+                assert!(matches!(content, ToolResultBody::Text(t) if t == "just text"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_strip_prior_images_removes_user_attached_images() {
+        use mika_common::claude::*;
+
+        let mut messages = vec![
+            // Prior turn: user message with text and an attached image
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "What is in this picture?".to_string(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: "iVBORw0KGgo=".to_string(),
+                        },
+                    },
+                ]),
+            },
+            // Assistant response
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("I see a cat.".to_string()),
+            },
+            // Current turn: user message with a new image (should be preserved)
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "And this one?".to_string(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/jpeg".to_string(),
+                            data: "/9j/4AAQ=".to_string(),
+                        },
+                    },
+                ]),
+            },
+        ];
+
+        strip_prior_images(&mut messages);
+
+        // First message: image should be replaced with placeholder text
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            assert_eq!(blocks.len(), 2);
+            assert!(
+                matches!(&blocks[0], ContentBlock::Text { text } if text == "What is in this picture?")
+            );
+            assert!(
+                matches!(&blocks[1], ContentBlock::Text { text } if text == "[user image from previous turn omitted]")
+            );
+        } else {
+            panic!("expected Blocks for first message");
+        }
+
+        // Last message: image should still be intact
+        if let MessageContent::Blocks(blocks) = &messages[2].content {
+            assert_eq!(blocks.len(), 2);
+            assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
+            assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+        } else {
+            panic!("expected Blocks for last message");
+        }
+    }
+
+    #[test]
+    fn test_strip_prior_images_no_mutation_without_images() {
+        use mika_common::claude::*;
+
+        let mut messages = vec![
+            // Prior turn: user message with only text blocks
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }]),
+            },
+            // Current turn
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("Current".to_string()),
+            },
+        ];
+
+        strip_prior_images(&mut messages);
+
+        // Text-only blocks should remain unchanged
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            assert_eq!(blocks.len(), 1);
+            assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello"));
+        } else {
+            panic!("expected Blocks");
+        }
     }
 }

@@ -2,7 +2,7 @@
 name = "file-reader"
 description = "Read files from the local filesystem"
 version = "0.1.0"
-always_on = false
+always_on = true
 timeout_secs = 10
 
 [triggers]

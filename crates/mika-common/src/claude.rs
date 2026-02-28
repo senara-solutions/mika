@@ -98,7 +98,7 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultBody,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
@@ -118,6 +118,31 @@ pub struct ImageSource {
     pub source_type: String,
     pub media_type: String,
     pub data: String,
+}
+
+/// Content blocks that can appear inside a `tool_result` content array.
+///
+/// The Claude API allows `tool_result.content` to be either a plain string
+/// (shorthand for a single text block) or an array of text + image blocks.
+/// This enum represents the array element types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolResultBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+}
+
+/// The body of a `tool_result` content field.
+///
+/// Serializes as a plain string when text-only (backward compatible shorthand),
+/// or as an array of `ToolResultBlock` when images are present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolResultBody {
+    Text(String),
+    Blocks(Vec<ToolResultBlock>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,5 +696,114 @@ mod tests {
         assert_eq!(json["type"], "image");
         assert_eq!(json["source"]["type"], "base64");
         assert_eq!(json["source"]["media_type"], "image/png");
+    }
+
+    // -- ToolResultBody serde round-trip tests --
+
+    #[test]
+    fn test_tool_result_body_text_serializes_as_string() {
+        let body = ToolResultBody::Text("hello".into());
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn test_tool_result_body_blocks_serializes_as_array() {
+        let body = ToolResultBody::Blocks(vec![
+            ToolResultBlock::Text {
+                text: "Screenshot taken.".into(),
+            },
+            ToolResultBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: "iVBOR...".into(),
+                },
+            },
+        ]);
+        let json = serde_json::to_value(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "Screenshot taken.");
+        assert_eq!(arr[1]["type"], "image");
+        assert_eq!(arr[1]["source"]["media_type"], "image/png");
+    }
+
+    #[test]
+    fn test_tool_result_body_text_round_trip() {
+        let body = ToolResultBody::Text("result text".into());
+        let json = serde_json::to_string(&body).unwrap();
+        let deserialized: ToolResultBody = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolResultBody::Text(ref s) if s == "result text"));
+    }
+
+    #[test]
+    fn test_tool_result_body_blocks_round_trip() {
+        let body = ToolResultBody::Blocks(vec![
+            ToolResultBlock::Text {
+                text: "Done.".into(),
+            },
+            ToolResultBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".into(),
+                    media_type: "image/jpeg".into(),
+                    data: "/9j/4AAQ...".into(),
+                },
+            },
+        ]);
+        let json = serde_json::to_string(&body).unwrap();
+        let deserialized: ToolResultBody = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            ToolResultBody::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(&blocks[0], ToolResultBlock::Text { text } if text == "Done."));
+                assert!(
+                    matches!(&blocks[1], ToolResultBlock::Image { source } if source.media_type == "image/jpeg")
+                );
+            }
+            _ => panic!("expected Blocks variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_content_block_text_only() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "tu_1".into(),
+            content: ToolResultBody::Text("success".into()),
+            is_error: None,
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["tool_use_id"], "tu_1");
+        assert_eq!(json["content"], "success");
+        assert!(json.get("is_error").is_none());
+    }
+
+    #[test]
+    fn test_tool_result_content_block_with_images() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "tu_2".into(),
+            content: ToolResultBody::Blocks(vec![
+                ToolResultBlock::Text {
+                    text: "Screenshot captured.".into(),
+                },
+                ToolResultBlock::Image {
+                    source: ImageSource {
+                        source_type: "base64".into(),
+                        media_type: "image/png".into(),
+                        data: "abc123".into(),
+                    },
+                },
+            ]),
+            is_error: None,
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["tool_use_id"], "tu_2");
+        let content = json["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
     }
 }

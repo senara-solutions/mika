@@ -60,11 +60,23 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>;
 }
 
+/// Image data produced by a tool, ready for inclusion in a Claude API tool_result.
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    /// MIME type: "image/jpeg", "image/png", "image/gif", or "image/webp".
+    pub media_type: String,
+    /// Base64-encoded image bytes.
+    pub data: String,
+}
+
 /// Result of a tool execution.
 #[derive(Debug)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Images to include alongside text in the tool result.
+    /// When non-empty, the tool result is sent as a multi-block content array.
+    pub images: Vec<ImageData>,
 }
 
 impl ToolOutput {
@@ -72,6 +84,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            images: vec![],
         }
     }
 
@@ -79,6 +92,15 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            images: vec![],
+        }
+    }
+
+    pub fn success_with_images(content: impl Into<String>, images: Vec<ImageData>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images,
         }
     }
 }

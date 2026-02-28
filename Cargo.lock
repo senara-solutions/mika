@@ -1641,6 +1641,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "chrono-tz",
  "http-body-util",
