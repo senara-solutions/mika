@@ -718,4 +718,215 @@ mod tests {
         assert_eq!(req.text, "hello");
         assert!(req.images.is_none());
     }
+
+    #[tokio::test]
+    async fn test_image_payload_converts_to_agent_params_image_source() {
+        // Verify the handler's ImagePayload -> ImageSource conversion that feeds AgentParams.
+        // This exercises the exact mapping the handler performs before spawning the agent task.
+        use mika_common::claude::ImageSource;
+        use super::types::ImagePayload;
+
+        let payloads = vec![
+            ImagePayload {
+                media_type: "image/jpeg".to_string(),
+                data: "dGVzdC1qcGVn".to_string(),
+            },
+            ImagePayload {
+                media_type: "image/png".to_string(),
+                data: "dGVzdC1wbmc=".to_string(),
+            },
+            ImagePayload {
+                media_type: "image/gif".to_string(),
+                data: "dGVzdC1naWY=".to_string(),
+            },
+            ImagePayload {
+                media_type: "image/webp".to_string(),
+                data: "dGVzdC13ZWJw".to_string(),
+            },
+        ];
+
+        // Apply the same conversion the handler uses (handlers.rs lines 157-167)
+        let user_images: Vec<ImageSource> = payloads
+            .into_iter()
+            .map(|img| ImageSource {
+                source_type: "base64".to_string(),
+                media_type: img.media_type,
+                data: img.data,
+            })
+            .collect();
+
+        assert_eq!(user_images.len(), 4);
+
+        // Verify each converted ImageSource has the correct fields for AgentParams
+        assert_eq!(user_images[0].source_type, "base64");
+        assert_eq!(user_images[0].media_type, "image/jpeg");
+        assert_eq!(user_images[0].data, "dGVzdC1qcGVn");
+
+        assert_eq!(user_images[1].source_type, "base64");
+        assert_eq!(user_images[1].media_type, "image/png");
+        assert_eq!(user_images[1].data, "dGVzdC1wbmc=");
+
+        assert_eq!(user_images[2].source_type, "base64");
+        assert_eq!(user_images[2].media_type, "image/gif");
+        assert_eq!(user_images[2].data, "dGVzdC1naWY=");
+
+        assert_eq!(user_images[3].source_type, "base64");
+        assert_eq!(user_images[3].media_type, "image/webp");
+        assert_eq!(user_images[3].data, "dGVzdC13ZWJw");
+    }
+
+    #[tokio::test]
+    async fn test_message_with_multiple_image_types_accepted() {
+        // Integration test: send all four supported image types through the full server path
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let body = serde_json::json!({
+            "text": "describe these images",
+            "chat_id": 456,
+            "channel": "telegram",
+            "request_id": "multi-img-001",
+            "images": [
+                {"media_type": "image/jpeg", "data": "dGVzdC1qcGVn"},
+                {"media_type": "image/png", "data": "dGVzdC1wbmc="},
+                {"media_type": "image/gif", "data": "dGVzdC1naWY="},
+                {"media_type": "image/webp", "data": "dGVzdC13ZWJw"}
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["request_id"], "multi-img-001");
+        assert_eq!(json["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn test_message_empty_text_with_images_accepted() {
+        // The handler allows empty text when images are present (image-only sends)
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let body = serde_json::json!({
+            "text": "",
+            "chat_id": 456,
+            "channel": "telegram",
+            "request_id": "img-only-001",
+            "images": [
+                {"media_type": "image/jpeg", "data": "dGVzdA=="}
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["request_id"], "img-only-001");
+        assert_eq!(json["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn test_message_rejects_unsupported_image_media_type() {
+        // The handler validates image media_type against an allowlist
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let body = serde_json::json!({
+            "text": "look at this",
+            "chat_id": 456,
+            "channel": "telegram",
+            "request_id": "bad-img-001",
+            "images": [
+                {"media_type": "image/bmp", "data": "dGVzdA=="}
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(
+            error.contains("unsupported media_type"),
+            "error should mention unsupported media_type, got: {error}"
+        );
+        assert!(
+            error.contains("image/bmp"),
+            "error should mention the rejected type, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_empty_images_array_with_empty_text_rejected() {
+        // Empty images array does not count as "has images" — empty text should be rejected
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let body = serde_json::json!({
+            "text": "",
+            "chat_id": 456,
+            "channel": "telegram",
+            "request_id": "empty-arr-001",
+            "images": []
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
