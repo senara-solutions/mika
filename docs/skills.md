@@ -12,7 +12,7 @@ A skill is a directory under `~/.mika/skills/<name>/` that contains:
 
 At startup, Mika scans `~/.mika/skills/` and builds a `SkillRegistry`. On each user turn, the registry matches skills against the user's message. Matched skills contribute their tools and prompt snippets to that turn's agent loop. Claude then decides which of the available tools to call.
 
-Three built-in skills (memory, reminders, messaging) ship with Mika and are seeded into `~/.mika/skills/` on first run. You can modify these or add entirely new skills without changing any Rust code.
+Several built-in skills ship with Mika and are seeded into `~/.mika/skills/` on first run. You can modify these or add entirely new skills without changing any Rust code.
 
 ---
 
@@ -323,17 +323,33 @@ Tool definitions are loaded lazily on each turn (via `tokio::fs::read_to_string`
 
 ## Built-in Skills Reference
 
-These three skills are seeded into `~/.mika/skills/` on first bootstrap:
+These skills are bundled into the binary and seeded into `~/.mika/skills/` on every startup (overwriting existing files unless `MIKA_DISABLE_BUNDLED_SKILLS=true`):
 
-| Skill      | Always On | Keywords                                                       | Tools                                                             | Prompt Snippet |
-|------------|-----------|----------------------------------------------------------------|-------------------------------------------------------------------|----------------|
-| memory     | Yes       | remember, memory, fact, person, commitment, preference, event  | `update_core_memory`, `store_fact`, `search_memory`, `update_fact` | Yes            |
-| reminders  | Yes       | remind, reminder, schedule, alarm, alert                       | `create_reminder`, `list_reminders`, `cancel_reminder`             | Yes            |
-| messaging  | Yes       | send, message, notify                                          | `send_message`                                                     | No (empty)     |
+### Builtin-handler skills (always-on)
 
-All three use the `builtin` handler type, so their tools are dispatched through the Rust `ToolRegistry` with full access to the database and agent context. All three are `always_on = true`, meaning they are active on every turn regardless of message content.
+| Skill      | Keywords                                                       | Tools                                                             | Prompt Snippet |
+|------------|----------------------------------------------------------------|-------------------------------------------------------------------|----------------|
+| memory     | remember, memory, fact, person, commitment, preference, event  | `update_core_memory`, `store_fact`, `search_memory`, `update_fact` | Yes            |
+| reminders  | remind, reminder, schedule, alarm, alert                       | `create_reminder`, `list_reminders`, `cancel_reminder`             | Yes            |
+| messaging  | send, message, notify                                          | `send_message`                                                     | No (empty)     |
 
-Additionally, the **file-reader** bundled skill (exec handler, `always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it). Note: as an exec handler, file-reader is excluded from heartbeat mode by `safe_always_on_skills()`.
+These three use the `builtin` handler type, so their tools are dispatched through the Rust `ToolRegistry` with full access to the database and agent context. All three are `always_on = true`, meaning they are active on every turn regardless of message content.
+
+### Exec-handler skills
+
+| Skill          | Always On | Keywords                                                                                          | Tools        | Prompt Snippet |
+|----------------|-----------|---------------------------------------------------------------------------------------------------|--------------|----------------|
+| file-reader    | Yes       | read, file, open, show, cat, view, look at, display, print, content, what does, what's in         | `read_file`  | Yes            |
+| shell-exec     | No        | run command, execute, shell, terminal, bash                                                       | `shell_exec` | Yes            |
+| tmux           | No        | tmux, terminal, session, pane, window                                                             | `tmux`       | Yes            |
+| web-search     | No        | search, look up, find out, google, browse, web                                                    | `web_search` | Yes            |
+| github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status | `run_gh`     | Yes            |
+
+The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
+
+The **github** skill provides `run_gh` for interacting with GitHub via the `gh` CLI. It uses an allowlist of safe subcommands (pr, issue, run, workflow, release, repo, search, label, milestone, project) and scrubs sensitive `MIKA_*` environment variables before execution. Requires `gh` CLI to be installed (included in Docker image).
+
+Note: all exec-handler skills are excluded from heartbeat mode by `safe_always_on_skills()`.
 
 ---
 
@@ -468,7 +484,7 @@ If the skill fails to load, check the Mika logs for warnings. Common issues:
 
 ## Customizing Built-in Skills
 
-The three built-in skills (memory, reminders, messaging) are seeded into `~/.mika/skills/` only on first bootstrap. If a skill directory already exists, the bootstrap process skips it entirely. This means you can safely modify built-in skills and your changes will persist across upgrades.
+Bundled skills are re-synced from compiled-in templates on every startup, ensuring updates propagate to existing installations. To preserve local edits to handler scripts, set `MIKA_DISABLE_BUNDLED_SKILLS=true` (not recommended in production).
 
 ### Example: Disable always-on for reminders
 

@@ -1,7 +1,7 @@
 ---
 title: "feat: Add builtin GitHub skill using gh CLI"
 type: feat
-status: active
+status: completed
 date: 2026-02-28
 ---
 
