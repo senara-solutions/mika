@@ -266,16 +266,31 @@ async fn execute_exec(
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         // Log successful output for debugging silent failures
+        // Use char-boundary-safe slicing to avoid panics on multi-byte UTF-8
+        let stdout_end = {
+            let mut b = stdout.len().min(200);
+            while b > 0 && !stdout.is_char_boundary(b) {
+                b -= 1;
+            }
+            b
+        };
         tracing::debug!(
             tool = %tool_name,
             stdout_len = stdout.len(),
-            stdout_preview = %&stdout[..stdout.len().min(200)],
+            stdout_preview = %&stdout[..stdout_end],
             "skill exec succeeded"
         );
         if !stderr.trim().is_empty() {
+            let stderr_end = {
+                let mut b = stderr.len().min(500);
+                while b > 0 && !stderr.is_char_boundary(b) {
+                    b -= 1;
+                }
+                b
+            };
             tracing::debug!(
                 tool = %tool_name,
-                stderr = %&stderr[..stderr.len().min(500)],
+                stderr = %&stderr[..stderr_end],
                 "skill exec stderr on success"
             );
         }

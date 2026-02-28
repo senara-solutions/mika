@@ -27,5 +27,5 @@ You have access to tmux tools for managing terminal sessions. Use these for:
 
 **Error recovery:**
 - If a pane is reported as dead, kill the session with `tmux_kill_session` and create a new one. Inform the user that the previous process has exited.
-- If a pane is stuck in copy-mode, kill the session and recreate it. This is rare but unrecoverable via send-keys.
+- If a pane is stuck in copy-mode, `tmux_send_command` will attempt auto-recovery. If it reports the pane is still stuck, kill the session and recreate it.
 - If `tmux_read_output` reports stale output from a dead pane, do not retry the same command — the process has exited.
