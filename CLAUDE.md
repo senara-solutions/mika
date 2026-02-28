@@ -23,7 +23,6 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup). TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Shell-like input history (Up/Down arrows, cursor-position-aware, draft saving). Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer.
-- `crates/mika-gateway/` — Gateway: Telegram webhook router (text + images), customer pairing, outbound relay (Postgres-backed)
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/brainstorms/` — Decision brainstorm documents
 - `docs/plans/` — Implementation plans
@@ -45,13 +44,13 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~632 tests)
+- `cargo test` — Run all tests (~585 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
 - `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image
-- `docker build -f Dockerfile.gateway -t mika-gateway:dev .` — Build gateway container image
+- Gateway is in the private `mika-cloud` repo (see Reference Repositories below)
 
 ## Architecture
 
@@ -72,8 +71,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Heartbeat pre-filter:** Active hours (8-21 local via chrono-tz), rate limits (1/hour, 3/day), skip if user messaged within 2h. All checks before acquiring Mutex.
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 8 (v7 adds: skills system tables; v8 adds: search_content, fts_search FTS5, vec_search vec0 for Layer 3)
-- **mika-gateway:** Telegram webhook router with Postgres customer registry. Handles text messages and images (photos + image documents). Image pipeline: `getFile` API → download → magic-byte validation (JPEG/PNG/GIF/WebP) → base64 encode → forward to agent with `images` array. 5MB per-image limit, Content-Length pre-check, file_path validation. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (K8s probes). Stateless, env-var-only config.
-- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). `Dockerfile.gateway` (90MB) for shared router. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
+- **mika-gateway** (separate repo `mika-cloud`)**:** Telegram webhook router with Postgres customer registry. Handles text messages and images. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (K8s probes). Stateless, env-var-only config.
+- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). Gateway Dockerfile is in the `mika-cloud` repo. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
 
 ## Environment Variables
 
@@ -95,7 +94,6 @@ Optional (startup behavior):
 
 Optional (log files — logs go to stdout + file when set):
 - `MIKA_SERVER_LOG_FILE` — File path for mika-server log output
-- `MIKA_GATEWAY_LOG_FILE` — File path for mika-gateway log output
 
 ## Pending Work
 
@@ -111,3 +109,6 @@ Local clones of agent platforms to study for patterns and inspiration. Read free
 
 - **LettaBot** — `/home/samidarko/workspace/senara-solutions/lettabot/`
   TypeScript. Study for: memory hierarchy patterns (core/archival/recall from MemGPT), autonomous memory self-editing via tool calls, agent state persistence, channel integrations built on top of Letta's memory API.
+
+- **mika-cloud** — `/home/samidarko/workspace/senara-solutions/mika-cloud/`
+  Private repo. Contains mika-gateway (Telegram webhook router, Postgres customer registry, outbound relay). References mika-common via git dependency.

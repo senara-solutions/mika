@@ -93,7 +93,7 @@ Before deploying Mika, ensure you have:
 
 ## 3. Building Docker Images
 
-Both images use multi-stage builds with a Rust builder stage and a minimal Debian runtime stage.
+The agent image is built from this repo. The gateway image is built from the private [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo. Both use multi-stage builds with a Rust builder stage and a minimal Debian runtime stage.
 
 ### Agent Image (~95MB)
 
@@ -113,8 +113,11 @@ Build details:
 
 ### Gateway Image (~90MB)
 
+The gateway Dockerfile lives in the private [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo.
+
 ```bash
-docker build -f Dockerfile.gateway -t mika-gateway:dev .
+# From the mika-cloud repo:
+docker build -t mika-gateway:dev .
 ```
 
 Build details:
@@ -763,7 +766,7 @@ This applies to:
 
 ### Constant-Time Comparison
 
-All token comparisons use the `subtle` crate's `ConstantTimeEq` trait to prevent timing attacks. Both the webhook secret header and Bearer token middleware use the `constant_time_eq` helper (see `crates/mika-gateway/src/routes.rs:449`). Token length is validated at startup (must be exactly 64 hex chars) to eliminate length-based timing leaks from `ct_eq`.
+All token comparisons use the `subtle` crate's `ConstantTimeEq` trait to prevent timing attacks. Both the webhook secret header and Bearer token middleware use the `constant_time_eq` helper (see gateway `routes.rs`). Token length is validated at startup (must be exactly 64 hex chars) to eliminate length-based timing leaks from `ct_eq`.
 
 ### Non-Root Containers
 
@@ -785,7 +788,7 @@ Data at rest is encrypted at the cloud provider level. SQLite databases are stor
 
 ### SSRF Prevention
 
-Container URLs are computed deterministically from the customer UUID via the `container_url()` function (see `crates/mika-gateway/src/routes.rs:163`). No user-controlled input influences the URL. The gateway never forwards to arbitrary destinations.
+Container URLs are computed deterministically from the customer UUID via the `container_url()` function in the gateway. No user-controlled input influences the URL. The gateway never forwards to arbitrary destinations.
 
 ### Request Body Limits
 

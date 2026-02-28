@@ -70,7 +70,6 @@ On first run, Mika creates `~/.mika/` with default configuration, personality, a
 | Database | SQLite via rusqlite (per-customer) |
 | HTTP server | Axum 0.8 with tower-http |
 | TUI | ratatui + tui-textarea + crossterm |
-| Gateway DB | PostgreSQL via sqlx |
 | Async runtime | tokio |
 | Config | config-rs with `MIKA_` env prefix |
 
@@ -81,8 +80,9 @@ crates/
   mika-common/     Shared: config, Claude API client, logging, home directory
   mika-agent/      Agent: SQLite DB, agent loop, tools, skills, HTTP server (mika-server)
   mika-cli/        TUI CLI (mika): ratatui chat, clap subcommands, slash commands
-  mika-gateway/    Gateway: Telegram webhook router, customer pairing, outbound relay
 ```
+
+The gateway (Telegram webhook router) lives in the private [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo.
 
 ## Tools
 

@@ -1,7 +1,7 @@
 ---
 title: "chore: Extract mika-gateway to mika-cloud private repo"
 type: refactor
-status: active
+status: completed
 date: 2026-02-28
 ---
 
