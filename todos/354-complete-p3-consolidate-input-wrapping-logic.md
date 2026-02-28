@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "354"
 tags: [code-review, performance, quality, tui]

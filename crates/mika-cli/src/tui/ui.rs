@@ -37,6 +37,74 @@ pub(crate) fn visual_line_rows(line: &str, width: usize) -> usize {
     rows
 }
 
+/// Result of wrapping multi-line input text with cursor tracking.
+struct WrappedInput {
+    lines: Vec<Line<'static>>,
+    cursor_x: u16,
+    cursor_y: u16,
+}
+
+/// Wrap input text lines at character-width boundaries and track cursor position.
+fn wrap_input_with_cursor(
+    text_lines: &[impl AsRef<str>],
+    cursor_row: usize,
+    cursor_col: usize,
+    width: usize,
+) -> WrappedInput {
+    let mut display_lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_x: u16 = 0;
+    let mut cursor_y: u16 = 0;
+    let mut found_cursor = false;
+
+    for (line_idx, line) in text_lines.iter().enumerate() {
+        let line = line.as_ref();
+        if line.is_empty() {
+            if line_idx == cursor_row && !found_cursor {
+                cursor_y = display_lines.len() as u16;
+                cursor_x = 0;
+                found_cursor = true;
+            }
+            display_lines.push(Line::from(""));
+            continue;
+        }
+
+        let mut seg_start = 0;
+        let mut col = 0usize;
+
+        for (char_idx, (byte_offset, ch)) in line.char_indices().enumerate() {
+            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+            if col + ch_w > width && col > 0 {
+                display_lines.push(Line::from(line[seg_start..byte_offset].to_string()));
+                seg_start = byte_offset;
+                col = 0;
+            }
+
+            if line_idx == cursor_row && char_idx == cursor_col && !found_cursor {
+                cursor_y = display_lines.len() as u16;
+                cursor_x = col as u16;
+                found_cursor = true;
+            }
+
+            col += ch_w;
+        }
+
+        display_lines.push(Line::from(line[seg_start..].to_string()));
+
+        if line_idx == cursor_row && !found_cursor {
+            cursor_y = (display_lines.len() - 1) as u16;
+            cursor_x = col as u16;
+            found_cursor = true;
+        }
+    }
+
+    WrappedInput {
+        lines: display_lines,
+        cursor_x,
+        cursor_y,
+    }
+}
+
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     // Dynamic input height: grow with content, capped at 6 lines.
     // Use character display widths (not byte lengths) for accurate wrapping estimation.
@@ -291,77 +359,29 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
         return;
     }
 
-    // Build wrapped display lines and track cursor visual position
-    let mut display_lines: Vec<Line<'static>> = Vec::new();
-    let mut visual_cursor_x: u16 = 0;
-    let mut visual_cursor_y: u16 = 0;
-    let mut found_cursor = false;
-
-    for (line_idx, line) in lines.iter().enumerate() {
-        if line.is_empty() {
-            if line_idx == cursor_row && !found_cursor {
-                visual_cursor_y = display_lines.len() as u16;
-                visual_cursor_x = 0;
-                found_cursor = true;
-            }
-            display_lines.push(Line::from(""));
-            continue;
-        }
-
-        // Wrap this line at character-width boundaries
-        let mut seg_start = 0; // byte offset of current segment start
-        let mut col = 0usize; // display column within current visual row
-
-        for (char_idx, (byte_offset, ch)) in line.char_indices().enumerate() {
-            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-
-            // Wrap if adding this char exceeds width (and we have content)
-            if col + ch_w > width && col > 0 {
-                display_lines.push(Line::from(line[seg_start..byte_offset].to_string()));
-                seg_start = byte_offset;
-                col = 0;
-            }
-
-            // Check cursor before advancing
-            if line_idx == cursor_row && char_idx == cursor_col && !found_cursor {
-                visual_cursor_y = display_lines.len() as u16;
-                visual_cursor_x = col as u16;
-                found_cursor = true;
-            }
-
-            col += ch_w;
-        }
-
-        // Emit remaining segment
-        display_lines.push(Line::from(line[seg_start..].to_string()));
-
-        // Cursor at end of line (past last character)
-        if line_idx == cursor_row && !found_cursor {
-            visual_cursor_y = (display_lines.len() - 1) as u16;
-            visual_cursor_x = col as u16;
-            found_cursor = true;
-        }
-    }
+    // Wrap input and track cursor position
+    let wrapped = wrap_input_with_cursor(lines, cursor_row, cursor_col, width);
 
     // Scroll the input view if cursor is beyond the visible area
     let visible_height = textarea_area.height;
-    let scroll_offset = if visual_cursor_y >= visible_height {
-        visual_cursor_y - visible_height + 1
+    let scroll_offset = if wrapped.cursor_y >= visible_height {
+        wrapped.cursor_y - visible_height + 1
     } else {
         0
     };
 
     // Render display lines (with scroll offset)
-    let display_lines_to_render: Vec<Line<'static>> = display_lines
+    let display_lines: Vec<Line<'static>> = wrapped
+        .lines
         .into_iter()
         .skip(scroll_offset as usize)
         .collect();
-    let paragraph = Paragraph::new(display_lines_to_render);
+    let paragraph = Paragraph::new(display_lines);
     f.render_widget(paragraph, textarea_area);
 
     // Set cursor position
-    let cx = textarea_area.x + visual_cursor_x.min(textarea_area.width.saturating_sub(1));
-    let cy = textarea_area.y + visual_cursor_y - scroll_offset;
+    let cx = textarea_area.x + wrapped.cursor_x.min(textarea_area.width.saturating_sub(1));
+    let cy = textarea_area.y + wrapped.cursor_y - scroll_offset;
     if cy < textarea_area.y + textarea_area.height {
         f.set_cursor_position(Position::new(cx, cy));
     }

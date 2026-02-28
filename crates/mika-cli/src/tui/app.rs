@@ -63,23 +63,14 @@ pub struct AgentResponse {
     pub input_tokens: Option<u32>,
 }
 
-/// Result of navigating forward through input history.
-pub enum HistoryNavResult {
-    /// Navigated to a history entry.
-    Entry(String),
-    /// Cycled past newest — restore the saved draft.
-    Draft(String),
-    /// Already past newest / no-op.
-    None,
-}
-
 /// Shell-like input history with draft saving.
 pub struct InputHistory {
     entries: Vec<String>,
     index: Option<usize>,
     saved_draft: Option<String>,
-    max_size: usize,
 }
+
+const HISTORY_MAX_SIZE: usize = 500;
 
 impl InputHistory {
     pub fn new() -> Self {
@@ -87,7 +78,6 @@ impl InputHistory {
             entries: Vec::new(),
             index: None,
             saved_draft: None,
-            max_size: 500,
         }
     }
 
@@ -95,7 +85,7 @@ impl InputHistory {
     pub fn push(&mut self, entry: String) {
         if !entry.is_empty() {
             self.entries.push(entry);
-            if self.entries.len() > self.max_size {
+            if self.entries.len() > HISTORY_MAX_SIZE {
                 self.entries.remove(0);
             }
         }
@@ -124,21 +114,19 @@ impl InputHistory {
     }
 
     /// Navigate to the next (newer) history entry.
-    /// Returns Draft when cycling past newest (restores saved draft).
-    pub fn next(&mut self) -> HistoryNavResult {
+    /// Returns Some(text) when navigating forward, None if not browsing.
+    /// When cycling past newest, restores the saved draft.
+    pub fn next(&mut self) -> Option<String> {
         match self.index {
-            None => HistoryNavResult::None,
+            None => None,
             Some(i) => {
                 if i + 1 >= self.entries.len() {
                     // Past newest — restore draft
                     self.index = None;
-                    match self.saved_draft.take() {
-                        Some(draft) => HistoryNavResult::Draft(draft),
-                        None => HistoryNavResult::Draft(String::new()),
-                    }
+                    Some(self.saved_draft.take().unwrap_or_default())
                 } else {
                     self.index = Some(i + 1);
-                    HistoryNavResult::Entry(self.entries[i + 1].clone())
+                    Some(self.entries[i + 1].clone())
                 }
             }
         }
@@ -532,26 +520,16 @@ impl<'a> App<'a> {
     }
 
     pub fn history_next(&mut self) {
-        match self.history.next() {
-            HistoryNavResult::Entry(text) => {
+        if let Some(text) = self.history.next() {
+            if text.is_empty() {
+                self.reset_textarea();
+            } else {
                 self.textarea =
                     TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
                 self.textarea
                     .set_cursor_line_style(ratatui::style::Style::default());
                 self.textarea.set_placeholder_text("Type a message...");
             }
-            HistoryNavResult::Draft(text) => {
-                if text.is_empty() {
-                    self.reset_textarea();
-                } else {
-                    self.textarea =
-                        TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
-                    self.textarea
-                        .set_cursor_line_style(ratatui::style::Style::default());
-                    self.textarea.set_placeholder_text("Type a message...");
-                }
-            }
-            HistoryNavResult::None => {}
         }
     }
 
@@ -722,16 +700,10 @@ mod tests {
         assert_eq!(h.previous("my draft").unwrap(), "entry1");
 
         // Navigate forward
-        match h.next() {
-            HistoryNavResult::Entry(s) => assert_eq!(s, "entry2"),
-            _ => panic!("expected Entry"),
-        }
+        assert_eq!(h.next().unwrap(), "entry2");
 
         // Past newest restores draft
-        match h.next() {
-            HistoryNavResult::Draft(s) => assert_eq!(s, "my draft"),
-            _ => panic!("expected Draft"),
-        }
+        assert_eq!(h.next().unwrap(), "my draft");
     }
 
     #[test]
@@ -743,10 +715,7 @@ mod tests {
         assert_eq!(h.previous("").unwrap(), "entry");
 
         // Navigate past newest — draft is empty
-        match h.next() {
-            HistoryNavResult::Draft(s) => assert!(s.is_empty()),
-            _ => panic!("expected Draft"),
-        }
+        assert!(h.next().unwrap().is_empty());
     }
 
     #[test]
@@ -755,10 +724,7 @@ mod tests {
         h.push("entry".to_string());
 
         // next() without previous() is a no-op
-        match h.next() {
-            HistoryNavResult::None => {}
-            _ => panic!("expected None"),
-        }
+        assert!(h.next().is_none());
     }
 
     #[test]
