@@ -3,17 +3,17 @@
 ## 1. Overview
 
 Mika is a conversation-first AI executive assistant built in Rust. It operates in two
-distinct modes:
+modes:
 
 - **CLI mode (embedded):** The `mika` binary runs locally. User input flows through a
   ratatui TUI, the agent loop runs in-process, and SQLite stores all data on the local
   filesystem. No network services are required beyond the Claude API.
 
-- **Hosted mode (per-customer containers on Kubernetes):** A shared gateway receives
-  Telegram webhooks and routes messages to per-customer agent containers. Each container
-  runs `mika-server` (Axum HTTP), owns its own SQLite database on a K8s encrypted
-  volume, and communicates with the Claude API independently. Outbound messages flow
-  back through the gateway to the Telegram Bot API.
+- **Hosted mode (per-customer containers on Kubernetes):** Each customer gets their own
+  agent container running `mika-server` (Axum HTTP), with an isolated SQLite database
+  on a K8s encrypted volume. A shared gateway (in the private
+  [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo) routes messages
+  from Telegram to the correct container.
 
 Both modes use the same agent loop, tools, memory model, and prompt assembly code
 from the `mika-agent` crate.
@@ -40,31 +40,18 @@ from the `mika-agent` crate.
 
 ```
 +----------+     +--------------------+     +----------------------------+
-| Telegram  |---->|  mika-gateway      |     |  Per-customer container    |
-| Bot API   |<----|  (shared, Axum)    |     |  mika-server (Axum)        |
-+----------+     |                    |     |                            |
-                  |  Postgres          |     |  SQLite (encrypted vol)    |
-                  |  (customer         |     |  Agent loop + tools        |
-                  |   registry)        |     |                            |
-                  +--------+-----------+     +-------------+--------------+
-                           |                               |
-                           |   POST /message               |
-                           +------------------------------>|
-                           |                               |
-                           |   POST /send (outbound)       |
+| Telegram  |---->|  Gateway           |     |  Per-customer container    |
+| Bot API   |<----|  (mika-cloud repo) |     |  mika-server (Axum)        |
++----------+     +--------+-----------+     |                            |
+                           |                 |  SQLite (encrypted vol)    |
+                           |   POST /message |  Agent loop + tools        |
+                           +---------------->|                            |
+                           |                 +-------------+--------------+
+                           |   POST /send                  |
                            |<------------------------------+
-                           |                               |
                            |                        +------+------+
                            |                        |  Claude API  |
                            |                        +-------------+
-                           |
-                           |  (one container per customer)
-                           |
-                  +--------+-----------+
-                  |  mika-{customer-id} |  <-- deterministic DNS:
-                  |  .mika-agents.svc   |      http://mika-{uuid}.mika-agents
-                  |  .cluster.local:8080|      .svc.cluster.local:8080
-                  +--------------------+
 ```
 
 
@@ -75,7 +62,9 @@ from the `mika-agent` crate.
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), home directory resolution |
 | `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
-| `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres-backed customer registry, inbound webhook handling, outbound relay (`/send`), customer pairing via deep links, K8s health probes |
+
+The gateway crate (`mika-gateway`) lives in the private
+[mika-cloud](https://github.com/senara-solutions/mika-cloud) repo.
 
 
 ## 4. Agent Loop
@@ -115,8 +104,7 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
    **Multi-modal tool results:** Tools can return images alongside text via
    `ToolOutput::success_with_images()`. When images are present, the tool result
    is sent as a multi-block content array (`[{type: "text"}, {type: "image"}]`)
-   matching the Claude API spec. When text-only, the string shorthand is used
-   (backward compatible). Prior-turn images are replaced with
+   matching the Claude API spec. Prior-turn images are replaced with
    `[image(s) from previous turn omitted]` text before each API call.
 
 7. **Post-turn compaction** -- after the agent returns, check if conversation
@@ -126,17 +114,11 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 
 ### Constants
 
-Defined in `crates/mika-agent/src/agent.rs`:
-
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `MAX_TOOL_STEPS` | 10 | Maximum tool-use iterations per agent turn |
 | `TOOL_TIMEOUT_SECS` | 30 | Per-tool execution timeout (seconds) |
 | `AGENT_TOTAL_TIMEOUT_SECS` | 300 | Total agent loop timeout (5 minutes) |
-
-If the agent exceeds `MAX_TOOL_STEPS`, it returns a fallback message. If the total
-timeout fires, the outer `tokio::time::timeout` wrapper catches it and saves a
-fallback response to the database.
 
 
 ## 5. Memory Model
@@ -156,15 +138,11 @@ Always present in the system prompt. The agent can edit these blocks via the
 | `current_priorities` | "Get to know the user and understand their needs." |
 | `key_people` | "No one tracked yet." |
 
-Source: `crates/mika-agent/src/db.rs` -- `CORE_MEMORY_SECTIONS`
-
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
 - Per-session edit limit: `MAX_CORE_MEMORY_EDITS_PER_SESSION = 3` (onboarding sessions exempt)
 - Actions: `replace`, `append`, `remove_line`, `reset`
 - All mutations are recorded in the `memory_events` audit table
-
-Source: `crates/mika-agent/src/tools/update_core_memory.rs`
 
 ### Layer 2: Structured Facts
 
@@ -182,8 +160,10 @@ Stored in dedicated SQLite tables. Managed by the agent via `store_fact`,
 
 FTS5 full-text + sqlite-vec cosine similarity via Reciprocal Rank Fusion.
 Optional OpenAI embeddings (`text-embedding-3-small`, 512 dims). Graceful
-degradation: hybrid → FTS5-only → LIKE fallback. Indexed on `store_fact`/
+degradation: hybrid -> FTS5-only -> LIKE fallback. Indexed on `store_fact`/
 `update_fact`, backfilled on startup.
+
+See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details.
 
 
 ## 6. Tools
@@ -195,18 +175,16 @@ All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 |------|-------------|----------|
 | `update_core_memory` | Update persistent core memory blocks (Layer 1). Actions: replace, append, remove_line, reset. Rate limited to 3 edits/session. | Memory |
 | `store_fact` | Store a new structured fact (person, commitment, preference, or event) into Layer 2 tables. | Memory |
-| `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events) using LIKE queries. | Memory |
+| `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events). | Memory |
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
 | `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. | Reminders |
 | `list_reminders` | List pending and future reminders. | Reminders |
 | `cancel_reminder` | Cancel a pending reminder by ID. | Reminders |
-| `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the gateway `/send` endpoint. Required for silent mode (heartbeat/reminders). | Messaging |
+| `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
 
 **Tool trait:** `#[async_trait]` with `Send + Sync` bounds (required for `tokio::spawn`
 in server handlers). Each tool validates inputs: empty string check + 10,000 character
 maximum (`MAX_INPUT_LEN`).
-
-**ToolContext** provided to every tool execution contains references to the async database, session ID, home directory path, core memory edit counter, an onboarding flag, and an optional message sender. See `crates/mika-agent/src/tools/mod.rs:25` for the full struct definition.
 
 
 ## 7. Conversation Compaction
@@ -214,8 +192,6 @@ maximum (`MAX_INPUT_LEN`).
 When conversation history grows beyond a threshold, older messages are summarized via
 a Claude API call and replaced with a summary row. The summary is injected into the
 system prompt (not into message history).
-
-Source: `crates/mika-agent/src/compaction.rs`
 
 ### Constants
 
@@ -230,33 +206,24 @@ Source: `crates/mika-agent/src/compaction.rs`
 ### Flow
 
 1. After each agent turn, `maybe_compact()` checks `count_messages()`.
-2. If total messages <= `COMPACTION_THRESHOLD` (50), skip.
-3. Load all messages outside the context window (`load_messages_before_window(20)`).
-4. Cap the batch at `MAX_COMPACTION_BATCH` (100) messages.
-5. Call Claude API with a summarization system prompt and the message batch
-   (optionally merged with any existing summary).
-6. Truncate the generated summary to `MAX_SUMMARY_CHARS` (4000) if needed.
-7. Call `replace_with_summary()` -- deletes old messages up to `compacted_through_id`,
-   inserts or updates the summary row (role = 'summary').
-8. Recent `CONTEXT_WINDOW` (20) messages remain untouched.
+2. If total messages <= 50, skip.
+3. Load all messages outside the context window.
+4. Cap the batch at 100 messages.
+5. Call Claude API with a summarization system prompt and the message batch.
+6. Truncate the generated summary to 4000 characters if needed.
+7. Delete old messages up to `compacted_through_id`, insert or update the summary row.
+8. Recent 20 messages remain untouched.
 
-Compaction is **incremental** -- subsequent compaction rounds merge the existing summary
-with newly compacted messages.
+Compaction is incremental -- subsequent rounds merge the existing summary with
+newly compacted messages.
 
 
 ## 8. AsyncDatabase
 
 Source: `crates/mika-agent/src/async_db.rs`
 
-### Problem
-
-`rusqlite::Connection` is `!Send` -- it cannot be moved across threads, which is
-required by `tokio::spawn` in the HTTP server handlers.
-
-### Solution: Closure-Based Dispatch
-
-`AsyncDatabase` wraps the synchronous `Database` with a dedicated OS thread and an
-`mpsc` channel:
+`AsyncDatabase` wraps the synchronous `Database` (rusqlite) with a dedicated OS
+thread and an `mpsc` channel, making it Send+Sync and compatible with `tokio::spawn`.
 
 ```
 Caller (any tokio task)                  Dedicated OS thread ("mika-db")
@@ -264,63 +231,27 @@ Caller (any tokio task)                  Dedicated OS thread ("mika-db")
         |-- mpsc::send(closure) ----------------->|
         |                                        |-- closure(&Database)
         |<-- oneshot::send(Result<T>) ------------|
-        |                                        |
 ```
 
-1. `AsyncDatabase::new(db)` spawns a named OS thread (`"mika-db"`) that owns the
-   `Database` instance and loops on `mpsc::Receiver::recv()`.
-2. Each async method (e.g., `save_message()`) clones owned values, creates a
-   `oneshot::channel()`, and sends a `Box<dyn FnOnce(&Database) + Send>` closure over
-   the `mpsc` channel.
-3. The background thread executes the closure and sends the result back via the
-   `oneshot` sender.
-4. The caller `.await`s the `oneshot` receiver.
-
-### Properties
-
-- **Clone-able:** `AsyncDatabase` wraps `Arc<AsyncDatabaseInner>`, so clones share
-  the same background thread and connection.
-- **Send + Sync:** Safe to hold in `AppState` and pass to `tokio::spawn` tasks.
-- **Panic-resilient:** The background thread wraps each closure in
-  `std::panic::catch_unwind()` -- a panicking closure does not kill the thread.
-- **Graceful shutdown:** `shutdown()` drops the `mpsc::Sender` (causing `recv()` to
-  return `Err`), then joins the background thread. Subsequent operations return
-  `"database has been shut down"`.
+Properties:
+- **Clone-able:** Wraps `Arc<AsyncDatabaseInner>` — clones share the same connection.
+- **Panic-resilient:** Each closure wrapped in `catch_unwind()`.
+- **Graceful shutdown:** `shutdown()` drops the sender, joins the background thread.
 
 
 ## 9. Heartbeat System
 
-The heartbeat system enables proactive check-ins without user initiation. A K8s CronJob
-periodically POSTs to the container's `/heartbeat` endpoint.
+The heartbeat system enables proactive check-ins without user initiation. A K8s
+CronJob periodically POSTs to the container's `/heartbeat` endpoint.
 
-Source: `crates/mika-agent/src/server/handlers.rs` -- `handle_heartbeat()`,
-`heartbeat_should_run()`
+### Pre-Filter Checks (before acquiring Mutex)
 
-### Pre-Filter Checks
-
-All checks run **before** acquiring the agent Mutex (cheap, no Claude API call):
-
-1. **Active hours:** Customer's local time must be between 08:00 and 21:00
-   (via `chrono-tz` timezone conversion).
-2. **Hourly rate limit:** Maximum 1 heartbeat send per hour
-   (`count_heartbeat_sends_last_hour() >= 1`).
-3. **Daily rate limit:** Maximum 3 heartbeat sends per day
-   (`count_heartbeat_sends_today() >= 3`).
-4. **Recent activity:** Skip if the user sent a message within the last 2 hours
-   (`last_user_message_time()` + `TimeDelta::hours(2)`).
+1. Active hours: 08:00-21:00 in customer's local timezone
+2. Max 1 heartbeat per hour
+3. Max 3 heartbeats per day
+4. Skip if user messaged within 2 hours
 
 If any check fails, the handler returns `204 No Content` immediately.
-
-### Execution Flow
-
-1. Pre-filter passes.
-2. `try_lock_owned()` on the agent Mutex -- if busy, return `204` (heartbeat is
-   skippable).
-3. Spawn a background task that:
-   a. Creates a `SilentAgentParams` with `SilentTrigger::Heartbeat`.
-   b. Runs `run_silent_agent()` (see Silent Mode below).
-   c. Records the heartbeat send (`record_heartbeat_send()`) for rate limiting.
-4. Return `200 OK` immediately.
 
 
 ## 10. Silent Mode
@@ -328,157 +259,68 @@ If any check fails, the handler returns `204 No Content` immediately.
 Silent mode is used for background tasks (heartbeat check-ins and reminders) where
 the agent's text output is NOT automatically delivered to the user.
 
-Source: `crates/mika-agent/src/agent.rs` -- `run_silent_agent()`, `run_silent_inner()`
-
-### Key Differences from Normal Agent Loop
-
 | Aspect | Normal Mode | Silent Mode |
 |--------|-------------|-------------|
-| User message | Actual user input | Synthetic trigger: `"[heartbeat trigger]"` or `"[reminder trigger: ...]"` |
-| Text output delivery | Returned to caller / sent via gateway | NOT delivered -- saved to DB for audit only |
-| How to reach the user | Automatic | Agent must explicitly use `send_message` tool |
-| System prompt | `build_system_prompt()` | `build_silent_prompt()` with `SilentPromptContext` |
-| Message history | Last 20 messages loaded | No history loaded -- single trigger message only |
+| User message | Actual user input | Synthetic trigger |
+| Text output | Returned to caller | NOT delivered (saved to DB for audit) |
+| How to reach user | Automatic | Must use `send_message` tool |
+| Message history | Last 20 messages | Single trigger message only |
 | Compaction | Runs post-turn | Does not run |
 
-### SilentPromptContext
-
-The silent prompt includes:
-- Soul content and identity
-- Core memory blocks
-- Pending commitments (so the agent can reason about timely follow-ups)
-- Trigger context (heartbeat instructions or reminder data)
-- Current UTC time and customer timezone
-
-### Trigger Types
-
-`SilentTrigger` is an enum with two variants: `Heartbeat` (no data) and `Reminder { id, message }`. For reminders, the agent loop marks the reminder as `delivered` on success or `failed` on error/timeout. See `crates/mika-agent/src/agent.rs:312` for the definition.
+Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handler
+skills for security — only builtin-handler skills are available in autonomous
+background runs.
 
 
-## 11. Gateway Architecture
+## 11. HTTP Server (mika-server)
 
-The gateway (`mika-gateway`) is a stateless Axum HTTP service that routes messages
-between Telegram and per-customer agent containers. It uses Postgres for the customer
-registry.
-
-Source: `crates/mika-gateway/src/routes.rs`, `crates/mika-gateway/src/telegram.rs`
-
-### Endpoints
+The per-customer agent container runs an Axum HTTP server:
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/webhook/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` header (constant-time comparison) | Receive Telegram updates |
-| `/send` | POST | `Authorization: Bearer <MIKA_INTERNAL_TOKEN>` (constant-time comparison) | Containers deliver outbound messages to Telegram |
-| `/health` | GET | None | K8s readiness probe (checks `ready` flag + Postgres `SELECT 1`) |
-| `/readyz` | GET | None | K8s readiness probe (alias for `/health`) |
-| `/livez` | GET | None | K8s liveness probe (unconditional `200 OK`) |
+| `/health` | GET | None | K8s liveness/readiness probe |
+| `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
+| `/heartbeat` | POST | Bearer | CronJob trigger for proactive check-ins |
 
-### Inbound Flow (Telegram -> Container)
+`AppState` is Clone via Arc-wrapped dependencies. Agent lock
+(`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock`
+(429 if busy).
 
-1. Telegram POSTs an update to `/webhook/telegram`.
-2. Gateway validates the `X-Telegram-Bot-Api-Secret-Token` header (constant-time).
-3. Concurrency check: acquire a semaphore permit (`try_acquire_owned`). If at
-   capacity, return `503` (Telegram will retry).
-4. Return `200 OK` to Telegram immediately.
-5. Spawn async task to process the update:
-   a. **Parse update** via `parse_update()` -- yields one of: `Start` (pairing),
-      `Text` (message), `BareStart`, `Unsupported`, `NoMessage`.
-   b. **For text messages:**
-      - Look up customer by `telegram_chat_id` in Postgres.
-      - Check customer status (drop silently if `suspended`).
-      - **Atomic dedup:** `UPDATE customers SET last_update_id = $1 WHERE id = $2
-        AND last_update_id < $1 RETURNING id` -- prevents duplicate processing.
-      - Compute deterministic container URL: `http://mika-{customer_id}.mika-agents
-        .svc.cluster.local:8080` (no user-controlled URLs, prevents SSRF).
-      - Forward to container `POST /message` with Bearer auth, 2s timeout.
-      - On forwarding failure: reset dedup counter (CAS-safe) so Telegram retry
-        can succeed.
-   c. **For pairing (`/start <token>`):**
-      - Validate token format: 64-character hex string.
-      - Atomic pair: `UPDATE customers SET telegram_chat_id = $1 ... WHERE
-        pairing_token = $2 AND telegram_chat_id IS NULL AND status = 'provisioned'
-        AND pairing_expires_at > now()`.
-      - On success: forward synthetic `"Hello!"` to the container for onboarding.
-      - On failure: return opaque "Invalid or expired invite link."
-
-### Outbound Flow (Container -> Telegram)
-
-1. Container's `GatewayMessageSender` POSTs to gateway `/send` with
-   `{ chat_id, text, request_id }` and Bearer auth.
-2. Gateway validates the Bearer token (constant-time).
-3. Gateway calls `TelegramClient::send_message(chat_id, text)`.
-4. Returns status based on Telegram response:
-   - `200 OK` -- sent successfully
-   - `410 Gone` -- bot blocked by user
-   - `429 Too Many Requests` -- Telegram rate limited (includes `Retry-After` header)
-   - `502 Bad Gateway` -- other Telegram API errors
-
-### Telegram Client
-
-Source: `crates/mika-gateway/src/telegram.rs`
-
-`TelegramClient` wraps `reqwest::Client` with a `SecretString` bot token. Typed errors
-via `TelegramApiError`:
-
-| Variant | HTTP Status | Meaning |
-|---------|-------------|---------|
-| `Unauthorized` | 401 | Invalid bot token |
-| `BotBlocked` | 403 | User blocked the bot |
-| `RateLimited` | 429 | Telegram rate limit (with optional `retry_after`) |
-| `BadRequest` | 400 | Invalid payload |
-| `Other` | * | Unrecognized error |
-| `Network` | -- | reqwest transport error |
-
-### Customer Pairing (Deep Link)
-
-1. Provisioning creates a customer row in Postgres with a 64-character hex
-   `pairing_token` and `pairing_expires_at` timestamp.
-2. User clicks a Telegram deep link: `https://t.me/<bot>?start=<token>`.
-3. Telegram sends `/start <token>` to the webhook.
-4. Gateway validates the token and atomically pairs the customer (`UPDATE` with
-   conditions: token matches, not already paired, status is `provisioned`,
-   token not expired).
-5. On success, the customer status transitions from `provisioned` to `active`.
+See [ADR-001](adr/001-axum-http-server-architecture.md) for design decisions.
 
 
 ## 12. Failed Sends (Durable Outbox Pattern)
 
-When the gateway's `/send` endpoint is unreachable, outbound messages must not be lost.
-
-Source: `crates/mika-agent/src/messaging.rs` -- `GatewayMessageSender`
-Source: `crates/mika-agent/src/server/handlers.rs` -- `flush_failed_sends()`
+When the outbound routing endpoint is unreachable, messages are not lost.
 
 ### Write Path
 
 `GatewayMessageSender::send()` implements retry-then-persist:
-
-1. **First attempt:** POST to `{gateway_url}/send` with 10s timeout.
-2. **On failure:** Wait 2 seconds, retry once.
-3. **On second failure:** Save the message text to the `failed_sends` SQLite table
-   (`save_failed_send()`). Return `Ok(())` to the caller -- the agent loop does not
-   see a tool error (the message is queued, not lost).
+1. First attempt: POST to routing URL with 10s timeout.
+2. On failure: Wait 2 seconds, retry once.
+3. On second failure: Save to `failed_sends` SQLite table. Return `Ok(())` so
+   the agent loop does not see a tool error.
 
 ### Read Path (Flush)
 
-At the start of each `/message` handler invocation, the server spawns a best-effort
-flush task:
+At the start of each `/message` handler, the server flushes up to 5 pending failed
+sends in a background task (does not block message processing).
 
-1. Load up to 5 pending failed sends (`get_pending_failed_sends(5)`).
-2. For each, re-attempt sending via `GatewayMessageSender`.
-3. On success: delete the row (`delete_failed_send()`).
-4. On failure: increment the retry counter (`increment_failed_send_retry()`).
 
-The flush runs in a separate `tokio::spawn` task -- it does not block the main
-message processing path.
+## 13. Multi-Agent Support
 
-### Schema
+- Global home directory: `~/.mika/`
+- Agent homes: `~/.mika/agents/{name}/` (each with data/, skills/, logs/)
+- Active agent tracked in `~/.mika/active_agent`
+- CLI `--agent` flag overrides active agent
+- Server discovers all agents on startup
 
-The `failed_sends` table stores the message text, an optional request ID, a creation timestamp (defaults to current UTC), and a retry counter (defaults to 0). See `crates/mika-agent/src/db.rs:273` for the full CREATE TABLE statement.
+See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
 
 ## Appendix: Database Schema
 
-**Schema version:** 8 (defined as `CURRENT_SCHEMA_VERSION` in `crates/mika-agent/src/db.rs`)
+**Schema version:** 8
 
 ### Tables
 
@@ -505,4 +347,5 @@ The `failed_sends` table stores the message text, an optional request ID, a crea
 
 ### SQLite Pragmas
 
-The database is initialized with WAL journal mode, NORMAL synchronous level, foreign keys enabled, a 5-second busy timeout, and incremental auto-vacuum. See `crates/mika-agent/src/db.rs:46` for the full PRAGMA list.
+The database is initialized with WAL journal mode, NORMAL synchronous level, foreign
+keys enabled, a 5-second busy timeout, and incremental auto-vacuum.

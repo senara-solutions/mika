@@ -24,8 +24,9 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup). TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Shell-like input history (Up/Down arrows, cursor-position-aware, draft saving). Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer.
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
-- `docs/brainstorms/` — Decision brainstorm documents
-- `docs/plans/` — Implementation plans
+- `docs/` — Public documentation (architecture, configuration, deployment, skills, slash-commands, getting-started)
+- `docs/adr/` — Architecture Decision Records (numbered)
+- `docs/openapi/` — OpenAPI spec (mika-server.yaml)
 - `todos/` — Code review findings (tracked as markdown files)
 - `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit)
 

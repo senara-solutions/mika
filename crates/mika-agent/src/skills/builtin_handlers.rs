@@ -13,7 +13,7 @@ use crate::tools::{ToolContext, ToolOutput};
 static AGENT_API_SPEC: &str = include_str!("../../../../docs/openapi/mika-server.yaml");
 
 /// Embedded architecture overview document.
-static ARCHITECTURE_OVERVIEW: &str = include_str!("../../../../docs/architecture/OVERVIEW.md");
+static ARCHITECTURE_OVERVIEW: &str = include_str!("../../../../docs/architecture.md");
 
 /// Known builtin function names, used for startup validation.
 pub const KNOWN_BUILTINS: &[&str] = &[
