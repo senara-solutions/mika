@@ -19,7 +19,7 @@ pub enum TelegramApiError {
     Network(#[from] reqwest::Error),
 }
 
-// -- Telegram Update types (minimal, only what we need) --
+// -- Telegram Update types --
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TelegramUpdate {
@@ -30,12 +30,43 @@ pub struct TelegramUpdate {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TelegramMessage {
     pub chat: TelegramChat,
+    #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub photo: Option<Vec<PhotoSize>>,
+    #[serde(default)]
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub document: Option<TelegramDocument>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TelegramChat {
     pub id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct TelegramDocument {
+    pub file_id: String,
+    pub file_unique_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
 }
 
 // -- Parsed message result --
@@ -51,6 +82,19 @@ pub enum ParsedMessage {
         text: String,
         update_id: i64,
     },
+    Photo {
+        chat_id: i64,
+        file_id: String,
+        caption: Option<String>,
+        update_id: i64,
+    },
+    Document {
+        chat_id: i64,
+        file_id: String,
+        mime_type: String,
+        caption: Option<String>,
+        update_id: i64,
+    },
     BareStart {
         chat_id: i64,
     },
@@ -59,6 +103,9 @@ pub enum ParsedMessage {
     },
     NoMessage,
 }
+
+/// Image MIME types supported for forwarding to the agent.
+const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 /// Parse a Telegram update into a structured message type.
 pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
@@ -69,30 +116,56 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
 
     let chat_id = message.chat.id;
 
-    match &message.text {
-        Some(text) => {
-            if text == "/start" {
-                return ParsedMessage::BareStart { chat_id };
+    // Text messages (including /start commands) take priority
+    if let Some(text) = &message.text {
+        if text == "/start" {
+            return ParsedMessage::BareStart { chat_id };
+        }
+        if let Some(payload) = text.strip_prefix("/start ") {
+            let token = payload.trim();
+            if token.is_empty() {
+                return ParsedMessage::Unsupported { chat_id };
             }
-            if let Some(payload) = text.strip_prefix("/start ") {
-                let token = payload.trim();
-                if token.is_empty() {
-                    return ParsedMessage::Unsupported { chat_id };
-                }
-                ParsedMessage::Start {
+            return ParsedMessage::Start {
+                chat_id,
+                pairing_token: token.to_string(),
+            };
+        }
+        return ParsedMessage::Text {
+            chat_id,
+            text: text.clone(),
+            update_id: update.update_id,
+        };
+    }
+
+    // Photo messages: pick the largest photo (last in the array)
+    if let Some(photos) = &message.photo {
+        if let Some(largest) = photos.last() {
+            return ParsedMessage::Photo {
+                chat_id,
+                file_id: largest.file_id.clone(),
+                caption: message.caption.clone(),
+                update_id: update.update_id,
+            };
+        }
+    }
+
+    // Document messages: only forward image documents
+    if let Some(doc) = &message.document {
+        if let Some(mime) = &doc.mime_type {
+            if SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
+                return ParsedMessage::Document {
                     chat_id,
-                    pairing_token: token.to_string(),
-                }
-            } else {
-                ParsedMessage::Text {
-                    chat_id,
-                    text: text.clone(),
+                    file_id: doc.file_id.clone(),
+                    mime_type: mime.clone(),
+                    caption: message.caption.clone(),
                     update_id: update.update_id,
-                }
+                };
             }
         }
-        None => ParsedMessage::Unsupported { chat_id },
     }
+
+    ParsedMessage::Unsupported { chat_id }
 }
 
 // -- Telegram API response types --
@@ -107,6 +180,49 @@ struct TelegramResponse {
 #[derive(Debug, Deserialize)]
 struct TelegramResponseParameters {
     retry_after: Option<u64>,
+}
+
+/// Response from Telegram `getFile` API.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GetFileResponse {
+    ok: bool,
+    result: Option<TelegramFile>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramFile {
+    pub file_path: Option<String>,
+}
+
+/// Maximum image file size we'll download (5 MB).
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Result of downloading and validating an image from Telegram.
+#[derive(Debug)]
+pub struct DownloadedImage {
+    pub data: Vec<u8>,
+    pub media_type: String,
+}
+
+/// Detect media type from magic bytes. Returns None if unrecognized.
+pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    if bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        Some("image/jpeg")
+    } else if bytes[0..4] == [0x89, 0x50, 0x4E, 0x47] {
+        Some("image/png")
+    } else if bytes[0..4] == [0x47, 0x49, 0x46, 0x38] {
+        Some("image/gif")
+    } else if bytes[0..4] == [0x52, 0x49, 0x46, 0x46] && bytes[8..12] == [0x57, 0x45, 0x42, 0x50]
+    {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 // -- sendMessage payload --
@@ -190,6 +306,99 @@ impl TelegramClient {
         }
     }
 
+    /// Resolve a file_id to a file_path via Telegram's `getFile` API.
+    async fn get_file(&self, file_id: &str) -> Result<String, TelegramApiError> {
+        let url = self.api_url("getFile");
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("file_id", file_id)])
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
+                ok: false,
+                description: None,
+                parameters: None,
+            });
+            return match status {
+                401 => Err(TelegramApiError::Unauthorized),
+                429 => Err(TelegramApiError::RateLimited {
+                    retry_after: body.parameters.and_then(|p| p.retry_after),
+                }),
+                _ => Err(TelegramApiError::Other {
+                    status,
+                    body: body.description.unwrap_or_default(),
+                }),
+            };
+        }
+
+        let file_resp: GetFileResponse = resp
+            .json()
+            .await
+            .map_err(|e| TelegramApiError::Other {
+                status: 200,
+                body: format!("failed to parse getFile response: {e}"),
+            })?;
+
+        file_resp
+            .result
+            .and_then(|f| f.file_path)
+            .ok_or(TelegramApiError::Other {
+                status: 200,
+                body: "getFile returned no file_path".to_string(),
+            })
+    }
+
+    /// Download file bytes from Telegram's file server.
+    async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>, TelegramApiError> {
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token.expose_secret(),
+            file_path
+        );
+        let resp = self.client.get(&url).send().await?;
+
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(TelegramApiError::Other {
+                status,
+                body: format!("file download returned {status}"),
+            });
+        }
+
+        let bytes = resp.bytes().await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Download an image by file_id: resolves path, downloads bytes, validates magic bytes, enforces size limit.
+    /// Returns the raw bytes and detected media type.
+    pub async fn download_image(&self, file_id: &str) -> Result<DownloadedImage, TelegramApiError> {
+        let file_path = self.get_file(file_id).await?;
+        let bytes = self.download_file_bytes(&file_path).await?;
+
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(TelegramApiError::BadRequest {
+                message: format!(
+                    "image too large ({:.1} MB, max {} MB)",
+                    bytes.len() as f64 / 1_048_576.0,
+                    MAX_IMAGE_BYTES / 1_048_576
+                ),
+            });
+        }
+
+        let media_type = detect_media_type(&bytes).ok_or(TelegramApiError::BadRequest {
+            message: "unsupported image format".to_string(),
+        })?;
+
+        Ok(DownloadedImage {
+            data: bytes,
+            media_type: media_type.to_string(),
+        })
+    }
+
     /// Register the webhook URL with Telegram. Verifies `ok: true` response.
     pub async fn set_webhook(&self, webhook_url: &str, webhook_secret: &str) -> anyhow::Result<()> {
         let payload = SetWebhookPayload {
@@ -236,14 +445,65 @@ impl std::fmt::Debug for TelegramClient {
 mod tests {
     use super::*;
 
+    /// Helper to build a text-only TelegramMessage.
+    fn text_msg(chat_id: i64, text: Option<&str>) -> TelegramMessage {
+        TelegramMessage {
+            chat: TelegramChat { id: chat_id },
+            text: text.map(|s| s.to_string()),
+            photo: None,
+            caption: None,
+            document: None,
+        }
+    }
+
+    /// Helper to build a photo TelegramMessage.
+    fn photo_msg(chat_id: i64, photos: Vec<PhotoSize>, caption: Option<&str>) -> TelegramMessage {
+        TelegramMessage {
+            chat: TelegramChat { id: chat_id },
+            text: None,
+            photo: Some(photos),
+            caption: caption.map(|s| s.to_string()),
+            document: None,
+        }
+    }
+
+    /// Helper to build a document TelegramMessage.
+    fn document_msg(
+        chat_id: i64,
+        file_id: &str,
+        mime_type: Option<&str>,
+        caption: Option<&str>,
+    ) -> TelegramMessage {
+        TelegramMessage {
+            chat: TelegramChat { id: chat_id },
+            text: None,
+            photo: None,
+            caption: caption.map(|s| s.to_string()),
+            document: Some(TelegramDocument {
+                file_id: file_id.to_string(),
+                file_unique_id: "unique_1".to_string(),
+                file_name: None,
+                mime_type: mime_type.map(|s| s.to_string()),
+                file_size: None,
+            }),
+        }
+    }
+
+    fn make_photo_size(file_id: &str, width: u32, height: u32) -> PhotoSize {
+        PhotoSize {
+            file_id: file_id.to_string(),
+            file_unique_id: format!("uniq_{file_id}"),
+            width,
+            height,
+            file_size: None,
+        }
+    }
+
     #[test]
     fn test_parse_text_message() {
         let update = TelegramUpdate {
             update_id: 100,
-            message: Some(TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some("Hello Mika!".to_string()),
-            }),
+            message: Some(text_msg(42, Some("Hello Mika!"))),
         };
         assert_eq!(
             parse_update(&update),
@@ -260,10 +520,7 @@ mod tests {
         let token = "a1b2c3d4e5f6";
         let update = TelegramUpdate {
             update_id: 101,
-            message: Some(TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some(format!("/start {token}")),
-            }),
+            message: Some(text_msg(42, Some(&format!("/start {token}")))),
         };
         assert_eq!(
             parse_update(&update),
@@ -278,10 +535,7 @@ mod tests {
     fn test_parse_start_with_whitespace() {
         let update = TelegramUpdate {
             update_id: 102,
-            message: Some(TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some("/start  abc123  ".to_string()),
-            }),
+            message: Some(text_msg(42, Some("/start  abc123  "))),
         };
         assert_eq!(
             parse_update(&update),
@@ -296,10 +550,7 @@ mod tests {
     fn test_parse_start_empty_payload() {
         let update = TelegramUpdate {
             update_id: 103,
-            message: Some(TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some("/start ".to_string()),
-            }),
+            message: Some(text_msg(42, Some("/start "))),
         };
         assert_eq!(
             parse_update(&update),
@@ -311,10 +562,7 @@ mod tests {
     fn test_parse_non_text_message() {
         let update = TelegramUpdate {
             update_id: 104,
-            message: Some(TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: None,
-            }),
+            message: Some(text_msg(42, None)),
         };
         assert_eq!(
             parse_update(&update),
@@ -335,10 +583,7 @@ mod tests {
     fn test_parse_bare_start() {
         let update = TelegramUpdate {
             update_id: 106,
-            message: Some(TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some("/start".to_string()),
-            }),
+            message: Some(text_msg(42, Some("/start"))),
         };
         assert_eq!(
             parse_update(&update),
@@ -352,5 +597,282 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("ABC-DEF"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    // -- Photo parsing tests --
+
+    #[test]
+    fn test_parse_photo_message_picks_largest() {
+        let photos = vec![
+            make_photo_size("small", 90, 90),
+            make_photo_size("medium", 320, 320),
+            make_photo_size("large", 800, 800),
+        ];
+        let update = TelegramUpdate {
+            update_id: 200,
+            message: Some(photo_msg(42, photos, None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Photo {
+                chat_id: 42,
+                file_id: "large".to_string(),
+                caption: None,
+                update_id: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_photo_message_with_caption() {
+        let photos = vec![make_photo_size("pic1", 640, 480)];
+        let update = TelegramUpdate {
+            update_id: 201,
+            message: Some(photo_msg(42, photos, Some("Look at this!"))),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Photo {
+                chat_id: 42,
+                file_id: "pic1".to_string(),
+                caption: Some("Look at this!".to_string()),
+                update_id: 201,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_photo_message_single_size() {
+        let photos = vec![make_photo_size("only", 1024, 768)];
+        let update = TelegramUpdate {
+            update_id: 202,
+            message: Some(photo_msg(42, photos, None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Photo {
+                chat_id: 42,
+                file_id: "only".to_string(),
+                caption: None,
+                update_id: 202,
+            }
+        );
+    }
+
+    // -- Document parsing tests --
+
+    #[test]
+    fn test_parse_image_document() {
+        let update = TelegramUpdate {
+            update_id: 300,
+            message: Some(document_msg(42, "doc_file_1", Some("image/jpeg"), None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Document {
+                chat_id: 42,
+                file_id: "doc_file_1".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                caption: None,
+                update_id: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_image_document_with_caption() {
+        let update = TelegramUpdate {
+            update_id: 301,
+            message: Some(document_msg(
+                42,
+                "doc_file_2",
+                Some("image/png"),
+                Some("A diagram"),
+            )),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Document {
+                chat_id: 42,
+                file_id: "doc_file_2".to_string(),
+                mime_type: "image/png".to_string(),
+                caption: Some("A diagram".to_string()),
+                update_id: 301,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_non_image_document_is_unsupported() {
+        let update = TelegramUpdate {
+            update_id: 302,
+            message: Some(document_msg(42, "pdf_file", Some("application/pdf"), None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Unsupported { chat_id: 42 }
+        );
+    }
+
+    #[test]
+    fn test_parse_document_no_mime_is_unsupported() {
+        let update = TelegramUpdate {
+            update_id: 303,
+            message: Some(document_msg(42, "unknown_file", None, None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Unsupported { chat_id: 42 }
+        );
+    }
+
+    #[test]
+    fn test_parse_webp_document() {
+        let update = TelegramUpdate {
+            update_id: 304,
+            message: Some(document_msg(42, "webp_file", Some("image/webp"), None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Document {
+                chat_id: 42,
+                file_id: "webp_file".to_string(),
+                mime_type: "image/webp".to_string(),
+                caption: None,
+                update_id: 304,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_gif_document() {
+        let update = TelegramUpdate {
+            update_id: 305,
+            message: Some(document_msg(42, "gif_file", Some("image/gif"), None)),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Document {
+                chat_id: 42,
+                file_id: "gif_file".to_string(),
+                mime_type: "image/gif".to_string(),
+                caption: None,
+                update_id: 305,
+            }
+        );
+    }
+
+    // -- Magic byte detection tests --
+
+    #[test]
+    fn test_detect_jpeg() {
+        let bytes = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(detect_media_type(&bytes), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn test_detect_png() {
+        let bytes = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        assert_eq!(detect_media_type(&bytes), Some("image/png"));
+    }
+
+    #[test]
+    fn test_detect_gif() {
+        let bytes = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0];
+        assert_eq!(detect_media_type(&bytes), Some("image/gif"));
+    }
+
+    #[test]
+    fn test_detect_webp() {
+        let bytes = [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50];
+        assert_eq!(detect_media_type(&bytes), Some("image/webp"));
+    }
+
+    #[test]
+    fn test_detect_unknown_format() {
+        let bytes = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B];
+        assert_eq!(detect_media_type(&bytes), None);
+    }
+
+    #[test]
+    fn test_detect_too_short() {
+        let bytes = [0xFF, 0xD8];
+        assert_eq!(detect_media_type(&bytes), None);
+    }
+
+    // -- JSON deserialization tests --
+
+    #[test]
+    fn test_deserialize_photo_update() {
+        let json = r#"{
+            "update_id": 500,
+            "message": {
+                "chat": {"id": 42},
+                "photo": [
+                    {"file_id": "sm", "file_unique_id": "u1", "width": 90, "height": 90},
+                    {"file_id": "lg", "file_unique_id": "u2", "width": 800, "height": 600}
+                ],
+                "caption": "Check this out"
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Photo {
+                chat_id: 42,
+                file_id: "lg".to_string(),
+                caption: Some("Check this out".to_string()),
+                update_id: 500,
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_document_update() {
+        let json = r#"{
+            "update_id": 501,
+            "message": {
+                "chat": {"id": 42},
+                "document": {
+                    "file_id": "doc1",
+                    "file_unique_id": "u3",
+                    "file_name": "photo.jpg",
+                    "mime_type": "image/jpeg",
+                    "file_size": 123456
+                }
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Document {
+                chat_id: 42,
+                file_id: "doc1".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                caption: None,
+                update_id: 501,
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_text_update_ignores_new_fields() {
+        // Verify backward compat: a text-only update still parses correctly
+        let json = r#"{
+            "update_id": 502,
+            "message": {
+                "chat": {"id": 42},
+                "text": "Hello"
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Text {
+                chat_id: 42,
+                text: "Hello".to_string(),
+                update_id: 502,
+            }
+        );
     }
 }

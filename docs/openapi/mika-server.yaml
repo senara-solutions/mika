@@ -120,6 +120,17 @@ components:
           description: Target agent name (defaults to the server's default agent if absent).
         request_id:
           type: string
+    ImagePayload:
+      type: object
+      description: Image payload forwarded from the gateway.
+      required:
+      - media_type
+      - data
+      properties:
+        data:
+          type: string
+        media_type:
+          type: string
     MessageRequest:
       type: object
       description: Inbound message from the gateway.
@@ -137,6 +148,13 @@ components:
         chat_id:
           type: integer
           format: int64
+        images:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/ImagePayload'
+          description: Optional images forwarded from the gateway (base64-encoded).
         request_id:
           type: string
         text:

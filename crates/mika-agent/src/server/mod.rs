@@ -10,6 +10,7 @@ use axum::{
     Router, middleware,
     routing::{get, post},
 };
+use tower_http::limit::RequestBodyLimitLayer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +38,10 @@ use state::{AgentState, AppState};
 /// Shared between production `run_server` and test `test_app`.
 fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/message", post(handlers::handle_message))
+        .route(
+            "/message",
+            post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
+        )
         .route("/heartbeat", post(handlers::handle_heartbeat))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -619,5 +623,96 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_message_with_images_accepted() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"[Photo]","chat_id":456,"channel":"telegram","request_id":"img-001","images":[{"media_type":"image/jpeg","data":"dGVzdA=="}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["request_id"], "img-001");
+        assert_eq!(json["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn test_message_without_images_backward_compat() {
+        // Verify messages without images field still work (backward compat)
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"hello","chat_id":456,"channel":"telegram","request_id":"compat-001"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_message_request_deserializes_images() {
+        // Unit test for MessageRequest deserialization with images
+        let json = r#"{
+            "text": "[Photo]",
+            "chat_id": 42,
+            "channel": "telegram",
+            "request_id": "r1",
+            "images": [
+                {"media_type": "image/jpeg", "data": "base64data1"},
+                {"media_type": "image/png", "data": "base64data2"}
+            ]
+        }"#;
+        let req: super::types::MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.text, "[Photo]");
+        let images = req.images.unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].media_type, "image/jpeg");
+        assert_eq!(images[0].data, "base64data1");
+        assert_eq!(images[1].media_type, "image/png");
+        assert_eq!(images[1].data, "base64data2");
+    }
+
+    #[tokio::test]
+    async fn test_message_request_deserializes_without_images() {
+        // images field is optional — missing should default to None
+        let json = r#"{
+            "text": "hello",
+            "chat_id": 42,
+            "channel": "telegram",
+            "request_id": "r2"
+        }"#;
+        let req: super::types::MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.text, "hello");
+        assert!(req.images.is_none());
     }
 }

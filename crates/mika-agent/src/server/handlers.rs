@@ -5,6 +5,8 @@ use std::sync::atomic::Ordering;
 use tracing::Instrument;
 use tracing::{error, info, warn};
 
+use mika_common::claude::ImageSource;
+
 use crate::agent::{
     self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent,
 };
@@ -114,6 +116,19 @@ pub async fn handle_message(
 
     let request_id = req.request_id.clone();
 
+    // Convert gateway image payloads to Claude API ImageSource
+    let user_images: Vec<ImageSource> = req
+        .images
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|img| ImageSource {
+            source_type: "base64".to_string(),
+            media_type: img.media_type.clone(),
+            data: img.data.clone(),
+        })
+        .collect();
+
     // Spawn flush of previously failed sends in parallel (best-effort, non-blocking)
     let flush_state = state.clone();
     let flush_agent = agent_state.clone();
@@ -155,7 +170,7 @@ pub async fn handle_message(
                 skip_compaction: true,
                 embedding_client: a.embedding_client.as_ref(),
                 thinking: None,
-                user_images: &[],
+                user_images: &user_images,
                 brave_api_key: s.brave_api_key.as_deref(),
             };
 

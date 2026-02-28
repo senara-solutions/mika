@@ -15,7 +15,8 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tracing::{info, warn};
+use base64::Engine;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::telegram::{
@@ -140,6 +141,24 @@ pub(crate) async fn handle_webhook(
                 update_id,
             } => {
                 handle_text_message(&s, chat_id, &text, update_id).await;
+            }
+            ParsedMessage::Photo {
+                chat_id,
+                file_id,
+                caption,
+                update_id,
+            } => {
+                handle_photo_message(&s, chat_id, &file_id, caption.as_deref(), update_id).await;
+            }
+            ParsedMessage::Document {
+                chat_id,
+                file_id,
+                mime_type: _,
+                caption,
+                update_id,
+            } => {
+                // Image documents use the same flow as photos
+                handle_photo_message(&s, chat_id, &file_id, caption.as_deref(), update_id).await;
             }
             ParsedMessage::BareStart { chat_id } => {
                 let _ = s
@@ -271,6 +290,171 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
             .execute(&state.pool)
             .await;
             warn!(error = %e, customer_id = %row.id, "container unreachable, dedup reset");
+            reply_transient_error(&state.telegram, chat_id).await;
+        }
+    }
+}
+
+// -- Photo message routing --
+
+/// Route a photo/document message to the correct customer container.
+///
+/// Downloads the image from Telegram, base64-encodes it, and forwards
+/// alongside the caption (or synthetic text) to the agent container.
+/// Dedup is claimed *after* a successful download to prevent message loss.
+async fn handle_photo_message(
+    state: &AppState,
+    chat_id: i64,
+    file_id: &str,
+    caption: Option<&str>,
+    update_id: i64,
+) {
+    // Look up customer (same as text messages)
+    let row = match sqlx::query_as::<_, CustomerRow>(
+        "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
+    )
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            let _ = state
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Please pair your account first. Use your invite link to get started.",
+                )
+                .await;
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, "customer lookup failed");
+            reply_transient_error(&state.telegram, chat_id).await;
+            return;
+        }
+    };
+
+    if row.status == "suspended" {
+        info!(chat_id, customer_id = %row.id, "photo from suspended customer, dropping");
+        return;
+    }
+
+    // Download image BEFORE claiming dedup (prevents message loss on download failure)
+    let image = match state.telegram.download_image(file_id).await {
+        Ok(img) => img,
+        Err(TelegramApiError::BadRequest { ref message }) if message.contains("too large") => {
+            let _ = state
+                .telegram
+                .send_message(
+                    chat_id,
+                    "That image is too large for me to process. Please send a smaller photo (under 5 MB).",
+                )
+                .await;
+            return;
+        }
+        Err(TelegramApiError::BadRequest { ref message })
+            if message.contains("unsupported") =>
+        {
+            let _ = state
+                .telegram
+                .send_message(
+                    chat_id,
+                    "I couldn't recognize that image format. Please send a JPEG, PNG, GIF, or WebP image.",
+                )
+                .await;
+            return;
+        }
+        Err(e) => {
+            error!(error = %e, chat_id, "failed to download image from Telegram");
+            let _ = state
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Sorry, I couldn't download your photo. Please try sending it again.",
+                )
+                .await;
+            return;
+        }
+    };
+
+    let image_size = image.data.len();
+    let media_type = image.media_type.clone();
+
+    // Base64-encode the image
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&image.data);
+    drop(image); // Free raw bytes
+
+    info!(
+        chat_id,
+        customer_id = %row.id,
+        media_type = %media_type,
+        image_size,
+        "downloaded and encoded image"
+    );
+
+    // Now claim dedup (download succeeded)
+    let claimed = sqlx::query(
+        "UPDATE customers SET last_update_id = $1 WHERE id = $2 AND last_update_id < $1 RETURNING id",
+    )
+    .bind(update_id)
+    .bind(row.id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match claimed {
+        Ok(Some(_)) => {}
+        Ok(None) => return, // already processed
+        Err(e) => {
+            warn!(error = %e, "dedup update failed");
+            return;
+        }
+    }
+
+    // Use caption or synthetic text for captionless photos
+    let text = caption.unwrap_or("[Photo]");
+
+    let url = container_url(&row.id, &state.agent_base_url);
+    let request_id = Uuid::new_v4().to_string();
+
+    // Forward to container with images array (longer timeout for large payloads)
+    let result = state
+        .http_client
+        .post(format!("{url}/message"))
+        .bearer_auth(state.internal_token.expose_secret())
+        .json(&serde_json::json!({
+            "text": text,
+            "chat_id": chat_id,
+            "channel": "telegram",
+            "request_id": request_id,
+            "images": [{
+                "media_type": media_type,
+                "data": base64_data,
+            }]
+        }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
+            // Successfully forwarded
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            warn!(status, customer_id = %row.id, "container returned error for photo");
+            reply_transient_error(&state.telegram, chat_id).await;
+        }
+        Err(e) => {
+            // Reset dedup so Telegram retry can succeed
+            let _ = sqlx::query(
+                "UPDATE customers SET last_update_id = last_update_id - 1 WHERE id = $1 AND last_update_id = $2",
+            )
+            .bind(row.id)
+            .bind(update_id)
+            .execute(&state.pool)
+            .await;
+            warn!(error = %e, customer_id = %row.id, "container unreachable for photo, dedup reset");
             reply_transient_error(&state.telegram, chat_id).await;
         }
     }
