@@ -35,14 +35,10 @@ struct McpConnection {
     tools: Vec<rmcp::model::Tool>,
 }
 
-/// Status of an MCP server connection.
-#[derive(Debug)]
-pub struct McpServerStatus {
-    pub name: String,
-    pub transport: String,
-    pub connected: bool,
-    pub tool_count: usize,
-}
+/// Maximum number of images allowed in a single MCP tool result.
+const MAX_MCP_IMAGES: usize = 5;
+/// Maximum base64 data size for a single MCP image (5 MB).
+const MAX_MCP_IMAGE_SIZE: usize = 5 * 1024 * 1024;
 
 /// Manages connections to all configured MCP servers.
 ///
@@ -57,6 +53,7 @@ pub struct McpManager {
 impl McpManager {
     /// Connect to all enabled MCP servers from config.
     ///
+    /// Connections are established in parallel for fast startup.
     /// Failures are logged and skipped -- never blocks startup.
     /// Returns an empty manager if no servers are configured or all fail.
     pub async fn connect_all(config: &McpConfig) -> Self {
@@ -64,31 +61,55 @@ impl McpManager {
         let mut tool_definitions = Vec::new();
         let mut tool_routing = HashMap::new();
 
+        // Spawn all connections in parallel
+        let mut join_set = tokio::task::JoinSet::new();
         for (name, server_config) in config.enabled_servers() {
             if let Err(e) = server_config.validate(name) {
                 warn!(server = name, error = %e, "skipping MCP server: invalid config");
                 continue;
             }
+            let name = name.to_string();
+            let server_config = server_config.clone();
+            join_set.spawn(async move {
+                let result = connect_server(&name, &server_config).await;
+                (name, result)
+            });
+        }
 
-            match connect_server(name, server_config).await {
+        // Collect results
+        while let Some(join_result) = join_set.join_next().await {
+            let (name, connect_result) = match join_result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "MCP server connection task panicked");
+                    continue;
+                }
+            };
+            match connect_result {
                 Ok(conn) => {
                     info!(
-                        server = name,
+                        server = %name,
                         tools = conn.tools.len(),
                         "connected to MCP server"
                     );
 
-                    // Convert MCP tools to Claude ToolDefinitions with namespacing
                     for tool in &conn.tools {
                         let tool_name_str: &str = &tool.name;
                         let namespaced =
                             format!("{MCP_PREFIX}{name}{MCP_SEP}{tool_name_str}");
+
+                        if tool_routing.contains_key(&namespaced) {
+                            warn!(
+                                tool = %namespaced,
+                                "duplicate MCP tool name, skipping"
+                            );
+                            continue;
+                        }
+
                         let description = format!(
                             "[MCP: {name}] {}",
                             tool.description.as_deref().unwrap_or("")
                         );
-
-                        // Convert Arc<JsonObject> to serde_json::Value
                         let input_schema =
                             serde_json::Value::Object(tool.input_schema.as_ref().clone());
 
@@ -103,10 +124,10 @@ impl McpManager {
                         );
                     }
 
-                    connections.insert(name.to_string(), conn);
+                    connections.insert(name, conn);
                 }
                 Err(e) => {
-                    warn!(server = name, error = %e, "failed to connect to MCP server");
+                    warn!(server = %name, error = %e, "failed to connect to MCP server");
                 }
             }
         }
@@ -123,15 +144,6 @@ impl McpManager {
             connections,
             tool_definitions,
             tool_routing,
-        }
-    }
-
-    /// Create an empty manager (no servers configured).
-    pub fn empty() -> Self {
-        Self {
-            connections: HashMap::new(),
-            tool_definitions: Vec::new(),
-            tool_routing: HashMap::new(),
         }
     }
 
@@ -191,19 +203,6 @@ impl McpManager {
         convert_mcp_result(&result, tool_name)
     }
 
-    /// Get connection status for all configured servers.
-    pub fn status(&self) -> Vec<McpServerStatus> {
-        self.connections
-            .values()
-            .map(|conn| McpServerStatus {
-                name: conn.name.clone(),
-                transport: "connected".to_string(),
-                connected: true,
-                tool_count: conn.tools.len(),
-            })
-            .collect()
-    }
-
     /// Gracefully shut down all MCP server connections.
     pub async fn shutdown(self) {
         for (name, conn) in self.connections {
@@ -254,9 +253,13 @@ async fn connect_stdio(name: &str, config: &McpServerConfig) -> Result<McpConnec
         }
     }
 
-    // Add server-specific env vars
+    // Add server-specific env vars (reject overrides of essential vars and MIKA_ secrets)
     if let Some(env) = &config.env {
         for (key, value) in env {
+            if key.starts_with("MIKA_") {
+                warn!(server = name, key = %key, "ignoring MIKA_ env var override in MCP config");
+                continue;
+            }
             cmd.env(key, value);
         }
     }
@@ -325,7 +328,6 @@ fn convert_mcp_result(
     let mut images = Vec::new();
 
     for content in &result.content {
-        // Content = Annotated<RawContent>, which Derefs to RawContent
         match &**content {
             RawContent::Text(t) => {
                 if !text.is_empty() {
@@ -334,21 +336,32 @@ fn convert_mcp_result(
                 text.push_str(&t.text);
             }
             RawContent::Image(img) => {
+                if images.len() >= MAX_MCP_IMAGES {
+                    warn!(tool = tool_name, "MCP tool returned too many images, truncating");
+                    break;
+                }
+                if img.data.len() > MAX_MCP_IMAGE_SIZE {
+                    warn!(tool = tool_name, size = img.data.len(), "MCP image too large, skipping");
+                    continue;
+                }
                 images.push(ImageData {
                     media_type: img.mime_type.clone(),
                     data: img.data.clone(),
                 });
             }
             _ => {
-                // Audio, Resource, ResourceLink -- log and skip
                 warn!(tool = tool_name, "unsupported MCP content type, skipping");
             }
         }
     }
 
-    // Truncate text output
+    // Truncate text output (char-boundary-safe)
     if text.len() > MAX_OUTPUT_LEN {
-        text.truncate(MAX_OUTPUT_LEN);
+        let mut boundary = MAX_OUTPUT_LEN;
+        while boundary > 0 && !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
         text.push_str("\n... (truncated at 10000 chars)");
     }
 
@@ -360,42 +373,45 @@ fn convert_mcp_result(
         };
     }
 
-    if images.is_empty() {
-        if is_error {
-            ToolOutput::error(text)
-        } else {
-            ToolOutput::success(text)
-        }
-    } else if is_error {
+    if is_error {
         ToolOutput::error(text)
+    } else if images.is_empty() {
+        ToolOutput::success(text)
     } else {
         ToolOutput::success_with_images(text, images)
     }
-}
-
-/// Parse a namespaced MCP tool name into (server_name, tool_name).
-///
-/// Format: `mcp__{server_name}__{tool_name}`
-pub fn parse_mcp_tool_name(namespaced: &str) -> Option<(&str, &str)> {
-    let rest = namespaced.strip_prefix(MCP_PREFIX)?;
-    let sep_pos = rest.find(MCP_SEP)?;
-    let server = &rest[..sep_pos];
-    let tool = &rest[sep_pos + MCP_SEP.len()..];
-    if server.is_empty() || tool.is_empty() {
-        return None;
-    }
-    Some((server, tool))
-}
-
-/// Build a namespaced MCP tool name.
-pub fn mcp_tool_name(server_name: &str, tool_name: &str) -> String {
-    format!("{MCP_PREFIX}{server_name}{MCP_SEP}{tool_name}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rmcp::model::{CallToolResult, Content};
+
+    /// Create an empty manager for testing.
+    fn empty_manager() -> McpManager {
+        McpManager {
+            connections: HashMap::new(),
+            tool_definitions: Vec::new(),
+            tool_routing: HashMap::new(),
+        }
+    }
+
+    /// Parse a namespaced MCP tool name into (server_name, tool_name).
+    fn parse_mcp_tool_name(namespaced: &str) -> Option<(&str, &str)> {
+        let rest = namespaced.strip_prefix(MCP_PREFIX)?;
+        let sep_pos = rest.find(MCP_SEP)?;
+        let server = &rest[..sep_pos];
+        let tool = &rest[sep_pos + MCP_SEP.len()..];
+        if server.is_empty() || tool.is_empty() {
+            return None;
+        }
+        Some((server, tool))
+    }
+
+    /// Build a namespaced MCP tool name.
+    fn mcp_tool_name(server_name: &str, tool_name: &str) -> String {
+        format!("{MCP_PREFIX}{server_name}{MCP_SEP}{tool_name}")
+    }
 
     #[test]
     fn test_parse_mcp_tool_name() {
@@ -429,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_is_mcp_tool_empty_manager() {
-        let manager = McpManager::empty();
+        let manager = empty_manager();
         assert!(!manager.is_mcp_tool("mcp__test__tool"));
         assert!(!manager.has_connections());
     }
@@ -527,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_call_tool_unknown() {
-        let manager = McpManager::empty();
+        let manager = empty_manager();
         let output = manager
             .call_tool("mcp__test__nonexistent", serde_json::json!({}))
             .await;

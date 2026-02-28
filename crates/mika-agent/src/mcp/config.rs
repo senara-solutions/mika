@@ -97,6 +97,20 @@ impl McpConfig {
 impl McpServerConfig {
     /// Validate that the config has the required fields for its transport type.
     pub fn validate(&self, name: &str) -> anyhow::Result<()> {
+        // Server names must be lowercase alphanumeric with single hyphens/underscores.
+        // Double underscores (__) are the namespacing separator and must not appear in names.
+        if name.is_empty()
+            || name.contains("__")
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            anyhow::bail!(
+                "MCP server name '{name}' is invalid: use lowercase alphanumeric, hyphens, \
+                 or single underscores (no '__')"
+            );
+        }
+
         match self.transport {
             McpTransport::Stdio => {
                 if self.command.as_ref().is_none_or(|c| c.trim().is_empty()) {
@@ -104,8 +118,20 @@ impl McpServerConfig {
                 }
             }
             McpTransport::Http => {
-                if self.url.as_ref().is_none_or(|u| u.trim().is_empty()) {
-                    anyhow::bail!("MCP server '{name}': http transport requires 'url'");
+                let url = match self.url.as_deref() {
+                    Some(u) if !u.trim().is_empty() => u.trim(),
+                    _ => {
+                        anyhow::bail!("MCP server '{name}': http transport requires 'url'");
+                    }
+                };
+                // Validate URL scheme
+                match url.split_once("://") {
+                    Some(("http" | "https", _)) => {}
+                    _ => {
+                        anyhow::bail!(
+                            "MCP server '{name}': url must use http or https scheme"
+                        );
+                    }
                 }
             }
         }
@@ -264,5 +290,70 @@ mod tests {
         let loaded = McpConfig::load(tmp.path()).unwrap();
         assert_eq!(loaded.mcp_servers.len(), 1);
         assert!(loaded.mcp_servers.contains_key("test"));
+    }
+
+    #[test]
+    fn test_validate_rejects_double_underscore_name() {
+        let cfg = McpServerConfig {
+            transport: McpTransport::Stdio,
+            command: Some("echo".to_string()),
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        };
+        assert!(cfg.validate("my__server").is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_uppercase_name() {
+        let cfg = McpServerConfig {
+            transport: McpTransport::Stdio,
+            command: Some("echo".to_string()),
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        };
+        assert!(cfg.validate("MyServer").is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_hyphen_underscore_name() {
+        let cfg = McpServerConfig {
+            transport: McpTransport::Stdio,
+            command: Some("echo".to_string()),
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        };
+        assert!(cfg.validate("my-server_1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_rejects_ftp_scheme() {
+        let cfg = McpServerConfig {
+            transport: McpTransport::Http,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("ftp://evil.com/mcp".to_string()),
+            enabled: true,
+        };
+        assert!(cfg.validate("test").is_err());
+    }
+
+    #[test]
+    fn test_validate_http_accepts_https() {
+        let cfg = McpServerConfig {
+            transport: McpTransport::Http,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://mcp.example.com/v1".to_string()),
+            enabled: true,
+        };
+        assert!(cfg.validate("test").is_ok());
     }
 }
