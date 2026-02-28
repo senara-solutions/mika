@@ -21,7 +21,7 @@ MIME=$(file -b --mime-type "$PATH_VALUE" 2>/dev/null)
 case "$MIME" in
     image/jpeg|image/png|image/gif|image/webp)
         # Use jq for safe JSON construction (handles all special characters)
-        jq -n --arg path "$PATH_VALUE" --arg mime "$MIME" \
+        jq -cn --arg path "$PATH_VALUE" --arg mime "$MIME" \
             '{"__mika_v1":{"text":"Image file: \($path) (\($mime))","images":[$path]}}'
         ;;
     *)

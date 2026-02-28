@@ -26,6 +26,11 @@ use mika_common::embedding::EmbeddingClient;
 const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Maximum total base64 image bytes across all tool results in a single agent step.
+/// Prevents memory spikes when multiple tools return images in one step.
+/// 5 images at 5 MB each ≈ 33 MB base64 — this caps at ~20 MB to stay within
+/// container memory limits (256 MB target).
+const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024;
 
 /// Fallback message sent when the agent completes without producing text output
 /// (e.g., all work done via tool calls).
@@ -228,43 +233,33 @@ fn strip_prior_images(messages: &mut [Message]) {
     // Process all messages except the last one
     for msg in &mut messages[..len - 1] {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
-            // Strip images from tool result blocks
             for block in blocks.iter_mut() {
-                if let ContentBlock::ToolResult { content, .. } = block
-                    && let ToolResultBody::Blocks(inner_blocks) = content
-                {
-                    let text_parts: Vec<String> = inner_blocks
-                        .iter()
-                        .filter_map(|b| {
-                            if let ToolResultBlock::Text { text } = b {
-                                Some(text.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let has_images = inner_blocks
-                        .iter()
-                        .any(|b| matches!(b, ToolResultBlock::Image { .. }));
-                    if has_images {
-                        let mut combined = text_parts.join("\n");
-                        combined.push_str("\n[image(s) from previous turn omitted]");
-                        *content = ToolResultBody::Text(combined);
+                match block {
+                    // Strip images from tool result blocks (Blocks variant only
+                    // exists when images were present at construction time)
+                    ContentBlock::ToolResult { content, .. }
+                        if matches!(content, ToolResultBody::Blocks(_)) =>
+                    {
+                        if let ToolResultBody::Blocks(inner_blocks) = content {
+                            let mut combined: String = inner_blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ToolResultBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            combined.push_str("\n[image(s) from previous turn omitted]");
+                            *content = ToolResultBody::Text(combined);
+                        }
                     }
-                }
-            }
-
-            // Strip user-attached ContentBlock::Image blocks
-            let has_user_images = blocks
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Image { .. }));
-            if has_user_images {
-                for block in blocks.iter_mut() {
-                    if matches!(block, ContentBlock::Image { .. }) {
+                    // Replace user-attached images with placeholder text
+                    ContentBlock::Image { .. } => {
                         *block = ContentBlock::Text {
                             text: "[user image from previous turn omitted]".to_string(),
                         };
                     }
+                    _ => {}
                 }
             }
         }
@@ -684,6 +679,7 @@ async fn process_tool_calls(
 ) -> Vec<ToolCallSummary> {
     let mut tool_results = Vec::new();
     let mut summaries = Vec::new();
+    let mut image_bytes_budget = MAX_IMAGE_BYTES_PER_STEP;
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
@@ -721,7 +717,14 @@ async fn process_tool_calls(
                 let mut blocks = vec![ToolResultBlock::Text {
                     text: output.content,
                 }];
+                let mut included = 0;
                 for img in output.images {
+                    let img_bytes = img.data.len();
+                    if img_bytes > image_bytes_budget {
+                        break;
+                    }
+                    image_bytes_budget -= img_bytes;
+                    included += 1;
                     blocks.push(ToolResultBlock::Image {
                         source: ImageSource {
                             source_type: "base64".to_string(),
@@ -730,7 +733,32 @@ async fn process_tool_calls(
                         },
                     });
                 }
-                ToolResultBody::Blocks(blocks)
+                if included < image_count {
+                    let skipped = image_count - included;
+                    blocks.push(ToolResultBlock::Text {
+                        text: format!("[{skipped} image(s) skipped: step memory budget exceeded]"),
+                    });
+                    warn!(
+                        included,
+                        skipped,
+                        "image budget exceeded, skipped images in tool result"
+                    );
+                }
+                if included == 0 {
+                    // All images skipped — fall back to text-only
+                    ToolResultBody::Text(
+                        blocks
+                            .into_iter()
+                            .filter_map(|b| match b {
+                                ToolResultBlock::Text { text } => Some(text),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                } else {
+                    ToolResultBody::Blocks(blocks)
+                }
             };
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),

@@ -95,7 +95,7 @@ async fn execute_inner(
 /// `None` otherwise (plain text output — backward compatible).
 fn try_parse_envelope(stdout: &str) -> Option<MikaOutput> {
     let trimmed = stdout.trim();
-    if !trimmed.starts_with(r#"{"__mika_v1""#) {
+    if !trimmed.starts_with('{') || !trimmed.contains(r#""__mika_v1""#) {
         return None;
     }
     serde_json::from_str::<MikaEnvelope>(trimmed)
@@ -108,12 +108,13 @@ fn try_parse_envelope(stdout: &str) -> Option<MikaOutput> {
 /// Security checks:
 /// - Canonicalizes path (resolves symlinks)
 /// - Verifies regular file (rejects devices, sockets, etc.)
-/// - Enforces 5 MB size limit (checked before reading)
+/// - Enforces 5 MB size limit via metadata pre-check AND capped read (TOCTOU-safe)
 /// - Magic-byte validation for supported image types (JPEG, PNG, GIF, WebP)
 async fn read_and_validate_image(path: &str) -> Result<ImageData, String> {
     let path = path.to_string();
     tokio::task::spawn_blocking(move || {
         use std::fs;
+        use std::io::Read;
 
         let canonical = fs::canonicalize(&path)
             .map_err(|e| format!("cannot resolve image path '{}': {}", path, e))?;
@@ -133,14 +134,26 @@ async fn read_and_validate_image(path: &str) -> Result<ImageData, String> {
             ));
         }
 
-        let bytes = fs::read(&canonical)
+        // Use capped read to prevent TOCTOU race (file could grow between metadata and read)
+        let file = fs::File::open(&canonical)
+            .map_err(|e| format!("cannot open image '{}': {}", canonical.display(), e))?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_IMAGE_SIZE + 1)
+            .read_to_end(&mut bytes)
             .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
+
+        if bytes.len() as u64 > MAX_IMAGE_SIZE {
+            return Err(format!(
+                "image too large: {} bytes (max {} bytes)",
+                bytes.len(),
+                MAX_IMAGE_SIZE
+            ));
+        }
 
         let media_type = detect_image_type(&bytes)
             .ok_or_else(|| format!("not a supported image type: {}", canonical.display()))?;
 
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        drop(bytes); // Free raw bytes, keep only base64
 
         Ok(ImageData {
             media_type: media_type.to_string(),
@@ -490,6 +503,15 @@ mod tests {
     #[test]
     fn test_try_parse_envelope_plain_text() {
         assert!(try_parse_envelope("hello world").is_none());
+    }
+
+    #[test]
+    fn test_try_parse_envelope_pretty_printed() {
+        // jq without -c produces pretty-printed JSON — must still parse
+        let json = "{\n  \"__mika_v1\": {\n    \"text\": \"Image file: /tmp/shot.png (image/png)\",\n    \"images\": [\n      \"/tmp/shot.png\"\n    ]\n  }\n}";
+        let env = try_parse_envelope(json).unwrap();
+        assert_eq!(env.text, "Image file: /tmp/shot.png (image/png)");
+        assert_eq!(env.images, vec!["/tmp/shot.png"]);
     }
 
     #[test]
