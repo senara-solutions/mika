@@ -5,6 +5,7 @@ category: documentation-gaps
 severity: medium
 component:
   - .claude/commands/mika.md (project-level slash command)
+  - .claude/commands/mika-doc-audit.md (standalone doc audit command)
   - ~/.claude/commands/letsgo.md (global slash command)
   - CLAUDE.md (project instructions)
 tags:
@@ -67,14 +68,14 @@ File: `.claude/commands/mika.md`
 3. /workflows:work
 4. /workflows:review
 5. /compound-engineering:resolve_todo_parallel
-6. Documentation audit (NEW — checks git diff, updates affected docs)
+6. /mika-doc-audit (checks git diff, updates affected docs)
 7. /workflows:compound
 8. Output completion promise
 ```
 
-### 2. Documentation audit checklist (Step 6)
+### 2. Extracted `/mika-doc-audit` command (Step 6)
 
-The audit is conditional and systematic:
+The audit is extracted into a standalone command (`.claude/commands/mika-doc-audit.md`) so it can be run independently. It is conditional and systematic:
 
 - **Always audit:** `CLAUDE.md` for accuracy (architecture, conventions, commands,
   env vars, test count, schema version, pending work)
@@ -127,7 +128,7 @@ penalty for skipping. Automated enforcement works because:
 
 ### When to extend the checklist
 
-Update the audit step in `/mika` when:
+Update the audit checklist in `/mika-doc-audit` when:
 - New documentation files are added to the project
 - New crates or binaries are introduced
 - New public APIs or configuration fields are created

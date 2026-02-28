@@ -28,7 +28,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/brainstorms/` — Decision brainstorm documents
 - `docs/plans/` — Implementation plans
 - `todos/` — Code review findings (tracked as markdown files)
-- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow with doc audit)
+- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit)
 
 ## Conventions
 
