@@ -5,6 +5,9 @@
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
 
+# Prevent nested tmux client issues when spawned from within tmux
+unset TMUX TMUX_PANE
+
 # Consume stdin
 cat >/dev/null
 

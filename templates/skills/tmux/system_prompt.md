@@ -24,3 +24,8 @@ You have access to tmux tools for managing terminal sessions. Use these for:
 - Use `tmux_kill_session` to clean up sessions when done
 - Use `tmux_wait_for_text` to wait for expected output instead of arbitrary delays
 - When sending multi-line input, send one line at a time with `tmux_send_command`
+
+**Error recovery:**
+- If a pane is reported as dead, kill the session with `tmux_kill_session` and create a new one. Inform the user that the previous process has exited.
+- If a pane is stuck in copy-mode, kill the session and recreate it. This is rare but unrecoverable via send-keys.
+- If `tmux_read_output` reports stale output from a dead pane, do not retry the same command — the process has exited.

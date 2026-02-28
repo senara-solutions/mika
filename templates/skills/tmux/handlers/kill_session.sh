@@ -5,12 +5,15 @@
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
 
+# Prevent nested tmux client issues when spawned from within tmux
+unset TMUX TMUX_PANE
+
 INPUT=$(cat)
 
 if command -v jq >/dev/null 2>&1; then
-    SESSION=$(echo "$INPUT" | jq -r '.session // empty')
+    SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
 else
-    SESSION=$(echo "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
+    SESSION=$(printf '%s\n' "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
 fi
 
 if [ -z "$SESSION" ]; then

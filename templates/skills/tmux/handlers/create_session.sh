@@ -5,17 +5,20 @@
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
 
+# Prevent nested tmux client issues when spawned from within tmux
+unset TMUX TMUX_PANE
+
 INPUT=$(cat)
 
 # Parse JSON fields (jq preferred, grep/cut fallback)
 if command -v jq >/dev/null 2>&1; then
-    NAME=$(echo "$INPUT" | jq -r '.name // empty')
-    COMMAND=$(echo "$INPUT" | jq -r '.command // empty')
-    WORKDIR=$(echo "$INPUT" | jq -r '.working_dir // empty')
+    NAME=$(printf '%s\n' "$INPUT" | jq -r '.name // empty')
+    COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')
+    WORKDIR=$(printf '%s\n' "$INPUT" | jq -r '.working_dir // empty')
 else
-    NAME=$(echo "$INPUT" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
-    COMMAND=$(echo "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
-    WORKDIR=$(echo "$INPUT" | grep -o '"working_dir":"[^"]*"' | head -1 | cut -d'"' -f4)
+    NAME=$(printf '%s\n' "$INPUT" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    COMMAND=$(printf '%s\n' "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
+    WORKDIR=$(printf '%s\n' "$INPUT" | grep -o '"working_dir":"[^"]*"' | head -1 | cut -d'"' -f4)
 fi
 
 # Generate name if not provided
@@ -24,7 +27,7 @@ if [ -z "$NAME" ]; then
 fi
 
 # Validate session name: only allow alphanumeric, dash, underscore, dot
-if ! echo "$NAME" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+if ! printf '%s' "$NAME" | grep -qE '^[a-zA-Z0-9._-]+$'; then
     echo "Error: invalid session name '$NAME' (only alphanumeric, dash, underscore, dot allowed)" >&2
     exit 1
 fi
@@ -44,9 +47,17 @@ fi
 
 # Run command if provided
 if [ -n "$COMMAND" ]; then
-    sleep 0.1
+    sleep 0.2
+
+    # Check pane is alive before sending
+    PANE_DEAD=$(tmux display-message -t "$NAME" -p '#{pane_dead}' 2>/dev/null)
+    if [ "$PANE_DEAD" = "1" ]; then
+        echo "Error: pane in new session '$NAME' is dead" >&2
+        exit 1
+    fi
+
     tmux send-keys -t "$NAME" -l -- "$COMMAND"
-    sleep 0.1
+    sleep 0.2
     tmux send-keys -t "$NAME" Enter
 fi
 
