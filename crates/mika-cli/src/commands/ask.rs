@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
 use mika_agent::agent::{self, AgentParams, check_onboarding};
@@ -33,6 +34,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
     }
 
     let is_onboarding = check_onboarding(&ctx.async_db).await;
+    let skills_dirty = AtomicBool::new(false);
 
     let output = agent::run_agent(&AgentParams {
         db: &ctx.async_db,
@@ -50,6 +52,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         thinking: None,
         user_images: &[],
         brave_api_key: ctx.settings.brave_api_key.as_deref(),
+        skills_dirty: &skills_dirty,
     })
     .await?;
 

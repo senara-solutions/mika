@@ -95,7 +95,8 @@ fn init_agent(
 
     let agent_state = AgentState {
         db: async_db,
-        skills: skill_registry,
+        skills: std::sync::Mutex::new(skill_registry),
+        skills_dirty: Arc::new(AtomicBool::new(false)),
         scheduler: scheduler.clone(),
         agent_lock: Arc::new(tokio::sync::Mutex::new(())),
         home_dir: agent_home.to_path_buf(),
@@ -295,7 +296,8 @@ mod tests {
 
         let agent_state = AgentState {
             db,
-            skills: skills_reg,
+            skills: std::sync::Mutex::new(skills_reg),
+            skills_dirty: Arc::new(AtomicBool::new(false)),
             scheduler,
             agent_lock: Arc::new(tokio::sync::Mutex::new(())),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),

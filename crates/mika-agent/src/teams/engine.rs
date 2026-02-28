@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tracing::{info, warn};
 
 use mika_common::agent;
@@ -317,6 +318,7 @@ impl TeamEngine {
                 let result: Result<String> = match resources {
                     Ok(resources) => {
                         let session_id = format!("team-{}-{}", run_id, agent_name);
+                        let skills_dirty = AtomicBool::new(false);
                         let params = TeamAgentParams {
                             db: &resources.db,
                             claude: &claude,
@@ -328,6 +330,7 @@ impl TeamEngine {
                             session_id: &session_id,
                             embedding_client: resources.embedding_client.as_ref(),
                             brave_api_key: brave_api_key.as_deref(),
+                            skills_dirty: &skills_dirty,
                         };
                         crate::agent::run_team_agent(&params)
                             .await
@@ -443,6 +446,7 @@ impl TeamEngine {
 
         // Use the pre-built tool registry (#255)
         let session_id = format!("team-{}-{}", self.run.run_id, agent_name);
+        let skills_dirty = AtomicBool::new(false);
         let params = TeamAgentParams {
             db: &resources.db,
             claude: &self.claude,
@@ -454,6 +458,7 @@ impl TeamEngine {
             session_id: &session_id,
             embedding_client: resources.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            skills_dirty: &skills_dirty,
         };
 
         Ok(crate::agent::run_team_agent(&params)

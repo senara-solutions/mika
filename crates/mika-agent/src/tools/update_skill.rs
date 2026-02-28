@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 use super::create_skill::{
     validate_description, validate_keywords, validate_skill_name, validate_system_prompt,
@@ -23,7 +24,7 @@ impl Tool for UpdateSkillTool {
             name: "update_skill".to_string(),
             description: "Update an existing skill's manifest or system prompt. \
                 At least one optional field must be provided. \
-                Changes take effect after restarting the conversation."
+                Changes take effect immediately on the next turn."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -186,9 +187,11 @@ impl Tool for UpdateSkillTool {
             updated.push("system_prompt");
         }
 
+        ctx.skills_dirty.store(true, Ordering::Release);
+
         Ok(ToolOutput::success(format!(
             "Updated skill '{name}': changed {fields}.\n\
-             Changes take effect after restarting the conversation.",
+             Changes take effect immediately on the next turn.",
             fields = updated.join(", ")
         )))
     }

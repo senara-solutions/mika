@@ -61,6 +61,8 @@ pub struct AgentResponse {
     pub is_error: bool,
     pub thinking: Option<String>,
     pub input_tokens: Option<u32>,
+    /// If skills were hot-reloaded during this turn, contains the new registry.
+    pub updated_skills: Option<Arc<SkillRegistry>>,
 }
 
 /// Shell-like input history with draft saving.
@@ -374,6 +376,11 @@ impl<'a> App<'a> {
         // Check for agent response
         match self.agent_rx.try_recv() {
             Ok(response) => {
+                // Update skills if hot-reloaded during this turn
+                if let Some(new_skills) = response.updated_skills {
+                    self.skills = new_skills;
+                }
+
                 // Update context token tracking
                 if let Some(tokens) = response.input_tokens {
                     self.context_tokens = Some(tokens);

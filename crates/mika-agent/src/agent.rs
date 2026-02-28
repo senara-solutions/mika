@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -456,6 +456,8 @@ pub struct AgentParams<'a> {
     pub user_images: &'a [mika_common::claude::ImageSource],
     /// Brave Search API key (optional; enables web_search builtin skill).
     pub brave_api_key: Option<&'a str>,
+    /// Shared dirty flag for skill hot-reload.
+    pub skills_dirty: &'a AtomicBool,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -612,6 +614,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
+        skills_dirty: params.skills_dirty,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -862,6 +865,8 @@ pub struct SilentAgentParams<'a> {
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
+    /// Shared dirty flag for skill hot-reload.
+    pub skills_dirty: &'a AtomicBool,
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -984,6 +989,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
+        skills_dirty: params.skills_dirty,
     };
 
     let mut request = MessagesRequest {
@@ -1029,6 +1035,8 @@ pub struct TeamAgentParams<'a> {
     pub session_id: &'a str,
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
+    /// Shared dirty flag for skill hot-reload.
+    pub skills_dirty: &'a AtomicBool,
 }
 
 /// Run an agent within a team execution context.
@@ -1107,6 +1115,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         message_sender: None,
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
+        skills_dirty: params.skills_dirty,
     };
 
     let mut request = MessagesRequest {

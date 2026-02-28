@@ -3,7 +3,7 @@ pub mod test_helpers {
     use crate::async_db::AsyncDatabase;
     use crate::db::Database;
     use crate::tools::ToolContext;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
 
     /// Create an in-memory database for tests (sync — for db module tests).
     pub fn test_db() -> Database {
@@ -30,6 +30,7 @@ pub mod test_helpers {
         is_onboarding: bool,
     ) -> ToolContext<'a> {
         static HOME_DIR: &str = "/tmp/mika-test";
+        static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
         ToolContext {
             db,
             session_id: "test-session",
@@ -39,6 +40,7 @@ pub mod test_helpers {
             message_sender: None,
             embedding_client: None,
             brave_api_key: None,
+            skills_dirty: &SKILLS_DIRTY,
         }
     }
 
@@ -70,6 +72,7 @@ pub mod test_helpers {
 
         /// Create a ToolContext with a custom home directory.
         pub fn ctx_with_home<'a>(&'a self, home: &'a std::path::Path) -> ToolContext<'a> {
+            static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -79,6 +82,7 @@ pub mod test_helpers {
                 message_sender: None,
                 embedding_client: None,
                 brave_api_key: None,
+                skills_dirty: &SKILLS_DIRTY,
             }
         }
     }
