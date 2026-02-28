@@ -198,6 +198,19 @@ Six issues found during code review and resolved:
 
 4. **Generic infrastructure, not skill-specific** -- Any tool (builtin Rust, exec handler, future HTTP handler) can return images. No special-casing of screenshot or file-reader skills.
 
+5. **File-reader as `always_on = true`** -- After initial infrastructure landed, testing showed Mika still couldn't view screenshots. Root cause: file-reader was `always_on = false`, so `read_file` wasn't in tool definitions when screenshot skills were active. Fix: make file-reader always-on (it's a fundamental capability like filesystem read) and add system prompt guidance to chain `read_file` on image file paths. Note: as an exec handler, file-reader is correctly excluded from heartbeat mode by `safe_always_on_skills()`.
+
+6. **User-attached image stripping** -- `strip_prior_images()` extended to also strip `ContentBlock::Image` blocks (user-attached images from prior turns), not just `ToolResult` image blocks. Prevents re-sending user images on every tool step within an agent loop.
+
+### Follow-Up Fixes (Second Review Round)
+
+| Fix | Problem | Solution |
+|-----|---------|----------|
+| Dockerfile.agent | Missing `file` and `jq` packages in runtime stage | Added to apt-get install |
+| `read.sh` input parsing | grep-based JSON parsing fragile with escapes | Use `jq -r '.path // empty'` |
+| User image stripping | `strip_prior_images` only handled ToolResult blocks | Extended to also strip `ContentBlock::Image` |
+| `truncate_output` UTF-8 | Byte slicing panics on multi-byte chars (pre-existing) | Walk back to valid char boundary |
+
 ## Prevention & Best Practices
 
 ### Avoiding Similar Capability Gaps
@@ -226,6 +239,8 @@ Six issues found during code review and resolved:
 ## Related Documentation
 
 - [Implementation plan](../../plans/2026-02-28-feat-multimodal-tool-results-plan.md) -- Full 5-phase plan with acceptance criteria
+- [Follow-up fix plan](../../plans/2026-02-28-fix-screenshot-read-file-chaining.md) -- File-reader always-on + chaining guidance
 - [Telegram image support](telegram-image-support.md) -- Upstream image pipeline (gateway -> agent server)
 - [Tool call introspection](../logic-errors/tool-call-introspection-cross-turn-persistence.md) -- `ToolCallSummary` persistence, updated with `[+N image(s)]` suffix
 - [TUI image paste](tui-slash-commands-web-search-image-paste.md) -- Existing image handling patterns (magic bytes, base64)
+- [Skill availability and honesty](../logic-errors/skill-availability-and-send-message-honesty.md) -- always_on decision framework, heartbeat safety
