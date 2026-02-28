@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mika_common::claude::{
-    ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
+    ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, StopReason,
+    ToolResultBlock, ToolResultBody,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -636,16 +637,44 @@ async fn process_tool_calls(
                 skill_timeout,
             )
             .await;
+            let image_count = output.images.len();
+            let output_summary = if image_count > 0 {
+                format!(
+                    "{} [+{} image(s)]",
+                    truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX),
+                    image_count
+                )
+            } else {
+                truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX)
+            };
             summaries.push(ToolCallSummary {
                 step,
                 name: name.clone(),
                 input_summary,
-                output_summary: truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX),
+                output_summary,
                 success: !output.is_error,
             });
+
+            let content = if output.images.is_empty() {
+                ToolResultBody::Text(output.content)
+            } else {
+                let mut blocks = vec![ToolResultBlock::Text {
+                    text: output.content,
+                }];
+                for img in output.images {
+                    blocks.push(ToolResultBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: img.media_type,
+                            data: img.data,
+                        },
+                    });
+                }
+                ToolResultBody::Blocks(blocks)
+            };
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content: output.content,
+                content,
                 is_error: if output.is_error { Some(true) } else { None },
             });
         }
