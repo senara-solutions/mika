@@ -57,6 +57,10 @@ pub struct Settings {
     #[serde(default)]
     pub brave_api_key: Option<String>,
 
+    /// Optional log file path for mika-server (maps to MIKA_SERVER_LOG_FILE)
+    #[serde(default)]
+    pub server_log_file: Option<PathBuf>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -206,6 +210,7 @@ impl std::fmt::Debug for Settings {
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("server_log_file", &self.server_log_file)
             .field("home_dir", &self.home_dir)
             .finish()
     }

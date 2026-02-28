@@ -89,6 +89,10 @@ Server mode additionally requires:
 - `MIKA_ROUTING_URL` — Gateway URL for outbound message delivery
 - `MIKA_INTERNAL_TOKEN` — Shared secret for Bearer auth between gateway and agent
 
+Optional (log files — logs go to stdout + file when set):
+- `MIKA_SERVER_LOG_FILE` — File path for mika-server log output
+- `MIKA_GATEWAY_LOG_FILE` — File path for mika-gateway log output
+
 ## Pending Work
 
 - **Deployment:** Helm charts (mika-customer + mika-gateway), provision.sh + deprovision.sh, AWS Secrets Manager integration, K8s manifests
