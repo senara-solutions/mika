@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         },
         Some(Commands::Agents(args)) => commands::agents::run(args).await,
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
+        Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
     }
 }
 

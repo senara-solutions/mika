@@ -136,6 +136,7 @@ async fn spawn_agent_worker(
                         user_images: &image_sources,
                         brave_api_key: worker_brave_key.as_deref(),
                         skills_dirty: &worker_dirty,
+                        mcp_manager: None,
                     })
                     .await;
 

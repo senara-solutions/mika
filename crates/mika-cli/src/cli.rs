@@ -36,6 +36,8 @@ pub enum Commands {
     Agents(AgentsArgs),
     /// Manage teams
     Teams(TeamsArgs),
+    /// Manage MCP (Model Context Protocol) servers
+    Mcp(McpArgs),
 }
 
 #[derive(clap::Args)]
@@ -209,4 +211,38 @@ pub enum ConfigCommand {
     Edit,
     /// Print soul.md to stdout
     Soul,
+}
+
+#[derive(clap::Args)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum McpCommand {
+    /// List configured MCP servers
+    List,
+    /// Add a new MCP server
+    Add {
+        /// Server name (used as identifier)
+        name: String,
+        /// Transport type: "stdio" or "http"
+        #[arg(long)]
+        transport: String,
+        /// Command to run (stdio transport)
+        #[arg(long)]
+        command: Option<String>,
+        /// Arguments for the command (stdio transport)
+        #[arg(long, num_args = 1..)]
+        args: Option<Vec<String>>,
+        /// URL to connect to (http transport)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Remove a configured MCP server
+    Remove {
+        /// Name of the server to remove
+        name: String,
+    },
 }

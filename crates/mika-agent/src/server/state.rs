@@ -9,6 +9,7 @@ use mika_common::embedding::EmbeddingClient;
 use secrecy::SecretString;
 
 use crate::async_db::AsyncDatabase;
+use crate::mcp::McpManager;
 use crate::scheduler::ReminderScheduler;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
@@ -23,6 +24,7 @@ pub struct AgentState {
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,
     pub home_dir: PathBuf,
     pub embedding_client: Option<EmbeddingClient>,
+    pub mcp_manager: Option<McpManager>,
 }
 
 /// Shared application state for the Axum HTTP server.

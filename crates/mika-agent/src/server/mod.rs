@@ -54,7 +54,7 @@ fn build_router(state: AppState) -> Router {
 
 /// Initialize a single agent and return its AgentState.
 #[allow(clippy::too_many_arguments)]
-fn init_agent(
+async fn init_agent(
     agent_name: &str,
     agent_home: &std::path::Path,
     claude: &ClaudeClient,
@@ -93,6 +93,19 @@ fn init_agent(
         brave_api_key,
     });
 
+    // Load MCP configuration and connect to configured servers
+    let mcp_config = crate::mcp::config::McpConfig::load(agent_home)?;
+    let mcp_manager = if mcp_config.mcp_servers.is_empty() {
+        None
+    } else {
+        let manager = crate::mcp::McpManager::connect_all(&mcp_config).await;
+        if manager.has_connections() {
+            Some(manager)
+        } else {
+            None
+        }
+    };
+
     let agent_state = AgentState {
         db: async_db,
         skills: std::sync::Mutex::new(skill_registry),
@@ -101,6 +114,7 @@ fn init_agent(
         agent_lock: Arc::new(tokio::sync::Mutex::new(())),
         home_dir: agent_home.to_path_buf(),
         embedding_client,
+        mcp_manager,
     };
 
     info!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -173,7 +187,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
                 settings.disable_bundled_skills,
-            )?;
+            )
+            .await?;
             agents.insert(agent::DEFAULT_AGENT.to_string(), Arc::new(agent_state));
             schedulers.push(scheduler);
         }
@@ -191,7 +206,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
                 settings.disable_bundled_skills,
-            ) {
+            )
+            .await
+            {
                 Ok((agent_state, scheduler)) => {
                     agents.insert(name.clone(), Arc::new(agent_state));
                     schedulers.push(scheduler);
@@ -302,6 +319,7 @@ mod tests {
             agent_lock: Arc::new(tokio::sync::Mutex::new(())),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
+            mcp_manager: None,
         };
 
         let mut agents = HashMap::new();

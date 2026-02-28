@@ -351,6 +351,16 @@ The **github** skill provides `run_gh` for interacting with GitHub via the `gh` 
 
 Note: all exec-handler skills are excluded from heartbeat mode by `safe_always_on_skills()`.
 
+### Prompt-only skills (no tools)
+
+| Skill           | Keywords                                                      | Prompt Snippet |
+|-----------------|---------------------------------------------------------------|----------------|
+| self-knowledge  | help, what can you do, capabilities, commands, how to use     | Yes            |
+| calendar        | calendar, meeting, schedule, event                             | Yes            |
+| mcp             | mcp, model context protocol, mcp server, mcp tool              | Yes            |
+
+These skills provide only system prompt guidance — they have no tools of their own. The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands.
+
 ---
 
 ## Creating a Custom Skill

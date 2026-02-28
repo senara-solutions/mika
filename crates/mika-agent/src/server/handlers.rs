@@ -222,6 +222,7 @@ pub async fn handle_message(
                 user_images: &user_images,
                 brave_api_key: s.brave_api_key.as_deref(),
                 skills_dirty: &a.skills_dirty,
+                mcp_manager: a.mcp_manager.as_ref(),
             };
 
             match agent::run_agent(&params).await {
