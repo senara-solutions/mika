@@ -333,7 +333,7 @@ These three skills are seeded into `~/.mika/skills/` on first bootstrap:
 
 All three use the `builtin` handler type, so their tools are dispatched through the Rust `ToolRegistry` with full access to the database and agent context. All three are `always_on = true`, meaning they are active on every turn regardless of message content.
 
-Additionally, the **file-reader** bundled skill (exec handler) detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout.
+Additionally, the **file-reader** bundled skill (exec handler, `always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it). Note: as an exec handler, file-reader is excluded from heartbeat mode by `safe_always_on_skills()`.
 
 ---
 
