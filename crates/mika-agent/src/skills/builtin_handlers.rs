@@ -12,9 +12,6 @@ use crate::tools::{ToolContext, ToolOutput};
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
 static AGENT_API_SPEC: &str = include_str!("../../../../docs/openapi/mika-server.yaml");
 
-/// Embedded OpenAPI spec for the gateway HTTP API.
-static GATEWAY_API_SPEC: &str = include_str!("../../../../docs/openapi/gateway.yaml");
-
 /// Embedded architecture overview document.
 static ARCHITECTURE_OVERVIEW: &str = include_str!("../../../../docs/architecture/OVERVIEW.md");
 
@@ -85,16 +82,15 @@ async fn get_cli_reference(ctx: &ToolContext<'_>) -> ToolOutput {
     }
 }
 
-/// Return the embedded OpenAPI YAML spec for a given service.
+/// Return the embedded OpenAPI YAML spec for the agent service.
 ///
-/// Input: `{"service": "agent"}` or `{"service": "gateway"}`
+/// Input: `{"service": "agent"}`
 fn get_api_spec(input: &serde_json::Value) -> ToolOutput {
     let service = input.get("service").and_then(|v| v.as_str()).unwrap_or("");
     match service {
         "agent" => ToolOutput::success(AGENT_API_SPEC.to_string()),
-        "gateway" => ToolOutput::success(GATEWAY_API_SPEC.to_string()),
         _ => ToolOutput::error(
-            "Invalid service. Use \"agent\" for the mika-server API or \"gateway\" for the gateway API.".to_string(),
+            "Invalid service. Use \"agent\" for the mika-server API.".to_string(),
         ),
     }
 }
@@ -229,11 +225,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_api_spec_gateway() {
+    fn test_get_api_spec_gateway_returns_error() {
         let input = serde_json::json!({"service": "gateway"});
         let output = get_api_spec(&input);
-        assert!(!output.is_error);
-        assert!(output.content.contains("openapi"));
+        assert!(output.is_error);
     }
 
     #[test]

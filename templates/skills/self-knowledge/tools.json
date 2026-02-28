@@ -13,14 +13,14 @@
   },
   {
     "name": "get_api_spec",
-    "description": "Get the OpenAPI specification for a Mika HTTP service. Use 'agent' for the per-customer agent API (mika-server) or 'gateway' for the shared routing gateway.",
+    "description": "Get the OpenAPI specification for the mika-server (agent) HTTP API.",
     "input_schema": {
       "type": "object",
       "properties": {
         "service": {
           "type": "string",
-          "enum": ["agent", "gateway"],
-          "description": "Which service's API spec to retrieve: 'agent' (mika-server) or 'gateway'"
+          "enum": ["agent"],
+          "description": "Which service's API spec to retrieve: 'agent' (mika-server)"
         }
       },
       "required": ["service"]

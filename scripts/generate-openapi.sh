@@ -13,8 +13,4 @@ echo "Generating mika-server OpenAPI spec..."
 cargo test -p mika-agent write_agent_openapi_yaml -- --ignored
 echo "  → docs/openapi/mika-server.yaml"
 
-echo "Generating gateway OpenAPI spec..."
-cargo test -p mika-gateway write_gateway_openapi_yaml -- --ignored
-echo "  → docs/openapi/gateway.yaml"
-
 echo "Done. Verify with: cargo build"
