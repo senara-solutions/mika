@@ -88,6 +88,10 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `routing_url` | `Option<String>` | None | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery. Required in server mode. |
 | `customer_id` | `Option<String>` | None | `MIKA_CUSTOMER_ID` | Customer identifier. Set per container in Kubernetes deployments. |
 | `server_port` | `u16` | `8080` | `MIKA_SERVER_PORT` | HTTP server listen port. Only used in server mode (`mika-server`). |
+| `openai_api_key` | `Option<String>` | None | `MIKA_OPENAI_API_KEY` | OpenAI API key for embedding generation. Enables vector similarity in Layer 3 hybrid search. |
+| `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
+| `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
+| `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. |
 
 The `home_dir` field is also present on the struct but is not configurable via
@@ -96,9 +100,10 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key` and `internal_token` are redacted in `Debug` output
-  (printed as `[REDACTED]`). The `mika config` command distinguishes between
-  credential types: `OAuth token [REDACTED]` or `API key [REDACTED]`.
+- `anthropic_api_key`, `internal_token`, and `brave_api_key` are redacted in
+  `Debug` output (printed as `[REDACTED]`). The `mika config` command
+  distinguishes between credential types: `OAuth token [REDACTED]` or
+  `API key [REDACTED]`.
 - `anthropic_api_key` accepts both standard API keys and OAuth subscription
   tokens. Mika detects the type from the `sk-ant-oat` prefix and adjusts the
   HTTP auth scheme automatically (Bearer + `anthropic-beta` header for OAuth,
@@ -244,6 +249,8 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level (default: `info`) |
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
+| `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
+| `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
 
 ### Server mode
 

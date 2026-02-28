@@ -51,6 +51,8 @@ async fn spawn_agent_worker(
     let message_sender =
         crate::init::make_message_sender(&ctx.settings, &ctx.async_db, http_client);
 
+    let brave_api_key = ctx.settings.brave_api_key.clone();
+
     // Recover reminders on startup
     {
         let scheduler = ReminderScheduler {
@@ -61,6 +63,7 @@ async fn spawn_agent_worker(
             home_dir: ctx.home_dir.clone(),
             message_sender: message_sender.clone(),
             embedding_client: embedding_client.clone(),
+            brave_api_key: brave_api_key.clone(),
         };
         if let Err(e) = scheduler.recover().await {
             tracing::warn!(error = %e, "reminder recovery failed");
@@ -71,12 +74,13 @@ async fn spawn_agent_worker(
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
 
     let worker_db = ctx.async_db.clone();
-    let worker_claude = ctx.claude.clone();
+    let mut worker_claude = ctx.claude.clone();
     let worker_tools = tool_registry.clone();
     let worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let worker_session = session_id.clone();
     let worker_embedding = embedding_client;
+    let worker_brave_key = brave_api_key;
     let worker_sender = message_sender;
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
@@ -116,6 +120,7 @@ async fn spawn_agent_worker(
                         embedding_client: worker_embedding.as_ref(),
                         thinking,
                         user_images: &image_sources,
+                        brave_api_key: worker_brave_key.as_deref(),
                     })
                     .await;
 
@@ -136,6 +141,9 @@ async fn spawn_agent_worker(
                     if agent_tx.send(response).is_err() {
                         break;
                     }
+                }
+                AgentRequest::SetModel { model } => {
+                    worker_claude.model = model;
                 }
                 AgentRequest::Quit => break,
             }

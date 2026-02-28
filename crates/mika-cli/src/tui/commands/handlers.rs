@@ -26,7 +26,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "status" | "stat" => Some(handle_status(app).await),
         "soul" => Some(handle_soul(app).await),
         "config" | "cfg" => Some(handle_config(app, args).await),
-        "model" => Some(handle_model(app)),
+        "model" => Some(handle_model(app, args)),
         "export" => Some(handle_export(app).await),
         "skills" => Some(handle_skills(app)),
         "skill" => Some(handle_skill(app, args)),
@@ -34,10 +34,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "agents" => Some(handle_agents(app)),
         "teams" => Some(handle_teams(app)),
         "team" => Some(handle_team(args)),
-        "think" | "t" => {
-            handle_think(app, args);
-            None
-        }
+        "think" | "t" => handle_think(app, args),
         "attach" | "img" => Some(handle_attach(app, args)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
@@ -319,8 +316,57 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
     }
 }
 
-fn handle_model(app: &App<'_>) -> String {
-    format!("Current model: {}", app.model)
+/// Known model shorthands: (shorthand, full_model_id, display_name).
+const MODEL_ALIASES: &[(&str, &str, &str)] = &[
+    ("sonnet", "claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("opus", "claude-opus-4-6", "Claude Opus 4.6"),
+    ("haiku", "claude-haiku-4-5", "Claude Haiku 4.5"),
+];
+
+fn resolve_model_name(input: &str) -> Option<(&'static str, &'static str)> {
+    let lower = input.to_lowercase();
+    for &(alias, full_id, display) in MODEL_ALIASES {
+        if lower == alias || lower == full_id {
+            return Some((full_id, display));
+        }
+    }
+    None
+}
+
+fn handle_model(app: &mut App<'_>, args: &str) -> String {
+    let args = args.trim();
+    if args.is_empty() {
+        let mut out = format!("Current model: {}\n\nAvailable models:", app.model);
+        for &(alias, full_id, display) in MODEL_ALIASES {
+            let current = if full_id == app.model {
+                " (current)"
+            } else {
+                ""
+            };
+            let _ = write!(out, "\n  /{alias} — {display}{current}");
+        }
+        let _ = write!(out, "\n\nUsage: /model <name>");
+        return out;
+    }
+
+    match resolve_model_name(args) {
+        Some((full_id, display)) => {
+            if full_id == app.model {
+                return format!("Already using {display}.");
+            }
+            app.model = full_id.to_string();
+            app.claude.model = full_id.to_string();
+            let _ = app.agent_tx.send(AgentRequest::SetModel {
+                model: full_id.to_string(),
+            });
+            app.needs_redraw = true;
+            format!("Switched to {display} ({full_id}).")
+        }
+        None => {
+            let options: Vec<&str> = MODEL_ALIASES.iter().map(|&(a, _, _)| a).collect();
+            format!("Unknown model: {args}\nAvailable: {}", options.join(", "))
+        }
+    }
 }
 
 async fn handle_export(app: &mut App<'_>) -> String {
@@ -570,49 +616,59 @@ fn handle_team(args: &str) -> String {
     )
 }
 
-fn handle_think(app: &mut App<'_>, args: &str) {
-    let args = args.trim();
-    if args.is_empty() {
-        app.messages.push(ChatMessage {
-            role: ChatRole::Command,
-            content: "Usage: /think [low|medium|high] <prompt>  (default: medium)".to_string(),
-            rendered: None,
-            channel: None,
-        });
-        return;
+/// Resolve a thinking level keyword to (budget_tokens, level_name).
+fn resolve_thinking_level(word: &str) -> Option<(u32, &'static str)> {
+    match word.to_lowercase().as_str() {
+        "low" => Some((5_000, "low")),
+        "medium" | "med" => Some((10_000, "medium")),
+        "high" => Some((50_000, "high")),
+        _ => None,
     }
-    if app.status != AgentStatus::Idle {
-        app.messages.push(ChatMessage {
-            role: ChatRole::Command,
-            content: "Agent is busy. Wait for the current response to finish.".to_string(),
-            rendered: None,
-            channel: None,
-        });
-        return;
+}
+
+fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
+    let args = args.trim();
+
+    // No args: show current level and usage
+    if args.is_empty() {
+        let current = match app.thinking_level {
+            Some((budget, level)) => format!("Thinking level: {level} ({budget} tokens)"),
+            None => "Thinking: off".to_string(),
+        };
+        return Some(format!(
+            "{current}\nUsage: /think [low|medium|high|off] [prompt]"
+        ));
     }
 
-    // Parse optional level: if first word is low/medium/high, use it
-    let (budget, level, prompt) = match args.split_once(char::is_whitespace) {
-        Some((first, rest)) => match first.to_lowercase().as_str() {
-            "low" => (5_000, "low", rest.trim()),
-            "medium" => (10_000, "medium", rest.trim()),
-            "high" => (50_000, "high", rest.trim()),
-            _ => (10_000, "medium", args),
-        },
+    // /think off — disable persistent thinking
+    if args.eq_ignore_ascii_case("off") {
+        app.thinking_level = None;
+        return Some("Thinking: off".to_string());
+    }
+
+    // Parse: first word might be a level
+    let (first, rest) = match args.split_once(char::is_whitespace) {
+        Some((f, r)) => (f, r.trim()),
+        None => (args, ""),
+    };
+
+    // Resolve budget, level, and prompt text in one step
+    let (budget, level, prompt) = match resolve_thinking_level(first) {
+        Some((b, l)) if rest.is_empty() => {
+            // /think high — set persistent level, no prompt
+            app.thinking_level = Some((b, l));
+            return Some(format!(
+                "Thinking level: {l} ({b} tokens). All messages will use extended thinking."
+            ));
+        }
+        Some((b, l)) => (b, l, rest),
         None => (10_000, "medium", args),
     };
 
-    if prompt.is_empty() {
-        app.messages.push(ChatMessage {
-            role: ChatRole::Command,
-            content: "Usage: /think [low|medium|high] <prompt>".to_string(),
-            rendered: None,
-            channel: None,
-        });
-        return;
+    if app.status != AgentStatus::Idle {
+        return Some("Agent is busy. Wait for the current response to finish.".to_string());
     }
 
-    // Display user message with [think] prefix
     app.messages.push(ChatMessage {
         role: ChatRole::User,
         content: format!("[think:{level}] {prompt}"),
@@ -620,9 +676,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
         channel: None,
     });
 
-    // Drain any pending images
     let images = std::mem::take(&mut app.pending_images);
-
     let _ = app.agent_tx.send(AgentRequest::Message {
         text: prompt.to_string(),
         images,
@@ -631,6 +685,7 @@ fn handle_think(app: &mut App<'_>, args: &str) {
     app.status = AgentStatus::Thinking;
     app.scroll_offset = 0;
     app.needs_redraw = true;
+    None
 }
 
 fn handle_attach(app: &mut App<'_>, args: &str) -> String {

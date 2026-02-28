@@ -68,8 +68,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
         aliases: &[],
-        description: "Show active model",
-        args_hint: None,
+        description: "Show or switch model",
+        args_hint: Some("[sonnet|opus|haiku]"),
     },
     SlashCommand {
         name: "export",
@@ -116,8 +116,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "think",
         aliases: &["t"],
-        description: "Ask with extended thinking",
-        args_hint: Some("[low|medium|high] <prompt>"),
+        description: "Set thinking level or think once",
+        args_hint: Some("[low|medium|high|off] [prompt]"),
     },
     SlashCommand {
         name: "attach",

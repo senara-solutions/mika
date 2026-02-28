@@ -50,6 +50,9 @@ pub enum AgentRequest {
         images: Vec<ImageAttachment>,
         thinking_budget: Option<u32>,
     },
+    SetModel {
+        model: String,
+    },
     Quit,
 }
 
@@ -111,6 +114,9 @@ pub struct App<'a> {
 
     // Image attachments pending send
     pub pending_images: Vec<ImageAttachment>,
+
+    // Persistent thinking level: (budget_tokens, level_name)
+    pub thinking_level: Option<(u32, &'static str)>,
 
     // Context usage tracking
     pub context_tokens: Option<u32>,
@@ -177,6 +183,7 @@ impl<'a> App<'a> {
             global_home,
             pending_switch: None,
             pending_images: Vec::new(),
+            thinking_level: None,
             context_tokens: None,
             last_seen_msg_id: 0,
         }
@@ -184,7 +191,8 @@ impl<'a> App<'a> {
 
     /// Submit the current input to the agent, or queue a slash command.
     pub fn send_message(&mut self) {
-        self.send_message_with_thinking(None);
+        let budget = self.thinking_level.map(|(b, _)| b);
+        self.send_message_with_thinking(budget);
     }
 
     /// Submit the current input with optional thinking budget.
