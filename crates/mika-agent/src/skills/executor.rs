@@ -324,8 +324,11 @@ fn truncate_output(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_LEN {
         s.to_string()
     } else {
-        let truncated = &s[..MAX_OUTPUT_LEN];
-        format!("{truncated}\n... (truncated at {MAX_OUTPUT_LEN} chars)")
+        let mut boundary = MAX_OUTPUT_LEN;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}\n... (truncated at {MAX_OUTPUT_LEN} chars)", &s[..boundary])
     }
 }
 

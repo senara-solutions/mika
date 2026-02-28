@@ -4,7 +4,7 @@
 # Output: file contents on stdout, or __mika_v1 envelope for images
 
 INPUT=$(cat)
-PATH_VALUE=$(echo "$INPUT" | grep -o '"path":"[^"]*"' | head -1 | cut -d'"' -f4)
+PATH_VALUE=$(echo "$INPUT" | jq -r '.path // empty')
 
 if [ -z "$PATH_VALUE" ]; then
     echo "Error: no path provided" >&2

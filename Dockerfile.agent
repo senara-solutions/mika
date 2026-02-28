@@ -36,7 +36,7 @@ RUN cargo build --release --bin mika-server -p mika-agent
 # === Runtime stage ===
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget file jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with home directory

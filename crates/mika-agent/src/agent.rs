@@ -228,6 +228,7 @@ fn strip_prior_images(messages: &mut [Message]) {
     // Process all messages except the last one
     for msg in &mut messages[..len - 1] {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
+            // Strip images from tool result blocks
             for block in blocks.iter_mut() {
                 if let ContentBlock::ToolResult { content, .. } = block
                     && let ToolResultBody::Blocks(inner_blocks) = content
@@ -249,6 +250,20 @@ fn strip_prior_images(messages: &mut [Message]) {
                         let mut combined = text_parts.join("\n");
                         combined.push_str("\n[image(s) from previous turn omitted]");
                         *content = ToolResultBody::Text(combined);
+                    }
+                }
+            }
+
+            // Strip user-attached ContentBlock::Image blocks
+            let has_user_images = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            if has_user_images {
+                for block in blocks.iter_mut() {
+                    if matches!(block, ContentBlock::Image { .. }) {
+                        *block = ContentBlock::Text {
+                            text: "[user image from previous turn omitted]".to_string(),
+                        };
                     }
                 }
             }
@@ -1654,6 +1669,105 @@ mod tests {
             if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
                 assert!(matches!(content, ToolResultBody::Text(t) if t == "just text"));
             }
+        }
+    }
+
+    #[test]
+    fn test_strip_prior_images_removes_user_attached_images() {
+        use mika_common::claude::*;
+
+        let mut messages = vec![
+            // Prior turn: user message with text and an attached image
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "What is in this picture?".to_string(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: "iVBORw0KGgo=".to_string(),
+                        },
+                    },
+                ]),
+            },
+            // Assistant response
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("I see a cat.".to_string()),
+            },
+            // Current turn: user message with a new image (should be preserved)
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "And this one?".to_string(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/jpeg".to_string(),
+                            data: "/9j/4AAQ=".to_string(),
+                        },
+                    },
+                ]),
+            },
+        ];
+
+        strip_prior_images(&mut messages);
+
+        // First message: image should be replaced with placeholder text
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            assert_eq!(blocks.len(), 2);
+            assert!(
+                matches!(&blocks[0], ContentBlock::Text { text } if text == "What is in this picture?")
+            );
+            assert!(
+                matches!(&blocks[1], ContentBlock::Text { text } if text == "[user image from previous turn omitted]")
+            );
+        } else {
+            panic!("expected Blocks for first message");
+        }
+
+        // Last message: image should still be intact
+        if let MessageContent::Blocks(blocks) = &messages[2].content {
+            assert_eq!(blocks.len(), 2);
+            assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
+            assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+        } else {
+            panic!("expected Blocks for last message");
+        }
+    }
+
+    #[test]
+    fn test_strip_prior_images_no_mutation_without_images() {
+        use mika_common::claude::*;
+
+        let mut messages = vec![
+            // Prior turn: user message with only text blocks
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }]),
+            },
+            // Current turn
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("Current".to_string()),
+            },
+        ];
+
+        strip_prior_images(&mut messages);
+
+        // Text-only blocks should remain unchanged
+        if let MessageContent::Blocks(blocks) = &messages[0].content {
+            assert_eq!(blocks.len(), 1);
+            assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello"));
+        } else {
+            panic!("expected Blocks");
         }
     }
 }
