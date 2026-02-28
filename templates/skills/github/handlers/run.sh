@@ -4,22 +4,19 @@
 # Output: gh command output on stdout, errors on stderr
 #
 # SECURITY: Does not use eval. Arguments are passed directly to gh.
-# Credential-leaking subcommands are blocked.
+# Only allowlisted top-level subcommands are permitted.
 
 set -f  # Disable globbing for safe word splitting
 
 # Disable interactive prompts (prevents hangs in piped mode)
 export GH_PROMPT_DISABLED=1
 
-INPUT=$(cat)
-COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty' 2>/dev/null)
-REPO=$(printf '%s\n' "$INPUT" | jq -r '.repo // empty' 2>/dev/null)
+# Scrub sensitive env vars so gh subprocesses cannot leak them
+unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 
-# Fallback if jq is not available
-if [ -z "$COMMAND" ]; then
-    COMMAND=$(printf '%s\n' "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
-    REPO=$(printf '%s\n' "$INPUT" | grep -o '"repo":"[^"]*"' | head -1 | cut -d'"' -f4)
-fi
+INPUT=$(cat)
+COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')
+REPO=$(printf '%s\n' "$INPUT" | jq -r '.repo // empty')
 
 if [ -z "$COMMAND" ]; then
     echo "Error: no command provided" >&2
@@ -32,19 +29,16 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 1
 fi
 
-# Block credential-leaking commands
-case "$COMMAND" in
-    auth\ token*|auth\ refresh*|auth\ setup-git*)
-        echo "Error: credential management commands are blocked for security." >&2
+# Allowlist of permitted top-level subcommands
+SUBCOMMAND=$(printf '%s\n' "$COMMAND" | awk '{print $1}')
+case "$SUBCOMMAND" in
+    pr|issue|run|workflow|release|repo|search|label|milestone|project)
+        ;;
+    *)
+        echo "Error: gh subcommand '$SUBCOMMAND' is not allowed. Permitted: pr, issue, run, workflow, release, repo, search, label, milestone, project." >&2
         exit 1
         ;;
 esac
-
-# Validate gh is authenticated
-if ! gh auth status >/dev/null 2>&1; then
-    echo "Error: gh is not authenticated. Run 'gh auth login' or set the GH_TOKEN environment variable." >&2
-    exit 1
-fi
 
 # Execute gh with the provided arguments (no eval — prevents shell injection)
 # shellcheck disable=SC2086
