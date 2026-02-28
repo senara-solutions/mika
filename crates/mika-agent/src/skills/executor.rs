@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use tokio::io::AsyncWriteExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::index::ResolvedSkillTool;
 use super::manifest::ToolHandler;
@@ -76,6 +76,7 @@ async fn execute_exec(
 ) -> Result<ToolOutput> {
     // Resolve command relative to skill directory
     let cmd_path = skill_dir.join(command);
+    info!(command = %cmd_path.display(), "executing skill command");
     if !cmd_path.exists() {
         bail!(
             "handler command not found: {} (resolved to {})",
