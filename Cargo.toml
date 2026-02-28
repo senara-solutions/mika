@@ -83,6 +83,14 @@ png = "0.17"
 # Unicode
 unicode-width = "0.2"
 
+# MCP (Model Context Protocol)
+rmcp = { version = "0.17", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }
+
 # Utilities
 rand = "0.9"
 hex = "0.4"
