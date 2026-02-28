@@ -4,7 +4,9 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::config_keys::{is_settable_key, settable_keys_display, validate_config_value};
+use crate::config_keys::{
+    SETTABLE_CONFIG_KEYS, is_settable_key, settable_keys_display, validate_config_value,
+};
 
 pub struct SetConfigTool;
 
@@ -27,11 +29,15 @@ impl Tool for SetConfigTool {
                     "key": {
                         "type": "string",
                         "description": "Configuration key to set",
-                        "enum": ["chat_id", "timezone"]
+                        "enum": serde_json::Value::Array(
+                            SETTABLE_CONFIG_KEYS.iter()
+                                .map(|k| serde_json::Value::String(k.to_string()))
+                                .collect()
+                        )
                     },
                     "value": {
                         "type": "string",
-                        "description": "Value to set for the key (e.g. 'Asia/Singapore' for timezone, '123456789' for chat_id)"
+                        "description": "Value to set for the key (e.g. 'Asia/Singapore' for timezone, '123456789' for chat_id, 'low'/'medium'/'high'/'off' for thinking_level)"
                     }
                 },
                 "required": ["key", "value"]

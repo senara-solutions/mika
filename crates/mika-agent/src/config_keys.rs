@@ -31,9 +31,9 @@ pub fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
             }
         }
         "thinking_level" => {
-            if !matches!(value, "low" | "medium" | "high" | "off") {
+            if !matches!(value, "low" | "medium" | "med" | "high" | "off") {
                 return Err(format!(
-                    "Invalid thinking_level: {value}\nAllowed values: low, medium, high, off"
+                    "Invalid thinking_level: {value}\nAllowed values: low, medium, med, high, off"
                 ));
             }
         }

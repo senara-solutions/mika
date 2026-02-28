@@ -59,7 +59,7 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
 
     let db = open_db(&settings)?;
     startup::seed_core_memory_if_empty(&db, &agent_home)?;
-    startup::seed_bundled_skills_if_needed(&agent_home);
+    startup::seed_bundled_skills_if_needed(&agent_home, settings.disable_bundled_skills);
     let async_db = AsyncDatabase::new(db);
 
     Ok((settings, async_db, agent_home, global_home))

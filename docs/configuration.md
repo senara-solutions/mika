@@ -93,6 +93,8 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. |
+| `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
+| `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 
 The `home_dir` field is also present on the struct but is not configurable via
 file or environment variable. It is resolved automatically from `$MIKA_HOME` or
@@ -251,6 +253,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
+| `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 
 ### Server mode
 
@@ -268,6 +271,7 @@ are required for inter-service communication:
 | `MIKA_CLAUDE_MAX_TOKENS` | No | Override max tokens |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level |
+| `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 
 ### Gateway
 

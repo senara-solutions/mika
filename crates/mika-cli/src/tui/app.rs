@@ -189,6 +189,16 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Load persisted thinking level from the database.
+    pub async fn load_thinking_level(&mut self) {
+        self.thinking_level = None;
+        if let Ok(Some(level_str)) = self.db.get_customer_config("thinking_level").await
+            && let Some(resolved) = commands::resolve_thinking_level(&level_str)
+        {
+            self.thinking_level = Some(resolved);
+        }
+    }
+
     /// Submit the current input to the agent, or queue a slash command.
     pub fn send_message(&mut self) {
         let budget = self.thinking_level.map(|(b, _)| b);

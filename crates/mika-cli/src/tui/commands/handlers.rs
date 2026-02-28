@@ -633,7 +633,9 @@ async fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
     // /think off — disable persistent thinking
     if args.eq_ignore_ascii_case("off") {
         app.thinking_level = None;
-        let _ = app.db.set_customer_config("thinking_level", "off").await;
+        if let Err(e) = app.db.set_customer_config("thinking_level", "off").await {
+            tracing::warn!(error = %e, "failed to persist thinking level");
+        }
         return Some("Thinking: off".to_string());
     }
 
@@ -648,7 +650,9 @@ async fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
         Some((b, l)) if rest.is_empty() => {
             // /think high — set persistent level, no prompt
             app.thinking_level = Some((b, l));
-            let _ = app.db.set_customer_config("thinking_level", l).await;
+            if let Err(e) = app.db.set_customer_config("thinking_level", l).await {
+                tracing::warn!(error = %e, "failed to persist thinking level");
+            }
             return Some(format!(
                 "Thinking level: {l} ({b} tokens). All messages will use extended thinking."
             ));

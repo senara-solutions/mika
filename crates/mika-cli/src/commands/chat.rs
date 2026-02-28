@@ -223,15 +223,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     }
 
     // Load persisted thinking level ("off" resolves to None → stays default)
-    if let Ok(Some(level_str)) = worker
-        ._ctx
-        .async_db
-        .get_customer_config("thinking_level")
-        .await
-        && let Some(resolved) = crate::tui::commands::resolve_thinking_level(&level_str)
-    {
-        app.thinking_level = Some(resolved);
-    }
+    app.load_thinking_level().await;
 
     // Initialize cross-channel polling watermark
     app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
@@ -316,14 +308,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                             worker = new_worker;
 
                             // Load persisted thinking level from new agent's DB
-                            app.thinking_level = None;
-                            if let Ok(Some(level_str)) =
-                                app.db.get_customer_config("thinking_level").await
-                                && let Some(resolved) =
-                                    crate::tui::commands::resolve_thinking_level(&level_str)
-                            {
-                                app.thinking_level = Some(resolved);
-                            }
+                            app.load_thinking_level().await;
 
                             app.messages.push(ChatMessage {
                                 role: ChatRole::System,

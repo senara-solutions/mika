@@ -234,7 +234,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str("- You can update existing skill descriptions, keywords, prompts, or always_on settings with update_skill.\n");
     prompt.push_str("- You can permanently remove custom skills with delete_skill. Built-in skills cannot be deleted.\n");
     prompt.push_str(
-        "- You can read and update customer config (timezone, chat_id) with get_config and set_config.\n",
+        "- You can read and update customer config (timezone, chat_id, thinking_level) with get_config and set_config.\n",
     );
 
     prompt
