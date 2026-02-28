@@ -99,12 +99,12 @@ impl McpServerConfig {
     pub fn validate(&self, name: &str) -> anyhow::Result<()> {
         match self.transport {
             McpTransport::Stdio => {
-                if self.command.as_ref().map_or(true, |c| c.trim().is_empty()) {
+                if self.command.as_ref().is_none_or(|c| c.trim().is_empty()) {
                     anyhow::bail!("MCP server '{name}': stdio transport requires 'command'");
                 }
             }
             McpTransport::Http => {
-                if self.url.as_ref().map_or(true, |u| u.trim().is_empty()) {
+                if self.url.as_ref().is_none_or(|u| u.trim().is_empty()) {
                     anyhow::bail!("MCP server '{name}': http transport requires 'url'");
                 }
             }

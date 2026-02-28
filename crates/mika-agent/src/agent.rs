@@ -685,6 +685,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
 /// Execute tool-use blocks from a response and push both assistant and
 /// tool-result messages onto the request. Returns summaries of each tool call
 /// for persistence in conversation metadata.
+#[allow(clippy::too_many_arguments)]
 async fn process_tool_calls(
     response_content: Vec<ContentBlock>,
     tools: &ToolRegistry,
@@ -856,23 +857,23 @@ async fn execute_tool(
     }
 
     // 3. Try MCP tool (external server)
-    if let Some(mcp) = mcp_manager {
-        if mcp.is_mcp_tool(name) {
-            return match tokio::time::timeout(
-                std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                mcp.call_tool(name, input),
-            )
-            .await
-            {
-                Ok(output) => output,
-                Err(_) => {
-                    warn!(tool = %name, "MCP tool execution timed out");
-                    ToolOutput::error(format!(
-                        "MCP tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
-                    ))
-                }
-            };
-        }
+    if let Some(mcp) = mcp_manager
+        && mcp.is_mcp_tool(name)
+    {
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+            mcp.call_tool(name, input),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(_) => {
+                warn!(tool = %name, "MCP tool execution timed out");
+                ToolOutput::error(format!(
+                    "MCP tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
+                ))
+            }
+        };
     }
 
     warn!(tool = %name, "unknown tool requested");
