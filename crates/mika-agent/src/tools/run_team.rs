@@ -107,6 +107,7 @@ mod tests {
             brave_api_key: None,
             home_dir: PathBuf::from("/tmp"),
             server_log_file: None,
+            disable_bundled_skills: false,
         }
     }
 

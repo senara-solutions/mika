@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "322"
 tags: [code-review, agent-native, prompt]

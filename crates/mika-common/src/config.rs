@@ -61,6 +61,10 @@ pub struct Settings {
     #[serde(default)]
     pub server_log_file: Option<PathBuf>,
 
+    /// Disable bundled skill re-sync on startup (default: false)
+    #[serde(default)]
+    pub disable_bundled_skills: bool,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -211,6 +215,7 @@ impl std::fmt::Debug for Settings {
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("server_log_file", &self.server_log_file)
+            .field("disable_bundled_skills", &self.disable_bundled_skills)
             .field("home_dir", &self.home_dir)
             .finish()
     }
@@ -245,6 +250,7 @@ mod tests {
         let expected_db = tmp.path().join("data").join("mika.db");
         assert_eq!(settings.db_path, expected_db);
         assert_eq!(settings.home_dir, tmp.path());
+        assert!(!settings.disable_bundled_skills);
     }
 
     #[test]
@@ -351,5 +357,19 @@ mod tests {
         let via_load_for_agent = Settings::load_for_agent(tmp.path(), tmp.path()).unwrap();
         assert_eq!(via_load.claude_model, via_load_for_agent.claude_model);
         assert_eq!(via_load.home_dir, via_load_for_agent.home_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable_bundled_skills_from_env() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_DISABLE_BUNDLED_SKILLS", "true") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.disable_bundled_skills);
+
+        unsafe { std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS") };
     }
 }

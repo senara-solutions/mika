@@ -64,10 +64,11 @@ fn init_agent(
     http_client: &reqwest::Client,
     embedding_client: Option<EmbeddingClient>,
     brave_api_key: Option<String>,
+    disable_bundled_skills: bool,
 ) -> Result<(AgentState, Arc<ReminderScheduler>)> {
     let db = Database::open(&agent_home.join("data").join("mika.db"))?;
     startup::seed_core_memory_if_empty(&db, agent_home)?;
-    startup::seed_bundled_skills_if_needed(agent_home);
+    startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     let async_db = AsyncDatabase::new(db);
 
     let skill_registry = Arc::new(SkillRegistry::from_dir(&agent_home.join("skills")));
@@ -170,6 +171,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
+                settings.disable_bundled_skills,
             )?;
             agents.insert(agent::DEFAULT_AGENT.to_string(), Arc::new(agent_state));
             schedulers.push(scheduler);
@@ -187,6 +189,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
+                settings.disable_bundled_skills,
             ) {
                 Ok((agent_state, scheduler)) => {
                     agents.insert(name.clone(), Arc::new(agent_state));
