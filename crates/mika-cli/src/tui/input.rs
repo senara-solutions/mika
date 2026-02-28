@@ -1,8 +1,21 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use std::path::Path;
 
 use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::attachment::ImageAttachment;
+
+/// Handle a mouse event (scroll wheel for conversation scrolling).
+pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_up(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_down(3);
+        }
+        _ => {} // Ignore clicks, drags, etc.
+    }
+}
 
 /// Handle a key event with autocomplete-aware dispatch.
 pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
@@ -105,7 +118,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
         app.textarea
             .set_cursor_line_style(ratatui::style::Style::default());
         app.textarea.set_placeholder_text("Type a message...");
-        app.history_index = None;
+        app.history.reset();
         return;
     }
 
@@ -137,13 +150,26 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
         // Otherwise let tab fall through to textarea
     }
 
-    // Up/Down for history when input is empty
-    let input_empty = app.textarea.lines().iter().all(|l| l.trim().is_empty());
-    if input_empty && key.code == KeyCode::Up {
+    // Ctrl+Up/Down: scroll conversation without leaving input field
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Up {
+        app.scroll_up(1);
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
+        app.scroll_down(1);
+        return;
+    }
+
+    // Up/Down: cursor-position-aware history navigation
+    // Up triggers history when cursor is on the first row
+    if key.code == KeyCode::Up && app.textarea.cursor().0 == 0 {
         app.history_previous();
         return;
     }
-    if input_empty && key.code == KeyCode::Down {
+    // Down triggers history when cursor is on the last row
+    if key.code == KeyCode::Down
+        && app.textarea.cursor().0 == app.textarea.lines().len().saturating_sub(1)
+    {
         app.history_next();
         return;
     }

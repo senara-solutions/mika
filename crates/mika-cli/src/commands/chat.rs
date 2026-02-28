@@ -1,7 +1,9 @@
 use anyhow::Result;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{event::DisableMouseCapture, execute};
+use crossterm::execute;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -238,7 +240,12 @@ pub async fn run(agent_name: &str) -> Result<()> {
     // Enter TUI mode
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -256,6 +263,10 @@ pub async fn run(agent_name: &str) -> Result<()> {
         match events.next().await {
             Some(AppEvent::Key(key)) => {
                 input::handle_key(&mut app, key);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Mouse(mouse)) => {
+                input::handle_mouse(&mut app, mouse);
                 app.needs_redraw = true;
             }
             Some(AppEvent::Paste(text)) => {

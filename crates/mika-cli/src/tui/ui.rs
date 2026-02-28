@@ -1,8 +1,9 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::app::{AgentStatus, App, ChatRole};
 use crate::tui::markdown;
@@ -14,19 +15,108 @@ fn channel_prefix_span(channel: &Option<String>) -> Option<Span<'static>> {
         .map(|ch| Span::styled(format!("[{ch}] "), Style::default().fg(Color::Yellow)))
 }
 
+/// Count visual rows a line occupies when wrapped at the given width, using character display widths.
+pub(crate) fn visual_line_rows(line: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    if line.is_empty() {
+        return 1;
+    }
+    let mut rows = 1;
+    let mut col = 0;
+    for ch in line.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + ch_w > width && col > 0 {
+            rows += 1;
+            col = ch_w;
+        } else {
+            col += ch_w;
+        }
+    }
+    rows
+}
+
+/// Result of wrapping multi-line input text with cursor tracking.
+struct WrappedInput {
+    lines: Vec<Line<'static>>,
+    cursor_x: u16,
+    cursor_y: u16,
+}
+
+/// Wrap input text lines at character-width boundaries and track cursor position.
+fn wrap_input_with_cursor(
+    text_lines: &[impl AsRef<str>],
+    cursor_row: usize,
+    cursor_col: usize,
+    width: usize,
+) -> WrappedInput {
+    let mut display_lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_x: u16 = 0;
+    let mut cursor_y: u16 = 0;
+    let mut found_cursor = false;
+
+    for (line_idx, line) in text_lines.iter().enumerate() {
+        let line = line.as_ref();
+        if line.is_empty() {
+            if line_idx == cursor_row && !found_cursor {
+                cursor_y = display_lines.len() as u16;
+                cursor_x = 0;
+                found_cursor = true;
+            }
+            display_lines.push(Line::from(""));
+            continue;
+        }
+
+        let mut seg_start = 0;
+        let mut col = 0usize;
+
+        for (char_idx, (byte_offset, ch)) in line.char_indices().enumerate() {
+            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+            if col + ch_w > width && col > 0 {
+                display_lines.push(Line::from(line[seg_start..byte_offset].to_string()));
+                seg_start = byte_offset;
+                col = 0;
+            }
+
+            if line_idx == cursor_row && char_idx == cursor_col && !found_cursor {
+                cursor_y = display_lines.len() as u16;
+                cursor_x = col as u16;
+                found_cursor = true;
+            }
+
+            col += ch_w;
+        }
+
+        display_lines.push(Line::from(line[seg_start..].to_string()));
+
+        if line_idx == cursor_row && !found_cursor {
+            cursor_y = (display_lines.len() - 1) as u16;
+            cursor_x = col as u16;
+            found_cursor = true;
+        }
+    }
+
+    WrappedInput {
+        lines: display_lines,
+        cursor_x,
+        cursor_y,
+    }
+}
+
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     // Dynamic input height: grow with content, capped at 6 lines.
-    // Account for both wrapped lines (long lines) and explicit newlines (pasted text).
+    // Use character display widths (not byte lengths) for accurate wrapping estimation.
     let available_width = f.area().width.saturating_sub(4) as usize; // borders + "> " prompt
     let input_lines = if available_width > 0 {
         let wrapped: usize = app
             .textarea
             .lines()
             .iter()
-            .map(|l| (l.len() / available_width) + 1)
+            .map(|l| visual_line_rows(l, available_width))
             .sum();
-        let line_count = app.textarea.lines().len();
-        wrapped.max(line_count).clamp(1, 6) as u16
+        wrapped.clamp(1, 6) as u16
     } else {
         1
     };
@@ -251,7 +341,50 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(prompt, input_chunks[0]);
-    f.render_widget(&app.textarea, input_chunks[1]);
+
+    let textarea_area = input_chunks[1];
+    let width = textarea_area.width as usize;
+
+    let lines = app.textarea.lines();
+    let (cursor_row, cursor_col) = app.textarea.cursor();
+
+    // Show placeholder when input is empty
+    if lines.iter().all(|l| l.is_empty()) && !app.history.is_browsing() {
+        let placeholder = Paragraph::new(Span::styled(
+            "Type a message...",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(placeholder, textarea_area);
+        f.set_cursor_position(Position::new(textarea_area.x, textarea_area.y));
+        return;
+    }
+
+    // Wrap input and track cursor position
+    let wrapped = wrap_input_with_cursor(lines, cursor_row, cursor_col, width);
+
+    // Scroll the input view if cursor is beyond the visible area
+    let visible_height = textarea_area.height;
+    let scroll_offset = if wrapped.cursor_y >= visible_height {
+        wrapped.cursor_y - visible_height + 1
+    } else {
+        0
+    };
+
+    // Render display lines (with scroll offset)
+    let display_lines: Vec<Line<'static>> = wrapped
+        .lines
+        .into_iter()
+        .skip(scroll_offset as usize)
+        .collect();
+    let paragraph = Paragraph::new(display_lines);
+    f.render_widget(paragraph, textarea_area);
+
+    // Set cursor position
+    let cx = textarea_area.x + wrapped.cursor_x.min(textarea_area.width.saturating_sub(1));
+    let cy = textarea_area.y + wrapped.cursor_y - scroll_offset;
+    if cy < textarea_area.y + textarea_area.height {
+        f.set_cursor_position(Position::new(cx, cy));
+    }
 }
 
 fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
@@ -313,6 +446,24 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             format!("ctx: {tokens_k}k/{limit_k}k ({pct}%)"),
             Style::default().fg(color),
         ));
+    }
+
+    // Scroll / new-message indicator
+    if app.scroll_offset > 0 {
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        if app.has_new_message {
+            spans.push(Span::styled(
+                "\u{2193} new messages",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "\u{2191} scrolled",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
 
     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
