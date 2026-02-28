@@ -27,8 +27,10 @@ RUN cargo build --release --bin mika-server -p mika-agent || true \
     && rm -rf target/release/.fingerprint/mika-* \
     && rm -rf target/release/deps/libmika_* target/release/deps/mika_*
 
-# 4. Copy real source code
+# 4. Copy real source code (+ templates and docs for include_str! macros)
 COPY crates/ crates/
+COPY templates/ templates/
+COPY docs/ docs/
 
 # 5. Build the actual binary (dependencies are cached, only workspace crates rebuild)
 RUN cargo build --release --bin mika-server -p mika-agent
@@ -38,6 +40,14 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget file jq \
     && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI (for github builtin skill)
+RUN ARCH=$(dpkg --print-architecture) && \
+    GH_VERSION="2.65.0" && \
+    wget -qO /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" && \
+    tar -xzf /tmp/gh.tar.gz -C /tmp && \
+    mv /tmp/gh_${GH_VERSION}_linux_${ARCH}/bin/gh /usr/local/bin/gh && \
+    rm -rf /tmp/gh*
 
 # Create non-root user with home directory
 RUN useradd -m -u 1000 -s /bin/false mika
