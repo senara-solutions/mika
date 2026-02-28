@@ -4,7 +4,7 @@
 //! `set_config` tool so both enforce the same rules.
 
 /// Config keys that may be set via agent tools or `/config set`.
-pub const SETTABLE_CONFIG_KEYS: &[&str] = &["chat_id", "timezone"];
+pub const SETTABLE_CONFIG_KEYS: &[&str] = &["chat_id", "timezone", "thinking_level"];
 
 /// Validate a config value for the given key.
 ///
@@ -27,6 +27,13 @@ pub fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
             if value.parse::<chrono_tz::Tz>().is_err() {
                 return Err(format!(
                     "Invalid timezone: {value}\nExample: Asia/Singapore, America/New_York, Europe/London"
+                ));
+            }
+        }
+        "thinking_level" => {
+            if !matches!(value, "low" | "medium" | "high" | "off") {
+                return Err(format!(
+                    "Invalid thinking_level: {value}\nAllowed values: low, medium, high, off"
                 ));
             }
         }
@@ -54,6 +61,7 @@ mod tests {
     fn test_allowlist_contains_expected_keys() {
         assert!(is_settable_key("chat_id"));
         assert!(is_settable_key("timezone"));
+        assert!(is_settable_key("thinking_level"));
         assert!(!is_settable_key("api_key"));
         assert!(!is_settable_key("db_path"));
     }
@@ -92,9 +100,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_thinking_level_valid() {
+        assert!(validate_config_value("thinking_level", "low").is_ok());
+        assert!(validate_config_value("thinking_level", "medium").is_ok());
+        assert!(validate_config_value("thinking_level", "high").is_ok());
+        assert!(validate_config_value("thinking_level", "off").is_ok());
+    }
+
+    #[test]
+    fn test_validate_thinking_level_invalid() {
+        let err = validate_config_value("thinking_level", "max").unwrap_err();
+        assert!(err.contains("Invalid thinking_level"));
+    }
+
+    #[test]
     fn test_settable_keys_display() {
         let display = settable_keys_display();
         assert!(display.contains("chat_id"));
         assert!(display.contains("timezone"));
+        assert!(display.contains("thinking_level"));
     }
 }

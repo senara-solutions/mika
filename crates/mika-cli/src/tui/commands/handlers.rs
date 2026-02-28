@@ -6,7 +6,7 @@ use mika_common::home;
 use mika_common::team;
 
 use crate::tui::app::{AgentRequest, AgentStatus, App, ChatMessage, ChatRole};
-use crate::tui::commands::{COMMANDS, parse_command};
+use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
 use crate::tui::input;
 
 /// Dispatch a slash command string to the appropriate handler.
@@ -34,7 +34,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "agents" => Some(handle_agents(app)),
         "teams" => Some(handle_teams(app)),
         "team" => Some(handle_team(args)),
-        "think" | "t" => handle_think(app, args),
+        "think" | "t" => handle_think(app, args).await,
         "attach" | "img" => Some(handle_attach(app, args)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
@@ -616,17 +616,7 @@ fn handle_team(args: &str) -> String {
     )
 }
 
-/// Resolve a thinking level keyword to (budget_tokens, level_name).
-fn resolve_thinking_level(word: &str) -> Option<(u32, &'static str)> {
-    match word.to_lowercase().as_str() {
-        "low" => Some((5_000, "low")),
-        "medium" | "med" => Some((10_000, "medium")),
-        "high" => Some((50_000, "high")),
-        _ => None,
-    }
-}
-
-fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
+async fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
     let args = args.trim();
 
     // No args: show current level and usage
@@ -643,6 +633,7 @@ fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
     // /think off — disable persistent thinking
     if args.eq_ignore_ascii_case("off") {
         app.thinking_level = None;
+        let _ = app.db.set_customer_config("thinking_level", "off").await;
         return Some("Thinking: off".to_string());
     }
 
@@ -657,6 +648,7 @@ fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
         Some((b, l)) if rest.is_empty() => {
             // /think high — set persistent level, no prompt
             app.thinking_level = Some((b, l));
+            let _ = app.db.set_customer_config("thinking_level", l).await;
             return Some(format!(
                 "Thinking level: {l} ({b} tokens). All messages will use extended thinking."
             ));
