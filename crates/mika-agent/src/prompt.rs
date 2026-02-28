@@ -237,7 +237,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- You can read and update customer config (timezone, chat_id, thinking_level) with get_config and set_config.\n",
     );
     prompt.push_str(
-        "- Some tools can return images alongside text. When a tool produces an image (e.g., a screenshot or reading an image file), you will see the image and can describe its contents to the user.\n",
+        "- Tools may return images (screenshots, image files); you will see and can describe their contents.\n",
     );
 
     prompt

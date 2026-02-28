@@ -94,8 +94,13 @@ async fn execute_inner(
 /// Returns `Some(MikaOutput)` if the output is valid JSON with the sentinel key,
 /// `None` otherwise (plain text output — backward compatible).
 fn try_parse_envelope(stdout: &str) -> Option<MikaOutput> {
-    let envelope: MikaEnvelope = serde_json::from_str(stdout).ok()?;
-    Some(envelope.__mika_v1)
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with(r#"{"__mika_v1""#) {
+        return None;
+    }
+    serde_json::from_str::<MikaEnvelope>(trimmed)
+        .ok()
+        .map(|e| e.__mika_v1)
 }
 
 /// Read an image file from disk, validate it, and return base64-encoded data.
@@ -105,39 +110,45 @@ fn try_parse_envelope(stdout: &str) -> Option<MikaOutput> {
 /// - Verifies regular file (rejects devices, sockets, etc.)
 /// - Enforces 5 MB size limit (checked before reading)
 /// - Magic-byte validation for supported image types (JPEG, PNG, GIF, WebP)
-fn read_and_validate_image(path: &str) -> Result<ImageData, String> {
-    use std::fs;
+async fn read_and_validate_image(path: &str) -> Result<ImageData, String> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::fs;
 
-    let canonical = fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve image path '{}': {}", path, e))?;
+        let canonical = fs::canonicalize(&path)
+            .map_err(|e| format!("cannot resolve image path '{}': {}", path, e))?;
 
-    let metadata = fs::metadata(&canonical)
-        .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
+        let metadata = fs::metadata(&canonical)
+            .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
 
-    if !metadata.is_file() {
-        return Err(format!("not a regular file: {}", canonical.display()));
-    }
+        if !metadata.is_file() {
+            return Err(format!("not a regular file: {}", canonical.display()));
+        }
 
-    if metadata.len() > MAX_IMAGE_SIZE {
-        return Err(format!(
-            "image too large: {} bytes (max {} bytes)",
-            metadata.len(),
-            MAX_IMAGE_SIZE
-        ));
-    }
+        if metadata.len() > MAX_IMAGE_SIZE {
+            return Err(format!(
+                "image too large: {} bytes (max {} bytes)",
+                metadata.len(),
+                MAX_IMAGE_SIZE
+            ));
+        }
 
-    let bytes = fs::read(&canonical)
-        .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
+        let bytes = fs::read(&canonical)
+            .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
 
-    let media_type = detect_image_type(&bytes)
-        .ok_or_else(|| format!("not a supported image type: {}", canonical.display()))?;
+        let media_type = detect_image_type(&bytes)
+            .ok_or_else(|| format!("not a supported image type: {}", canonical.display()))?;
 
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        drop(bytes); // Free raw bytes, keep only base64
 
-    Ok(ImageData {
-        media_type: media_type.to_string(),
-        data,
+        Ok(ImageData {
+            media_type: media_type.to_string(),
+            data,
+        })
     })
+    .await
+    .map_err(|e| format!("image read task panicked: {e}"))?
 }
 
 /// Detect image type from magic bytes. Returns MIME type or None.
@@ -163,7 +174,7 @@ fn detect_image_type(bytes: &[u8]) -> Option<&'static str> {
 
 /// Process image file paths from a Mika envelope, returning validated images
 /// and any error notes for paths that couldn't be loaded.
-fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec<String>) {
+async fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec<String>) {
     let mut images = Vec::new();
     let mut errors = Vec::new();
 
@@ -176,7 +187,7 @@ fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec<Strin
             ));
             break;
         }
-        match read_and_validate_image(path) {
+        match read_and_validate_image(path).await {
             Ok(img) => images.push(img),
             Err(e) => {
                 warn!(path, error = %e, "failed to load envelope image");
@@ -237,7 +248,7 @@ async fn execute_exec(
 
         // Try to parse as __mika_v1 image envelope
         if let Some(envelope) = try_parse_envelope(&stdout) {
-            let (images, errors) = process_envelope_images(&envelope.images);
+            let (images, errors) = process_envelope_images(&envelope.images).await;
             let mut text = truncate_output(&envelope.text);
             if !errors.is_empty() {
                 text.push_str("\n[image errors: ");
@@ -534,22 +545,26 @@ mod tests {
 
     // -- Image file validation tests --
 
-    #[test]
-    fn test_read_and_validate_image_nonexistent() {
-        let err = read_and_validate_image("/tmp/nonexistent_abc123.png").unwrap_err();
+    #[tokio::test]
+    async fn test_read_and_validate_image_nonexistent() {
+        let err = read_and_validate_image("/tmp/nonexistent_abc123.png")
+            .await
+            .unwrap_err();
         assert!(err.contains("cannot resolve"));
     }
 
-    #[test]
-    fn test_read_and_validate_image_not_image() {
+    #[tokio::test]
+    async fn test_read_and_validate_image_not_image() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"this is plain text").unwrap();
-        let err = read_and_validate_image(tmp.path().to_str().unwrap()).unwrap_err();
+        let err = read_and_validate_image(tmp.path().to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err.contains("not a supported image type"));
     }
 
-    #[test]
-    fn test_read_and_validate_image_valid_png() {
+    #[tokio::test]
+    async fn test_read_and_validate_image_valid_png() {
         let tmp = tempfile::NamedTempFile::with_suffix(".png").unwrap();
         // Minimal valid PNG header + IHDR
         let png_bytes = [
@@ -558,13 +573,15 @@ mod tests {
             0x49, 0x48, 0x44, 0x52, // IHDR
         ];
         std::fs::write(tmp.path(), &png_bytes).unwrap();
-        let img = read_and_validate_image(tmp.path().to_str().unwrap()).unwrap();
+        let img = read_and_validate_image(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
         assert_eq!(img.media_type, "image/png");
         assert!(!img.data.is_empty());
     }
 
-    #[test]
-    fn test_process_envelope_images_respects_max() {
+    #[tokio::test]
+    async fn test_process_envelope_images_respects_max() {
         // Create 7 temp PNG files — only 5 should be processed
         let dir = tempfile::tempdir().unwrap();
         let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -574,7 +591,7 @@ mod tests {
             std::fs::write(&p, &png_header).unwrap();
             paths.push(p.to_str().unwrap().to_string());
         }
-        let (images, errors) = process_envelope_images(&paths);
+        let (images, errors) = process_envelope_images(&paths).await;
         assert_eq!(images.len(), 5);
         assert!(!errors.is_empty());
         assert!(errors.last().unwrap().contains("skipped"));

@@ -20,10 +20,9 @@ fi
 MIME=$(file -b --mime-type "$PATH_VALUE" 2>/dev/null)
 case "$MIME" in
     image/jpeg|image/png|image/gif|image/webp)
-        # Escape path for JSON (handle special chars)
-        ESCAPED_PATH=$(printf '%s' "$PATH_VALUE" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        printf '{"__mika_v1":{"text":"Image file: %s (%s)","images":["%s"]}}' \
-            "$ESCAPED_PATH" "$MIME" "$ESCAPED_PATH"
+        # Use jq for safe JSON construction (handles all special characters)
+        jq -n --arg path "$PATH_VALUE" --arg mime "$MIME" \
+            '{"__mika_v1":{"text":"Image file: \($path) (\($mime))","images":[$path]}}'
         ;;
     *)
         cat "$PATH_VALUE"
