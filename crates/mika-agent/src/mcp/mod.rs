@@ -94,8 +94,7 @@ impl McpManager {
 
                     for tool in &conn.tools {
                         let tool_name_str: &str = &tool.name;
-                        let namespaced =
-                            format!("{MCP_PREFIX}{name}{MCP_SEP}{tool_name_str}");
+                        let namespaced = format!("{MCP_PREFIX}{name}{MCP_SEP}{tool_name_str}");
 
                         if tool_routing.contains_key(&namespaced) {
                             warn!(
@@ -117,10 +116,8 @@ impl McpManager {
                             description,
                             input_schema,
                         });
-                        tool_routing.insert(
-                            namespaced,
-                            (name.to_string(), tool_name_str.to_string()),
-                        );
+                        tool_routing
+                            .insert(namespaced, (name.to_string(), tool_name_str.to_string()));
                     }
 
                     connections.insert(name, conn);
@@ -176,9 +173,7 @@ impl McpManager {
         let conn = match self.connections.get(server_name) {
             Some(c) => c,
             None => {
-                return ToolOutput::error(format!(
-                    "MCP server '{server_name}' is not connected."
-                ));
+                return ToolOutput::error(format!("MCP server '{server_name}' is not connected."));
             }
         };
 
@@ -268,14 +263,13 @@ async fn connect_stdio(name: &str, config: &McpServerConfig) -> Result<McpConnec
 
     let transport = TokioChildProcess::new(cmd)?;
 
-    let service: RunningService<RoleClient, ()> =
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            <() as ServiceExt<RoleClient>>::serve((), transport),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("MCP server '{name}' handshake timed out (30s)"))?
-        .map_err(|e| anyhow::anyhow!("MCP server '{name}' handshake failed: {e}"))?;
+    let service: RunningService<RoleClient, ()> = tokio::time::timeout(
+        Duration::from_secs(30),
+        <() as ServiceExt<RoleClient>>::serve((), transport),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("MCP server '{name}' handshake timed out (30s)"))?
+    .map_err(|e| anyhow::anyhow!("MCP server '{name}' handshake failed: {e}"))?;
 
     let tools_result = service
         .list_tools(Default::default())
@@ -290,19 +284,52 @@ async fn connect_stdio(name: &str, config: &McpServerConfig) -> Result<McpConnec
 
 /// Connect to an MCP server via Streamable HTTP.
 async fn connect_http(name: &str, config: &McpServerConfig) -> Result<McpConnection> {
-    use rmcp::transport::streamable_http_client::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::{
+        StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+    };
 
     let url = config.url.as_deref().unwrap_or_default();
-    let transport = StreamableHttpClientTransport::from_uri(url);
+    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
 
-    let service: RunningService<RoleClient, ()> =
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            <() as ServiceExt<RoleClient>>::serve((), transport),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("MCP server '{name}' HTTP handshake timed out (30s)"))?
-        .map_err(|e| anyhow::anyhow!("MCP server '{name}' HTTP handshake failed: {e}"))?;
+    // Apply configured HTTP headers
+    if let Some(headers) = &config.headers {
+        // Authorization goes through rmcp's built-in auth_header support
+        if let Some(auth) = headers.get("Authorization") {
+            transport_config = transport_config.auth_header(auth.clone());
+        }
+
+        // Other headers use the custom_headers API
+        let mut custom = std::collections::HashMap::new();
+        for (key, value) in headers {
+            if key == "Authorization" {
+                continue; // Already handled above
+            }
+            match (
+                http::HeaderName::from_bytes(key.as_bytes()),
+                http::HeaderValue::from_str(value),
+            ) {
+                (Ok(hname), Ok(hval)) => {
+                    custom.insert(hname, hval);
+                }
+                _ => {
+                    warn!(server = name, header = %key, "invalid HTTP header, skipping");
+                }
+            }
+        }
+        if !custom.is_empty() {
+            transport_config = transport_config.custom_headers(custom);
+        }
+    }
+
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
+
+    let service: RunningService<RoleClient, ()> = tokio::time::timeout(
+        Duration::from_secs(30),
+        <() as ServiceExt<RoleClient>>::serve((), transport),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("MCP server '{name}' HTTP handshake timed out (30s)"))?
+    .map_err(|e| anyhow::anyhow!("MCP server '{name}' HTTP handshake failed: {e}"))?;
 
     let tools_result = service
         .list_tools(Default::default())
@@ -316,10 +343,7 @@ async fn connect_http(name: &str, config: &McpServerConfig) -> Result<McpConnect
 }
 
 /// Convert an MCP CallToolResult to a ToolOutput.
-fn convert_mcp_result(
-    result: &rmcp::model::CallToolResult,
-    tool_name: &str,
-) -> ToolOutput {
+fn convert_mcp_result(result: &rmcp::model::CallToolResult, tool_name: &str) -> ToolOutput {
     let is_error = result.is_error.unwrap_or(false);
     let mut text = String::new();
     let mut images = Vec::new();
@@ -334,11 +358,18 @@ fn convert_mcp_result(
             }
             RawContent::Image(img) => {
                 if images.len() >= MAX_MCP_IMAGES {
-                    warn!(tool = tool_name, "MCP tool returned too many images, truncating");
+                    warn!(
+                        tool = tool_name,
+                        "MCP tool returned too many images, truncating"
+                    );
                     break;
                 }
                 if img.data.len() > MAX_MCP_IMAGE_SIZE {
-                    warn!(tool = tool_name, size = img.data.len(), "MCP image too large, skipping");
+                    warn!(
+                        tool = tool_name,
+                        size = img.data.len(),
+                        "MCP image too large, skipping"
+                    );
                     continue;
                 }
                 images.push(ImageData {
@@ -512,6 +543,7 @@ mod tests {
                 args: None,
                 env: None,
                 url: None,
+                headers: None,
                 enabled: false,
             },
         );
@@ -531,6 +563,7 @@ mod tests {
                 args: None,
                 env: None,
                 url: None,
+                headers: None,
                 enabled: true,
             },
         );

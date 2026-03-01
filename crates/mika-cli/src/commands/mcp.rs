@@ -17,8 +17,19 @@ pub async fn run(args: McpArgs, agent_name: &str) -> Result<()> {
             command,
             args: cmd_args,
             url,
-        }) => add_server(&agent_home, &name, &transport, command, cmd_args, url),
+            headers,
+        }) => add_server(
+            &agent_home,
+            &name,
+            &transport,
+            command,
+            cmd_args,
+            url,
+            headers,
+        ),
         Some(McpCommand::Remove { name }) => remove_server(&agent_home, &name),
+        Some(McpCommand::Enable { name }) => toggle_server(&agent_home, &name, true),
+        Some(McpCommand::Disable { name }) => toggle_server(&agent_home, &name, false),
     }
 }
 
@@ -59,17 +70,23 @@ fn add_server(
     command: Option<String>,
     args: Option<Vec<String>>,
     url: Option<String>,
+    raw_headers: Option<Vec<String>>,
 ) -> Result<()> {
     let mut config = McpConfig::load(agent_home)?;
 
     if config.mcp_servers.contains_key(name) {
-        anyhow::bail!("MCP server '{name}' already exists. Remove it first with: mika mcp remove {name}");
+        anyhow::bail!(
+            "MCP server '{name}' already exists. Remove it first with: mika mcp remove {name}"
+        );
     }
 
     let transport_type = match transport {
         "stdio" => {
             if command.is_none() {
                 anyhow::bail!("--command is required for stdio transport");
+            }
+            if raw_headers.as_ref().is_some_and(|h| !h.is_empty()) {
+                anyhow::bail!("--header is only supported for http transport");
             }
             McpTransport::Stdio
         }
@@ -82,12 +99,15 @@ fn add_server(
         other => anyhow::bail!("Unknown transport type: {other}. Use 'stdio' or 'http'."),
     };
 
+    let headers = parse_headers(raw_headers)?;
+
     let server_config = McpServerConfig {
         transport: transport_type,
         command,
         args,
         env: None,
         url,
+        headers,
         enabled: true,
     };
 
@@ -97,6 +117,49 @@ fn add_server(
 
     println!("Added MCP server '{name}'. Restart Mika to connect.");
     Ok(())
+}
+
+fn toggle_server(agent_home: &std::path::Path, name: &str, enabled: bool) -> Result<()> {
+    let mut config = McpConfig::load(agent_home)?;
+
+    let server = config
+        .mcp_servers
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found."))?;
+
+    if server.enabled == enabled {
+        let state = if enabled { "enabled" } else { "disabled" };
+        println!("MCP server '{name}' is already {state}.");
+        return Ok(());
+    }
+
+    server.enabled = enabled;
+    config.save(agent_home)?;
+
+    let action = if enabled { "Enabled" } else { "Disabled" };
+    println!("{action} MCP server '{name}'. Restart Mika to apply.");
+    Ok(())
+}
+
+fn parse_headers(
+    raw: Option<Vec<String>>,
+) -> Result<Option<std::collections::HashMap<String, String>>> {
+    let raw = match raw {
+        Some(h) if !h.is_empty() => h,
+        _ => return Ok(None),
+    };
+
+    let mut map = std::collections::HashMap::new();
+    for entry in &raw {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("Invalid header format: '{entry}'. Use KEY=VALUE."))?;
+        if key.is_empty() {
+            anyhow::bail!("Empty header name in: '{entry}'");
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(Some(map))
 }
 
 fn remove_server(agent_home: &std::path::Path, name: &str) -> Result<()> {

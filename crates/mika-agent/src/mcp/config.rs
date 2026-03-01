@@ -30,7 +30,7 @@ pub struct McpConfig {
 }
 
 /// Configuration for a single MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub transport: McpTransport,
     /// Command to run for stdio transport.
@@ -45,9 +45,34 @@ pub struct McpServerConfig {
     /// URL for HTTP transport.
     #[serde(default)]
     pub url: Option<String>,
+    /// HTTP headers for Streamable HTTP transport (e.g. Authorization, API keys).
+    /// Ignored for stdio transport.
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
     /// Whether this server is enabled (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("McpServerConfig");
+        s.field("transport", &self.transport);
+        s.field("command", &self.command);
+        s.field("args", &self.args);
+        s.field("env", &self.env);
+        s.field("url", &self.url);
+        // Redact header values (may contain bearer tokens / API keys)
+        if let Some(headers) = &self.headers {
+            let redacted: HashMap<&String, &str> =
+                headers.keys().map(|k| (k, "[REDACTED]")).collect();
+            s.field("headers", &redacted);
+        } else {
+            s.field("headers", &self.headers);
+        }
+        s.field("enabled", &self.enabled);
+        s.finish()
+    }
 }
 
 /// MCP transport type.
@@ -116,6 +141,12 @@ impl McpServerConfig {
                 if self.command.as_ref().is_none_or(|c| c.trim().is_empty()) {
                     anyhow::bail!("MCP server '{name}': stdio transport requires 'command'");
                 }
+                if self.headers.as_ref().is_some_and(|h| !h.is_empty()) {
+                    tracing::warn!(
+                        server = name,
+                        "MCP server '{name}': headers are ignored for stdio transport"
+                    );
+                }
             }
             McpTransport::Http => {
                 let url = match self.url.as_deref() {
@@ -128,9 +159,7 @@ impl McpServerConfig {
                 match url.split_once("://") {
                     Some(("http" | "https", _)) => {}
                     _ => {
-                        anyhow::bail!(
-                            "MCP server '{name}': url must use http or https scheme"
-                        );
+                        anyhow::bail!("MCP server '{name}': url must use http or https scheme");
                     }
                 }
             }
@@ -219,6 +248,7 @@ mod tests {
             args: None,
             env: None,
             url: None,
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("test").is_err());
@@ -232,6 +262,7 @@ mod tests {
             args: None,
             env: None,
             url: None,
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("test").is_err());
@@ -245,6 +276,7 @@ mod tests {
             args: Some(vec!["-y".to_string(), "server".to_string()]),
             env: None,
             url: None,
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("test").is_ok());
@@ -258,6 +290,7 @@ mod tests {
             args: None,
             env: None,
             url: Some("http://localhost:8000/mcp".to_string()),
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("test").is_ok());
@@ -282,6 +315,7 @@ mod tests {
                 args: None,
                 env: None,
                 url: None,
+                headers: None,
                 enabled: true,
             },
         );
@@ -300,6 +334,7 @@ mod tests {
             args: None,
             env: None,
             url: None,
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("my__server").is_err());
@@ -313,6 +348,7 @@ mod tests {
             args: None,
             env: None,
             url: None,
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("MyServer").is_err());
@@ -326,6 +362,7 @@ mod tests {
             args: None,
             env: None,
             url: None,
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("my-server_1").is_ok());
@@ -339,6 +376,7 @@ mod tests {
             args: None,
             env: None,
             url: Some("ftp://evil.com/mcp".to_string()),
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("test").is_err());
@@ -352,8 +390,107 @@ mod tests {
             args: None,
             env: None,
             url: Some("https://mcp.example.com/v1".to_string()),
+            headers: None,
             enabled: true,
         };
         assert!(cfg.validate("test").is_ok());
+    }
+
+    #[test]
+    fn test_parse_config_with_headers() {
+        let json = r#"{
+            "mcpServers": {
+                "remote": {
+                    "transport": "http",
+                    "url": "https://mcp.example.com/v1",
+                    "headers": {
+                        "Authorization": "Bearer sk-test-123",
+                        "X-API-Key": "abc"
+                    }
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        let remote = &config.mcp_servers["remote"];
+        let headers = remote.headers.as_ref().unwrap();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers["Authorization"], "Bearer sk-test-123");
+        assert_eq!(headers["X-API-Key"], "abc");
+    }
+
+    #[test]
+    fn test_parse_config_without_headers_backwards_compatible() {
+        let json = r#"{
+            "mcpServers": {
+                "old": {
+                    "transport": "http",
+                    "url": "http://localhost:8000/mcp"
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        assert!(config.mcp_servers["old"].headers.is_none());
+    }
+
+    #[test]
+    fn test_parse_config_empty_headers() {
+        let json = r#"{
+            "mcpServers": {
+                "test": {
+                    "transport": "http",
+                    "url": "http://localhost:8000/mcp",
+                    "headers": {}
+                }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        let headers = config.mcp_servers["test"].headers.as_ref().unwrap();
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_debug_redacts_header_values() {
+        let cfg = McpServerConfig {
+            transport: McpTransport::Http,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("http://localhost/mcp".to_string()),
+            headers: Some(HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            )])),
+            enabled: true,
+        };
+        let debug_output = format!("{:?}", cfg);
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("secret-token"));
+        assert!(debug_output.contains("Authorization"));
+    }
+
+    #[test]
+    fn test_headers_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "api".to_string(),
+            McpServerConfig {
+                transport: McpTransport::Http,
+                command: None,
+                args: None,
+                env: None,
+                url: Some("https://api.example.com/mcp".to_string()),
+                headers: Some(HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer tok".to_string(),
+                )])),
+                enabled: true,
+            },
+        );
+        config.save(tmp.path()).unwrap();
+
+        let loaded = McpConfig::load(tmp.path()).unwrap();
+        let headers = loaded.mcp_servers["api"].headers.as_ref().unwrap();
+        assert_eq!(headers["Authorization"], "Bearer tok");
     }
 }

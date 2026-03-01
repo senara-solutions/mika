@@ -15,6 +15,10 @@ MCP servers extend Mika with external tools. They are configured in `~/.mika/mcp
     "remote-api": {
       "transport": "http",
       "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-my-token",
+        "X-Api-Key": "my-api-key"
+      },
       "enabled": true
     }
   }
@@ -23,7 +27,7 @@ MCP servers extend Mika with external tools. They are configured in `~/.mika/mcp
 
 **Transport types:**
 - `stdio` — Runs a local command as a child process. Requires `command` and optionally `args` and `env`. Environment is sandboxed: only essential variables (PATH, HOME, etc.) plus explicitly configured `env` vars are passed to the child process.
-- `http` — Connects to a remote MCP server via Streamable HTTP. Requires `url`.
+- `http` — Connects to a remote MCP server via Streamable HTTP. Requires `url`. Optional `headers` for authentication and custom HTTP headers.
 
 **Key details:**
 - Set `"enabled": false` to temporarily disable a server without removing its config.
@@ -34,5 +38,7 @@ MCP servers extend Mika with external tools. They are configured in `~/.mika/mcp
 **CLI management:**
 - `mika mcp list` — Show configured MCP servers and their status
 - `mika mcp add <name> --transport stdio --command <cmd> [--args ...]` — Add a new stdio server
-- `mika mcp add <name> --transport http --url <url>` — Add a new HTTP server
+- `mika mcp add <name> --transport http --url <url> [--header KEY=VALUE ...]` — Add a new HTTP server (with optional headers)
 - `mika mcp remove <name>` — Remove a configured server
+- `mika mcp enable <name>` — Enable a disabled server
+- `mika mcp disable <name>` — Disable a server without removing it

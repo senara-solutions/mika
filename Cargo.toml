@@ -51,6 +51,9 @@ chrono-tz = "0.10"
 # Async trait
 async-trait = "0.1"
 
+# HTTP
+http = "1"
+
 # HTTP server
 axum = "0.8"
 tower = "0.5"
