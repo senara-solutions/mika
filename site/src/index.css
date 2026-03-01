@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --color-bg: #0d0f12;
+  --color-bg-card: #151820;
+  --color-accent: #7c6af7;
+  --color-accent-light: #9d8fff;
+  --color-heading: #e8ecf2;
+  --color-muted: #a0a8b8;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Typing cursor blink */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.cursor-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Typing animation */
+@keyframes type {
+  from { max-width: 0; }
+  to { max-width: 100%; }
+}
+.type-reveal {
+  overflow: hidden;
+  white-space: nowrap;
+  display: inline-block;
+  max-width: 0;
+}
+.type-reveal.is-visible {
+  animation: type 0.6s steps(30, end) forwards;
+}
