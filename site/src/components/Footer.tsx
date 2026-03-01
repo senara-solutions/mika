@@ -13,7 +13,7 @@ export function Footer() {
             </span>
             <span className="inline-block h-1.5 w-1.5 rounded-full bg-accent" />
           </a>
-          <span className="text-sm text-muted/40">&copy; 2025</span>
+          <span className="text-sm text-muted/40">&copy; {new Date().getFullYear()}</span>
         </div>
 
         <div className="flex items-center gap-8">
