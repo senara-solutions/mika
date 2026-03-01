@@ -15,7 +15,7 @@ const steps: Step[] = [
     num: 1,
     icon: Download,
     title: "Install",
-    code: "cargo install mika",
+    code: "cargo install mika-ai",
     description: "or pull the Docker image.",
   },
   {

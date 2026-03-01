@@ -3,6 +3,8 @@ name = "mika-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Shared library for Mika AI assistant"
+repository.workspace = true
 
 [dependencies]
 tokio.workspace = true

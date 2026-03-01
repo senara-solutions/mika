@@ -6,6 +6,11 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "AI executive assistant with persistent memory"
+repository = "https://github.com/senara-solutions/mika"
+homepage = "https://github.com/senara-solutions/mika"
+keywords = ["ai", "assistant", "cli", "llm", "agent"]
+categories = ["command-line-utilities"]
 
 [workspace.dependencies]
 # Async runtime
@@ -107,8 +112,8 @@ tempfile = "3"
 serial_test = "3"
 
 # Workspace crates
-mika-common = { path = "crates/mika-common" }
-mika-agent = { path = "crates/mika-agent" }
+mika-common = { path = "crates/mika-common", version = "0.1.0" }
+mika-agent = { path = "crates/mika-agent", version = "0.1.0" }
 
 [profile.release]
 lto = true

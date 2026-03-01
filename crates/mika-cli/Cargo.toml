@@ -1,8 +1,14 @@
 [package]
-name = "mika-cli"
+name = "mika-ai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "CLI for Mika — AI executive assistant with persistent memory"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "mika"

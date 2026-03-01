@@ -1805,7 +1805,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mika-cli"
+name = "mika-ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
