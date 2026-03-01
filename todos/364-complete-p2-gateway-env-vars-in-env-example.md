@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "364"
 tags: [code-review, configuration, gateway]

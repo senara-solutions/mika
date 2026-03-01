@@ -2,12 +2,8 @@
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
-changelog_update = true
-dependencies_update = true
 semver_check = false
-allow_dirty = false
 pr_labels = ["release"]
-features_always_increment_minor = false
 
 [[package]]
 name = "mika-common"

@@ -37,6 +37,20 @@ if [ -z "${VERSION}" ]; then
     fi
 fi
 
+# Validate VERSION format (semver)
+if [ -n "$VERSION" ]; then
+  case "$VERSION" in
+    *[!0-9a-zA-Z._-]*) echo "Error: invalid version format: $VERSION" >&2; exit 1 ;;
+  esac
+  if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+    # Also accept "v" prefix: v1.2.3
+    if ! echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+      echo "Error: invalid version format: $VERSION (expected semver like 1.2.3 or v1.2.3)" >&2
+      exit 1
+    fi
+  fi
+fi
+
 ARCHIVE="${BINARY}-${VERSION}-${TARGET}"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
 CHECKSUM_URL="${URL}.sha256"
