@@ -184,29 +184,34 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
     }
 }
 
-/// Handle a bracketed paste event — insert multiline text into the textarea.
-pub fn handle_paste(app: &mut App<'_>, text: &str) {
-    // Insert each line into the textarea. tui-textarea handles multiline via successive inserts.
-    // The simplest approach: replace the textarea with current lines + pasted text.
-    let mut current: Vec<String> = app.textarea.lines().to_vec();
-    let paste_lines: Vec<&str> = text.lines().collect();
+/// Maximum paste size (100KB) to prevent UI freezing.
+const MAX_PASTE_BYTES: usize = 100 * 1024;
 
-    if let Some(last) = current.last_mut() {
-        if let Some((first, rest)) = paste_lines.split_first() {
-            last.push_str(first);
-            for line in rest {
-                current.push(line.to_string());
-            }
-        }
-    } else {
-        for line in &paste_lines {
-            current.push(line.to_string());
-        }
+/// Handle a bracketed paste event — insert text at the current cursor position.
+pub fn handle_paste(app: &mut App<'_>, text: &str) {
+    if text.is_empty() {
+        return;
     }
 
-    app.textarea = tui_textarea::TextArea::from(current);
-    app.textarea
-        .set_cursor_line_style(ratatui::style::Style::default());
+    let text = if text.len() > MAX_PASTE_BYTES {
+        app.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: format!(
+                "Paste truncated to {}KB (was {}KB).",
+                MAX_PASTE_BYTES / 1024,
+                text.len() / 1024
+            ),
+            rendered: None,
+            channel: None,
+        });
+        &text[..text.floor_char_boundary(MAX_PASTE_BYTES)]
+    } else {
+        text
+    };
+
+    // Normalize line endings: \r\n → \n, bare \r → \n
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    app.textarea.insert_str(&normalized);
     app.needs_redraw = true;
 }
 

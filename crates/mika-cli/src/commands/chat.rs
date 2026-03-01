@@ -354,6 +354,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                             app.home_dir = new_worker._ctx.home_dir.clone();
                             app.skills = new_skills;
                             app.agent_name = target_name.clone();
+                            app.history = crate::tui::app::InputHistory::load(&app.home_dir);
 
                             worker = new_worker;
 
