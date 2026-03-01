@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with plaintext SQLite storage on K8s encrypted volumes. A shared routing layer (Phase 2) will handle Telegram/WhatsApp and forward messages to the correct container.
+Mika is a conversation-first AI executive assistant with per-customer container isolation on Kubernetes. Each customer gets their own agent container with plaintext SQLite storage on K8s encrypted volumes. A shared gateway (`mika-gateway`) routes Telegram messages to the correct container.
 
-**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, Helm charts + provisioning next).
+**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, Helm charts done in mika-cloud, CI/CD next).
 
 ## Stack
 
@@ -23,11 +23,12 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
+- `crates/mika-gateway/` — Telegram webhook router: Postgres customer registry, message routing, pairing flow, outbound relay
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup, mcp). TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Shell-like input history (Up/Down arrows, cursor-position-aware, draft saving). Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer.
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/` — Public documentation (architecture, configuration, deployment, skills, slash-commands, getting-started)
 - `docs/adr/` — Architecture Decision Records (numbered)
-- `docs/openapi/` — OpenAPI spec (mika-server.yaml)
+- `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
 - `todos/` — Code review findings (tracked as markdown files)
 - `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit)
 
@@ -46,13 +47,13 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~628 tests)
+- `cargo test` — Run all tests (~680 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
 - `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image
-- Gateway source is in `crates/mika-gateway/` in this repo
+- `docker build -f Dockerfile.gateway -t mika-gateway:dev .` — Build gateway container image
 
 ## Architecture
 
@@ -75,7 +76,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 8 (v7 adds: skills system tables; v8 adds: search_content, fts_search FTS5, vec_search vec0 for Layer 3)
 - **mika-gateway** (`crates/mika-gateway/` in this repo)**:** Telegram webhook router with Postgres customer registry. Handles text messages and images. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (K8s probes). Stateless, env-var-only config.
-- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). Gateway Dockerfile is in `crates/mika-gateway/`. Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
+- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). `Dockerfile.gateway` for the stateless gateway (leaner: ca-certificates + wget only, no home dir). Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
 
 ## Environment Variables
 
@@ -98,9 +99,16 @@ Optional (startup behavior):
 Optional (log files — logs go to stdout + file when set):
 - `MIKA_SERVER_LOG_FILE` — File path for mika-server log output
 
+Gateway mode (`mika-gateway` binary) additionally requires:
+- `MIKA_DATABASE_URL` — Postgres connection string
+- `MIKA_TELEGRAM_BOT_TOKEN` — Telegram Bot API token
+- `MIKA_TELEGRAM_WEBHOOK_SECRET` — 64-char hex secret for webhook validation
+- `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for Telegram webhook delivery
+- `MIKA_INTERNAL_TOKEN` — Shared 64-char hex bearer token (same as server mode)
+
 ## Pending Work
 
-- **Deployment:** Helm charts (mika-customer + mika-gateway), provision.sh + deprovision.sh, AWS Secrets Manager integration, K8s manifests
+- **Deployment:** CI/CD pipeline, first production cluster setup, External Secrets Operator
 - **Future features:** WhatsApp channel adapter, morning briefings, admin API
 
 ## Reference Repositories
@@ -114,4 +122,4 @@ Local clones of agent platforms to study for patterns and inspiration. Read free
   TypeScript. Study for: memory hierarchy patterns (core/archival/recall from MemGPT), autonomous memory self-editing via tool calls, agent state persistence, channel integrations built on top of Letta's memory API.
 
 - **mika-cloud** — `/home/samidarko/workspace/senara-solutions/mika-cloud/`
-  Private repo. Contains Helm charts and provisioning/deprovisioning scripts for gateway and agent deployments. Gateway source has moved to `crates/mika-gateway/` in this repo. References mika-common via git dependency.
+  Private repo. Contains Helm charts and provisioning/deprovisioning scripts for gateway and agent deployments. Gateway source has moved to `crates/mika-gateway/` in this repo.

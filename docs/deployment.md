@@ -89,6 +89,24 @@ Rebuilds after source changes are fast because dependency compilation is cached 
 
 ---
 
+## 3b. Building the Gateway Docker Image
+
+```bash
+docker build -f Dockerfile.gateway -t mika-gateway:dev .
+```
+
+Build details:
+- **Builder:** `rust:1.85-slim` with pkg-config, libssl-dev (no gcc — no bundled SQLite)
+- **Runtime:** `debian:bookworm-slim` with ca-certificates, wget
+- **Binary:** `mika-gateway` (Axum HTTP server)
+- **User:** `mika` (UID 1000), non-root, no home directory (stateless)
+- **Port:** 8080
+- **Healthcheck:** `wget -q --spider http://localhost:8080/readyz` (10s interval, 10s start period)
+
+The gateway image is leaner than the agent image — no GitHub CLI, no file/jq utilities, no home directory. It uses the same dependency caching strategy as the agent image.
+
+---
+
 ## 4. Helm Values Reference (mika-customer)
 
 File: `helm/mika-customer/values.yaml`

@@ -338,8 +338,25 @@ openssl rand -hex 32
 `MIKA_INTERNAL_TOKEN` is validated on startup: it must be exactly 64 hexadecimal
 characters (32 bytes hex-encoded). Invalid values cause an immediate startup error.
 
-Gateway environment variables are documented in the
-[mika-cloud](https://github.com/senara-solutions/mika-cloud) repo.
+### Gateway mode
+
+For running `mika-gateway` (the Telegram webhook router), these additional
+variables are required:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `MIKA_DATABASE_URL` | Yes | Postgres connection string |
+| `MIKA_TELEGRAM_BOT_TOKEN` | Yes | Telegram Bot API token |
+| `MIKA_TELEGRAM_WEBHOOK_SECRET` | Yes | 64-char hex secret for webhook validation |
+| `MIKA_TELEGRAM_WEBHOOK_URL` | Yes | Public HTTPS URL for Telegram webhook delivery |
+| `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for container auth |
+| `MIKA_GATEWAY_PORT` | No | Listen port (default: `8080`) |
+| `MIKA_LOG_LEVEL` | No | Log level (default: `info`) |
+| `MIKA_AGENT_BASE_URL` | No | Override agent container URL for local E2E testing |
+| `MIKA_GATEWAY_LOG_FILE` | No | Optional log file path |
+
+Both `MIKA_INTERNAL_TOKEN` and `MIKA_TELEGRAM_WEBHOOK_SECRET` must be exactly 64
+hexadecimal characters (32 bytes hex-encoded). Generate with `openssl rand -hex 32`.
 
 ---
 
