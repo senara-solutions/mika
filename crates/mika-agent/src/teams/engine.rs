@@ -571,7 +571,7 @@ fn parse_review_response(response: &str) -> Result<(bool, String)> {
 /// Uses smarter start patterns to avoid matching brackets in prose:
 /// - For arrays (`[`/`]`): looks for `[{` as the start pattern
 /// - For objects (`{`/`}`): looks for `{"` as the start pattern
-/// Then searches backwards from the end for the matching close bracket. (#257)
+///   Then searches backwards from the end for the matching close bracket. (#257)
 fn extract_json(text: &str, open: char, close: char) -> Option<&str> {
     // Build a smarter start pattern to reduce false positives
     let start_pattern = if open == '[' { "[{" } else { "{\"" };

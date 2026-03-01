@@ -158,8 +158,7 @@ fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
     // redirect writes (including executable handler scripts) to an arbitrary
     // location.
     if skill_dir.exists() && skill_dir.symlink_metadata()?.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "skill directory is a symlink, refusing to write",
         ));
     }
@@ -173,10 +172,10 @@ fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
 
         // Refuse to overwrite a file that is a symlink (same defense-in-depth).
         if file_path.exists() && file_path.symlink_metadata()?.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("file '{}' is a symlink, refusing to write", file.path),
-            ));
+            return Err(std::io::Error::other(format!(
+                "file '{}' is a symlink, refusing to write",
+                file.path
+            )));
         }
 
         std::fs::write(&file_path, file.content)?;

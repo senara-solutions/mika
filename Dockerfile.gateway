@@ -1,9 +1,8 @@
 # === Builder stage ===
-FROM rust:1.85-slim AS builder
+FROM rust:1.93-slim AS builder
 
-# Install OpenSSL for reqwest
-# No gcc/libc-dev needed: mika-gateway skips rusqlite (bundled SQLite C compilation)
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# No native deps needed: uses rustls (no OpenSSL), no rusqlite (no SQLite C compilation)
+RUN echo "No build dependencies required"
 
 WORKDIR /app
 

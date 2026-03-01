@@ -483,7 +483,7 @@ impl<'a> App<'a> {
 
         // Cross-channel polling: check for new messages from other channels every ~5 seconds.
         // Only poll when idle to avoid visual confusion during agent processing.
-        if self.tick_count % POLL_INTERVAL_TICKS == 0 && self.status == AgentStatus::Idle {
+        if self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) && self.status == AgentStatus::Idle {
             self.poll_cross_channel_messages().await;
         }
 

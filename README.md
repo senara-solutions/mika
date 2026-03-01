@@ -46,17 +46,24 @@ Each customer gets an isolated container with their own SQLite database. No cust
 
 ## Quick Start
 
-```bash
-# Clone and build
-git clone https://github.com/senara-solutions/mika.git
-cd mika
-cargo build --release
+### Install (Linux / macOS)
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/senara-solutions/mika/main/install.sh | sh
+```
+
+Or install from [crates.io](https://crates.io/crates/mika-cli): `cargo install mika-cli`
+
+Pre-built binaries are also available on the [Releases page](https://github.com/senara-solutions/mika/releases).
+
+### Run
+
+```bash
 # Set your Anthropic credential (API key or Claude subscription token)
 export MIKA_ANTHROPIC_API_KEY=sk-ant-...
 
 # Run (auto-setup on first launch)
-cargo run --bin mika
+mika
 ```
 
 On first run, Mika creates `~/.mika/` with default configuration, personality, and builtin skills, then opens an interactive chat.
@@ -116,7 +123,7 @@ cargo run --bin mika # Run TUI CLI
 
 ## Current Status
 
-**Phase 4** -- Deployment infrastructure. Dockerfiles are complete. Gateway with Telegram integration is operational. CI/CD pipeline next.
+**Phase 4** -- Deployment infrastructure. Dockerfiles, CI/CD pipeline, and automated releases are complete. Gateway with Telegram integration is operational.
 
 ## License
 

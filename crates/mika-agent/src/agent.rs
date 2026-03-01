@@ -162,10 +162,10 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
     // Drop entries from the tail until under the cap
     for count in (1..summaries.len()).rev() {
         let wrapper = serde_json::json!({ "tool_calls": &summaries[..count] });
-        if let Ok(json) = serde_json::to_string(&wrapper) {
-            if json.len() <= TOOL_METADATA_MAX {
-                return Some(json);
-            }
+        if let Ok(json) = serde_json::to_string(&wrapper)
+            && json.len() <= TOOL_METADATA_MAX
+        {
+            return Some(json);
         }
     }
     None
@@ -1603,7 +1603,7 @@ mod tests {
     fn test_truncate_summary_safe_with_emoji() {
         // Emoji is 4 bytes
         let s = "Hello \u{1F600} world! More text here to exceed the limit easily.";
-        let result = truncate_summary(&s, 10);
+        let result = truncate_summary(s, 10);
         assert!(result.ends_with("..."));
         assert!(result.len() <= 13); // 10 bytes + "..."
     }
@@ -1838,10 +1838,10 @@ mod tests {
         strip_prior_images(&mut messages);
 
         // Text-only tool result should be unchanged
-        if let MessageContent::Blocks(blocks) = &messages[0].content {
-            if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
-                assert!(matches!(content, ToolResultBody::Text(t) if t == "just text"));
-            }
+        if let MessageContent::Blocks(blocks) = &messages[0].content
+            && let ContentBlock::ToolResult { content, .. } = &blocks[0]
+        {
+            assert!(matches!(content, ToolResultBody::Text(t) if t == "just text"));
         }
     }
 

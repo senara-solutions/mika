@@ -558,9 +558,7 @@ mod tests {
 
     #[test]
     fn test_beta_headers_combine_oauth_and_thinking() {
-        let mut betas: Vec<&str> = Vec::new();
-        betas.push("oauth-2025-04-20");
-        betas.push("interleaved-thinking-2025-05-14");
+        let betas: Vec<&str> = vec!["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
         let combined = betas.join(",");
         assert_eq!(combined, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
         assert!(HeaderValue::from_str(&combined).is_ok());

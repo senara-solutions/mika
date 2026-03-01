@@ -152,7 +152,8 @@ mod tests {
     fn test_validate_agent_base_url_rejects_invalid_url() {
         let err = validate_agent_base_url("not-a-url").unwrap_err();
         assert!(
-            err.to_string().contains("MIKA_AGENT_BASE_URL is not a valid URL"),
+            err.to_string()
+                .contains("MIKA_AGENT_BASE_URL is not a valid URL"),
             "unexpected error: {err}"
         );
     }

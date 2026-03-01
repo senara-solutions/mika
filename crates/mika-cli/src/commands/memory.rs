@@ -36,64 +36,64 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             let mut found = false;
             println!();
 
-            if let Ok(ref items) = people {
-                if !items.is_empty() {
-                    found = true;
-                    println!("  People:");
-                    for p in items {
-                        println!(
-                            "    {} — {} {}",
-                            p.canonical_name,
-                            p.relationship.as_deref().unwrap_or(""),
-                            p.notes.as_deref().unwrap_or("")
-                        );
-                    }
-                    println!();
+            if let Ok(ref items) = people
+                && !items.is_empty()
+            {
+                found = true;
+                println!("  People:");
+                for p in items {
+                    println!(
+                        "    {} — {} {}",
+                        p.canonical_name,
+                        p.relationship.as_deref().unwrap_or(""),
+                        p.notes.as_deref().unwrap_or("")
+                    );
                 }
+                println!();
             }
 
-            if let Ok(ref items) = commitments {
-                if !items.is_empty() {
-                    found = true;
-                    println!("  Commitments:");
-                    for c in items {
-                        println!(
-                            "    #{} [{}] {} {}",
-                            c.id,
-                            c.status,
-                            c.description,
-                            c.due_date.as_deref().unwrap_or("")
-                        );
-                    }
-                    println!();
+            if let Ok(ref items) = commitments
+                && !items.is_empty()
+            {
+                found = true;
+                println!("  Commitments:");
+                for c in items {
+                    println!(
+                        "    #{} [{}] {} {}",
+                        c.id,
+                        c.status,
+                        c.description,
+                        c.due_date.as_deref().unwrap_or("")
+                    );
                 }
+                println!();
             }
 
-            if let Ok(ref items) = preferences {
-                if !items.is_empty() {
-                    found = true;
-                    println!("  Preferences:");
-                    for p in items {
-                        println!("    {}: {}", p.category, p.value);
-                    }
-                    println!();
+            if let Ok(ref items) = preferences
+                && !items.is_empty()
+            {
+                found = true;
+                println!("  Preferences:");
+                for p in items {
+                    println!("    {}: {}", p.category, p.value);
                 }
+                println!();
             }
 
-            if let Ok(ref items) = events {
-                if !items.is_empty() {
-                    found = true;
-                    println!("  Events:");
-                    for e in items {
-                        println!(
-                            "    #{} {} {}",
-                            e.id,
-                            e.description,
-                            e.event_date.as_deref().unwrap_or("")
-                        );
-                    }
-                    println!();
+            if let Ok(ref items) = events
+                && !items.is_empty()
+            {
+                found = true;
+                println!("  Events:");
+                for e in items {
+                    println!(
+                        "    #{} {} {}",
+                        e.id,
+                        e.description,
+                        e.event_date.as_deref().unwrap_or("")
+                    );
                 }
+                println!();
             }
 
             if !found {

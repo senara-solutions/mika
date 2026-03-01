@@ -10,7 +10,7 @@ This guide walks you through installation, first run, and everyday usage.
 
 ## 1. Prerequisites
 
-- **Rust toolchain:** Mika requires Rust 1.93 (stable). Install via [rustup](https://rustup.rs/):
+- **Rust toolchain:** Mika requires Rust 1.91+ (the repository pins 1.93 via `rust-toolchain.toml`). Install via [rustup](https://rustup.rs/):
 
   ```sh
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -30,30 +30,40 @@ This guide walks you through installation, first run, and everyday usage.
 
 ## 2. Installation
 
-Clone the repository and build the CLI binary:
+### Quick install (Linux / macOS)
+
+Download and install the latest pre-built binary:
 
 ```sh
-git clone https://github.com/senara-solutions/mika.git
-cd mika
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/senara-solutions/mika/main/install.sh | sh
 ```
 
-The binary is at `target/release/mika`. Add it to your PATH:
+To install a specific version:
 
 ```sh
-cp target/release/mika ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/senara-solutions/mika/main/install.sh | sh -s -- v0.2.0
 ```
 
-Or install directly from [crates.io](https://crates.io/crates/mika-cli):
+### Download from GitHub Releases
+
+Pre-built binaries for Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
+are available on the [Releases page](https://github.com/senara-solutions/mika/releases).
+Download the archive for your platform, extract it, and place the `mika` binary
+on your PATH.
+
+### Install from crates.io
 
 ```sh
 cargo install mika-cli
 ```
 
-To install from source instead:
+### Build from source
 
 ```sh
-cargo install --path crates/mika-cli
+git clone https://github.com/senara-solutions/mika.git
+cd mika
+cargo build --release
+cp target/release/mika ~/.local/bin/
 ```
 
 ---

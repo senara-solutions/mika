@@ -4,7 +4,7 @@
 
 Mika is a conversation-first AI executive assistant with per-customer container isolation. Each customer gets their own agent container with SQLite storage. A shared gateway (`mika-gateway`) routes Telegram messages to the correct container.
 
-**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, CI/CD next).
+**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, CI/CD done).
 
 ## Stack
 
@@ -108,7 +108,7 @@ Gateway mode (`mika-gateway` binary) additionally requires:
 
 ## Pending Work
 
-- **Deployment:** CI/CD pipeline, deployment manifests, production deployment guide
+- **Deployment:** Deployment manifests, production deployment guide, Docker image CI
 - **Future features:** WhatsApp channel adapter, morning briefings, admin API
 
 ## Reference Repositories

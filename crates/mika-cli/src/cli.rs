@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mika", about = "Mika — AI Executive Assistant")]
+#[command(name = "mika", version, about = "Mika — AI Executive Assistant")]
 pub struct Cli {
     /// Agent to use (overrides active agent)
     #[arg(long, global = true)]

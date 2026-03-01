@@ -62,8 +62,7 @@ impl std::fmt::Debug for McpServerConfig {
         s.field("args", &self.args);
         // Redact env values (may contain secrets like GITHUB_TOKEN)
         if let Some(env) = &self.env {
-            let redacted: HashMap<&String, &str> =
-                env.keys().map(|k| (k, "[REDACTED]")).collect();
+            let redacted: HashMap<&String, &str> = env.keys().map(|k| (k, "[REDACTED]")).collect();
             s.field("env", &redacted);
         } else {
             s.field("env", &self.env);

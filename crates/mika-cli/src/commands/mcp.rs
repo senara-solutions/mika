@@ -61,14 +61,13 @@ fn list_servers(agent_home: &std::path::Path) -> Result<()> {
         let status = if cfg.enabled { "enabled" } else { "disabled" };
         println!("    {name}: {transport} [{status}]");
         // Show header keys (values redacted) for HTTP servers
-        if cfg.transport == McpTransport::Http {
-            if let Some(headers) = &cfg.headers {
-                if !headers.is_empty() {
-                    let mut keys: Vec<_> = headers.keys().cloned().collect();
-                    keys.sort();
-                    println!("      headers: {}", keys.join(", "));
-                }
-            }
+        if cfg.transport == McpTransport::Http
+            && let Some(headers) = &cfg.headers
+            && !headers.is_empty()
+        {
+            let mut keys: Vec<_> = headers.keys().cloned().collect();
+            keys.sort();
+            println!("      headers: {}", keys.join(", "));
         }
     }
     println!();
@@ -153,9 +152,7 @@ fn toggle_server(agent_home: &std::path::Path, name: &str, enabled: bool) -> Res
     Ok(())
 }
 
-fn parse_headers(
-    raw: Option<Vec<String>>,
-) -> Result<Option<HashMap<String, String>>> {
+fn parse_headers(raw: Option<Vec<String>>) -> Result<Option<HashMap<String, String>>> {
     let raw = match raw {
         Some(h) if !h.is_empty() => h,
         _ => return Ok(None),
@@ -225,10 +222,7 @@ mod tests {
         let result = parse_headers(input);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Empty header name"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("Empty header name"), "unexpected error: {err}");
     }
 
     #[test]
