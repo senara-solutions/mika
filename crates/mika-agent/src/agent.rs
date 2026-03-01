@@ -27,6 +27,9 @@ use mika_common::embedding::EmbeddingClient;
 const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Timeout for the continuation API call after max tool steps are exceeded.
+/// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
+const CONTINUATION_TIMEOUT_SECS: u64 = 60;
 /// Maximum total base64 image bytes across all tool results in a single agent step.
 /// Prevents memory spikes when multiple tools return images in one step.
 /// 5 images at 5 MB each ≈ 33 MB base64 — this caps at ~20 MB to stay within
@@ -236,6 +239,9 @@ struct LoopResult {
     /// Accumulated tool call summaries from all loop steps.
     /// Used by the `max_steps_exceeded` fallback path to persist metadata.
     tool_call_summaries: Vec<ToolCallSummary>,
+    /// Original system prompt length before step-awareness nudge was appended.
+    /// Used to strip the nudge before the continuation turn.
+    system_prompt_original_len: usize,
 }
 
 /// Remove image blocks from prior tool results to prevent unbounded memory
@@ -305,6 +311,8 @@ async fn run_loop(
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
     let channel_type = mode.channel_type();
+    // Track system prompt length before nudge so we can strip it later
+    let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
     for step in 0..MAX_TOOL_STEPS {
         debug!(
@@ -358,6 +366,7 @@ async fn run_loop(
                         usage: last_usage,
                         max_steps_exceeded: false,
                         tool_call_summaries: all_tool_summaries,
+                        system_prompt_original_len: system_prompt_len,
                     });
                 }
 
@@ -369,6 +378,7 @@ async fn run_loop(
                         usage: None,
                         max_steps_exceeded: false,
                         tool_call_summaries: all_tool_summaries,
+                        system_prompt_original_len: system_prompt_len,
                     });
                 }
 
@@ -410,6 +420,7 @@ async fn run_loop(
                     usage: last_usage,
                     max_steps_exceeded: false,
                     tool_call_summaries: all_tool_summaries,
+                    system_prompt_original_len: system_prompt_len,
                 });
             }
             StopReason::ToolUse => {
@@ -440,6 +451,7 @@ async fn run_loop(
         usage: last_usage,
         max_steps_exceeded: true,
         tool_call_summaries: all_tool_summaries,
+        system_prompt_original_len: system_prompt_len,
     })
 }
 
@@ -688,7 +700,12 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     .await?;
 
     if result.max_steps_exceeded {
-        // Attempt a continuation turn: disable tools, force a text summary
+        // Attempt a continuation turn: disable tools, force a text summary.
+        // Strip the step-awareness nudge from the system prompt so the continuation
+        // turn does not see stale "2 steps remaining" text.
+        if let Some(ref mut system) = request.system {
+            system.truncate(result.system_prompt_original_len);
+        }
         request.tools = None;
         request.thinking = None;
         request.messages.push(Message {
@@ -699,27 +716,28 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         });
 
         let continuation = tokio::time::timeout(
-            Duration::from_secs(TOOL_TIMEOUT_SECS),
+            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
             claude.send_message(&request),
         )
         .await;
 
-        let text = match continuation {
+        let (text, continuation_usage) = match continuation {
             Ok(Ok(resp)) => {
                 let t = resp.text();
+                let u = Some(resp.usage);
                 if t.is_empty() {
-                    format_step_exceeded_fallback(&result.tool_call_summaries)
+                    (format_step_exceeded_fallback(&result.tool_call_summaries), u)
                 } else {
-                    t
+                    (t, u)
                 }
             }
             Ok(Err(e)) => {
-                warn!(error = %e, "continuation turn API error after max steps");
-                format_step_exceeded_fallback(&result.tool_call_summaries)
+                warn!(error = %e, tool_calls = result.tool_call_summaries.len(), "continuation turn API error after max steps");
+                (format_step_exceeded_fallback(&result.tool_call_summaries), None)
             }
             Err(_) => {
-                warn!("continuation turn timed out after max steps");
-                format_step_exceeded_fallback(&result.tool_call_summaries)
+                warn!(timeout_secs = CONTINUATION_TIMEOUT_SECS, tool_calls = result.tool_call_summaries.len(), "continuation turn timed out after max steps");
+                (format_step_exceeded_fallback(&result.tool_call_summaries), None)
             }
         };
 
@@ -729,7 +747,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         return Ok(AgentOutput {
             text: Some(text),
             thinking: result.thinking,
-            usage: result.usage,
+            usage: continuation_usage.or(result.usage),
         });
     }
 
