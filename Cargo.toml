@@ -92,6 +92,7 @@ rmcp = { version = "0.17", default-features = false, features = [
     "transport-child-process",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
+    "reqwest",
 ] }
 
 # Utilities
