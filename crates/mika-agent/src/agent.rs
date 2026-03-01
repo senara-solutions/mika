@@ -726,18 +726,31 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 let t = resp.text();
                 let u = Some(resp.usage);
                 if t.is_empty() {
-                    (format_step_exceeded_fallback(&result.tool_call_summaries), u)
+                    (
+                        format_step_exceeded_fallback(&result.tool_call_summaries),
+                        u,
+                    )
                 } else {
                     (t, u)
                 }
             }
             Ok(Err(e)) => {
                 warn!(error = %e, tool_calls = result.tool_call_summaries.len(), "continuation turn API error after max steps");
-                (format_step_exceeded_fallback(&result.tool_call_summaries), None)
+                (
+                    format_step_exceeded_fallback(&result.tool_call_summaries),
+                    None,
+                )
             }
             Err(_) => {
-                warn!(timeout_secs = CONTINUATION_TIMEOUT_SECS, tool_calls = result.tool_call_summaries.len(), "continuation turn timed out after max steps");
-                (format_step_exceeded_fallback(&result.tool_call_summaries), None)
+                warn!(
+                    timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                    tool_calls = result.tool_call_summaries.len(),
+                    "continuation turn timed out after max steps"
+                );
+                (
+                    format_step_exceeded_fallback(&result.tool_call_summaries),
+                    None,
+                )
             }
         };
 
@@ -836,8 +849,7 @@ async fn process_tool_calls(
                     });
                     warn!(
                         included,
-                        skipped,
-                        "image budget exceeded, skipped images in tool result"
+                        skipped, "image budget exceeded, skipped images in tool result"
                     );
                 }
                 if included == 0 {

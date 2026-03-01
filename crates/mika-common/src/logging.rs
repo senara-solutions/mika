@@ -33,7 +33,8 @@ pub fn init(default_level: &str, log_file: Option<&Path>) -> Option<WorkerGuard>
 
             let file_appender = tracing_appender::rolling::never(
                 path.parent().unwrap_or_else(|| Path::new(".")),
-                path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("mika.log")),
+                path.file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("mika.log")),
             );
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 

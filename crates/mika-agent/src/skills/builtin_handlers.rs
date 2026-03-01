@@ -89,9 +89,9 @@ fn get_api_spec(input: &serde_json::Value) -> ToolOutput {
     let service = input.get("service").and_then(|v| v.as_str()).unwrap_or("");
     match service {
         "agent" => ToolOutput::success(AGENT_API_SPEC.to_string()),
-        _ => ToolOutput::error(
-            "Invalid service. Use \"agent\" for the mika-server API.".to_string(),
-        ),
+        _ => {
+            ToolOutput::error("Invalid service. Use \"agent\" for the mika-server API.".to_string())
+        }
     }
 }
 

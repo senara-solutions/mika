@@ -71,10 +71,7 @@ pub async fn handle_message(
     JsonBody(mut req): JsonBody<MessageRequest>,
 ) -> impl IntoResponse {
     // Validate input: text may be empty when images are present (e.g. image-only sends).
-    let has_images = req
-        .images
-        .as_ref()
-        .is_some_and(|imgs| !imgs.is_empty());
+    let has_images = req.images.as_ref().is_some_and(|imgs| !imgs.is_empty());
 
     if req.text.is_empty() && !has_images {
         return (
