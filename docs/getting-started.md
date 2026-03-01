@@ -44,10 +44,10 @@ The binary is at `target/release/mika`. Add it to your PATH:
 cp target/release/mika ~/.local/bin/
 ```
 
-Or install directly from [crates.io](https://crates.io/crates/mika-ai):
+Or install directly from [crates.io](https://crates.io/crates/mika-cli):
 
 ```sh
-cargo install mika-ai
+cargo install mika-cli
 ```
 
 To install from source instead:

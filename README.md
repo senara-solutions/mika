@@ -80,7 +80,7 @@ crates/
   mika-common/     Shared: config, Claude API client, logging, home directory
   mika-agent/      Agent: SQLite DB, agent loop, tools, skills, HTTP server (mika-server)
   mika-gateway/    Telegram webhook router: Postgres customer registry, message routing
-  mika-cli/        TUI CLI, published as `mika-ai` (ratatui chat, clap subcommands, slash commands)
+  mika-cli/        TUI CLI (mika): ratatui chat, clap subcommands, slash commands
 ```
 
 ## Tools
