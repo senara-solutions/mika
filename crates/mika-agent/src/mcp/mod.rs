@@ -293,15 +293,18 @@ async fn connect_http(name: &str, config: &McpServerConfig) -> Result<McpConnect
 
     // Apply configured HTTP headers
     if let Some(headers) = &config.headers {
-        // Authorization goes through rmcp's built-in auth_header support
-        if let Some(auth) = headers.get("Authorization") {
+        // Authorization goes through rmcp's built-in auth_header support (case-insensitive)
+        if let Some(auth) = headers
+            .iter()
+            .find_map(|(k, v)| k.eq_ignore_ascii_case("authorization").then_some(v))
+        {
             transport_config = transport_config.auth_header(auth.clone());
         }
 
         // Other headers use the custom_headers API
-        let mut custom = std::collections::HashMap::new();
+        let mut custom = HashMap::new();
         for (key, value) in headers {
-            if key == "Authorization" {
+            if key.eq_ignore_ascii_case("authorization") {
                 continue; // Already handled above
             }
             match (

@@ -60,7 +60,14 @@ impl std::fmt::Debug for McpServerConfig {
         s.field("transport", &self.transport);
         s.field("command", &self.command);
         s.field("args", &self.args);
-        s.field("env", &self.env);
+        // Redact env values (may contain secrets like GITHUB_TOKEN)
+        if let Some(env) = &self.env {
+            let redacted: HashMap<&String, &str> =
+                env.keys().map(|k| (k, "[REDACTED]")).collect();
+            s.field("env", &redacted);
+        } else {
+            s.field("env", &self.env);
+        }
         s.field("url", &self.url);
         // Redact header values (may contain bearer tokens / API keys)
         if let Some(headers) = &self.headers {
@@ -103,10 +110,17 @@ impl McpConfig {
     }
 
     /// Save MCP configuration to `{home_dir}/mcp.json`.
+    ///
+    /// Sets file permissions to `0600` on Unix (may contain secrets in headers/env).
     pub fn save(&self, home_dir: &Path) -> anyhow::Result<()> {
         let path = home_dir.join("mcp.json");
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -449,12 +463,15 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_redacts_header_values() {
+    fn test_debug_redacts_header_and_env_values() {
         let cfg = McpServerConfig {
             transport: McpTransport::Http,
             command: None,
             args: None,
-            env: None,
+            env: Some(HashMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                "ghp_secret123".to_string(),
+            )])),
             url: Some("http://localhost/mcp".to_string()),
             headers: Some(HashMap::from([(
                 "Authorization".to_string(),
@@ -464,8 +481,12 @@ mod tests {
         };
         let debug_output = format!("{:?}", cfg);
         assert!(debug_output.contains("[REDACTED]"));
+        // Header values redacted
         assert!(!debug_output.contains("secret-token"));
         assert!(debug_output.contains("Authorization"));
+        // Env values redacted
+        assert!(!debug_output.contains("ghp_secret123"));
+        assert!(debug_output.contains("GITHUB_TOKEN"));
     }
 
     #[test]

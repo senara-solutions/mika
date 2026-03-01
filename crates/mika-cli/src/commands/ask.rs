@@ -63,6 +63,11 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
     }
 
+    // Gracefully shut down MCP server connections
+    if let Some(mcp) = mcp_manager {
+        mcp.shutdown().await;
+    }
+
     // Database shutdown happens automatically via Drop on ctx
     Ok(())
 }
