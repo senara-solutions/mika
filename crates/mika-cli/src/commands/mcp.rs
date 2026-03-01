@@ -60,6 +60,21 @@ fn list_servers(agent_home: &std::path::Path) -> Result<()> {
         };
         let status = if cfg.enabled { "enabled" } else { "disabled" };
         println!("    {name}: {transport} [{status}]");
+        // Show header keys (values redacted) for HTTP servers
+        if cfg.transport == McpTransport::Http {
+            if let Some(headers) = &cfg.headers {
+                if !headers.is_empty() {
+                    let mut keys: Vec<&String> = headers.keys().collect();
+                    keys.sort();
+                    let keys_str = keys
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("      headers: {keys_str}");
+                }
+            }
+        }
     }
     println!();
     Ok(())

@@ -35,10 +35,17 @@ MCP servers extend Mika with external tools. They are configured in `~/.mika/mcp
 - MCP servers connect on startup. If a server fails to connect, it is skipped and other servers continue normally.
 - MCP tools are NOT available in silent mode (heartbeat/reminders) for security.
 
-**CLI management:**
-- `mika mcp list` — Show configured MCP servers and their status
+**CLI management (these are the ONLY mcp subcommands — do not suggest any others):**
+- `mika mcp list` — Show configured MCP servers, status, and header keys
 - `mika mcp add <name> --transport stdio --command <cmd> [--args ...]` — Add a new stdio server
 - `mika mcp add <name> --transport http --url <url> [--header KEY=VALUE ...]` — Add a new HTTP server (with optional headers)
 - `mika mcp remove <name>` — Remove a configured server
 - `mika mcp enable <name>` — Enable a disabled server
 - `mika mcp disable <name>` — Disable a server without removing it
+
+**Important:** If you need to verify what CLI commands exist, use the `get_cli_reference` self-knowledge tool. Do NOT guess or suggest commands that aren't listed here or in the CLI reference.
+
+**Troubleshooting:**
+- Headers not working? Run `mika mcp list` to verify header keys are shown. Check the log file for connection errors.
+- HTTPS server failing? Mika requires the rmcp `reqwest` feature for TLS. Check for `ConnectError("invalid URL, scheme is not http")` in logs — this means TLS is missing.
+- Server not connecting? MCP servers connect on startup. After changing `mcp.json`, restart Mika to reconnect.
