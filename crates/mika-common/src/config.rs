@@ -233,6 +233,7 @@ mod tests {
             std::env::set_var("MIKA_ANTHROPIC_API_KEY", "test-key");
             std::env::remove_var("MIKA_CLAUDE_MODEL");
             std::env::remove_var("MIKA_DB_PATH");
+            std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
         }
     }
 
