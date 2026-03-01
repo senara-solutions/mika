@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratatui::text::Line;
@@ -65,25 +65,43 @@ pub struct AgentResponse {
     pub updated_skills: Option<Arc<SkillRegistry>>,
 }
 
-/// Shell-like input history with draft saving.
+/// Shell-like input history with draft saving and optional disk persistence.
 pub struct InputHistory {
     entries: Vec<String>,
     index: Option<usize>,
     saved_draft: Option<String>,
+    /// Path to the history file (None = no persistence, e.g. in tests).
+    file_path: Option<PathBuf>,
 }
 
 const HISTORY_MAX_SIZE: usize = 500;
+const HISTORY_FILENAME: &str = ".input_history";
 
 impl InputHistory {
+    /// Load history from disk, or start empty if file is missing/corrupt.
+    pub fn load(home_dir: &Path) -> Self {
+        let file_path = home_dir.join(HISTORY_FILENAME);
+        let entries = Self::read_file(&file_path).unwrap_or_default();
+        Self {
+            entries,
+            index: None,
+            saved_draft: None,
+            file_path: Some(file_path),
+        }
+    }
+
+    /// In-memory only (for tests).
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             index: None,
             saved_draft: None,
+            file_path: None,
         }
     }
 
-    /// Add a sent message to history. Resets navigation state.
+    /// Add a sent message to history. Resets navigation state. Persists to disk.
     pub fn push(&mut self, entry: String) {
         if !entry.is_empty() {
             self.entries.push(entry);
@@ -93,6 +111,44 @@ impl InputHistory {
         }
         self.index = None;
         self.saved_draft = None;
+        self.save();
+    }
+
+    /// Persist history entries to disk (no-op if no file_path).
+    fn save(&self) {
+        let Some(path) = &self.file_path else { return };
+        if let Err(e) = Self::write_file(path, &self.entries) {
+            tracing::warn!("failed to save input history: {e}");
+        }
+    }
+
+    fn read_file(path: &Path) -> Option<Vec<String>> {
+        let data = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    fn write_file(path: &Path, entries: &[String]) -> std::io::Result<()> {
+        let json = serde_json::to_string(entries).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("tmp");
+        // Create temp file with 0600 permissions from the start (no race window).
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+                .write_all(json.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, &json)?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Navigate to the previous (older) history entry.
@@ -251,7 +307,7 @@ impl<'a> App<'a> {
             pending_response: None,
             reveal_index: 0,
             textarea,
-            history: InputHistory::new(),
+            history: InputHistory::load(&home_dir),
             has_new_message: false,
             session_id,
             model,
@@ -776,6 +832,69 @@ mod tests {
 
         h.reset();
         assert!(!h.is_browsing());
+    }
+
+    // === InputHistory persistence tests ===
+
+    #[test]
+    fn test_history_load_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = InputHistory::load(dir.path());
+        assert!(h.entries.is_empty());
+        assert!(h.file_path.is_some());
+    }
+
+    #[test]
+    fn test_history_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = InputHistory::load(dir.path());
+        h.push("hello".to_string());
+        h.push("world\nwith newlines".to_string());
+
+        let h2 = InputHistory::load(dir.path());
+        assert_eq!(h2.entries.len(), 2);
+        assert_eq!(h2.entries[0], "hello");
+        assert_eq!(h2.entries[1], "world\nwith newlines");
+    }
+
+    #[test]
+    fn test_history_load_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".input_history"), "not valid json{{{").unwrap();
+        let h = InputHistory::load(dir.path());
+        assert!(h.entries.is_empty());
+    }
+
+    #[test]
+    fn test_history_load_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".input_history"), "").unwrap();
+        let h = InputHistory::load(dir.path());
+        assert!(h.entries.is_empty());
+    }
+
+    #[test]
+    fn test_history_file_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = InputHistory::load(dir.path());
+        h.push("secret message".to_string());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join(".input_history");
+            let perms = std::fs::metadata(&path).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_history_in_memory_does_not_save() {
+        let mut h = InputHistory::new();
+        h.push("entry".to_string());
+        // No file_path, so save is a no-op — just verify no panic
+        assert_eq!(h.entries.len(), 1);
+        assert!(h.file_path.is_none());
     }
 
     // === Scroll behavior tests ===
