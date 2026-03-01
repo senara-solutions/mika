@@ -23,6 +23,7 @@ changelog_update = false
 
 [[package]]
 name = "mika-gateway"
+publish = false
 release = false
 
 [changelog]
