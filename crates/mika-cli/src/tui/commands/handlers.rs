@@ -106,11 +106,8 @@ async fn handle_memory(app: &mut App<'_>, args: &str) -> String {
                     entry.key, entry.value, entry.token_count
                 );
             }
-            match app.db.total_core_memory_tokens().await {
-                Ok(total) => {
-                    let _ = writeln!(out, "\nTotal: {total}/2000 tokens");
-                }
-                Err(_) => {}
+            if let Ok(total) = app.db.total_core_memory_tokens().await {
+                let _ = writeln!(out, "\nTotal: {total}/2000 tokens");
             }
             out
         }
@@ -130,43 +127,43 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
         app.db.search_events(query),
     );
 
-    if let Ok(people) = people {
-        if !people.is_empty() {
-            found = true;
-            let _ = writeln!(out, "People:");
-            for p in &people {
-                let rel = p.relationship.as_deref().unwrap_or("unknown");
-                let _ = writeln!(out, "  {} ({})", p.canonical_name, rel);
-            }
+    if let Ok(people) = people
+        && !people.is_empty()
+    {
+        found = true;
+        let _ = writeln!(out, "People:");
+        for p in &people {
+            let rel = p.relationship.as_deref().unwrap_or("unknown");
+            let _ = writeln!(out, "  {} ({})", p.canonical_name, rel);
         }
     }
-    if let Ok(commitments) = commitments {
-        if !commitments.is_empty() {
-            found = true;
-            let _ = writeln!(out, "Commitments:");
-            for c in &commitments {
-                let due = c.due_date.as_deref().unwrap_or("no due date");
-                let _ = writeln!(out, "  [{}] {} ({})", c.status, c.description, due);
-            }
+    if let Ok(commitments) = commitments
+        && !commitments.is_empty()
+    {
+        found = true;
+        let _ = writeln!(out, "Commitments:");
+        for c in &commitments {
+            let due = c.due_date.as_deref().unwrap_or("no due date");
+            let _ = writeln!(out, "  [{}] {} ({})", c.status, c.description, due);
         }
     }
-    if let Ok(preferences) = preferences {
-        if !preferences.is_empty() {
-            found = true;
-            let _ = writeln!(out, "Preferences:");
-            for p in &preferences {
-                let _ = writeln!(out, "  {}: {}", p.category, p.value);
-            }
+    if let Ok(preferences) = preferences
+        && !preferences.is_empty()
+    {
+        found = true;
+        let _ = writeln!(out, "Preferences:");
+        for p in &preferences {
+            let _ = writeln!(out, "  {}: {}", p.category, p.value);
         }
     }
-    if let Ok(events) = events {
-        if !events.is_empty() {
-            found = true;
-            let _ = writeln!(out, "Events:");
-            for e in &events {
-                let date = e.event_date.as_deref().unwrap_or("no date");
-                let _ = writeln!(out, "  {} ({})", e.description, date);
-            }
+    if let Ok(events) = events
+        && !events.is_empty()
+    {
+        found = true;
+        let _ = writeln!(out, "Events:");
+        for e in &events {
+            let date = e.event_date.as_deref().unwrap_or("no date");
+            let _ = writeln!(out, "  {} ({})", e.description, date);
         }
     }
 
@@ -275,13 +272,13 @@ async fn handle_config(app: &mut App<'_>, args: &str) -> String {
     }
 
     // Show customer config entries
-    if let Ok(configs) = app.db.list_customer_config().await {
-        if !configs.is_empty() {
-            let _ = writeln!(out);
-            let _ = writeln!(out, "Customer settings:");
-            for (key, value) in &configs {
-                let _ = writeln!(out, "  {key}: {value}");
-            }
+    if let Ok(configs) = app.db.list_customer_config().await
+        && !configs.is_empty()
+    {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Customer settings:");
+        for (key, value) in &configs {
+            let _ = writeln!(out, "  {key}: {value}");
         }
     }
 

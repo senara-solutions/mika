@@ -23,8 +23,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
 
     let agent_home = home::resolve_agent_home(&home_dir, agent_name);
     println!(
-        "\n  {} Mika initialized at {}\n",
-        '\u{2726}',
+        "\n  \u{2726} Mika initialized at {}\n",
         agent_home.display()
     );
 

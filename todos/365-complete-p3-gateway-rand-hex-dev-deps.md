@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "365"
 tags: [code-review, dependencies, gateway]

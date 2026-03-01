@@ -51,7 +51,7 @@ docker build -f Dockerfile.agent -t mika-agent:dev .
 ```
 
 Build details:
-- **Builder:** `rust:1.85-slim` with gcc, libc-dev, pkg-config, libssl-dev
+- **Builder:** `rust:1.93-slim` with gcc, libc-dev, pkg-config (no OpenSSL — uses rustls)
 - **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, and gh (GitHub CLI v2.65.0 with SHA256 checksum verification)
 - **Binary:** `mika-server` (Axum HTTP server)
 - **User:** `mika` (UID 1000), non-root
@@ -87,7 +87,7 @@ docker build -f Dockerfile.gateway -t mika-gateway:dev .
 ```
 
 Build details:
-- **Builder:** `rust:1.85-slim` with pkg-config, libssl-dev (no gcc — no bundled SQLite)
+- **Builder:** `rust:1.93-slim` (no native build deps — uses rustls, no bundled SQLite)
 - **Runtime:** `debian:bookworm-slim` with ca-certificates, wget
 - **Binary:** `mika-gateway` (Axum HTTP server)
 - **User:** `mika` (UID 1000), non-root, no home directory (stateless)
@@ -95,6 +95,46 @@ Build details:
 - **Healthcheck:** `wget -q --spider http://localhost:8080/readyz` (10s interval, 10s start period)
 
 The gateway image is leaner than the agent image — no GitHub CLI, no file/jq utilities, no home directory. It uses the same dependency caching strategy as the agent image.
+
+---
+
+## 3c. CI/CD Pipeline
+
+Three GitHub Actions workflows automate testing, versioning, and binary distribution.
+
+### CI (`ci.yml`)
+
+Runs on every PR and push to `main`:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test`
+
+### Release-plz (`release-plz.yml`)
+
+Runs on push to `main` (after CI passes):
+- Creates a release PR with version bumps and changelog updates (conventional commits)
+- On merge of the release PR: publishes to crates.io and creates a git tag (`v{version}`)
+- Requires `RELEASE_PLZ_TOKEN` (PAT with `contents: write` and `pull-requests: write`)
+- Requires `CARGO_REGISTRY_TOKEN` for crates.io publishing
+
+**Important:** Uses a PAT (`RELEASE_PLZ_TOKEN`) instead of `GITHUB_TOKEN` so that the tag push triggers the release binary workflow.
+
+### Release Binaries (`release.yml`)
+
+Triggered by `v*` tag push:
+- Builds cross-platform binaries: x86_64-linux, aarch64-linux (cross-compiled), x86_64-macos, aarch64-macos
+- Uploads to GitHub Releases with SHA256 checksums
+- Only builds the `mika` CLI binary (not gateway or server)
+
+### Installer Script
+
+Users can install pre-built binaries via:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/senara-solutions/mika/main/install.sh | sh
+```
+
+The script detects platform/architecture, downloads from GitHub Releases, verifies SHA256 checksum, and installs to `~/.local/bin/mika`.
 
 ---
 

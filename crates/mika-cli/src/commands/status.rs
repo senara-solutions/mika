@@ -33,7 +33,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
         .unwrap_or_else(|| "never".to_string());
 
     println!();
-    println!("  {} Mika Status", '\u{2726}');
+    println!("  \u{2726} Mika Status");
     println!(
         "  Database:       {} ({})",
         ctx.settings.db_path.display(),

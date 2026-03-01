@@ -423,12 +423,12 @@ async fn heartbeat_should_run(db: &AsyncDatabase) -> bool {
     }
 
     // 4. Skip if user messaged recently (within last 2 hours)
-    if let Ok(Some(last_msg)) = db.last_user_message_time().await {
-        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&last_msg, "%Y-%m-%d %H:%M:%S") {
-            let elapsed = now_utc.naive_utc() - parsed;
-            if elapsed < chrono::TimeDelta::hours(2) {
-                return false;
-            }
+    if let Ok(Some(last_msg)) = db.last_user_message_time().await
+        && let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&last_msg, "%Y-%m-%d %H:%M:%S")
+    {
+        let elapsed = now_utc.naive_utc() - parsed;
+        if elapsed < chrono::TimeDelta::hours(2) {
+            return false;
         }
     }
 

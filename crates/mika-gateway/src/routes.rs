@@ -10,12 +10,12 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
-use base64::Engine;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -241,8 +241,8 @@ async fn claim_dedup(state: &AppState, customer_id: Uuid, update_id: i64) -> boo
     .await;
 
     match claimed {
-        Ok(Some(_)) => true,  // claimed -- proceed to forward
-        Ok(None) => false,    // already processed by another task
+        Ok(Some(_)) => true, // claimed -- proceed to forward
+        Ok(None) => false,   // already processed by another task
         Err(e) => {
             warn!(error = %e, "dedup update failed");
             false
@@ -367,9 +367,7 @@ async fn handle_photo_message(
                 .await;
             return;
         }
-        Err(TelegramApiError::BadRequest { ref message })
-            if message.contains("unsupported") =>
-        {
+        Err(TelegramApiError::BadRequest { ref message }) if message.contains("unsupported") => {
             let _ = state
                 .telegram
                 .send_message(
@@ -736,10 +734,7 @@ mod tests {
     fn test_container_url_default() {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let url = container_url(&id, &None);
-        assert_eq!(
-            url,
-            "http://mika-12345678-1234-1234-1234-123456789abc:8080"
-        );
+        assert_eq!(url, "http://mika-12345678-1234-1234-1234-123456789abc:8080");
     }
 
     #[test]

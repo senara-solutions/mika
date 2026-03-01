@@ -11,14 +11,14 @@ repository = "https://github.com/senara-solutions/mika"
 homepage = "https://github.com/senara-solutions/mika"
 keywords = ["ai", "assistant", "cli", "llm", "agent"]
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.91"
 
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # HTTP
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

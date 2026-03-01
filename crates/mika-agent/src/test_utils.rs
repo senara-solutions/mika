@@ -52,6 +52,12 @@ pub mod test_helpers {
         pub counter: AtomicU32,
     }
 
+    impl Default for TestHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl TestHarness {
         pub fn new() -> Self {
             Self {

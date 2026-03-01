@@ -217,8 +217,7 @@ pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/png")
     } else if bytes[0..4] == [0x47, 0x49, 0x46, 0x38] {
         Some("image/gif")
-    } else if bytes[0..4] == [0x52, 0x49, 0x46, 0x46] && bytes[8..12] == [0x57, 0x45, 0x42, 0x50]
-    {
+    } else if bytes[0..4] == [0x52, 0x49, 0x46, 0x46] && bytes[8..12] == [0x57, 0x45, 0x42, 0x50] {
         Some("image/webp")
     } else {
         None
@@ -335,10 +334,8 @@ impl TelegramClient {
             };
         }
 
-        let file_resp: GetFileResponse = resp
-            .json()
-            .await
-            .map_err(|e| TelegramApiError::Other {
+        let file_resp: GetFileResponse =
+            resp.json().await.map_err(|e| TelegramApiError::Other {
                 status: 200,
                 body: format!("failed to parse getFile response: {e}"),
             })?;
@@ -376,9 +373,7 @@ impl TelegramClient {
         for ch in ['@', '?', '#'] {
             if file_path.contains(ch) {
                 return Err(TelegramApiError::BadRequest {
-                    message: format!(
-                        "invalid file_path from Telegram API: contains '{ch}'"
-                    ),
+                    message: format!("invalid file_path from Telegram API: contains '{ch}'"),
                 });
             }
         }
@@ -843,7 +838,9 @@ mod tests {
 
     #[test]
     fn test_detect_unknown_format() {
-        let bytes = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B];
+        let bytes = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+        ];
         assert_eq!(detect_media_type(&bytes), None);
     }
 

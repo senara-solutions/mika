@@ -1,8 +1,8 @@
 # === Builder stage ===
-FROM rust:1.85-slim AS builder
+FROM rust:1.93-slim AS builder
 
-# Install C compiler for rusqlite bundled SQLite + OpenSSL for reqwest
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# Install C compiler for rusqlite bundled SQLite (no OpenSSL needed — uses rustls)
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc-dev pkg-config && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

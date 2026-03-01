@@ -642,7 +642,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x0D, // IHDR length
             0x49, 0x48, 0x44, 0x52, // IHDR
         ];
-        std::fs::write(tmp.path(), &png_bytes).unwrap();
+        std::fs::write(tmp.path(), png_bytes).unwrap();
         let img = read_and_validate_image(tmp.path().to_str().unwrap())
             .await
             .unwrap();
@@ -658,7 +658,7 @@ mod tests {
         let mut paths = Vec::new();
         for i in 0..7 {
             let p = dir.path().join(format!("img{i}.png"));
-            std::fs::write(&p, &png_header).unwrap();
+            std::fs::write(&p, png_header).unwrap();
             paths.push(p.to_str().unwrap().to_string());
         }
         let (images, errors) = process_envelope_images(&paths).await;
@@ -676,7 +676,7 @@ mod tests {
         // Create a fake PNG image
         let img_path = tmp.path().join("screenshot.png");
         let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        std::fs::write(&img_path, &png_header).unwrap();
+        std::fs::write(&img_path, png_header).unwrap();
 
         // Script that outputs a Mika envelope
         let script = format!(

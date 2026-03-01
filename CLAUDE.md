@@ -4,7 +4,7 @@
 
 Mika is a conversation-first AI executive assistant with per-customer container isolation. Each customer gets their own agent container with SQLite storage. A shared gateway (`mika-gateway`) routes Telegram messages to the correct container.
 
-**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, CI/CD next).
+**Current phase:** Phase 4 — Deployment infrastructure (Dockerfiles done, CI/CD done).
 
 ## Stack
 
@@ -13,7 +13,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **LLM:** Claude (Sonnet 4.6 default) via direct reqwest calls to Messages API
 - **Database:** SQLite via rusqlite (per-customer)
 - **HTTP server:** Axum 0.8 (mika-server binary) with tower-http middleware
-- **HTTP client:** reqwest 0.12 (Claude API client with typed errors and retry)
+- **HTTP client:** reqwest 0.12 with rustls-tls (Claude API client with typed errors and retry)
 - **Async runtime:** tokio
 - **MCP client:** rmcp 0.17 (official Rust MCP SDK) — stdio and Streamable HTTP transports
 - **Config:** config-rs with `MIKA_` env prefix
@@ -76,7 +76,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 8 (v7 adds: skills system tables; v8 adds: search_content, fts_search FTS5, vec_search vec0 for Layer 3)
 - **mika-gateway** (`crates/mika-gateway/` in this repo)**:** Telegram webhook router with Postgres customer registry. Handles text messages and images. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (health probes). Stateless, env-var-only config.
-- **Docker images:** Multi-stage builds with dependency layer caching. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). `Dockerfile.gateway` for the stateless gateway (leaner: ca-certificates + wget only, no home dir). Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
+- **Docker images:** Multi-stage builds with dependency layer caching. Builder: `rust:1.93-slim`. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). `Dockerfile.gateway` for the stateless gateway (leaner: ca-certificates + wget only, no home dir). Both use rustls (no OpenSSL build deps). Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip.
+- **CI/CD:** Three GitHub Actions workflows: `ci.yml` (PR checks: fmt, clippy, test), `release-plz.yml` (automated versioning, changelog, crates.io publishing, git tagging via conventional commits), `release.yml` (cross-platform binary builds on tag push: x86_64/aarch64 Linux + macOS). All actions pinned to commit SHAs. Binaries published to GitHub Releases with SHA256 checksums. Installer script: `install.sh`.
 
 ## Environment Variables
 
@@ -108,7 +109,7 @@ Gateway mode (`mika-gateway` binary) additionally requires:
 
 ## Pending Work
 
-- **Deployment:** CI/CD pipeline, deployment manifests, production deployment guide
+- **Deployment:** Deployment manifests, production deployment guide, Docker image CI
 - **Future features:** WhatsApp channel adapter, morning briefings, admin API
 
 ## Reference Repositories

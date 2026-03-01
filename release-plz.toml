@@ -1,0 +1,51 @@
+[workspace]
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+semver_check = false
+pr_labels = ["release"]
+
+[[package]]
+name = "mika-common"
+publish = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["mika-agent", "mika-cli"]
+
+[[package]]
+name = "mika-agent"
+publish = true
+changelog_update = false
+
+[[package]]
+name = "mika-cli"
+publish = true
+changelog_update = false
+
+[[package]]
+name = "mika-gateway"
+release = false
+
+[changelog]
+header = """# Changelog\n\nAll notable changes to this project will be documented in this file.\n"""
+body = """
+## [{{ version }}](https://github.com/senara-solutions/mika/releases/tag/v{{ version }}) — {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}**BREAKING** {% endif %}{{ commit.message }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+protect_breaking_commits = true
+commit_parsers = [
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^perf", group = "Performance" },
+    { message = "^doc", group = "Documentation" },
+    { message = "^test", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^style", skip = true },
+]
