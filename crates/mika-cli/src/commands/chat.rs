@@ -90,7 +90,7 @@ async fn spawn_agent_worker(
     let worker_brave_key = brave_api_key;
     let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
-    let worker_mcp = mcp_manager;
+    let mut worker_mcp = mcp_manager;
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -184,6 +184,10 @@ async fn spawn_agent_worker(
                 }
                 AgentRequest::Quit => break,
             }
+        }
+        // Gracefully shut down MCP server connections
+        if let Some(mcp) = worker_mcp.take() {
+            mcp.shutdown().await;
         }
     });
 

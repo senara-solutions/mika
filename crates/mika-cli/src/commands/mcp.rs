@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use mika_agent::mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use mika_common::home;
@@ -143,13 +145,13 @@ fn toggle_server(agent_home: &std::path::Path, name: &str, enabled: bool) -> Res
 
 fn parse_headers(
     raw: Option<Vec<String>>,
-) -> Result<Option<std::collections::HashMap<String, String>>> {
+) -> Result<Option<HashMap<String, String>>> {
     let raw = match raw {
         Some(h) if !h.is_empty() => h,
         _ => return Ok(None),
     };
 
-    let mut map = std::collections::HashMap::new();
+    let mut map = HashMap::new();
     for entry in &raw {
         let (key, value) = entry
             .split_once('=')
@@ -172,4 +174,62 @@ fn remove_server(agent_home: &std::path::Path, name: &str) -> Result<()> {
     config.save(agent_home)?;
     println!("Removed MCP server '{name}'.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_headers_normal_key_value() {
+        let input = Some(vec!["Content-Type=application/json".to_string()]);
+        let result = parse_headers(input).unwrap();
+        let map = result.expect("should return Some");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("Content-Type").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn parse_headers_value_containing_equals() {
+        let input = Some(vec!["Authorization=Bearer abc==".to_string()]);
+        let result = parse_headers(input).unwrap();
+        let map = result.expect("should return Some");
+        assert_eq!(map.get("Authorization").unwrap(), "Bearer abc==");
+    }
+
+    #[test]
+    fn parse_headers_missing_equals_returns_error() {
+        let input = Some(vec!["InvalidHeader".to_string()]);
+        let result = parse_headers(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid header format"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_headers_empty_key_returns_error() {
+        let input = Some(vec!["=some-value".to_string()]);
+        let result = parse_headers(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Empty header name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_headers_none_returns_ok_none() {
+        let result = parse_headers(None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_headers_empty_vec_returns_ok_none() {
+        let result = parse_headers(Some(vec![])).unwrap();
+        assert!(result.is_none());
+    }
 }

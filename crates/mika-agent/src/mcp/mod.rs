@@ -298,7 +298,11 @@ async fn connect_http(name: &str, config: &McpServerConfig) -> Result<McpConnect
             .iter()
             .find_map(|(k, v)| k.eq_ignore_ascii_case("authorization").then_some(v))
         {
-            transport_config = transport_config.auth_header(auth.clone());
+            if http::HeaderValue::from_str(auth).is_ok() {
+                transport_config = transport_config.auth_header(auth.clone());
+            } else {
+                warn!(server = name, "invalid Authorization header value, skipping");
+            }
         }
 
         // Other headers use the custom_headers API
