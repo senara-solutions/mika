@@ -128,14 +128,24 @@ impl InputHistory {
     }
 
     fn write_file(path: &Path, entries: &[String]) -> std::io::Result<()> {
-        let json = serde_json::to_string(entries)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string(entries).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &json)?;
+        // Create temp file with 0600 permissions from the start (no race window).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+                .write_all(json.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, &json)?;
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
