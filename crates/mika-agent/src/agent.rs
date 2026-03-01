@@ -27,6 +27,9 @@ use mika_common::embedding::EmbeddingClient;
 const MAX_TOOL_STEPS: usize = 10;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Timeout for the continuation API call after max tool steps are exceeded.
+/// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
+const CONTINUATION_TIMEOUT_SECS: u64 = 60;
 /// Maximum total base64 image bytes across all tool results in a single agent step.
 /// Prevents memory spikes when multiple tools return images in one step.
 /// 5 images at 5 MB each ≈ 33 MB base64 — this caps at ~20 MB to stay within
@@ -214,6 +217,19 @@ pub fn format_tool_summary_block(metadata_json: &str) -> Option<String> {
     ))
 }
 
+/// Format a user-friendly fallback message when the agent exceeds max tool steps
+/// and the continuation turn fails. Shows the last 5 tool calls with status.
+fn format_step_exceeded_fallback(summaries: &[ToolCallSummary]) -> String {
+    let mut msg = String::from("I ran out of steps working on that. Here's what I did:\n");
+    let start = summaries.len().saturating_sub(5);
+    for s in &summaries[start..] {
+        let status = if s.success { "done" } else { "failed" };
+        msg.push_str(&format!("- {} ({})\n", s.name, status));
+    }
+    msg.push_str("\nYou can ask me to continue where I left off.");
+    msg
+}
+
 /// Result from the shared tool-step loop.
 struct LoopResult {
     text: Option<String>,
@@ -223,6 +239,9 @@ struct LoopResult {
     /// Accumulated tool call summaries from all loop steps.
     /// Used by the `max_steps_exceeded` fallback path to persist metadata.
     tool_call_summaries: Vec<ToolCallSummary>,
+    /// Original system prompt length before step-awareness nudge was appended.
+    /// Used to strip the nudge before the continuation turn.
+    system_prompt_original_len: usize,
 }
 
 /// Remove image blocks from prior tool results to prevent unbounded memory
@@ -292,6 +311,8 @@ async fn run_loop(
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
     let channel_type = mode.channel_type();
+    // Track system prompt length before nudge so we can strip it later
+    let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
     for step in 0..MAX_TOOL_STEPS {
         debug!(
@@ -305,6 +326,17 @@ async fn run_loop(
         // Strip images from prior turns to prevent unbounded memory growth
         if step > 0 {
             strip_prior_images(&mut request.messages);
+        }
+
+        // Nudge the model to wrap up when approaching the step limit (conversation only)
+        if mode.is_conversation()
+            && step == MAX_TOOL_STEPS - 2
+            && let Some(ref mut system) = request.system
+        {
+            system.push_str(
+                "\n\n[SYSTEM: You have 2 tool steps remaining before the limit. \
+                 Prioritize completing your current task or summarizing progress.]",
+            );
         }
 
         let response = claude.send_message(request).await?;
@@ -334,6 +366,7 @@ async fn run_loop(
                         usage: last_usage,
                         max_steps_exceeded: false,
                         tool_call_summaries: all_tool_summaries,
+                        system_prompt_original_len: system_prompt_len,
                     });
                 }
 
@@ -345,6 +378,7 @@ async fn run_loop(
                         usage: None,
                         max_steps_exceeded: false,
                         tool_call_summaries: all_tool_summaries,
+                        system_prompt_original_len: system_prompt_len,
                     });
                 }
 
@@ -386,6 +420,7 @@ async fn run_loop(
                     usage: last_usage,
                     max_steps_exceeded: false,
                     tool_call_summaries: all_tool_summaries,
+                    system_prompt_original_len: system_prompt_len,
                 });
             }
             StopReason::ToolUse => {
@@ -416,6 +451,7 @@ async fn run_loop(
         usage: last_usage,
         max_steps_exceeded: true,
         tool_call_summaries: all_tool_summaries,
+        system_prompt_original_len: system_prompt_len,
     })
 }
 
@@ -664,14 +700,54 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     .await?;
 
     if result.max_steps_exceeded {
-        let fallback = "I need a moment to think about that. Let me get back to you.";
+        // Attempt a continuation turn: disable tools, force a text summary.
+        // Strip the step-awareness nudge from the system prompt so the continuation
+        // turn does not see stale "2 steps remaining" text.
+        if let Some(ref mut system) = request.system {
+            system.truncate(result.system_prompt_original_len);
+        }
+        request.tools = None;
+        request.thinking = None;
+        request.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(
+                "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
+            ),
+        });
+
+        let continuation = tokio::time::timeout(
+            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
+            claude.send_message(&request),
+        )
+        .await;
+
+        let (text, continuation_usage) = match continuation {
+            Ok(Ok(resp)) => {
+                let t = resp.text();
+                let u = Some(resp.usage);
+                if t.is_empty() {
+                    (format_step_exceeded_fallback(&result.tool_call_summaries), u)
+                } else {
+                    (t, u)
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, tool_calls = result.tool_call_summaries.len(), "continuation turn API error after max steps");
+                (format_step_exceeded_fallback(&result.tool_call_summaries), None)
+            }
+            Err(_) => {
+                warn!(timeout_secs = CONTINUATION_TIMEOUT_SECS, tool_calls = result.tool_call_summaries.len(), "continuation turn timed out after max steps");
+                (format_step_exceeded_fallback(&result.tool_call_summaries), None)
+            }
+        };
+
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata("assistant", fallback, channel_type, metadata.as_deref())
+        db.save_message_with_metadata("assistant", &text, channel_type, metadata.as_deref())
             .await?;
         return Ok(AgentOutput {
-            text: Some(fallback.to_string()),
+            text: Some(text),
             thinking: result.thinking,
-            usage: result.usage,
+            usage: continuation_usage.or(result.usage),
         });
     }
 
@@ -1854,5 +1930,67 @@ mod tests {
         } else {
             panic!("expected Blocks");
         }
+    }
+
+    // -- format_step_exceeded_fallback tests --
+
+    #[test]
+    fn test_format_step_exceeded_fallback_empty_summaries() {
+        let result = format_step_exceeded_fallback(&[]);
+        assert!(result.contains("I ran out of steps"));
+        assert!(result.contains("You can ask me to continue"));
+        // No bullet points when empty
+        assert!(!result.contains("- "));
+    }
+
+    #[test]
+    fn test_format_step_exceeded_fallback_few_summaries() {
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "search_memory".to_string(),
+                input_summary: "query".to_string(),
+                output_summary: "found 3 results".to_string(),
+                success: true,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "run_shell".to_string(),
+                input_summary: "ls".to_string(),
+                output_summary: "error".to_string(),
+                success: false,
+            },
+            ToolCallSummary {
+                step: 2,
+                name: "read_file".to_string(),
+                input_summary: "/tmp/test".to_string(),
+                output_summary: "contents".to_string(),
+                success: true,
+            },
+        ];
+        let result = format_step_exceeded_fallback(&summaries);
+        assert!(result.contains("- search_memory (done)"));
+        assert!(result.contains("- run_shell (failed)"));
+        assert!(result.contains("- read_file (done)"));
+        assert!(result.contains("You can ask me to continue"));
+    }
+
+    #[test]
+    fn test_format_step_exceeded_fallback_truncates_to_last_five() {
+        let summaries: Vec<ToolCallSummary> = (0..10)
+            .map(|i| ToolCallSummary {
+                step: i,
+                name: format!("tool_{i}"),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+            })
+            .collect();
+        let result = format_step_exceeded_fallback(&summaries);
+        // Should only show last 5 (tool_5 through tool_9)
+        assert!(!result.contains("tool_0"));
+        assert!(!result.contains("tool_4"));
+        assert!(result.contains("tool_5"));
+        assert!(result.contains("tool_9"));
     }
 }
