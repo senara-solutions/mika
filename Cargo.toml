@@ -95,6 +95,9 @@ rmcp = { version = "0.17", default-features = false, features = [
     "reqwest",
 ] }
 
+# Postgres (mika-gateway)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+
 # Utilities
 rand = "0.9"
 hex = "0.4"
