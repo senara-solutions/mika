@@ -81,7 +81,7 @@ by writing the file manually.
 
 **CLI management:**
 
-- `mika mcp list` -- Show configured servers and status
+- `mika mcp list` -- Show configured servers, status, and header keys
 - `mika mcp add <name> --transport stdio --command <cmd> [--args ...]`
 - `mika mcp add <name> --transport http --url <url> [--header KEY=VALUE ...]`
 - `mika mcp remove <name>` -- Remove a server
