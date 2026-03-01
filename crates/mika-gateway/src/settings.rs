@@ -70,8 +70,39 @@ impl GatewaySettings {
             "MIKA_TELEGRAM_WEBHOOK_SECRET",
         )?;
 
+        // Validate agent_base_url scheme when set (dev-only override)
+        if let Some(ref url_str) = settings.agent_base_url {
+            validate_agent_base_url(url_str)?;
+        }
+
         Ok(settings)
     }
+}
+
+/// Validate MIKA_AGENT_BASE_URL: must be a well-formed URL with an http/https scheme.
+/// Emits a warning when the host is not localhost/127.x/::1 because this setting is
+/// intended only for local E2E testing.
+fn validate_agent_base_url(url_str: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(url_str)
+        .map_err(|e| anyhow::anyhow!("MIKA_AGENT_BASE_URL is not a valid URL: {e}"))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!(
+            "MIKA_AGENT_BASE_URL has unsupported scheme '{scheme}': must be http or https"
+        );
+    }
+    let is_local = url
+        .host_str()
+        .map(|h| h == "localhost" || h.starts_with("127.") || h == "::1")
+        .unwrap_or(false);
+    if !is_local {
+        tracing::warn!(
+            url = %url_str,
+            "MIKA_AGENT_BASE_URL is set to a non-localhost host; \
+             this setting is intended for local E2E testing only"
+        );
+    }
+    Ok(())
 }
 
 fn validate_hex_token(token: &SecretString, name: &str) -> anyhow::Result<()> {
@@ -101,6 +132,46 @@ impl std::fmt::Debug for GatewaySettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_agent_base_url_accepts_http_localhost() {
+        assert!(validate_agent_base_url("http://localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn test_validate_agent_base_url_accepts_https_localhost() {
+        assert!(validate_agent_base_url("https://localhost").is_ok());
+    }
+
+    #[test]
+    fn test_validate_agent_base_url_accepts_127_x() {
+        assert!(validate_agent_base_url("http://127.0.0.1:3000").is_ok());
+    }
+
+    #[test]
+    fn test_validate_agent_base_url_rejects_invalid_url() {
+        let err = validate_agent_base_url("not-a-url").unwrap_err();
+        assert!(
+            err.to_string().contains("MIKA_AGENT_BASE_URL is not a valid URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_agent_base_url_rejects_bad_scheme() {
+        let err = validate_agent_base_url("ftp://localhost/path").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported scheme"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_agent_base_url_accepts_non_local_with_warning() {
+        // Non-localhost URLs are allowed but should trigger a tracing::warn.
+        // We can only assert that the function succeeds (warn is a side-effect).
+        assert!(validate_agent_base_url("https://my-agent.internal.example.com").is_ok());
+    }
 
     #[test]
     fn test_debug_redacts_secrets() {

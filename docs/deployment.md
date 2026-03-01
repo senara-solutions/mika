@@ -15,7 +15,7 @@ Telegram
 [Ingress / Load Balancer]
    |
    v
-[mika-gateway]  (mika-system namespace, from mika-cloud repo)
+[mika-gateway]  (mika-system namespace, crates/mika-gateway/)
    |   Stateless, Postgres-backed
    |   Routes by telegram_chat_id
    |
@@ -37,7 +37,7 @@ Telegram
 | `mika-system` | Gateway deployment, service, ingress, secrets | Shared Telegram webhook router |
 | `mika-agents` | Per-customer deployments, services, PVCs, secrets | Isolated agent containers |
 
-The gateway lives in the private [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo. See that repo for gateway deployment, Helm charts, provisioning/deprovisioning scripts, and Telegram setup.
+The gateway source lives in `crates/mika-gateway/` in this repo. See the [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo for Helm charts, provisioning/deprovisioning scripts, and Telegram setup.
 
 ---
 

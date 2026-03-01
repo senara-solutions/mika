@@ -11,9 +11,8 @@ modes:
 
 - **Hosted mode (per-customer containers on Kubernetes):** Each customer gets their own
   agent container running `mika-server` (Axum HTTP), with an isolated SQLite database
-  on a K8s encrypted volume. A shared gateway (in the private
-  [mika-cloud](https://github.com/senara-solutions/mika-cloud) repo) routes messages
-  from Telegram to the correct container.
+  on a K8s encrypted volume. A shared gateway (`crates/mika-gateway/` in this repo)
+  routes messages from Telegram to the correct container.
 
 Both modes use the same agent loop, tools, memory model, and prompt assembly code
 from the `mika-agent` crate.
@@ -41,7 +40,7 @@ from the `mika-agent` crate.
 ```
 +----------+     +--------------------+     +----------------------------+
 | Telegram  |---->|  Gateway           |     |  Per-customer container    |
-| Bot API   |<----|  (mika-cloud repo) |     |  mika-server (Axum)        |
+| Bot API   |<----|  (mika-gateway)    |     |  mika-server (Axum)        |
 +----------+     +--------+-----------+     |                            |
                            |                 |  SQLite (encrypted vol)    |
                            |   POST /message |  Agent loop + tools        |
@@ -63,8 +62,7 @@ from the `mika-agent` crate.
 | `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
 
-The gateway crate (`mika-gateway`) lives in the private
-[mika-cloud](https://github.com/senara-solutions/mika-cloud) repo.
+The gateway crate (`mika-gateway`) lives in `crates/mika-gateway/` in this repo.
 
 
 ## 4. Agent Loop
