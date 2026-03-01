@@ -17,6 +17,7 @@ When Mika runs for the first time, it bootstraps the home directory at
   soul.md            # Personality definition (system prompt)
   heartbeat.md       # Heartbeat checklist for proactive behaviors
   user.md            # User self-description (seeds initial context)
+  mcp.json           # MCP server configuration (optional, see below)
   data/
     mika.db          # SQLite database (conversations, memory, reminders)
   logs/              # Log files
@@ -38,6 +39,59 @@ sensitive data.
 Bootstrap never overwrites existing files. If a file already exists, the default
 content is skipped. This means you can safely customize any file and re-run
 `mika setup` without losing changes.
+
+### mcp.json
+
+MCP (Model Context Protocol) servers are configured in `{agent_home}/mcp.json`.
+This file is not bootstrapped automatically -- create it via `mika mcp add` or
+by writing the file manually.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"],
+      "env": {},
+      "enabled": true
+    },
+    "remote-api": {
+      "transport": "http",
+      "url": "https://mcp.example.com/v1",
+      "headers": {
+        "Authorization": "Bearer sk-my-token",
+        "X-Api-Key": "my-api-key"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `transport` | `"stdio"` or `"http"` | Yes | Transport type |
+| `command` | String | stdio only | Command to run as child process |
+| `args` | String array | No | Arguments for the command |
+| `env` | Object | No | Environment variables for stdio child process |
+| `url` | String | http only | URL of the remote MCP server |
+| `headers` | Object | No | HTTP headers for http transport (e.g. Authorization) |
+| `enabled` | Boolean | No | Default `true`. Set to `false` to disable without removing. |
+
+**CLI management:**
+
+- `mika mcp list` -- Show configured servers, status, and header keys
+- `mika mcp add <name> --transport stdio --command <cmd> [--args ...]`
+- `mika mcp add <name> --transport http --url <url> [--header KEY=VALUE ...]`
+- `mika mcp remove <name>` -- Remove a server
+- `mika mcp enable <name>` -- Enable a disabled server
+- `mika mcp disable <name>` -- Disable without removing
+
+**Security:** `mcp.json` is written with `0600` permissions on Unix. Header and
+env values are redacted in debug output. Header values passed via `--header` on
+the command line are visible in shell history and process listings -- for
+sensitive tokens, edit `mcp.json` directly.
 
 ---
 

@@ -2,8 +2,8 @@ use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -57,6 +57,9 @@ async fn spawn_agent_worker(
 
     let brave_api_key = ctx.settings.brave_api_key.clone();
 
+    // Connect to MCP servers
+    let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
+
     // Recover reminders on startup
     {
         let scheduler = ReminderScheduler {
@@ -87,6 +90,7 @@ async fn spawn_agent_worker(
     let worker_brave_key = brave_api_key;
     let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
+    let mut worker_mcp = mcp_manager;
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -136,7 +140,7 @@ async fn spawn_agent_worker(
                         user_images: &image_sources,
                         brave_api_key: worker_brave_key.as_deref(),
                         skills_dirty: &worker_dirty,
-                        mcp_manager: None,
+                        mcp_manager: worker_mcp.as_ref(),
                     })
                     .await;
 
@@ -180,6 +184,10 @@ async fn spawn_agent_worker(
                 }
                 AgentRequest::Quit => break,
             }
+        }
+        // Gracefully shut down MCP server connections
+        if let Some(mcp) = worker_mcp.take() {
+            mcp.shutdown().await;
         }
     });
 

@@ -80,7 +80,13 @@ async fn execute_inner(
     );
     match &skill_tool.handler {
         ToolHandler::Exec { command } => {
-            execute_exec(command, &skill_tool.skill_dir, &skill_tool.definition.name, input).await
+            execute_exec(
+                command,
+                &skill_tool.skill_dir,
+                &skill_tool.definition.name,
+                input,
+            )
+            .await
         }
         ToolHandler::Http { url, method } => execute_http(url, method, input).await,
         ToolHandler::Builtin { .. } => {
@@ -377,7 +383,10 @@ fn truncate_output(s: &str) -> String {
         while boundary > 0 && !s.is_char_boundary(boundary) {
             boundary -= 1;
         }
-        format!("{}\n... (truncated at {MAX_OUTPUT_LEN} chars)", &s[..boundary])
+        format!(
+            "{}\n... (truncated at {MAX_OUTPUT_LEN} chars)",
+            &s[..boundary]
+        )
     }
 }
 

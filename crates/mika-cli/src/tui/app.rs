@@ -531,8 +531,7 @@ impl<'a> App<'a> {
             if text.is_empty() {
                 self.reset_textarea();
             } else {
-                self.textarea =
-                    TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
+                self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
                 self.textarea
                     .set_cursor_line_style(ratatui::style::Style::default());
                 self.textarea.set_placeholder_text("Type a message...");

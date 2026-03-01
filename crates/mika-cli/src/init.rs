@@ -124,6 +124,27 @@ fn open_db(settings: &Settings) -> Result<Database> {
     Database::open(db_path).context("failed to open database")
 }
 
+/// Load MCP config and connect to all enabled servers.
+/// Returns `None` if no servers are configured or all connections fail.
+pub async fn connect_mcp(agent_home: &Path) -> Option<mika_agent::mcp::McpManager> {
+    let config = match mika_agent::mcp::config::McpConfig::load(agent_home) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load MCP config, skipping");
+            return None;
+        }
+    };
+    if config.mcp_servers.is_empty() {
+        return None;
+    }
+    let manager = mika_agent::mcp::McpManager::connect_all(&config).await;
+    if manager.has_connections() {
+        Some(manager)
+    } else {
+        None
+    }
+}
+
 /// Build a `GatewayMessageSender` if both `routing_url` and `internal_token` are configured.
 /// Returns `None` otherwise, preserving CLI-only behavior.
 pub fn make_message_sender(

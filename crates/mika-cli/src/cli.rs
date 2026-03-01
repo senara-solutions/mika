@@ -239,10 +239,23 @@ pub enum McpCommand {
         /// URL to connect to (http transport)
         #[arg(long)]
         url: Option<String>,
+        /// HTTP headers as KEY=VALUE pairs (http transport only)
+        #[arg(long = "header", num_args = 1..)]
+        headers: Option<Vec<String>>,
     },
     /// Remove a configured MCP server
     Remove {
         /// Name of the server to remove
+        name: String,
+    },
+    /// Enable a configured MCP server
+    Enable {
+        /// Name of the server to enable
+        name: String,
+    },
+    /// Disable a configured MCP server
+    Disable {
+        /// Name of the server to disable
         name: String,
     },
 }

@@ -10,11 +10,11 @@ use axum::{
     Router, middleware,
     routing::{get, post},
 };
-use tower_http::limit::RequestBodyLimitLayer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::info;
 
 use mika_common::agent;
@@ -743,8 +743,8 @@ mod tests {
     async fn test_image_payload_converts_to_agent_params_image_source() {
         // Verify the handler's ImagePayload -> ImageSource conversion that feeds AgentParams.
         // This exercises the exact mapping the handler performs before spawning the agent task.
-        use mika_common::claude::ImageSource;
         use super::types::ImagePayload;
+        use mika_common::claude::ImageSource;
 
         let payloads = vec![
             ImagePayload {

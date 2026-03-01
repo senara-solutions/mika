@@ -35,6 +35,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
 
     let is_onboarding = check_onboarding(&ctx.async_db).await;
     let skills_dirty = AtomicBool::new(false);
+    let mcp_manager = init::connect_mcp(&ctx.home_dir).await;
 
     let output = agent::run_agent(&AgentParams {
         db: &ctx.async_db,
@@ -53,13 +54,18 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         user_images: &[],
         brave_api_key: ctx.settings.brave_api_key.as_deref(),
         skills_dirty: &skills_dirty,
-        mcp_manager: None,
+        mcp_manager: mcp_manager.as_ref(),
     })
     .await?;
 
     match output.text {
         Some(text) => println!("{text}"),
         None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
+    }
+
+    // Gracefully shut down MCP server connections
+    if let Some(mcp) = mcp_manager {
+        mcp.shutdown().await;
     }
 
     // Database shutdown happens automatically via Drop on ctx
