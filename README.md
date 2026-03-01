@@ -104,7 +104,7 @@ The agent has 8 tools organized into 3 skills:
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (226 tests)
+cargo test           # Run tests (~680 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI
