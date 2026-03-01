@@ -30,7 +30,6 @@ const MCP_SEP: &str = "__";
 
 /// A connected MCP server with its discovered tools.
 struct McpConnection {
-    name: String,
     service: RunningService<RoleClient, ()>,
     tools: Vec<rmcp::model::Tool>,
 }
@@ -284,7 +283,6 @@ async fn connect_stdio(name: &str, config: &McpServerConfig) -> Result<McpConnec
         .map_err(|e| anyhow::anyhow!("MCP server '{name}' tools/list failed: {e}"))?;
 
     Ok(McpConnection {
-        name: name.to_string(),
         service,
         tools: tools_result.tools,
     })
@@ -312,7 +310,6 @@ async fn connect_http(name: &str, config: &McpServerConfig) -> Result<McpConnect
         .map_err(|e| anyhow::anyhow!("MCP server '{name}' tools/list failed: {e}"))?;
 
     Ok(McpConnection {
-        name: name.to_string(),
         service,
         tools: tools_result.tools,
     })
