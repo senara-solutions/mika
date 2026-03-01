@@ -2,12 +2,11 @@
 name = "mika-gateway"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Telegram webhook gateway for Mika AI assistant"
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-readme = "../../README.md"
+publish = false
 
 [[bin]]
 name = "mika-gateway"

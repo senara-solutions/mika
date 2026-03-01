@@ -10,10 +10,10 @@ use std::sync::LazyLock;
 use crate::tools::{ToolContext, ToolOutput};
 
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
-static AGENT_API_SPEC: &str = include_str!("../../../../docs/openapi/mika-server.yaml");
+static AGENT_API_SPEC: &str = include_str!("../../docs/openapi/mika-server.yaml");
 
 /// Embedded architecture overview document.
-static ARCHITECTURE_OVERVIEW: &str = include_str!("../../../../docs/architecture.md");
+static ARCHITECTURE_OVERVIEW: &str = include_str!("../../docs/architecture.md");
 
 /// Known builtin function names, used for startup validation.
 pub const KNOWN_BUILTINS: &[&str] = &[

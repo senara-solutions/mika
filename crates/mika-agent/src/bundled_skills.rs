@@ -51,60 +51,60 @@ macro_rules! skill {
 }
 
 static TMUX_SKILL: BundledSkill = skill!("tmux", [
-    ("skill.toml" => "../../../templates/skills/tmux/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/tmux/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/tmux/tools.json"),
-    ("handlers/create_session.sh" => "../../../templates/skills/tmux/handlers/create_session.sh", +x),
-    ("handlers/kill_session.sh" => "../../../templates/skills/tmux/handlers/kill_session.sh", +x),
-    ("handlers/list_sessions.sh" => "../../../templates/skills/tmux/handlers/list_sessions.sh", +x),
-    ("handlers/read_output.sh" => "../../../templates/skills/tmux/handlers/read_output.sh", +x),
-    ("handlers/send_command.sh" => "../../../templates/skills/tmux/handlers/send_command.sh", +x),
-    ("handlers/wait_for_text.sh" => "../../../templates/skills/tmux/handlers/wait_for_text.sh", +x),
+    ("skill.toml" => "../templates/skills/tmux/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/tmux/system_prompt.md"),
+    ("tools.json" => "../templates/skills/tmux/tools.json"),
+    ("handlers/create_session.sh" => "../templates/skills/tmux/handlers/create_session.sh", +x),
+    ("handlers/kill_session.sh" => "../templates/skills/tmux/handlers/kill_session.sh", +x),
+    ("handlers/list_sessions.sh" => "../templates/skills/tmux/handlers/list_sessions.sh", +x),
+    ("handlers/read_output.sh" => "../templates/skills/tmux/handlers/read_output.sh", +x),
+    ("handlers/send_command.sh" => "../templates/skills/tmux/handlers/send_command.sh", +x),
+    ("handlers/wait_for_text.sh" => "../templates/skills/tmux/handlers/wait_for_text.sh", +x),
 ]);
 
 static SHELL_EXEC_SKILL: BundledSkill = skill!("shell-exec", [
-    ("skill.toml" => "../../../templates/skills/shell-exec/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/shell-exec/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/shell-exec/tools.json"),
-    ("handlers/run.sh" => "../../../templates/skills/shell-exec/handlers/run.sh", +x),
+    ("skill.toml" => "../templates/skills/shell-exec/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/shell-exec/system_prompt.md"),
+    ("tools.json" => "../templates/skills/shell-exec/tools.json"),
+    ("handlers/run.sh" => "../templates/skills/shell-exec/handlers/run.sh", +x),
 ]);
 
 static WEB_SEARCH_SKILL: BundledSkill = skill!("web-search", [
-    ("skill.toml" => "../../../templates/skills/web-search/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/web-search/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/web-search/tools.json"),
+    ("skill.toml" => "../templates/skills/web-search/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/web-search/system_prompt.md"),
+    ("tools.json" => "../templates/skills/web-search/tools.json"),
 ]);
 
 static FILE_READER_SKILL: BundledSkill = skill!("file-reader", [
-    ("skill.toml" => "../../../templates/skills/file-reader/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/file-reader/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/file-reader/tools.json"),
-    ("handlers/read.sh" => "../../../templates/skills/file-reader/handlers/read.sh", +x),
+    ("skill.toml" => "../templates/skills/file-reader/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/file-reader/system_prompt.md"),
+    ("tools.json" => "../templates/skills/file-reader/tools.json"),
+    ("handlers/read.sh" => "../templates/skills/file-reader/handlers/read.sh", +x),
 ]);
 
 static CALENDAR_SKILL: BundledSkill = skill!("calendar", [
-    ("skill.toml" => "../../../templates/skills/calendar/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/calendar/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/calendar/tools.json"),
+    ("skill.toml" => "../templates/skills/calendar/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/calendar/system_prompt.md"),
+    ("tools.json" => "../templates/skills/calendar/tools.json"),
 ]);
 
 static SELF_KNOWLEDGE_SKILL: BundledSkill = skill!("self-knowledge", [
-    ("skill.toml" => "../../../templates/skills/self-knowledge/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/self-knowledge/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/self-knowledge/tools.json"),
+    ("skill.toml" => "../templates/skills/self-knowledge/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/self-knowledge/system_prompt.md"),
+    ("tools.json" => "../templates/skills/self-knowledge/tools.json"),
 ]);
 
 static GITHUB_SKILL: BundledSkill = skill!("github", [
-    ("skill.toml" => "../../../templates/skills/github/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/github/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/github/tools.json"),
-    ("handlers/run.sh" => "../../../templates/skills/github/handlers/run.sh", +x),
+    ("skill.toml" => "../templates/skills/github/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/github/system_prompt.md"),
+    ("tools.json" => "../templates/skills/github/tools.json"),
+    ("handlers/run.sh" => "../templates/skills/github/handlers/run.sh", +x),
 ]);
 
 static MCP_SKILL: BundledSkill = skill!("mcp", [
-    ("skill.toml" => "../../../templates/skills/mcp/skill.toml"),
-    ("system_prompt.md" => "../../../templates/skills/mcp/system_prompt.md"),
-    ("tools.json" => "../../../templates/skills/mcp/tools.json"),
+    ("skill.toml" => "../templates/skills/mcp/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/mcp/system_prompt.md"),
+    ("tools.json" => "../templates/skills/mcp/tools.json"),
 ]);
 
 /// All bundled skills.

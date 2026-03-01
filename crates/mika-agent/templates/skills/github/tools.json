@@ -1,0 +1,24 @@
+[
+  {
+    "name": "run_gh",
+    "description": "Execute a GitHub CLI (gh) command. Use for interacting with GitHub repositories, pull requests, issues, workflows, and more.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The gh subcommand and arguments to execute (e.g., 'pr list --state open', 'issue create --title \"Bug\" --body \"Details\"')"
+        },
+        "repo": {
+          "type": "string",
+          "description": "Repository in OWNER/REPO format (optional, defaults to current repo context)"
+        }
+      },
+      "required": ["command"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh"
+    }
+  }
+]

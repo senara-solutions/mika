@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_committed_spec_is_current() {
         let generated = agent_openapi_yaml();
-        let committed = include_str!("../../../../docs/openapi/mika-server.yaml");
+        let committed = include_str!("../../docs/openapi/mika-server.yaml");
         assert_eq!(
             generated, committed,
             "Agent OpenAPI spec is out of date. Run ./scripts/generate-openapi.sh to update."

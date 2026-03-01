@@ -2,9 +2,11 @@
 name = "mika-agent"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Agent engine and HTTP server for Mika AI assistant"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"

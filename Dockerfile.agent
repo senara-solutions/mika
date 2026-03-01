@@ -23,7 +23,7 @@ RUN mkdir -p crates/mika-common/src && echo "pub fn _dummy() {}" > crates/mika-c
 # 3. Build dependencies only, then clean workspace crate artifacts (keep dependency cache)
 RUN cargo build --release --bin mika-server -p mika-agent || true \
     && rm -rf crates/ \
-    && rm -f target/release/mika-server target/release/mika-cli \
+    && rm -f target/release/mika-server target/release/mika \
     && rm -rf target/release/.fingerprint/mika-* \
     && rm -rf target/release/deps/libmika_* target/release/deps/mika_*
 

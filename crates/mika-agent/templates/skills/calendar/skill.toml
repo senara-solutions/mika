@@ -1,0 +1,9 @@
+[skill]
+name = "calendar"
+description = "Manage calendar events and meetings"
+version = "0.1.0"
+always_on = false
+timeout_secs = 30
+
+[triggers]
+keywords = ["calendar", "meeting", "schedule", "appointment", "event"]
