@@ -3,7 +3,9 @@ use std::path::Path;
 
 use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::attachment::ImageAttachment;
-use crate::tui::commands::autocomplete::{CompletionContext, CompletionMode, longest_common_prefix};
+use crate::tui::commands::autocomplete::{
+    CompletionContext, CompletionMode, longest_common_prefix,
+};
 
 /// Handle a mouse event (scroll wheel for conversation scrolling).
 pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
@@ -161,7 +163,9 @@ fn handle_enter_completion(app: &mut App<'_>) {
                 }
             }
         }
-        CompletionMode::Argument { items, selected, .. } => {
+        CompletionMode::Argument {
+            items, selected, ..
+        } => {
             if let Some(item) = items.get(*selected) {
                 let input = app.input_text();
                 let arg_start = find_current_arg_start(&input);

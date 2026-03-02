@@ -188,9 +188,9 @@ pub fn parse_command(input: &str) -> (&str, &str) {
 /// Find a command by name (exact match on name or alias).
 pub fn find_command(name: &str) -> Option<&'static SlashCommand> {
     let lower = name.to_lowercase();
-    COMMANDS.iter().find(|cmd| {
-        cmd.name == lower || cmd.aliases.iter().any(|a| *a == lower)
-    })
+    COMMANDS
+        .iter()
+        .find(|cmd| cmd.name == lower || cmd.aliases.iter().any(|a| *a == lower))
 }
 
 #[cfg(test)]

@@ -71,9 +71,9 @@ impl AutocompleteState {
                 self.dismiss();
             } else {
                 let selected = match &self.mode {
-                    CompletionMode::Command {
-                        selected: prev, ..
-                    } => (*prev).min(items.len().saturating_sub(1)),
+                    CompletionMode::Command { selected: prev, .. } => {
+                        (*prev).min(items.len().saturating_sub(1))
+                    }
                     _ => 0,
                 };
                 self.mode = CompletionMode::Command { items, selected };
@@ -84,12 +84,7 @@ impl AutocompleteState {
     }
 
     /// Show argument completions for a command.
-    pub fn show_arguments(
-        &mut self,
-        items: Vec<CompletionItem>,
-        title: &'static str,
-        wide: bool,
-    ) {
+    pub fn show_arguments(&mut self, items: Vec<CompletionItem>, title: &'static str, wide: bool) {
         if items.is_empty() {
             self.dismiss();
         } else {
@@ -110,7 +105,9 @@ impl AutocompleteState {
                     *selected = (*selected + 1) % items.len();
                 }
             }
-            CompletionMode::Argument { items, selected, .. } => {
+            CompletionMode::Argument {
+                items, selected, ..
+            } => {
                 if !items.is_empty() {
                     *selected = (*selected + 1) % items.len();
                 }
@@ -127,7 +124,9 @@ impl AutocompleteState {
                     *selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
                 }
             }
-            CompletionMode::Argument { items, selected, .. } => {
+            CompletionMode::Argument {
+                items, selected, ..
+            } => {
                 if !items.is_empty() {
                     *selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
                 }
@@ -140,9 +139,7 @@ impl AutocompleteState {
     #[allow(dead_code)] // used in tests
     pub fn selected_command(&self) -> Option<&'static SlashCommand> {
         match &self.mode {
-            CompletionMode::Command { items, selected } => {
-                items.get(*selected).copied()
-            }
+            CompletionMode::Command { items, selected } => items.get(*selected).copied(),
             _ => None,
         }
     }
@@ -151,12 +148,10 @@ impl AutocompleteState {
     #[allow(dead_code)] // used in tests
     pub fn selected_value(&self) -> Option<&str> {
         match &self.mode {
-            CompletionMode::Command { items, selected } => {
-                items.get(*selected).map(|cmd| cmd.name)
-            }
-            CompletionMode::Argument { items, selected, .. } => {
-                items.get(*selected).map(|item| item.value.as_str())
-            }
+            CompletionMode::Command { items, selected } => items.get(*selected).map(|cmd| cmd.name),
+            CompletionMode::Argument {
+                items, selected, ..
+            } => items.get(*selected).map(|item| item.value.as_str()),
             CompletionMode::Hidden => None,
         }
     }
@@ -164,9 +159,7 @@ impl AutocompleteState {
     /// Get all current item values (for computing common prefix).
     pub fn item_values(&self) -> Vec<&str> {
         match &self.mode {
-            CompletionMode::Command { items, .. } => {
-                items.iter().map(|cmd| cmd.name).collect()
-            }
+            CompletionMode::Command { items, .. } => items.iter().map(|cmd| cmd.name).collect(),
             CompletionMode::Argument { items, .. } => {
                 items.iter().map(|item| item.value.as_str()).collect()
             }
