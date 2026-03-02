@@ -1,7 +1,7 @@
 ---
 title: "fix: Tab completion cursor jumps to position 0"
 type: fix
-status: active
+status: completed
 date: 2026-03-02
 ---
 
