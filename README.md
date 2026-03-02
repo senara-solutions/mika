@@ -105,11 +105,13 @@ The agent has 8 builtin tools and 6 conditional management tools:
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (~703 tests)
+cargo test           # Run tests (~745 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, commit conventions, and quality gates.
 
 ## Documentation
 
@@ -121,6 +123,7 @@ cargo run --bin mika # Run TUI CLI
 | [Configuration](docs/configuration.md) | All | Settings reference, directory layout |
 | [Slash Commands](docs/slash-commands.md) | End users | TUI command reference |
 | [Deployment](docs/deployment.md) | Operators | Docker images, container deployment |
+| [Contributing](CONTRIBUTING.md) | Contributors | Development workflow, conventions, quality gates |
 
 ## Current Status
 
