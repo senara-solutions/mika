@@ -1,6 +1,24 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.1.3](https://github.com/senara-solutions/mika/releases/tag/v0.1.3) — 2026-03-02
+
+### Added
+
+- add agent and team management tools
+
+### Changed
+
+- standardize jq JSON parsing and add env scrubbing to handlers
+
+### Documentation
+
+- update documentation for agent management tools
+
+### Fixed
+
+- use jq for JSON parsing in shell-exec handler
+
 ## [0.1.2](https://github.com/senara-solutions/mika/releases/tag/v0.1.2) — 2026-03-01
 
 ### Added
