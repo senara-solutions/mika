@@ -243,15 +243,27 @@ async fn execute_exec(
         );
     }
 
-    let mut child = tokio::process::Command::new(&cmd_path)
-        .current_dir(skill_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut child = loop {
+        match tokio::process::Command::new(&cmd_path)
+            .current_dir(skill_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(e) if e.raw_os_error() == Some(26 /* ETXTBSY */) => {
+                // ETXTBSY — another process has the file open for writing.
+                // Retry after a brief yield (common fork+exec race).
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
 
     // Write input JSON to stdin and close.
     // Ignore BrokenPipe — the child may exit without reading stdin.
@@ -404,7 +416,9 @@ mod tests {
         let file = std::fs::File::create(path).unwrap();
         let mut writer = std::io::BufWriter::new(file);
         writer.write_all(content.as_bytes()).unwrap();
-        writer.into_inner().unwrap().sync_all().unwrap();
+        let file = writer.into_inner().unwrap();
+        file.sync_all().unwrap();
+        drop(file); // Explicitly close before chmod
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
