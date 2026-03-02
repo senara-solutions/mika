@@ -13,7 +13,11 @@ use crate::init;
 pub async fn run(message: &str, agent_name: &str) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
     let session_id = Uuid::new_v4().to_string();
-    let tool_registry = Arc::new(tools::default_tools());
+    let mut tool_registry = tools::default_tools();
+    for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
+        tool_registry.register(tool);
+    }
+    let tool_registry = Arc::new(tool_registry);
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
     let http_client = reqwest::Client::new();
     let message_sender =
@@ -55,6 +59,7 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
         brave_api_key: ctx.settings.brave_api_key.as_deref(),
         skills_dirty: &skills_dirty,
         mcp_manager: mcp_manager.as_ref(),
+        global_home_dir: Some(&ctx.global_home),
     })
     .await?;
 

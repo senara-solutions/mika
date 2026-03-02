@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 
 use mika_common::agent;
 use mika_common::claude::ClaudeClient;
+use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use secrecy::SecretString;
 
@@ -47,6 +48,8 @@ pub struct AppState {
     pub startup_time: std::time::Instant,
     pub http_client: reqwest::Client,
     pub brave_api_key: Option<String>,
+    pub global_home_dir: PathBuf,
+    pub settings: Settings,
 }
 
 impl AppState {

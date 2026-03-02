@@ -137,7 +137,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         settings.claude_model.clone(),
         settings.claude_max_tokens,
     )?;
-    let tool_registry = Arc::new(tools::default_tools());
+    let mut tool_registry = tools::default_tools();
+    for tool in tools::management_tools_if_needed(global_home, settings) {
+        tool_registry.register(tool);
+    }
+    let tool_registry = Arc::new(tool_registry);
     let ready = Arc::new(AtomicBool::new(false));
     let http_client = reqwest::Client::new();
 
@@ -239,6 +243,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         startup_time: std::time::Instant::now(),
         http_client,
         brave_api_key: settings.brave_api_key.clone(),
+        global_home_dir: global_home.to_path_buf(),
+        settings: settings.clone(),
     };
 
     let app = build_router(state);
@@ -336,6 +342,25 @@ mod tests {
             startup_time: std::time::Instant::now(),
             http_client: reqwest::Client::new(),
             brave_api_key: None,
+            global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
+            settings: Settings {
+                anthropic_api_key: Some("test-key".to_string()),
+                claude_model: "claude-sonnet-4-6".to_string(),
+                claude_max_tokens: 4096,
+                db_path: std::path::PathBuf::from("/tmp/mika-test/data/mika.db"),
+                log_level: "info".to_string(),
+                routing_url: None,
+                customer_id: None,
+                server_port: 8080,
+                internal_token: None,
+                openai_api_key: None,
+                embedding_model: "text-embedding-3-small".to_string(),
+                embedding_dimensions: 512,
+                brave_api_key: None,
+                home_dir: std::path::PathBuf::from("/tmp/mika-test"),
+                server_log_file: None,
+                disable_bundled_skills: false,
+            },
         }
     }
 

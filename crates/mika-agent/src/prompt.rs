@@ -1,6 +1,6 @@
 use crate::db::{Commitment, CoreMemoryEntry, core_memory_section_names};
 use chrono::{DateTime, Utc};
-use mika_common::team;
+use mika_common::{agent, team};
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
@@ -188,24 +188,48 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push('\n');
     }
 
-    // Teams section (only if teams are configured)
+    // Agents & Teams section (only if multiple agents or teams are configured)
     if let Some(home_dir) = ctx.global_home_dir {
+        let agents = agent::list_agents(home_dir);
         let teams = team::list_teams(home_dir);
-        if !teams.is_empty() {
-            prompt.push_str("\n## Teams\n");
-            prompt.push_str(
-                "You can run team workflows using the `run_team` tool. Available teams:\n",
-            );
-            for name in &teams {
-                match team::load_team(home_dir, name) {
-                    Ok(def) => {
-                        writeln!(prompt, "- {} ({} agents)", name, def.agents.len()).unwrap();
-                    }
-                    Err(_) => {
-                        writeln!(prompt, "- {} (unable to load)", name).unwrap();
+
+        if agents.len() > 1 || !teams.is_empty() {
+            prompt.push_str("\n## Agents & Teams\n");
+            writeln!(
+                prompt,
+                "You are {} {}. Do not delegate tasks to yourself.\n",
+                ctx.identity.emoji, ctx.identity.name
+            )
+            .unwrap();
+
+            if agents.len() > 1 {
+                prompt.push_str(
+                    "You can delegate tasks to other agents using `delegate_task`. Available agents:\n",
+                );
+                for name in &agents {
+                    let agent_home = agent::agent_dir(home_dir, name);
+                    let identity = load_identity(&agent_home);
+                    writeln!(prompt, "- {} ({} {})", name, identity.emoji, identity.name).unwrap();
+                }
+            }
+
+            if !teams.is_empty() {
+                prompt.push_str("You can run team workflows using `run_team`. Available teams:\n");
+                for name in &teams {
+                    match team::load_team(home_dir, name) {
+                        Ok(def) => {
+                            writeln!(prompt, "- {} ({} agents)", name, def.agents.len()).unwrap();
+                        }
+                        Err(_) => {
+                            writeln!(prompt, "- {} (unable to load)", name).unwrap();
+                        }
                     }
                 }
             }
+
+            prompt.push_str(
+                "Use `list_agents` for details. Use `get_team_status`/`get_team_history` for run results.\n",
+            );
         }
     }
 
@@ -241,6 +265,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     );
     prompt.push_str(
         "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_file on that path to view the image contents.\n",
+    );
+    prompt.push_str(
+        "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
     );
 
     prompt
@@ -746,13 +773,82 @@ max_iterations = 3
         };
 
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Teams"));
+        assert!(prompt.contains("## Agents & Teams"));
         assert!(prompt.contains("run_team"));
         assert!(prompt.contains("dev-team (2 agents)"));
     }
 
     #[test]
-    fn test_prompt_omits_teams_when_none_configured() {
+    fn test_prompt_includes_agents_when_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create two agents
+        let main_dir = tmp.path().join("agents").join("main");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        std::fs::write(main_dir.join("config.toml"), "# config").unwrap();
+        std::fs::write(
+            main_dir.join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
+
+        let researcher_dir = tmp.path().join("agents").join("researcher");
+        std::fs::create_dir_all(&researcher_dir).unwrap();
+        std::fs::write(researcher_dir.join("config.toml"), "# config").unwrap();
+        std::fs::write(
+            researcher_dir.join("identity.toml"),
+            "name = \"Rex\"\nemoji = \"🔬\"\n",
+        )
+        .unwrap();
+
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: Some(tmp.path()),
+            channel_type: None,
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Agents & Teams"));
+        assert!(prompt.contains("delegate_task"));
+        assert!(prompt.contains("main (✦ Mika)"));
+        assert!(prompt.contains("researcher (🔬 Rex)"));
+    }
+
+    #[test]
+    fn test_prompt_omits_agents_teams_when_single_agent_no_teams() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Single agent only
+        let main_dir = tmp.path().join("agents").join("main");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        std::fs::write(main_dir.join("config.toml"), "# config").unwrap();
+
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: Some(tmp.path()),
+            channel_type: None,
+            telegram_configured: false,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Agents & Teams"));
+    }
+
+    #[test]
+    fn test_prompt_omits_agents_teams_when_none_configured() {
         let tmp = tempfile::tempdir().unwrap();
         let identity = test_identity();
         let ctx = PromptContext {
@@ -768,11 +864,11 @@ max_iterations = 3
         };
 
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Teams"));
+        assert!(!prompt.contains("## Agents & Teams"));
     }
 
     #[test]
-    fn test_prompt_omits_teams_when_home_dir_none() {
+    fn test_prompt_omits_agents_teams_when_home_dir_none() {
         let identity = test_identity();
         let ctx = PromptContext {
             soul_content: "",
@@ -787,7 +883,7 @@ max_iterations = 3
         };
 
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Teams"));
+        assert!(!prompt.contains("## Agents & Teams"));
     }
 
     #[test]

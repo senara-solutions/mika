@@ -1,8 +1,12 @@
 mod cancel_reminder;
 mod create_reminder;
 mod create_skill;
+mod delegate_task;
 mod delete_skill;
 mod get_config;
+mod get_team_history;
+mod get_team_status;
+mod list_agents;
 mod list_reminders;
 mod list_skills;
 mod list_teams;
@@ -62,6 +66,12 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given JSON input.
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>;
+
+    /// Optional per-tool timeout override (in seconds).
+    /// Returns `None` to use the default agent tool timeout.
+    fn timeout_secs(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Image data produced by a tool, ready for inclusion in a Claude API tool_result.
@@ -232,18 +242,48 @@ pub fn default_tools() -> ToolRegistry {
     registry
 }
 
-/// Create team-related tools (list_teams + run_team).
+/// Return management tools only when the system has multiple agents or teams.
 ///
+/// Checks the filesystem and returns an empty vec when the current setup
+/// is single-agent with no teams (the common case), avoiding unnecessary
+/// tool exposure.
+pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
+    let agents = mika_common::agent::list_agents(home_dir);
+    let teams = mika_common::team::list_teams(home_dir);
+    if agents.len() > 1 || !teams.is_empty() {
+        management_tools(home_dir, settings)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Create management tools for multi-agent and team workflows.
+///
+/// Includes agent listing, delegation, team execution, and team status/history.
 /// These are separate from `default_tools()` so they can be conditionally
-/// added only when teams are configured.
-pub fn team_agent_tools(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
+/// added only when multiple agents or teams are configured.
+/// Prefer `management_tools_if_needed()` which checks the condition automatically.
+pub fn management_tools(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
     vec![
+        Box::new(list_agents::ListAgentsTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
         Box::new(list_teams::ListTeamsTool {
             home_dir: home_dir.to_path_buf(),
         }),
         Box::new(run_team::RunTeamTool {
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
+        }),
+        Box::new(delegate_task::DelegateTaskTool {
+            home_dir: home_dir.to_path_buf(),
+            settings: settings.clone(),
+        }),
+        Box::new(get_team_status::GetTeamStatusTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
+        Box::new(get_team_history::GetTeamHistoryTool {
+            home_dir: home_dir.to_path_buf(),
         }),
     ]
 }
