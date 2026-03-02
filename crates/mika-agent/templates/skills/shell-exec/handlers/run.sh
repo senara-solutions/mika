@@ -6,8 +6,16 @@
 # SECURITY: This handler executes arbitrary commands. Use responsibly.
 
 INPUT=$(cat)
-COMMAND=$(echo "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
-WORKDIR=$(echo "$INPUT" | grep -o '"working_dir":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+# Parse JSON fields (jq preferred, grep/cut fallback)
+if command -v jq >/dev/null 2>&1; then
+    COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')
+    WORKDIR=$(printf '%s\n' "$INPUT" | jq -r '.working_dir // empty')
+else
+    # Fallback: grep-based extraction (cannot handle embedded quotes)
+    COMMAND=$(printf '%s\n' "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
+    WORKDIR=$(printf '%s\n' "$INPUT" | grep -o '"working_dir":"[^"]*"' | head -1 | cut -d'"' -f4)
+fi
 
 if [ -z "$COMMAND" ]; then
     echo "Error: no command provided" >&2
