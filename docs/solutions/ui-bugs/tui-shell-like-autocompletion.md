@@ -92,3 +92,5 @@ Eight commands have completers:
 2. **Config value completion**: `complete_config` at arg_index 2 must check the actual config key from `ctx.args_str` before offering values. Only `thinking_level` has enumerable values — other keys return empty completions.
 
 3. **Backspace boundary**: When backspace removes the space between command and args, the input no longer contains a space so `update_command()` naturally transitions back to command mode.
+
+4. **Cursor positioning after `set_textarea()`**: `TextArea::from(...)` defaults cursor to (0, 0). The `set_textarea()` helper must call `move_cursor(CursorMove::End)` after construction to place the cursor at the end of the completed text. Without this, any further typing inserts at position 0 instead of after the completion.

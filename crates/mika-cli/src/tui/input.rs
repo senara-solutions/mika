@@ -384,10 +384,12 @@ fn find_current_arg_start(input: &str) -> usize {
 }
 
 /// Set the textarea to new content, preserving style settings.
+/// Cursor is placed at the end of the text.
 fn set_textarea(app: &mut App<'_>, text: &str) {
     app.textarea = tui_textarea::TextArea::from(vec![text.to_string()]);
     app.textarea
         .set_cursor_line_style(ratatui::style::Style::default());
+    app.textarea.move_cursor(tui_textarea::CursorMove::End);
 }
 
 /// Maximum paste size (100KB) to prevent UI freezing.
