@@ -98,7 +98,7 @@ pub fn complete_memory(
 pub fn complete_config(
     arg_text: &str,
     arg_index: usize,
-    _ctx: &CompletionContext,
+    ctx: &CompletionContext,
 ) -> (Vec<CompletionItem>, &'static str) {
     match arg_index {
         0 => {
@@ -127,26 +127,34 @@ pub fn complete_config(
             (filter_by_prefix(items, arg_text), " Config Keys ")
         }
         2 => {
-            // Value completions for specific keys — only thinking_level has enumerable values
-            let items = vec![
-                CompletionItem {
-                    value: "low".to_string(),
-                    description: None,
-                },
-                CompletionItem {
-                    value: "medium".to_string(),
-                    description: None,
-                },
-                CompletionItem {
-                    value: "high".to_string(),
-                    description: None,
-                },
-                CompletionItem {
-                    value: "off".to_string(),
-                    description: None,
-                },
-            ];
-            (filter_by_prefix(items, arg_text), " Values ")
+            // Value completions — only for keys with enumerable values.
+            // Check the previous arg (the config key) from args_str.
+            let prev_args: Vec<&str> = ctx.args_str.split_whitespace().collect();
+            let key = prev_args.get(1).copied().unwrap_or("");
+            match key {
+                "thinking_level" => {
+                    let items = vec![
+                        CompletionItem {
+                            value: "low".to_string(),
+                            description: None,
+                        },
+                        CompletionItem {
+                            value: "medium".to_string(),
+                            description: None,
+                        },
+                        CompletionItem {
+                            value: "high".to_string(),
+                            description: None,
+                        },
+                        CompletionItem {
+                            value: "off".to_string(),
+                            description: None,
+                        },
+                    ];
+                    (filter_by_prefix(items, arg_text), " Values ")
+                }
+                _ => (vec![], " Config "),
+            }
         }
         _ => (vec![], " Config "),
     }
@@ -288,9 +296,10 @@ fn complete_file_path(prefix: &str, cwd: &Path) -> Vec<CompletionItem> {
     items
 }
 
-/// Expand `~` to the user's home directory.
+/// Expand `~` or `~/...` to the user's home directory.
+/// Does NOT expand `~otheruser` forms.
 fn expand_tilde(path: &str) -> String {
-    if path.starts_with('~')
+    if (path == "~" || path.starts_with("~/"))
         && let Some(home) = std::env::var_os("HOME")
     {
         return path.replacen('~', &home.to_string_lossy(), 1);
@@ -330,6 +339,10 @@ mod tests {
     use mika_agent::skills::SkillRegistry;
 
     fn test_ctx(cwd: &Path) -> CompletionContext<'_> {
+        test_ctx_with_args(cwd, "")
+    }
+
+    fn test_ctx_with_args<'a>(cwd: &'a Path, args_str: &'a str) -> CompletionContext<'a> {
         let registry = SkillRegistry::empty();
         // Leak to get 'static-like lifetime for test — fine in tests
         let skills = Box::leak(Box::new(registry));
@@ -339,6 +352,7 @@ mod tests {
             skills,
             current_agent: "main",
             cwd,
+            args_str,
         }
     }
 
@@ -462,6 +476,27 @@ mod tests {
         }];
         let filtered = filter_by_prefix(items, "");
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_complete_config_values_thinking_level() {
+        let ctx = test_ctx_with_args(Path::new("/tmp"), "set thinking_level ");
+        let (items, title) = complete_config("", 2, &ctx);
+        assert_eq!(items.len(), 4);
+        assert_eq!(title, " Values ");
+    }
+
+    #[test]
+    fn test_complete_config_values_other_key_empty() {
+        let ctx = test_ctx_with_args(Path::new("/tmp"), "set timezone ");
+        let (items, _) = complete_config("", 2, &ctx);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_expand_tilde_rejects_other_user() {
+        let result = expand_tilde("~otheruser/docs");
+        assert_eq!(result, "~otheruser/docs");
     }
 
     #[test]

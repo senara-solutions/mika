@@ -20,6 +20,8 @@ pub struct CompletionContext<'a> {
     pub skills: &'a SkillRegistry,
     pub current_agent: &'a str,
     pub cwd: &'a Path,
+    /// Full args string (everything after the command name), for multi-arg completers.
+    pub args_str: &'a str,
 }
 
 /// What kind of completion is active.

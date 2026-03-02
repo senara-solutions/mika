@@ -339,6 +339,7 @@ fn trigger_argument_completion(app: &mut App<'_>) {
         skills: &app.skills,
         current_agent: &app.agent_name,
         cwd: &cwd,
+        args_str,
     };
 
     let (items, title) = completer(arg_prefix, arg_index, &ctx);
