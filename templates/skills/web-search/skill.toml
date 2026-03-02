@@ -1,9 +1,0 @@
-[skill]
-name = "web-search"
-description = "Search the web for current information"
-version = "0.1.0"
-always_on = false
-timeout_secs = 30
-
-[triggers]
-keywords = ["search", "look up", "find online", "google", "latest"]
