@@ -2,6 +2,7 @@ pub mod builtin_handlers;
 pub mod executor;
 pub mod index;
 pub mod manifest;
+pub(crate) mod marketplace;
 pub mod matcher;
 
 use std::path::Path;

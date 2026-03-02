@@ -12,7 +12,7 @@ use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
 pub struct CreateSkillTool;
 
 /// Maximum allowed length for skill name.
-pub(super) const MAX_SKILL_NAME_LEN: usize = 50;
+pub(crate) const MAX_SKILL_NAME_LEN: usize = 50;
 
 /// Maximum number of keywords per skill.
 pub(super) const MAX_KEYWORDS: usize = 50;
@@ -22,7 +22,7 @@ pub(super) const MAX_KEYWORD_LEN: usize = 100;
 
 /// Verify that a skill directory is actually inside the skills root.
 /// Guards against symlink attacks where a skill name resolves outside the expected directory.
-pub(super) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(), String> {
+pub(crate) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(), String> {
     match (skills_dir.canonicalize(), skill_dir.canonicalize()) {
         (Ok(parent), Ok(child)) if child.starts_with(&parent) => Ok(()),
         (Ok(_), Ok(_)) => {
@@ -33,7 +33,7 @@ pub(super) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(
 }
 
 /// Validate a skill description: non-empty and within length limit.
-pub(super) fn validate_description(desc: &str) -> Result<(), String> {
+pub(crate) fn validate_description(desc: &str) -> Result<(), String> {
     if desc.is_empty() {
         return Err("Description cannot be empty.".to_string());
     }
@@ -47,7 +47,7 @@ pub(super) fn validate_description(desc: &str) -> Result<(), String> {
 }
 
 /// Validate a system prompt: non-empty and within length limit.
-pub(super) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
+pub(crate) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
     if prompt.is_empty() {
         return Err("System prompt cannot be empty.".to_string());
     }
@@ -61,7 +61,7 @@ pub(super) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
 }
 
 /// Validate keywords: count and individual length limits.
-pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
+pub(crate) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
     if keywords.len() > MAX_KEYWORDS {
         return Err(format!(
             "Too many keywords ({}, max {MAX_KEYWORDS}).",
@@ -78,7 +78,7 @@ pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
 }
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
-pub(super) fn validate_skill_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Skill name cannot be empty.".to_string());
     }
