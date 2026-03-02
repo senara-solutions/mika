@@ -491,7 +491,7 @@ fn draw_autocomplete(f: &mut Frame<'_>, app: &App<'_>, input_area: Rect) {
 
     // Adapt width based on completion mode
     let max_width = match &app.autocomplete.mode {
-        CompletionMode::Argument { title: t, .. } if *t == " Files " => {
+        CompletionMode::Argument { wide: true, .. } => {
             80u16.min(input_area.width.saturating_sub(2))
         }
         _ => 55u16.min(input_area.width.saturating_sub(2)),
@@ -512,7 +512,7 @@ fn draw_autocomplete(f: &mut Frame<'_>, app: &App<'_>, input_area: Rect) {
             .iter()
             .take(10)
             .enumerate()
-            .map(|(i, (cmd, _item))| {
+            .map(|(i, cmd)| {
                 let args = cmd.args_hint.unwrap_or("");
                 let text = format!("/{} {} \u{2014} {}", cmd.name, args, cmd.description);
                 let style = if i == selected {

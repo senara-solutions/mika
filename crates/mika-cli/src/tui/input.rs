@@ -89,7 +89,7 @@ fn handle_tab_completion(app: &mut App<'_>) {
                 app.autocomplete.update_command(&new_input);
             } else if items.len() == 1 {
                 // Unique match: complete fully
-                let cmd = items[0].0;
+                let cmd = items[0];
                 if cmd.args_hint.is_some() {
                     // Command takes args: complete and add space for argument input
                     let new_input = format!("/{} ", cmd.name);
@@ -141,7 +141,7 @@ fn handle_tab_completion(app: &mut App<'_>) {
 fn handle_enter_completion(app: &mut App<'_>) {
     match &app.autocomplete.mode {
         CompletionMode::Command { items, selected } => {
-            if let Some((cmd, _)) = items.get(*selected) {
+            if let Some(cmd) = items.get(*selected) {
                 let cmd_name = cmd.name;
                 let has_args = cmd.args_hint.is_some();
 
@@ -343,7 +343,8 @@ fn trigger_argument_completion(app: &mut App<'_>) {
     };
 
     let (items, title) = completer(arg_prefix, arg_index, &ctx);
-    app.autocomplete.show_arguments(cmd.name, items, title);
+    let wide = title == " Files ";
+    app.autocomplete.show_arguments(items, title, wide);
 }
 
 /// Parse args string to determine which argument index and prefix we're on.

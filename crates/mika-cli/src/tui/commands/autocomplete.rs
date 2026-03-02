@@ -30,17 +30,17 @@ pub enum CompletionMode {
     Hidden,
     /// Completing a command name after "/".
     Command {
-        items: Vec<(&'static SlashCommand, CompletionItem)>,
+        items: Vec<&'static SlashCommand>,
         selected: usize,
     },
     /// Completing an argument for a known command.
     Argument {
-        #[allow(dead_code)]
-        command_name: &'static str,
         items: Vec<CompletionItem>,
         selected: usize,
         /// Popup title for this argument context (e.g., " Models ", " Agents ").
         title: &'static str,
+        /// Whether the popup should use a wider layout (e.g., for file paths).
+        wide: bool,
     },
 }
 
@@ -66,26 +66,10 @@ impl AutocompleteState {
     pub fn update_command(&mut self, input: &str) {
         if input.starts_with('/') && !input[1..].contains(' ') {
             let prefix = &input[1..];
-            let commands = filter_commands(prefix);
-            if commands.is_empty() {
+            let items = filter_commands(prefix);
+            if items.is_empty() {
                 self.dismiss();
             } else {
-                let items: Vec<_> = commands
-                    .into_iter()
-                    .map(|cmd| {
-                        let args = cmd.args_hint.unwrap_or("");
-                        let desc = if args.is_empty() {
-                            cmd.description.to_string()
-                        } else {
-                            format!("{args} \u{2014} {}", cmd.description)
-                        };
-                        let item = CompletionItem {
-                            value: cmd.name.to_string(),
-                            description: Some(desc),
-                        };
-                        (cmd, item)
-                    })
-                    .collect();
                 let selected = match &self.mode {
                     CompletionMode::Command {
                         selected: prev, ..
@@ -102,18 +86,18 @@ impl AutocompleteState {
     /// Show argument completions for a command.
     pub fn show_arguments(
         &mut self,
-        command_name: &'static str,
         items: Vec<CompletionItem>,
         title: &'static str,
+        wide: bool,
     ) {
         if items.is_empty() {
             self.dismiss();
         } else {
             self.mode = CompletionMode::Argument {
-                command_name,
                 items,
                 selected: 0,
                 title,
+                wide,
             };
         }
     }
@@ -157,7 +141,7 @@ impl AutocompleteState {
     pub fn selected_command(&self) -> Option<&'static SlashCommand> {
         match &self.mode {
             CompletionMode::Command { items, selected } => {
-                items.get(*selected).map(|(cmd, _)| *cmd)
+                items.get(*selected).copied()
             }
             _ => None,
         }
@@ -168,7 +152,7 @@ impl AutocompleteState {
     pub fn selected_value(&self) -> Option<&str> {
         match &self.mode {
             CompletionMode::Command { items, selected } => {
-                items.get(*selected).map(|(_, item)| item.value.as_str())
+                items.get(*selected).map(|cmd| cmd.name)
             }
             CompletionMode::Argument { items, selected, .. } => {
                 items.get(*selected).map(|item| item.value.as_str())
@@ -181,7 +165,7 @@ impl AutocompleteState {
     pub fn item_values(&self) -> Vec<&str> {
         match &self.mode {
             CompletionMode::Command { items, .. } => {
-                items.iter().map(|(_, item)| item.value.as_str()).collect()
+                items.iter().map(|cmd| cmd.name).collect()
             }
             CompletionMode::Argument { items, .. } => {
                 items.iter().map(|item| item.value.as_str()).collect()
@@ -363,7 +347,6 @@ mod tests {
     fn test_argument_mode() {
         let mut state = AutocompleteState::new();
         state.show_arguments(
-            "model",
             vec![
                 CompletionItem {
                     value: "sonnet".to_string(),
@@ -375,6 +358,7 @@ mod tests {
                 },
             ],
             " Models ",
+            false,
         );
         assert!(state.visible());
         assert_eq!(state.item_count(), 2);
@@ -388,7 +372,7 @@ mod tests {
     #[test]
     fn test_argument_mode_empty_dismisses() {
         let mut state = AutocompleteState::new();
-        state.show_arguments("model", vec![], " Models ");
+        state.show_arguments(vec![], " Models ", false);
         assert!(!state.visible());
     }
 
