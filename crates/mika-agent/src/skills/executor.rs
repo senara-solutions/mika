@@ -498,6 +498,27 @@ mod tests {
         assert_eq!(parsed, input);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_command_with_quotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler_dir = tmp.path().join("handlers");
+        fs::create_dir_all(&handler_dir).unwrap();
+        write_script(
+            &handler_dir.join("run.sh"),
+            include_str!("../../templates/skills/shell-exec/handlers/run.sh"),
+        );
+
+        let tool = make_exec_tool(tmp.path(), "handlers/run.sh");
+        let input = serde_json::json!({"command": "echo \"hello world\""});
+        let output = execute_skill_tool(&tool, input, 30).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("hello world"),
+            "expected 'hello world' in output, got: {}",
+            output.content
+        );
+    }
+
     #[test]
     fn test_truncate_output() {
         assert_eq!(truncate_output("short"), "short");

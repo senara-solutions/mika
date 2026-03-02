@@ -5,25 +5,18 @@
 # Output: matched line on stdout, or timeout error on stderr
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed" >&2; exit 1; }
 
 # Prevent nested tmux client issues when spawned from within tmux
 unset TMUX TMUX_PANE
 
 INPUT=$(cat)
 
-if command -v jq >/dev/null 2>&1; then
-    SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
-    PATTERN=$(printf '%s\n' "$INPUT" | jq -r '.pattern // empty')
-    TIMEOUT=$(printf '%s\n' "$INPUT" | jq -r '.timeout // 15')
-    USE_REGEX=$(printf '%s\n' "$INPUT" | jq -r '.regex // false')
-else
-    SESSION=$(printf '%s\n' "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
-    PATTERN=$(printf '%s\n' "$INPUT" | grep -o '"pattern":"[^"]*"' | head -1 | cut -d'"' -f4)
-    TIMEOUT=$(printf '%s\n' "$INPUT" | grep -o '"timeout":[0-9]*' | head -1 | cut -d':' -f2)
-    USE_REGEX=$(printf '%s\n' "$INPUT" | grep -o '"regex":true' | head -1)
-    if [ -z "$TIMEOUT" ]; then TIMEOUT=15; fi
-    if [ -n "$USE_REGEX" ]; then USE_REGEX="true"; else USE_REGEX="false"; fi
-fi
+# Parse JSON fields
+SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
+PATTERN=$(printf '%s\n' "$INPUT" | jq -r '.pattern // empty')
+TIMEOUT=$(printf '%s\n' "$INPUT" | jq -r '.timeout // empty')
+USE_REGEX=$(printf '%s\n' "$INPUT" | jq -r 'if .regex == true then "true" else "" end')
 
 if [ -z "$SESSION" ]; then
     echo "Error: session name is required" >&2

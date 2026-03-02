@@ -4,24 +4,18 @@
 # Output: confirmation on stdout, errors on stderr
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed" >&2; exit 1; }
 
 # Prevent nested tmux client issues when spawned from within tmux
 unset TMUX TMUX_PANE
 
 INPUT=$(cat)
 
-if command -v jq >/dev/null 2>&1; then
-    SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
-    TEXT=$(printf '%s\n' "$INPUT" | jq -r '.text // empty')
-    SPECIAL_KEY=$(printf '%s\n' "$INPUT" | jq -r '.special_key // empty')
-    NO_ENTER=$(printf '%s\n' "$INPUT" | jq -r '.no_enter // false')
-else
-    SESSION=$(printf '%s\n' "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
-    TEXT=$(printf '%s\n' "$INPUT" | grep -o '"text":"[^"]*"' | head -1 | cut -d'"' -f4)
-    SPECIAL_KEY=$(printf '%s\n' "$INPUT" | grep -o '"special_key":"[^"]*"' | head -1 | cut -d'"' -f4)
-    NO_ENTER=$(printf '%s\n' "$INPUT" | grep -o '"no_enter":true' | head -1)
-    if [ -n "$NO_ENTER" ]; then NO_ENTER="true"; else NO_ENTER="false"; fi
-fi
+# Parse JSON fields
+SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
+TEXT=$(printf '%s\n' "$INPUT" | jq -r '.text // empty')
+SPECIAL_KEY=$(printf '%s\n' "$INPUT" | jq -r '.special_key // empty')
+NO_ENTER=$(printf '%s\n' "$INPUT" | jq -r 'if .no_enter == true then "true" else "" end')
 
 if [ -z "$SESSION" ]; then
     echo "Error: session name is required" >&2

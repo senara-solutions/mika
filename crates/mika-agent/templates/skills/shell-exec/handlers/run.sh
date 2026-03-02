@@ -5,9 +5,16 @@
 #
 # SECURITY: This handler executes arbitrary commands. Use responsibly.
 
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed" >&2; exit 1; }
+
 INPUT=$(cat)
-COMMAND=$(echo "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
-WORKDIR=$(echo "$INPUT" | grep -o '"working_dir":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+# Scrub sensitive env vars so subprocesses cannot leak them
+unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
+
+# Parse JSON fields
+COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')
+WORKDIR=$(printf '%s\n' "$INPUT" | jq -r '.working_dir // empty')
 
 if [ -z "$COMMAND" ]; then
     echo "Error: no command provided" >&2
