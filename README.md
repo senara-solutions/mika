@@ -92,19 +92,20 @@ crates/
 
 ## Tools
 
-The agent has 8 tools organized into 3 skills:
+The agent has 8 builtin tools and 6 conditional management tools:
 
-| Skill | Tools | Description |
-|-------|-------|-------------|
+| Category | Tools | Description |
+|----------|-------|-------------|
 | Memory | `update_core_memory`, `store_fact`, `search_memory`, `update_fact` | Persistent memory management |
 | Reminders | `create_reminder`, `list_reminders`, `cancel_reminder` | Time-based reminders |
 | Messaging | `send_message` | Proactive outbound messages |
+| Management | `list_agents`, `delegate_task`, `list_teams`, `run_team`, `get_team_status`, `get_team_history` | Multi-agent delegation and team workflows (registered only when multiple agents or teams exist) |
 
 ## Development
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (~680 tests)
+cargo test           # Run tests (~703 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI

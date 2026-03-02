@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -125,7 +125,7 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `MAX_TOOL_STEPS` | 10 | Maximum tool-use iterations per agent turn |
-| `TOOL_TIMEOUT_SECS` | 30 | Per-tool execution timeout (seconds) |
+| `TOOL_TIMEOUT_SECS` | 30 | Default per-tool execution timeout (overridable via `Tool::timeout_secs()`) |
 | `AGENT_TOTAL_TIMEOUT_SECS` | 300 | Total agent loop timeout (5 minutes) |
 | `CONTINUATION_TIMEOUT_SECS` | 60 | Continuation turn timeout after max steps |
 
@@ -177,6 +177,8 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ## 6. Tools
 
+### Builtin Tools
+
 All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
@@ -191,9 +193,27 @@ All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `cancel_reminder` | Cancel a pending reminder by ID. | Reminders |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
 
+### Management Tools
+
+6 tools for multi-agent and team workflows, registered conditionally via
+`management_tools_if_needed()` only when `agents.len() > 1 || !teams.is_empty()`:
+
+| Tool | Description | Timeout |
+|------|-------------|---------|
+| `list_agents` | List all configured agents with their identities and role hints. | default (30s) |
+| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s |
+| `list_teams` | List all configured teams with agent counts. | default (30s) |
+| `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s |
+| `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) |
+| `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) |
+
+Management tools are NOT registered for team sub-agents or delegated agents,
+preventing infinite delegation chains.
+
 **Tool trait:** `#[async_trait]` with `Send + Sync` bounds (required for `tokio::spawn`
 in server handlers). Each tool validates inputs: empty string check + 10,000 character
-maximum (`MAX_INPUT_LEN`).
+maximum (`MAX_INPUT_LEN`). Per-tool timeout override via `timeout_secs()` default method
+(returns `None` to use the 30s default).
 
 
 ## 7. Conversation Compaction
@@ -323,6 +343,23 @@ sends in a background task (does not block message processing).
 - Active agent tracked in `~/.mika/active_agent`
 - CLI `--agent` flag overrides active agent
 - Server discovers all agents on startup
+- `AgentParams` carries `global_home_dir: Option<&Path>` (global `~/.mika/`) distinct from
+  per-agent `home_dir` (e.g. `~/.mika/agents/main/`) for agent/team discovery
+
+### Agent Delegation
+
+When multiple agents are configured, the primary agent can delegate tasks to other
+agents via the `delegate_task` tool. The delegate runs with its own personality,
+memory, and skills but receives only `default_tools()` (no management tools, no MCP)
+to prevent infinite delegation chains. The system prompt includes an "Agents & Teams"
+section listing available agents with their identities (emoji + name).
+
+### Team Workflows
+
+Teams are defined in `~/.mika/teams/{name}/team.toml` and orchestrated by the
+`run_team` tool. Team history is persisted as TOML files in
+`~/.mika/teams/{name}/history/` and queryable via `get_team_status` and
+`get_team_history` tools.
 
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
