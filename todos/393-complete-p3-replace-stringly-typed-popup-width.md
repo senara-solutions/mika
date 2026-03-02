@@ -41,3 +41,4 @@ In `ui.rs`, the popup width for file path completion is determined by comparing 
 | Date | Action |
 |------|--------|
 | 2026-03-02 | Created from code review |
+| 2026-03-02 | Resolved: added `wide: bool` to `Argument` variant (Option A) |
