@@ -40,7 +40,7 @@ Each customer gets an isolated container with their own SQLite database. No cust
 - **Proactive heartbeat** -- Check-ins via silent agent loop with rate limiting
 - **Reminders** -- Time-based reminders with recovery on restart
 - **Conversation compaction** -- Automatic summarization of old messages
-- **Slash commands** -- 13 client-side commands with tab-completion in the TUI
+- **Slash commands** -- 19 client-side commands with shell-like Tab completion and argument completers
 - **Multi-channel** -- CLI (local) and Telegram (hosted) with WhatsApp planned
 - **Per-customer isolation** -- One container per customer
 

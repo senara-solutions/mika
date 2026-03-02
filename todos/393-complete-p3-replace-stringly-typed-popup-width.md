@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "393"
 tags: [code-review, quality, autocomplete]
@@ -32,9 +32,9 @@ In `ui.rs`, the popup width for file path completion is determined by comparing 
 
 ## Acceptance Criteria
 
-- [ ] No string comparison for popup width
-- [ ] File path popup still renders wider than other popups
-- [ ] All tests pass
+- [x] No string comparison for popup width
+- [x] File path popup still renders wider than other popups
+- [x] All tests pass
 
 ## Work Log
 
