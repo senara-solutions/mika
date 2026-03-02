@@ -1,9 +1,0 @@
-[skill]
-name = "shell-exec"
-description = "Execute shell commands"
-version = "0.1.0"
-always_on = true
-timeout_secs = 30
-
-[triggers]
-keywords = ["run command", "execute", "shell", "terminal"]

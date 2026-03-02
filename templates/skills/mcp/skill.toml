@@ -1,9 +1,0 @@
-[skill]
-name = "mcp"
-description = "Explain MCP (Model Context Protocol) server configuration"
-version = "0.1.0"
-always_on = false
-timeout_secs = 10
-
-[triggers]
-keywords = ["mcp", "model context protocol", "mcp server", "mcp tool"]

@@ -514,6 +514,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_exec_handler_command_with_quotes() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        let input = serde_json::json!({"command": "echo \"hello world\""});
+        let output = execute_skill_tool(&tool, input, 30).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("hello world"),
+            "expected 'hello world' in output, got: {}",
+            output.content
+        );
+    }
+
+    /// Helper to create a temp dir with the real shell-exec handler script.
+    fn setup_shell_exec_handler() -> (tempfile::TempDir, ResolvedSkillTool) {
         let tmp = tempfile::tempdir().unwrap();
         let handler_dir = tmp.path().join("handlers");
         fs::create_dir_all(&handler_dir).unwrap();
@@ -521,14 +534,85 @@ mod tests {
             &handler_dir.join("run.sh"),
             include_str!("../../templates/skills/shell-exec/handlers/run.sh"),
         );
-
         let tool = make_exec_tool(tmp.path(), "handlers/run.sh");
-        let input = serde_json::json!({"command": "echo \"hello world\""});
+        (tmp, tool)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_css_hash_chars() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        // CSS selectors and hex colors contain # which must survive JSON → jq → eval
+        let input = serde_json::json!({"command": "echo '#custom-relay { color: #a6e3a1; }'"});
         let output = execute_skill_tool(&tool, input, 30).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
-            output.content.contains("hello world"),
-            "expected 'hello world' in output, got: {}",
+            output.content.contains("#custom-relay"),
+            "expected CSS selector in output, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("#a6e3a1"),
+            "expected hex color in output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_heredoc_multiline() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        // Multi-line command with heredoc: \n in JSON must become real newlines
+        let input = serde_json::json!({
+            "command": "cat << 'EOF'\n#selector { color: #fff; }\nEOF"
+        });
+        let output = execute_skill_tool(&tool, input, 30).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("#selector"),
+            "expected CSS selector from heredoc, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("#fff"),
+            "expected hex color from heredoc, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_sed_with_hash() {
+        let (tmp, tool) = setup_shell_exec_handler();
+        // Create a temp CSS file, then use sed to replace a selector with #
+        let css_file = tmp.path().join("test.css");
+        fs::write(&css_file, "#old-selector { color: red; }\n").unwrap();
+        let cmd = format!(
+            "sed 's/#old-selector/#new-selector/' '{}' && echo done",
+            css_file.display()
+        );
+        let input = serde_json::json!({"command": cmd});
+        let output = execute_skill_tool(&tool, input, 30).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("#new-selector"),
+            "expected sed replacement with # in output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_backslash_in_printf() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        // printf with \n format specifiers: backslashes must survive JSON → jq → eval → printf
+        let input = serde_json::json!({"command": "printf 'line1\\nline2\\n'"});
+        let output = execute_skill_tool(&tool, input, 30).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("line1"),
+            "expected line1 in output, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("line2"),
+            "expected line2 in output, got: {}",
             output.content
         );
     }

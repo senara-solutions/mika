@@ -3,6 +3,8 @@
 # Input: JSON on stdin with "path" field
 # Output: file contents on stdout, or __mika_v1 envelope for images
 
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed" >&2; exit 1; }
+
 INPUT=$(cat)
 PATH_VALUE=$(echo "$INPUT" | jq -r '.path // empty')
 
