@@ -36,7 +36,10 @@ impl Tool for ListRemindersTool {
         for r in &reminders {
             output.push_str(&format!(
                 "- #{}: \"{}\" at {} (created: {})\n",
-                r.id, r.message, r.display_fire_at(), r.created_at
+                r.id,
+                r.message,
+                r.display_fire_at(),
+                r.created_at
             ));
         }
 

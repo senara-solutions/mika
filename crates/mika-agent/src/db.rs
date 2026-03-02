@@ -414,7 +414,9 @@ impl Database {
     }
 
     fn migrate_v9(&self) -> Result<()> {
-        info!("applying migration v9: convert reminders.fire_at from TEXT to INTEGER (unix timestamp)");
+        info!(
+            "applying migration v9: convert reminders.fire_at from TEXT to INTEGER (unix timestamp)"
+        );
 
         self.conn
             .execute_batch(
@@ -2459,9 +2461,7 @@ mod tests {
         // 2020-01-01T00:00:00Z
         let past_id = db.add_reminder(1_577_836_800, "past reminder").unwrap();
         // 2099-12-31T23:59:59Z
-        let future_id = db
-            .add_reminder(4_102_444_799, "future reminder")
-            .unwrap();
+        let future_id = db.add_reminder(4_102_444_799, "future reminder").unwrap();
         assert!(past_id > 0);
         assert!(future_id > past_id);
 

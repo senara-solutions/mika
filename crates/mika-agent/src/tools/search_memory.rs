@@ -158,7 +158,10 @@ async fn search_reminders(
     for r in reminders {
         results.push(format!(
             "[reminder] #{}: \"{}\" at {} (created: {})",
-            r.id, r.message, r.display_fire_at(), r.created_at
+            r.id,
+            r.message,
+            r.display_fire_at(),
+            r.created_at
         ));
     }
     Ok(())
