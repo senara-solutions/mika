@@ -1,5 +1,6 @@
 pub mod builtin_handlers;
 pub mod executor;
+pub(crate) mod git;
 pub mod index;
 pub mod manifest;
 pub(crate) mod marketplace;
