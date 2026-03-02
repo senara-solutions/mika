@@ -1,6 +1,17 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.1.3](https://github.com/senara-solutions/mika/releases/tag/v0.1.3) — 2026-03-02
+
+### Added
+
+- add config editing and shellcheck guidance to shell-exec skill
+- add agent and team management tools
+
+### Documentation
+
+- update documentation for agent management tools
+
 ## [0.1.2](https://github.com/senara-solutions/mika/releases/tag/v0.1.2) — 2026-03-01
 
 ### Added
