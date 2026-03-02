@@ -183,7 +183,13 @@ async fn handle_reminders(app: &mut App<'_>) -> String {
         Ok(reminders) if !reminders.is_empty() => {
             let _ = writeln!(out, "Pending reminders:");
             for r in &reminders {
-                let _ = writeln!(out, "  #{}: {} (due: {})", r.id, r.message, r.fire_at);
+                let _ = writeln!(
+                    out,
+                    "  #{}: {} (due: {})",
+                    r.id,
+                    r.message,
+                    r.display_fire_at()
+                );
             }
         }
         _ => {}
@@ -192,7 +198,13 @@ async fn handle_reminders(app: &mut App<'_>) -> String {
         Ok(reminders) if !reminders.is_empty() => {
             let _ = writeln!(out, "Upcoming reminders:");
             for r in &reminders {
-                let _ = writeln!(out, "  #{}: {} (fires: {})", r.id, r.message, r.fire_at);
+                let _ = writeln!(
+                    out,
+                    "  #{}: {} (fires: {})",
+                    r.id,
+                    r.message,
+                    r.display_fire_at()
+                );
             }
         }
         _ => {}

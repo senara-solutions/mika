@@ -73,21 +73,23 @@ impl Tool for CreateReminderTool {
             return Ok(ToolOutput::error("Reminder time must be in the future."));
         }
 
-        let id = ctx.db.add_reminder(fire_at, message).await?;
+        let timestamp = parsed.timestamp();
+        let id = ctx.db.add_reminder(timestamp, message).await?;
 
+        let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC");
         ctx.db
             .log_memory_event(
                 ctx.session_id,
                 "create_reminder",
                 &format!("reminder:{id}"),
                 None,
-                &format!("{fire_at} — {message}"),
+                &format!("{display_time} — {message}"),
                 None,
             )
             .await?;
 
         Ok(ToolOutput::success(format!(
-            "Reminder #{id} scheduled for {fire_at}."
+            "Reminder #{id} scheduled for {display_time}."
         )))
     }
 }

@@ -36,7 +36,10 @@ impl Tool for ListRemindersTool {
         for r in &reminders {
             output.push_str(&format!(
                 "- #{}: \"{}\" at {} (created: {})\n",
-                r.id, r.message, r.fire_at, r.created_at
+                r.id,
+                r.message,
+                r.display_fire_at(),
+                r.created_at
             ));
         }
 
@@ -63,14 +66,16 @@ mod tests {
     #[tokio::test]
     async fn test_list_reminders_shows_active() {
         let harness = TestHarness::new();
+        // 2099-01-01T00:00:00Z
         harness
             .db
-            .add_reminder("2099-01-01T00:00:00Z", "Meeting prep")
+            .add_reminder(4_070_908_800, "Meeting prep")
             .await
             .unwrap();
+        // 2099-06-15T12:00:00Z
         harness
             .db
-            .add_reminder("2099-06-15T12:00:00Z", "Birthday party")
+            .add_reminder(4_085_380_800, "Birthday party")
             .await
             .unwrap();
 
@@ -88,13 +93,13 @@ mod tests {
         let harness = TestHarness::new();
         let id = harness
             .db
-            .add_reminder("2099-01-01T00:00:00Z", "Cancelled one")
+            .add_reminder(4_070_908_800, "Cancelled one")
             .await
             .unwrap();
         harness.db.cancel_reminder(id).await.unwrap();
         harness
             .db
-            .add_reminder("2099-06-15T12:00:00Z", "Active one")
+            .add_reminder(4_085_380_800, "Active one")
             .await
             .unwrap();
 

@@ -26,9 +26,10 @@ use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 use mika_common::claude::{ImageSource, ThinkingConfig};
 
-/// Holds the agent worker task handle and the AppContext (for DB shutdown).
+/// Holds the agent worker task handle, poller handle, and the AppContext (for DB shutdown).
 struct AgentWorker {
     handle: JoinHandle<()>,
+    poller_handle: JoinHandle<()>,
     _ctx: AppContext,
 }
 
@@ -64,22 +65,23 @@ async fn spawn_agent_worker(
     // Connect to MCP servers
     let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
 
-    // Recover reminders on startup
-    {
-        let scheduler = ReminderScheduler {
-            db: ctx.async_db.clone(),
-            claude: ctx.claude.clone(),
-            tools: tool_registry.clone(),
-            skills: skill_registry.clone(),
-            home_dir: ctx.home_dir.clone(),
-            message_sender: message_sender.clone(),
-            embedding_client: embedding_client.clone(),
-            brave_api_key: brave_api_key.clone(),
-        };
-        if let Err(e) = scheduler.recover().await {
-            tracing::warn!(error = %e, "reminder recovery failed");
-        }
+    // Recover reminders on startup and start background poller
+    let scheduler = Arc::new(ReminderScheduler {
+        db: ctx.async_db.clone(),
+        claude: ctx.claude.clone(),
+        tools: tool_registry.clone(),
+        skills: skill_registry.clone(),
+        home_dir: ctx.home_dir.clone(),
+        message_sender: message_sender.clone(),
+        embedding_client: embedding_client.clone(),
+        brave_api_key: brave_api_key.clone(),
+        skills_dirty: skills_dirty.clone(),
+        agent_lock: None, // CLI serializes via channel, no lock needed
+    });
+    if let Err(e) = scheduler.recover().await {
+        tracing::warn!(error = %e, "reminder recovery failed");
     }
+    let poller_handle = scheduler.spawn_poller();
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
@@ -200,7 +202,11 @@ async fn spawn_agent_worker(
     let model = ctx.settings.claude_model.clone();
     let identity_name = identity.name.clone();
 
-    let worker = AgentWorker { handle, _ctx: ctx };
+    let worker = AgentWorker {
+        handle,
+        poller_handle,
+        _ctx: ctx,
+    };
 
     Ok((
         worker,
@@ -329,7 +335,8 @@ pub async fn run(agent_name: &str) -> Result<()> {
 
         // Handle agent switch
         if let Some(target_name) = app.pending_switch.take() {
-            // Wait for the old worker to stop (with timeout)
+            // Abort the old poller and wait for the worker to stop (with timeout)
+            worker.poller_handle.abort();
             let old_handle = std::mem::replace(
                 &mut worker.handle,
                 tokio::spawn(async {}), // placeholder
@@ -410,6 +417,9 @@ pub async fn run(agent_name: &str) -> Result<()> {
 
     // Shut down event reader thread
     events.shutdown();
+
+    // Stop the reminder poller
+    worker.poller_handle.abort();
 
     // Check agent worker for panics
     if worker.handle.is_finished() {

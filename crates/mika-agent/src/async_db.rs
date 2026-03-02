@@ -320,9 +320,9 @@ impl AsyncDatabase {
 
     // -- Reminders --
 
-    pub async fn add_reminder(&self, fire_at: &str, message: &str) -> Result<i64> {
-        let (f, m) = (fire_at.to_owned(), message.to_owned());
-        self.with_db(move |db| db.add_reminder(&f, &m)).await
+    pub async fn add_reminder(&self, fire_at: i64, message: &str) -> Result<i64> {
+        let m = message.to_owned();
+        self.with_db(move |db| db.add_reminder(fire_at, &m)).await
     }
 
     pub async fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {

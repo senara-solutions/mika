@@ -17,7 +17,10 @@ pub async fn run(args: ReminderArgs, agent_name: &str) -> Result<()> {
                 for r in &reminders {
                     println!(
                         "    #{}: \"{}\" at {} (created: {})",
-                        r.id, r.message, r.fire_at, r.created_at
+                        r.id,
+                        r.message,
+                        r.display_fire_at(),
+                        r.created_at
                     );
                 }
                 println!();
