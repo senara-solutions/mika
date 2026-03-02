@@ -18,6 +18,10 @@ impl Tool for RunTeamTool {
         "run_team"
     }
 
+    fn timeout_secs(&self) -> Option<u64> {
+        Some(300)
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "run_team".to_string(),
@@ -49,6 +53,9 @@ impl Tool for RunTeamTool {
                 "'team_name' too long: {} characters (max: {MAX_INPUT_LEN})",
                 team_name.len()
             )));
+        }
+        if let Err(e) = mika_common::team::validate_team_name(team_name) {
+            return Ok(ToolOutput::error(format!("Invalid team name: {e}")));
         }
 
         let goal = input["goal"].as_str().unwrap_or("");
@@ -87,29 +94,7 @@ impl Tool for RunTeamTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::TestHarness;
-
-    fn dummy_settings() -> Settings {
-        // Create minimal settings for testing (API key not needed for validation tests)
-        Settings {
-            anthropic_api_key: None,
-            claude_model: "claude-sonnet-4-6".to_string(),
-            claude_max_tokens: 4096,
-            db_path: PathBuf::from("test.db"),
-            log_level: "info".to_string(),
-            routing_url: None,
-            customer_id: None,
-            server_port: 8080,
-            internal_token: None,
-            openai_api_key: None,
-            embedding_model: "text-embedding-3-small".to_string(),
-            embedding_dimensions: 512,
-            brave_api_key: None,
-            home_dir: PathBuf::from("/tmp"),
-            server_log_file: None,
-            disable_bundled_skills: false,
-        }
-    }
+    use crate::test_utils::test_helpers::{TestHarness, dummy_settings};
 
     #[tokio::test]
     async fn test_run_team_missing_team_name() {
@@ -164,5 +149,25 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn test_run_team_invalid_name() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = RunTeamTool {
+            home_dir: PathBuf::from("/tmp"),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"team_name": "INVALID", "goal": "test"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Invalid team name"));
     }
 }

@@ -43,12 +43,20 @@ pub fn load_latest_run(history_dir: &Path) -> Result<Option<TeamRun>> {
 
 /// List all runs in the history directory.
 pub fn list_runs(history_dir: &Path) -> Result<Vec<TeamRun>> {
+    list_runs_limited(history_dir, usize::MAX)
+}
+
+/// List runs with an upper bound on how many files to read.
+pub fn list_runs_limited(history_dir: &Path, limit: usize) -> Result<Vec<TeamRun>> {
     let mut files = list_run_files(history_dir)?;
     files.sort();
     files.reverse(); // most recent first
 
-    let mut runs = Vec::new();
+    let mut runs = Vec::with_capacity(limit.min(files.len()));
     for filename in files {
+        if runs.len() >= limit {
+            break;
+        }
         let path = history_dir.join(&filename);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -90,35 +98,15 @@ fn list_run_files(history_dir: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::teams::types::{RunStatus, TaskAssignment, TaskStatus, TeamRun};
-
-    fn test_run() -> TeamRun {
-        TeamRun {
-            run_id: "abcd1234".to_string(),
-            team_name: "dev-team".to_string(),
-            goal: "Test goal".to_string(),
-            status: RunStatus::Completed,
-            iteration: 1,
-            max_iterations: 3,
-            tasks: vec![TaskAssignment {
-                agent: "researcher".to_string(),
-                role: "specialist".to_string(),
-                task: "Research".to_string(),
-                output_file: "research.md".to_string(),
-                status: TaskStatus::Completed,
-            }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
-            ended_at: Some("2026-02-25T10:05:00Z".to_string()),
-            deliverable: Some("Summary".to_string()),
-        }
-    }
+    use crate::teams::types::RunStatus;
+    use crate::test_utils::test_helpers::test_team_run;
 
     #[test]
     fn test_save_and_load_run() {
         let tmp = tempfile::tempdir().unwrap();
         let history = tmp.path().join("history");
 
-        let run = test_run();
+        let run = test_team_run();
         save_run(&history, &run).unwrap();
 
         let loaded = load_latest_run(&history).unwrap().unwrap();
@@ -141,12 +129,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let history = tmp.path().join("history");
 
-        let mut run1 = test_run();
+        let mut run1 = test_team_run();
         run1.run_id = "aaaa1111".to_string();
         run1.started_at = "2026-02-24T10:00:00Z".to_string();
         save_run(&history, &run1).unwrap();
 
-        let mut run2 = test_run();
+        let mut run2 = test_team_run();
         run2.run_id = "bbbb2222".to_string();
         run2.started_at = "2026-02-25T10:00:00Z".to_string();
         save_run(&history, &run2).unwrap();

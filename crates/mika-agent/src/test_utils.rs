@@ -2,7 +2,10 @@
 pub mod test_helpers {
     use crate::async_db::AsyncDatabase;
     use crate::db::Database;
+    use crate::teams::types::{RunStatus, TaskAssignment, TaskStatus, TeamRun};
     use crate::tools::ToolContext;
+    use mika_common::config::Settings;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU32};
 
     /// Create an in-memory database for tests (sync — for db module tests).
@@ -90,6 +93,50 @@ pub mod test_helpers {
                 brave_api_key: None,
                 skills_dirty: &SKILLS_DIRTY,
             }
+        }
+    }
+
+    /// Minimal Settings for validation-only tests (no API key needed).
+    pub fn dummy_settings() -> Settings {
+        Settings {
+            anthropic_api_key: None,
+            claude_model: "claude-sonnet-4-6".to_string(),
+            claude_max_tokens: 4096,
+            db_path: PathBuf::from("test.db"),
+            log_level: "info".to_string(),
+            routing_url: None,
+            customer_id: None,
+            server_port: 8080,
+            internal_token: None,
+            openai_api_key: None,
+            embedding_model: "text-embedding-3-small".to_string(),
+            embedding_dimensions: 512,
+            brave_api_key: None,
+            home_dir: PathBuf::from("/tmp"),
+            server_log_file: None,
+            disable_bundled_skills: false,
+        }
+    }
+
+    /// Sample TeamRun for history/status tests.
+    pub fn test_team_run() -> TeamRun {
+        TeamRun {
+            run_id: "abcd1234".to_string(),
+            team_name: "dev-team".to_string(),
+            goal: "Test goal".to_string(),
+            status: RunStatus::Completed,
+            iteration: 1,
+            max_iterations: 3,
+            tasks: vec![TaskAssignment {
+                agent: "researcher".to_string(),
+                role: "specialist".to_string(),
+                task: "Research".to_string(),
+                output_file: "research.md".to_string(),
+                status: TaskStatus::Completed,
+            }],
+            started_at: "2026-02-25T10:00:00Z".to_string(),
+            ended_at: Some("2026-02-25T10:05:00Z".to_string()),
+            deliverable: Some("Summary".to_string()),
         }
     }
 }

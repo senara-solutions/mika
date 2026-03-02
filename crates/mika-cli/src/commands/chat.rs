@@ -48,7 +48,11 @@ async fn spawn_agent_worker(
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
     let session_id = Uuid::new_v4().to_string();
-    let tool_registry = Arc::new(tools::default_tools());
+    let mut tool_registry = tools::default_tools();
+    for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
+        tool_registry.register(tool);
+    }
+    let tool_registry = Arc::new(tool_registry);
     let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
@@ -91,6 +95,7 @@ async fn spawn_agent_worker(
     let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
     let mut worker_mcp = mcp_manager;
+    let worker_global_home = ctx.global_home.clone();
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -141,6 +146,7 @@ async fn spawn_agent_worker(
                         brave_api_key: worker_brave_key.as_deref(),
                         skills_dirty: &worker_dirty,
                         mcp_manager: worker_mcp.as_ref(),
+                        global_home_dir: Some(&worker_global_home),
                     })
                     .await;
 

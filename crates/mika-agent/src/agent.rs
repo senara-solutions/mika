@@ -499,6 +499,9 @@ pub struct AgentParams<'a> {
     pub skills_dirty: &'a AtomicBool,
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
+    /// Global Mika home directory (e.g. `~/.mika/`), used for team/agent discovery in the prompt.
+    /// Distinct from `home_dir` which is the per-agent home (e.g. `~/.mika/agents/main/`).
+    pub global_home_dir: Option<&'a Path>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -575,7 +578,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         is_onboarding: params.is_onboarding,
         current_utc: chrono::Utc::now(),
         timezone: ctx.timezone,
-        global_home_dir: Some(params.home_dir),
+        global_home_dir: params.global_home_dir,
         channel_type: Some(params.channel_type),
         telegram_configured: chat_id.is_some(),
     };
@@ -902,8 +905,9 @@ async fn execute_tool(
 ) -> ToolOutput {
     // 1. Try builtin tool
     if let Some(tool) = tools.get(name) {
+        let timeout = tool.timeout_secs().unwrap_or(TOOL_TIMEOUT_SECS);
         return match tokio::time::timeout(
-            std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+            std::time::Duration::from_secs(timeout),
             tool.execute(input, ctx),
         )
         .await
@@ -914,10 +918,8 @@ async fn execute_tool(
                 ToolOutput::error(format!("Tool error: {e}"))
             }
             Err(_) => {
-                warn!(tool = %name, "tool execution timed out");
-                ToolOutput::error(format!(
-                    "Tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
-                ))
+                warn!(tool = %name, timeout_secs = timeout, "tool execution timed out");
+                ToolOutput::error(format!("Tool '{name}' timed out after {timeout}s"))
             }
         };
     }
