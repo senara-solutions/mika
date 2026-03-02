@@ -26,6 +26,8 @@ This guide walks you through installation, first run, and everyday usage.
 - **Platform:** Linux or macOS. File permissions (0700 dirs, 0600 files) are
   applied automatically on Unix systems.
 
+- **jq:** Required by all bundled skill handler scripts (shell-exec, tmux, github, file-reader) for JSON input parsing. Install via your package manager (e.g., `apt install jq`, `brew install jq`, `emerge app-misc/jq`). The Docker agent image includes `jq` by default.
+
 ---
 
 ## 2. Installation

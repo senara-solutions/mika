@@ -349,7 +349,7 @@ The **file-reader** skill (`always_on = true`) provides the `read_file` tool on 
 
 The **github** skill provides `run_gh` for interacting with GitHub via the `gh` CLI. It uses an allowlist of safe subcommands (pr, issue, run, workflow, release, repo, search, label, milestone, project) and scrubs sensitive `MIKA_*` environment variables before execution. Requires `gh` CLI to be installed (included in Docker image).
 
-Note: all exec-handler skills are excluded from heartbeat mode by `safe_always_on_skills()`.
+All bundled exec-handler scripts require `jq` for JSON input parsing and will fail with a clear error if `jq` is not found. The Docker agent image includes `jq`; CLI users must install it separately. Note: all exec-handler skills are excluded from heartbeat mode by `safe_always_on_skills()`.
 
 ### Prompt-only skills (no tools)
 
@@ -569,7 +569,7 @@ rm -rf ~/.mika/skills/memory
 
 Exec handlers spawn a child process with `tokio::process::Command`. The process runs with the same user permissions as Mika itself. There is no sandboxing, chroot, or capability restriction.
 
-**Environment variable leakage:** The child process inherits Mika's full environment, which may include `MIKA_ANTHROPIC_API_KEY` and other secrets. The only environment variable explicitly set by Mika is `MIKA_TOOL_INPUT` (containing the tool's JSON input). If you run untrusted exec handlers, secrets in the environment are accessible to them.
+**Environment variable scrubbing:** Bundled handler scripts (shell-exec, github) explicitly `unset` sensitive `MIKA_*` environment variables (`MIKA_ANTHROPIC_API_KEY`, `MIKA_INTERNAL_TOKEN`, `MIKA_OPENAI_API_KEY`, `MIKA_BRAVE_API_KEY`) before executing commands. Custom exec handlers should do the same if they run user-controllable commands.
 
 **Mitigation:** Only install exec skills from sources you trust. Review handler scripts before placing them in `~/.mika/skills/`. Consider using http handlers to isolate untrusted tools behind a network boundary.
 
