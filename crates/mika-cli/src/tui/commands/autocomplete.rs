@@ -1,66 +1,247 @@
+use std::path::Path;
+
+use mika_agent::skills::SkillRegistry;
+
 use super::{SlashCommand, filter_commands};
 
-/// Tracks autocomplete popup state for slash commands.
+/// A single completion candidate.
+#[derive(Clone, Debug)]
+pub struct CompletionItem {
+    /// The value to insert (e.g., "sonnet", "main", "~/Documents").
+    pub value: String,
+    /// Optional description shown alongside (e.g., "Claude Sonnet 4.6").
+    pub description: Option<String>,
+}
+
+/// Context passed to argument completer functions.
+pub struct CompletionContext<'a> {
+    pub home_dir: &'a Path,
+    pub global_home: &'a Path,
+    pub skills: &'a SkillRegistry,
+    pub current_agent: &'a str,
+    pub cwd: &'a Path,
+}
+
+/// What kind of completion is active.
+pub enum CompletionMode {
+    /// No popup visible.
+    Hidden,
+    /// Completing a command name after "/".
+    Command {
+        items: Vec<(&'static SlashCommand, CompletionItem)>,
+        selected: usize,
+    },
+    /// Completing an argument for a known command.
+    Argument {
+        #[allow(dead_code)]
+        command_name: &'static str,
+        items: Vec<CompletionItem>,
+        selected: usize,
+        /// Popup title for this argument context (e.g., " Models ", " Agents ").
+        title: &'static str,
+    },
+}
+
+/// Tracks autocomplete popup state for slash commands and arguments.
 pub struct AutocompleteState {
-    pub visible: bool,
-    pub items: Vec<&'static SlashCommand>,
-    pub selected: usize,
+    pub mode: CompletionMode,
 }
 
 impl AutocompleteState {
     pub fn new() -> Self {
         Self {
-            visible: false,
-            items: Vec::new(),
-            selected: 0,
+            mode: CompletionMode::Hidden,
         }
     }
 
-    /// Update suggestions based on current input text.
-    /// Shows popup when input starts with "/" and has no space yet (command-level completion).
-    pub fn update(&mut self, input: &str) {
+    /// Whether the popup is visible.
+    pub fn visible(&self) -> bool {
+        !matches!(self.mode, CompletionMode::Hidden)
+    }
+
+    /// Update suggestions based on current input text (command-level only).
+    /// Shows popup when input starts with "/" and has no space yet.
+    pub fn update_command(&mut self, input: &str) {
         if input.starts_with('/') && !input[1..].contains(' ') {
             let prefix = &input[1..];
-            self.items = filter_commands(prefix);
-            self.visible = !self.items.is_empty();
-            // Clamp selected index
-            if self.selected >= self.items.len() {
-                self.selected = 0;
+            let commands = filter_commands(prefix);
+            if commands.is_empty() {
+                self.dismiss();
+            } else {
+                let items: Vec<_> = commands
+                    .into_iter()
+                    .map(|cmd| {
+                        let args = cmd.args_hint.unwrap_or("");
+                        let desc = if args.is_empty() {
+                            cmd.description.to_string()
+                        } else {
+                            format!("{args} \u{2014} {}", cmd.description)
+                        };
+                        let item = CompletionItem {
+                            value: cmd.name.to_string(),
+                            description: Some(desc),
+                        };
+                        (cmd, item)
+                    })
+                    .collect();
+                let selected = match &self.mode {
+                    CompletionMode::Command {
+                        selected: prev, ..
+                    } => (*prev).min(items.len().saturating_sub(1)),
+                    _ => 0,
+                };
+                self.mode = CompletionMode::Command { items, selected };
             }
         } else {
             self.dismiss();
         }
     }
 
+    /// Show argument completions for a command.
+    pub fn show_arguments(
+        &mut self,
+        command_name: &'static str,
+        items: Vec<CompletionItem>,
+        title: &'static str,
+    ) {
+        if items.is_empty() {
+            self.dismiss();
+        } else {
+            self.mode = CompletionMode::Argument {
+                command_name,
+                items,
+                selected: 0,
+                title,
+            };
+        }
+    }
+
     /// Move selection to the next item (wraps around).
     pub fn next(&mut self) {
-        if !self.items.is_empty() {
-            self.selected = (self.selected + 1) % self.items.len();
+        match &mut self.mode {
+            CompletionMode::Command { items, selected } => {
+                if !items.is_empty() {
+                    *selected = (*selected + 1) % items.len();
+                }
+            }
+            CompletionMode::Argument { items, selected, .. } => {
+                if !items.is_empty() {
+                    *selected = (*selected + 1) % items.len();
+                }
+            }
+            CompletionMode::Hidden => {}
         }
     }
 
     /// Move selection to the previous item (wraps around).
     pub fn previous(&mut self) {
-        if !self.items.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
+        match &mut self.mode {
+            CompletionMode::Command { items, selected } => {
+                if !items.is_empty() {
+                    *selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
+                }
+            }
+            CompletionMode::Argument { items, selected, .. } => {
+                if !items.is_empty() {
+                    *selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
+                }
+            }
+            CompletionMode::Hidden => {}
         }
     }
 
-    /// Get the name of the currently selected command, if any.
-    pub fn selected_name(&self) -> Option<&'static str> {
-        if self.visible {
-            self.items.get(self.selected).map(|cmd| cmd.name)
-        } else {
-            None
+    /// Get the name of the currently selected command (command mode only).
+    #[allow(dead_code)] // used in tests
+    pub fn selected_command(&self) -> Option<&'static SlashCommand> {
+        match &self.mode {
+            CompletionMode::Command { items, selected } => {
+                items.get(*selected).map(|(cmd, _)| *cmd)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the value of the currently selected item.
+    #[allow(dead_code)] // used in tests
+    pub fn selected_value(&self) -> Option<&str> {
+        match &self.mode {
+            CompletionMode::Command { items, selected } => {
+                items.get(*selected).map(|(_, item)| item.value.as_str())
+            }
+            CompletionMode::Argument { items, selected, .. } => {
+                items.get(*selected).map(|item| item.value.as_str())
+            }
+            CompletionMode::Hidden => None,
+        }
+    }
+
+    /// Get all current item values (for computing common prefix).
+    pub fn item_values(&self) -> Vec<&str> {
+        match &self.mode {
+            CompletionMode::Command { items, .. } => {
+                items.iter().map(|(_, item)| item.value.as_str()).collect()
+            }
+            CompletionMode::Argument { items, .. } => {
+                items.iter().map(|item| item.value.as_str()).collect()
+            }
+            CompletionMode::Hidden => Vec::new(),
+        }
+    }
+
+    /// Get the selected index.
+    pub fn selected_index(&self) -> usize {
+        match &self.mode {
+            CompletionMode::Command { selected, .. } => *selected,
+            CompletionMode::Argument { selected, .. } => *selected,
+            CompletionMode::Hidden => 0,
+        }
+    }
+
+    /// Get the number of items.
+    pub fn item_count(&self) -> usize {
+        match &self.mode {
+            CompletionMode::Command { items, .. } => items.len(),
+            CompletionMode::Argument { items, .. } => items.len(),
+            CompletionMode::Hidden => 0,
+        }
+    }
+
+    /// Get the popup title.
+    pub fn title(&self) -> &str {
+        match &self.mode {
+            CompletionMode::Command { .. } => " Commands ",
+            CompletionMode::Argument { title, .. } => title,
+            CompletionMode::Hidden => "",
         }
     }
 
     /// Dismiss the popup without clearing input.
     pub fn dismiss(&mut self) {
-        self.visible = false;
-        self.items.clear();
-        self.selected = 0;
+        self.mode = CompletionMode::Hidden;
     }
+}
+
+/// Compute the longest common prefix of a set of strings.
+pub fn longest_common_prefix(strings: &[&str]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    if strings.len() == 1 {
+        return strings[0].to_string();
+    }
+
+    let first = strings[0];
+    let mut len = first.len();
+    for s in &strings[1..] {
+        len = len.min(s.len());
+        for (i, (a, b)) in first.bytes().zip(s.bytes()).enumerate() {
+            if !a.eq_ignore_ascii_case(&b) {
+                len = len.min(i);
+                break;
+            }
+        }
+    }
+    first[..len].to_string()
 }
 
 #[cfg(test)]
@@ -70,83 +251,156 @@ mod tests {
     #[test]
     fn test_update_shows_all_on_slash() {
         let mut state = AutocompleteState::new();
-        state.update("/");
-        assert!(state.visible);
-        assert!(!state.items.is_empty());
+        state.update_command("/");
+        assert!(state.visible());
+        assert!(state.item_count() > 0);
     }
 
     #[test]
     fn test_update_filters_on_prefix() {
         let mut state = AutocompleteState::new();
-        state.update("/he");
-        assert!(state.visible);
-        assert_eq!(state.items.len(), 1);
-        assert_eq!(state.items[0].name, "help");
+        state.update_command("/he");
+        assert!(state.visible());
+        assert_eq!(state.item_count(), 1);
+        assert_eq!(state.selected_value(), Some("help"));
     }
 
     #[test]
     fn test_update_hides_on_no_match() {
         let mut state = AutocompleteState::new();
-        state.update("/zzz");
-        assert!(!state.visible);
+        state.update_command("/zzz");
+        assert!(!state.visible());
     }
 
     #[test]
     fn test_update_hides_after_space() {
         let mut state = AutocompleteState::new();
-        state.update("/memory search");
-        assert!(!state.visible);
+        state.update_command("/memory search");
+        assert!(!state.visible());
     }
 
     #[test]
     fn test_update_hides_on_no_slash() {
         let mut state = AutocompleteState::new();
-        state.update("hello");
-        assert!(!state.visible);
+        state.update_command("hello");
+        assert!(!state.visible());
     }
 
     #[test]
     fn test_next_wraps_around() {
         let mut state = AutocompleteState::new();
-        state.update("/he");
-        assert_eq!(state.selected, 0);
+        state.update_command("/he");
+        assert_eq!(state.selected_index(), 0);
         state.next();
         // Only 1 item, wraps back to 0
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.selected_index(), 0);
 
         // Multiple items
-        state.update("/");
-        let count = state.items.len();
+        state.update_command("/");
+        let count = state.item_count();
         for _ in 0..count {
             state.next();
         }
-        assert_eq!(state.selected, 0); // wrapped back
+        assert_eq!(state.selected_index(), 0); // wrapped back
     }
 
     #[test]
     fn test_previous_wraps_around() {
         let mut state = AutocompleteState::new();
-        state.update("/");
-        let count = state.items.len();
+        state.update_command("/");
+        let count = state.item_count();
         state.previous(); // 0 -> last
-        assert_eq!(state.selected, count - 1);
+        assert_eq!(state.selected_index(), count - 1);
     }
 
     #[test]
-    fn test_selected_name() {
+    fn test_selected_command() {
         let mut state = AutocompleteState::new();
-        state.update("/");
-        assert_eq!(state.selected_name(), Some("help")); // first command
+        state.update_command("/");
+        let cmd = state.selected_command().unwrap();
+        assert_eq!(cmd.name, "help"); // first command
     }
 
     #[test]
     fn test_dismiss_resets_state() {
         let mut state = AutocompleteState::new();
-        state.update("/");
-        assert!(state.visible);
+        state.update_command("/");
+        assert!(state.visible());
         state.dismiss();
-        assert!(!state.visible);
-        assert!(state.items.is_empty());
-        assert_eq!(state.selected, 0);
+        assert!(!state.visible());
+        assert_eq!(state.item_count(), 0);
+        assert_eq!(state.selected_index(), 0);
+    }
+
+    #[test]
+    fn test_longest_common_prefix_single() {
+        assert_eq!(longest_common_prefix(&["hello"]), "hello");
+    }
+
+    #[test]
+    fn test_longest_common_prefix_multiple() {
+        assert_eq!(longest_common_prefix(&["compact", "config"]), "co");
+    }
+
+    #[test]
+    fn test_longest_common_prefix_exact() {
+        assert_eq!(longest_common_prefix(&["model"]), "model");
+    }
+
+    #[test]
+    fn test_longest_common_prefix_empty() {
+        assert_eq!(longest_common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn test_longest_common_prefix_no_common() {
+        assert_eq!(longest_common_prefix(&["abc", "xyz"]), "");
+    }
+
+    #[test]
+    fn test_argument_mode() {
+        let mut state = AutocompleteState::new();
+        state.show_arguments(
+            "model",
+            vec![
+                CompletionItem {
+                    value: "sonnet".to_string(),
+                    description: Some("Claude Sonnet 4.6".to_string()),
+                },
+                CompletionItem {
+                    value: "opus".to_string(),
+                    description: Some("Claude Opus 4.6".to_string()),
+                },
+            ],
+            " Models ",
+        );
+        assert!(state.visible());
+        assert_eq!(state.item_count(), 2);
+        assert_eq!(state.selected_value(), Some("sonnet"));
+        assert_eq!(state.title(), " Models ");
+
+        state.next();
+        assert_eq!(state.selected_value(), Some("opus"));
+    }
+
+    #[test]
+    fn test_argument_mode_empty_dismisses() {
+        let mut state = AutocompleteState::new();
+        state.show_arguments("model", vec![], " Models ");
+        assert!(!state.visible());
+    }
+
+    #[test]
+    fn test_selected_preserves_across_filter() {
+        let mut state = AutocompleteState::new();
+        state.update_command("/");
+        // Move to item 2
+        state.next();
+        state.next();
+        let prev_selected = state.selected_index();
+
+        // Re-filter with same prefix — should clamp
+        state.update_command("/");
+        assert_eq!(state.selected_index(), prev_selected);
     }
 }

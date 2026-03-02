@@ -1,5 +1,11 @@
 pub mod autocomplete;
+pub mod completers;
 pub mod handlers;
+
+use autocomplete::{CompletionContext, CompletionItem};
+
+/// Signature for argument completer functions.
+pub type CompleterFn = fn(&str, usize, &CompletionContext) -> (Vec<CompletionItem>, &'static str);
 
 /// Definition of a slash command.
 pub struct SlashCommand {
@@ -7,6 +13,8 @@ pub struct SlashCommand {
     pub aliases: &'static [&'static str],
     pub description: &'static str,
     pub args_hint: Option<&'static str>,
+    /// Returns completion candidates for the given argument prefix and position.
+    pub completer: Option<CompleterFn>,
 }
 
 /// All available slash commands. Adding a new command = append here + add match arm in handlers::dispatch.
@@ -16,114 +24,133 @@ pub const COMMANDS: &[SlashCommand] = &[
         aliases: &["h", "?"],
         description: "List available commands",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "clear",
         aliases: &[],
         description: "Clear chat display (--all for DB)",
         args_hint: Some("[--all]"),
+        completer: None,
     },
     SlashCommand {
         name: "exit",
         aliases: &["quit", "q"],
         description: "Quit mika",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "compact",
         aliases: &[],
         description: "Compact conversation history",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "memory",
         aliases: &["mem"],
         description: "Show core memory blocks",
         args_hint: Some("[search <query>]"),
+        completer: Some(completers::complete_memory),
     },
     SlashCommand {
         name: "reminders",
         aliases: &["remind"],
         description: "List active reminders",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "status",
         aliases: &["stat"],
         description: "Show system health info",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "soul",
         aliases: &[],
         description: "Display current soul.md",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "config",
         aliases: &["cfg"],
         description: "Show or set config",
         args_hint: Some("[set <key> <value>]"),
+        completer: Some(completers::complete_config),
     },
     SlashCommand {
         name: "model",
         aliases: &[],
         description: "Show or switch model",
         args_hint: Some("[sonnet|opus|haiku]"),
+        completer: Some(completers::complete_model),
     },
     SlashCommand {
         name: "export",
         aliases: &[],
         description: "Export conversation to markdown",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "skills",
         aliases: &[],
         description: "List loaded skills",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "skill",
         aliases: &[],
         description: "Show skill details",
         args_hint: Some("<name>"),
+        completer: Some(completers::complete_skill),
     },
     SlashCommand {
         name: "switch",
         aliases: &["agent"],
         description: "Switch to a different agent",
         args_hint: Some("<name>"),
+        completer: Some(completers::complete_switch),
     },
     SlashCommand {
         name: "agents",
         aliases: &[],
         description: "List all agents",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "teams",
         aliases: &[],
         description: "List all teams",
         args_hint: None,
+        completer: None,
     },
     SlashCommand {
         name: "team",
         aliases: &[],
         description: "Run a team workflow",
         args_hint: Some("<name> \"<goal>\""),
+        completer: Some(completers::complete_team),
     },
     SlashCommand {
         name: "think",
         aliases: &["t"],
         description: "Set thinking level or think once",
         args_hint: Some("[low|medium|high|off] [prompt]"),
+        completer: Some(completers::complete_think),
     },
     SlashCommand {
         name: "attach",
         aliases: &["img"],
         description: "Attach an image file",
         args_hint: Some("<path>"),
+        completer: Some(completers::complete_attach),
     },
 ];
 
@@ -156,6 +183,14 @@ pub fn parse_command(input: &str) -> (&str, &str) {
         Some((cmd, args)) => (cmd, args.trim()),
         None => (trimmed, ""),
     }
+}
+
+/// Find a command by name (exact match on name or alias).
+pub fn find_command(name: &str) -> Option<&'static SlashCommand> {
+    let lower = name.to_lowercase();
+    COMMANDS.iter().find(|cmd| {
+        cmd.name == lower || cmd.aliases.iter().any(|a| *a == lower)
+    })
 }
 
 #[cfg(test)]
@@ -222,5 +257,22 @@ mod tests {
         let (cmd, args) = parse_command("/  config   set  key  value ");
         assert_eq!(cmd, "config");
         assert_eq!(args, "set  key  value");
+    }
+
+    #[test]
+    fn test_find_command_by_name() {
+        let cmd = find_command("model").unwrap();
+        assert_eq!(cmd.name, "model");
+    }
+
+    #[test]
+    fn test_find_command_by_alias() {
+        let cmd = find_command("q").unwrap();
+        assert_eq!(cmd.name, "exit");
+    }
+
+    #[test]
+    fn test_find_command_not_found() {
+        assert!(find_command("nonexistent").is_none());
     }
 }
