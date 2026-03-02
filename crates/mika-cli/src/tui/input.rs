@@ -3,6 +3,9 @@ use std::path::Path;
 
 use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::attachment::ImageAttachment;
+use crate::tui::commands::autocomplete::{
+    CompletionContext, CompletionMode, longest_common_prefix,
+};
 
 /// Handle a mouse event (scroll wheel for conversation scrolling).
 pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
@@ -25,7 +28,7 @@ pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
         return;
     }
 
-    if app.autocomplete.visible {
+    if app.autocomplete.visible() {
         handle_key_autocomplete(app, key);
     } else {
         handle_key_normal(app, key);
@@ -40,8 +43,8 @@ fn handle_key_autocomplete(app: &mut App<'_>, key: KeyEvent) {
             app.autocomplete.dismiss();
         }
 
-        // Tab or Down: next suggestion
-        KeyCode::Tab | KeyCode::Down => {
+        // Down: next suggestion
+        KeyCode::Down => {
             app.autocomplete.next();
         }
 
@@ -50,26 +53,151 @@ fn handle_key_autocomplete(app: &mut App<'_>, key: KeyEvent) {
             app.autocomplete.previous();
         }
 
-        // Enter: accept selected completion and execute
+        // Tab: bash-style completion
+        KeyCode::Tab => {
+            handle_tab_completion(app);
+        }
+
+        // Enter: accept selected completion
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            if let Some(name) = app.autocomplete.selected_name() {
-                // Set textarea to the full command and execute
-                let cmd = format!("/{name}");
-                app.textarea = tui_textarea::TextArea::from(vec![cmd.clone()]);
-                app.textarea
-                    .set_cursor_line_style(ratatui::style::Style::default());
-                app.autocomplete.dismiss();
-                if app.status == AgentStatus::Idle {
-                    app.send_message();
-                }
-            }
+            handle_enter_completion(app);
         }
 
         // Any other key: pass to textarea, then update autocomplete filter
         _ => {
             app.textarea.input(key);
+            update_autocomplete_for_input(app);
+        }
+    }
+}
+
+/// Handle Tab key: bash-style longest common prefix completion.
+fn handle_tab_completion(app: &mut App<'_>) {
+    let values = app.autocomplete.item_values();
+    if values.is_empty() {
+        return;
+    }
+
+    match &app.autocomplete.mode {
+        CompletionMode::Command { items, .. } => {
+            let lcp = longest_common_prefix(&values);
             let input = app.input_text();
-            app.autocomplete.update(&input);
+            let current_prefix = &input[1..]; // strip "/"
+
+            if lcp.len() > current_prefix.len() {
+                // Partial completion: extend to longest common prefix
+                let new_input = format!("/{lcp}");
+                set_textarea(app, &new_input);
+                app.autocomplete.update_command(&new_input);
+            } else if items.len() == 1 {
+                // Unique match: complete fully
+                let cmd = items[0];
+                if cmd.args_hint.is_some() {
+                    // Command takes args: complete and add space for argument input
+                    let new_input = format!("/{} ", cmd.name);
+                    set_textarea(app, &new_input);
+                    app.autocomplete.dismiss();
+                } else {
+                    // No args: complete and execute
+                    let new_input = format!("/{}", cmd.name);
+                    set_textarea(app, &new_input);
+                    app.autocomplete.dismiss();
+                    if app.status == AgentStatus::Idle {
+                        app.send_message();
+                    }
+                }
+            } else {
+                // Multiple matches with no further common prefix: cycle
+                app.autocomplete.next();
+            }
+        }
+        CompletionMode::Argument { items, .. } => {
+            let lcp = longest_common_prefix(&values);
+            let input = app.input_text();
+
+            // Find where the current argument starts
+            let arg_start = find_current_arg_start(&input);
+            let current_arg = &input[arg_start..];
+
+            if lcp.len() > current_arg.len() {
+                // Partial completion
+                let new_input = format!("{}{lcp}", &input[..arg_start]);
+                set_textarea(app, &new_input);
+                // Re-trigger argument completion with new prefix
+                trigger_argument_completion(app);
+            } else if items.len() == 1 {
+                // Unique match: complete fully and add space
+                let new_input = format!("{}{} ", &input[..arg_start], items[0].value);
+                set_textarea(app, &new_input);
+                app.autocomplete.dismiss();
+            } else {
+                // Multiple matches: cycle
+                app.autocomplete.next();
+            }
+        }
+        CompletionMode::Hidden => {}
+    }
+}
+
+/// Handle Enter key in autocomplete mode.
+fn handle_enter_completion(app: &mut App<'_>) {
+    match &app.autocomplete.mode {
+        CompletionMode::Command { items, selected } => {
+            if let Some(cmd) = items.get(*selected) {
+                let cmd_name = cmd.name;
+                let has_args = cmd.args_hint.is_some();
+
+                if has_args {
+                    // Command takes args: accept name, add space, dismiss popup
+                    let new_input = format!("/{cmd_name} ");
+                    set_textarea(app, &new_input);
+                    app.autocomplete.dismiss();
+                } else {
+                    // No args: accept and execute immediately
+                    let cmd_text = format!("/{cmd_name}");
+                    set_textarea(app, &cmd_text);
+                    app.autocomplete.dismiss();
+                    if app.status == AgentStatus::Idle {
+                        app.send_message();
+                    }
+                }
+            }
+        }
+        CompletionMode::Argument {
+            items, selected, ..
+        } => {
+            if let Some(item) = items.get(*selected) {
+                let input = app.input_text();
+                let arg_start = find_current_arg_start(&input);
+                let new_input = format!("{}{} ", &input[..arg_start], item.value);
+                set_textarea(app, &new_input);
+                app.autocomplete.dismiss();
+            }
+        }
+        CompletionMode::Hidden => {}
+    }
+}
+
+/// Update autocomplete state based on current input.
+fn update_autocomplete_for_input(app: &mut App<'_>) {
+    let input = app.input_text();
+
+    if !input.starts_with('/') {
+        app.autocomplete.dismiss();
+        return;
+    }
+
+    // Check if we're in command or argument territory
+    if !input[1..].contains(' ') {
+        // Still typing the command name
+        app.autocomplete.update_command(&input);
+    } else {
+        // Past the command name — in argument territory
+        // Don't auto-show argument completions (lazy/Tab-triggered per design)
+        // But if we were in argument mode, dismiss since text changed
+        if matches!(app.autocomplete.mode, CompletionMode::Argument { .. }) {
+            // Re-trigger argument completion with the new prefix
+            trigger_argument_completion(app);
         }
     }
 }
@@ -140,11 +268,17 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
         return;
     }
 
-    // Tab: if input starts with "/", open autocomplete
+    // Tab: if input starts with "/", trigger completion
     if key.code == KeyCode::Tab {
         let input = app.input_text();
-        if input.starts_with('/') {
-            app.autocomplete.update(&input);
+        if let Some(after_slash) = input.strip_prefix('/') {
+            if after_slash.contains(' ') {
+                // In argument territory — trigger argument completion
+                trigger_argument_completion(app);
+            } else {
+                // Command name completion
+                app.autocomplete.update_command(&input);
+            }
             return;
         }
         // Otherwise let tab fall through to textarea
@@ -180,8 +314,80 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
     // After typing, check if we should show autocomplete (e.g., user just typed "/")
     let input = app.input_text();
     if input.starts_with('/') && !input[1..].contains(' ') {
-        app.autocomplete.update(&input);
+        app.autocomplete.update_command(&input);
     }
+}
+
+/// Trigger argument completion for the current input.
+fn trigger_argument_completion(app: &mut App<'_>) {
+    let input = app.input_text();
+    let (cmd_name, args_str) = crate::tui::commands::parse_command(&input);
+
+    let Some(cmd) = crate::tui::commands::find_command(cmd_name) else {
+        app.autocomplete.dismiss();
+        return;
+    };
+
+    let Some(completer) = cmd.completer else {
+        app.autocomplete.dismiss();
+        return;
+    };
+
+    // Determine arg_index and current arg prefix
+    let (arg_index, arg_prefix) = parse_arg_position(args_str);
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let ctx = CompletionContext {
+        home_dir: &app.home_dir,
+        global_home: &app.global_home,
+        skills: &app.skills,
+        current_agent: &app.agent_name,
+        cwd: &cwd,
+        args_str,
+    };
+
+    let (items, title) = completer(arg_prefix, arg_index, &ctx);
+    let wide = title == " Files ";
+    app.autocomplete.show_arguments(items, title, wide);
+}
+
+/// Parse args string to determine which argument index and prefix we're on.
+/// Returns (arg_index, current_arg_prefix).
+fn parse_arg_position(args: &str) -> (usize, &str) {
+    if args.is_empty() {
+        return (0, "");
+    }
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+
+    // If the args string ends with whitespace, we're starting a new argument
+    if args.ends_with(' ') {
+        return (parts.len(), "");
+    }
+
+    // Otherwise, the last part is the current prefix being typed
+    let index = parts.len().saturating_sub(1);
+    let prefix = parts.last().copied().unwrap_or("");
+    (index, prefix)
+}
+
+/// Find the byte offset where the current argument starts in the input.
+fn find_current_arg_start(input: &str) -> usize {
+    // Input is like "/cmd arg1 arg2 prefix"
+    // We want the start of "prefix"
+    if let Some(last_space) = input.rfind(' ') {
+        last_space + 1
+    } else {
+        // No space found — shouldn't happen in argument mode, but handle gracefully
+        input.len()
+    }
+}
+
+/// Set the textarea to new content, preserving style settings.
+fn set_textarea(app: &mut App<'_>, text: &str) {
+    app.textarea = tui_textarea::TextArea::from(vec![text.to_string()]);
+    app.textarea
+        .set_cursor_line_style(ratatui::style::Style::default());
 }
 
 /// Maximum paste size (100KB) to prevent UI freezing.
@@ -212,6 +418,15 @@ pub fn handle_paste(app: &mut App<'_>, text: &str) {
     // Normalize line endings: \r\n → \n, bare \r → \n
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     app.textarea.insert_str(&normalized);
+
+    // Re-evaluate autocomplete after paste
+    let input = app.input_text();
+    if input.starts_with('/') && !input[1..].contains(' ') {
+        app.autocomplete.update_command(&input);
+    } else {
+        app.autocomplete.dismiss();
+    }
+
     app.needs_redraw = true;
 }
 
@@ -502,5 +717,47 @@ mod tests {
     fn test_format_size_megabytes() {
         assert_eq!(ImageAttachment::format_size(1_048_576), "1.0MB");
         assert_eq!(ImageAttachment::format_size(5 * 1_048_576), "5.0MB");
+    }
+
+    #[test]
+    fn test_parse_arg_position_empty() {
+        let (idx, prefix) = parse_arg_position("");
+        assert_eq!(idx, 0);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_parse_arg_position_first_arg() {
+        let (idx, prefix) = parse_arg_position("son");
+        assert_eq!(idx, 0);
+        assert_eq!(prefix, "son");
+    }
+
+    #[test]
+    fn test_parse_arg_position_after_first_arg() {
+        let (idx, prefix) = parse_arg_position("set ");
+        assert_eq!(idx, 1);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_parse_arg_position_second_arg() {
+        let (idx, prefix) = parse_arg_position("set think");
+        assert_eq!(idx, 1);
+        assert_eq!(prefix, "think");
+    }
+
+    #[test]
+    fn test_parse_arg_position_after_second_arg() {
+        let (idx, prefix) = parse_arg_position("set thinking_level ");
+        assert_eq!(idx, 2);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_find_current_arg_start() {
+        assert_eq!(find_current_arg_start("/model sonnet"), 7);
+        assert_eq!(find_current_arg_start("/config set key"), 12);
+        assert_eq!(find_current_arg_start("/model "), 7);
     }
 }

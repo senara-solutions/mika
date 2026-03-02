@@ -19,28 +19,70 @@ Unknown command: /foo. Type /help for available commands.
 
 ## Autocomplete
 
-The TUI provides a filtered autocomplete popup for slash commands.
+The TUI provides shell-like autocompletion for both slash command names and their
+arguments.
 
-**How it works:**
+### Command Completion
 
 1. Type `/` -- a popup appears listing all 19 commands.
 2. Continue typing to narrow the list. For example, `/me` narrows to `/memory`.
    Matching works on both command names and aliases (e.g., typing `/q` matches
    `/exit` via its `q` alias).
-3. The popup disappears automatically once a space is typed after the command name
-   (arguments are not autocompleted).
 
-**Popup controls:**
+### Argument Completion
+
+Commands that accept arguments support Tab-triggered argument completion. After
+accepting a command name, press Tab to see available completions:
+
+| Command | Completes | Source |
+|---------|-----------|--------|
+| `/model` | Model aliases (sonnet, opus, haiku) | Static |
+| `/think` | Thinking levels (off, low, medium, high) | Static |
+| `/memory` | Subcommands (search) | Static |
+| `/config` | Subcommands (set, get), then config keys, then values | Static + config registry |
+| `/switch` | Agent names (excluding current agent) | `~/.mika/agents/` |
+| `/team` | Team names | `~/.mika/teams/` |
+| `/skill` | Skill names from the registry | Skill registry |
+| `/attach` | File paths with tilde expansion | Current working directory |
+
+Argument completion is lazy (Tab-triggered) -- the popup does not appear
+automatically when a space is typed after the command name.
+
+### Tab Behavior (Bash-style)
+
+Tab uses longest-common-prefix completion, similar to bash:
+
+1. If multiple matches share a common prefix longer than what is typed, Tab
+   extends the input to that prefix (partial completion).
+2. If exactly one match remains, Tab completes it fully and appends a space.
+   For argless commands, this also executes the command.
+3. If multiple matches share no further common prefix, Tab cycles to the next
+   suggestion.
+
+### Enter Behavior (Smart Dispatch)
+
+Enter is context-aware in the autocomplete popup:
+
+- **Commands with no arguments** (e.g., `/help`, `/clear`, `/exit`): Enter
+  accepts and executes immediately.
+- **Commands with arguments** (e.g., `/model`, `/switch`): Enter accepts the
+  command name, appends a space, and dismisses the popup so you can type or
+  Tab-complete arguments.
+
+### Popup Controls
 
 | Key        | Action                                          |
 |------------|-------------------------------------------------|
-| Tab / Down | Cycle to next suggestion                        |
-| Up         | Cycle to previous suggestion                    |
-| Enter      | Accept selected command and execute immediately  |
+| Tab        | Longest common prefix completion (see above)    |
+| Down       | Next suggestion (wraps around)                  |
+| Up         | Previous suggestion (wraps around)              |
+| Enter      | Accept selection (execute or transition to args) |
 | Esc        | Dismiss popup (keeps typed text in input)        |
-| Any other  | Continues filtering the suggestion list          |
+| Any other  | Passes to input field; popup re-filters          |
 
-Selection wraps around in both directions.
+The popup title changes contextually: " Commands ", " Models ", " Agents ",
+" Teams ", " Skills ", " Files ", " Config ", " Config Keys ", " Values ",
+" Think ", " Memory ".
 
 ## Command Reference
 
@@ -330,7 +372,7 @@ Complete key bindings for the Mika TUI. These apply regardless of slash commands
 | Enter       | Send message to agent, or execute slash command        |
 | Shift+Enter | Insert newline in input (multi-line editing)           |
 | Esc         | Clear input field and reset input history index        |
-| Tab         | Open autocomplete popup (when input starts with `/`)   |
+| Tab         | Open autocomplete popup (when input starts with `/`). In argument territory, triggers argument completion. |
 | PageUp      | Scroll message history up (5 lines)                    |
 | PageDown    | Scroll message history down (5 lines)                  |
 | Up          | Previous input history entry (when input is empty)     |
@@ -344,8 +386,9 @@ agent is busy processing a turn, Enter has no effect.
 
 | Key        | Action                                          |
 |------------|-------------------------------------------------|
-| Tab / Down | Next suggestion (wraps around)                  |
+| Tab        | Longest common prefix completion; cycles if no further prefix |
+| Down       | Next suggestion (wraps around)                  |
 | Up         | Previous suggestion (wraps around)              |
-| Enter      | Accept and execute selected command              |
+| Enter      | Accept selection (execute argless commands, or transition to argument input for commands with args) |
 | Esc        | Dismiss popup (keeps typed text)                 |
 | Any other  | Passes to input field; popup re-filters          |
