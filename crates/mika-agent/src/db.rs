@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Once;
@@ -22,7 +23,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -138,6 +139,9 @@ impl Database {
         }
         if version < 8 {
             self.migrate_v8()?;
+        }
+        if version < 9 {
+            self.migrate_v9()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -405,6 +409,49 @@ impl Database {
                 );",
             )
             .context("failed to create vec_search table")?;
+
+        Ok(())
+    }
+
+    fn migrate_v9(&self) -> Result<()> {
+        info!("applying migration v9: convert reminders.fire_at from TEXT to INTEGER (unix timestamp)");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            -- Add new integer column
+            ALTER TABLE reminders ADD COLUMN fire_at_unix INTEGER;
+
+            -- Backfill: unixepoch() handles both 'T' and space separators
+            UPDATE reminders SET fire_at_unix = unixepoch(fire_at);
+
+            -- Guard: mark any reminders with unparseable fire_at as failed
+            -- (unixepoch returns NULL for invalid input)
+            UPDATE reminders SET status = 'failed'
+                WHERE fire_at_unix IS NULL AND status = 'pending';
+            -- Set a safe default for non-pending rows with NULL (delivered/cancelled/failed)
+            UPDATE reminders SET fire_at_unix = 0 WHERE fire_at_unix IS NULL;
+
+            -- Must drop index before dropping the column (SQLite constraint)
+            DROP INDEX IF EXISTS idx_reminders_status_fire_at;
+
+            -- Drop old text column (requires SQLite 3.35+)
+            ALTER TABLE reminders DROP COLUMN fire_at;
+
+            -- Rename new column to fire_at
+            ALTER TABLE reminders RENAME COLUMN fire_at_unix TO fire_at;
+
+            -- Recreate index on the new integer column
+            CREATE INDEX idx_reminders_status_fire_at ON reminders(status, fire_at);
+
+            INSERT INTO schema_version (version) VALUES (9);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v9")?;
 
         Ok(())
     }
@@ -844,8 +891,9 @@ impl Database {
 
     // -- Reminders --
 
-    /// Add a new reminder. Returns the reminder ID.
-    pub fn add_reminder(&self, fire_at: &str, message: &str) -> Result<i64> {
+    /// Add a new reminder. `fire_at` is a Unix timestamp (seconds since epoch).
+    /// Returns the reminder ID.
+    pub fn add_reminder(&self, fire_at: i64, message: &str) -> Result<i64> {
         self.conn
             .execute(
                 "INSERT INTO reminders (fire_at, message) VALUES (?1, ?2)",
@@ -864,11 +912,11 @@ impl Database {
             }
             ReminderFilter::Future => {
                 "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' AND fire_at > datetime('now') ORDER BY fire_at ASC"
+                 FROM reminders WHERE status = 'pending' AND fire_at > unixepoch('now') ORDER BY fire_at ASC"
             }
             ReminderFilter::PastDue => {
                 "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' AND fire_at <= datetime('now') ORDER BY fire_at ASC"
+                 FROM reminders WHERE status = 'pending' AND fire_at <= unixepoch('now') ORDER BY fire_at ASC"
             }
         };
         let mut stmt = self.conn.prepare_cached(sql)?;
@@ -2013,11 +2061,20 @@ pub struct Event {
 #[derive(Debug, Clone)]
 pub struct Reminder {
     pub id: i64,
-    pub fire_at: String,
+    pub fire_at: i64,
     pub message: String,
     pub status: String,
     pub created_at: String,
     pub delivered_at: Option<String>,
+}
+
+impl Reminder {
+    /// Format `fire_at` unix timestamp as a human-readable UTC string.
+    pub fn display_fire_at(&self) -> String {
+        DateTime::from_timestamp(self.fire_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| self.fire_at.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2065,7 +2122,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -2078,7 +2135,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -2399,11 +2456,11 @@ mod tests {
         let db = test_db();
 
         // Create two reminders: one in the past, one in the future
-        let past_id = db
-            .add_reminder("2020-01-01T00:00:00Z", "past reminder")
-            .unwrap();
+        // 2020-01-01T00:00:00Z
+        let past_id = db.add_reminder(1_577_836_800, "past reminder").unwrap();
+        // 2099-12-31T23:59:59Z
         let future_id = db
-            .add_reminder("2099-12-31T23:59:59Z", "future reminder")
+            .add_reminder(4_102_444_799, "future reminder")
             .unwrap();
         assert!(past_id > 0);
         assert!(future_id > past_id);
@@ -2437,9 +2494,7 @@ mod tests {
     #[test]
     fn test_cancel_nonpending_reminder() {
         let db = test_db();
-        let id = db
-            .add_reminder("2020-01-01T00:00:00Z", "already delivered")
-            .unwrap();
+        let id = db.add_reminder(1_577_836_800, "already delivered").unwrap();
         db.mark_reminder_delivered(id).unwrap();
 
         // Cancelling a delivered reminder returns false
@@ -2450,9 +2505,7 @@ mod tests {
     #[test]
     fn test_mark_reminder_failed() {
         let db = test_db();
-        let id = db
-            .add_reminder("2020-01-01T00:00:00Z", "will fail")
-            .unwrap();
+        let id = db.add_reminder(1_577_836_800, "will fail").unwrap();
         db.mark_reminder_failed(id).unwrap();
 
         let pending = db.get_pending_reminders().unwrap();
@@ -2462,11 +2515,10 @@ mod tests {
     #[test]
     fn test_get_pending_reminders_excludes_cancelled() {
         let db = test_db();
-        db.add_reminder("2099-01-01T00:00:00Z", "active one")
-            .unwrap();
-        let id2 = db
-            .add_reminder("2099-02-01T00:00:00Z", "will cancel")
-            .unwrap();
+        // 2099-01-01T00:00:00Z
+        db.add_reminder(4_070_908_800, "active one").unwrap();
+        // 2099-02-01T00:00:00Z
+        let id2 = db.add_reminder(4_073_587_200, "will cancel").unwrap();
         db.cancel_reminder(id2).unwrap();
 
         let active = db.get_pending_reminders().unwrap();

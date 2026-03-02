@@ -39,7 +39,7 @@ pub struct ReminderScheduler {
 impl ReminderScheduler {
     /// Recover pending reminders on startup.
     /// - Past-due reminders: fire immediately (max 5 to avoid blocking startup)
-    /// - Future reminders: log count (timer scheduling is Phase 2)
+    /// - Future reminders: log count (poller handles them when due)
     ///
     /// Also prunes old heartbeat_sends records.
     pub async fn recover(&self) -> Result<()> {
@@ -319,10 +319,10 @@ mod tests {
     #[test]
     fn test_past_due_reminders_identified() {
         let db = test_db();
-        db.add_reminder("2020-01-01T00:00:00Z", "Past due reminder")
-            .unwrap();
-        db.add_reminder("2099-12-31T23:59:59Z", "Future reminder")
-            .unwrap();
+        // 2020-01-01T00:00:00Z as unix timestamp
+        db.add_reminder(1_577_836_800, "Past due reminder").unwrap();
+        // 2099-12-31T23:59:59Z as unix timestamp
+        db.add_reminder(4_102_444_799, "Future reminder").unwrap();
 
         let past_due = db.get_past_due_reminders().unwrap();
         assert_eq!(past_due.len(), 1);
@@ -336,9 +336,7 @@ mod tests {
     #[test]
     fn test_cancelled_reminders_excluded() {
         let db = test_db();
-        let id = db
-            .add_reminder("2020-01-01T00:00:00Z", "Cancelled one")
-            .unwrap();
+        let id = db.add_reminder(1_577_836_800, "Cancelled one").unwrap();
         db.cancel_reminder(id).unwrap();
 
         let past_due = db.get_past_due_reminders().unwrap();

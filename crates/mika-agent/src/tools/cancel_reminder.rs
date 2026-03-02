@@ -71,7 +71,7 @@ mod tests {
         let harness = TestHarness::new();
         let id = harness
             .db
-            .add_reminder("2099-01-01T00:00:00Z", "To cancel")
+            .add_reminder(4_070_908_800, "To cancel")
             .await
             .unwrap();
 
@@ -108,7 +108,7 @@ mod tests {
         let harness = TestHarness::new();
         let id = harness
             .db
-            .add_reminder("2020-01-01T00:00:00Z", "Already delivered")
+            .add_reminder(1_577_836_800, "Already delivered")
             .await
             .unwrap();
         harness.db.mark_reminder_delivered(id).await.unwrap();

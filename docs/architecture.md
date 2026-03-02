@@ -366,7 +366,7 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 
 ## Appendix: Database Schema
 
-**Schema version:** 8
+**Schema version:** 9
 
 ### Tables
 
@@ -380,7 +380,7 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 | `preferences` | Layer 2 user preferences | v4 |
 | `events` | Layer 2 notable events | v4 |
 | `memory_events` | Audit log for all memory mutations | v4 (+`created_at` index in v7) |
-| `reminders` | Scheduled future reminders | v5 |
+| `reminders` | Scheduled future reminders (`fire_at` INTEGER unix timestamp since v9) | v5 (+`fire_at` TEXT→INTEGER in v9) |
 | `heartbeat_sends` | Rate limiting for heartbeat sends | v5 |
 | `customer_config` | Key-value store (timezone, chat_id) | v5 |
 | `failed_sends` | Durable outbox for failed outbound messages | v5 |
