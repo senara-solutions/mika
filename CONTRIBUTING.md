@@ -8,21 +8,7 @@ Mika is developed using [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **jq** -- required by skill handler scripts
 - **Claude Code** + **compound engineering plugin** (recommended, not required)
 
-## Getting Started
-
-```bash
-# Clone the repository
-git clone https://github.com/senara-solutions/mika.git
-cd mika
-
-# Build all crates
-cargo build
-
-# Run tests (no API key needed)
-cargo test
-```
-
-Tests are fully mocked and do not require a `MIKA_ANTHROPIC_API_KEY`.
+Build with `cargo build` and run tests with `cargo test`. Tests are fully mocked and do not require a `MIKA_ANTHROPIC_API_KEY`.
 
 ## Development Workflow with Claude Code
 
@@ -34,12 +20,16 @@ The recommended workflow uses the `/mika` slash command, which chains every step
 
 This runs the following steps in order:
 
-1. **Plan** (`/workflows:plan`) -- Research the codebase, design the approach, write a plan file
+1. **Plan** (`/workflows:plan`) -- Research the codebase, design the approach, write a plan file to `docs/plans/`
 2. **Work** (`/workflows:work`) -- Implement the plan with incremental commits and continuous testing
 3. **Review** (`/workflows:review`) -- Multi-agent code review for quality and correctness
-4. **Resolve TODOs** (`/compound-engineering:resolve_todo_parallel`) -- Address code review findings in parallel
+4. **Resolve TODOs** (`/compound-engineering:resolve_todo_parallel`) -- Address review findings tracked in `todos/`
 5. **Doc Audit** (`/mika-doc-audit`) -- Update documentation based on code changes
-6. **Compound** (`/workflows:compound`) -- Document the solution for institutional knowledge
+6. **Compound** (`/workflows:compound`) -- Document the solution in `docs/solutions/` for institutional knowledge
+
+The command uses a `/ralph-loop` wrapper internally to ensure all steps run to completion without stopping between them.
+
+For documentation-only changes, you can run `/mika-doc-audit` directly instead of the full `/mika` workflow.
 
 ### Setup
 
@@ -52,10 +42,10 @@ This runs the following steps in order:
 If you prefer not to use Claude Code:
 
 ```bash
-# 1. Create a feature branch
+# 1. Create a feature branch (type/description-kebab-case)
 git checkout -b feat/my-feature
 
-# 2. Make changes and run quality gates
+# 2. Make changes and run quality gates (these match CI exactly)
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
@@ -67,14 +57,7 @@ git commit -m "feat(agent): add new capability"
 git push -u origin feat/my-feature
 ```
 
-## Branch Naming
-
-Use `type/description-kebab-case`:
-
-- `feat/add-web-search` -- new feature
-- `fix/reminder-timezone` -- bug fix
-- `refactor/extract-api-client` -- refactoring
-- `docs/update-architecture` -- documentation
+Branch types: `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`.
 
 ## Commit Conventions
 
@@ -88,7 +71,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) for automate
 | `fix` | Fixed | `fix(agent): handle empty response` |
 | `refactor` | Changed | `refactor: extract config module` |
 | `perf` | Performance | `perf(search): optimize FTS5 queries` |
-| `doc` | Documentation | `doc: update architecture guide` |
+| `doc`/`docs` | Documentation | `doc: update architecture guide` |
 
 **Skipped in changelog** (still valid):
 
@@ -101,18 +84,6 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) for automate
 
 Scopes are optional. Common scopes: `agent`, `tui`, `gateway`, `common`, `cli`.
 
-## Quality Gates
-
-Every PR must pass these checks (matching CI exactly):
-
-```bash
-cargo fmt --all -- --check       # Formatting
-cargo clippy --all-targets --all-features -- -D warnings  # Linting (warnings are errors)
-cargo test                       # All tests pass
-```
-
-Run these locally before pushing.
-
 ## Testing
 
 - Tests live inline in each module: `#[cfg(test)] mod tests`
@@ -122,11 +93,11 @@ Run these locally before pushing.
 
 ## Documentation
 
-When your changes affect behavior, update the relevant docs:
+When your changes affect behavior, update the relevant docs. The `/mika-doc-audit` step handles this automatically when using the Claude Code workflow.
 
 | What Changed | Update |
 |-------------|--------|
-| Any code change | `CLAUDE.md` (project instructions) |
+| Significant feature or behavior changes | `CLAUDE.md` (project instructions) |
 | Environment variables | `.env.example` |
 | Architecture or agent loop | `docs/architecture.md` |
 | Configuration or settings | `docs/configuration.md` |
@@ -136,15 +107,7 @@ When your changes affect behavior, update the relevant docs:
 | New user-facing features | `docs/getting-started.md` |
 | Public API changes | `README.md` |
 
-The `/mika-doc-audit` step handles this automatically when using the Claude Code workflow.
-
-## Architecture Decision Records
-
-For significant architectural changes, add an ADR to `docs/adr/`:
-
-- Follow the existing numbering: `006-your-decision.md`
-- Use the format: Context, Decision, Consequences
-- See existing ADRs for examples
+For significant architectural changes, add an ADR to `docs/adr/` following the existing sequential numbering and Context/Decision/Consequences format.
 
 ## Security Guidelines
 
@@ -153,17 +116,6 @@ For significant architectural changes, add an ADR to `docs/adr/`:
 - Child processes use `env_clear()` + allowlist to prevent `MIKA_*` env var leakage
 - Handler scripts `unset` MIKA env vars before executing commands
 - When adding tools that spawn processes, use the existing `env_clear()` pattern in `McpManager`
-
-## Project Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/architecture.md) | System design, agent loop, memory model |
-| [Getting Started](docs/getting-started.md) | Installation, first run, CLI commands |
-| [Skills](docs/skills.md) | Creating and managing skills |
-| [Configuration](docs/configuration.md) | Settings reference, directory layout |
-| [Slash Commands](docs/slash-commands.md) | TUI command reference |
-| [Deployment](docs/deployment.md) | Docker images, container deployment |
 
 ## License
 
