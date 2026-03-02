@@ -4,23 +4,17 @@
 # Output: pane content on stdout
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed" >&2; exit 1; }
 
 # Prevent nested tmux client issues when spawned from within tmux
 unset TMUX TMUX_PANE
 
 INPUT=$(cat)
 
-if command -v jq >/dev/null 2>&1; then
-    SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
-    LINE_COUNT=$(printf '%s\n' "$INPUT" | jq -r '.lines // 50')
-    FULL=$(printf '%s\n' "$INPUT" | jq -r '.full // false')
-else
-    SESSION=$(printf '%s\n' "$INPUT" | grep -o '"session":"[^"]*"' | head -1 | cut -d'"' -f4)
-    LINE_COUNT=$(printf '%s\n' "$INPUT" | grep -o '"lines":[0-9]*' | head -1 | cut -d':' -f2)
-    FULL=$(printf '%s\n' "$INPUT" | grep -o '"full":true' | head -1)
-    if [ -z "$LINE_COUNT" ]; then LINE_COUNT=50; fi
-    if [ -n "$FULL" ]; then FULL="true"; else FULL="false"; fi
-fi
+# Parse JSON fields
+SESSION=$(printf '%s\n' "$INPUT" | jq -r '.session // empty')
+LINE_COUNT=$(printf '%s\n' "$INPUT" | jq -r '.lines // empty')
+FULL=$(printf '%s\n' "$INPUT" | jq -r 'if .full == true then "true" else "" end')
 
 # Validate LINE_COUNT as a positive integer, clamp to max 10000
 case "$LINE_COUNT" in
