@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
@@ -1310,6 +1310,8 @@ pub struct TeamAgentParams<'a> {
     pub skills_dirty: &'a AtomicBool,
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
+    /// Agent name for per-agent log filtering in team runs.
+    pub agent_name: &'a str,
 }
 
 /// Run an agent within a team execution context.
@@ -1343,6 +1345,12 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
 }
 
 async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
+    run_team_agent_inner_impl(params)
+        .instrument(tracing::info_span!("team_agent", agent = %params.agent_name))
+        .await
+}
+
+async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let claude = params.claude;
     let tools = params.tools;
 
@@ -1426,7 +1434,46 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
     .await?;
 
     if result.max_steps_exceeded {
-        return Ok(Some("Agent exceeded maximum tool steps.".to_string()));
+        // Continuation turn: strip tools, ask agent to summarize what it accomplished.
+        // Same pattern as the CLI conversation loop.
+        if let Some(ref mut system) = request.system {
+            system.truncate(result.system_prompt_original_len);
+        }
+        request.tools = None;
+        request.thinking = None;
+        request.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(
+                "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
+            ),
+        });
+
+        let continuation = tokio::time::timeout(
+            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
+            claude.send_message(&request),
+        )
+        .await;
+
+        let text = match continuation {
+            Ok(Ok(resp)) => {
+                let t = resp.text();
+                if t.is_empty() {
+                    format_step_exceeded_fallback(&result.tool_call_summaries)
+                } else {
+                    t
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "team agent continuation turn API error");
+                format_step_exceeded_fallback(&result.tool_call_summaries)
+            }
+            Err(_) => {
+                warn!(timeout_secs = CONTINUATION_TIMEOUT_SECS, "team agent continuation turn timed out");
+                format_step_exceeded_fallback(&result.tool_call_summaries)
+            }
+        };
+
+        return Ok(Some(text));
     }
 
     Ok(result.text)

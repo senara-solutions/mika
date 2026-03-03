@@ -494,6 +494,13 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                                 ))
                             }
                             TeamEvent::TasksAssigned { tasks, iteration } => {
+                                // In verbose mode, show individual assignments
+                                for task in &tasks {
+                                    let _ = tx.send(TeamResponse::AgentMessage {
+                                        agent: task.agent.clone(),
+                                        content: format!("[assigned] {}", task.task),
+                                    });
+                                }
                                 let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
                                 TeamResponse::Progress(format!(
                                     "Iteration {iteration}: assigned tasks to {}",
@@ -546,6 +553,12 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         global_home.to_path_buf(),
         team_db,
     );
+
+    // Insert session boundary marker so different TUI sessions are visually separated
+    app.db
+        .save_message("system", "--- New team session ---", "team")
+        .await
+        .ok();
 
     // Load recent conversations from DB
     if let Ok(history) = app.db.load_recent_messages(20, Some(vec!["team".into()])).await {

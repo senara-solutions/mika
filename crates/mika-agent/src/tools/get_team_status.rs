@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::async_db::AsyncDatabase;
-use crate::db::{Database, TeamRunRow, format_unix_ts};
+use crate::db::{TeamRunRow, format_unix_ts};
+use crate::teams::{TeamDbError, open_team_db};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -68,20 +68,10 @@ impl Tool for GetTeamStatusTool {
         }
 
         // Open team DB
-        let team_data_dir = team::team_dir(&self.home_dir, team_name).join("data");
-        if !team_data_dir.exists() {
-            return Ok(ToolOutput::success(format!(
-                "No runs found for team '{team_name}'."
-            )));
-        }
-        let team_db_path = team_data_dir.join("mika.db");
-        let team_db = match Database::open(&team_db_path) {
-            Ok(db) => AsyncDatabase::new(db),
-            Err(e) => {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to open team database: {e}"
-                )));
-            }
+        let team_db = match open_team_db(&self.home_dir, team_name) {
+            Ok(db) => db,
+            Err(TeamDbError::NoRuns(msg)) => return Ok(ToolOutput::success(msg)),
+            Err(TeamDbError::OpenFailed(msg)) => return Ok(ToolOutput::error(msg)),
         };
 
         let run: Option<TeamRunRow> = if let Some(target_id) = run_id_filter {
@@ -166,6 +156,7 @@ impl Tool for GetTeamStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use crate::test_utils::test_helpers::TestHarness;
 
     fn setup_team_db(team_name: &str) -> (tempfile::TempDir, PathBuf) {

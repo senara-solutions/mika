@@ -519,7 +519,7 @@ impl Database {
                 started_at INTEGER NOT NULL,
                 ended_at INTEGER
             );
-            CREATE INDEX IF NOT EXISTS idx_team_runs_started ON team_runs(started_at);
+            CREATE INDEX IF NOT EXISTS idx_team_runs_team_started ON team_runs(team_name, started_at);
 
             CREATE TABLE IF NOT EXISTS team_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

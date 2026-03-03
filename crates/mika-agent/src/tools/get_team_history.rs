@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::async_db::AsyncDatabase;
-use crate::db::{Database, format_unix_ts};
+use crate::db::format_unix_ts;
+use crate::teams::{TeamDbError, open_team_db};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -62,20 +62,10 @@ impl Tool for GetTeamHistoryTool {
         let limit = input["limit"].as_u64().unwrap_or(5).min(20) as usize;
 
         // Open team DB
-        let team_data_dir = team::team_dir(&self.home_dir, team_name).join("data");
-        if !team_data_dir.exists() {
-            return Ok(ToolOutput::success(format!(
-                "No runs found for team '{team_name}'."
-            )));
-        }
-        let team_db_path = team_data_dir.join("mika.db");
-        let team_db = match Database::open(&team_db_path) {
-            Ok(db) => AsyncDatabase::new(db),
-            Err(e) => {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to open team database: {e}"
-                )));
-            }
+        let team_db = match open_team_db(&self.home_dir, team_name) {
+            Ok(db) => db,
+            Err(TeamDbError::NoRuns(msg)) => return Ok(ToolOutput::success(msg)),
+            Err(TeamDbError::OpenFailed(msg)) => return Ok(ToolOutput::error(msg)),
         };
 
         let runs = match team_db.load_team_runs(team_name, limit).await {
@@ -128,6 +118,7 @@ impl Tool for GetTeamHistoryTool {
 mod tests {
     use super::*;
 
+    use crate::db::Database;
     use crate::test_utils::test_helpers::TestHarness;
 
     /// Create a team DB with `n` runs and return the home_dir.

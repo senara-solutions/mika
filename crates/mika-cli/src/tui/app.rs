@@ -477,7 +477,9 @@ impl<'a> App<'a> {
             // Persist user message to DB (fire-and-forget)
             let db = self.db.clone();
             tokio::spawn(async move {
-                let _ = db.save_message("user", &text, "team").await;
+                if let Err(e) = db.save_message("user", &text, "team").await {
+                    tracing::warn!(error = %e, "failed to save team user message");
+                }
             });
             self.status = AgentStatus::Thinking;
             self.reset_textarea();
@@ -652,7 +654,9 @@ impl<'a> App<'a> {
                     self.status = AgentStatus::Idle;
                 } else {
                     // Persist deliverable to DB
-                    let _ = self.db.save_message("assistant", &text, "team").await;
+                    if let Err(e) = self.db.save_message("assistant", &text, "team").await {
+                        tracing::warn!(error = %e, "failed to save team deliverable");
+                    }
                     self.pending_response = Some(text);
                     self.reveal_index = 0;
                     self.status = AgentStatus::Responding(0);

@@ -128,6 +128,7 @@ impl Tool for DelegateTaskTool {
             brave_api_key: self.settings.brave_api_key.as_deref(),
             skills_dirty: &skills_dirty,
             mcp_manager: None,
+            agent_name,
         };
 
         let result = crate::agent::run_team_agent(&params).await;

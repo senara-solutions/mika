@@ -164,10 +164,22 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
     println!("\n  Running team '{name}'...");
     println!("  Goal: {goal}\n");
 
-    let callback = |event: TeamEvent| {
-        if let TeamEvent::Progress(msg) = event {
-            println!("  > {msg}");
+    let callback = |event: TeamEvent| match event {
+        TeamEvent::Progress(msg) => println!("  > {msg}"),
+        TeamEvent::AgentCompleted { agent, .. } => println!("  > {agent} completed"),
+        TeamEvent::AgentFailed { agent, error } => {
+            eprintln!("  > {agent} failed: {error}")
         }
+        TeamEvent::CriticReview {
+            approved, feedback, ..
+        } => {
+            if approved {
+                println!("  > Critic approved");
+            } else {
+                println!("  > Critic rejected: {feedback}");
+            }
+        }
+        _ => {}
     };
 
     // Open team DB for persistence

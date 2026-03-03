@@ -238,18 +238,14 @@ impl TeamEngine {
 
         // Step 1: Decompose -- orchestrator produces task assignments
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
-        match self.decompose(None, &history).await {
-            Ok(tasks) => {
+        match self.decompose(None, &history).await? {
+            DecomposeResult::Tasks(tasks) => {
                 self.run.tasks = tasks;
             }
-            Err(e) => {
-                let msg = e.to_string();
-                if let Some(reply) = msg.strip_prefix("__conversational__:") {
-                    self.run.deliverable = Some(reply.to_string());
-                    self.emit_event(TeamEvent::Deliverable(reply.to_string()));
-                    return Ok(());
-                }
-                return Err(e);
+            DecomposeResult::Conversational(reply) => {
+                self.run.deliverable = Some(reply.clone());
+                self.emit_event(TeamEvent::Deliverable(reply));
+                return Ok(());
             }
         }
 
@@ -287,8 +283,16 @@ impl TeamEngine {
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
             )));
-            let tasks = self.decompose(Some(&feedback), &history).await?;
-            self.run.tasks = tasks;
+            match self.decompose(Some(&feedback), &history).await? {
+                DecomposeResult::Tasks(tasks) => {
+                    self.run.tasks = tasks;
+                }
+                DecomposeResult::Conversational(reply) => {
+                    self.run.deliverable = Some(reply.clone());
+                    self.emit_event(TeamEvent::Deliverable(reply));
+                    return Ok(());
+                }
+            }
 
             self.emit_event(TeamEvent::TasksAssigned {
                 tasks: self.run.tasks.clone(),
@@ -315,7 +319,7 @@ impl TeamEngine {
         &self,
         feedback: Option<&str>,
         history: &[crate::db::TeamRunRow],
-    ) -> Result<Vec<TaskAssignment>> {
+    ) -> Result<DecomposeResult> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
         let context = prompt::build_orchestrator_context(&self.team, &listing, feedback, history);
 
@@ -334,7 +338,34 @@ impl TeamEngine {
             .run_agent(orchestrator_name, &message, &context)
             .await?;
 
-        let tasks = parse_task_assignments(&response, &self.team)?;
+        let result = parse_task_assignments(&response, &self.team)?;
+
+        // For conversational replies, persist and return early
+        let tasks = match result {
+            DecomposeResult::Conversational(reply) => {
+                // Persist orchestrator conversational response to DB
+                let iteration = if feedback.is_some() {
+                    self.run.iteration + 1
+                } else {
+                    1
+                };
+                if let Some(goal_id) = self.goal_msg_id {
+                    let _ = self
+                        .team_db
+                        .insert_team_message(
+                            &self.run.run_id,
+                            Some(goal_id),
+                            Some(orchestrator_name),
+                            "orchestrator",
+                            &response,
+                            iteration,
+                        )
+                        .await;
+                }
+                return Ok(DecomposeResult::Conversational(reply));
+            }
+            DecomposeResult::Tasks(tasks) => tasks,
+        };
 
         // Persist orchestrator decomposition to DB
         let iteration = if feedback.is_some() {
@@ -374,7 +405,7 @@ impl TeamEngine {
             }
         }
 
-        Ok(tasks)
+        Ok(DecomposeResult::Tasks(tasks))
     }
 
     /// Execute all tasks by delegating to specialist agents concurrently.
@@ -498,6 +529,7 @@ impl TeamEngine {
                             brave_api_key: brave_api_key.as_deref(),
                             skills_dirty: &skills_dirty,
                             mcp_manager: None,
+                            agent_name,
                         };
                         crate::agent::run_team_agent(&params)
                             .await
@@ -706,6 +738,7 @@ impl TeamEngine {
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &skills_dirty,
             mcp_manager: None,
+            agent_name,
         };
 
         Ok(crate::agent::run_team_agent(&params)
@@ -714,42 +747,55 @@ impl TeamEngine {
     }
 
     fn emit_event(&self, event: TeamEvent) {
-        let msg = match &event {
-            TeamEvent::Progress(s) => s.as_str(),
-            TeamEvent::TasksAssigned { .. } => "Tasks assigned",
+        match &event {
+            TeamEvent::Progress(s) => {
+                info!(team = %self.run.team_name, "{s}");
+            }
+            TeamEvent::TasksAssigned { .. } => {
+                info!(team = %self.run.team_name, "Tasks assigned");
+            }
             TeamEvent::AgentCompleted { agent, .. } => {
-                info!(agent, "agent completed");
-                "agent completed"
+                info!(team = %self.run.team_name, agent, "agent completed");
             }
             TeamEvent::AgentFailed { agent, error } => {
-                warn!(agent, error, "agent failed");
-                "agent failed"
+                warn!(team = %self.run.team_name, agent, error, "agent failed");
             }
-            TeamEvent::CriticReview { .. } => "Critic review",
-            TeamEvent::Deliverable(_) => "Deliverable ready",
+            TeamEvent::CriticReview { approved, .. } => {
+                info!(team = %self.run.team_name, approved, "Critic review");
+            }
+            TeamEvent::Deliverable(_) => {
+                info!(team = %self.run.team_name, "Deliverable ready");
+            }
             TeamEvent::RunFailed(reason) => {
-                warn!(reason, "run failed");
-                reason.as_str()
+                warn!(team = %self.run.team_name, reason, "run failed");
             }
-        };
-        info!(team = %self.run.team_name, "{msg}");
+        }
         if let Some(cb) = &self.callback {
             cb(event);
         }
     }
 }
 
+/// Result of parsing the orchestrator's response.
+enum DecomposeResult {
+    /// Orchestrator produced valid task assignments.
+    Tasks(Vec<TaskAssignment>),
+    /// Orchestrator replied conversationally instead of producing tasks.
+    Conversational(String),
+}
+
 /// Parse the orchestrator's JSON response into task assignments.
 ///
 /// If the orchestrator replied conversationally (via `{"reply": "..."}`),
-/// returns a sentinel error so `execute_inner` can handle it as a deliverable.
-fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Vec<TaskAssignment>> {
+/// returns `DecomposeResult::Conversational` so the caller can handle it
+/// as a deliverable without error-based control flow.
+fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<DecomposeResult> {
     // Check for conversational reply envelope before trying array parse
     if let Some(json_str) = extract_json(response, '{', '}')
         && let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str)
         && let Some(reply) = obj.get("reply").and_then(|v| v.as_str())
     {
-        bail!("__conversational__:{reply}");
+        return Ok(DecomposeResult::Conversational(reply.to_string()));
     }
 
     // Try to extract JSON array from the response (#257: unified extract_json)
@@ -814,7 +860,7 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Vec<T
         bail!("Orchestrator produced no valid task assignments");
     }
 
-    Ok(tasks)
+    Ok(DecomposeResult::Tasks(tasks))
 }
 
 /// Parse the critic's JSON response.
@@ -893,7 +939,11 @@ mod tests {
         let response =
             r#"[{"agent": "worker", "task": "Do research", "output_file": "research.md"}]"#;
         let team = test_team();
-        let tasks = parse_task_assignments(response, &team).unwrap();
+        let result = parse_task_assignments(response, &team).unwrap();
+        let tasks = match result {
+            DecomposeResult::Tasks(tasks) => tasks,
+            DecomposeResult::Conversational(_) => panic!("expected Tasks, got Conversational"),
+        };
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].agent, "worker");
         assert_eq!(tasks[0].task, "Do research");
@@ -906,7 +956,11 @@ mod tests {
     fn test_parse_task_assignments_with_surrounding_text() {
         let response = "Here are the tasks:\n\n[{\"agent\": \"worker\", \"task\": \"Research\", \"output_file\": \"out.md\"}]\n\nGood luck!";
         let team = test_team();
-        let tasks = parse_task_assignments(response, &team).unwrap();
+        let result = parse_task_assignments(response, &team).unwrap();
+        let tasks = match result {
+            DecomposeResult::Tasks(tasks) => tasks,
+            DecomposeResult::Conversational(_) => panic!("expected Tasks, got Conversational"),
+        };
         assert_eq!(tasks.len(), 1);
     }
 
@@ -962,7 +1016,11 @@ mod tests {
         let response =
             format!(r#"[{{"agent": "worker", "task": "{long_task}", "output_file": "out.md"}}]"#);
         let team = test_team();
-        let tasks = parse_task_assignments(&response, &team).unwrap();
+        let result = parse_task_assignments(&response, &team).unwrap();
+        let tasks = match result {
+            DecomposeResult::Tasks(tasks) => tasks,
+            DecomposeResult::Conversational(_) => panic!("expected Tasks, got Conversational"),
+        };
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task.len(), 5000);
     }
@@ -1009,14 +1067,16 @@ mod tests {
 
     #[test]
     fn test_parse_task_assignments_conversational_reply() {
-        // Conversational reply envelope should return a sentinel error
+        // Conversational reply envelope should return DecomposeResult::Conversational
         let response = r#"{"reply": "Hey! The team is ready and waiting."}"#;
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.starts_with("__conversational__:"));
-        assert!(err_msg.contains("The team is ready and waiting."));
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(reply) => {
+                assert!(reply.contains("The team is ready and waiting."));
+            }
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
@@ -1025,10 +1085,13 @@ mod tests {
         let response =
             "Sure thing!\n{\"reply\": \"Hello! Everything looks good.\"}\nHope that helps.";
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.starts_with("__conversational__:"));
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(reply) => {
+                assert!(reply.contains("Everything looks good."));
+            }
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
@@ -1039,7 +1102,6 @@ mod tests {
         let result = parse_task_assignments(response, &team);
         // Should fail as normal invalid task assignments, not conversational
         assert!(result.is_err());
-        assert!(!result.unwrap_err().to_string().starts_with("__conversational__:"));
     }
 
     #[test]

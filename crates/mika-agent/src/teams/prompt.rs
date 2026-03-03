@@ -37,7 +37,11 @@ pub fn build_orchestrator_context(
         for run in history.iter().rev() {
             let _ = writeln!(buf, "User: {}", run.goal);
             if let Some(ref d) = run.deliverable {
-                let truncated = if d.len() > 500 { &d[..500] } else { d };
+                let truncated = if d.len() > 500 {
+                    &d[..d.floor_char_boundary(500)]
+                } else {
+                    d
+                };
                 let _ = writeln!(buf, "Assistant: {truncated}");
             }
             buf.push('\n');

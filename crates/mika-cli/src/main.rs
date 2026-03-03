@@ -29,23 +29,10 @@ async fn main() -> Result<()> {
         // Only allow bare `mika --team` or `mika --team chat`
         match cli.command {
             None | Some(Commands::Chat) => {
-                // Read log_level from global config
-                let log_level = std::env::var("MIKA_LOG_LEVEL")
-                    .ok()
-                    .filter(|s| {
-                        matches!(
-                            s.as_str(),
-                            "trace" | "debug" | "info" | "warn" | "error" | "off"
-                        )
-                    })
-                    .or_else(|| {
-                        std::fs::read_to_string(global_home.join("config.toml"))
-                            .ok()
-                            .and_then(|content| parse_log_level(&content))
-                    })
-                    .unwrap_or_else(|| "warn".to_string());
+                let log_level =
+                    resolve_log_level(&[global_home.join("config.toml")]);
 
-                let log_dir = global_home.join("logs");
+                let log_dir = team::team_dir(&global_home, &team_name).join("logs");
                 let _log_guard = mika_common::logging::init_pretty(
                     &log_level,
                     Some(&log_dir),
@@ -96,30 +83,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Read log_level from agent config. Uses toml crate (already a dependency)
-    // rather than full config-rs which needs DB.
-    let log_level = std::env::var("MIKA_LOG_LEVEL")
-        .ok()
-        .filter(|s| {
-            matches!(
-                s.as_str(),
-                "trace" | "debug" | "info" | "warn" | "error" | "off"
-            )
-        })
-        .or_else(|| {
-            agent_home
-                .as_ref()
-                .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
-                .and_then(|content| parse_log_level(&content))
-        })
-        .or_else(|| {
-            // Fall back to global config
-            global_home
-                .as_ref()
-                .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
-                .and_then(|content| parse_log_level(&content))
-        })
-        .unwrap_or_else(|| "warn".to_string());
+    // Read log_level from agent config, falling back to global config.
+    let mut config_paths = Vec::new();
+    if let Some(ref h) = agent_home {
+        config_paths.push(h.join("config.toml"));
+    }
+    if let Some(ref h) = global_home {
+        config_paths.push(h.join("config.toml"));
+    }
+    let log_level = resolve_log_level(&config_paths);
 
     // Initialize tracing with correct agent-specific directory and configured level.
     // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
@@ -160,6 +132,26 @@ async fn main() -> Result<()> {
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
     }
+}
+
+/// Resolve log level from env var or config files (first match wins).
+fn resolve_log_level(config_paths: &[std::path::PathBuf]) -> String {
+    std::env::var("MIKA_LOG_LEVEL")
+        .ok()
+        .filter(|s| {
+            matches!(
+                s.as_str(),
+                "trace" | "debug" | "info" | "warn" | "error" | "off"
+            )
+        })
+        .or_else(|| {
+            config_paths.iter().find_map(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_log_level(&content))
+            })
+        })
+        .unwrap_or_else(|| "warn".to_string())
 }
 
 /// Extract `log_level` value from a TOML config string.
