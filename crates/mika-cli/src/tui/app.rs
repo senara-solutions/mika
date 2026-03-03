@@ -893,7 +893,12 @@ impl<'a> App<'a> {
         self.textarea = TextArea::default();
         self.textarea
             .set_cursor_line_style(ratatui::style::Style::default());
-        self.textarea.set_placeholder_text("Type a message...");
+        let placeholder = if self.is_team_mode() {
+            "Type a goal for the team..."
+        } else {
+            "Type a message..."
+        };
+        self.textarea.set_placeholder_text(placeholder);
     }
 }
 

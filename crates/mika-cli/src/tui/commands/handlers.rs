@@ -9,25 +9,10 @@ use crate::tui::app::{AgentRequest, AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
 use crate::tui::input;
 
-/// Commands that are not available in team mode (agent-specific).
-const TEAM_MODE_BLOCKED_COMMANDS: &[&str] = &[
-    "compact",
-    "memory",
-    "mem",
-    "reminders",
-    "remind",
-    "soul",
-    "config",
-    "cfg",
-    "model",
-    "skills",
-    "skill",
-    "switch",
-    "agent",
-    "think",
-    "t",
-    "attach",
-    "img",
+/// Commands allowed in team mode. New commands are blocked by default (safe failure mode).
+const TEAM_MODE_ALLOWED_COMMANDS: &[&str] = &[
+    "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team", "status",
+    "stat",
 ];
 
 /// Dispatch a slash command string to the appropriate handler.
@@ -35,8 +20,8 @@ const TEAM_MODE_BLOCKED_COMMANDS: &[&str] = &[
 pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
     let (cmd_name, args) = parse_command(input);
 
-    // Gate agent-specific commands in team mode
-    if app.is_team_mode() && TEAM_MODE_BLOCKED_COMMANDS.contains(&cmd_name) {
+    // Gate agent-specific commands in team mode (allowlist — new commands blocked by default)
+    if app.is_team_mode() && !TEAM_MODE_ALLOWED_COMMANDS.contains(&cmd_name) {
         return Some(format!("/{cmd_name} is not available in team mode."));
     }
 
@@ -52,7 +37,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "reminders" | "remind" => Some(handle_reminders(app).await),
         "status" | "stat" => {
             if app.is_team_mode() {
-                Some(handle_team_status(app))
+                Some(handle_team_info(app))
             } else {
                 Some(handle_status(app).await)
             }
@@ -433,13 +418,25 @@ async fn handle_export(app: &mut App<'_>) -> String {
     }
 
     let timestamp = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
-    let short_session = &app.session_id[..8.min(app.session_id.len())];
-    let filename = format!("session-{short_session}-{timestamp}.md");
+    let (label, filename) = if app.is_team_mode() {
+        let name = app.team_name.as_deref().unwrap_or("team");
+        (name.to_string(), format!("team-{name}-{timestamp}.md"))
+    } else {
+        let short_session = &app.session_id[..8.min(app.session_id.len())];
+        (
+            app.session_id.clone(),
+            format!("session-{short_session}-{timestamp}.md"),
+        )
+    };
     let filepath = exports_dir.join(&filename);
 
     let mut content = String::from("# Mika Conversation Export\n\n");
-    let _ = writeln!(content, "Session: {}", app.session_id);
-    let _ = writeln!(content, "Model: {}", app.model);
+    if app.is_team_mode() {
+        let _ = writeln!(content, "Team: {label}");
+    } else {
+        let _ = writeln!(content, "Session: {label}");
+        let _ = writeln!(content, "Model: {}", app.model);
+    }
     let _ = writeln!(
         content,
         "Exported: {}\n",
@@ -648,11 +645,11 @@ fn handle_teams(app: &App<'_>) -> String {
     out
 }
 
-/// Show team info when `/team` is used in team mode (no switching).
+/// Show team info for both `/team` and `/status` in team mode.
 fn handle_team_info(app: &App<'_>) -> String {
     let team_name = app.team_name.as_deref().unwrap_or("unknown");
     let mut out = String::new();
-    let _ = writeln!(out, "Current team: {team_name}");
+    let _ = writeln!(out, "Team: {team_name}");
     match team::load_team(&app.global_home, team_name) {
         Ok(def) => {
             let _ = writeln!(out, "  Orchestrator: {}", def.team.orchestrator);
@@ -664,22 +661,6 @@ fn handle_team_info(app: &App<'_>) -> String {
         }
         Err(e) => {
             let _ = writeln!(out, "  (failed to load team definition: {e})");
-        }
-    }
-    out
-}
-
-/// Show team status in team mode.
-fn handle_team_status(app: &App<'_>) -> String {
-    let team_name = app.team_name.as_deref().unwrap_or("unknown");
-    let mut out = format!("Team: {team_name}\n");
-    match team::load_team(&app.global_home, team_name) {
-        Ok(def) => {
-            let _ = writeln!(out, "  Agents: {}", def.agents.len());
-            let _ = writeln!(out, "  Orchestrator: {}", def.team.orchestrator);
-        }
-        Err(e) => {
-            let _ = writeln!(out, "  (failed to load team: {e})");
         }
     }
     out
@@ -841,43 +822,28 @@ mod tests {
     }
 
     #[test]
-    fn test_team_mode_blocked_commands() {
-        // Verify all agent-specific commands are in the blocklist
+    fn test_team_mode_allowed_commands() {
+        // Verify all universal commands are in the allowlist
         for cmd in &[
-            "compact",
-            "memory",
-            "mem",
-            "reminders",
-            "remind",
-            "soul",
-            "config",
-            "cfg",
-            "model",
-            "skills",
-            "skill",
-            "switch",
-            "agent",
-            "think",
-            "t",
-            "attach",
-            "img",
+            "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team",
+            "status", "stat",
         ] {
             assert!(
-                TEAM_MODE_BLOCKED_COMMANDS.contains(cmd),
-                "Expected '{cmd}' to be blocked in team mode"
+                TEAM_MODE_ALLOWED_COMMANDS.contains(cmd),
+                "Expected '{cmd}' to be allowed in team mode"
             );
         }
     }
 
     #[test]
-    fn test_team_mode_allowed_commands() {
-        // Verify universal commands are NOT in the blocklist
+    fn test_team_mode_blocks_agent_commands() {
+        // Verify agent-specific commands are NOT in the allowlist
         for cmd in &[
-            "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams",
+            "compact", "memory", "model", "think", "soul", "config", "skills", "agent", "attach",
         ] {
             assert!(
-                !TEAM_MODE_BLOCKED_COMMANDS.contains(cmd),
-                "Expected '{cmd}' to be allowed in team mode"
+                !TEAM_MODE_ALLOWED_COMMANDS.contains(cmd),
+                "Expected '{cmd}' to be blocked in team mode"
             );
         }
     }

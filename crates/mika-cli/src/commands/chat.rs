@@ -451,18 +451,18 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let worker_home = global_home.to_path_buf();
     let worker_name = team_name.to_string();
     let team_worker_handle = tokio::spawn(async move {
+        let settings = match Settings::load(&worker_home) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ =
+                    response_tx.send(TeamResponse::Error(format!("Failed to load settings: {e}")));
+                return;
+            }
+        };
+
         while let Some(request) = team_rx_worker.recv().await {
             match request {
                 TeamRequest::Goal(goal) => {
-                    let settings = match Settings::load(&worker_home) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = response_tx
-                                .send(TeamResponse::Error(format!("Failed to load settings: {e}")));
-                            continue;
-                        }
-                    };
-
                     let tx = response_tx.clone();
                     let progress = move |msg: &str| {
                         let _ = tx.send(TeamResponse::Progress(msg.to_string()));
@@ -569,8 +569,8 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     // Shut down event reader thread
     events.shutdown();
 
-    // Abort team worker
-    team_worker_handle.abort();
+    // Give team worker a brief window to shut down gracefully before aborting
+    let _ = tokio::time::timeout(Duration::from_secs(2), team_worker_handle).await;
 
     Ok(())
 }

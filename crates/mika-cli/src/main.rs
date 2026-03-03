@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
     // --team is mutually exclusive with --agent (enforced by clap).
     if let Some(ref team_name) = cli.team {
         let team_name = team::normalize_team_name(team_name);
+        team::validate_team_name(&team_name)?;
         let global_home = home::resolve_home_dir()?;
 
         if !team::team_exists(&global_home, &team_name) {
