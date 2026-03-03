@@ -251,4 +251,30 @@ mod tests {
         let written = fs::read_to_string(workspace.join("file..v2.md")).unwrap();
         assert_eq!(written, "version 2");
     }
+
+    #[tokio::test]
+    async fn test_write_success_message_contains_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+
+        let tool = WriteWorkspaceTool {
+            workspace_dir: workspace.clone(),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "sub/file.md", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        let expected_path = workspace.join("sub/file.md");
+        assert!(
+            output
+                .content
+                .contains(&expected_path.display().to_string()),
+            "expected absolute path '{}' in message: {}",
+            expected_path.display(),
+            output.content
+        );
+    }
 }
