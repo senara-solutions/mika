@@ -80,8 +80,6 @@ impl Tool for DelegateTaskTool {
         let agent_home = agent::agent_dir(&self.home_dir, agent_name);
         let db_path = agent_home.join("data").join("mika.db");
 
-        // Initialize sqlite-vec and open the delegate agent's database
-        crate::db::init_sqlite_vec();
         let db = match crate::db::Database::open(&db_path) {
             Ok(db) => db,
             Err(e) => {

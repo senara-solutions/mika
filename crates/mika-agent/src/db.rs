@@ -7,6 +7,8 @@ use tracing::{debug, info};
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
 /// Idempotent — uses an internal Once guard so multiple calls are safe.
+/// Auto-called by [`Database::open`] and [`Database::open_in_memory`], so
+/// callers typically don't need to invoke this directly.
 pub fn init_sqlite_vec() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -53,8 +55,9 @@ pub struct Database {
 
 impl Database {
     /// Open (or create) a per-customer SQLite database at `path`.
-    /// Runs migrations automatically.
+    /// Runs migrations automatically. Registers sqlite-vec if not already done.
     pub fn open(path: &Path) -> Result<Self> {
+        init_sqlite_vec();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
 
@@ -76,7 +79,9 @@ impl Database {
     }
 
     /// Open an in-memory database (for tests).
+    /// Registers sqlite-vec if not already done.
     pub fn open_in_memory() -> Result<Self> {
+        init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("failed to set pragmas")?;

@@ -491,6 +491,11 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         }
     });
 
+    // Open on-disk DB for team conversation persistence
+    let data_dir = team_dir.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let team_db = mika_agent::async_db::AsyncDatabase::open(&data_dir.join("mika.db"))?;
+
     // Build app in team mode
     let mut app = App::new_team(
         team_tx,
@@ -498,10 +503,29 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         team_name,
         team_dir.clone(),
         global_home.to_path_buf(),
+        team_db,
     );
 
-    // Load latest completed team run as initial history
-    load_team_history(&mut app, global_home, team_name);
+    // Load recent conversations from DB
+    if let Ok(history) = app.db.load_recent_messages(20, Some(vec!["team".into()])).await {
+        for msg in history {
+            let role = match msg.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => ChatRole::System,
+            };
+            app.messages.push(ChatMessage {
+                role,
+                content: msg.content,
+                rendered: None,
+                channel: None,
+            });
+        }
+    }
+    // Fall back to TOML history if DB was empty (transition from pre-persistence)
+    if app.messages.is_empty() {
+        load_team_history(&mut app, global_home, team_name);
+    }
 
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
@@ -562,6 +586,9 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
             break;
         }
     }
+
+    // Shut down team DB (ensures pending writes complete)
+    app.db.shutdown();
 
     // Restore terminal
     restore_terminal()?;

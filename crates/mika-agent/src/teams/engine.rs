@@ -69,8 +69,6 @@ impl TeamEngine {
         let mut agents = HashMap::new();
         let embedding_client = settings.make_embedding_client();
 
-        crate::db::init_sqlite_vec();
-
         for ta in &team.agents {
             let home_dir = agent::agent_dir(global_home, &ta.name);
             let db_path = home_dir.join("data").join("mika.db");

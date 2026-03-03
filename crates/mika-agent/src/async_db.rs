@@ -67,7 +67,7 @@ impl AsyncDatabase {
         Ok(Self::new(db))
     }
 
-    /// Create an in-memory database (useful for team mode TUI where no agent DB is needed).
+    /// Create an in-memory database (primarily for tests; team mode now uses on-disk DB).
     pub fn in_memory() -> Self {
         let db = Database::open_in_memory().expect("failed to open in-memory SQLite");
         Self::new(db)
@@ -597,7 +597,6 @@ mod tests {
     use crate::db::Database;
 
     fn test_async_db() -> AsyncDatabase {
-        crate::db::init_sqlite_vec();
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new(db)
     }

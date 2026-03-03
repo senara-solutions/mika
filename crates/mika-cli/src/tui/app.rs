@@ -367,6 +367,7 @@ impl<'a> App<'a> {
         team_name: &str,
         team_dir: PathBuf,
         global_home: PathBuf,
+        db: AsyncDatabase,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -396,7 +397,7 @@ impl<'a> App<'a> {
             // Team mode does not use agent-specific resources. These are set to
             // safe defaults. Slash command handlers check `is_team_mode()` before
             // accessing them.
-            db: AsyncDatabase::in_memory(),
+            db,
             claude: ClaudeClient::dummy(),
             home_dir: team_dir.clone(),
             skills: Arc::new(SkillRegistry::empty()),
@@ -466,7 +467,12 @@ impl<'a> App<'a> {
                 rendered: None,
                 channel: None,
             });
-            let _ = team_tx.send(TeamRequest::Goal(text));
+            let _ = team_tx.send(TeamRequest::Goal(text.clone()));
+            // Persist user message to DB (fire-and-forget)
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let _ = db.save_message("user", &text, "team").await;
+            });
             self.status = AgentStatus::Thinking;
             self.reset_textarea();
             self.scroll_offset = 0;
@@ -538,7 +544,7 @@ impl<'a> App<'a> {
 
         // Team mode: poll team response channel
         if self.is_team_mode() {
-            self.tick_team_mode();
+            self.tick_team_mode().await;
         } else {
             self.tick_agent_mode().await;
         }
@@ -602,7 +608,7 @@ impl<'a> App<'a> {
     }
 
     /// Tick handler for team mode: poll team_rx for progress/deliverable/error.
-    fn tick_team_mode(&mut self) {
+    async fn tick_team_mode(&mut self) {
         let Some(ref mut team_rx) = self.team_rx else {
             return;
         };
@@ -627,6 +633,8 @@ impl<'a> App<'a> {
                     });
                     self.status = AgentStatus::Idle;
                 } else {
+                    // Persist deliverable to DB
+                    let _ = self.db.save_message("assistant", &text, "team").await;
                     self.pending_response = Some(text);
                     self.reveal_index = 0;
                     self.status = AgentStatus::Responding(0);
