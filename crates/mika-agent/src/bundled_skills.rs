@@ -107,6 +107,12 @@ static MCP_SKILL: BundledSkill = skill!("mcp", [
     ("tools.json" => "../templates/skills/mcp/tools.json"),
 ]);
 
+static AGENTS_TEAMS_SKILL: BundledSkill = skill!("agents-teams", [
+    ("skill.toml" => "../templates/skills/agents-teams/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/agents-teams/system_prompt.md"),
+    ("tools.json" => "../templates/skills/agents-teams/tools.json"),
+]);
+
 /// All bundled skills.
 static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &TMUX_SKILL,
@@ -117,6 +123,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &SELF_KNOWLEDGE_SKILL,
     &GITHUB_SKILL,
     &MCP_SKILL,
+    &AGENTS_TEAMS_SKILL,
 ];
 
 /// Check whether a skill name matches a bundled (built-in) skill.
