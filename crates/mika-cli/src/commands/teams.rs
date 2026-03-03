@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use std::io::{self, Write};
 
-use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, format_unix_ts};
+use mika_agent::teams::open_or_create_team_db;
 use mika_agent::teams::types::TeamEvent;
 use mika_common::config::Settings;
 use mika_common::home;
@@ -183,10 +183,8 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
     };
 
     // Open team DB for persistence
-    let team_data_dir = team::team_dir(global_home, &name).join("data");
-    std::fs::create_dir_all(&team_data_dir)?;
-    let team_db_path = team_data_dir.join("mika.db");
-    let team_db = AsyncDatabase::new(Database::open(&team_db_path)?);
+    let team_db =
+        open_or_create_team_db(global_home, &name).map_err(|e| anyhow::anyhow!(e))?;
 
     let run = mika_agent::teams::run_team(
         &name,

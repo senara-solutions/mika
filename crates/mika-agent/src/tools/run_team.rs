@@ -2,12 +2,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
-use mika_common::team;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::async_db::AsyncDatabase;
-use crate::db::Database;
+use crate::teams::open_or_create_team_db;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -74,16 +72,9 @@ impl Tool for RunTeamTool {
         }
 
         // Open team DB for persistence
-        let team_data_dir = team::team_dir(&self.home_dir, team_name).join("data");
-        std::fs::create_dir_all(&team_data_dir).ok();
-        let team_db_path = team_data_dir.join("mika.db");
-        let team_db = match Database::open(&team_db_path) {
-            Ok(db) => AsyncDatabase::new(db),
-            Err(e) => {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to open team database: {e}"
-                )));
-            }
+        let team_db = match open_or_create_team_db(&self.home_dir, team_name) {
+            Ok(db) => db,
+            Err(msg) => return Ok(ToolOutput::error(msg)),
         };
 
         let result = crate::teams::run_team(

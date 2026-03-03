@@ -118,26 +118,7 @@ impl Tool for GetTeamHistoryTool {
 mod tests {
     use super::*;
 
-    use crate::db::Database;
-    use crate::test_utils::test_helpers::TestHarness;
-
-    /// Create a team DB with `n` runs and return the home_dir.
-    fn setup_team_db(team_name: &str, n: usize) -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        let data_dir = team::team_dir(&home, team_name).join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let db = Database::open(&data_dir.join("mika.db")).unwrap();
-        for i in 0..n {
-            let run_id = format!("run-{i:04}");
-            let ts = 1740000000 + (i as i64 * 300); // spaced 5 min apart
-            db.insert_team_run(&run_id, team_name, &format!("Goal {i}"), 3, ts)
-                .unwrap();
-            db.update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
-                .unwrap();
-        }
-        (tmp, home)
-    }
+    use crate::test_utils::test_helpers::{TestHarness, setup_team_db};
 
     #[tokio::test]
     async fn test_get_team_history_empty() {

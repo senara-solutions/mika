@@ -156,21 +156,7 @@ impl Tool for GetTeamStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
-    use crate::test_utils::test_helpers::TestHarness;
-
-    fn setup_team_db(team_name: &str) -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        let data_dir = team::team_dir(&home, team_name).join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let db = Database::open(&data_dir.join("mika.db")).unwrap();
-        db.insert_team_run("abcd1234", team_name, "Test goal", 3, 1740000000)
-            .unwrap();
-        db.update_team_run("abcd1234", "completed", None, 1, Some("Summary"), Some(1740000300))
-            .unwrap();
-        (tmp, home)
-    }
+    use crate::test_utils::test_helpers::{TestHarness, setup_team_db};
 
     #[tokio::test]
     async fn test_get_team_status_no_runs() {
@@ -191,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_team_status_latest() {
-        let (_tmp, home) = setup_team_db("dev-team");
+        let (_tmp, home) = setup_team_db("dev-team", 1);
 
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -203,8 +189,8 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Status: completed"));
-        assert!(result.content.contains("abcd1234"));
-        assert!(result.content.contains("Test goal"));
+        assert!(result.content.contains("run-0000"));
+        assert!(result.content.contains("Goal 0"));
     }
 
     #[tokio::test]
