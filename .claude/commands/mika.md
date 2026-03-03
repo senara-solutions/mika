@@ -14,6 +14,7 @@ Run these slash commands in order. Do not do anything else. Do not stop between 
 5. `/compound-engineering:resolve_todo_parallel`
 6. `/mika-doc-audit`
 7. `/workflows:compound`
-8. Output `<promise>DONE</promise>` when complete
+8. Create a PR if one doesn't already exist
+9. Output `<promise>DONE</promise>` when complete
 
 Start with step 1 now.
