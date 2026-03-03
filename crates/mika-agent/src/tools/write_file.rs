@@ -2,9 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use std::path::Component;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, validate_and_resolve_path};
 
 /// Maximum file size for reading existing content during confirmation flow (100 KB).
 const MAX_EXISTING_SIZE: u64 = 100 * 1024;
@@ -44,14 +43,6 @@ impl Tool for WriteFileTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
-        if path.is_empty() {
-            return Ok(ToolOutput::error("'path' is required and cannot be empty."));
-        }
-        if path.len() > MAX_INPUT_LEN {
-            return Ok(ToolOutput::error(format!(
-                "Path exceeds maximum length of {MAX_INPUT_LEN} characters."
-            )));
-        }
 
         let content = input["content"].as_str().unwrap_or("");
         if content.is_empty() {
@@ -67,72 +58,10 @@ impl Tool for WriteFileTool {
 
         let confirm = input["confirm"].as_bool().unwrap_or(false);
 
-        // Reject absolute paths
-        if std::path::Path::new(path).is_absolute() {
-            return Ok(ToolOutput::error(
-                "Absolute paths are not allowed. Use a relative path within the home directory.",
-            ));
-        }
-
-        // Prevent path traversal using component inspection
-        for component in std::path::Path::new(path).components() {
-            match component {
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Ok(ToolOutput::error(
-                        "Path traversal components ('..', root, or prefix) are not allowed.",
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        let full_path = ctx.home_dir.join(path);
-
-        // Create parent directories if needed
-        if let Some(parent) = full_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to create parent directories: {e}"
-                )));
-            }
-
-            // Check for symlinks in the parent chain
-            match tokio::fs::symlink_metadata(parent).await {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        return Ok(ToolOutput::error(
-                            "Symbolic links are not allowed in the path.",
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Ok(ToolOutput::error(format!(
-                        "Failed to verify parent directory: {e}"
-                    )));
-                }
-            }
-
-            // Verify containment using canonicalize (parent now exists)
-            let canonical_parent = match parent.canonicalize() {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(ToolOutput::error(format!(
-                        "Failed to resolve parent directory: {e}"
-                    )));
-                }
-            };
-            let home_canonical = match ctx.home_dir.canonicalize() {
-                Ok(c) => c,
-                Err(_) => {
-                    return Ok(ToolOutput::error("Home directory does not exist."));
-                }
-            };
-            if !canonical_parent.starts_with(&home_canonical) {
-                return Ok(ToolOutput::error(
-                    "Path resolves outside the home directory.",
-                ));
-            }
-        }
+        let full_path = match validate_and_resolve_path(path, ctx.home_dir).await {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
 
         // Check if file already exists
         let file_exists = tokio::fs::try_exists(&full_path).await.unwrap_or(false);

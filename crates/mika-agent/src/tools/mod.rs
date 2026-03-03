@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -179,6 +179,101 @@ pub(crate) fn check_reflection_evidence(
         }
     }
     None
+}
+
+/// Validate a relative path and resolve it to a full path within `base_dir`.
+///
+/// Performs the following security checks:
+/// 1. Non-empty path
+/// 2. Path length within `MAX_INPUT_LEN`
+/// 3. Absolute paths rejected
+/// 4. Path traversal components (`..`, root, prefix) rejected
+/// 5. Parent directories created (idempotent)
+/// 6. Parent directory symlink check
+/// 7. Canonicalize containment check (resolved parent must be within `base_dir`)
+///
+/// Returns `Ok(full_path)` on success or `Err(ToolOutput::error(...))` on failure.
+pub(crate) async fn validate_and_resolve_path(
+    path: &str,
+    base_dir: &Path,
+) -> std::result::Result<PathBuf, ToolOutput> {
+    if path.is_empty() {
+        return Err(ToolOutput::error("'path' is required and cannot be empty."));
+    }
+    if path.len() > MAX_INPUT_LEN {
+        return Err(ToolOutput::error(format!(
+            "Path exceeds maximum length of {MAX_INPUT_LEN} characters."
+        )));
+    }
+
+    // Reject absolute paths
+    if Path::new(path).is_absolute() {
+        return Err(ToolOutput::error(
+            "Absolute paths are not allowed. Use a relative path within the directory.",
+        ));
+    }
+
+    // Prevent path traversal using component inspection
+    for component in Path::new(path).components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ToolOutput::error(
+                    "Path traversal components ('..', root, or prefix) are not allowed.",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let full_path = base_dir.join(path);
+
+    // Create parent directories if needed
+    if let Some(parent) = full_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(ToolOutput::error(format!(
+                "Failed to create parent directories: {e}"
+            )));
+        }
+
+        // Check for symlinks in the parent chain
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(ToolOutput::error(
+                        "Symbolic links are not allowed in the path.",
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(ToolOutput::error(format!(
+                    "Failed to verify parent directory: {e}"
+                )));
+            }
+        }
+
+        // Verify containment using canonicalize (parent now exists)
+        let canonical_parent = match parent.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(ToolOutput::error(format!(
+                    "Failed to resolve parent directory: {e}"
+                )));
+            }
+        };
+        let base_canonical = match base_dir.canonicalize() {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(ToolOutput::error("Base directory does not exist."));
+            }
+        };
+        if !canonical_parent.starts_with(&base_canonical) {
+            return Err(ToolOutput::error(
+                "Path resolves outside the base directory.",
+            ));
+        }
+    }
+
+    Ok(full_path)
 }
 
 /// Registry of available tools.
