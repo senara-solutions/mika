@@ -2,9 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput, validate_and_resolve_path};
 
 /// Maximum file size that can be read from the workspace (100 KB).
 const MAX_READ_SIZE: u64 = 100 * 1024;
@@ -38,39 +38,13 @@ impl Tool for ReadWorkspaceTool {
 
     async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
-        if path.is_empty() {
-            return Ok(ToolOutput::error("'path' is required and cannot be empty."));
-        }
 
-        // Validate path length
-        if path.len() > MAX_INPUT_LEN {
-            return Ok(ToolOutput::error(format!(
-                "Path exceeds maximum length of {MAX_INPUT_LEN} characters."
-            )));
-        }
+        let full_path = match validate_and_resolve_path(path, &self.workspace_dir).await {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
 
-        // Reject absolute paths
-        if std::path::Path::new(path).is_absolute() {
-            return Ok(ToolOutput::error(
-                "Absolute paths are not allowed. Use a relative path within the workspace.",
-            ));
-        }
-
-        // Prevent path traversal using component inspection
-        for component in std::path::Path::new(path).components() {
-            match component {
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Ok(ToolOutput::error(
-                        "Path traversal components ('..', root, or prefix) are not allowed.",
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        let full_path = self.workspace_dir.join(path);
-
-        // Reject symlinks (check before canonicalize to prevent TOCTOU via symlink)
+        // Reject symlinks at the target file (check before canonicalize to prevent TOCTOU via symlink)
         match tokio::fs::symlink_metadata(&full_path).await {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -131,6 +105,7 @@ impl Tool for ReadWorkspaceTool {
 mod tests {
     use super::*;
     use crate::test_utils::test_helpers::TestHarness;
+    use crate::tools::MAX_INPUT_LEN;
     use std::fs;
 
     #[tokio::test]
