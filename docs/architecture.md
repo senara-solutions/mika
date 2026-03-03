@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 16 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -179,7 +179,7 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ### Builtin Tools
 
-All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
+All 16 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
 | Tool | Description | Category |
@@ -192,6 +192,14 @@ All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `list_reminders` | List pending and future reminders. | Reminders |
 | `cancel_reminder` | Cancel a pending reminder by ID. | Reminders |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
+| `create_skill` | Create a new custom skill with prompt snippets and tool definitions. | Skills |
+| `delete_skill` | Delete a custom or marketplace skill. Built-in skills cannot be deleted. | Skills |
+| `list_skills` | List all skills with their origin, status, and keywords. | Skills |
+| `toggle_skill` | Enable or disable a skill. | Skills |
+| `update_skill` | Update an existing skill's description, keywords, prompts, or always_on setting. | Skills |
+| `get_config` | Read customer config values (timezone, chat_id, thinking_level). | Config |
+| `set_config` | Update customer config values. | Config |
+| `write_file` | Write content to a file in the agent's home directory. Requires `confirm: true` to overwrite existing files — returns current content first. | Files |
 
 ### Management Tools
 
