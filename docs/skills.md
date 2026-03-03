@@ -358,8 +358,9 @@ All bundled exec-handler scripts require `jq` for JSON input parsing and will fa
 | self-knowledge  | help, what can you do, capabilities, commands, how to use     | Yes            |
 | calendar        | calendar, meeting, schedule, event                             | Yes            |
 | mcp             | mcp, model context protocol, mcp server, mcp tool              | Yes            |
+| agents-teams    | delegate, delegate task, run team, list agents, list teams, team workflow, team status, team history, multi-agent | Yes |
 
-These skills provide only system prompt guidance — they have no tools of their own. The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands.
+These skills provide only system prompt guidance — they have no tools of their own. The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands. The **agents-teams** skill provides behavioral guidance for using the 6 management tools (`delegate_task`, `run_team`, `list_agents`, `list_teams`, `get_team_status`, `get_team_history`) — when to delegate vs run a team, delegate limitations, and timeout expectations.
 
 ---
 
