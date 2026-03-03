@@ -2,7 +2,6 @@
 pub mod test_helpers {
     use crate::async_db::AsyncDatabase;
     use crate::db::Database;
-    use crate::teams::types::{RunStatus, TaskAssignment, TaskStatus, TeamRun};
     use crate::tools::ToolContext;
     use mika_common::config::Settings;
     use std::path::PathBuf;
@@ -135,25 +134,4 @@ pub mod test_helpers {
         }
     }
 
-    /// Sample TeamRun for history/status tests.
-    pub fn test_team_run() -> TeamRun {
-        TeamRun {
-            run_id: "abcd1234".to_string(),
-            team_name: "dev-team".to_string(),
-            goal: "Test goal".to_string(),
-            status: RunStatus::Completed,
-            iteration: 1,
-            max_iterations: 3,
-            tasks: vec![TaskAssignment {
-                agent: "researcher".to_string(),
-                role: "specialist".to_string(),
-                task: "Research".to_string(),
-                output_file: "research.md".to_string(),
-                status: TaskStatus::Completed,
-            }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
-            ended_at: Some("2026-02-25T10:05:00Z".to_string()),
-            deliverable: Some("Summary".to_string()),
-        }
-    }
 }

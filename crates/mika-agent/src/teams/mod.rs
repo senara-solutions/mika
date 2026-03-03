@@ -1,5 +1,4 @@
 pub mod engine;
-pub mod history;
 pub mod prompt;
 pub mod types;
 

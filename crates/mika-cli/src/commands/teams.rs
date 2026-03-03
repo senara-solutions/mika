@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
 use std::io::{self, Write};
 
 use mika_agent::async_db::AsyncDatabase;
@@ -7,6 +8,12 @@ use mika_agent::teams::types::TeamEvent;
 use mika_common::config::Settings;
 use mika_common::home;
 use mika_common::team;
+
+fn format_ts(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
 
 use crate::cli::{TeamsArgs, TeamsCommand};
 
@@ -140,7 +147,6 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
     let dir = team::team_dir(global_home, &name);
     std::fs::create_dir_all(&dir)?;
     std::fs::create_dir_all(team::workspace_dir(global_home, &name))?;
-    std::fs::create_dir_all(team::history_dir(global_home, &name))?;
 
     let toml_content = toml::to_string_pretty(&def)?;
     std::fs::write(dir.join("team.toml"), toml_content)?;
@@ -207,10 +213,6 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
     }
 
     println!("\n  Run ID: {}", run.run_id);
-    println!(
-        "  History: {}\n",
-        team::history_dir(global_home, &name).display()
-    );
 
     Ok(())
 }
@@ -235,16 +237,21 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
     }
     println!("  Max iterations: {}", def.flow.max_iterations);
 
-    // Show latest run if available
-    let history_dir = team::history_dir(global_home, &name);
-    if let Ok(Some(latest)) = mika_agent::teams::history::load_latest_run(&history_dir) {
+    // Show latest run if available from team DB
+    let team_db_path = team::team_dir(global_home, &name)
+        .join("data")
+        .join("mika.db");
+    if team_db_path.exists()
+        && let Ok(db) = Database::open(&team_db_path)
+        && let Ok(Some(latest)) = db.load_latest_team_run(&name)
+    {
         println!("\n  Latest run:");
-        println!("    ID: {}", latest.run_id);
+        println!("    ID: {}", latest.id);
         println!("    Goal: {}", latest.goal);
         println!("    Status: {}", latest.status);
-        println!("    Started: {}", latest.started_at);
-        if let Some(ended) = &latest.ended_at {
-            println!("    Ended: {ended}");
+        println!("    Started: {}", format_ts(latest.started_at));
+        if let Some(ended) = latest.ended_at {
+            println!("    Ended: {}", format_ts(ended));
         }
     }
     println!();
@@ -259,8 +266,16 @@ fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
         bail!("Team '{name}' not found.");
     }
 
-    let history_dir = team::history_dir(global_home, &name);
-    let runs = mika_agent::teams::history::list_runs(&history_dir)?;
+    let team_db_path = team::team_dir(global_home, &name)
+        .join("data")
+        .join("mika.db");
+    if !team_db_path.exists() {
+        println!("\n  No runs found for team '{name}'.\n");
+        return Ok(());
+    }
+
+    let db = Database::open(&team_db_path)?;
+    let runs = db.load_team_runs(&name, 50)?;
 
     if runs.is_empty() {
         println!("\n  No runs found for team '{name}'.\n");
@@ -269,13 +284,17 @@ fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
 
     println!("\n  Run history for team '{name}':");
     for run in &runs {
-        let ended = run.ended_at.as_deref().unwrap_or("in progress");
+        let started = format_ts(run.started_at);
+        let ended = run
+            .ended_at
+            .map(format_ts)
+            .unwrap_or_else(|| "in progress".to_string());
         println!(
             "    [{}] {} | {} -> {}",
-            run.run_id.get(..8).unwrap_or(&run.run_id),
-            run.started_at.get(..10).unwrap_or(&run.started_at),
+            run.id.get(..8).unwrap_or(&run.id),
+            started.get(..10).unwrap_or(&started),
             run.status,
-            ended.get(..10).unwrap_or(ended)
+            ended.get(..10).unwrap_or(&ended)
         );
         println!("      Goal: {}", run.goal);
     }
