@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent,
-    Person, Preference, Reminder, SearchResult,
+    Person, Preference, Reminder, SearchResult, TeamMessageRow, TeamRunRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -588,6 +588,80 @@ impl AsyncDatabase {
 
     pub async fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
         self.with_db(|db| db.get_all_facts_for_indexing()).await
+    }
+
+    // -- Team Runs --
+
+    pub async fn insert_team_run(
+        &self,
+        run_id: &str,
+        team_name: &str,
+        goal: &str,
+        max_iterations: u32,
+        started_at: i64,
+    ) -> Result<()> {
+        let (ri, tn, g) = (run_id.to_owned(), team_name.to_owned(), goal.to_owned());
+        self.with_db(move |db| db.insert_team_run(&ri, &tn, &g, max_iterations, started_at))
+            .await
+    }
+
+    pub async fn update_team_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        failure_reason: Option<&str>,
+        iteration: u32,
+        deliverable: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<()> {
+        let (ri, s, fr, d) = (
+            run_id.to_owned(),
+            status.to_owned(),
+            failure_reason.map(|s| s.to_owned()),
+            deliverable.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.update_team_run(&ri, &s, fr.as_deref(), iteration, d.as_deref(), ended_at)
+        })
+        .await
+    }
+
+    pub async fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.load_team_runs(&tn, limit)).await
+    }
+
+    pub async fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.load_latest_team_run(&tn)).await
+    }
+
+    // -- Team Messages --
+
+    pub async fn insert_team_message(
+        &self,
+        run_id: &str,
+        parent_id: Option<i64>,
+        agent_name: Option<&str>,
+        message_type: &str,
+        content: &str,
+        iteration: u32,
+    ) -> Result<i64> {
+        let (ri, an, mt, c) = (
+            run_id.to_owned(),
+            agent_name.map(|s| s.to_owned()),
+            message_type.to_owned(),
+            content.to_owned(),
+        );
+        self.with_db(move |db| {
+            db.insert_team_message(&ri, parent_id, an.as_deref(), &mt, &c, iteration)
+        })
+        .await
+    }
+
+    pub async fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.load_team_messages(&ri)).await
     }
 }
 
