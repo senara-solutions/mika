@@ -14,6 +14,13 @@ When modifying config files (hyprland.conf, waybar config, bashrc, etc.):
 - Check if the entry already exists before adding it (idempotent edits).
 - Use `~` instead of hardcoded absolute home paths where the config format supports it.
 
+## File writing
+
+Before writing to any file via shell (cat >, tee, sed -i, echo >, heredoc, etc.):
+- ALWAYS read the file first if it exists, to understand what you're replacing.
+- Prefer the `write_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
+- When shell writes are necessary (e.g., binary data, piping, large files), use `cat <file>` or `head <file>` first.
+
 ## Writing shell scripts
 
 When writing shell scripts to disk:

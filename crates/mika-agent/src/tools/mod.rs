@@ -21,6 +21,7 @@ mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod update_skill;
+mod write_file;
 mod write_workspace;
 
 use anyhow::Result;
@@ -259,6 +260,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(update_skill::UpdateSkillTool));
     registry.register(Box::new(get_config::GetConfigTool));
     registry.register(Box::new(set_config::SetConfigTool));
+    registry.register(Box::new(write_file::WriteFileTool));
     registry
 }
 
