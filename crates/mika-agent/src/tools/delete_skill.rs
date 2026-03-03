@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use super::create_skill::{validate_skill_name, verify_skill_path};
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bundled_skills::is_bundled_skill;
+use crate::skills::marketplace;
 
 pub struct DeleteSkillTool;
 
@@ -68,6 +69,14 @@ impl Tool for DeleteSkillTool {
         // Delete the skill directory
         if let Err(e) = std::fs::remove_dir_all(&skill_dir) {
             return Ok(ToolOutput::error(format!("Failed to delete skill: {e}")));
+        }
+
+        // Clean up marketplace lock entry if this was a marketplace skill
+        let mut lock = marketplace::read_lock(ctx.home_dir);
+        if lock.skills.remove(name).is_some() {
+            if let Err(e) = marketplace::write_lock(ctx.home_dir, &lock) {
+                tracing::warn!(skill = name, error = %e, "failed to update marketplace lock after delete");
+            }
         }
 
         ctx.skills_dirty.store(true, Ordering::Release);
