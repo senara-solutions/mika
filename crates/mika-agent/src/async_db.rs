@@ -500,6 +500,11 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_memory_events_since(&s)).await
     }
 
+    pub async fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
+        self.with_db(move |db| db.prune_old_reflection_runs(days))
+            .await
+    }
+
     pub async fn record_reflection_run(
         &self,
         status: &str,

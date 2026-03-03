@@ -479,6 +479,8 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_reflection_runs_ran_at ON reflection_runs(ran_at);
 
+            CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
+
             INSERT INTO schema_version (version) VALUES (10);
 
             COMMIT;
@@ -1043,29 +1045,9 @@ impl Database {
     /// Computes the local start-of-day boundary using chrono-tz, then counts
     /// sends with `sent_at >= local_midnight_utc`.
     pub fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
-        use chrono::{Datelike, NaiveDate, Utc};
-        use chrono_tz::Tz;
-
-        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-
-        // Current time in the customer's timezone
-        let now_local = Utc::now().with_timezone(&tz);
-        // Start of today in customer's local time
-        let local_midnight =
-            NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
-                .unwrap_or_else(|| Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid");
-
-        // Convert local midnight back to UTC for SQL comparison
-        // Use the earliest possible time if ambiguous (e.g., DST transitions)
-        let midnight_utc = local_midnight
-            .and_local_timezone(tz)
-            .earliest()
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let boundary = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+        let boundary = today_midnight_utc(timezone)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         let count: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= ?1",
@@ -1088,7 +1070,32 @@ impl Database {
             .optional()
             .map_err(Into::into)
     }
+}
 
+/// Compute today's midnight in the given timezone, converted to UTC.
+///
+/// Falls back to UTC if the timezone string is invalid. Handles DST
+/// ambiguity by choosing the earliest possible time.
+pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{Datelike, NaiveDate, Utc};
+    use chrono_tz::Tz;
+
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    let now_local = Utc::now().with_timezone(&tz);
+    let local_midnight =
+        NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
+            .unwrap_or_else(|| Utc::now().date_naive())
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid");
+
+    local_midnight
+        .and_local_timezone(tz)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now)
+}
+
+impl Database {
     // -- Reflection --
 
     /// Get conversation messages since a given UTC boundary timestamp.
@@ -1099,7 +1106,8 @@ impl Database {
              FROM conversations
              WHERE created_at >= ?1
                AND channel_type != 'reflection'
-             ORDER BY id",
+             ORDER BY id
+             LIMIT 500",
         )?;
 
         let messages: Vec<ConversationMessage> = stmt
@@ -1145,6 +1153,16 @@ impl Database {
         Ok(events)
     }
 
+    /// Delete reflection runs older than `days` days.
+    pub fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86_400);
+        let deleted = self.conn.execute(
+            "DELETE FROM reflection_runs WHERE ran_at < ?1",
+            [cutoff],
+        )?;
+        Ok(deleted)
+    }
+
     /// Record a reflection run for rate limiting and audit.
     pub fn record_reflection_run(
         &self,
@@ -1162,24 +1180,7 @@ impl Database {
 
     /// Check if a reflection has already run today (any status) in the user's timezone.
     pub fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
-        use chrono::{Datelike, NaiveDate, Utc};
-        use chrono_tz::Tz;
-
-        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-        let now_local = Utc::now().with_timezone(&tz);
-        let local_midnight =
-            NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
-                .unwrap_or_else(|| Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid");
-
-        let midnight_utc = local_midnight
-            .and_local_timezone(tz)
-            .earliest()
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let midnight_unix = midnight_utc.timestamp();
+        let midnight_unix = today_midnight_utc(timezone).timestamp();
 
         let count: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM reflection_runs WHERE ran_at >= ?1",

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Datelike;
 use mika_common::claude::{
     ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, StopReason,
     ToolResultBlock, ToolResultBody,
@@ -128,6 +127,9 @@ const TOOL_INPUT_SUMMARY_MAX: usize = 120;
 const TOOL_OUTPUT_SUMMARY_MAX: usize = 180;
 /// Maximum total characters for serialized tool call metadata.
 const TOOL_METADATA_MAX: usize = 4000;
+/// Maximum characters of conversation/memory digest injected into the reflection prompt.
+/// ~12,500 tokens at 4 chars/token -- keeps total prompt well within Claude's context.
+const MAX_REFLECTION_DIGEST_CHARS: usize = 50_000;
 
 /// Truncate a string to approximately `max_len` bytes, appending "..." if truncated.
 /// Always cuts at a valid UTF-8 char boundary to avoid panics on multi-byte input.
@@ -1061,26 +1063,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 .get_customer_config("timezone")
                 .await?
                 .unwrap_or_else(|| "UTC".to_string());
-            let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
-            let now_local = chrono::Utc::now().with_timezone(&tz);
-
-            // Compute midnight in user's timezone, convert to UTC
-            let local_midnight = chrono::NaiveDate::from_ymd_opt(
-                now_local.year(),
-                now_local.month(),
-                now_local.day(),
-            )
-            .unwrap_or_else(|| chrono::Utc::now().date_naive())
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid");
-
-            let midnight_utc = local_midnight
-                .and_local_timezone(tz)
-                .earliest()
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
-
-            let midnight_str = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+            let midnight_str = crate::db::today_midnight_utc(&tz_str)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
 
             // Load today's conversations (capped at 50,000 chars)
             let conversations = db.get_conversations_since(&midnight_str).await?;
@@ -1090,7 +1075,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 let mut buf = String::new();
                 for msg in &conversations {
                     let line = format!("[{}] {}: {}\n", msg.created_at, msg.role, msg.content);
-                    if buf.len() + line.len() > 50_000 {
+                    if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
                         buf.push_str("... (truncated)\n");
                         break;
                     }
@@ -1099,21 +1084,26 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 Some(buf)
             };
 
-            // Load today's memory events
+            // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
             let memory_events = db.get_memory_events_since(&midnight_str).await?;
             let mem_digest = if memory_events.is_empty() {
                 None
             } else {
                 let mut buf = String::new();
                 for evt in &memory_events {
-                    buf.push_str(&format!(
+                    let line = format!(
                         "[{}] {} on {}: {} -> {}\n",
                         evt.created_at,
                         evt.tool_name,
                         evt.target_key,
                         evt.before_value.as_deref().unwrap_or("(none)"),
                         evt.after_value
-                    ));
+                    );
+                    if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
+                        buf.push_str("... (truncated)\n");
+                        break;
+                    }
+                    buf.push_str(&line);
                 }
                 Some(buf)
             };
@@ -1141,12 +1131,18 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
             "You are in REFLECTION mode. This is your daily end-of-day review.\n\n\
              Your job: Review today's conversations and recently stored facts. Update your\n\
              memory to better serve the user tomorrow.\n\n\
+             ## Available tools\n\n\
+             - update_core_memory: Edit persistent core memory blocks\n\
+             - store_fact: Store new facts (person, commitment, preference, event)\n\
+             - update_fact: Update commitment status (completed/cancelled)\n\
+             - search_memory: Search existing facts\n\n\
              ## What to do\n\n\
-             1. HOUSEKEEPING: Scan for duplicate or redundant facts. Consolidate them.\n\
-                Remove stale information that's no longer relevant.\n\n\
+             1. HOUSEKEEPING: Scan for duplicate or redundant facts. Consolidate them\n\
+                using update_fact (mark stale commitments as cancelled) or store_fact\n\
+                (store consolidated versions of fragmented information).\n\n\
              2. PROMOTION: If important patterns in Layer 2 facts deserve a place in core\n\
-                memory, promote them. Core memory is precious (2000 tokens) — only promote\n\
-                information that will be useful in most future conversations.\n\n\
+                memory, promote them via update_core_memory. Core memory is precious\n\
+                (2000 tokens) — only promote information useful in most future conversations.\n\n\
              3. INSIGHT: Look for themes across today's conversations. Has the user's\n\
                 focus shifted? Are there emerging priorities? New people becoming important?\n\n\
              ## Rules\n\n\
@@ -1154,7 +1150,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
              - Never infer preferences from a single data point\n\
              - The evidence field MUST cite a specific conversation timestamp and quote\n\
              - If unsure whether to update, DON'T — you can learn it more clearly tomorrow\n\
-             - Prioritize: you have a maximum of 5 memory edits this session"
+             - Prioritize: you have a maximum of 5 core memory edits this session"
                 .to_string()
         }
     };

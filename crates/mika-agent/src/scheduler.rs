@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Datelike, Timelike};
+use chrono::Timelike;
 use mika_common::claude::ClaudeClient;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +35,9 @@ pub struct ReminderScheduler {
     /// `None` in CLI mode (serialization handled by channel).
     /// When `Some`, `check_and_fire_reminders` uses `try_lock` and defers if busy.
     pub agent_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// Cached reflection config loaded at construction time.
+    /// Avoids re-reading identity.toml on every 60s poll tick.
+    pub reflection_config: Option<crate::prompt::ReflectionConfig>,
 }
 
 impl ReminderScheduler {
@@ -47,6 +50,11 @@ impl ReminderScheduler {
         // Prune heartbeat sends older than 7 days to prevent unbounded growth
         if let Err(e) = self.db.prune_old_heartbeat_sends(7).await {
             warn!(error = %e, "failed to prune old heartbeat sends");
+        }
+
+        // Prune reflection runs older than 90 days
+        if let Err(e) = self.db.prune_old_reflection_runs(90).await {
+            warn!(error = %e, "failed to prune old reflection runs");
         }
 
         // Compact memory events older than 90 days into monthly summaries
@@ -330,9 +338,8 @@ impl ReminderScheduler {
     /// 5. Conversations exist today
     /// 6. Agent lock available (server mode)
     async fn check_and_fire_reflection(&self) {
-        // 1. Load identity, check reflection.enabled
-        let identity = crate::prompt::load_identity_async(&self.home_dir).await;
-        let config = match identity.reflection {
+        // 1. Check cached reflection config
+        let config = match self.reflection_config {
             Some(ref c) if c.enabled => c,
             _ => return,
         };
@@ -355,8 +362,8 @@ impl ReminderScheduler {
         let now_local = chrono::Utc::now().with_timezone(&tz);
 
         // Check if it's past the configured time
-        if now_local.hour() < time.hour() as u32
-            || (now_local.hour() == time.hour() as u32 && now_local.minute() < time.minute() as u32)
+        if now_local.hour() < time.hour()
+            || (now_local.hour() == time.hour() && now_local.minute() < time.minute())
         {
             return;
         }
@@ -387,19 +394,9 @@ impl ReminderScheduler {
         }
 
         // 6. Check conversation volume (skip if no activity today)
-        let local_midnight =
-            chrono::NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
-                .unwrap_or_else(|| chrono::Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid");
-
-        let midnight_utc = local_midnight
-            .and_local_timezone(tz)
-            .earliest()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(chrono::Utc::now);
-
-        let midnight_str = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+        let midnight_str = crate::db::today_midnight_utc(&tz_str)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         let conversations = match self.db.get_conversations_since(&midnight_str).await {
             Ok(c) => c,
@@ -539,6 +536,7 @@ mod tests {
             brave_api_key: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
+            reflection_config: None,
         };
 
         // Should succeed silently when no reminders are due

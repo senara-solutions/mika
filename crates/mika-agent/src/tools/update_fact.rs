@@ -44,6 +44,10 @@ impl Tool for UpdateFactTool {
                             }
                         },
                         "required": ["status"]
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
                     }
                 },
                 "required": ["id", "category", "updates"]
@@ -53,13 +57,8 @@ impl Tool for UpdateFactTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         // Reflection mode: require evidence field
-        if ctx.is_reflection {
-            let evidence = input["evidence"].as_str().unwrap_or("").trim();
-            if evidence.is_empty() {
-                return Ok(ToolOutput::error(
-                    "Reflection mode requires an evidence field citing specific conversation content.",
-                ));
-            }
+        if let Some(err) = super::check_reflection_evidence(ctx, &input) {
+            return Ok(err);
         }
 
         let category = input["category"].as_str().unwrap_or("");
@@ -126,6 +125,13 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
     // Log audit event with before_value
     let target = format!("commitment:{id}");
     let after = format!("status -> {status}");
+    let reasoning = if ctx.is_reflection {
+        input["evidence"]
+            .as_str()
+            .map(|e| format!("[evidence] {e}"))
+    } else {
+        None
+    };
     ctx.db
         .log_memory_event(
             ctx.session_id,
@@ -133,7 +139,7 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
             &target,
             before_status.as_deref(),
             &after,
-            None,
+            reasoning.as_deref(),
         )
         .await?;
 

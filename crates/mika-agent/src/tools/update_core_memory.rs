@@ -48,6 +48,10 @@ impl Tool for UpdateCoreMemoryTool {
                     "reasoning": {
                         "type": "string",
                         "description": "Why you are making this change (recorded in audit log)"
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
                     }
                 },
                 "required": ["section", "action", "reasoning"]
@@ -74,13 +78,8 @@ impl Tool for UpdateCoreMemoryTool {
         }
 
         // Reflection mode: require evidence field
-        if ctx.is_reflection {
-            let evidence = input["evidence"].as_str().unwrap_or("").trim();
-            if evidence.is_empty() {
-                return Ok(ToolOutput::error(
-                    "Reflection mode requires an evidence field citing specific conversation content.",
-                ));
-            }
+        if let Some(err) = super::check_reflection_evidence(ctx, &input) {
+            return Ok(err);
         }
 
         // Validate section

@@ -163,6 +163,23 @@ pub(crate) async fn index_fact(
     }
 }
 
+/// Check that the `evidence` field is present and non-empty when running in reflection mode.
+/// Returns `Some(ToolOutput::error(...))` if evidence is missing, `None` if valid.
+pub(crate) fn check_reflection_evidence(
+    ctx: &ToolContext<'_>,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    if ctx.is_reflection {
+        let evidence = input["evidence"].as_str().unwrap_or("").trim();
+        if evidence.is_empty() {
+            return Some(ToolOutput::error(
+                "Reflection mode requires an evidence field citing specific conversation content.",
+            ));
+        }
+    }
+    None
+}
+
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,

@@ -56,6 +56,10 @@ impl Tool for StoreFactTool {
                     "value": {
                         "type": "string",
                         "description": "Preference value (required for preference)"
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
                     }
                 },
                 "required": ["category"]
@@ -65,13 +69,8 @@ impl Tool for StoreFactTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         // Reflection mode: require evidence field
-        if ctx.is_reflection {
-            let evidence = input["evidence"].as_str().unwrap_or("").trim();
-            if evidence.is_empty() {
-                return Ok(ToolOutput::error(
-                    "Reflection mode requires an evidence field citing specific conversation content.",
-                ));
-            }
+        if let Some(err) = super::check_reflection_evidence(ctx, &input) {
+            return Ok(err);
         }
 
         let category = input["category"].as_str().unwrap_or("");
@@ -86,6 +85,17 @@ impl Tool for StoreFactTool {
                 "Invalid category '{other}'. Use: person, commitment, preference, event"
             ))),
         }
+    }
+}
+
+/// Build reasoning string with evidence for audit log in reflection mode.
+fn reflection_reasoning(ctx: &ToolContext<'_>, input: &Value) -> Option<String> {
+    if ctx.is_reflection {
+        input["evidence"]
+            .as_str()
+            .map(|e| format!("[evidence] {e}"))
+    } else {
+        None
     }
 }
 
@@ -121,8 +131,9 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
         name,
         relationship.map(|r| format!(" — {r}")).unwrap_or_default()
     );
+    let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(ctx.session_id, "store_fact", &target, None, &after, None)
+        .log_memory_event(ctx.session_id, "store_fact", &target, None, &after, reasoning.as_deref())
         .await?;
 
     // Index for search
@@ -164,6 +175,7 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
         .await?;
 
     let target = format!("commitment:{description}");
+    let reasoning = reflection_reasoning(ctx, input);
     ctx.db
         .log_memory_event(
             ctx.session_id,
@@ -171,7 +183,7 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
             &target,
             None,
             description,
-            None,
+            reasoning.as_deref(),
         )
         .await?;
 
@@ -208,8 +220,9 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
     let pref_id = ctx.db.set_preference(key, value).await?;
 
     let target = format!("preference:{key}");
+    let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(ctx.session_id, "store_fact", &target, None, value, None)
+        .log_memory_event(ctx.session_id, "store_fact", &target, None, value, reasoning.as_deref())
         .await?;
 
     // Index for search
@@ -238,6 +251,7 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
     let event_id = ctx.db.add_event(description, event_date, notes).await?;
 
     let target = format!("event:{description}");
+    let reasoning = reflection_reasoning(ctx, input);
     ctx.db
         .log_memory_event(
             ctx.session_id,
@@ -245,7 +259,7 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
             &target,
             None,
             description,
-            None,
+            reasoning.as_deref(),
         )
         .await?;
 
