@@ -137,6 +137,18 @@ impl Tool for WriteFileTool {
         // Check if file already exists
         let file_exists = tokio::fs::try_exists(&full_path).await.unwrap_or(false);
 
+        // Reject symlinks at the target file itself (defense-in-depth beyond parent check)
+        if file_exists {
+            match tokio::fs::symlink_metadata(&full_path).await {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Ok(ToolOutput::error(
+                        "Target file is a symbolic link. Symbolic links are not allowed.",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         if file_exists && !confirm {
             // Read existing content and return it for the agent to review
             match tokio::fs::metadata(&full_path).await {
@@ -382,6 +394,33 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("File already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_symlink_target_file_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // Create a real file outside home and symlink to it from within home
+        let outside = tmp.path().join("secret.txt");
+        fs::write(&outside, "secret data").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link.md")).unwrap();
+
+        let tool = WriteFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+
+        // Even with confirm: true, symlink target should be rejected
+        let input = serde_json::json!({
+            "path": "link.md",
+            "content": "overwrite attempt",
+            "confirm": true
+        });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("symbolic link"));
     }
 
     #[tokio::test]

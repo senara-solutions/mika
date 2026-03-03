@@ -306,6 +306,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
     );
+    prompt.push_str(
+        "- You can write files to your home directory with write_file. Paths are relative to your home. If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
+    );
 
     prompt
 }
