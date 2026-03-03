@@ -24,6 +24,8 @@ pub enum TeamRequest {
 pub enum TeamResponse {
     /// Progress update from the team engine (e.g., "Decomposing goal...", "Running researcher...")
     Progress(String),
+    /// Individual agent message (shown in verbose mode).
+    AgentMessage { agent: String, content: String },
     /// Final deliverable text from the completed team run.
     Deliverable(String),
     /// Team execution failed with an error message.
@@ -291,6 +293,8 @@ pub struct App<'a> {
     pub team_name: Option<String>,
     /// Team directory path (e.g., ~/.mika/teams/{name}/).
     pub team_dir: Option<PathBuf>,
+    /// Verbose mode: show individual agent responses in team mode.
+    pub verbose_mode: bool,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -357,6 +361,7 @@ impl<'a> App<'a> {
             team_rx: None,
             team_name: None,
             team_dir: None,
+            verbose_mode: false,
         }
     }
 
@@ -414,6 +419,7 @@ impl<'a> App<'a> {
             team_rx: Some(team_rx),
             team_name: Some(team_name.to_string()),
             team_dir: Some(team_dir),
+            verbose_mode: false,
         }
     }
 
@@ -622,6 +628,18 @@ impl<'a> App<'a> {
                 });
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
+            }
+            Ok(TeamResponse::AgentMessage { agent, content }) => {
+                if self.verbose_mode {
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: format!("[{agent}] {content}"),
+                        rendered: None,
+                        channel: None,
+                    });
+                    self.auto_scroll_to_bottom();
+                    self.needs_redraw = true;
+                }
             }
             Ok(TeamResponse::Deliverable(text)) => {
                 if text.is_empty() {

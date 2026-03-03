@@ -12,7 +12,7 @@ use crate::tui::input;
 /// Commands allowed in team mode. New commands are blocked by default (safe failure mode).
 const TEAM_MODE_ALLOWED_COMMANDS: &[&str] = &[
     "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team", "status",
-    "stat",
+    "stat", "verbose", "v",
 ];
 
 /// Dispatch a slash command string to the appropriate handler.
@@ -58,6 +58,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
                 Some(handle_team(args))
             }
         }
+        "verbose" | "v" => Some(handle_verbose(app)),
         "think" | "t" => handle_think(app, args).await,
         "attach" | "img" => Some(handle_attach(app, args)),
         _ => Some(format!(
@@ -646,6 +647,15 @@ fn handle_teams(app: &App<'_>) -> String {
 }
 
 /// Show team info for both `/team` and `/status` in team mode.
+fn handle_verbose(app: &mut App<'_>) -> String {
+    if !app.is_team_mode() {
+        return "Verbose mode is only available in team mode.".to_string();
+    }
+    app.verbose_mode = !app.verbose_mode;
+    let state = if app.verbose_mode { "on" } else { "off" };
+    format!("Verbose mode: {state}")
+}
+
 fn handle_team_info(app: &App<'_>) -> String {
     let team_name = app.team_name.as_deref().unwrap_or("unknown");
     let mut out = String::new();

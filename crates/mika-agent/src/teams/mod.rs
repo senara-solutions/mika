@@ -9,8 +9,10 @@ use std::path::Path;
 use mika_common::config::Settings;
 use mika_common::team;
 
-use self::engine::{ProgressCallback, TeamEngine};
-use self::types::TeamRun;
+use crate::async_db::AsyncDatabase;
+
+use self::engine::TeamEngine;
+use self::types::{TeamEventCallback, TeamRun};
 
 /// Run a team workflow end-to-end.
 ///
@@ -21,11 +23,12 @@ pub async fn run_team(
     goal: &str,
     global_home: &Path,
     settings: &Settings,
-    progress: Option<ProgressCallback>,
+    callback: Option<TeamEventCallback>,
+    team_db: AsyncDatabase,
 ) -> Result<TeamRun> {
     let def = team::load_team(global_home, team_name)?;
     team::validate_team(global_home, &def)?;
 
-    let engine = TeamEngine::new(def, goal, global_home, settings, progress)?;
+    let engine = TeamEngine::new(def, goal, global_home, settings, callback, team_db)?;
     engine.execute().await
 }

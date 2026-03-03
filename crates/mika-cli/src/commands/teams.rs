@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
 use std::io::{self, Write};
 
+use mika_agent::async_db::AsyncDatabase;
+use mika_agent::db::Database;
+use mika_agent::teams::types::TeamEvent;
 use mika_common::config::Settings;
 use mika_common::home;
 use mika_common::team;
@@ -162,18 +165,28 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
     println!("\n  Running team '{name}'...");
     println!("  Goal: {goal}\n");
 
-    let progress = |msg: &str| {
-        println!("  > {msg}");
+    let callback = |event: TeamEvent| {
+        if let TeamEvent::Progress(msg) = event {
+            println!("  > {msg}");
+        }
     };
+
+    // Open team DB for persistence
+    let team_data_dir = team::team_dir(global_home, &name).join("data");
+    std::fs::create_dir_all(&team_data_dir)?;
+    let team_db_path = team_data_dir.join("mika.db");
+    let team_db = AsyncDatabase::new(Database::open(&team_db_path)?);
 
     let run = mika_agent::teams::run_team(
         &name,
         goal,
         global_home,
         &settings,
-        Some(Box::new(progress)),
+        Some(Box::new(callback)),
+        team_db.clone(),
     )
     .await?;
+    team_db.shutdown();
 
     println!();
     match &run.status {

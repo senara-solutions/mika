@@ -22,6 +22,7 @@ use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
 use mika_agent::agent::{self, AgentParams, check_onboarding};
+use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
@@ -447,9 +448,15 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
     let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamResponse>();
 
+    // Open on-disk DB for team conversation persistence
+    let data_dir = team_dir.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let team_db = mika_agent::async_db::AsyncDatabase::open(&data_dir.join("mika.db"))?;
+
     // Spawn team worker
     let worker_home = global_home.to_path_buf();
     let worker_name = team_name.to_string();
+    let worker_team_db = team_db.clone();
     let team_worker_handle = tokio::spawn(async move {
         let settings = match Settings::load(&worker_home) {
             Ok(s) => s,
@@ -464,8 +471,41 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
             match request {
                 TeamRequest::Goal(goal) => {
                     let tx = response_tx.clone();
-                    let progress = move |msg: &str| {
-                        let _ = tx.send(TeamResponse::Progress(msg.to_string()));
+                    let callback = move |event: TeamEvent| {
+                        let msg = match event {
+                            TeamEvent::Progress(s) => TeamResponse::Progress(s),
+                            TeamEvent::AgentCompleted { agent, response } => {
+                                TeamResponse::AgentMessage { agent, content: response }
+                            }
+                            TeamEvent::AgentFailed { agent, error } => {
+                                TeamResponse::AgentMessage {
+                                    agent: agent.clone(),
+                                    content: format!("[failed] {error}"),
+                                }
+                            }
+                            TeamEvent::CriticReview {
+                                approved,
+                                feedback,
+                                iteration,
+                            } => {
+                                let verdict = if approved { "approved" } else { "rejected" };
+                                TeamResponse::Progress(format!(
+                                    "Critic (iteration {iteration}): {verdict}. {feedback}"
+                                ))
+                            }
+                            TeamEvent::TasksAssigned { tasks, iteration } => {
+                                let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
+                                TeamResponse::Progress(format!(
+                                    "Iteration {iteration}: assigned tasks to {}",
+                                    names.join(", ")
+                                ))
+                            }
+                            TeamEvent::Deliverable(_) | TeamEvent::RunFailed(_) => {
+                                // Handled by the Ok/Err match below
+                                return;
+                            }
+                        };
+                        let _ = tx.send(msg);
                     };
 
                     match mika_agent::teams::run_team(
@@ -473,13 +513,19 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                         &goal,
                         &worker_home,
                         &settings,
-                        Some(Box::new(progress)),
+                        Some(Box::new(callback)),
+                        worker_team_db.clone(),
                     )
                     .await
                     {
                         Ok(run) => {
-                            let deliverable = run.deliverable.unwrap_or_default();
-                            let _ = response_tx.send(TeamResponse::Deliverable(deliverable));
+                            if let RunStatus::Failed(reason) = run.status {
+                                let _ = response_tx.send(TeamResponse::Error(reason));
+                            } else {
+                                let deliverable = run.deliverable.unwrap_or_default();
+                                let _ =
+                                    response_tx.send(TeamResponse::Deliverable(deliverable));
+                            }
                         }
                         Err(e) => {
                             let _ = response_tx.send(TeamResponse::Error(format!("{e}")));
@@ -490,11 +536,6 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
             }
         }
     });
-
-    // Open on-disk DB for team conversation persistence
-    let data_dir = team_dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-    let team_db = mika_agent::async_db::AsyncDatabase::open(&data_dir.join("mika.db"))?;
 
     // Build app in team mode
     let mut app = App::new_team(
@@ -522,11 +563,6 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
             });
         }
     }
-    // Fall back to TOML history if DB was empty (transition from pre-persistence)
-    if app.messages.is_empty() {
-        load_team_history(&mut app, global_home, team_name);
-    }
-
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -600,49 +636,6 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(2), team_worker_handle).await;
 
     Ok(())
-}
-
-/// Load the latest completed team run from history as initial TUI messages.
-fn load_team_history(app: &mut App<'_>, global_home: &Path, team_name: &str) {
-    let history_dir = team::history_dir(global_home, team_name);
-    let Ok(entries) = std::fs::read_dir(&history_dir) else {
-        return;
-    };
-
-    // Find the most recent .toml file (sorted by name = timestamp)
-    let mut files: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
-        .collect();
-    files.sort_by_key(|e| e.file_name());
-
-    let Some(latest) = files.last() else {
-        return;
-    };
-
-    let Ok(content) = std::fs::read_to_string(latest.path()) else {
-        return;
-    };
-
-    let Ok(run) = toml::from_str::<mika_agent::teams::types::TeamRun>(&content) else {
-        return;
-    };
-
-    // Show the goal and deliverable from the last run
-    app.messages.push(ChatMessage {
-        role: ChatRole::User,
-        content: run.goal,
-        rendered: None,
-        channel: None,
-    });
-    if let Some(deliverable) = run.deliverable {
-        app.messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: deliverable,
-            rendered: None,
-            channel: None,
-        });
-    }
 }
 
 fn restore_terminal() -> Result<()> {

@@ -19,7 +19,6 @@ use crate::startup;
 use crate::tools;
 use crate::tools::ToolRegistry;
 
-use super::history;
 use super::prompt;
 use super::types::*;
 
@@ -31,20 +30,20 @@ struct AgentResources {
     embedding_client: Option<EmbeddingClient>,
 }
 
-/// Progress callback type for team execution reporting.
-pub type ProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
-
 /// The team orchestration engine.
 pub struct TeamEngine {
     team: TeamDefinition,
     run: TeamRun,
     workspace_dir: PathBuf,
-    history_dir: PathBuf,
     agents: Arc<HashMap<String, AgentResources>>,
     claude: ClaudeClient,
     tool_registry: Arc<ToolRegistry>,
-    progress: Option<Arc<ProgressCallback>>,
+    callback: Option<Arc<TeamEventCallback>>,
     brave_api_key: Option<String>,
+    /// Team-level database for persisting runs and messages.
+    team_db: AsyncDatabase,
+    /// Message ID of the root goal message (set after insert).
+    goal_msg_id: Option<i64>,
 }
 
 impl TeamEngine {
@@ -54,12 +53,12 @@ impl TeamEngine {
         goal: &str,
         global_home: &Path,
         settings: &Settings,
-        progress: Option<ProgressCallback>,
+        callback: Option<TeamEventCallback>,
+        team_db: AsyncDatabase,
     ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let team_name = &team.team.name;
         let workspace_dir = mika_common::team::workspace_dir(global_home, team_name);
-        let history_dir = mika_common::team::history_dir(global_home, team_name);
 
         // Ensure workspace exists
         std::fs::create_dir_all(&workspace_dir)
@@ -118,17 +117,51 @@ impl TeamEngine {
             team,
             run,
             workspace_dir,
-            history_dir,
             agents: Arc::new(agents),
             claude,
             tool_registry: Arc::new(tool_registry),
-            progress: progress.map(Arc::new),
+            callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
+            team_db,
+            goal_msg_id: None,
         })
     }
 
     /// Execute the full team orchestration flow.
     pub async fn execute(mut self) -> Result<TeamRun> {
+        // Persist the team run to DB
+        let started_at = chrono::Utc::now().timestamp();
+        if let Err(e) = self
+            .team_db
+            .insert_team_run(
+                &self.run.run_id,
+                &self.run.team_name,
+                &self.run.goal,
+                self.run.max_iterations,
+                started_at,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to persist team run to DB");
+        }
+
+        // Insert the goal as the root message
+        match self
+            .team_db
+            .insert_team_message(
+                &self.run.run_id,
+                None,
+                None,
+                "goal",
+                &self.run.goal,
+                0,
+            )
+            .await
+        {
+            Ok(id) => self.goal_msg_id = Some(id),
+            Err(e) => warn!(error = %e, "failed to persist goal message"),
+        }
+
         let result = self.execute_inner().await;
 
         match &result {
@@ -137,14 +170,47 @@ impl TeamEngine {
             }
             Err(e) => {
                 self.run.status = RunStatus::Failed(e.to_string());
+                self.emit_event(TeamEvent::RunFailed(e.to_string()));
+
+                // Persist error message to DB
+                if let Some(goal_id) = self.goal_msg_id {
+                    let _ = self
+                        .team_db
+                        .insert_team_message(
+                            &self.run.run_id,
+                            Some(goal_id),
+                            None,
+                            "error",
+                            &e.to_string(),
+                            self.run.iteration,
+                        )
+                        .await;
+                }
             }
         }
 
         self.run.ended_at = Some(chrono::Utc::now().to_rfc3339());
 
-        // Save to history regardless of outcome
-        if let Err(e) = history::save_run(&self.history_dir, &self.run) {
-            warn!(error = %e, "failed to save team run history");
+        // Update run status in DB
+        let ended_at = chrono::Utc::now().timestamp();
+        let (status_str, failure_reason) = match &self.run.status {
+            RunStatus::Running => ("running", None),
+            RunStatus::Completed => ("completed", None),
+            RunStatus::Failed(reason) => ("failed", Some(reason.as_str())),
+        };
+        if let Err(e) = self
+            .team_db
+            .update_team_run(
+                &self.run.run_id,
+                status_str,
+                failure_reason,
+                self.run.iteration,
+                self.run.deliverable.as_deref(),
+                Some(ended_at),
+            )
+            .await
+        {
+            warn!(error = %e, "failed to update team run in DB");
         }
 
         // Shutdown all AsyncDatabase instances to avoid thread leaks (#256)
@@ -164,9 +230,15 @@ impl TeamEngine {
 
     async fn execute_inner(&mut self) -> Result<()> {
         // Step 1: Decompose -- orchestrator produces task assignments
-        self.report_progress("Decomposing goal...");
+        self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
         let tasks = self.decompose(None).await?;
         self.run.tasks = tasks;
+
+        // Emit structured event for task assignments
+        self.emit_event(TeamEvent::TasksAssigned {
+            tasks: self.run.tasks.clone(),
+            iteration: 1,
+        });
 
         // Iterate: execute -> review -> (retry if rejected)
         loop {
@@ -192,18 +264,27 @@ impl TeamEngine {
             }
 
             // Re-decompose with feedback
-            self.report_progress(&format!(
+            self.emit_event(TeamEvent::Progress(format!(
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
-            ));
+            )));
             let tasks = self.decompose(Some(&feedback)).await?;
             self.run.tasks = tasks;
+
+            self.emit_event(TeamEvent::TasksAssigned {
+                tasks: self.run.tasks.clone(),
+                iteration: self.run.iteration + 1,
+            });
         }
 
         // Step 4: Deliver -- produce final output
-        self.report_progress("Producing final deliverable...");
+        self.emit_event(TeamEvent::Progress(
+            "Producing final deliverable...".to_string(),
+        ));
         let deliverable = self.deliver().await?;
-        self.run.deliverable = Some(deliverable);
+        self.run.deliverable = Some(deliverable.clone());
+
+        self.emit_event(TeamEvent::Deliverable(deliverable));
 
         Ok(())
     }
@@ -230,7 +311,47 @@ impl TeamEngine {
             .run_agent(orchestrator_name, &message, &context)
             .await?;
 
-        parse_task_assignments(&response, &self.team)
+        let tasks = parse_task_assignments(&response, &self.team)?;
+
+        // Persist orchestrator decomposition to DB
+        let iteration = if feedback.is_some() {
+            self.run.iteration + 1
+        } else {
+            1
+        };
+        if let Some(goal_id) = self.goal_msg_id {
+            let orchestrator_msg_id = self
+                .team_db
+                .insert_team_message(
+                    &self.run.run_id,
+                    Some(goal_id),
+                    Some(orchestrator_name),
+                    "orchestrator",
+                    &response,
+                    iteration,
+                )
+                .await
+                .ok();
+
+            // Insert assignment messages as children of orchestrator
+            if let Some(orch_id) = orchestrator_msg_id {
+                for task in &tasks {
+                    let _ = self
+                        .team_db
+                        .insert_team_message(
+                            &self.run.run_id,
+                            Some(orch_id),
+                            Some(&task.agent),
+                            "assignment",
+                            &task.task,
+                            iteration,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        Ok(tasks)
     }
 
     /// Execute all tasks by delegating to specialist agents concurrently.
@@ -244,9 +365,31 @@ impl TeamEngine {
         let claude = self.claude.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let run_id = self.run.run_id.clone();
-        let progress = self.progress.clone();
+        let callback = self.callback.clone();
         let team_name = self.run.team_name.clone();
         let brave_api_key = self.brave_api_key.clone();
+        let team_db = self.team_db.clone();
+        let iteration = self.run.iteration;
+
+        // Look up assignment message IDs from DB for parent linking.
+        // We find the most recent assignment message for each agent at this iteration.
+        let assignment_msg_ids: HashMap<String, i64> = {
+            let messages = self
+                .team_db
+                .load_team_messages(&self.run.run_id)
+                .await
+                .unwrap_or_default();
+            messages
+                .iter()
+                .filter(|m| m.message_type == "assignment" && m.iteration == iteration)
+                .filter_map(|m| {
+                    m.agent_name
+                        .as_ref()
+                        .map(|name| (name.clone(), m.id))
+                })
+                .collect()
+        };
+        let assignment_msg_ids = Arc::new(assignment_msg_ids);
 
         // Build per-task parameters upfront from self (avoids borrowing self in spawned tasks).
         struct TaskInput {
@@ -283,10 +426,10 @@ impl TeamEngine {
             });
         }
 
-        self.report_progress(&format!(
+        self.emit_event(TeamEvent::Progress(format!(
             "Running {} specialist agents in parallel...",
             inputs.len()
-        ));
+        )));
 
         // Spawn all tasks concurrently via JoinSet.
         let mut join_set = tokio::task::JoinSet::new();
@@ -296,17 +439,19 @@ impl TeamEngine {
             let claude = claude.clone();
             let tool_registry = Arc::clone(&tool_registry);
             let run_id = run_id.clone();
-            let progress = progress.clone();
+            let callback = callback.clone();
             let team_name = team_name.clone();
             let brave_api_key = brave_api_key.clone();
+            let team_db = team_db.clone();
+            let assignment_msg_ids = Arc::clone(&assignment_msg_ids);
 
             join_set.spawn(async move {
                 let agent_name = &input.agent_name;
 
                 // Report that this agent is starting.
                 info!(team = %team_name, "Running {agent_name}...");
-                if let Some(ref cb) = progress {
-                    cb(&format!("Running {agent_name}..."));
+                if let Some(ref cb) = callback {
+                    cb(TeamEvent::Progress(format!("Running {agent_name}...")));
                 }
 
                 let resources = agents
@@ -338,19 +483,50 @@ impl TeamEngine {
                     Err(e) => Err(e),
                 };
 
-                // Report completion/failure for this agent.
+                // Persist and report completion/failure for this agent.
+                let parent_id = assignment_msg_ids.get(agent_name.as_str()).copied();
+
                 match &result {
-                    Ok(_) => {
+                    Ok(response) => {
                         info!(agent = %agent_name, "task completed");
-                        if let Some(ref cb) = progress {
-                            cb(&format!("{agent_name} completed"));
+                        if let Some(ref cb) = callback {
+                            cb(TeamEvent::AgentCompleted {
+                                agent: agent_name.to_string(),
+                                response: response.clone(),
+                            });
                         }
+                        // Persist agent response
+                        let _ = team_db
+                            .insert_team_message(
+                                &run_id,
+                                parent_id,
+                                Some(agent_name),
+                                "agent_response",
+                                response,
+                                iteration,
+                            )
+                            .await;
                     }
                     Err(e) => {
-                        warn!(agent = %agent_name, error = %e, "task failed");
-                        if let Some(ref cb) = progress {
-                            cb(&format!("{agent_name} failed: {e}"));
+                        let error_str = e.to_string();
+                        warn!(agent = %agent_name, error = %error_str, "task failed");
+                        if let Some(ref cb) = callback {
+                            cb(TeamEvent::AgentFailed {
+                                agent: agent_name.to_string(),
+                                error: error_str.clone(),
+                            });
                         }
+                        // Persist agent error
+                        let _ = team_db
+                            .insert_team_message(
+                                &run_id,
+                                parent_id,
+                                Some(agent_name),
+                                "error",
+                                &error_str,
+                                iteration,
+                            )
+                            .await;
                     }
                 }
 
@@ -371,7 +547,10 @@ impl TeamEngine {
                 },
                 Err(join_error) => {
                     // A JoinError means the task panicked or was cancelled.
+                    // Try to extract the task index from the error to update status.
                     warn!(error = %join_error, "spawned task failed unexpectedly");
+                    // We can't reliably map JoinError back to a task index, but
+                    // the individual agent's error was already persisted in the spawned task.
                 }
             }
         }
@@ -380,7 +559,7 @@ impl TeamEngine {
     }
 
     /// Ask the critic agent to review the outputs.
-    async fn review(&self) -> Result<(bool, String)> {
+    async fn review(&mut self) -> Result<(bool, String)> {
         // Find the QA/critic agent
         let critic = self
             .team
@@ -397,14 +576,39 @@ impl TeamEngine {
             }
         };
 
-        self.report_progress(&format!("Critic ({critic_name}) reviewing..."));
+        self.emit_event(TeamEvent::Progress(format!(
+            "Critic ({critic_name}) reviewing..."
+        )));
 
         let context = prompt::build_critic_context(&self.team, &self.run);
         let response = self
             .run_agent(&critic_name, "Review the team's outputs.", &context)
             .await?;
 
-        parse_review_response(&response)
+        let (approved, feedback) = parse_review_response(&response)?;
+
+        // Persist critic feedback to DB
+        if let Some(goal_id) = self.goal_msg_id {
+            let _ = self
+                .team_db
+                .insert_team_message(
+                    &self.run.run_id,
+                    Some(goal_id),
+                    Some(&critic_name),
+                    "critic",
+                    &response,
+                    self.run.iteration,
+                )
+                .await;
+        }
+
+        self.emit_event(TeamEvent::CriticReview {
+            approved,
+            feedback: feedback.clone(),
+            iteration: self.run.iteration,
+        });
+
+        Ok((approved, feedback))
     }
 
     /// Produce the final deliverable.
@@ -425,6 +629,21 @@ impl TeamEngine {
         let response = self
             .run_agent(&agent_name, "Produce the final deliverable.", &context)
             .await?;
+
+        // Persist deliverable to DB
+        if let Some(goal_id) = self.goal_msg_id {
+            let _ = self
+                .team_db
+                .insert_team_message(
+                    &self.run.run_id,
+                    Some(goal_id),
+                    Some(&agent_name),
+                    "deliverable",
+                    &response,
+                    self.run.iteration,
+                )
+                .await;
+        }
 
         Ok(response)
     }
@@ -466,10 +685,28 @@ impl TeamEngine {
             .unwrap_or_default())
     }
 
-    fn report_progress(&self, message: &str) {
-        info!(team = %self.run.team_name, "{message}");
-        if let Some(cb) = &self.progress {
-            cb(message);
+    fn emit_event(&self, event: TeamEvent) {
+        let msg = match &event {
+            TeamEvent::Progress(s) => s.as_str(),
+            TeamEvent::TasksAssigned { .. } => "Tasks assigned",
+            TeamEvent::AgentCompleted { agent, .. } => {
+                info!(agent, "agent completed");
+                "agent completed"
+            }
+            TeamEvent::AgentFailed { agent, error } => {
+                warn!(agent, error, "agent failed");
+                "agent failed"
+            }
+            TeamEvent::CriticReview { .. } => "Critic review",
+            TeamEvent::Deliverable(_) => "Deliverable ready",
+            TeamEvent::RunFailed(reason) => {
+                warn!(reason, "run failed");
+                reason.as_str()
+            }
+        };
+        info!(team = %self.run.team_name, "{msg}");
+        if let Some(cb) = &self.callback {
+            cb(event);
         }
     }
 }

@@ -152,6 +152,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         args_hint: Some("<path>"),
         completer: Some(completers::complete_attach),
     },
+    SlashCommand {
+        name: "verbose",
+        aliases: &["v"],
+        description: "Toggle verbose mode (team mode)",
+        args_hint: None,
+        completer: None,
+    },
 ];
 
 /// Resolve a thinking level keyword to (budget_tokens, level_name).
