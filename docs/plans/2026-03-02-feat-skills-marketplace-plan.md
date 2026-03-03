@@ -1,7 +1,7 @@
 ---
 title: "feat: Add git-based skills marketplace"
 type: feat
-status: active
+status: completed
 date: 2026-03-02
 brainstorm: docs/brainstorms/2026-03-02-skills-marketplace-brainstorm.md
 ---
