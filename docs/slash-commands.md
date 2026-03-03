@@ -355,6 +355,20 @@ Images can also be pasted from the clipboard via Ctrl+V. The TUI tries arboard
 first, then falls back to xclip/wl-paste on Linux. If the clipboard has no image,
 a system message suggests using `/attach` instead.
 
+## Team Mode
+
+When the TUI is launched with `mika --team <name>`, slash commands are restricted
+to a safe subset. Agent-specific commands are disabled:
+
+| Available | Disabled |
+|-----------|----------|
+| `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
+| `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
+| `/status`, `/team` | `/config`, `/skills`, `/skill`, `/attach` |
+
+In team mode, `/status` and `/team` both show team info (name, orchestrator,
+agents). `/export` writes to the team directory instead of the agent home.
+
 ## Keyboard Shortcuts
 
 Complete key bindings for the Mika TUI. These apply regardless of slash commands.

@@ -350,6 +350,7 @@ sends in a background task (does not block message processing).
 - Agent homes: `~/.mika/agents/{name}/` (each with data/, skills/, logs/)
 - Active agent tracked in `~/.mika/active_agent`
 - CLI `--agent` flag overrides active agent
+- CLI `--team` flag launches TUI in team mode (mutually exclusive with `--agent`)
 - Server discovers all agents on startup
 - `AgentParams` carries `global_home_dir: Option<&Path>` (global `~/.mika/`) distinct from
   per-agent `home_dir` (e.g. `~/.mika/agents/main/`) for agent/team discovery
