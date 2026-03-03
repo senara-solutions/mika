@@ -35,11 +35,6 @@ Delegate agents (via `delegate_task`) have their own personality, memory, and sk
 
 **Write clear, self-contained task descriptions.** Delegates have no context from your conversation — include all relevant information in the task.
 
-## Timeouts
-
-- `delegate_task`: 2 minutes — for tasks that may exceed this, break them into smaller sub-tasks.
-- `run_team`: 5 minutes — for full multi-agent orchestration with decomposition, execution, and review.
-
 ## Important
 
 - If these management tools are not listed in your available tools, the user has not configured multiple agents or teams yet. Let the user know they can set up additional agents to enable delegation.
