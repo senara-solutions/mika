@@ -356,7 +356,11 @@ fn install_skill(
             bail!(
                 "Multiple skills found in repo. --name can only be used when installing a single skill.\n\
                  Found skills: {}",
-                candidates.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                candidates
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         select_skills_interactive(&candidates)?
@@ -377,13 +381,15 @@ fn install_skill(
             &commit,
         )?;
 
-        println!("  Installed '{}' (commit: {})", result.name, &result.commit[..12.min(result.commit.len())]);
+        println!(
+            "  Installed '{}' (commit: {})",
+            result.name,
+            &result.commit[..12.min(result.commit.len())]
+        );
 
         if result.has_exec_handlers {
-            println!(
-                "\n  WARNING: This skill contains exec handlers that run shell commands.");
-            println!(
-                "  Review the source before use: {}\n", result.url);
+            println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
+            println!("  Review the source before use: {}\n", result.url);
         }
     }
 
@@ -408,12 +414,7 @@ fn select_skills_interactive(
 
     let items: Vec<String> = candidates
         .iter()
-        .map(|c| {
-            format!(
-                "{} — {} (at: {})",
-                c.name, c.description, c.relative_path
-            )
-        })
+        .map(|c| format!("{} — {} (at: {})", c.name, c.description, c.relative_path))
         .collect();
 
     println!("\n  Multiple skills found in repository:");
@@ -437,11 +438,7 @@ fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<(
     Ok(())
 }
 
-fn update_skills(
-    agent_home: &Path,
-    skills_dir: &Path,
-    name: Option<&str>,
-) -> Result<()> {
+fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Result<()> {
     let lock = marketplace::read_lock(agent_home);
 
     if lock.skills.is_empty() {

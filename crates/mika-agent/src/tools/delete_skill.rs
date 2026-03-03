@@ -73,10 +73,10 @@ impl Tool for DeleteSkillTool {
 
         // Clean up marketplace lock entry if this was a marketplace skill
         let mut lock = marketplace::read_lock(ctx.home_dir);
-        if lock.skills.remove(name).is_some() {
-            if let Err(e) = marketplace::write_lock(ctx.home_dir, &lock) {
-                tracing::warn!(skill = name, error = %e, "failed to update marketplace lock after delete");
-            }
+        if lock.skills.remove(name).is_some()
+            && let Err(e) = marketplace::write_lock(ctx.home_dir, &lock)
+        {
+            tracing::warn!(skill = name, error = %e, "failed to update marketplace lock after delete");
         }
 
         ctx.skills_dirty.store(true, Ordering::Release);

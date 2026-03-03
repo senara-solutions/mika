@@ -98,7 +98,9 @@ pub fn install_skill(
 pub fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<()> {
     // Protect bundled skills
     if is_bundled_skill(name) {
-        bail!("Cannot uninstall built-in skill '{name}'. Use `mika skills disable {name}` instead.");
+        bail!(
+            "Cannot uninstall built-in skill '{name}'. Use `mika skills disable {name}` instead."
+        );
     }
 
     let mut lock = read_lock(agent_home);
@@ -140,7 +142,11 @@ pub fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Resu
 /// Update a single marketplace skill to the latest commit.
 ///
 /// Returns `Ok(None)` if already up to date.
-pub fn update_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<Option<UpdateResult>> {
+pub fn update_skill(
+    agent_home: &Path,
+    skills_dir: &Path,
+    name: &str,
+) -> Result<Option<UpdateResult>> {
     let lock = read_lock(agent_home);
     let entry = lock
         .skills
@@ -202,10 +208,10 @@ pub fn update_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<
 ///
 /// Validates that no symlinks escape the source directory.
 fn copy_skill_dir(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("failed to create {}", dst.display()))?;
+    std::fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
 
-    let src_canonical = src.canonicalize()
+    let src_canonical = src
+        .canonicalize()
         .with_context(|| format!("failed to canonicalize source {}", src.display()))?;
 
     copy_dir_recursive(&src_canonical, src, dst)
@@ -219,12 +225,9 @@ fn copy_dir_recursive(src_root: &Path, src: &Path, dst: &Path) -> Result<()> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip .git directories
-        if name_str == ".git" || name_str == ".gitignore" || name_str == ".gitattributes" {
-            if name_str == ".git" {
-                continue;
-            }
-            // Keep .gitignore and .gitattributes — they're harmless
+        // Skip .git directory (keep .gitignore and .gitattributes — they're harmless)
+        if name_str == ".git" {
+            continue;
         }
 
         let src_path = entry.path();
@@ -246,9 +249,8 @@ fn copy_dir_recursive(src_root: &Path, src: &Path, dst: &Path) -> Result<()> {
 
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            std::fs::create_dir_all(&dst_path).with_context(|| {
-                format!("failed to create directory {}", dst_path.display())
-            })?;
+            std::fs::create_dir_all(&dst_path)
+                .with_context(|| format!("failed to create directory {}", dst_path.display()))?;
             copy_dir_recursive(src_root, &src_path, &dst_path)?;
         } else if ft.is_file() {
             std::fs::copy(&src_path, &dst_path).with_context(|| {
@@ -496,7 +498,12 @@ mod tests {
 
         let result = uninstall_skill(tmp.path(), &skills_dir, "custom-skill");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not a marketplace"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a marketplace")
+        );
     }
 
     #[test]

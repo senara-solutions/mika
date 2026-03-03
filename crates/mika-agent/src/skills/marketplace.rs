@@ -147,10 +147,7 @@ pub fn scan_repo_for_skills(repo_dir: &Path) -> Vec<SkillCandidate> {
 }
 
 /// Try to load a skill candidate from a directory that may contain skill.toml.
-fn try_load_candidate(
-    skill_dir: &Path,
-    repo_dir: &Path,
-) -> Option<SkillCandidate> {
+fn try_load_candidate(skill_dir: &Path, repo_dir: &Path) -> Option<SkillCandidate> {
     use super::manifest::{SkillManifest, SkillToolDef, ToolHandler};
 
     let manifest_path = skill_dir.join("skill.toml");
@@ -182,9 +179,7 @@ fn try_load_candidate(
     };
 
     // Check for exec handlers in tools.json
-    let has_exec_handlers = skill_dir
-        .join("tools.json")
-        .exists()
+    let has_exec_handlers = skill_dir.join("tools.json").exists()
         && std::fs::read_to_string(skill_dir.join("tools.json"))
             .ok()
             .and_then(|c| serde_json::from_str::<Vec<SkillToolDef>>(&c).ok())

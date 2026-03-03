@@ -11,13 +11,15 @@ use tempfile::TempDir;
 
 /// Check if git is available on PATH. Returns the version string.
 pub fn check_git() -> Result<String> {
-    let output = git_command()
-        .arg("--version")
-        .output()
-        .context("git is not installed or not found on PATH. Install git to use marketplace skills")?;
+    let output = git_command().arg("--version").output().context(
+        "git is not installed or not found on PATH. Install git to use marketplace skills",
+    )?;
 
     if !output.status.success() {
-        bail!("git --version failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "git --version failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
