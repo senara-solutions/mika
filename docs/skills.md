@@ -388,7 +388,7 @@ The install process:
 5. Copies the skill directory into `~/.mika/skills/<name>/`
 6. Records the installation in `marketplace.lock`
 
-Skills with exec handlers show a security warning at install time.
+Skills with exec handlers show a security warning before installation and require confirmation to proceed.
 
 ### Updating Skills
 
@@ -668,7 +668,7 @@ rm -rf ~/.mika/skills/memory
 
 Exec handlers spawn a child process with `tokio::process::Command`. The process runs with the same user permissions as Mika itself. There is no sandboxing, chroot, or capability restriction.
 
-**Environment variable scrubbing:** Bundled handler scripts (shell-exec, github) explicitly `unset` sensitive `MIKA_*` environment variables (`MIKA_ANTHROPIC_API_KEY`, `MIKA_INTERNAL_TOKEN`, `MIKA_OPENAI_API_KEY`, `MIKA_BRAVE_API_KEY`) before executing commands. Custom exec handlers should do the same if they run user-controllable commands.
+**Environment variable scrubbing:** The exec handler executor scrubs all `MIKA_*` environment variables from child processes before spawning them. This applies to all exec-handler skills (built-in, marketplace, and custom) and prevents API keys from leaking to handler scripts. Bundled handler scripts (shell-exec, github) additionally `unset` specific vars in their scripts as defense-in-depth.
 
 **Mitigation:** Only install exec skills from sources you trust. Review handler scripts before placing them in `~/.mika/skills/`. Consider using http handlers to isolate untrusted tools behind a network boundary.
 

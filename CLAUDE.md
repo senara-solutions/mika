@@ -24,7 +24,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `crates/mika-common/` — Shared library: config, Claude API client, logging, home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
 - `crates/mika-gateway/` — Telegram webhook router: Postgres customer registry, message routing, pairing flow, outbound relay
-- `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup, mcp). TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Shell-like Tab completion: bash-style longest-common-prefix for command names, context-aware argument completers (model aliases, thinking levels, agent/team/skill names, config keys+values, file paths with tilde expansion). `CompletionMode` state machine (Hidden/Command/Argument) with contextual popup titles. Smart Enter (execute argless, transition for arg commands). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Persistent input history (`{home_dir}/.input_history` JSON, per-agent, atomic writes, 0600 permissions). Shell-like Up/Down arrows (cursor-position-aware, draft saving). Bracketed paste inserts at cursor position with `\r\n` normalization and 100KB size limit. Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer.
+- `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup, mcp, skills). TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Shell-like Tab completion: bash-style longest-common-prefix for command names, context-aware argument completers (model aliases, thinking levels, agent/team/skill names, config keys+values, file paths with tilde expansion). `CompletionMode` state machine (Hidden/Command/Argument) with contextual popup titles. Smart Enter (execute argless, transition for arg commands). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Persistent input history (`{home_dir}/.input_history` JSON, per-agent, atomic writes, 0600 permissions). Shell-like Up/Down arrows (cursor-position-aware, draft saving). Bracketed paste inserts at cursor position with `\r\n` normalization and 100KB size limit. Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer.
 - `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/` — Public documentation (architecture, configuration, deployment, skills, slash-commands, getting-started)
 - `docs/adr/` — Architecture Decision Records (numbered)
@@ -40,14 +40,14 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Testing:** `#[cfg(test)] mod tests` inline in each module, `cargo test` to run
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Database:** Case-insensitive COLLATE NOCASE on unique text columns.
-- **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque. Shell-exec and github handlers `unset` MIKA_* env vars before executing commands (defense-in-depth). MCP child processes use `env_clear()` + allowlist.
+- **Secrets:** `Settings` has manual `Debug` impl that redacts API key. API key errors are opaque. Exec handler executor scrubs all MIKA_* env vars from child processes (defense-in-depth). Shell-exec and github handlers additionally `unset` specific vars in their scripts. MCP child processes use `env_clear()` + allowlist. Git subprocesses scrub MIKA_* vars and set `GIT_TERMINAL_PROMPT=0`.
 - **Tools:** Each tool validates inputs (empty check + 10,000 char max). `ToolContext` contains `{ db, session_id, home_dir, core_memory_edit_count, is_onboarding, message_sender, embedding_client, brave_api_key }`. Tool trait uses `#[async_trait]` (Send futures, required for `tokio::spawn` in server handlers). Per-tool timeout override via `timeout_secs()` default method (returns `None` → uses 30s default).
 - **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `mpsc` channel (closure-based dispatch). Clone-able, Send+Sync. Integrated into agent loop, tools, and scheduler.
 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~745 tests)
+- `cargo test` — Run all tests (~785 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint

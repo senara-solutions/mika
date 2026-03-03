@@ -212,6 +212,7 @@ The most commonly used commands:
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
 | `mika ask "<message>"`       | Send a message non-interactively                  |
+| `mika skills`                | List, install, update, and manage skills           |
 
 Run `mika --help` for the complete list of commands and options.
 
