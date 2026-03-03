@@ -133,7 +133,14 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
     );
     let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(ctx.session_id, "store_fact", &target, None, &after, reasoning.as_deref())
+        .log_memory_event(
+            ctx.session_id,
+            "store_fact",
+            &target,
+            None,
+            &after,
+            reasoning.as_deref(),
+        )
         .await?;
 
     // Index for search
@@ -222,7 +229,14 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
     let target = format!("preference:{key}");
     let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(ctx.session_id, "store_fact", &target, None, value, reasoning.as_deref())
+        .log_memory_event(
+            ctx.session_id,
+            "store_fact",
+            &target,
+            None,
+            value,
+            reasoning.as_deref(),
+        )
         .await?;
 
     // Index for search

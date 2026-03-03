@@ -1156,10 +1156,9 @@ impl Database {
     /// Delete reflection runs older than `days` days.
     pub fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
         let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86_400);
-        let deleted = self.conn.execute(
-            "DELETE FROM reflection_runs WHERE ran_at < ?1",
-            [cutoff],
-        )?;
+        let deleted = self
+            .conn
+            .execute("DELETE FROM reflection_runs WHERE ran_at < ?1", [cutoff])?;
         Ok(deleted)
     }
 
