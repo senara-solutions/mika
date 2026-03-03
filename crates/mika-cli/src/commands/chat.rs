@@ -15,7 +15,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::init::{self, AppContext};
-use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole};
+use crate::tui::app::{
+    AgentRequest, AgentResponse, App, ChatMessage, ChatRole, TeamRequest, TeamResponse,
+};
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
@@ -25,6 +27,9 @@ use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 use mika_common::claude::{ImageSource, ThinkingConfig};
+use mika_common::config::Settings;
+use mika_common::team;
+use std::path::Path;
 
 /// Holds the agent worker task handle, poller handle, and the AppContext (for DB shutdown).
 struct AgentWorker {
@@ -433,6 +438,184 @@ pub async fn run(agent_name: &str) -> Result<()> {
 
     // Database shutdown happens automatically via Drop on worker._ctx
     Ok(())
+}
+
+/// Run the TUI in team mode. Each user message is sent as a goal to `run_team()`.
+pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
+    let team_dir = team::team_dir(global_home, team_name);
+
+    let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
+    let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamResponse>();
+
+    // Spawn team worker
+    let worker_home = global_home.to_path_buf();
+    let worker_name = team_name.to_string();
+    let team_worker_handle = tokio::spawn(async move {
+        while let Some(request) = team_rx_worker.recv().await {
+            match request {
+                TeamRequest::Goal(goal) => {
+                    let settings = match Settings::load(&worker_home) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = response_tx
+                                .send(TeamResponse::Error(format!("Failed to load settings: {e}")));
+                            continue;
+                        }
+                    };
+
+                    let tx = response_tx.clone();
+                    let progress = move |msg: &str| {
+                        let _ = tx.send(TeamResponse::Progress(msg.to_string()));
+                    };
+
+                    match mika_agent::teams::run_team(
+                        &worker_name,
+                        &goal,
+                        &worker_home,
+                        &settings,
+                        Some(Box::new(progress)),
+                    )
+                    .await
+                    {
+                        Ok(run) => {
+                            let deliverable = run.deliverable.unwrap_or_default();
+                            let _ = response_tx.send(TeamResponse::Deliverable(deliverable));
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(TeamResponse::Error(format!("{e}")));
+                        }
+                    }
+                }
+                TeamRequest::Quit => break,
+            }
+        }
+    });
+
+    // Build app in team mode
+    let mut app = App::new_team(
+        team_tx,
+        response_rx,
+        team_name,
+        team_dir.clone(),
+        global_home.to_path_buf(),
+    );
+
+    // Load latest completed team run as initial history
+    load_team_history(&mut app, global_home, team_name);
+
+    // Install panic hook that restores terminal
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        original_hook(info);
+    }));
+
+    // Enter TUI mode
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    // Event reader (30ms tick rate for responsive progressive reveal)
+    let mut events = EventReader::new(Duration::from_millis(30));
+
+    // Main loop
+    loop {
+        if app.needs_redraw {
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            app.needs_redraw = false;
+        }
+
+        match events.next().await {
+            Some(AppEvent::Key(key)) => {
+                input::handle_key(&mut app, key);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Mouse(mouse)) => {
+                input::handle_mouse(&mut app, mouse);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Paste(text)) => {
+                input::handle_paste(&mut app, &text);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Tick) => {
+                app.tick().await;
+            }
+            Some(AppEvent::Resize) => {
+                app.needs_redraw = true;
+            }
+            None => break,
+        }
+
+        if app.should_quit {
+            if let Some(ref tx) = app.team_tx {
+                let _ = tx.send(TeamRequest::Quit);
+            }
+            break;
+        }
+    }
+
+    // Restore terminal
+    restore_terminal()?;
+
+    // Shut down event reader thread
+    events.shutdown();
+
+    // Abort team worker
+    team_worker_handle.abort();
+
+    Ok(())
+}
+
+/// Load the latest completed team run from history as initial TUI messages.
+fn load_team_history(app: &mut App<'_>, global_home: &Path, team_name: &str) {
+    let history_dir = team::history_dir(global_home, team_name);
+    let Ok(entries) = std::fs::read_dir(&history_dir) else {
+        return;
+    };
+
+    // Find the most recent .toml file (sorted by name = timestamp)
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+
+    let Some(latest) = files.last() else {
+        return;
+    };
+
+    let Ok(content) = std::fs::read_to_string(latest.path()) else {
+        return;
+    };
+
+    let Ok(run) = toml::from_str::<mika_agent::teams::types::TeamRun>(&content) else {
+        return;
+    };
+
+    // Show the goal and deliverable from the last run
+    app.messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: run.goal,
+        rendered: None,
+        channel: None,
+    });
+    if let Some(deliverable) = run.deliverable {
+        app.messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: deliverable,
+            rendered: None,
+            channel: None,
+        });
+    }
 }
 
 fn restore_terminal() -> Result<()> {

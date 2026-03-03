@@ -14,6 +14,22 @@ use crate::tui::commands;
 use crate::tui::commands::autocomplete::AutocompleteState;
 use crate::tui::markdown;
 
+/// Messages flowing between the TUI and the team worker.
+pub enum TeamRequest {
+    Goal(String),
+    Quit,
+}
+
+/// Responses from the team worker to the TUI.
+pub enum TeamResponse {
+    /// Progress update from the team engine (e.g., "Decomposing goal...", "Running researcher...")
+    Progress(String),
+    /// Final deliverable text from the completed team run.
+    Deliverable(String),
+    /// Team execution failed with an error message.
+    Error(String),
+}
+
 /// Agent processing status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -265,6 +281,16 @@ pub struct App<'a> {
     // Cross-channel polling
     /// Watermark: highest message id seen (used to avoid re-fetching).
     pub last_seen_msg_id: i64,
+
+    // Team mode fields (None when in agent mode)
+    /// Team worker channel for sending goals.
+    pub team_tx: Option<mpsc::UnboundedSender<TeamRequest>>,
+    /// Team worker channel for receiving progress/deliverables.
+    pub team_rx: Option<mpsc::UnboundedReceiver<TeamResponse>>,
+    /// Team name (set when in team mode).
+    pub team_name: Option<String>,
+    /// Team directory path (e.g., ~/.mika/teams/{name}/).
+    pub team_dir: Option<PathBuf>,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -327,7 +353,72 @@ impl<'a> App<'a> {
             thinking_level: None,
             context_tokens: None,
             last_seen_msg_id: 0,
+            team_tx: None,
+            team_rx: None,
+            team_name: None,
+            team_dir: None,
         }
+    }
+
+    /// Create a new App in team mode.
+    pub fn new_team(
+        team_tx: mpsc::UnboundedSender<TeamRequest>,
+        team_rx: mpsc::UnboundedReceiver<TeamResponse>,
+        team_name: &str,
+        team_dir: PathBuf,
+        global_home: PathBuf,
+    ) -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_cursor_line_style(ratatui::style::Style::default());
+        textarea.set_placeholder_text("Type a goal for the team...");
+
+        // Use dummy agent channels — team mode does not use them.
+        let (agent_tx, _) = mpsc::unbounded_channel::<AgentRequest>();
+        let (_, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
+
+        Self {
+            messages: Vec::new(),
+            scroll_offset: 0,
+            status: AgentStatus::Idle,
+            should_quit: false,
+            agent_tx,
+            agent_rx,
+            pending_response: None,
+            reveal_index: 0,
+            textarea,
+            history: InputHistory::load(&team_dir),
+            has_new_message: false,
+            session_id: String::new(),
+            model: String::new(),
+            identity_name: format!("Team: {team_name}"),
+            tick_count: 0,
+            needs_redraw: true,
+            // Team mode does not use agent-specific resources. These are set to
+            // safe defaults. Slash command handlers check `is_team_mode()` before
+            // accessing them.
+            db: AsyncDatabase::in_memory(),
+            claude: ClaudeClient::dummy(),
+            home_dir: team_dir.clone(),
+            skills: Arc::new(SkillRegistry::empty()),
+            autocomplete: AutocompleteState::new(),
+            pending_command: None,
+            agent_name: String::new(),
+            global_home,
+            pending_switch: None,
+            pending_images: Vec::new(),
+            thinking_level: None,
+            context_tokens: None,
+            last_seen_msg_id: 0,
+            team_tx: Some(team_tx),
+            team_rx: Some(team_rx),
+            team_name: Some(team_name.to_string()),
+            team_dir: Some(team_dir),
+        }
+    }
+
+    /// Whether the app is running in team mode.
+    pub fn is_team_mode(&self) -> bool {
+        self.team_name.is_some()
     }
 
     /// Load persisted thinking level from the database.
@@ -366,6 +457,22 @@ impl<'a> App<'a> {
 
         // Save to history
         self.history.push(text.clone());
+
+        // Team mode: send goal to team worker
+        if let Some(ref team_tx) = self.team_tx {
+            self.messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: text.clone(),
+                rendered: None,
+                channel: None,
+            });
+            let _ = team_tx.send(TeamRequest::Goal(text));
+            self.status = AgentStatus::Thinking;
+            self.reset_textarea();
+            self.scroll_offset = 0;
+            self.needs_redraw = true;
+            return;
+        }
 
         // Build display message with attachment info
         let display = if self.pending_images.is_empty() {
@@ -429,7 +536,131 @@ impl<'a> App<'a> {
             self.needs_redraw = true;
         }
 
-        // Check for agent response
+        // Team mode: poll team response channel
+        if self.is_team_mode() {
+            self.tick_team_mode();
+        } else {
+            self.tick_agent_mode().await;
+        }
+
+        // Advance progressive reveal
+        if self.pending_response.is_some() {
+            let full = self.pending_response.as_ref().unwrap();
+            let len = full.len();
+            if self.reveal_index < len {
+                // Reveal in chunks scaled by response length for smooth appearance.
+                // Small (<1KB): 8 bytes/tick, medium (<4KB): 32, large: 64.
+                // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 chars.
+                let increment = if len < 1024 {
+                    8
+                } else if len < 4096 {
+                    32
+                } else {
+                    64
+                };
+                self.reveal_index = full
+                    .floor_char_boundary(self.reveal_index + increment)
+                    .min(len);
+                self.status = AgentStatus::Responding(self.reveal_index);
+                self.needs_redraw = true;
+            } else {
+                // Reveal complete — take ownership (no clone) and add full message
+                let full = self.pending_response.take().unwrap();
+                let rendered = markdown::render(&full);
+                self.messages.push(ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: full,
+                    rendered: Some(rendered),
+                    channel: None,
+                });
+                self.reveal_index = 0;
+                self.status = AgentStatus::Idle;
+                // Auto-scroll to bottom (only if user hasn't scrolled up)
+                self.auto_scroll_to_bottom();
+                self.needs_redraw = true;
+                // Update watermark to avoid re-polling our own messages (agent mode only)
+                if !self.is_team_mode()
+                    && let Ok(max_id) = self.db.max_message_id().await
+                {
+                    self.last_seen_msg_id = max_id;
+                }
+            }
+        }
+
+        // Cross-channel polling: agent mode only.
+        if !self.is_team_mode()
+            && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
+            && self.status == AgentStatus::Idle
+        {
+            self.poll_cross_channel_messages().await;
+        }
+
+        // Thinking animation needs redraw every tick while active
+        if self.status == AgentStatus::Thinking {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Tick handler for team mode: poll team_rx for progress/deliverable/error.
+    fn tick_team_mode(&mut self) {
+        let Some(ref mut team_rx) = self.team_rx else {
+            return;
+        };
+        match team_rx.try_recv() {
+            Ok(TeamResponse::Progress(msg)) => {
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: msg,
+                    rendered: None,
+                    channel: None,
+                });
+                self.auto_scroll_to_bottom();
+                self.needs_redraw = true;
+            }
+            Ok(TeamResponse::Deliverable(text)) => {
+                if text.is_empty() {
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: "Team completed with no deliverable.".to_string(),
+                        rendered: None,
+                        channel: None,
+                    });
+                    self.status = AgentStatus::Idle;
+                } else {
+                    self.pending_response = Some(text);
+                    self.reveal_index = 0;
+                    self.status = AgentStatus::Responding(0);
+                }
+                self.needs_redraw = true;
+            }
+            Ok(TeamResponse::Error(msg)) => {
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!("Team error: {msg}"),
+                    rendered: None,
+                    channel: None,
+                });
+                self.status = AgentStatus::Idle;
+                self.needs_redraw = true;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                if self.status == AgentStatus::Thinking {
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: "Team worker stopped unexpectedly.".to_string(),
+                        rendered: None,
+                        channel: None,
+                    });
+                    self.status = AgentStatus::Idle;
+                    self.needs_redraw = true;
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Tick handler for agent mode: poll agent_rx for responses.
+    async fn tick_agent_mode(&mut self) {
         match self.agent_rx.try_recv() {
             Ok(response) => {
                 // Update skills if hot-reloaded during this turn
@@ -493,59 +724,6 @@ impl<'a> App<'a> {
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-
-        // Advance progressive reveal
-        if self.pending_response.is_some() {
-            let full = self.pending_response.as_ref().unwrap();
-            let len = full.len();
-            if self.reveal_index < len {
-                // Reveal in chunks scaled by response length for smooth appearance.
-                // Small (<1KB): 8 bytes/tick, medium (<4KB): 32, large: 64.
-                // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 chars.
-                let increment = if len < 1024 {
-                    8
-                } else if len < 4096 {
-                    32
-                } else {
-                    64
-                };
-                self.reveal_index = full
-                    .floor_char_boundary(self.reveal_index + increment)
-                    .min(len);
-                self.status = AgentStatus::Responding(self.reveal_index);
-                self.needs_redraw = true;
-            } else {
-                // Reveal complete — take ownership (no clone) and add full message
-                let full = self.pending_response.take().unwrap();
-                let rendered = markdown::render(&full);
-                self.messages.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: full,
-                    rendered: Some(rendered),
-                    channel: None,
-                });
-                self.reveal_index = 0;
-                self.status = AgentStatus::Idle;
-                // Auto-scroll to bottom (only if user hasn't scrolled up)
-                self.auto_scroll_to_bottom();
-                self.needs_redraw = true;
-                // Update watermark to avoid re-polling our own messages
-                if let Ok(max_id) = self.db.max_message_id().await {
-                    self.last_seen_msg_id = max_id;
-                }
-            }
-        }
-
-        // Cross-channel polling: check for new messages from other channels every ~5 seconds.
-        // Only poll when idle to avoid visual confusion during agent processing.
-        if self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) && self.status == AgentStatus::Idle {
-            self.poll_cross_channel_messages().await;
-        }
-
-        // Thinking animation needs redraw every tick while active
-        if self.status == AgentStatus::Thinking {
-            self.needs_redraw = true;
         }
     }
 

@@ -67,6 +67,12 @@ impl AsyncDatabase {
         Ok(Self::new(db))
     }
 
+    /// Create an in-memory database (useful for team mode TUI where no agent DB is needed).
+    pub fn in_memory() -> Self {
+        let db = Database::open_in_memory().expect("failed to open in-memory SQLite");
+        Self::new(db)
+    }
+
     /// Gracefully shut down the database thread.
     ///
     /// Drops the internal sender (so the thread's `recv()` loop exits)

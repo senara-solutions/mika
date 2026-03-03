@@ -9,10 +9,37 @@ use crate::tui::app::{AgentRequest, AgentStatus, App, ChatMessage, ChatRole};
 use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
 use crate::tui::input;
 
+/// Commands that are not available in team mode (agent-specific).
+const TEAM_MODE_BLOCKED_COMMANDS: &[&str] = &[
+    "compact",
+    "memory",
+    "mem",
+    "reminders",
+    "remind",
+    "soul",
+    "config",
+    "cfg",
+    "model",
+    "skills",
+    "skill",
+    "switch",
+    "agent",
+    "think",
+    "t",
+    "attach",
+    "img",
+];
+
 /// Dispatch a slash command string to the appropriate handler.
 /// Returns Some(output) for commands that produce output, None for commands like /exit.
 pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
     let (cmd_name, args) = parse_command(input);
+
+    // Gate agent-specific commands in team mode
+    if app.is_team_mode() && TEAM_MODE_BLOCKED_COMMANDS.contains(&cmd_name) {
+        return Some(format!("/{cmd_name} is not available in team mode."));
+    }
+
     match cmd_name {
         "help" | "h" | "?" => Some(handle_help()),
         "clear" => Some(handle_clear(app, args).await),
@@ -23,7 +50,13 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "compact" => Some(handle_compact(app).await),
         "memory" | "mem" => Some(handle_memory(app, args).await),
         "reminders" | "remind" => Some(handle_reminders(app).await),
-        "status" | "stat" => Some(handle_status(app).await),
+        "status" | "stat" => {
+            if app.is_team_mode() {
+                Some(handle_team_status(app))
+            } else {
+                Some(handle_status(app).await)
+            }
+        }
         "soul" => Some(handle_soul(app).await),
         "config" | "cfg" => Some(handle_config(app, args).await),
         "model" => Some(handle_model(app, args)),
@@ -33,7 +66,13 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "switch" | "agent" => Some(handle_switch(app, args)),
         "agents" => Some(handle_agents(app)),
         "teams" => Some(handle_teams(app)),
-        "team" => Some(handle_team(args)),
+        "team" => {
+            if app.is_team_mode() {
+                Some(handle_team_info(app))
+            } else {
+                Some(handle_team(args))
+            }
+        }
         "think" | "t" => handle_think(app, args).await,
         "attach" | "img" => Some(handle_attach(app, args)),
         _ => Some(format!(
@@ -383,7 +422,12 @@ async fn handle_export(app: &mut App<'_>) -> String {
         return "Nothing to export.".to_string();
     }
 
-    let exports_dir = app.home_dir.join("exports");
+    // Team mode exports to the team directory instead of agent home
+    let exports_dir = if let Some(ref team_dir) = app.team_dir {
+        team_dir.join("exports")
+    } else {
+        app.home_dir.join("exports")
+    };
     if let Err(e) = tokio::fs::create_dir_all(&exports_dir).await {
         return format!("Failed to create exports directory: {e}");
     }
@@ -604,6 +648,43 @@ fn handle_teams(app: &App<'_>) -> String {
     out
 }
 
+/// Show team info when `/team` is used in team mode (no switching).
+fn handle_team_info(app: &App<'_>) -> String {
+    let team_name = app.team_name.as_deref().unwrap_or("unknown");
+    let mut out = String::new();
+    let _ = writeln!(out, "Current team: {team_name}");
+    match team::load_team(&app.global_home, team_name) {
+        Ok(def) => {
+            let _ = writeln!(out, "  Orchestrator: {}", def.team.orchestrator);
+            let _ = writeln!(out, "  Max iterations: {}", def.flow.max_iterations);
+            let _ = writeln!(out, "  Agents:");
+            for a in &def.agents {
+                let _ = writeln!(out, "    {} — {}", a.name, a.role);
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "  (failed to load team definition: {e})");
+        }
+    }
+    out
+}
+
+/// Show team status in team mode.
+fn handle_team_status(app: &App<'_>) -> String {
+    let team_name = app.team_name.as_deref().unwrap_or("unknown");
+    let mut out = format!("Team: {team_name}\n");
+    match team::load_team(&app.global_home, team_name) {
+        Ok(def) => {
+            let _ = writeln!(out, "  Agents: {}", def.agents.len());
+            let _ = writeln!(out, "  Orchestrator: {}", def.team.orchestrator);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "  (failed to load team: {e})");
+        }
+    }
+    out
+}
+
 fn handle_team(args: &str) -> String {
     if args.is_empty() {
         return "Usage: /team <name> \"<goal>\"".to_string();
@@ -757,5 +838,47 @@ mod tests {
         assert!(is_settable_key("timezone"));
         assert!(!is_settable_key("api_key"));
         assert!(!is_settable_key("db_path"));
+    }
+
+    #[test]
+    fn test_team_mode_blocked_commands() {
+        // Verify all agent-specific commands are in the blocklist
+        for cmd in &[
+            "compact",
+            "memory",
+            "mem",
+            "reminders",
+            "remind",
+            "soul",
+            "config",
+            "cfg",
+            "model",
+            "skills",
+            "skill",
+            "switch",
+            "agent",
+            "think",
+            "t",
+            "attach",
+            "img",
+        ] {
+            assert!(
+                TEAM_MODE_BLOCKED_COMMANDS.contains(cmd),
+                "Expected '{cmd}' to be blocked in team mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_team_mode_allowed_commands() {
+        // Verify universal commands are NOT in the blocklist
+        for cmd in &[
+            "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams",
+        ] {
+            assert!(
+                !TEAM_MODE_BLOCKED_COMMANDS.contains(cmd),
+                "Expected '{cmd}' to be allowed in team mode"
+            );
+        }
     }
 }

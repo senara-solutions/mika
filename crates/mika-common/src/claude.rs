@@ -281,6 +281,17 @@ impl ClaudeClient {
         })
     }
 
+    /// Create a placeholder client that cannot make API calls.
+    /// Used by team mode TUI where the team engine creates its own clients.
+    pub fn dummy() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            auth: AnthropicAuth::ApiKey(String::new()),
+            model: String::new(),
+            max_tokens: 0,
+        }
+    }
+
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
         // Build the final auth header value upfront (non-retryable configuration error).
