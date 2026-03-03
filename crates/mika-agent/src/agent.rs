@@ -584,6 +584,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         global_home_dir: params.global_home_dir,
         channel_type: Some(params.channel_type),
         telegram_configured: chat_id.is_some(),
+        home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -1357,6 +1358,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
         telegram_configured: false,
+        home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 

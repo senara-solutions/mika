@@ -60,9 +60,13 @@ impl Tool for WriteWorkspaceTool {
         let bytes_written = content.len();
         match tokio::fs::write(&full_path, content).await {
             Ok(()) => Ok(ToolOutput::success(format!(
-                "Wrote {bytes_written} bytes to '{path}'."
+                "Wrote {bytes_written} bytes to '{}'.",
+                full_path.display()
             ))),
-            Err(e) => Ok(ToolOutput::error(format!("Failed to write '{path}': {e}"))),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "Failed to write '{}': {e}",
+                full_path.display()
+            ))),
         }
     }
 }

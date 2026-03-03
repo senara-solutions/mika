@@ -103,6 +103,9 @@ pub struct PromptContext<'a> {
     pub channel_type: Option<&'a str>,
     /// Whether Telegram integration is configured (chat_id exists in customer_config).
     pub telegram_configured: bool,
+    /// Per-agent home directory (e.g. `~/.mika/agents/main/`).
+    /// Surfaced in the Tool Usage section so the agent knows write_file's base path.
+    pub home_dir: Option<&'a Path>,
 }
 
 fn onboarding_prompt() -> String {
@@ -306,9 +309,22 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
     );
-    prompt.push_str(
-        "- You can write files to your home directory with write_file. Paths are relative to your home. If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
-    );
+    if let Some(home) = ctx.home_dir {
+        writeln!(
+            prompt,
+            "- You can write files to your home directory with write_file. \
+             Your home directory is {} — all paths are relative to this directory. \
+             For example, to write identity.toml at the root of your home, use path 'identity.toml'. \
+             If the file exists, you must review the current content and call again with confirm: true to overwrite.",
+            home.display()
+        )
+        .unwrap();
+    } else {
+        prompt.push_str(
+            "- You can write files to your home directory with write_file. Paths are relative to your home. \
+             If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
+        );
+    }
 
     prompt
 }
@@ -440,6 +456,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -460,6 +477,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -486,6 +504,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -505,6 +524,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -525,6 +545,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -566,6 +587,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -665,6 +687,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -686,6 +709,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -706,6 +730,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -738,6 +763,7 @@ mod tests {
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -840,6 +866,7 @@ max_iterations = 3
             global_home_dir: Some(tmp.path()),
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -882,6 +909,7 @@ max_iterations = 3
             global_home_dir: Some(tmp.path()),
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -911,6 +939,7 @@ max_iterations = 3
             global_home_dir: Some(tmp.path()),
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -931,6 +960,7 @@ max_iterations = 3
             global_home_dir: Some(tmp.path()),
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -950,6 +980,7 @@ max_iterations = 3
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -969,6 +1000,7 @@ max_iterations = 3
             global_home_dir: None,
             channel_type: Some("telegram"),
             telegram_configured: true,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -990,6 +1022,7 @@ max_iterations = 3
             global_home_dir: None,
             channel_type: Some("cli"),
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1011,10 +1044,61 @@ max_iterations = 3
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
+            home_dir: None,
         };
 
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Communication Channel"));
+    }
+
+    #[test]
+    fn test_prompt_includes_home_dir_in_write_file_instruction() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: Some(std::path::Path::new("/home/user/.mika/agents/main")),
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("/home/user/.mika/agents/main"),
+            "prompt should include the home directory path"
+        );
+        assert!(
+            prompt.contains("Your home directory is /home/user/.mika/agents/main"),
+            "prompt should include the home directory in write_file instruction"
+        );
+    }
+
+    #[test]
+    fn test_prompt_fallback_when_home_dir_none() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("Paths are relative to your home"),
+            "should fall back to generic instruction when home_dir is None"
+        );
     }
 
     #[test]

@@ -85,23 +85,26 @@ impl Tool for WriteFileTool {
                     let size = meta.len();
                     if size > MAX_EXISTING_SIZE {
                         return Ok(ToolOutput::error(format!(
-                            "File already exists at '{path}' ({size} bytes, too large to preview). \
-                             Call again with confirm: true to overwrite."
+                            "File already exists at '{}' ({size} bytes, too large to preview). \
+                             Call again with confirm: true to overwrite.",
+                            full_path.display()
                         )));
                     }
 
                     match tokio::fs::read_to_string(&full_path).await {
                         Ok(existing) => {
                             return Ok(ToolOutput::error(format!(
-                                "File already exists at '{path}' ({size} bytes). \
+                                "File already exists at '{}' ({size} bytes). \
                                  Current content is shown below. \
-                                 Call again with confirm: true to overwrite.\n\n{existing}"
+                                 Call again with confirm: true to overwrite.\n\n{existing}",
+                                full_path.display()
                             )));
                         }
                         Err(e) => {
                             return Ok(ToolOutput::error(format!(
-                                "File already exists at '{path}' but could not be read: {e}. \
-                                 Call again with confirm: true to overwrite."
+                                "File already exists at '{}' but could not be read: {e}. \
+                                 Call again with confirm: true to overwrite.",
+                                full_path.display()
                             )));
                         }
                     }
@@ -118,9 +121,13 @@ impl Tool for WriteFileTool {
         let bytes_written = content.len();
         match tokio::fs::write(&full_path, content).await {
             Ok(()) => Ok(ToolOutput::success(format!(
-                "Wrote {bytes_written} bytes to '{path}'."
+                "Wrote {bytes_written} bytes to '{}'.",
+                full_path.display()
             ))),
-            Err(e) => Ok(ToolOutput::error(format!("Failed to write '{path}': {e}"))),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "Failed to write '{}': {e}",
+                full_path.display()
+            ))),
         }
     }
 }
@@ -350,6 +357,59 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("symbolic link"));
+    }
+
+    #[tokio::test]
+    async fn test_success_message_contains_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let tool = WriteFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "sub/file.md", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Must contain the absolute path, not just the relative input
+        let expected_path = home.join("sub/file.md");
+        assert!(
+            output
+                .content
+                .contains(&expected_path.display().to_string()),
+            "expected absolute path '{}' in message: {}",
+            expected_path.display(),
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confirmation_message_contains_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("existing.md"), "old").unwrap();
+
+        let tool = WriteFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "existing.md", "content": "new" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+
+        // Confirmation message must show absolute path
+        let expected_path = home.join("existing.md");
+        assert!(
+            output
+                .content
+                .contains(&expected_path.display().to_string()),
+            "expected absolute path '{}' in confirmation: {}",
+            expected_path.display(),
+            output.content
+        );
     }
 
     #[tokio::test]
