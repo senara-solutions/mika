@@ -256,6 +256,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     );
     prompt.push_str("- You can enable or disable skills with toggle_skill.\n");
     prompt.push_str("- You can update existing skill descriptions, keywords, prompts, or always_on settings with update_skill.\n");
+    prompt.push_str("- Skills may be [built-in], [marketplace] (installed from Git repos via CLI), or [custom] (created locally). You can delete marketplace and custom skills.\n");
     prompt.push_str("- You can permanently remove custom skills with delete_skill. Built-in skills cannot be deleted.\n");
     prompt.push_str(
         "- You can read and update customer config (timezone, chat_id, thinking_level) with get_config and set_config.\n",

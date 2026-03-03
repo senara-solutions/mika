@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use mika_agent::bundled_skills;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::executor;
 use mika_agent::skills::git;
@@ -6,6 +7,7 @@ use mika_agent::skills::index::scan_skills_dir;
 use mika_agent::skills::install;
 use mika_agent::skills::marketplace;
 use mika_common::home;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::cli::{SkillsArgs, SkillsCommand};
@@ -19,7 +21,7 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     match args.command {
         None | Some(SkillsCommand::List) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
-            list_skills(&registry);
+            list_skills(&registry, &agent_home);
         }
         Some(SkillsCommand::Info { name }) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
@@ -50,20 +52,29 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_skills(registry: &SkillRegistry) {
+fn list_skills(registry: &SkillRegistry, agent_home: &Path) {
     let skills = registry.skills();
     if skills.is_empty() {
         println!("\n  No skills loaded.\n");
         println!("  Create one with: mika skills create <name>");
         return;
     }
+    let lock = marketplace::read_lock(agent_home);
     println!("\n  Skills ({}):", skills.len());
     for entry in skills {
+        let name = &entry.manifest.skill.name;
         let tool_count = entry.skill_tools.len();
         let tools_desc = if tool_count > 0 {
             format!("{} tools", tool_count)
         } else {
             "no tools".to_string()
+        };
+        let origin = if bundled_skills::is_bundled_skill(name) {
+            " [built-in]"
+        } else if lock.skills.contains_key(name.as_str()) {
+            " [marketplace]"
+        } else {
+            " [custom]"
         };
         let always_on = if entry.manifest.skill.always_on {
             " [always on]"
@@ -72,12 +83,8 @@ fn list_skills(registry: &SkillRegistry) {
         };
         let status = if entry.enabled { "" } else { " [disabled]" };
         println!(
-            "    {} ({}) — {}{}{}",
-            entry.manifest.skill.name,
-            tools_desc,
-            entry.manifest.skill.description,
-            always_on,
-            status
+            "    {} ({}) — {}{}{}{}",
+            name, tools_desc, entry.manifest.skill.description, origin, always_on, status
         );
     }
     println!();
@@ -372,6 +379,21 @@ fn install_skill(
     }
 
     for candidate in &selected {
+        if candidate.has_exec_handlers {
+            println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
+            println!("  Review the source before use: {}", &url);
+            if std::io::stdin().is_terminal() {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt("  Continue with installation?")
+                    .default(false)
+                    .interact()?;
+                if !confirm {
+                    println!("  Installation cancelled.");
+                    continue;
+                }
+            }
+        }
+
         let result = install::install_skill(
             agent_home,
             skills_dir,
@@ -386,11 +408,6 @@ fn install_skill(
             result.name,
             &result.commit[..12.min(result.commit.len())]
         );
-
-        if result.has_exec_handlers {
-            println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
-            println!("  Review the source before use: {}\n", result.url);
-        }
     }
 
     println!();
@@ -402,7 +419,7 @@ fn select_skills_interactive(
     candidates: &[marketplace::SkillCandidate],
 ) -> Result<Vec<&marketplace::SkillCandidate>> {
     // Check if we're in a TTY
-    if !atty_check() {
+    if !std::io::stdin().is_terminal() {
         let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
         bail!(
             "Multiple skills found but not running in a terminal.\n\
@@ -425,11 +442,6 @@ fn select_skills_interactive(
         .interact()?;
 
     Ok(selections.iter().map(|&i| &candidates[i]).collect())
-}
-
-/// Simple TTY check.
-fn atty_check() -> bool {
-    std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<()> {

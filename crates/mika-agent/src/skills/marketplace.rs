@@ -162,7 +162,7 @@ fn try_load_candidate(skill_dir: &Path, repo_dir: &Path) -> Option<SkillCandidat
     };
 
     // Validate skill name
-    if let Err(e) = super::super::tools::create_skill::validate_skill_name(&manifest.skill.name) {
+    if let Err(e) = crate::tools::create_skill::validate_skill_name(&manifest.skill.name) {
         warn!(name = %manifest.skill.name, error = %e, "invalid skill name in repo, skipping");
         return None;
     }
@@ -179,16 +179,15 @@ fn try_load_candidate(skill_dir: &Path, repo_dir: &Path) -> Option<SkillCandidat
     };
 
     // Check for exec handlers in tools.json
-    let has_exec_handlers = skill_dir.join("tools.json").exists()
-        && std::fs::read_to_string(skill_dir.join("tools.json"))
-            .ok()
-            .and_then(|c| serde_json::from_str::<Vec<SkillToolDef>>(&c).ok())
-            .map(|tools| {
-                tools
-                    .iter()
-                    .any(|t| matches!(t.handler, ToolHandler::Exec { .. }))
-            })
-            .unwrap_or(false);
+    let has_exec_handlers = std::fs::read_to_string(skill_dir.join("tools.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<Vec<SkillToolDef>>(&c).ok())
+        .map(|tools| {
+            tools
+                .iter()
+                .any(|t| matches!(t.handler, ToolHandler::Exec { .. }))
+        })
+        .unwrap_or(false);
 
     Some(SkillCandidate {
         name: manifest.skill.name,

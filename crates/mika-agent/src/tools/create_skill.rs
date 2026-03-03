@@ -33,7 +33,7 @@ pub(crate) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(
 }
 
 /// Validate a skill description: non-empty and within length limit.
-pub(crate) fn validate_description(desc: &str) -> Result<(), String> {
+pub(super) fn validate_description(desc: &str) -> Result<(), String> {
     if desc.is_empty() {
         return Err("Description cannot be empty.".to_string());
     }
@@ -47,7 +47,7 @@ pub(crate) fn validate_description(desc: &str) -> Result<(), String> {
 }
 
 /// Validate a system prompt: non-empty and within length limit.
-pub(crate) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
+pub(super) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
     if prompt.is_empty() {
         return Err("System prompt cannot be empty.".to_string());
     }
@@ -61,7 +61,7 @@ pub(crate) fn validate_system_prompt(prompt: &str) -> Result<(), String> {
 }
 
 /// Validate keywords: count and individual length limits.
-pub(crate) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
+pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
     if keywords.len() > MAX_KEYWORDS {
         return Err(format!(
             "Too many keywords ({}, max {MAX_KEYWORDS}).",

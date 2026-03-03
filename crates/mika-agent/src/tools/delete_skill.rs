@@ -20,10 +20,10 @@ impl Tool for DeleteSkillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "delete_skill".to_string(),
-            description: "Permanently delete a custom skill. Removes the skill directory and \
-                all its files (manifest, prompt, tools, handlers). Built-in skills cannot be \
-                deleted — use toggle_skill to disable them instead. Changes take effect \
-                immediately on the next turn."
+            description: "Permanently delete a custom or marketplace-installed skill. Removes \
+                the skill directory and all its files (manifest, prompt, tools, handlers). \
+                Built-in skills cannot be deleted — use toggle_skill to disable them instead. \
+                Changes take effect immediately on the next turn."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -247,6 +247,55 @@ keywords = ["test"]
             .unwrap();
         assert!(!result.is_error, "Got: {}", result.content);
         assert!(!tmp.path().join("skills/complex-skill").exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_skill_cleans_marketplace_lock() {
+        use crate::skills::marketplace::{
+            MarketplaceEntry, MarketplaceLock, read_lock, write_lock,
+        };
+        use std::collections::BTreeMap;
+
+        let (tmp, harness) = setup_with_skill("market-skill");
+
+        // Write a marketplace lock entry for this skill
+        let mut skills = BTreeMap::new();
+        skills.insert(
+            "market-skill".to_string(),
+            MarketplaceEntry {
+                url: "https://github.com/user/mika-skill-market.git".to_string(),
+                path: ".".to_string(),
+                commit: "abc123".to_string(),
+                installed_at: "2026-03-02T10:00:00Z".to_string(),
+                updated_at: "2026-03-02T10:00:00Z".to_string(),
+            },
+        );
+        let lock = MarketplaceLock { skills };
+        write_lock(tmp.path(), &lock).unwrap();
+
+        // Verify lock entry exists before delete
+        let lock_before = read_lock(tmp.path());
+        assert!(lock_before.skills.contains_key("market-skill"));
+
+        // Delete the skill
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = DeleteSkillTool;
+        let result = tool
+            .execute(serde_json::json!({"name": "market-skill"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "Got: {}", result.content);
+        assert!(result.content.contains("Deleted skill 'market-skill'"));
+
+        // Verify skill directory is gone
+        assert!(!tmp.path().join("skills/market-skill").exists());
+
+        // Verify marketplace lock entry is removed
+        let lock_after = read_lock(tmp.path());
+        assert!(
+            !lock_after.skills.contains_key("market-skill"),
+            "marketplace lock entry should be removed after delete"
+        );
     }
 
     #[cfg(unix)]

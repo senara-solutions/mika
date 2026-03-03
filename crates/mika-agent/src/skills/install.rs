@@ -147,7 +147,7 @@ pub fn update_skill(
     skills_dir: &Path,
     name: &str,
 ) -> Result<Option<UpdateResult>> {
-    let lock = read_lock(agent_home);
+    let mut lock = read_lock(agent_home);
     let entry = lock
         .skills
         .get(name)
@@ -190,7 +190,6 @@ pub fn update_skill(
     copy_skill_dir(&candidate.absolute_path, &target_dir)?;
 
     // Update lock
-    let mut lock = read_lock(agent_home);
     if let Some(entry) = lock.skills.get_mut(name) {
         entry.commit = new_commit.clone();
         entry.updated_at = Utc::now().to_rfc3339();
