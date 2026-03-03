@@ -24,7 +24,7 @@ arguments.
 
 ### Command Completion
 
-1. Type `/` -- a popup appears listing all 19 commands.
+1. Type `/` -- a popup appears listing all 20 commands.
 2. Continue typing to narrow the list. For example, `/me` narrows to `/memory`.
    Matching works on both command names and aliases (e.g., typing `/q` matches
    `/exit` via its `q` alias).

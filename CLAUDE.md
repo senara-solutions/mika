@@ -47,7 +47,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~826 tests)
+- `cargo test` — Run all tests (~834 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `cargo clippy` — Lint

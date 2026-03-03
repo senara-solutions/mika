@@ -366,16 +366,16 @@ section listing available agents with their identities (emoji + name).
 ### Team Workflows
 
 Teams are defined in `~/.mika/teams/{name}/team.toml` and orchestrated by the
-`run_team` tool. Team history is persisted as TOML files in
-`~/.mika/teams/{name}/history/` and queryable via `get_team_status` and
-`get_team_history` tools.
+`run_team` tool. Team runs and message graphs are persisted to a per-team SQLite
+database (`{team_dir}/data/mika.db`) with graph-structured messages linked via
+`parent_id`. Queryable via `get_team_status` and `get_team_history` tools.
 
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
 
 ## Appendix: Database Schema
 
-**Schema version:** 9
+**Schema version:** 11
 
 ### Tables
 
@@ -399,6 +399,9 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 | `search_content` | Unified search content for Layer 3 hybrid search | v8 |
 | `fts_search` | FTS5 virtual table for full-text search | v8 |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity | v8 |
+| `reflection_runs` | Periodic memory reflection tracking | v10 |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable) | v11 |
+| `team_messages` | Graph-structured team messages with `parent_id` links | v11 |
 
 ### SQLite Pragmas
 
