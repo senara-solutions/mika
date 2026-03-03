@@ -1,8 +1,13 @@
 use anyhow::{Context, Result, bail};
+use mika_agent::bundled_skills;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::executor;
+use mika_agent::skills::git;
 use mika_agent::skills::index::scan_skills_dir;
+use mika_agent::skills::install;
+use mika_agent::skills::marketplace;
 use mika_common::home;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::cli::{SkillsArgs, SkillsCommand};
@@ -16,11 +21,11 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     match args.command {
         None | Some(SkillsCommand::List) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
-            list_skills(&registry);
+            list_skills(&registry, &agent_home);
         }
         Some(SkillsCommand::Info { name }) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
-            show_skill_detail(&registry, &name);
+            show_skill_detail(&registry, &name, &agent_home);
         }
         Some(SkillsCommand::Create { name }) => {
             create_skill(&skills_dir, &name)?;
@@ -34,24 +39,42 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Disable { name }) => {
             toggle_skill(&skills_dir, &name, false)?;
         }
+        Some(SkillsCommand::Install { source, name }) => {
+            install_skill(&agent_home, &skills_dir, &source, name.as_deref())?;
+        }
+        Some(SkillsCommand::Uninstall { name }) => {
+            uninstall_skill(&agent_home, &skills_dir, &name)?;
+        }
+        Some(SkillsCommand::Update { name }) => {
+            update_skills(&agent_home, &skills_dir, name.as_deref())?;
+        }
     }
     Ok(())
 }
 
-fn list_skills(registry: &SkillRegistry) {
+fn list_skills(registry: &SkillRegistry, agent_home: &Path) {
     let skills = registry.skills();
     if skills.is_empty() {
         println!("\n  No skills loaded.\n");
         println!("  Create one with: mika skills create <name>");
         return;
     }
+    let lock = marketplace::read_lock(agent_home);
     println!("\n  Skills ({}):", skills.len());
     for entry in skills {
+        let name = &entry.manifest.skill.name;
         let tool_count = entry.skill_tools.len();
         let tools_desc = if tool_count > 0 {
             format!("{} tools", tool_count)
         } else {
             "no tools".to_string()
+        };
+        let origin = if bundled_skills::is_bundled_skill(name) {
+            " [built-in]"
+        } else if lock.skills.contains_key(name.as_str()) {
+            " [marketplace]"
+        } else {
+            " [custom]"
         };
         let always_on = if entry.manifest.skill.always_on {
             " [always on]"
@@ -60,18 +83,14 @@ fn list_skills(registry: &SkillRegistry) {
         };
         let status = if entry.enabled { "" } else { " [disabled]" };
         println!(
-            "    {} ({}) — {}{}{}",
-            entry.manifest.skill.name,
-            tools_desc,
-            entry.manifest.skill.description,
-            always_on,
-            status
+            "    {} ({}) — {}{}{}{}",
+            name, tools_desc, entry.manifest.skill.description, origin, always_on, status
         );
     }
     println!();
 }
 
-fn show_skill_detail(registry: &SkillRegistry, name: &str) {
+fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
     let skills = registry.skills();
     let found = skills
         .iter()
@@ -117,6 +136,16 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str) {
                 }
             }
             println!("    Path:        {}", entry.dir.display());
+
+            // Show marketplace metadata if applicable
+            let lock = marketplace::read_lock(agent_home);
+            if let Some(mp_entry) = lock.skills.get(&m.skill.name) {
+                println!("    Source:      {}", mp_entry.url);
+                println!("    Repo path:   {}", mp_entry.path);
+                println!("    Commit:      {}", mp_entry.commit);
+                println!("    Installed:   {}", mp_entry.installed_at);
+                println!("    Updated:     {}", mp_entry.updated_at);
+            }
             println!();
         }
         None => {
@@ -293,5 +322,206 @@ fn toggle_skill(skills_dir: &Path, name: &str, enable: bool) -> Result<()> {
     } else {
         println!("\n  Skill '{name}' is already disabled.\n");
     }
+    Ok(())
+}
+
+fn install_skill(
+    agent_home: &Path,
+    skills_dir: &Path,
+    source: &str,
+    alias: Option<&str>,
+) -> Result<()> {
+    // Resolve URL
+    let url = git::resolve_url(source)?;
+    println!("\n  Installing from {url}...");
+
+    // Check git is available
+    git::check_git()?;
+
+    // Clone to temp dir
+    let tmp = git::clone_to_temp(&url)?;
+
+    // Get commit hash
+    let commit = git::get_head_commit(tmp.path())?;
+
+    // Scan for skills
+    let candidates = marketplace::scan_repo_for_skills(tmp.path());
+    if candidates.is_empty() {
+        bail!("No valid skills found in repository. Ensure the repo contains a skill.toml file.");
+    }
+
+    // Ensure skills dir exists
+    std::fs::create_dir_all(skills_dir)
+        .with_context(|| format!("failed to create {}", skills_dir.display()))?;
+
+    // Select skill(s) to install
+    let selected = if candidates.len() == 1 {
+        vec![&candidates[0]]
+    } else {
+        // --name can only be used with a single skill
+        if alias.is_some() {
+            bail!(
+                "Multiple skills found in repo. --name can only be used when installing a single skill.\n\
+                 Found skills: {}",
+                candidates
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        select_skills_interactive(&candidates)?
+    };
+
+    if selected.is_empty() {
+        println!("  No skills selected.\n");
+        return Ok(());
+    }
+
+    for candidate in &selected {
+        if candidate.has_exec_handlers {
+            println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
+            println!("  Review the source before use: {}", &url);
+            if std::io::stdin().is_terminal() {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt("  Continue with installation?")
+                    .default(false)
+                    .interact()?;
+                if !confirm {
+                    println!("  Installation cancelled.");
+                    continue;
+                }
+            }
+        }
+
+        let result = install::install_skill(
+            agent_home,
+            skills_dir,
+            candidate,
+            if selected.len() == 1 { alias } else { None },
+            &url,
+            &commit,
+        )?;
+
+        println!(
+            "  Installed '{}' (commit: {})",
+            result.name,
+            &result.commit[..12.min(result.commit.len())]
+        );
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Interactive multi-skill selection using dialoguer.
+fn select_skills_interactive(
+    candidates: &[marketplace::SkillCandidate],
+) -> Result<Vec<&marketplace::SkillCandidate>> {
+    // Check if we're in a TTY
+    if !std::io::stdin().is_terminal() {
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        bail!(
+            "Multiple skills found but not running in a terminal.\n\
+             Found: {}\n\
+             Re-run with a specific skill name or use --name.",
+            names.join(", ")
+        );
+    }
+
+    let items: Vec<String> = candidates
+        .iter()
+        .map(|c| format!("{} — {} (at: {})", c.name, c.description, c.relative_path))
+        .collect();
+
+    println!("\n  Multiple skills found in repository:");
+
+    let selections = dialoguer::MultiSelect::new()
+        .with_prompt("  Select skills to install")
+        .items(&items)
+        .interact()?;
+
+    Ok(selections.iter().map(|&i| &candidates[i]).collect())
+}
+
+fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<()> {
+    install::uninstall_skill(agent_home, skills_dir, name)?;
+    println!("\n  Uninstalled '{name}'.\n");
+    Ok(())
+}
+
+fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Result<()> {
+    let lock = marketplace::read_lock(agent_home);
+
+    if lock.skills.is_empty() {
+        println!("\n  No marketplace skills installed.\n");
+        return Ok(());
+    }
+
+    match name {
+        Some(name) => {
+            // Update single skill
+            if !lock.skills.contains_key(name) {
+                bail!("Skill '{name}' is not a marketplace-installed skill.");
+            }
+            println!("\n  Updating '{name}'...");
+            match install::update_skill(agent_home, skills_dir, name)? {
+                Some(result) => {
+                    println!(
+                        "  {}: updated ({} -> {})",
+                        result.name,
+                        &result.old_commit[..12.min(result.old_commit.len())],
+                        &result.new_commit[..12.min(result.new_commit.len())]
+                    );
+                }
+                None => {
+                    println!("  {name}: already up to date.");
+                }
+            }
+        }
+        None => {
+            // Update all marketplace skills
+            let names: Vec<String> = lock.skills.keys().cloned().collect();
+            println!("\n  Updating {} marketplace skill(s)...", names.len());
+
+            let mut updated = 0;
+            let mut up_to_date = 0;
+            let mut failed: Vec<(String, String)> = Vec::new();
+
+            for skill_name in &names {
+                match install::update_skill(agent_home, skills_dir, skill_name) {
+                    Ok(Some(result)) => {
+                        println!(
+                            "  {}: updated ({} -> {})",
+                            result.name,
+                            &result.old_commit[..12.min(result.old_commit.len())],
+                            &result.new_commit[..12.min(result.new_commit.len())]
+                        );
+                        updated += 1;
+                    }
+                    Ok(None) => {
+                        up_to_date += 1;
+                    }
+                    Err(e) => {
+                        println!("  {skill_name}: failed ({e})");
+                        failed.push((skill_name.clone(), e.to_string()));
+                    }
+                }
+            }
+
+            println!();
+            if updated > 0 {
+                println!("  Updated {updated} skill(s).");
+            }
+            if up_to_date > 0 {
+                println!("  {up_to_date} skill(s) already up to date.");
+            }
+            if !failed.is_empty() {
+                println!("  {} skill(s) failed to update.", failed.len());
+            }
+        }
+    }
+
+    println!();
     Ok(())
 }

@@ -133,6 +133,11 @@ pub fn is_bundled_skill(name: &str) -> bool {
 /// bundle are left in place.
 ///
 /// On first-time creation failure, the partially created directory is removed.
+///
+/// **Invariant:** Marketplace skills can never have the same name as a bundled
+/// skill. The `mika skills install` command refuses installation when a name
+/// collision with a bundled skill is detected. Therefore this function will
+/// never overwrite a marketplace-installed skill.
 pub fn seed_bundled_skills(skills_dir: &Path) {
     for skill in BUNDLED_SKILLS {
         let skill_dir = skills_dir.join(skill.name);

@@ -1,6 +1,6 @@
 mod cancel_reminder;
 mod create_reminder;
-mod create_skill;
+pub(crate) mod create_skill;
 mod delegate_task;
 mod delete_skill;
 mod get_config;

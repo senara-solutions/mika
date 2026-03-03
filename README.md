@@ -36,7 +36,7 @@ Each customer gets an isolated container with their own SQLite database. No cust
 
 - **Persistent memory** -- Core memory always in context, updated by the agent itself
 - **Structured knowledge** -- Tracks people, commitments, preferences, and events
-- **Skills system** -- Extensible filesystem-based tool registry (`~/.mika/skills/`)
+- **Skills system** -- Extensible filesystem-based tool registry with Git-based marketplace (`mika skills install`)
 - **Proactive heartbeat** -- Check-ins via silent agent loop with rate limiting
 - **Reminders** -- Time-based reminders with recovery on restart
 - **Conversation compaction** -- Automatic summarization of old messages
@@ -105,7 +105,7 @@ The agent has 8 builtin tools and 6 conditional management tools:
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (~745 tests)
+cargo test           # Run tests (~785 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI

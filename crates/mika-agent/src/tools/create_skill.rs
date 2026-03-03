@@ -12,7 +12,7 @@ use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
 pub struct CreateSkillTool;
 
 /// Maximum allowed length for skill name.
-pub(super) const MAX_SKILL_NAME_LEN: usize = 50;
+pub(crate) const MAX_SKILL_NAME_LEN: usize = 50;
 
 /// Maximum number of keywords per skill.
 pub(super) const MAX_KEYWORDS: usize = 50;
@@ -22,7 +22,7 @@ pub(super) const MAX_KEYWORD_LEN: usize = 100;
 
 /// Verify that a skill directory is actually inside the skills root.
 /// Guards against symlink attacks where a skill name resolves outside the expected directory.
-pub(super) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(), String> {
+pub(crate) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(), String> {
     match (skills_dir.canonicalize(), skill_dir.canonicalize()) {
         (Ok(parent), Ok(child)) if child.starts_with(&parent) => Ok(()),
         (Ok(_), Ok(_)) => {
@@ -78,7 +78,7 @@ pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
 }
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
-pub(super) fn validate_skill_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Skill name cannot be empty.".to_string());
     }

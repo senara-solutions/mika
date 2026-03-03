@@ -1,7 +1,10 @@
 pub mod builtin_handlers;
 pub mod executor;
+pub mod git;
 pub mod index;
+pub mod install;
 pub mod manifest;
+pub mod marketplace;
 pub mod matcher;
 
 use std::path::Path;
