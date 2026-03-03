@@ -44,6 +44,10 @@ impl Tool for UpdateFactTool {
                             }
                         },
                         "required": ["status"]
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
                     }
                 },
                 "required": ["id", "category", "updates"]
@@ -52,6 +56,11 @@ impl Tool for UpdateFactTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+        // Reflection mode: require evidence field
+        if let Some(err) = super::check_reflection_evidence(ctx, &input) {
+            return Ok(err);
+        }
+
         let category = input["category"].as_str().unwrap_or("");
         let id = input["id"].as_i64().unwrap_or(0);
 
@@ -116,6 +125,13 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
     // Log audit event with before_value
     let target = format!("commitment:{id}");
     let after = format!("status -> {status}");
+    let reasoning = if ctx.is_reflection {
+        input["evidence"]
+            .as_str()
+            .map(|e| format!("[evidence] {e}"))
+    } else {
+        None
+    };
     ctx.db
         .log_memory_event(
             ctx.session_id,
@@ -123,7 +139,7 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
             &target,
             before_status.as_deref(),
             &after,
-            None,
+            reasoning.as_deref(),
         )
         .await?;
 
@@ -229,6 +245,59 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid status"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_requires_evidence() {
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Test task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateFactTool;
+
+        // Without evidence → rejected
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "id": id,
+                    "category": "commitment",
+                    "updates": { "status": "completed" }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_with_evidence_succeeds() {
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Test task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateFactTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "id": id,
+                    "category": "commitment",
+                    "updates": { "status": "completed" },
+                    "evidence": "User said task was done at 15:00"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
     }
 
     #[tokio::test]

@@ -96,6 +96,10 @@ async fn init_agent(
         brave_api_key,
         skills_dirty: skills_dirty.clone(),
         agent_lock: Some(agent_lock.clone()),
+        reflection_config: {
+            let identity = crate::prompt::load_identity(agent_home);
+            identity.reflection
+        },
     });
 
     // Load MCP configuration and connect to configured servers
@@ -331,6 +335,7 @@ mod tests {
             brave_api_key: None,
             skills_dirty: skills_dirty.clone(),
             agent_lock: Some(agent_lock.clone()),
+            reflection_config: None,
         });
 
         let agent_state = AgentState {

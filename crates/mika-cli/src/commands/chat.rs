@@ -77,6 +77,7 @@ async fn spawn_agent_worker(
         brave_api_key: brave_api_key.clone(),
         skills_dirty: skills_dirty.clone(),
         agent_lock: None, // CLI serializes via channel, no lock needed
+        reflection_config: identity.reflection.clone(),
     });
     if let Err(e) = scheduler.recover().await {
         tracing::warn!(error = %e, "reminder recovery failed");

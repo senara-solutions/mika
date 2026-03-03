@@ -1,9 +1,42 @@
 use crate::db::{Commitment, CoreMemoryEntry, core_memory_section_names};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
+
+/// Configuration for periodic memory reflection.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReflectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_reflection_time")]
+    pub time: String,
+    #[serde(default)]
+    pub notify: bool,
+}
+
+fn default_reflection_time() -> String {
+    "20:00".to_string()
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time: default_reflection_time(),
+            notify: false,
+        }
+    }
+}
+
+impl ReflectionConfig {
+    /// Parse the configured time string (HH:MM format) into a NaiveTime.
+    /// Returns None if the format is invalid.
+    pub fn parse_time(&self) -> Option<NaiveTime> {
+        NaiveTime::parse_from_str(&self.time, "%H:%M").ok()
+    }
+}
 
 /// Agent identity loaded from ~/.mika/identity.toml.
 #[derive(Debug, Deserialize, Clone)]
@@ -12,6 +45,8 @@ pub struct Identity {
     pub name: String,
     #[serde(default = "default_emoji")]
     pub emoji: String,
+    #[serde(default)]
+    pub reflection: Option<ReflectionConfig>,
 }
 
 fn default_name() -> String {
@@ -27,6 +62,7 @@ impl Default for Identity {
         Self {
             name: default_name(),
             emoji: default_emoji(),
+            reflection: None,
         }
     }
 }
@@ -274,7 +310,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt
 }
 
-/// Context for building a silent mode (heartbeat/reminder) system prompt.
+/// Context for building a silent mode (heartbeat/reminder/reflection) system prompt.
 pub struct SilentPromptContext<'a> {
     pub soul_content: &'a str,
     pub identity: &'a Identity,
@@ -288,6 +324,10 @@ pub struct SilentPromptContext<'a> {
     /// Whether a message sender is available for outbound delivery.
     /// When false, the prompt omits instructions to use `send_message`.
     pub has_message_sender: bool,
+    /// Pre-formatted digest of today's conversations (reflection mode only).
+    pub recent_conversations: Option<&'a str>,
+    /// Pre-formatted digest of today's memory events (reflection mode only).
+    pub recent_memory_events: Option<&'a str>,
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -328,6 +368,20 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         );
     }
 
+    // Reflection context (today's conversations and memory events)
+    if let Some(conversations) = ctx.recent_conversations.filter(|c| !c.is_empty()) {
+        prompt.push_str("## Today's Conversations\n");
+        prompt.push_str("<conversations>\n");
+        prompt.push_str(conversations);
+        prompt.push_str("\n</conversations>\n\n");
+    }
+    if let Some(events) = ctx.recent_memory_events.filter(|e| !e.is_empty()) {
+        prompt.push_str("## Recent Memory Changes\n");
+        prompt.push_str("<memory-events>\n");
+        prompt.push_str(events);
+        prompt.push_str("\n</memory-events>\n\n");
+    }
+
     // Trigger-specific context
     prompt.push_str("## Trigger\n");
     prompt.push_str(ctx.trigger_context);
@@ -344,6 +398,7 @@ mod tests {
         Identity {
             name: "Mika".to_string(),
             emoji: "✦".to_string(),
+            reflection: None,
         }
     }
 
@@ -416,6 +471,7 @@ mod tests {
         let identity = Identity {
             name: "TestBot".to_string(),
             emoji: "🤖".to_string(),
+            reflection: None,
         };
         let ctx = PromptContext {
             soul_content: "",
@@ -528,6 +584,8 @@ mod tests {
             timezone: None,
             telegram_configured: false,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -550,6 +608,8 @@ mod tests {
             timezone: None,
             telegram_configured: false,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -580,6 +640,8 @@ mod tests {
             timezone: None,
             telegram_configured: false,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -703,6 +765,8 @@ mod tests {
             timezone: None,
             telegram_configured: false,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -724,6 +788,8 @@ mod tests {
             timezone: Some("-05:00".to_string()),
             telegram_configured: false,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -961,6 +1027,8 @@ max_iterations = 3
             timezone: None,
             telegram_configured: true,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -980,6 +1048,8 @@ max_iterations = 3
             timezone: None,
             telegram_configured: false,
             has_message_sender: true,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -999,6 +1069,8 @@ max_iterations = 3
             timezone: None,
             telegram_configured: false,
             has_message_sender: false,
+            recent_conversations: None,
+            recent_memory_events: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1006,5 +1078,127 @@ max_iterations = 3
         assert!(prompt.contains("NOT delivered"));
         assert!(!prompt.contains("Use the send_message tool"));
         assert!(prompt.contains("No outbound messaging channel is configured"));
+    }
+
+    #[test]
+    fn test_reflection_config_parse_time_valid() {
+        use chrono::Timelike;
+        let config = ReflectionConfig {
+            enabled: true,
+            time: "20:00".to_string(),
+            notify: false,
+        };
+        let time = config.parse_time().unwrap();
+        assert_eq!(time.hour(), 20);
+        assert_eq!(time.minute(), 0);
+    }
+
+    #[test]
+    fn test_reflection_config_parse_time_invalid() {
+        let config = ReflectionConfig {
+            enabled: true,
+            time: "25:00".to_string(),
+            notify: false,
+        };
+        assert!(config.parse_time().is_none());
+
+        let config2 = ReflectionConfig {
+            enabled: true,
+            time: "8pm".to_string(),
+            notify: false,
+        };
+        assert!(config2.parse_time().is_none());
+    }
+
+    #[test]
+    fn test_reflection_config_defaults() {
+        let config = ReflectionConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.time, "20:00");
+        assert!(!config.notify);
+    }
+
+    #[test]
+    fn test_load_identity_with_reflection_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            r#"
+name = "Mika"
+emoji = "✦"
+
+[reflection]
+enabled = true
+time = "21:30"
+notify = true
+"#,
+        )
+        .unwrap();
+
+        let identity = load_identity(tmp.path());
+        assert_eq!(identity.name, "Mika");
+        let reflection = identity.reflection.unwrap();
+        assert!(reflection.enabled);
+        assert_eq!(reflection.time, "21:30");
+        assert!(reflection.notify);
+    }
+
+    #[test]
+    fn test_load_identity_without_reflection_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
+
+        let identity = load_identity(tmp.path());
+        assert!(identity.reflection.is_none());
+    }
+
+    #[test]
+    fn test_silent_prompt_includes_reflection_context() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Reflection mode.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: false,
+            recent_conversations: Some("User discussed Series A fundraise with Alice."),
+            recent_memory_events: Some("update_core_memory: current_priorities -> fundraise"),
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("## Today's Conversations"));
+        assert!(prompt.contains("Series A fundraise"));
+        assert!(prompt.contains("## Recent Memory Changes"));
+        assert!(prompt.contains("current_priorities"));
+    }
+
+    #[test]
+    fn test_silent_prompt_omits_empty_reflection_context() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Reflection mode.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: false,
+            recent_conversations: None,
+            recent_memory_events: None,
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(!prompt.contains("## Today's Conversations"));
+        assert!(!prompt.contains("## Recent Memory Changes"));
     }
 }

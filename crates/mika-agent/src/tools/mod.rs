@@ -53,6 +53,9 @@ pub struct ToolContext<'a> {
     /// The agent loop coordinator checks this before each turn and rebuilds the
     /// SkillRegistry if set, enabling hot-reload without restart.
     pub skills_dirty: &'a AtomicBool,
+    /// True when running in reflection mode (daily memory review).
+    /// Memory tools require an `evidence` field and use a higher edit cap.
+    pub is_reflection: bool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
@@ -158,6 +161,23 @@ pub(crate) async fn index_fact(
             }
         }
     }
+}
+
+/// Check that the `evidence` field is present and non-empty when running in reflection mode.
+/// Returns `Some(ToolOutput::error(...))` if evidence is missing, `None` if valid.
+pub(crate) fn check_reflection_evidence(
+    ctx: &ToolContext<'_>,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    if ctx.is_reflection {
+        let evidence = input["evidence"].as_str().unwrap_or("").trim();
+        if evidence.is_empty() {
+            return Some(ToolOutput::error(
+                "Reflection mode requires an evidence field citing specific conversation content.",
+            ));
+        }
+    }
+    None
 }
 
 /// Registry of available tools.

@@ -23,7 +23,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -142,6 +142,9 @@ impl Database {
         }
         if version < 9 {
             self.migrate_v9()?;
+        }
+        if version < 10 {
+            self.migrate_v10()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -454,6 +457,36 @@ impl Database {
             ",
             )
             .context("failed to apply migration v9")?;
+
+        Ok(())
+    }
+
+    fn migrate_v10(&self) -> Result<()> {
+        info!("applying migration v10: reflection_runs table for periodic memory reflection");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS reflection_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ran_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'completed',
+                changes_made INTEGER DEFAULT 0,
+                summary TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_reflection_runs_ran_at ON reflection_runs(ran_at);
+
+            CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
+
+            INSERT INTO schema_version (version) VALUES (10);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v10")?;
 
         Ok(())
     }
@@ -1012,29 +1045,9 @@ impl Database {
     /// Computes the local start-of-day boundary using chrono-tz, then counts
     /// sends with `sent_at >= local_midnight_utc`.
     pub fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
-        use chrono::{Datelike, NaiveDate, Utc};
-        use chrono_tz::Tz;
-
-        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-
-        // Current time in the customer's timezone
-        let now_local = Utc::now().with_timezone(&tz);
-        // Start of today in customer's local time
-        let local_midnight =
-            NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
-                .unwrap_or_else(|| Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid");
-
-        // Convert local midnight back to UTC for SQL comparison
-        // Use the earliest possible time if ambiguous (e.g., DST transitions)
-        let midnight_utc = local_midnight
-            .and_local_timezone(tz)
-            .earliest()
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let boundary = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+        let boundary = today_midnight_utc(timezone)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         let count: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= ?1",
@@ -1056,6 +1069,134 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+}
+
+/// Compute today's midnight in the given timezone, converted to UTC.
+///
+/// Falls back to UTC if the timezone string is invalid. Handles DST
+/// ambiguity by choosing the earliest possible time.
+pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{Datelike, NaiveDate, Utc};
+    use chrono_tz::Tz;
+
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    let now_local = Utc::now().with_timezone(&tz);
+    let local_midnight =
+        NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
+            .unwrap_or_else(|| Utc::now().date_naive())
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid");
+
+    local_midnight
+        .and_local_timezone(tz)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now)
+}
+
+impl Database {
+    // -- Reflection --
+
+    /// Get conversation messages since a given UTC boundary timestamp.
+    /// Excludes reflection channel messages to avoid self-referential loops.
+    pub fn get_conversations_since(&self, since_utc: &str) -> Result<Vec<ConversationMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, channel_type, metadata, created_at
+             FROM conversations
+             WHERE created_at >= ?1
+               AND channel_type != 'reflection'
+             ORDER BY id
+             LIMIT 500",
+        )?;
+
+        let messages: Vec<ConversationMessage> = stmt
+            .query_map([since_utc], |row| {
+                Ok(ConversationMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    channel_type: row.get(3)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(messages)
+    }
+
+    /// Get memory events since a given UTC boundary timestamp.
+    pub fn get_memory_events_since(&self, since_utc: &str) -> Result<Vec<MemoryEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning, created_at
+             FROM memory_events
+             WHERE created_at >= ?1
+             ORDER BY id",
+        )?;
+
+        let events: Vec<MemoryEvent> = stmt
+            .query_map([since_utc], |row| {
+                Ok(MemoryEvent {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    target_key: row.get(3)?,
+                    before_value: row.get(4)?,
+                    after_value: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(events)
+    }
+
+    /// Delete reflection runs older than `days` days.
+    pub fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86_400);
+        let deleted = self
+            .conn
+            .execute("DELETE FROM reflection_runs WHERE ran_at < ?1", [cutoff])?;
+        Ok(deleted)
+    }
+
+    /// Record a reflection run for rate limiting and audit.
+    pub fn record_reflection_run(
+        &self,
+        status: &str,
+        changes_made: i64,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let now_unix = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO reflection_runs (ran_at, status, changes_made, summary) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![now_unix, status, changes_made, summary],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a reflection has already run today (any status) in the user's timezone.
+    pub fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
+        let midnight_unix = today_midnight_utc(timezone).timestamp();
+
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reflection_runs WHERE ran_at >= ?1",
+            [midnight_unix],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Count memory events for a given session (used to count reflection changes).
+    pub fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     // -- Failed Sends --
@@ -2124,7 +2265,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -2137,7 +2278,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -3370,5 +3511,146 @@ mod tests {
             configs[1],
             ("timezone".to_string(), "Asia/Singapore".to_string())
         );
+    }
+
+    // -- Reflection --
+
+    #[test]
+    fn test_v10_reflection_runs_table_exists() {
+        let db = test_db();
+        // Table should exist after migration
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM reflection_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_record_and_check_reflection_run() {
+        let db = test_db();
+        db.record_reflection_run("completed", 3, Some("Promoted 2 facts, pruned 1"))
+            .unwrap();
+
+        let ran = db.last_reflection_run_today("UTC").unwrap();
+        assert!(ran, "should detect today's reflection run");
+    }
+
+    #[test]
+    fn test_last_reflection_run_today_none() {
+        let db = test_db();
+        let ran = db.last_reflection_run_today("UTC").unwrap();
+        assert!(!ran, "should return false when no reflection has run");
+    }
+
+    #[test]
+    fn test_last_reflection_run_today_with_timezone() {
+        let db = test_db();
+        db.record_reflection_run("completed", 1, None).unwrap();
+
+        // Should still be "today" regardless of timezone (just ran)
+        let ran = db.last_reflection_run_today("America/New_York").unwrap();
+        assert!(ran);
+
+        let ran = db.last_reflection_run_today("Asia/Tokyo").unwrap();
+        assert!(ran);
+    }
+
+    #[test]
+    fn test_last_reflection_run_today_invalid_tz_fallback() {
+        let db = test_db();
+        db.record_reflection_run("completed", 0, None).unwrap();
+
+        // Invalid timezone should fall back to UTC
+        let ran = db.last_reflection_run_today("Invalid/Zone").unwrap();
+        assert!(ran);
+    }
+
+    #[test]
+    fn test_get_conversations_since() {
+        let db = test_db();
+        db.save_message("user", "Hello", "cli").unwrap();
+        db.save_message("assistant", "Hi!", "cli").unwrap();
+        db.save_message("user", "Reflection msg", "reflection")
+            .unwrap();
+
+        // Use a past timestamp to get all messages
+        let msgs = db.get_conversations_since("2020-01-01 00:00:00").unwrap();
+        assert_eq!(msgs.len(), 2, "should exclude reflection channel_type");
+        assert_eq!(msgs[0].content, "Hello");
+        assert_eq!(msgs[1].content, "Hi!");
+    }
+
+    #[test]
+    fn test_get_conversations_since_future_returns_empty() {
+        let db = test_db();
+        db.save_message("user", "Hello", "cli").unwrap();
+
+        let msgs = db.get_conversations_since("2099-01-01 00:00:00").unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_get_memory_events_since() {
+        let db = test_db();
+        db.log_memory_event(
+            "s1",
+            "update_core_memory",
+            "user_summary",
+            None,
+            "Updated",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event(
+            "s1",
+            "store_fact",
+            "pref:coffee",
+            None,
+            "Likes coffee",
+            None,
+        )
+        .unwrap();
+
+        let events = db.get_memory_events_since("2020-01-01 00:00:00").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "update_core_memory");
+        assert_eq!(events[1].tool_name, "store_fact");
+    }
+
+    #[test]
+    fn test_count_memory_events_for_session() {
+        let db = test_db();
+        db.log_memory_event(
+            "reflection-2026-03-03",
+            "update_core_memory",
+            "user_summary",
+            None,
+            "v1",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event(
+            "reflection-2026-03-03",
+            "store_fact",
+            "pref:x",
+            None,
+            "v2",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event("other-session", "store_fact", "pref:y", None, "v3", None)
+            .unwrap();
+
+        let count = db
+            .count_memory_events_for_session("reflection-2026-03-03")
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let count = db.count_memory_events_for_session("other-session").unwrap();
+        assert_eq!(count, 1);
+
+        let count = db.count_memory_events_for_session("nonexistent").unwrap();
+        assert_eq!(count, 0);
     }
 }
