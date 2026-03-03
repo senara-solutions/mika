@@ -52,6 +52,16 @@ impl Tool for UpdateFactTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+        // Reflection mode: require evidence field
+        if ctx.is_reflection {
+            let evidence = input["evidence"].as_str().unwrap_or("").trim();
+            if evidence.is_empty() {
+                return Ok(ToolOutput::error(
+                    "Reflection mode requires an evidence field citing specific conversation content.",
+                ));
+            }
+        }
+
         let category = input["category"].as_str().unwrap_or("");
         let id = input["id"].as_i64().unwrap_or(0);
 
@@ -229,6 +239,59 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid status"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_requires_evidence() {
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Test task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateFactTool;
+
+        // Without evidence → rejected
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "id": id,
+                    "category": "commitment",
+                    "updates": { "status": "completed" }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_with_evidence_succeeds() {
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .add_commitment("Test task", None, None)
+            .await
+            .unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateFactTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "id": id,
+                    "category": "commitment",
+                    "updates": { "status": "completed" },
+                    "evidence": "User said task was done at 15:00"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
     }
 
     #[tokio::test]

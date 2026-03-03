@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{Datelike, Timelike};
 use mika_common::claude::ClaudeClient;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,6 +129,42 @@ impl ReminderScheduler {
             }
             Err(e) => warn!(error = %e, "failed to check search content count"),
             _ => {} // index already populated
+        }
+
+        // Check for missed reflection (if enabled, past time, no record, within 4h window)
+        {
+            let identity = crate::prompt::load_identity_async(&self.home_dir).await;
+            if let Some(config) = identity
+                .reflection
+                .as_ref()
+                .filter(|c| c.enabled)
+                .and_then(|c| c.parse_time().map(|t| (c, t)))
+            {
+                let (_, configured_time) = config;
+                let tz_str = self
+                    .db
+                    .get_customer_config("timezone")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "UTC".to_string());
+                let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+                let now_local = chrono::Utc::now().with_timezone(&tz);
+
+                let current_minutes = now_local.hour() as i32 * 60 + now_local.minute() as i32;
+                let configured_minutes =
+                    configured_time.hour() as i32 * 60 + configured_time.minute() as i32;
+                let elapsed_minutes = current_minutes - configured_minutes;
+
+                // Past configured time and within 4-hour window
+                if elapsed_minutes > 0
+                    && elapsed_minutes <= 240
+                    && matches!(self.db.last_reflection_run_today(&tz_str).await, Ok(false))
+                {
+                    info!("missed reflection detected on startup, firing now");
+                    self.check_and_fire_reflection().await;
+                }
+            }
         }
 
         let past_due = self.db.get_past_due_reminders().await?;
@@ -283,6 +320,141 @@ impl ReminderScheduler {
         }
     }
 
+    /// Check if it's time to run the daily reflection and fire it.
+    ///
+    /// Pre-filter checks (in order):
+    /// 1. Reflection enabled in identity.toml
+    /// 2. Past configured local time
+    /// 3. Not already run today
+    /// 4. User not active within 30 minutes
+    /// 5. Conversations exist today
+    /// 6. Agent lock available (server mode)
+    async fn check_and_fire_reflection(&self) {
+        // 1. Load identity, check reflection.enabled
+        let identity = crate::prompt::load_identity_async(&self.home_dir).await;
+        let config = match identity.reflection {
+            Some(ref c) if c.enabled => c,
+            _ => return,
+        };
+
+        // 2. Parse configured time
+        let time = match config.parse_time() {
+            Some(t) => t,
+            None => return, // invalid time, warning logged at startup
+        };
+
+        // 3. Get user timezone, compute current local time
+        let tz_str = self
+            .db
+            .get_customer_config("timezone")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "UTC".to_string());
+        let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+        let now_local = chrono::Utc::now().with_timezone(&tz);
+
+        // Check if it's past the configured time
+        if now_local.hour() < time.hour() as u32
+            || (now_local.hour() == time.hour() as u32 && now_local.minute() < time.minute() as u32)
+        {
+            return;
+        }
+
+        // 4. Check if already ran today
+        match self.db.last_reflection_run_today(&tz_str).await {
+            Ok(true) => return,
+            Err(e) => {
+                warn!(error = %e, "failed to check last reflection run");
+                return;
+            }
+            _ => {}
+        }
+
+        // 5. Check recent user activity (defer if within 30 min)
+        if let Ok(Some(last_msg_time)) = self.db.last_user_message_time().await {
+            let parsed = chrono::DateTime::parse_from_rfc3339(&last_msg_time).or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&last_msg_time, "%Y-%m-%d %H:%M:%S")
+                    .map(|ndt| ndt.and_local_timezone(chrono::Utc).unwrap().fixed_offset())
+            });
+            if let Ok(last_msg) = parsed {
+                let elapsed = chrono::Utc::now().signed_duration_since(last_msg);
+                if elapsed < chrono::TimeDelta::minutes(30) {
+                    debug!("user active within 30 min, deferring reflection");
+                    return;
+                }
+            }
+        }
+
+        // 6. Check conversation volume (skip if no activity today)
+        let local_midnight =
+            chrono::NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
+                .unwrap_or_else(|| chrono::Utc::now().date_naive())
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is always valid");
+
+        let midnight_utc = local_midnight
+            .and_local_timezone(tz)
+            .earliest()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(chrono::Utc::now);
+
+        let midnight_str = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let conversations = match self.db.get_conversations_since(&midnight_str).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "failed to query conversations for reflection");
+                return;
+            }
+        };
+
+        if conversations.is_empty() {
+            debug!("no conversations today, skipping reflection");
+            return;
+        }
+
+        // 7. Acquire agent lock (server mode)
+        let _guard = if let Some(ref lock) = self.agent_lock {
+            match lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    debug!("agent busy, deferring reflection to next cycle");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // 8. Fire reflection
+        let today_str = now_local.format("%Y-%m-%d").to_string();
+        let session_id = format!("reflection-{today_str}");
+        info!(session_id = %session_id, "firing daily reflection");
+
+        let params = SilentAgentParams {
+            db: &self.db,
+            claude: &self.claude,
+            tools: &self.tools,
+            skills: &self.skills,
+            trigger: SilentTrigger::Reflection,
+            home_dir: &self.home_dir,
+            session_id: &session_id,
+            message_sender: self.message_sender.clone(),
+            embedding_client: self.embedding_client.as_ref(),
+            brave_api_key: self.brave_api_key.as_deref(),
+            skills_dirty: &self.skills_dirty,
+        };
+
+        if let Err(e) = run_silent_agent(&params).await {
+            warn!(error = %e, "reflection run failed");
+            let _ = self
+                .db
+                .record_reflection_run("failed", 0, Some(&e.to_string()))
+                .await;
+        }
+    }
+
     /// Spawn a background task that polls for due reminders every 60 seconds.
     ///
     /// Uses `MissedTickBehavior::Skip` to prevent burst-firing after a slow
@@ -297,6 +469,7 @@ impl ReminderScheduler {
             loop {
                 interval.tick().await;
                 self.check_and_fire_reminders().await;
+                self.check_and_fire_reflection().await;
             }
         })
     }

@@ -485,6 +485,44 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_memory_events(&s)).await
     }
 
+    // -- Reflection --
+
+    pub async fn get_conversations_since(
+        &self,
+        since_utc: &str,
+    ) -> Result<Vec<ConversationMessage>> {
+        let s = since_utc.to_owned();
+        self.with_db(move |db| db.get_conversations_since(&s)).await
+    }
+
+    pub async fn get_memory_events_since(&self, since_utc: &str) -> Result<Vec<MemoryEvent>> {
+        let s = since_utc.to_owned();
+        self.with_db(move |db| db.get_memory_events_since(&s)).await
+    }
+
+    pub async fn record_reflection_run(
+        &self,
+        status: &str,
+        changes_made: i64,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let (st, su) = (status.to_owned(), summary.map(|s| s.to_owned()));
+        self.with_db(move |db| db.record_reflection_run(&st, changes_made, su.as_deref()))
+            .await
+    }
+
+    pub async fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
+        let tz = timezone.to_owned();
+        self.with_db(move |db| db.last_reflection_run_today(&tz))
+            .await
+    }
+
+    pub async fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
+        let s = session_id.to_owned();
+        self.with_db(move |db| db.count_memory_events_for_session(&s))
+            .await
+    }
+
     // -- Layer 3: Search Indexing --
 
     pub async fn index_content(

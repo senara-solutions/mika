@@ -44,6 +44,7 @@ pub mod test_helpers {
             embedding_client: None,
             brave_api_key: None,
             skills_dirty: &SKILLS_DIRTY,
+            is_reflection: false,
         }
     }
 
@@ -79,6 +80,23 @@ pub mod test_helpers {
             test_ctx_with_onboarding(&self.db, &self.counter, is_onboarding)
         }
 
+        /// Create a ToolContext in reflection mode.
+        pub fn ctx_with_reflection(&self) -> ToolContext<'_> {
+            static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+            ToolContext {
+                db: &self.db,
+                session_id: "test-session",
+                home_dir: std::path::Path::new("/tmp/mika-test"),
+                core_memory_edit_count: &self.counter,
+                is_onboarding: false,
+                message_sender: None,
+                embedding_client: None,
+                brave_api_key: None,
+                skills_dirty: &SKILLS_DIRTY,
+                is_reflection: true,
+            }
+        }
+
         /// Create a ToolContext with a custom home directory.
         pub fn ctx_with_home<'a>(&'a self, home: &'a std::path::Path) -> ToolContext<'a> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -92,6 +110,7 @@ pub mod test_helpers {
                 embedding_client: None,
                 brave_api_key: None,
                 skills_dirty: &SKILLS_DIRTY,
+                is_reflection: false,
             }
         }
     }

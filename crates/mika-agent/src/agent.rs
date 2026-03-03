@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Datelike;
 use mika_common::claude::{
     ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, StopReason,
     ToolResultBlock, ToolResultBody,
@@ -664,6 +665,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
+        is_reflection: false,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -976,6 +978,7 @@ async fn execute_tool(
 pub enum SilentTrigger {
     Heartbeat,
     Reminder { id: i64, message: String },
+    Reflection,
 }
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
@@ -1003,6 +1006,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     let channel_type = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reminder { .. } => "reminder",
+        SilentTrigger::Reflection => "reflection",
     };
 
     let timeout_result = tokio::time::timeout(
@@ -1030,6 +1034,13 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
             if let SilentTrigger::Reminder { id, .. } = &params.trigger {
                 params.db.mark_reminder_failed(*id).await?;
             }
+            // Record failed reflection run on timeout
+            if matches!(&params.trigger, SilentTrigger::Reflection) {
+                let _ = params
+                    .db
+                    .record_reflection_run("failed", 0, Some("Timed out"))
+                    .await;
+            }
             Ok(())
         }
     }
@@ -1042,6 +1053,75 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
 
     let ctx = load_agent_context(db, params.home_dir).await?;
     let pending_commitments = db.list_commitments("pending").await?;
+
+    // For reflection, prepare conversation and memory event digests
+    let (conversations_digest, memory_events_digest) =
+        if matches!(&params.trigger, SilentTrigger::Reflection) {
+            let tz_str = db
+                .get_customer_config("timezone")
+                .await?
+                .unwrap_or_else(|| "UTC".to_string());
+            let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+            let now_local = chrono::Utc::now().with_timezone(&tz);
+
+            // Compute midnight in user's timezone, convert to UTC
+            let local_midnight = chrono::NaiveDate::from_ymd_opt(
+                now_local.year(),
+                now_local.month(),
+                now_local.day(),
+            )
+            .unwrap_or_else(|| chrono::Utc::now().date_naive())
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid");
+
+            let midnight_utc = local_midnight
+                .and_local_timezone(tz)
+                .earliest()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+
+            let midnight_str = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+
+            // Load today's conversations (capped at 50,000 chars)
+            let conversations = db.get_conversations_since(&midnight_str).await?;
+            let conv_digest = if conversations.is_empty() {
+                None
+            } else {
+                let mut buf = String::new();
+                for msg in &conversations {
+                    let line = format!("[{}] {}: {}\n", msg.created_at, msg.role, msg.content);
+                    if buf.len() + line.len() > 50_000 {
+                        buf.push_str("... (truncated)\n");
+                        break;
+                    }
+                    buf.push_str(&line);
+                }
+                Some(buf)
+            };
+
+            // Load today's memory events
+            let memory_events = db.get_memory_events_since(&midnight_str).await?;
+            let mem_digest = if memory_events.is_empty() {
+                None
+            } else {
+                let mut buf = String::new();
+                for evt in &memory_events {
+                    buf.push_str(&format!(
+                        "[{}] {} on {}: {} -> {}\n",
+                        evt.created_at,
+                        evt.tool_name,
+                        evt.target_key,
+                        evt.before_value.as_deref().unwrap_or("(none)"),
+                        evt.after_value
+                    ));
+                }
+                Some(buf)
+            };
+
+            (conv_digest, mem_digest)
+        } else {
+            (None, None)
+        };
 
     let trigger_context = match &params.trigger {
         SilentTrigger::Heartbeat => {
@@ -1057,6 +1137,26 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                  Deliver this reminder using send_message, adding any relevant context."
             )
         }
+        SilentTrigger::Reflection => {
+            "You are in REFLECTION mode. This is your daily end-of-day review.\n\n\
+             Your job: Review today's conversations and recently stored facts. Update your\n\
+             memory to better serve the user tomorrow.\n\n\
+             ## What to do\n\n\
+             1. HOUSEKEEPING: Scan for duplicate or redundant facts. Consolidate them.\n\
+                Remove stale information that's no longer relevant.\n\n\
+             2. PROMOTION: If important patterns in Layer 2 facts deserve a place in core\n\
+                memory, promote them. Core memory is precious (2000 tokens) — only promote\n\
+                information that will be useful in most future conversations.\n\n\
+             3. INSIGHT: Look for themes across today's conversations. Has the user's\n\
+                focus shifted? Are there emerging priorities? New people becoming important?\n\n\
+             ## Rules\n\n\
+             - Only update based on things the user EXPLICITLY said or did\n\
+             - Never infer preferences from a single data point\n\
+             - The evidence field MUST cite a specific conversation timestamp and quote\n\
+             - If unsure whether to update, DON'T — you can learn it more clearly tomorrow\n\
+             - Prioritize: you have a maximum of 5 memory edits this session"
+                .to_string()
+        }
     };
 
     let chat_id = db.get_customer_config("chat_id").await?;
@@ -1070,6 +1170,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         timezone: ctx.timezone,
         telegram_configured: chat_id.is_some(),
         has_message_sender: params.message_sender.is_some(),
+        recent_conversations: conversations_digest.as_deref(),
+        recent_memory_events: memory_events_digest.as_deref(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -1081,10 +1183,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         system.push_str("\n</context>\n");
     }
 
-    // Match skills: heartbeat uses safe always-on skills (no exec/http handlers),
+    // Match skills: heartbeat/reflection use safe always-on skills (no exec/http handlers),
     // reminders use keyword matching against the reminder message.
     let matched = match &params.trigger {
-        SilentTrigger::Heartbeat => params.skills.safe_always_on_skills(),
+        SilentTrigger::Heartbeat | SilentTrigger::Reflection => {
+            params.skills.safe_always_on_skills()
+        }
         SilentTrigger::Reminder { message, .. } => params.skills.match_message(message),
     };
     let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
@@ -1097,6 +1201,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         SilentTrigger::Reminder { message, .. } => {
             format!("[reminder trigger: <reminder-data>{message}</reminder-data>]")
         }
+        SilentTrigger::Reflection => "[reflection trigger]".to_string(),
     };
 
     let messages = vec![Message {
@@ -1104,6 +1209,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         content: MessageContent::Text(user_msg),
     }];
 
+    let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
@@ -1115,6 +1221,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
+        is_reflection,
     };
 
     let mut request = MessagesRequest {
@@ -1143,6 +1250,47 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         None, // MCP tools excluded from silent mode
     )
     .await?;
+
+    // Post-loop: record reflection results and optionally notify user
+    if is_reflection {
+        let changes = db
+            .count_memory_events_for_session(params.session_id)
+            .await
+            .unwrap_or(0);
+
+        // Build summary from memory events
+        let summary = if changes > 0 {
+            let events = db.get_memory_events(params.session_id).await?;
+            let lines: Vec<String> = events
+                .iter()
+                .map(|e| format!("  - {} on {}", e.tool_name, e.target_key))
+                .collect();
+            Some(format!(
+                "Daily reflection — {changes} update{}:\n{}",
+                if changes == 1 { "" } else { "s" },
+                lines.join("\n")
+            ))
+        } else {
+            None
+        };
+
+        db.record_reflection_run("completed", changes, summary.as_deref())
+            .await?;
+
+        // Opt-in notification: send summary if configured and changes were made
+        if let Some(ref summary_text) = summary {
+            let should_notify = ctx.identity.reflection.as_ref().is_some_and(|r| r.notify);
+            if let (true, Some(sender)) = (should_notify, &params.message_sender) {
+                let _ = sender.send(summary_text).await;
+            }
+        }
+
+        info!(
+            changes = changes,
+            session_id = params.session_id,
+            "reflection completed"
+        );
+    }
 
     Ok(())
 }
@@ -1249,6 +1397,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
+        is_reflection: false,
     };
 
     let mut request = MessagesRequest {

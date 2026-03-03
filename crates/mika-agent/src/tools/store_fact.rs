@@ -64,6 +64,16 @@ impl Tool for StoreFactTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+        // Reflection mode: require evidence field
+        if ctx.is_reflection {
+            let evidence = input["evidence"].as_str().unwrap_or("").trim();
+            if evidence.is_empty() {
+                return Ok(ToolOutput::error(
+                    "Reflection mode requires an evidence field citing specific conversation content.",
+                ));
+            }
+        }
+
         let category = input["category"].as_str().unwrap_or("");
 
         match category {
@@ -377,6 +387,48 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "store_fact");
         assert!(events[0].target_key.starts_with("person:"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_requires_evidence() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_reflection();
+        let tool = StoreFactTool;
+
+        // Without evidence → rejected
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "category": "person",
+                    "name": "Alice"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_with_evidence_succeeds() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_reflection();
+        let tool = StoreFactTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "category": "person",
+                    "name": "Alice",
+                    "relationship": "CTO",
+                    "evidence": "User mentioned Alice as CTO in 3 conversations"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
     }
 
     #[tokio::test]

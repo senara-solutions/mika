@@ -53,6 +53,9 @@ pub struct ToolContext<'a> {
     /// The agent loop coordinator checks this before each turn and rebuilds the
     /// SkillRegistry if set, enabling hot-reload without restart.
     pub skills_dirty: &'a AtomicBool,
+    /// True when running in reflection mode (daily memory review).
+    /// Memory tools require an `evidence` field and use a higher edit cap.
+    pub is_reflection: bool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
