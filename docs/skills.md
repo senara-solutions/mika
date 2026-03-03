@@ -363,6 +363,105 @@ These skills provide only system prompt guidance — they have no tools of their
 
 ---
 
+## Marketplace (Installing Community Skills)
+
+Mika supports installing skills from Git repositories. This lets the community share skills without any central infrastructure — just push a skill to a Git repo and share the URL.
+
+### Installing a Skill
+
+```bash
+# From GitHub shorthand
+mika skills install user/repo
+
+# From full URL
+mika skills install https://github.com/user/mika-skill-weather.git
+
+# Install under a different name (alias)
+mika skills install user/repo --name my-weather
+```
+
+The install process:
+1. Clones the repository (shallow clone)
+2. Scans for `skill.toml` files (up to 2 levels deep)
+3. If multiple skills found, presents an interactive picker
+4. Validates the manifest and checks for name collisions
+5. Copies the skill directory into `~/.mika/skills/<name>/`
+6. Records the installation in `marketplace.lock`
+
+Skills with exec handlers show a security warning at install time.
+
+### Updating Skills
+
+```bash
+# Update a specific skill
+mika skills update weather
+
+# Update all marketplace skills
+mika skills update
+```
+
+Updates re-clone the source repo and replace the installed skill with the latest version. The lock file is updated with the new commit hash.
+
+### Uninstalling Skills
+
+```bash
+mika skills uninstall weather
+```
+
+This removes the skill directory and its lock file entry. Built-in skills cannot be uninstalled (use `mika skills disable` instead).
+
+### Skill Origins
+
+Skills have three possible origins, shown in `list_skills` output:
+
+- **[built-in]** — Bundled with Mika, re-synced on startup
+- **[marketplace]** — Installed from a Git repository via `mika skills install`
+- **[custom]** — Created locally via `mika skills create` or manually
+
+### Publishing Skills
+
+To publish a Mika skill, create a Git repository with this structure:
+
+**Single-skill repo** (skill.toml at the root):
+```
+mika-skill-weather/
+  skill.toml
+  system_prompt.md
+  tools.json
+  handlers/
+    run.sh
+  README.md
+```
+
+**Multi-skill repo** (multiple skill directories):
+```
+mika-skills-collection/
+  weather/
+    skill.toml
+    system_prompt.md
+  news/
+    skill.toml
+    tools.json
+  README.md
+```
+
+The installer scans up to 2 directory levels for `skill.toml` files. Ensure your skill names are valid (alphanumeric, hyphens, underscores only) and don't collide with built-in skill names.
+
+### Lock File
+
+Marketplace installations are tracked in `~/.mika/agents/<agent>/marketplace.lock`:
+
+```toml
+[skills.weather]
+url = "https://github.com/user/mika-skill-weather.git"
+path = "."
+commit = "abc123def456"
+installed_at = "2026-03-02T10:30:00Z"
+updated_at = "2026-03-02T10:30:00Z"
+```
+
+---
+
 ## Creating a Custom Skill
 
 This walkthrough creates an exec-based skill that converts between time zones using a shell script.
