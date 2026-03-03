@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use mika_common::claude::ToolDefinition;
 use mika_common::team;
 use serde_json::Value;
@@ -8,18 +7,12 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::async_db::AsyncDatabase;
-use crate::db::Database;
+use crate::db::{Database, format_unix_ts};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct GetTeamHistoryTool {
     pub home_dir: PathBuf,
-}
-
-fn format_ts(ts: i64) -> String {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| ts.to_string())
 }
 
 #[async_trait]
@@ -113,7 +106,7 @@ impl Tool for GetTeamHistoryTool {
         for run in &runs {
             let ended = run
                 .ended_at
-                .map(format_ts)
+                .map(format_unix_ts)
                 .unwrap_or_else(|| "in progress".to_string());
             writeln!(
                 out,
@@ -121,7 +114,7 @@ impl Tool for GetTeamHistoryTool {
                 run.id,
                 run.status,
                 run.goal,
-                format_ts(run.started_at),
+                format_unix_ts(run.started_at),
                 ended
             )
             .unwrap();

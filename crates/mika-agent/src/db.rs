@@ -621,6 +621,34 @@ impl Database {
         Ok(runs.pop())
     }
 
+    /// Load a specific team run by its ID.
+    pub fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
+                    deliverable, started_at, ended_at
+             FROM team_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([run_id], |row| {
+            Ok(TeamRunRow {
+                id: row.get(0)?,
+                team_name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                failure_reason: row.get(4)?,
+                iteration: row.get(5)?,
+                max_iterations: row.get(6)?,
+                deliverable: row.get(7)?,
+                started_at: row.get(8)?,
+                ended_at: row.get(9)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     // -- Team Messages --
 
     /// Insert a team message and return its id.
@@ -2332,6 +2360,13 @@ pub struct ConversationMessage {
     pub channel_type: String,
     pub metadata: Option<String>,
     pub created_at: String,
+}
+
+/// Format a Unix timestamp as an ISO 8601 UTC string.
+pub fn format_unix_ts(ts: i64) -> String {
+    DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|dt: DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 /// A row from the `team_runs` table.

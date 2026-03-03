@@ -67,12 +67,6 @@ impl AsyncDatabase {
         Ok(Self::new(db))
     }
 
-    /// Create an in-memory database (primarily for tests; team mode now uses on-disk DB).
-    pub fn in_memory() -> Self {
-        let db = Database::open_in_memory().expect("failed to open in-memory SQLite");
-        Self::new(db)
-    }
-
     /// Gracefully shut down the database thread.
     ///
     /// Drops the internal sender (so the thread's `recv()` loop exits)
@@ -634,6 +628,11 @@ impl AsyncDatabase {
     pub async fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
         let tn = team_name.to_owned();
         self.with_db(move |db| db.load_latest_team_run(&tn)).await
+    }
+
+    pub async fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.load_team_run_by_id(&ri)).await
     }
 
     // -- Team Messages --

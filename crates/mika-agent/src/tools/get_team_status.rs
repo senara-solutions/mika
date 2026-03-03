@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use mika_common::claude::ToolDefinition;
 use mika_common::team;
 use serde_json::Value;
@@ -8,18 +7,12 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::async_db::AsyncDatabase;
-use crate::db::{Database, TeamRunRow};
+use crate::db::{Database, TeamRunRow, format_unix_ts};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct GetTeamStatusTool {
     pub home_dir: PathBuf,
-}
-
-fn format_ts(ts: i64) -> String {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| ts.to_string())
 }
 
 #[async_trait]
@@ -92,13 +85,12 @@ impl Tool for GetTeamStatusTool {
         };
 
         let run: Option<TeamRunRow> = if let Some(target_id) = run_id_filter {
-            // Find specific run by ID — load recent runs and filter
-            match team_db.load_team_runs(team_name, 100).await {
-                Ok(runs) => runs.into_iter().find(|r| r.id == target_id),
+            match team_db.load_team_run_by_id(target_id).await {
+                Ok(run) => run,
                 Err(e) => {
                     team_db.shutdown();
                     return Ok(ToolOutput::error(format!(
-                        "Failed to load runs for team '{team_name}': {e}"
+                        "Failed to load run '{target_id}' for team '{team_name}': {e}"
                     )));
                 }
             }
@@ -127,9 +119,9 @@ impl Tool for GetTeamStatusTool {
         writeln!(out, "Status: {}", run.status).unwrap();
         writeln!(out, "Goal: {}", run.goal).unwrap();
         writeln!(out, "Iteration: {}/{}", run.iteration, run.max_iterations).unwrap();
-        writeln!(out, "Started: {}", format_ts(run.started_at)).unwrap();
+        writeln!(out, "Started: {}", format_unix_ts(run.started_at)).unwrap();
         if let Some(ended) = run.ended_at {
-            writeln!(out, "Ended: {}", format_ts(ended)).unwrap();
+            writeln!(out, "Ended: {}", format_unix_ts(ended)).unwrap();
         }
 
         if let Some(ref reason) = run.failure_reason {
@@ -144,11 +136,7 @@ impl Tool for GetTeamStatusTool {
             for msg in &messages {
                 let agent = msg.agent_name.as_deref().unwrap_or("system");
                 let preview = if msg.content.len() > 200 {
-                    let mut boundary = 200;
-                    while boundary > 0 && !msg.content.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    format!("{}...", &msg.content[..boundary])
+                    format!("{}...", &msg.content[..msg.content.floor_char_boundary(200)])
                 } else {
                     msg.content.clone()
                 };
@@ -163,11 +151,7 @@ impl Tool for GetTeamStatusTool {
 
         if let Some(ref deliverable) = run.deliverable {
             let preview = if deliverable.len() > 500 {
-                let mut boundary = 500;
-                while boundary > 0 && !deliverable.is_char_boundary(boundary) {
-                    boundary -= 1;
-                }
-                format!("{}...", &deliverable[..boundary])
+                format!("{}...", &deliverable[..deliverable.floor_char_boundary(500)])
             } else {
                 deliverable.clone()
             };

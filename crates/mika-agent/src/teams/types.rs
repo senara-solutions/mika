@@ -1,7 +1,5 @@
-use serde::{Deserialize, Serialize};
-
 /// Tracks the overall state of a team execution run.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TeamRun {
     pub run_id: String,
     pub team_name: String,
@@ -16,7 +14,7 @@ pub struct TeamRun {
 }
 
 /// Status of the overall team run.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RunStatus {
     Running,
     Completed,
@@ -24,7 +22,7 @@ pub enum RunStatus {
 }
 
 /// A task delegated to a specialist agent.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskAssignment {
     pub agent: String,
     pub role: String,
@@ -34,7 +32,7 @@ pub struct TaskAssignment {
 }
 
 /// Status of an individual task within a run.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TaskStatus {
     Pending,
     Running,
@@ -98,35 +96,6 @@ impl std::fmt::Display for TaskStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_team_run_serialization() {
-        let run = TeamRun {
-            run_id: "abc123".to_string(),
-            team_name: "dev-team".to_string(),
-            goal: "Research Rust patterns".to_string(),
-            status: RunStatus::Completed,
-            iteration: 1,
-            max_iterations: 3,
-            tasks: vec![TaskAssignment {
-                agent: "researcher".to_string(),
-                role: "specialist".to_string(),
-                task: "Research async patterns".to_string(),
-                output_file: "research.md".to_string(),
-                status: TaskStatus::Completed,
-            }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
-            ended_at: Some("2026-02-25T10:05:00Z".to_string()),
-            deliverable: Some("Final summary".to_string()),
-        };
-
-        let toml_str = toml::to_string_pretty(&run).unwrap();
-        let deserialized: TeamRun = toml::from_str(&toml_str).unwrap();
-        assert_eq!(deserialized.run_id, "abc123");
-        assert_eq!(deserialized.status, RunStatus::Completed);
-        assert_eq!(deserialized.tasks.len(), 1);
-        assert_eq!(deserialized.tasks[0].status, TaskStatus::Completed);
-    }
 
     #[test]
     fn test_run_status_display() {
