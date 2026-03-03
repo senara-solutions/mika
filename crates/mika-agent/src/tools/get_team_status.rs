@@ -126,7 +126,10 @@ impl Tool for GetTeamStatusTool {
             for msg in &messages {
                 let agent = msg.agent_name.as_deref().unwrap_or("system");
                 let preview = if msg.content.len() > 200 {
-                    format!("{}...", &msg.content[..msg.content.floor_char_boundary(200)])
+                    format!(
+                        "{}...",
+                        &msg.content[..msg.content.floor_char_boundary(200)]
+                    )
                 } else {
                     msg.content.clone()
                 };
@@ -141,7 +144,10 @@ impl Tool for GetTeamStatusTool {
 
         if let Some(ref deliverable) = run.deliverable {
             let preview = if deliverable.len() > 500 {
-                format!("{}...", &deliverable[..deliverable.floor_char_boundary(500)])
+                format!(
+                    "{}...",
+                    &deliverable[..deliverable.floor_char_boundary(500)]
+                )
             } else {
                 deliverable.clone()
             };

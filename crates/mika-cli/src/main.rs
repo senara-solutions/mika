@@ -29,8 +29,7 @@ async fn main() -> Result<()> {
         // Only allow bare `mika --team` or `mika --team chat`
         match cli.command {
             None | Some(Commands::Chat) => {
-                let log_level =
-                    resolve_log_level(&[global_home.join("config.toml")]);
+                let log_level = resolve_log_level(&[global_home.join("config.toml")]);
 
                 let log_dir = team::team_dir(&global_home, &team_name).join("logs");
                 let _log_guard = mika_common::logging::init_pretty(

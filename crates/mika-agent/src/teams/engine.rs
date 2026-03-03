@@ -148,14 +148,7 @@ impl TeamEngine {
         // Insert the goal as the root message
         match self
             .team_db
-            .insert_team_message(
-                &self.run.run_id,
-                None,
-                None,
-                "goal",
-                &self.run.goal,
-                0,
-            )
+            .insert_team_message(&self.run.run_id, None, None, "goal", &self.run.goal, 0)
             .await
         {
             Ok(id) => self.goal_msg_id = Some(id),
@@ -436,11 +429,7 @@ impl TeamEngine {
             messages
                 .iter()
                 .filter(|m| m.message_type == "assignment" && m.iteration == iteration)
-                .filter_map(|m| {
-                    m.agent_name
-                        .as_ref()
-                        .map(|name| (name.clone(), m.id))
-                })
+                .filter_map(|m| m.agent_name.as_ref().map(|name| (name.clone(), m.id)))
                 .collect()
         };
         let assignment_msg_ids = Arc::new(assignment_msg_ids);
@@ -610,8 +599,7 @@ impl TeamEngine {
         // Any tasks still Running after all joins completed must have hit a JoinError.
         for task in &mut self.run.tasks {
             if matches!(task.status, TaskStatus::Running) {
-                task.status =
-                    TaskStatus::Failed("task panicked or was cancelled".to_string());
+                task.status = TaskStatus::Failed("task panicked or was cancelled".to_string());
             }
         }
 

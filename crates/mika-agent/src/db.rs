@@ -500,7 +500,9 @@ impl Database {
     }
 
     fn migrate_v11(&self) -> Result<()> {
-        info!("applying migration v11: team_runs and team_messages tables for graph-structured team persistence");
+        info!(
+            "applying migration v11: team_runs and team_messages tables for graph-structured team persistence"
+        );
 
         self.conn
             .execute_batch(
@@ -579,7 +581,14 @@ impl Database {
             .execute(
                 "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
                  deliverable = ?4, ended_at = ?5 WHERE id = ?6",
-                rusqlite::params![status, failure_reason, iteration, deliverable, ended_at, run_id],
+                rusqlite::params![
+                    status,
+                    failure_reason,
+                    iteration,
+                    deliverable,
+                    ended_at,
+                    run_id
+                ],
             )
             .context("failed to update team run")?;
         Ok(())

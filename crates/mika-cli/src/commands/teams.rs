@@ -183,8 +183,7 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
     };
 
     // Open team DB for persistence
-    let team_db =
-        open_or_create_team_db(global_home, &name).map_err(|e| anyhow::anyhow!(e))?;
+    let team_db = open_or_create_team_db(global_home, &name).map_err(|e| anyhow::anyhow!(e))?;
 
     let run = mika_agent::teams::run_team(
         &name,

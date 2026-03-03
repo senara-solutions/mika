@@ -22,10 +22,10 @@ use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
 use mika_agent::agent::{self, AgentParams, check_onboarding};
-use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
+use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::tools;
 use mika_common::claude::{ImageSource, ThinkingConfig};
 use mika_common::config::Settings;
@@ -475,14 +475,15 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                         let msg = match event {
                             TeamEvent::Progress(s) => TeamResponse::Progress(s),
                             TeamEvent::AgentCompleted { agent, response } => {
-                                TeamResponse::AgentMessage { agent, content: response }
-                            }
-                            TeamEvent::AgentFailed { agent, error } => {
                                 TeamResponse::AgentMessage {
-                                    agent: agent.clone(),
-                                    content: format!("[failed] {error}"),
+                                    agent,
+                                    content: response,
                                 }
                             }
+                            TeamEvent::AgentFailed { agent, error } => TeamResponse::AgentMessage {
+                                agent: agent.clone(),
+                                content: format!("[failed] {error}"),
+                            },
                             TeamEvent::CriticReview {
                                 approved,
                                 feedback,
@@ -501,7 +502,8 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                                         content: format!("[assigned] {}", task.task),
                                     });
                                 }
-                                let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
+                                let names: Vec<_> =
+                                    tasks.iter().map(|t| t.agent.as_str()).collect();
                                 TeamResponse::Progress(format!(
                                     "Iteration {iteration}: assigned tasks to {}",
                                     names.join(", ")
@@ -530,8 +532,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                                 let _ = response_tx.send(TeamResponse::Error(reason));
                             } else {
                                 let deliverable = run.deliverable.unwrap_or_default();
-                                let _ =
-                                    response_tx.send(TeamResponse::Deliverable(deliverable));
+                                let _ = response_tx.send(TeamResponse::Deliverable(deliverable));
                             }
                         }
                         Err(e) => {
@@ -561,7 +562,11 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         .ok();
 
     // Load recent conversations from DB
-    if let Ok(history) = app.db.load_recent_messages(20, Some(vec!["team".into()])).await {
+    if let Ok(history) = app
+        .db
+        .load_recent_messages(20, Some(vec!["team".into()]))
+        .await
+    {
         for msg in history {
             let role = match msg.role.as_str() {
                 "user" => ChatRole::User,

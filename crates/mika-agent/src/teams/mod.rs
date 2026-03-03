@@ -56,10 +56,7 @@ pub fn open_team_db(home_dir: &Path, team_name: &str) -> Result<AsyncDatabase, T
 /// Creates the team data directory if it does not already exist.
 /// Returns `Err(String)` if the directory cannot be created or the
 /// database cannot be opened.
-pub fn open_or_create_team_db(
-    home_dir: &Path,
-    team_name: &str,
-) -> Result<AsyncDatabase, String> {
+pub fn open_or_create_team_db(home_dir: &Path, team_name: &str) -> Result<AsyncDatabase, String> {
     let team_data_dir = team::team_dir(home_dir, team_name).join("data");
     std::fs::create_dir_all(&team_data_dir)
         .map_err(|e| format!("Failed to create team data directory: {e}"))?;

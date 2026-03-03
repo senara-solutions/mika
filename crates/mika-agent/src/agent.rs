@@ -1468,7 +1468,10 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
                 format_step_exceeded_fallback(&result.tool_call_summaries)
             }
             Err(_) => {
-                warn!(timeout_secs = CONTINUATION_TIMEOUT_SECS, "team agent continuation turn timed out");
+                warn!(
+                    timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                    "team agent continuation turn timed out"
+                );
                 format_step_exceeded_fallback(&result.tool_call_summaries)
             }
         };
