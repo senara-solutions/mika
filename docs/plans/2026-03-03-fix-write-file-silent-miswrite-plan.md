@@ -1,7 +1,7 @@
 ---
 title: "fix: write_file silently writes to wrong path when agent uses incorrect relative path"
 type: fix
-status: active
+status: completed
 date: 2026-03-03
 ---
 
