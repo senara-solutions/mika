@@ -72,7 +72,7 @@ verification after resolution.
 - Workspace files are the only inter-agent data channel
 - Tool registry is built once and shared across all agent invocations
 - `AsyncDatabase` instances need explicit `shutdown()` for thread cleanup
-- Run history persisted as TOML files in `{team_dir}/history/`
+- Run history and message graph persisted in per-team SQLite DB (`{team_dir}/data/mika.db`) via `team_runs` and `team_messages` tables (migration v11). Messages linked via `parent_id` for graph-structured conversation tracking.
 
 ### CLI Commands
 
@@ -80,4 +80,4 @@ verification after resolution.
 mika teams list | create | run | status | log | delete
 ```
 
-TUI slash commands: `/teams` (list) and `/team <name> "<goal>"` (execute).
+TUI slash commands: `/teams` (list), `/team <name> "<goal>"` (execute), and `/verbose` (toggle agent response display in team mode).

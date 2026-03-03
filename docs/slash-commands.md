@@ -7,7 +7,7 @@ Slash commands are client-side actions executed directly in the Mika TUI. They a
 database and renders output in-place, while typing a regular message (no `/` prefix)
 sends it to the Claude-backed agent loop as usual.
 
-All 19 commands are defined in a single `COMMANDS` array
+All 20 commands are defined in a single `COMMANDS` array
 (`crates/mika-cli/src/tui/commands/mod.rs`), dispatched through pattern matching in
 `handlers.rs`, and surfaced via an autocomplete popup driven by `autocomplete.rs`.
 
@@ -355,6 +355,24 @@ Images can also be pasted from the clipboard via Ctrl+V. The TUI tries arboard
 first, then falls back to xclip/wl-paste on Linux. If the clipboard has no image,
 a system message suggests using `/attach` instead.
 
+### /verbose
+
+Toggle verbose mode in team TUI. When enabled, individual agent responses are
+displayed as system messages during team execution.
+
+**Aliases:** `/v` | **Arguments:** None
+
+```
+/verbose
+→ Verbose mode: ON — showing individual agent responses.
+/verbose
+→ Verbose mode: OFF — showing only progress and deliverables.
+```
+
+Only available in team mode (`mika --team <name>`).
+
+---
+
 ## Team Mode
 
 When the TUI is launched with `mika --team <name>`, slash commands are restricted
@@ -364,10 +382,14 @@ to a safe subset. Agent-specific commands are disabled:
 |-----------|----------|
 | `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
-| `/status`, `/team` | `/config`, `/skills`, `/skill`, `/attach` |
+| `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach` |
 
 In team mode, `/status` and `/team` both show team info (name, orchestrator,
 agents). `/export` writes to the team directory instead of the agent home.
+`/verbose` toggles display of individual agent messages during team execution.
+
+Team runs are persisted to a per-team SQLite database (`{team_dir}/data/mika.db`)
+with graph-structured messages linked via `parent_id`.
 
 ## Keyboard Shortcuts
 

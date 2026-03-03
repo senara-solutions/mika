@@ -547,11 +547,16 @@ impl TeamEngine {
                 },
                 Err(join_error) => {
                     // A JoinError means the task panicked or was cancelled.
-                    // Try to extract the task index from the error to update status.
                     warn!(error = %join_error, "spawned task failed unexpectedly");
-                    // We can't reliably map JoinError back to a task index, but
-                    // the individual agent's error was already persisted in the spawned task.
                 }
+            }
+        }
+
+        // Any tasks still Running after all joins completed must have hit a JoinError.
+        for task in &mut self.run.tasks {
+            if matches!(task.status, TaskStatus::Running) {
+                task.status =
+                    TaskStatus::Failed("task panicked or was cancelled".to_string());
             }
         }
 
