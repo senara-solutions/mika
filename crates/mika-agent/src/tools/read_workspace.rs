@@ -54,7 +54,10 @@ impl Tool for ReadWorkspaceTool {
                 }
             }
             Err(_) => {
-                return Ok(ToolOutput::error(format!("File not found: {path}")));
+                return Ok(ToolOutput::error(format!(
+                    "File not found: {}",
+                    full_path.display()
+                )));
             }
         }
 
@@ -74,7 +77,10 @@ impl Tool for ReadWorkspaceTool {
                 }
             }
             Err(_) => {
-                return Ok(ToolOutput::error(format!("File not found: {path}")));
+                return Ok(ToolOutput::error(format!(
+                    "File not found: {}",
+                    full_path.display()
+                )));
             }
         }
 
@@ -90,13 +96,19 @@ impl Tool for ReadWorkspaceTool {
                 }
             }
             Err(_) => {
-                return Ok(ToolOutput::error(format!("File not found: {path}")));
+                return Ok(ToolOutput::error(format!(
+                    "File not found: {}",
+                    full_path.display()
+                )));
             }
         }
 
         match tokio::fs::read_to_string(&full_path).await {
             Ok(content) => Ok(ToolOutput::success(content)),
-            Err(e) => Ok(ToolOutput::error(format!("Failed to read '{path}': {e}"))),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "Failed to read '{}': {e}",
+                full_path.display()
+            ))),
         }
     }
 }
