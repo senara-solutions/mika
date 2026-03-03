@@ -20,12 +20,12 @@ The recommended workflow uses the `/mika` slash command, which chains every step
 
 This runs the following steps in order:
 
-1. **Plan** (`/workflows:plan`) -- Research the codebase, design the approach, write a plan file to `docs/plans/`
-2. **Work** (`/workflows:work`) -- Implement the plan with incremental commits and continuous testing
-3. **Review** (`/workflows:review`) -- Multi-agent code review for quality and correctness
+1. **Plan** (`/ce:plan`) -- Research the codebase, design the approach, write a plan file to `docs/plans/`
+2. **Work** (`/ce:work`) -- Implement the plan with incremental commits and continuous testing
+3. **Review** (`/ce:review`) -- Multi-agent code review for quality and correctness
 4. **Resolve TODOs** (`/compound-engineering:resolve_todo_parallel`) -- Address review findings tracked in `todos/`
 5. **Doc Audit** (`/mika-doc-audit`) -- Update documentation based on code changes
-6. **Compound** (`/workflows:compound`) -- Document the solution in `docs/solutions/` for institutional knowledge
+6. **Compound** (`/ce:compound`) -- Document the solution in `docs/solutions/` for institutional knowledge
 
 The command uses a `/ralph-loop` wrapper internally to ensure all steps run to completion without stopping between them.
 
