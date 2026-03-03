@@ -229,10 +229,29 @@ impl TeamEngine {
     }
 
     async fn execute_inner(&mut self) -> Result<()> {
+        // Load recent conversation history for orchestrator context
+        let history = self
+            .team_db
+            .load_team_runs(&self.run.team_name, 10)
+            .await
+            .unwrap_or_default();
+
         // Step 1: Decompose -- orchestrator produces task assignments
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
-        let tasks = self.decompose(None).await?;
-        self.run.tasks = tasks;
+        match self.decompose(None, &history).await {
+            Ok(tasks) => {
+                self.run.tasks = tasks;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(reply) = msg.strip_prefix("__conversational__:") {
+                    self.run.deliverable = Some(reply.to_string());
+                    self.emit_event(TeamEvent::Deliverable(reply.to_string()));
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        }
 
         // Emit structured event for task assignments
         self.emit_event(TeamEvent::TasksAssigned {
@@ -268,7 +287,7 @@ impl TeamEngine {
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
             )));
-            let tasks = self.decompose(Some(&feedback)).await?;
+            let tasks = self.decompose(Some(&feedback), &history).await?;
             self.run.tasks = tasks;
 
             self.emit_event(TeamEvent::TasksAssigned {
@@ -292,9 +311,13 @@ impl TeamEngine {
     /// Ask the orchestrator to decompose the goal into tasks.
     /// Pass `None` for first decomposition, `Some(feedback)` for re-decomposition
     /// after critic rejection. (#261: merged decompose + decompose_with_feedback)
-    async fn decompose(&self, feedback: Option<&str>) -> Result<Vec<TaskAssignment>> {
+    async fn decompose(
+        &self,
+        feedback: Option<&str>,
+        history: &[crate::db::TeamRunRow],
+    ) -> Result<Vec<TaskAssignment>> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
-        let context = prompt::build_orchestrator_context(&self.team, &listing, feedback);
+        let context = prompt::build_orchestrator_context(&self.team, &listing, feedback, history);
 
         let orchestrator_name = &self.team.team.orchestrator;
 
@@ -717,7 +740,18 @@ impl TeamEngine {
 }
 
 /// Parse the orchestrator's JSON response into task assignments.
+///
+/// If the orchestrator replied conversationally (via `{"reply": "..."}`),
+/// returns a sentinel error so `execute_inner` can handle it as a deliverable.
 fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Vec<TaskAssignment>> {
+    // Check for conversational reply envelope before trying array parse
+    if let Some(json_str) = extract_json(response, '{', '}')
+        && let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str)
+        && let Some(reply) = obj.get("reply").and_then(|v| v.as_str())
+    {
+        bail!("__conversational__:{reply}");
+    }
+
     // Try to extract JSON array from the response (#257: unified extract_json)
     let json_str = extract_json(response, '[', ']').unwrap_or(response);
 
@@ -971,6 +1005,41 @@ mod tests {
         let response = r#"{"feedback": "some feedback"}"#;
         let (approved, _) = parse_review_response(response).unwrap();
         assert!(!approved);
+    }
+
+    #[test]
+    fn test_parse_task_assignments_conversational_reply() {
+        // Conversational reply envelope should return a sentinel error
+        let response = r#"{"reply": "Hey! The team is ready and waiting."}"#;
+        let team = test_team();
+        let result = parse_task_assignments(response, &team);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.starts_with("__conversational__:"));
+        assert!(err_msg.contains("The team is ready and waiting."));
+    }
+
+    #[test]
+    fn test_parse_task_assignments_conversational_reply_with_prose() {
+        // Conversational reply wrapped in prose should still be detected
+        let response =
+            "Sure thing!\n{\"reply\": \"Hello! Everything looks good.\"}\nHope that helps.";
+        let team = test_team();
+        let result = parse_task_assignments(response, &team);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.starts_with("__conversational__:"));
+    }
+
+    #[test]
+    fn test_parse_task_assignments_reply_without_reply_key_is_not_conversational() {
+        // A JSON object without "reply" key should NOT be treated as conversational
+        let response = r#"{"approved": true, "feedback": "ok"}"#;
+        let team = test_team();
+        let result = parse_task_assignments(response, &team);
+        // Should fail as normal invalid task assignments, not conversational
+        assert!(result.is_err());
+        assert!(!result.unwrap_err().to_string().starts_with("__conversational__:"));
     }
 
     #[test]

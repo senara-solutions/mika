@@ -3,6 +3,8 @@ use std::path::Path;
 
 use mika_common::team::TeamDefinition;
 
+use crate::db::TeamRunRow;
+
 use super::types::TeamRun;
 
 /// Build the team context injected into the orchestrator's system prompt.
@@ -13,6 +15,7 @@ pub fn build_orchestrator_context(
     def: &TeamDefinition,
     workspace_listing: &str,
     previous_feedback: Option<&str>,
+    history: &[TeamRunRow],
 ) -> String {
     let mut members = String::new();
     for agent in &def.agents {
@@ -25,6 +28,22 @@ pub fn build_orchestrator_context(
             agent.name, agent.role, agent.mandate
         );
     }
+
+    let history_section = if history.is_empty() {
+        String::new()
+    } else {
+        let mut buf = String::from("\n## Conversation History\n");
+        // Show oldest first (load_team_runs returns DESC, so reverse)
+        for run in history.iter().rev() {
+            let _ = writeln!(buf, "User: {}", run.goal);
+            if let Some(ref d) = run.deliverable {
+                let truncated = if d.len() > 500 { &d[..500] } else { d };
+                let _ = writeln!(buf, "Assistant: {truncated}");
+            }
+            buf.push('\n');
+        }
+        buf
+    };
 
     let feedback_section = match previous_feedback {
         Some(feedback) => format!(
@@ -51,9 +70,13 @@ pub fn build_orchestrator_context(
          \n\
          ## Workspace State\n\
          {workspace_section}\n\
+         {history_section}\
          {feedback_section}\n\
          ## Instructions\n\
-         Decompose the goal into tasks for your team members. \
+         If the input is NOT an actionable goal (e.g., a greeting, status question, \
+         or casual conversation), respond with: {{\"reply\": \"your response\"}}\n\
+         \n\
+         For actionable goals, decompose into tasks for your team members. \
          Respond with a JSON array of task assignments. Each assignment has:\n\
          - \"agent\": the team member's name\n\
          - \"task\": a clear, specific description of what to do\n\
@@ -61,8 +84,9 @@ pub fn build_orchestrator_context(
          \n\
          Use `list_workspace` to check the current workspace state before planning.\n\
          \n\
-         Respond ONLY with the JSON array. Example:\n\
-         [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
+         Respond ONLY with JSON. Examples:\n\
+         Conversational: {{\"reply\": \"Hey! The team is ready and waiting for a goal.\"}}\n\
+         Actionable: [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
         team_name = def.team.name,
         mi = def.flow.max_iterations,
     )
@@ -216,7 +240,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_includes_team_members() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", None);
+        let ctx = build_orchestrator_context(&def, "", None, &[]);
         assert!(ctx.contains("ORCHESTRATOR"));
         assert!(ctx.contains("researcher"));
         assert!(ctx.contains("Research topics"));
@@ -227,9 +251,54 @@ mod tests {
     #[test]
     fn test_orchestrator_context_with_feedback() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"));
+        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"), &[]);
         assert!(ctx.contains("Previous Review Feedback"));
         assert!(ctx.contains("Needs more detail"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_with_history() {
+        let def = test_def();
+        let history = vec![
+            TeamRunRow {
+                id: "run-1".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "How is the team?".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 0,
+                max_iterations: 3,
+                deliverable: Some("The team is ready!".to_string()),
+                started_at: 1000,
+                ended_at: Some(1001),
+            },
+            TeamRunRow {
+                id: "run-2".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Ping everyone".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: Some("Done, pinged all agents.".to_string()),
+                started_at: 1002,
+                ended_at: Some(1003),
+            },
+        ];
+        let ctx = build_orchestrator_context(&def, "", None, &history);
+        assert!(ctx.contains("## Conversation History"));
+        // History returned DESC, rendered oldest first — run-2 (index 0) is newer
+        assert!(ctx.contains("User: How is the team?"));
+        assert!(ctx.contains("Assistant: The team is ready!"));
+        assert!(ctx.contains("User: Ping everyone"));
+        assert!(ctx.contains("Assistant: Done, pinged all agents."));
+    }
+
+    #[test]
+    fn test_orchestrator_context_no_history_section_when_empty() {
+        let def = test_def();
+        let ctx = build_orchestrator_context(&def, "", None, &[]);
+        assert!(!ctx.contains("Conversation History"));
     }
 
     #[test]
