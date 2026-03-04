@@ -15,6 +15,9 @@ readme = "../../README.md"
 name = "mika"
 path = "src/main.rs"
 
+[features]
+telemetry = ["mika-common/telemetry"]
+
 [dependencies]
 mika-common.workspace = true
 mika-agent.workspace = true
@@ -40,6 +43,7 @@ arboard.workspace = true
 base64.workspace = true
 png.workspace = true
 unicode-width.workspace = true
+dialoguer.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

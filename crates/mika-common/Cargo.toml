@@ -27,6 +27,29 @@ secrecy.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+[features]
+telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:base64"]
+
+[dependencies.opentelemetry]
+workspace = true
+optional = true
+
+[dependencies.opentelemetry_sdk]
+workspace = true
+optional = true
+
+[dependencies.opentelemetry-otlp]
+workspace = true
+optional = true
+
+[dependencies.tracing-opentelemetry]
+workspace = true
+optional = true
+
+[dependencies.base64]
+workspace = true
+optional = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

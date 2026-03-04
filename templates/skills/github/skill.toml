@@ -1,9 +1,0 @@
-[skill]
-name = "github"
-description = "Interact with GitHub using the gh CLI"
-version = "0.1.0"
-always_on = false
-timeout_secs = 30
-
-[triggers]
-keywords = ["github", "pull request", "open pr", "my prs", "merge pr", "close pr", "check pr", "view pr", "pr status", "create issue", "file an issue", "github actions", "ci checks", "ci pipeline", "build status"]

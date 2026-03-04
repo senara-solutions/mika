@@ -6,6 +6,9 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::path::PathBuf;
 
+use crate::db::format_unix_ts;
+use crate::teams::{TeamDbError, open_team_db};
+
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct GetTeamHistoryTool {
@@ -58,15 +61,23 @@ impl Tool for GetTeamHistoryTool {
 
         let limit = input["limit"].as_u64().unwrap_or(5).min(20) as usize;
 
-        let history_dir = team::history_dir(&self.home_dir, team_name);
-        let runs = match crate::teams::history::list_runs_limited(&history_dir, limit) {
+        // Open team DB
+        let team_db = match open_team_db(&self.home_dir, team_name) {
+            Ok(db) => db,
+            Err(TeamDbError::NoRuns(msg)) => return Ok(ToolOutput::success(msg)),
+            Err(TeamDbError::OpenFailed(msg)) => return Ok(ToolOutput::error(msg)),
+        };
+
+        let runs = match team_db.load_team_runs(team_name, limit).await {
             Ok(r) => r,
             Err(e) => {
+                team_db.shutdown();
                 return Ok(ToolOutput::error(format!(
                     "Failed to load history for team '{team_name}': {e}"
                 )));
             }
         };
+        team_db.shutdown();
 
         if runs.is_empty() {
             return Ok(ToolOutput::success(format!(
@@ -74,21 +85,27 @@ impl Tool for GetTeamHistoryTool {
             )));
         }
 
-        let shown = &runs;
         let mut out = String::new();
         writeln!(
             out,
             "Recent runs for team '{team_name}' (showing {}):",
-            shown.len()
+            runs.len()
         )
         .unwrap();
 
-        for run in shown {
-            let ended = run.ended_at.as_deref().unwrap_or("in progress");
+        for run in &runs {
+            let ended = run
+                .ended_at
+                .map(format_unix_ts)
+                .unwrap_or_else(|| "in progress".to_string());
             writeln!(
                 out,
                 "  - [{}] {} | {} | started: {} | ended: {}",
-                run.run_id, run.status, run.goal, run.started_at, ended
+                run.id,
+                run.status,
+                run.goal,
+                format_unix_ts(run.started_at),
+                ended
             )
             .unwrap();
         }
@@ -100,16 +117,8 @@ impl Tool for GetTeamHistoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::teams::history::save_run;
-    use crate::test_utils::test_helpers::{TestHarness, test_team_run};
 
-    fn test_run(id: &str, date: &str) -> crate::teams::types::TeamRun {
-        let mut run = test_team_run();
-        run.run_id = id.to_string();
-        run.started_at = format!("{date}T10:00:00Z");
-        run.ended_at = Some(format!("{date}T10:05:00Z"));
-        run
-    }
+    use crate::test_utils::test_helpers::{TestHarness, setup_team_db};
 
     #[tokio::test]
     async fn test_get_team_history_empty() {
@@ -130,17 +139,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_team_history_multiple_runs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let history = team::history_dir(tmp.path(), "dev-team");
-
-        save_run(&history, &test_run("aaaa1111", "2026-02-24")).unwrap();
-        save_run(&history, &test_run("bbbb2222", "2026-02-25")).unwrap();
+        let (_tmp, home) = setup_team_db("dev-team", 2);
 
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamHistoryTool {
-            home_dir: tmp.path().to_path_buf(),
-        };
+        let tool = GetTeamHistoryTool { home_dir: home };
 
         let result = tool
             .execute(serde_json::json!({"team_name": "dev-team"}), &ctx)
@@ -148,28 +151,17 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("showing 2"));
-        assert!(result.content.contains("aaaa1111"));
-        assert!(result.content.contains("bbbb2222"));
+        assert!(result.content.contains("run-0000"));
+        assert!(result.content.contains("run-0001"));
     }
 
     #[tokio::test]
     async fn test_get_team_history_respects_limit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let history = team::history_dir(tmp.path(), "dev-team");
-
-        for i in 0..5 {
-            save_run(
-                &history,
-                &test_run(&format!("run{i:04}"), &format!("2026-02-{:02}", 20 + i)),
-            )
-            .unwrap();
-        }
+        let (_tmp, home) = setup_team_db("dev-team", 5);
 
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamHistoryTool {
-            home_dir: tmp.path().to_path_buf(),
-        };
+        let tool = GetTeamHistoryTool { home_dir: home };
 
         let result = tool
             .execute(

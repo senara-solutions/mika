@@ -1,6 +1,6 @@
 mod cancel_reminder;
 mod create_reminder;
-mod create_skill;
+pub(crate) mod create_skill;
 mod delegate_task;
 mod delete_skill;
 mod get_config;
@@ -21,6 +21,7 @@ mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod update_skill;
+mod write_file;
 mod write_workspace;
 
 use anyhow::Result;
@@ -28,7 +29,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -53,6 +54,9 @@ pub struct ToolContext<'a> {
     /// The agent loop coordinator checks this before each turn and rebuilds the
     /// SkillRegistry if set, enabling hot-reload without restart.
     pub skills_dirty: &'a AtomicBool,
+    /// True when running in reflection mode (daily memory review).
+    /// Memory tools require an `evidence` field and use a higher edit cap.
+    pub is_reflection: bool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
@@ -160,6 +164,118 @@ pub(crate) async fn index_fact(
     }
 }
 
+/// Check that the `evidence` field is present and non-empty when running in reflection mode.
+/// Returns `Some(ToolOutput::error(...))` if evidence is missing, `None` if valid.
+pub(crate) fn check_reflection_evidence(
+    ctx: &ToolContext<'_>,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    if ctx.is_reflection {
+        let evidence = input["evidence"].as_str().unwrap_or("").trim();
+        if evidence.is_empty() {
+            return Some(ToolOutput::error(
+                "Reflection mode requires an evidence field citing specific conversation content.",
+            ));
+        }
+    }
+    None
+}
+
+/// Validate a relative path and resolve it to a full path within `base_dir`.
+///
+/// Performs the following security checks:
+/// 1. Non-empty path
+/// 2. Path length within `MAX_INPUT_LEN`
+/// 3. Absolute paths rejected
+/// 4. Path traversal components (`..`, root, prefix) rejected
+/// 5. Parent directories created (idempotent)
+/// 6. Parent directory symlink check
+/// 7. Canonicalize containment check (resolved parent must be within `base_dir`)
+///
+/// Returns `Ok(full_path)` on success or `Err(ToolOutput::error(...))` on failure.
+pub(crate) async fn validate_and_resolve_path(
+    path: &str,
+    base_dir: &Path,
+) -> std::result::Result<PathBuf, ToolOutput> {
+    if path.is_empty() {
+        return Err(ToolOutput::error("'path' is required and cannot be empty."));
+    }
+    if path.len() > MAX_INPUT_LEN {
+        return Err(ToolOutput::error(format!(
+            "Path exceeds maximum length of {MAX_INPUT_LEN} characters."
+        )));
+    }
+
+    // Reject absolute paths
+    if Path::new(path).is_absolute() {
+        return Err(ToolOutput::error(
+            "Absolute paths are not allowed. Use a relative path within the directory.",
+        ));
+    }
+
+    // Prevent path traversal using component inspection
+    for component in Path::new(path).components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ToolOutput::error(
+                    "Path traversal components ('..', root, or prefix) are not allowed.",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let full_path = base_dir.join(path);
+
+    // Create parent directories if needed
+    if let Some(parent) = full_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(ToolOutput::error(format!(
+                "Failed to create parent directories: {e}"
+            )));
+        }
+
+        // Check for symlinks in the parent chain
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(ToolOutput::error(
+                        "Symbolic links are not allowed in the path.",
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(ToolOutput::error(format!(
+                    "Failed to verify parent directory: {e}"
+                )));
+            }
+        }
+
+        // Verify containment using canonicalize (parent now exists)
+        let canonical_parent = match parent.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(ToolOutput::error(format!(
+                    "Failed to resolve parent directory: {e}"
+                )));
+            }
+        };
+        let base_canonical = match base_dir.canonicalize() {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(ToolOutput::error("Base directory does not exist."));
+            }
+        };
+        if !canonical_parent.starts_with(&base_canonical) {
+            return Err(ToolOutput::error(
+                "Path resolves outside the base directory.",
+            ));
+        }
+    }
+
+    Ok(full_path)
+}
+
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
@@ -239,6 +355,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(update_skill::UpdateSkillTool));
     registry.register(Box::new(get_config::GetConfigTool));
     registry.register(Box::new(set_config::SetConfigTool));
+    registry.register(Box::new(write_file::WriteFileTool));
     registry
 }
 

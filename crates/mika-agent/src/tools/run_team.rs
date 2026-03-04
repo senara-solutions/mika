@@ -5,6 +5,8 @@ use mika_common::config::Settings;
 use serde_json::Value;
 use std::path::PathBuf;
 
+use crate::teams::open_or_create_team_db;
+
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct RunTeamTool {
@@ -69,7 +71,24 @@ impl Tool for RunTeamTool {
             )));
         }
 
-        match crate::teams::run_team(team_name, goal, &self.home_dir, &self.settings, None).await {
+        // Open team DB for persistence
+        let team_db = match open_or_create_team_db(&self.home_dir, team_name) {
+            Ok(db) => db,
+            Err(msg) => return Ok(ToolOutput::error(msg)),
+        };
+
+        let result = crate::teams::run_team(
+            team_name,
+            goal,
+            &self.home_dir,
+            &self.settings,
+            None,
+            team_db.clone(),
+        )
+        .await;
+        team_db.shutdown();
+
+        match result {
             Ok(run) => {
                 if let Some(ref deliverable) = run.deliverable {
                     Ok(ToolOutput::success(format!(

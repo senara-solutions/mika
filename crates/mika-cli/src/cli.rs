@@ -7,6 +7,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub agent: Option<String>,
 
+    /// Team to use (launches TUI in team mode)
+    #[arg(long, global = true, conflicts_with = "agent")]
+    pub team: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -158,6 +162,24 @@ pub enum SkillsCommand {
     Disable {
         /// Skill name
         name: String,
+    },
+    /// Install a skill from a Git repository
+    Install {
+        /// Git URL or GitHub shorthand (user/repo)
+        source: String,
+        /// Install under a different name (alias)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Uninstall a marketplace-installed skill
+    Uninstall {
+        /// Skill name to uninstall
+        name: String,
+    },
+    /// Update marketplace-installed skills
+    Update {
+        /// Skill name to update (omit to update all)
+        name: Option<String>,
     },
 }
 

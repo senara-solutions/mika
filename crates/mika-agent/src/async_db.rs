@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent,
-    Person, Preference, Reminder, SearchResult,
+    Person, Preference, Reminder, SearchResult, TeamMessageRow, TeamRunRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -320,9 +320,9 @@ impl AsyncDatabase {
 
     // -- Reminders --
 
-    pub async fn add_reminder(&self, fire_at: &str, message: &str) -> Result<i64> {
-        let (f, m) = (fire_at.to_owned(), message.to_owned());
-        self.with_db(move |db| db.add_reminder(&f, &m)).await
+    pub async fn add_reminder(&self, fire_at: i64, message: &str) -> Result<i64> {
+        let m = message.to_owned();
+        self.with_db(move |db| db.add_reminder(fire_at, &m)).await
     }
 
     pub async fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
@@ -485,6 +485,49 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_memory_events(&s)).await
     }
 
+    // -- Reflection --
+
+    pub async fn get_conversations_since(
+        &self,
+        since_utc: &str,
+    ) -> Result<Vec<ConversationMessage>> {
+        let s = since_utc.to_owned();
+        self.with_db(move |db| db.get_conversations_since(&s)).await
+    }
+
+    pub async fn get_memory_events_since(&self, since_utc: &str) -> Result<Vec<MemoryEvent>> {
+        let s = since_utc.to_owned();
+        self.with_db(move |db| db.get_memory_events_since(&s)).await
+    }
+
+    pub async fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
+        self.with_db(move |db| db.prune_old_reflection_runs(days))
+            .await
+    }
+
+    pub async fn record_reflection_run(
+        &self,
+        status: &str,
+        changes_made: i64,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let (st, su) = (status.to_owned(), summary.map(|s| s.to_owned()));
+        self.with_db(move |db| db.record_reflection_run(&st, changes_made, su.as_deref()))
+            .await
+    }
+
+    pub async fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
+        let tz = timezone.to_owned();
+        self.with_db(move |db| db.last_reflection_run_today(&tz))
+            .await
+    }
+
+    pub async fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
+        let s = session_id.to_owned();
+        self.with_db(move |db| db.count_memory_events_for_session(&s))
+            .await
+    }
+
     // -- Layer 3: Search Indexing --
 
     pub async fn index_content(
@@ -540,6 +583,106 @@ impl AsyncDatabase {
     pub async fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
         self.with_db(|db| db.get_all_facts_for_indexing()).await
     }
+
+    // -- Team Runs --
+
+    pub async fn insert_team_run(
+        &self,
+        run_id: &str,
+        team_name: &str,
+        goal: &str,
+        max_iterations: u32,
+        started_at: i64,
+    ) -> Result<()> {
+        let (ri, tn, g) = (run_id.to_owned(), team_name.to_owned(), goal.to_owned());
+        self.with_db(move |db| db.insert_team_run(&ri, &tn, &g, max_iterations, started_at))
+            .await
+    }
+
+    pub async fn update_team_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        failure_reason: Option<&str>,
+        iteration: u32,
+        deliverable: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<()> {
+        let (ri, s, fr, d) = (
+            run_id.to_owned(),
+            status.to_owned(),
+            failure_reason.map(|s| s.to_owned()),
+            deliverable.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.update_team_run(&ri, &s, fr.as_deref(), iteration, d.as_deref(), ended_at)
+        })
+        .await
+    }
+
+    pub async fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.load_team_runs(&tn, limit)).await
+    }
+
+    pub async fn load_team_runs_for_prompt(
+        &self,
+        team_name: &str,
+        limit: usize,
+        max_text_len: usize,
+    ) -> Result<Vec<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.load_team_runs_for_prompt(&tn, limit, max_text_len))
+            .await
+    }
+
+    pub async fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.load_latest_team_run(&tn)).await
+    }
+
+    pub async fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.load_team_run_by_id(&ri)).await
+    }
+
+    // -- Team Messages --
+
+    pub async fn insert_team_message(
+        &self,
+        run_id: &str,
+        parent_id: Option<i64>,
+        agent_name: Option<&str>,
+        message_type: &str,
+        content: &str,
+        iteration: u32,
+    ) -> Result<i64> {
+        let (ri, an, mt, c) = (
+            run_id.to_owned(),
+            agent_name.map(|s| s.to_owned()),
+            message_type.to_owned(),
+            content.to_owned(),
+        );
+        self.with_db(move |db| {
+            db.insert_team_message(&ri, parent_id, an.as_deref(), &mt, &c, iteration)
+        })
+        .await
+    }
+
+    pub async fn load_assignment_msg_ids(
+        &self,
+        run_id: &str,
+        iteration: u32,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.load_assignment_msg_ids(&ri, iteration))
+            .await
+    }
+
+    pub async fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.load_team_messages(&ri)).await
+    }
 }
 
 #[cfg(test)]
@@ -548,7 +691,6 @@ mod tests {
     use crate::db::Database;
 
     fn test_async_db() -> AsyncDatabase {
-        crate::db::init_sqlite_vec();
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new(db)
     }

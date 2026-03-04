@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use mika_common::agent;
@@ -49,6 +50,7 @@ fn build_router(state: AppState) -> Router {
         ))
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -82,6 +84,9 @@ async fn init_agent(
     );
     let scheduler_sender: Arc<dyn MessageSender> = Arc::new(scheduler_sender);
 
+    let skills_dirty = Arc::new(AtomicBool::new(false));
+    let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     let scheduler = Arc::new(ReminderScheduler {
         db: async_db.clone(),
         claude: claude.clone(),
@@ -91,6 +96,12 @@ async fn init_agent(
         message_sender: Some(scheduler_sender),
         embedding_client: embedding_client.clone(),
         brave_api_key,
+        skills_dirty: skills_dirty.clone(),
+        agent_lock: Some(agent_lock.clone()),
+        reflection_config: {
+            let identity = crate::prompt::load_identity(agent_home);
+            identity.reflection
+        },
     });
 
     // Load MCP configuration and connect to configured servers
@@ -109,9 +120,9 @@ async fn init_agent(
     let agent_state = AgentState {
         db: async_db,
         skills: std::sync::Mutex::new(skill_registry),
-        skills_dirty: Arc::new(AtomicBool::new(false)),
+        skills_dirty,
         scheduler: scheduler.clone(),
-        agent_lock: Arc::new(tokio::sync::Mutex::new(())),
+        agent_lock,
         home_dir: agent_home.to_path_buf(),
         embedding_client,
         mcp_manager,
@@ -258,12 +269,19 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     ready.store(true, Ordering::Release);
     info!("server ready");
 
-    // Fire past-due reminders in background (slow, runs agent loops)
+    // Fire past-due reminders in background (slow, runs agent loops),
+    // then start a poller for each agent to fire future reminders when due.
+    // The poller starts AFTER recovery completes to avoid double-firing
+    // reminders that recovery is still processing.
     for scheduler in schedulers {
+        let poller_scheduler = scheduler.clone();
         tokio::spawn(async move {
             if let Err(e) = scheduler.recover().await {
                 tracing::warn!(error = %e, "reminder recovery failed");
             }
+            // Start polling only after recovery finishes
+            // (handle dropped, task lives on for the server's lifetime)
+            poller_scheduler.spawn_poller();
         });
     }
 
@@ -306,6 +324,8 @@ mod tests {
         .expect("test API key should be valid");
         let tools_reg = Arc::new(tools::default_tools());
         let skills_reg = Arc::new(SkillRegistry::empty());
+        let skills_dirty = Arc::new(AtomicBool::new(false));
+        let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
         let scheduler = Arc::new(ReminderScheduler {
             db: db.clone(),
             claude: claude.clone(),
@@ -315,14 +335,17 @@ mod tests {
             message_sender: None,
             embedding_client: None,
             brave_api_key: None,
+            skills_dirty: skills_dirty.clone(),
+            agent_lock: Some(agent_lock.clone()),
+            reflection_config: None,
         });
 
         let agent_state = AgentState {
             db,
             skills: std::sync::Mutex::new(skills_reg),
-            skills_dirty: Arc::new(AtomicBool::new(false)),
+            skills_dirty,
             scheduler,
-            agent_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lock,
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             mcp_manager: None,
@@ -360,6 +383,9 @@ mod tests {
                 home_dir: std::path::PathBuf::from("/tmp/mika-test"),
                 server_log_file: None,
                 disable_bundled_skills: false,
+                telemetry_enabled: false,
+                otlp_endpoint: None,
+                otlp_auth_header: None,
             },
         }
     }

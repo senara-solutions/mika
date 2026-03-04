@@ -9,6 +9,7 @@ use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
 
 const MAX_TOKENS_PER_BLOCK: i32 = 500;
 const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
+const MAX_CORE_MEMORY_EDITS_REFLECTION: u32 = 5;
 
 pub struct UpdateCoreMemoryTool;
 
@@ -47,6 +48,10 @@ impl Tool for UpdateCoreMemoryTool {
                     "reasoning": {
                         "type": "string",
                         "description": "Why you are making this change (recorded in audit log)"
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
                     }
                 },
                 "required": ["section", "action", "reasoning"]
@@ -70,6 +75,11 @@ impl Tool for UpdateCoreMemoryTool {
             return Ok(ToolOutput::error(
                 "Required fields missing: section, action, reasoning (and content for non-reset actions).",
             ));
+        }
+
+        // Reflection mode: require evidence field
+        if let Some(err) = super::check_reflection_evidence(ctx, &input) {
+            return Ok(err);
         }
 
         // Validate section
@@ -97,10 +107,15 @@ impl Tool for UpdateCoreMemoryTool {
         }
 
         // Rate limit check (onboarding sessions are exempt)
+        let max_edits = if ctx.is_reflection {
+            MAX_CORE_MEMORY_EDITS_REFLECTION
+        } else {
+            MAX_CORE_MEMORY_EDITS_PER_SESSION
+        };
         let current_edits = ctx.core_memory_edit_count.load(Ordering::Relaxed);
-        if current_edits >= MAX_CORE_MEMORY_EDITS_PER_SESSION && !ctx.is_onboarding {
+        if current_edits >= max_edits && !ctx.is_onboarding {
             return Ok(ToolOutput::error(format!(
-                "Core memory edit limit ({MAX_CORE_MEMORY_EDITS_PER_SESSION}) reached for this session. Focus on using your existing knowledge."
+                "Core memory edit limit ({max_edits}) reached for this session. Focus on using your existing knowledge."
             )));
         }
 
@@ -165,7 +180,13 @@ impl Tool for UpdateCoreMemoryTool {
         // Write to DB
         ctx.db.set_core_memory(section, &new_value).await?;
 
-        // Log audit event
+        // Log audit event (include evidence in reasoning when in reflection mode)
+        let audit_reasoning = if ctx.is_reflection {
+            let evidence = input["evidence"].as_str().unwrap_or("");
+            format!("{reasoning} [evidence] {evidence}")
+        } else {
+            reasoning.to_string()
+        };
         ctx.db
             .log_memory_event(
                 ctx.session_id,
@@ -173,7 +194,7 @@ impl Tool for UpdateCoreMemoryTool {
                 section,
                 before_value,
                 &new_value,
-                Some(reasoning),
+                Some(&audit_reasoning),
             )
             .await?;
 
@@ -450,6 +471,104 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("tokens"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_requires_evidence() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateCoreMemoryTool;
+
+        // Without evidence field → rejected
+        let result = tool
+            .execute(
+                make_input("persona", "replace", "Updated persona", "Reflection update"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("evidence"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_with_evidence_succeeds() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateCoreMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "section": "persona",
+                    "action": "replace",
+                    "content": "Updated persona",
+                    "reasoning": "Reflection update",
+                    "evidence": "User said 'I prefer a more formal tone' at 14:30"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_reflection_edit_cap_is_five() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateCoreMemoryTool;
+
+        let make_reflection_input = |i: u32| {
+            serde_json::json!({
+                "section": "persona",
+                "action": "replace",
+                "content": format!("Edit {i}"),
+                "reasoning": "Reflection",
+                "evidence": format!("Evidence for edit {i}")
+            })
+        };
+
+        // Make 5 successful edits
+        for i in 0..5 {
+            let result = tool.execute(make_reflection_input(i), &ctx).await.unwrap();
+            assert!(!result.is_error, "Reflection edit {i} should succeed");
+        }
+
+        // 6th edit should be rate limited
+        let result = tool.execute(make_reflection_input(5), &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("edit limit"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_audit_includes_evidence() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx_with_reflection();
+        let tool = UpdateCoreMemoryTool;
+
+        tool.execute(
+            serde_json::json!({
+                "section": "user_summary",
+                "action": "replace",
+                "content": "Alice, CEO",
+                "reasoning": "Promoting from facts",
+                "evidence": "User said 'I am the CEO of Acme' at 10:15"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let events = harness.db.get_memory_events("test-session").await.unwrap();
+        assert_eq!(events.len(), 1);
+        let reasoning = events[0].reasoning.as_deref().unwrap();
+        assert!(reasoning.contains("[evidence]"));
+        assert!(reasoning.contains("CEO of Acme"));
     }
 
     #[tokio::test]

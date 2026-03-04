@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
@@ -25,8 +25,13 @@ use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::embedding::EmbeddingClient;
 
 const MAX_TOOL_STEPS: usize = 10;
+const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Per-agent timeout for team sub-agents (matches AGENT_TOTAL_TIMEOUT_SECS).
+/// Since team agents run in parallel, the constraint is fitting within the global
+/// team run budget (max of agent times, not sum).
+const TEAM_AGENT_TIMEOUT_SECS: u64 = 300;
 /// Timeout for the continuation API call after max tool steps are exceeded.
 /// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
 const CONTINUATION_TIMEOUT_SECS: u64 = 60;
@@ -100,6 +105,13 @@ impl LoopMode<'_> {
         }
     }
 
+    fn max_steps(&self) -> usize {
+        match self {
+            Self::Team => MAX_TEAM_TOOL_STEPS,
+            _ => MAX_TOOL_STEPS,
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::Conversation { .. } => "agent",
@@ -127,6 +139,9 @@ const TOOL_INPUT_SUMMARY_MAX: usize = 120;
 const TOOL_OUTPUT_SUMMARY_MAX: usize = 180;
 /// Maximum total characters for serialized tool call metadata.
 const TOOL_METADATA_MAX: usize = 4000;
+/// Maximum characters of conversation/memory digest injected into the reflection prompt.
+/// ~12,500 tokens at 4 chars/token -- keeps total prompt well within Claude's context.
+const MAX_REFLECTION_DIGEST_CHARS: usize = 50_000;
 
 /// Truncate a string to approximately `max_len` bytes, appending "..." if truncated.
 /// Always cuts at a valid UTF-8 char boundary to avoid panics on multi-byte input.
@@ -314,13 +329,14 @@ async fn run_loop(
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
-    for step in 0..MAX_TOOL_STEPS {
+    let max_steps = mode.max_steps();
+    for step in 0..max_steps {
         debug!(
             step,
             label = mode.label(),
             channel_type,
             messages_len = request.messages.len(),
-            "agent loop step"
+            "agent_step"
         );
 
         // Strip images from prior turns to prevent unbounded memory growth
@@ -328,9 +344,9 @@ async fn run_loop(
             strip_prior_images(&mut request.messages);
         }
 
-        // Nudge the model to wrap up when approaching the step limit (conversation only)
-        if mode.is_conversation()
-            && step == MAX_TOOL_STEPS - 2
+        // Nudge the model to wrap up when approaching the step limit
+        if matches!(mode, LoopMode::Conversation { .. } | LoopMode::Team)
+            && step == max_steps - 2
             && let Some(ref mut system) = request.system
         {
             system.push_str(
@@ -443,7 +459,7 @@ async fn run_loop(
 
     warn!(
         label = mode.label(),
-        channel_type, "agent exceeded {MAX_TOOL_STEPS} steps"
+        max_steps, channel_type, "agent exceeded max tool steps"
     );
     Ok(LoopResult {
         text: None,
@@ -522,9 +538,21 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .save_message("user", &save_text, params.channel_type)
         .await?;
 
+    let agent_name = params
+        .home_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let span = info_span!(
+        "agent_turn",
+        agent = %agent_name,
+        mode = "conversation",
+        channel = %params.channel_type,
+    );
+
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_agent_inner(params),
+        run_agent_inner(params).instrument(span),
     )
     .await;
 
@@ -581,6 +609,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         global_home_dir: params.global_home_dir,
         channel_type: Some(params.channel_type),
         telegram_configured: chat_id.is_some(),
+        home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -664,6 +693,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
+        is_reflection: false,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -903,6 +933,8 @@ async fn execute_tool(
     skill_timeout: u64,
     mcp_manager: Option<&McpManager>,
 ) -> ToolOutput {
+    debug!(tool = %name, "tool_execution");
+
     // 1. Try builtin tool
     if let Some(tool) = tools.get(name) {
         let timeout = tool.timeout_secs().unwrap_or(TOOL_TIMEOUT_SECS);
@@ -976,6 +1008,7 @@ async fn execute_tool(
 pub enum SilentTrigger {
     Heartbeat,
     Reminder { id: i64, message: String },
+    Reflection,
 }
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
@@ -1003,11 +1036,19 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     let channel_type = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reminder { .. } => "reminder",
+        SilentTrigger::Reflection => "reflection",
     };
+
+    let silent_span = info_span!(
+        "agent_turn",
+        agent = %params.home_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
+        mode = "silent",
+        trigger = %channel_type,
+    );
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_silent_inner(params, channel_type),
+        run_silent_inner(params, channel_type).instrument(silent_span),
     )
     .await;
 
@@ -1030,6 +1071,13 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
             if let SilentTrigger::Reminder { id, .. } = &params.trigger {
                 params.db.mark_reminder_failed(*id).await?;
             }
+            // Record failed reflection run on timeout
+            if matches!(&params.trigger, SilentTrigger::Reflection) {
+                let _ = params
+                    .db
+                    .record_reflection_run("failed", 0, Some("Timed out"))
+                    .await;
+            }
             Ok(())
         }
     }
@@ -1042,6 +1090,63 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
 
     let ctx = load_agent_context(db, params.home_dir).await?;
     let pending_commitments = db.list_commitments("pending").await?;
+
+    // For reflection, prepare conversation and memory event digests
+    let (conversations_digest, memory_events_digest) =
+        if matches!(&params.trigger, SilentTrigger::Reflection) {
+            let tz_str = db
+                .get_customer_config("timezone")
+                .await?
+                .unwrap_or_else(|| "UTC".to_string());
+            let midnight_str = crate::db::today_midnight_utc(&tz_str)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+
+            // Load today's conversations (capped at 50,000 chars)
+            let conversations = db.get_conversations_since(&midnight_str).await?;
+            let conv_digest = if conversations.is_empty() {
+                None
+            } else {
+                let mut buf = String::new();
+                for msg in &conversations {
+                    let line = format!("[{}] {}: {}\n", msg.created_at, msg.role, msg.content);
+                    if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
+                        buf.push_str("... (truncated)\n");
+                        break;
+                    }
+                    buf.push_str(&line);
+                }
+                Some(buf)
+            };
+
+            // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
+            let memory_events = db.get_memory_events_since(&midnight_str).await?;
+            let mem_digest = if memory_events.is_empty() {
+                None
+            } else {
+                let mut buf = String::new();
+                for evt in &memory_events {
+                    let line = format!(
+                        "[{}] {} on {}: {} -> {}\n",
+                        evt.created_at,
+                        evt.tool_name,
+                        evt.target_key,
+                        evt.before_value.as_deref().unwrap_or("(none)"),
+                        evt.after_value
+                    );
+                    if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
+                        buf.push_str("... (truncated)\n");
+                        break;
+                    }
+                    buf.push_str(&line);
+                }
+                Some(buf)
+            };
+
+            (conv_digest, mem_digest)
+        } else {
+            (None, None)
+        };
 
     let trigger_context = match &params.trigger {
         SilentTrigger::Heartbeat => {
@@ -1057,6 +1162,32 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                  Deliver this reminder using send_message, adding any relevant context."
             )
         }
+        SilentTrigger::Reflection => {
+            "You are in REFLECTION mode. This is your daily end-of-day review.\n\n\
+             Your job: Review today's conversations and recently stored facts. Update your\n\
+             memory to better serve the user tomorrow.\n\n\
+             ## Available tools\n\n\
+             - update_core_memory: Edit persistent core memory blocks\n\
+             - store_fact: Store new facts (person, commitment, preference, event)\n\
+             - update_fact: Update commitment status (completed/cancelled)\n\
+             - search_memory: Search existing facts\n\n\
+             ## What to do\n\n\
+             1. HOUSEKEEPING: Scan for duplicate or redundant facts. Consolidate them\n\
+                using update_fact (mark stale commitments as cancelled) or store_fact\n\
+                (store consolidated versions of fragmented information).\n\n\
+             2. PROMOTION: If important patterns in Layer 2 facts deserve a place in core\n\
+                memory, promote them via update_core_memory. Core memory is precious\n\
+                (2000 tokens) — only promote information useful in most future conversations.\n\n\
+             3. INSIGHT: Look for themes across today's conversations. Has the user's\n\
+                focus shifted? Are there emerging priorities? New people becoming important?\n\n\
+             ## Rules\n\n\
+             - Only update based on things the user EXPLICITLY said or did\n\
+             - Never infer preferences from a single data point\n\
+             - The evidence field MUST cite a specific conversation timestamp and quote\n\
+             - If unsure whether to update, DON'T — you can learn it more clearly tomorrow\n\
+             - Prioritize: you have a maximum of 5 core memory edits this session"
+                .to_string()
+        }
     };
 
     let chat_id = db.get_customer_config("chat_id").await?;
@@ -1070,6 +1201,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         timezone: ctx.timezone,
         telegram_configured: chat_id.is_some(),
         has_message_sender: params.message_sender.is_some(),
+        recent_conversations: conversations_digest.as_deref(),
+        recent_memory_events: memory_events_digest.as_deref(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -1081,10 +1214,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         system.push_str("\n</context>\n");
     }
 
-    // Match skills: heartbeat uses safe always-on skills (no exec/http handlers),
+    // Match skills: heartbeat/reflection use safe always-on skills (no exec/http handlers),
     // reminders use keyword matching against the reminder message.
     let matched = match &params.trigger {
-        SilentTrigger::Heartbeat => params.skills.safe_always_on_skills(),
+        SilentTrigger::Heartbeat | SilentTrigger::Reflection => {
+            params.skills.safe_always_on_skills()
+        }
         SilentTrigger::Reminder { message, .. } => params.skills.match_message(message),
     };
     let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
@@ -1097,6 +1232,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         SilentTrigger::Reminder { message, .. } => {
             format!("[reminder trigger: <reminder-data>{message}</reminder-data>]")
         }
+        SilentTrigger::Reflection => "[reflection trigger]".to_string(),
     };
 
     let messages = vec![Message {
@@ -1104,6 +1240,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         content: MessageContent::Text(user_msg),
     }];
 
+    let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
@@ -1115,6 +1252,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
+        is_reflection,
     };
 
     let mut request = MessagesRequest {
@@ -1144,6 +1282,47 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     )
     .await?;
 
+    // Post-loop: record reflection results and optionally notify user
+    if is_reflection {
+        let changes = db
+            .count_memory_events_for_session(params.session_id)
+            .await
+            .unwrap_or(0);
+
+        // Build summary from memory events
+        let summary = if changes > 0 {
+            let events = db.get_memory_events(params.session_id).await?;
+            let lines: Vec<String> = events
+                .iter()
+                .map(|e| format!("  - {} on {}", e.tool_name, e.target_key))
+                .collect();
+            Some(format!(
+                "Daily reflection — {changes} update{}:\n{}",
+                if changes == 1 { "" } else { "s" },
+                lines.join("\n")
+            ))
+        } else {
+            None
+        };
+
+        db.record_reflection_run("completed", changes, summary.as_deref())
+            .await?;
+
+        // Opt-in notification: send summary if configured and changes were made
+        if let Some(ref summary_text) = summary {
+            let should_notify = ctx.identity.reflection.as_ref().is_some_and(|r| r.notify);
+            if let (true, Some(sender)) = (should_notify, &params.message_sender) {
+                let _ = sender.send(summary_text).await;
+            }
+        }
+
+        info!(
+            changes = changes,
+            session_id = params.session_id,
+            "reflection completed"
+        );
+    }
+
     Ok(())
 }
 
@@ -1165,6 +1344,8 @@ pub struct TeamAgentParams<'a> {
     pub skills_dirty: &'a AtomicBool,
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
+    /// Agent name for per-agent log filtering in team runs.
+    pub agent_name: &'a str,
 }
 
 /// Run an agent within a team execution context.
@@ -1178,7 +1359,7 @@ pub struct TeamAgentParams<'a> {
 ///   or `None` for tool-use-only turns.
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let timeout_result = tokio::time::timeout(
-        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
+        Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS),
         run_team_agent_inner(params),
     )
     .await;
@@ -1187,7 +1368,7 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
         Ok(result) => result,
         Err(_elapsed) => {
             warn!(
-                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
+                timeout_secs = TEAM_AGENT_TIMEOUT_SECS,
                 "team agent loop total timeout exceeded"
             );
             Ok(Some(
@@ -1198,6 +1379,12 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
 }
 
 async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
+    run_team_agent_inner_impl(params)
+        .instrument(tracing::info_span!("team_agent", agent = %params.agent_name))
+        .await
+}
+
+async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let claude = params.claude;
     let tools = params.tools;
 
@@ -1213,6 +1400,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
         telegram_configured: false,
+        home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
@@ -1249,6 +1437,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
+        is_reflection: false,
     };
 
     let mut request = MessagesRequest {
@@ -1279,7 +1468,49 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
     .await?;
 
     if result.max_steps_exceeded {
-        return Ok(Some("Agent exceeded maximum tool steps.".to_string()));
+        // Continuation turn: strip tools, ask agent to summarize what it accomplished.
+        // Same pattern as the CLI conversation loop.
+        if let Some(ref mut system) = request.system {
+            system.truncate(result.system_prompt_original_len);
+        }
+        request.tools = None;
+        request.thinking = None;
+        request.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(
+                "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
+            ),
+        });
+
+        let continuation = tokio::time::timeout(
+            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
+            claude.send_message(&request),
+        )
+        .await;
+
+        let text = match continuation {
+            Ok(Ok(resp)) => {
+                let t = resp.text();
+                if t.is_empty() {
+                    format_step_exceeded_fallback(&result.tool_call_summaries)
+                } else {
+                    t
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "team agent continuation turn API error");
+                format_step_exceeded_fallback(&result.tool_call_summaries)
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                    "team agent continuation turn timed out"
+                );
+                format_step_exceeded_fallback(&result.tool_call_summaries)
+            }
+        };
+
+        return Ok(Some(text));
     }
 
     Ok(result.text)

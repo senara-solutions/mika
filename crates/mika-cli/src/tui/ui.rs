@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
-use crate::tui::app::{AgentStatus, App, ChatRole};
+use crate::tui::app::{AgentStatus, App, ChatRole, DashboardAgentStatus};
 use crate::tui::markdown;
 
 /// Build a yellow `[channel] ` prefix span for non-CLI messages.
@@ -132,33 +132,58 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     .split(f.area());
 
     draw_header(f, app, chunks[0]);
-    draw_messages(f, app, chunks[1]);
+
+    // Split-pane: show dashboard panel when team dashboard is active and terminal is wide enough
+    let show_dashboard = app.team_dashboard.is_some() && chunks[1].width >= 80;
+    if show_dashboard {
+        let horiz = Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(chunks[1]);
+        draw_messages(f, app, horiz[0]);
+        draw_team_dashboard(f, app, horiz[1]);
+    } else {
+        draw_messages(f, app, chunks[1]);
+    }
+
     draw_input(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
 
     // Autocomplete popup (rendered last to overlay)
-    if app.autocomplete.visible && !app.autocomplete.items.is_empty() {
+    if app.autocomplete.visible() && app.autocomplete.item_count() > 0 {
         draw_autocomplete(f, app, chunks[2]);
     }
 }
 
 fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let now = chrono::Utc::now().format("%H:%M UTC");
-    let short_session = &app.session_id[..8.min(app.session_id.len())];
-    let header = Line::from(vec![
-        Span::styled(
-            format!(" \u{2726} {} ", app.identity_name),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("\u{2014} session {short_session}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("   "),
-        Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
-    ]);
+
+    let header = if app.is_team_mode() {
+        Line::from(vec![
+            Span::styled(
+                format!(" \u{2726} {} ", app.identity_name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        let short_session = &app.session_id[..8.min(app.session_id.len())];
+        Line::from(vec![
+            Span::styled(
+                format!(" \u{2726} {} ", app.identity_name),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("\u{2014} session {short_session}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("   "),
+            Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
+        ])
+    };
     f.render_widget(Paragraph::new(header), area);
 }
 
@@ -390,63 +415,115 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
 fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let status_text = match &app.status {
         AgentStatus::Idle => "ready",
-        AgentStatus::Thinking => "thinking...",
+        AgentStatus::Thinking => {
+            if app.is_team_mode() {
+                "running..."
+            } else {
+                "thinking..."
+            }
+        }
         AgentStatus::Responding(_) => "responding...",
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", app.agent_name),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{} ", app.model),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            status_text.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-
-    // Thinking level indicator (always shown)
-    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-    match app.thinking_level {
-        Some((_, level)) => {
-            spans.push(Span::styled(
-                format!("think: {level}"),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-        None => {
-            spans.push(Span::styled(
-                "think: off",
+    let mut spans = if app.is_team_mode() {
+        // Team mode: show dashboard summary when active
+        let team_name = app.team_name.as_deref().unwrap_or("team");
+        let mut s = vec![
+            Span::styled(
+                format!(" team: {team_name} "),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                status_text.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if let Some(ref dash) = app.team_dashboard {
+            let elapsed = dash.run_started.elapsed().as_secs();
+            let total = dash.agents.len();
+            let done = dash
+                .agents
+                .iter()
+                .filter(|a| a.status == DashboardAgentStatus::Completed)
+                .count();
+            if total > 0 {
+                s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                s.push(Span::styled(
+                    format!("agents: {done}/{total}"),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            s.push(Span::styled(
+                format!("{elapsed}s"),
                 Style::default().fg(Color::DarkGray),
             ));
+            if let Some(ref phase) = dash.phase {
+                s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                s.push(Span::styled(
+                    format!("{phase}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
         }
-    }
+        s
+    } else {
+        let mut s = vec![
+            Span::styled(
+                format!(" {} ", app.agent_name),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ", app.model),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                status_text.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
 
-    // Context usage indicator
-    if let Some(tokens) = app.context_tokens {
-        let limit = crate::tui::app::MODEL_CONTEXT_LIMIT;
-        let pct = (tokens as f64 / limit as f64 * 100.0) as u32;
-        let tokens_k = tokens / 1000;
-        let limit_k = limit / 1000;
-        let color = if pct > 80 {
-            Color::Red
-        } else if pct > 50 {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            format!("ctx: {tokens_k}k/{limit_k}k ({pct}%)"),
-            Style::default().fg(color),
-        ));
-    }
+        // Thinking level indicator (always shown in agent mode)
+        s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        match app.thinking_level {
+            Some((_, level)) => {
+                s.push(Span::styled(
+                    format!("think: {level}"),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            None => {
+                s.push(Span::styled(
+                    "think: off",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
+        // Context usage indicator
+        if let Some(tokens) = app.context_tokens {
+            let limit = crate::tui::app::MODEL_CONTEXT_LIMIT;
+            let pct = (tokens as f64 / limit as f64 * 100.0) as u32;
+            let tokens_k = tokens / 1000;
+            let limit_k = limit / 1000;
+            let color = if pct > 80 {
+                Color::Red
+            } else if pct > 50 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            s.push(Span::styled(
+                format!("ctx: {tokens_k}k/{limit_k}k ({pct}%)"),
+                Style::default().fg(color),
+            ));
+        }
+        s
+    };
 
     // Scroll / new-message indicator
     if app.scroll_offset > 0 {
@@ -481,45 +558,185 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     f.render_widget(Paragraph::new(footer), area);
 }
 
+fn draw_team_dashboard(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
+    let dash = match &app.team_dashboard {
+        Some(d) => d,
+        None => return,
+    };
+
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Dashboard ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Phase + iteration
+    let phase_str = dash
+        .phase
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "starting".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("Phase: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(phase_str, Style::default().fg(Color::Cyan)),
+    ]));
+    if dash.iteration > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Iter:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", dash.iteration),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // Agent status grid
+    if !dash.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Agents:",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for agent in &dash.agents {
+            let (icon, color) = match agent.status {
+                DashboardAgentStatus::Running => ("\u{2026}", Color::Yellow), // …
+                DashboardAgentStatus::Completed => ("\u{2713}", Color::Green), // ✓
+                DashboardAgentStatus::Failed => ("\u{2717}", Color::Red),     // ✗
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                Span::styled(agent.name.clone(), Style::default().fg(color)),
+                Span::styled(
+                    format!(" ({})", agent.role),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Elapsed time
+    let elapsed = dash.run_started.elapsed();
+    let secs = elapsed.as_secs();
+    let elapsed_str = if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Elapsed: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(elapsed_str, Style::default().fg(Color::White)),
+    ]));
+
+    // Agent completion summary
+    let total = dash.agents.len();
+    let done = dash
+        .agents
+        .iter()
+        .filter(|a| a.status == DashboardAgentStatus::Completed)
+        .count();
+    if total > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Done:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{done}/{total}"), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(paragraph, inner);
+}
+
 fn draw_autocomplete(f: &mut Frame<'_>, app: &App<'_>, input_area: Rect) {
-    let item_count = app.autocomplete.items.len().min(10);
+    use crate::tui::commands::autocomplete::CompletionMode;
+
+    let item_count = app.autocomplete.item_count().min(10);
     let popup_height = item_count as u16 + 2; // +2 for border
+    let selected = app.autocomplete.selected_index();
+    let title = app.autocomplete.title();
+
+    // Adapt width based on completion mode
+    let max_width = match &app.autocomplete.mode {
+        CompletionMode::Argument { wide: true, .. } => {
+            80u16.min(input_area.width.saturating_sub(2))
+        }
+        _ => 55u16.min(input_area.width.saturating_sub(2)),
+    };
 
     let popup_area = Rect {
         x: input_area.x + 2,
         y: input_area.y.saturating_sub(popup_height),
-        width: 50.min(input_area.width.saturating_sub(2)),
+        width: max_width,
         height: popup_height,
     };
 
     // Clear the area behind the popup
     f.render_widget(Clear, popup_area);
 
-    let items: Vec<ListItem<'_>> = app
-        .autocomplete
-        .items
-        .iter()
-        .take(10)
-        .enumerate()
-        .map(|(i, cmd)| {
-            let args = cmd.args_hint.unwrap_or("");
-            let text = format!("/{} {} — {}", cmd.name, args, cmd.description);
-            let style = if i == app.autocomplete.selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(Line::from(vec![Span::styled(text, style)]))
-        })
-        .collect();
+    let items: Vec<ListItem<'_>> = match &app.autocomplete.mode {
+        CompletionMode::Command { items, .. } => items
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(i, cmd)| {
+                let args = cmd.args_hint.unwrap_or("");
+                let text = format!("/{} {} \u{2014} {}", cmd.name, args, cmd.description);
+                let style = if i == selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(Line::from(vec![Span::styled(text, style)]))
+            })
+            .collect(),
+        CompletionMode::Argument { items, .. } => items
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(i, item)| {
+                let text = if let Some(ref desc) = item.description {
+                    format!("{} \u{2014} {desc}", item.value)
+                } else {
+                    item.value.clone()
+                };
+                let style = if i == selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(Line::from(vec![Span::styled(text, style)]))
+            })
+            .collect(),
+        CompletionMode::Hidden => vec![],
+    };
+
+    // Add scroll indicator if more items than visible
+    let total = app.autocomplete.item_count();
+    let display_title = if total > 10 {
+        format!("{title}({total}) ")
+    } else {
+        title.to_string()
+    };
 
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Commands "),
+            .title(display_title),
     );
 
     f.render_widget(list, popup_area);

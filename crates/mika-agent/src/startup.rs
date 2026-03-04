@@ -30,7 +30,11 @@ pub fn seed_core_memory_if_empty(db: &Database, home_dir: &Path) -> Result<()> {
 /// When `disabled` is true, skips seeding entirely (useful for debugging handlers).
 pub fn seed_bundled_skills_if_needed(home_dir: &Path, disabled: bool) {
     if disabled {
-        tracing::warn!("bundled skill seeding disabled by config");
+        tracing::warn!(
+            "bundled skill seeding disabled by config \
+             (MIKA_DISABLE_BUNDLED_SKILLS=true) — handler script security updates \
+             will not be applied; set to false or remove to re-enable"
+        );
         return;
     }
     let skills_dir = home_dir.join("skills");

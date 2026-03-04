@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bundled_skills::is_bundled_skill;
+use crate::skills::marketplace::is_marketplace_skill;
 
 pub struct ListSkillsTool;
 
@@ -49,8 +50,11 @@ impl Tool for ListSkillsTool {
                 ""
             };
             let tools_count = entry.skill_tools.len();
-            let origin = if is_bundled_skill(&entry.manifest.skill.name) {
+            let name = &entry.manifest.skill.name;
+            let origin = if is_bundled_skill(name) {
                 " [built-in]"
+            } else if is_marketplace_skill(ctx.home_dir, name) {
+                " [marketplace]"
             } else {
                 " [custom]"
             };

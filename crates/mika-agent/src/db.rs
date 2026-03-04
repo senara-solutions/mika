@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Once;
@@ -6,6 +7,8 @@ use tracing::{debug, info};
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
 /// Idempotent — uses an internal Once guard so multiple calls are safe.
+/// Auto-called by [`Database::open`] and [`Database::open_in_memory`], so
+/// callers typically don't need to invoke this directly.
 pub fn init_sqlite_vec() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -22,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -52,8 +55,9 @@ pub struct Database {
 
 impl Database {
     /// Open (or create) a per-customer SQLite database at `path`.
-    /// Runs migrations automatically.
+    /// Runs migrations automatically. Registers sqlite-vec if not already done.
     pub fn open(path: &Path) -> Result<Self> {
+        init_sqlite_vec();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
 
@@ -75,7 +79,9 @@ impl Database {
     }
 
     /// Open an in-memory database (for tests).
+    /// Registers sqlite-vec if not already done.
     pub fn open_in_memory() -> Result<Self> {
+        init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("failed to set pragmas")?;
@@ -138,6 +144,15 @@ impl Database {
         }
         if version < 8 {
             self.migrate_v8()?;
+        }
+        if version < 9 {
+            self.migrate_v9()?;
+        }
+        if version < 10 {
+            self.migrate_v10()?;
+        }
+        if version < 11 {
+            self.migrate_v11()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -407,6 +422,353 @@ impl Database {
             .context("failed to create vec_search table")?;
 
         Ok(())
+    }
+
+    fn migrate_v9(&self) -> Result<()> {
+        info!(
+            "applying migration v9: convert reminders.fire_at from TEXT to INTEGER (unix timestamp)"
+        );
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            -- Add new integer column
+            ALTER TABLE reminders ADD COLUMN fire_at_unix INTEGER;
+
+            -- Backfill: unixepoch() handles both 'T' and space separators
+            UPDATE reminders SET fire_at_unix = unixepoch(fire_at);
+
+            -- Guard: mark any reminders with unparseable fire_at as failed
+            -- (unixepoch returns NULL for invalid input)
+            UPDATE reminders SET status = 'failed'
+                WHERE fire_at_unix IS NULL AND status = 'pending';
+            -- Set a safe default for non-pending rows with NULL (delivered/cancelled/failed)
+            UPDATE reminders SET fire_at_unix = 0 WHERE fire_at_unix IS NULL;
+
+            -- Must drop index before dropping the column (SQLite constraint)
+            DROP INDEX IF EXISTS idx_reminders_status_fire_at;
+
+            -- Drop old text column (requires SQLite 3.35+)
+            ALTER TABLE reminders DROP COLUMN fire_at;
+
+            -- Rename new column to fire_at
+            ALTER TABLE reminders RENAME COLUMN fire_at_unix TO fire_at;
+
+            -- Recreate index on the new integer column
+            CREATE INDEX idx_reminders_status_fire_at ON reminders(status, fire_at);
+
+            INSERT INTO schema_version (version) VALUES (9);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v9")?;
+
+        Ok(())
+    }
+
+    fn migrate_v10(&self) -> Result<()> {
+        info!("applying migration v10: reflection_runs table for periodic memory reflection");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS reflection_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ran_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'completed',
+                changes_made INTEGER DEFAULT 0,
+                summary TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_reflection_runs_ran_at ON reflection_runs(ran_at);
+
+            CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
+
+            INSERT INTO schema_version (version) VALUES (10);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v10")?;
+
+        Ok(())
+    }
+
+    fn migrate_v11(&self) -> Result<()> {
+        info!(
+            "applying migration v11: team_runs and team_messages tables for graph-structured team persistence"
+        );
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS team_runs (
+                id TEXT PRIMARY KEY,
+                team_name TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                failure_reason TEXT,
+                iteration INTEGER NOT NULL DEFAULT 0,
+                max_iterations INTEGER NOT NULL DEFAULT 3,
+                deliverable TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_team_runs_team_started ON team_runs(team_name, started_at);
+
+            CREATE TABLE IF NOT EXISTS team_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES team_runs(id),
+                parent_id INTEGER REFERENCES team_messages(id),
+                agent_name TEXT,
+                message_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                iteration INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_team_messages_run ON team_messages(run_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_team_messages_parent ON team_messages(parent_id);
+
+            INSERT INTO schema_version (version) VALUES (11);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v11")?;
+
+        Ok(())
+    }
+
+    // -- Team Runs --
+
+    /// Insert a new team run record. Returns the run_id.
+    pub fn insert_team_run(
+        &self,
+        run_id: &str,
+        team_name: &str,
+        goal: &str,
+        max_iterations: u32,
+        started_at: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_name, goal, status, max_iterations, started_at)
+                 VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+                rusqlite::params![run_id, team_name, goal, max_iterations, started_at],
+            )
+            .context("failed to insert team run")?;
+        Ok(())
+    }
+
+    /// Update a team run's status, iteration, deliverable, and end time.
+    pub fn update_team_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        failure_reason: Option<&str>,
+        iteration: u32,
+        deliverable: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
+                 deliverable = ?4, ended_at = ?5 WHERE id = ?6",
+                rusqlite::params![
+                    status,
+                    failure_reason,
+                    iteration,
+                    deliverable,
+                    ended_at,
+                    run_id
+                ],
+            )
+            .context("failed to update team run")?;
+        Ok(())
+    }
+
+    /// Load recent team runs, most recent first.
+    pub fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
+                    deliverable, started_at, ended_at
+             FROM team_runs WHERE team_name = ?1
+             ORDER BY started_at DESC LIMIT ?2",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![team_name, limit], |row| {
+                Ok(TeamRunRow {
+                    id: row.get(0)?,
+                    team_name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    failure_reason: row.get(4)?,
+                    iteration: row.get(5)?,
+                    max_iterations: row.get(6)?,
+                    deliverable: row.get(7)?,
+                    started_at: row.get(8)?,
+                    ended_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to load team runs")?;
+
+        Ok(rows)
+    }
+
+    /// Load recent team runs with goal and deliverable truncated in SQL.
+    ///
+    /// Used for prompt injection where full text is unnecessary.
+    /// `max_text_len` controls the `SUBSTR` limit for both fields.
+    pub fn load_team_runs_for_prompt(
+        &self,
+        team_name: &str,
+        limit: usize,
+        max_text_len: usize,
+    ) -> Result<Vec<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, SUBSTR(goal, 1, ?3), status, failure_reason,
+                    iteration, max_iterations, SUBSTR(deliverable, 1, ?3),
+                    started_at, ended_at
+             FROM team_runs WHERE team_name = ?1
+             ORDER BY started_at DESC LIMIT ?2",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![team_name, limit, max_text_len], |row| {
+                Ok(TeamRunRow {
+                    id: row.get(0)?,
+                    team_name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    failure_reason: row.get(4)?,
+                    iteration: row.get(5)?,
+                    max_iterations: row.get(6)?,
+                    deliverable: row.get(7)?,
+                    started_at: row.get(8)?,
+                    ended_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to load team runs for prompt")?;
+
+        Ok(rows)
+    }
+
+    /// Load the latest team run for a team.
+    pub fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let mut runs = self.load_team_runs(team_name, 1)?;
+        Ok(runs.pop())
+    }
+
+    /// Load a specific team run by its ID.
+    pub fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
+                    deliverable, started_at, ended_at
+             FROM team_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([run_id], |row| {
+            Ok(TeamRunRow {
+                id: row.get(0)?,
+                team_name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                failure_reason: row.get(4)?,
+                iteration: row.get(5)?,
+                max_iterations: row.get(6)?,
+                deliverable: row.get(7)?,
+                started_at: row.get(8)?,
+                ended_at: row.get(9)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    // -- Team Messages --
+
+    /// Insert a team message and return its id.
+    pub fn insert_team_message(
+        &self,
+        run_id: &str,
+        parent_id: Option<i64>,
+        agent_name: Option<&str>,
+        message_type: &str,
+        content: &str,
+        iteration: u32,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO team_messages (run_id, parent_id, agent_name, message_type, content, iteration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![run_id, parent_id, agent_name, message_type, content, iteration],
+            )
+            .context("failed to insert team message")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Load all messages for a team run, ordered by creation time.
+    pub fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, parent_id, agent_name, message_type, content, iteration, created_at
+             FROM team_messages WHERE run_id = ?1 ORDER BY created_at, id",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![run_id], |row| {
+                Ok(TeamMessageRow {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    parent_id: row.get(2)?,
+                    agent_name: row.get(3)?,
+                    message_type: row.get(4)?,
+                    content: row.get(5)?,
+                    iteration: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to load team messages")?;
+
+        Ok(rows)
+    }
+
+    /// Load assignment message IDs for a specific run and iteration.
+    ///
+    /// Returns a map of agent_name -> message_id for assignment messages,
+    /// used for parent-linking agent responses to their assignments.
+    pub fn load_assignment_msg_ids(
+        &self,
+        run_id: &str,
+        iteration: u32,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_name FROM team_messages
+             WHERE run_id = ?1 AND message_type = 'assignment' AND iteration = ?2
+             ORDER BY id",
+        )?;
+        let map = stmt
+            .query_map(rusqlite::params![run_id, iteration], |row| {
+                let id: i64 = row.get(0)?;
+                let agent: Option<String> = row.get(1)?;
+                Ok((agent, id))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(agent, id)| agent.map(|name| (name, id)))
+            .collect();
+        Ok(map)
     }
 
     // -- Conversations --
@@ -844,8 +1206,9 @@ impl Database {
 
     // -- Reminders --
 
-    /// Add a new reminder. Returns the reminder ID.
-    pub fn add_reminder(&self, fire_at: &str, message: &str) -> Result<i64> {
+    /// Add a new reminder. `fire_at` is a Unix timestamp (seconds since epoch).
+    /// Returns the reminder ID.
+    pub fn add_reminder(&self, fire_at: i64, message: &str) -> Result<i64> {
         self.conn
             .execute(
                 "INSERT INTO reminders (fire_at, message) VALUES (?1, ?2)",
@@ -864,11 +1227,11 @@ impl Database {
             }
             ReminderFilter::Future => {
                 "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' AND fire_at > datetime('now') ORDER BY fire_at ASC"
+                 FROM reminders WHERE status = 'pending' AND fire_at > unixepoch('now') ORDER BY fire_at ASC"
             }
             ReminderFilter::PastDue => {
                 "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' AND fire_at <= datetime('now') ORDER BY fire_at ASC"
+                 FROM reminders WHERE status = 'pending' AND fire_at <= unixepoch('now') ORDER BY fire_at ASC"
             }
         };
         let mut stmt = self.conn.prepare_cached(sql)?;
@@ -962,29 +1325,9 @@ impl Database {
     /// Computes the local start-of-day boundary using chrono-tz, then counts
     /// sends with `sent_at >= local_midnight_utc`.
     pub fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
-        use chrono::{Datelike, NaiveDate, Utc};
-        use chrono_tz::Tz;
-
-        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-
-        // Current time in the customer's timezone
-        let now_local = Utc::now().with_timezone(&tz);
-        // Start of today in customer's local time
-        let local_midnight =
-            NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
-                .unwrap_or_else(|| Utc::now().date_naive())
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid");
-
-        // Convert local midnight back to UTC for SQL comparison
-        // Use the earliest possible time if ambiguous (e.g., DST transitions)
-        let midnight_utc = local_midnight
-            .and_local_timezone(tz)
-            .earliest()
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let boundary = midnight_utc.format("%Y-%m-%d %H:%M:%S").to_string();
+        let boundary = today_midnight_utc(timezone)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         let count: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= ?1",
@@ -1006,6 +1349,134 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+}
+
+/// Compute today's midnight in the given timezone, converted to UTC.
+///
+/// Falls back to UTC if the timezone string is invalid. Handles DST
+/// ambiguity by choosing the earliest possible time.
+pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{Datelike, NaiveDate, Utc};
+    use chrono_tz::Tz;
+
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    let now_local = Utc::now().with_timezone(&tz);
+    let local_midnight =
+        NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
+            .unwrap_or_else(|| Utc::now().date_naive())
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid");
+
+    local_midnight
+        .and_local_timezone(tz)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now)
+}
+
+impl Database {
+    // -- Reflection --
+
+    /// Get conversation messages since a given UTC boundary timestamp.
+    /// Excludes reflection channel messages to avoid self-referential loops.
+    pub fn get_conversations_since(&self, since_utc: &str) -> Result<Vec<ConversationMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, channel_type, metadata, created_at
+             FROM conversations
+             WHERE created_at >= ?1
+               AND channel_type != 'reflection'
+             ORDER BY id
+             LIMIT 500",
+        )?;
+
+        let messages: Vec<ConversationMessage> = stmt
+            .query_map([since_utc], |row| {
+                Ok(ConversationMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    channel_type: row.get(3)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(messages)
+    }
+
+    /// Get memory events since a given UTC boundary timestamp.
+    pub fn get_memory_events_since(&self, since_utc: &str) -> Result<Vec<MemoryEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning, created_at
+             FROM memory_events
+             WHERE created_at >= ?1
+             ORDER BY id",
+        )?;
+
+        let events: Vec<MemoryEvent> = stmt
+            .query_map([since_utc], |row| {
+                Ok(MemoryEvent {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    target_key: row.get(3)?,
+                    before_value: row.get(4)?,
+                    after_value: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(events)
+    }
+
+    /// Delete reflection runs older than `days` days.
+    pub fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86_400);
+        let deleted = self
+            .conn
+            .execute("DELETE FROM reflection_runs WHERE ran_at < ?1", [cutoff])?;
+        Ok(deleted)
+    }
+
+    /// Record a reflection run for rate limiting and audit.
+    pub fn record_reflection_run(
+        &self,
+        status: &str,
+        changes_made: i64,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let now_unix = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO reflection_runs (ran_at, status, changes_made, summary) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![now_unix, status, changes_made, summary],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a reflection has already run today (any status) in the user's timezone.
+    pub fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
+        let midnight_unix = today_midnight_utc(timezone).timestamp();
+
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reflection_runs WHERE ran_at >= ?1",
+            [midnight_unix],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Count memory events for a given session (used to count reflection changes).
+    pub fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     // -- Failed Sends --
@@ -1965,6 +2436,41 @@ pub struct ConversationMessage {
     pub created_at: String,
 }
 
+/// Format a Unix timestamp as an ISO 8601 UTC string.
+pub fn format_unix_ts(ts: i64) -> String {
+    DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|dt: DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// A row from the `team_runs` table.
+#[derive(Debug, Clone)]
+pub struct TeamRunRow {
+    pub id: String,
+    pub team_name: String,
+    pub goal: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub deliverable: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+/// A row from the `team_messages` table.
+#[derive(Debug, Clone)]
+pub struct TeamMessageRow {
+    pub id: i64,
+    pub run_id: String,
+    pub parent_id: Option<i64>,
+    pub agent_name: Option<String>,
+    pub message_type: String,
+    pub content: String,
+    pub iteration: u32,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreMemoryEntry {
     pub key: String,
@@ -2013,11 +2519,20 @@ pub struct Event {
 #[derive(Debug, Clone)]
 pub struct Reminder {
     pub id: i64,
-    pub fire_at: String,
+    pub fire_at: i64,
     pub message: String,
     pub status: String,
     pub created_at: String,
     pub delivered_at: Option<String>,
+}
+
+impl Reminder {
+    /// Format `fire_at` unix timestamp as a human-readable UTC string.
+    pub fn display_fire_at(&self) -> String {
+        DateTime::from_timestamp(self.fire_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| self.fire_at.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2065,7 +2580,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2078,7 +2593,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2399,12 +2914,10 @@ mod tests {
         let db = test_db();
 
         // Create two reminders: one in the past, one in the future
-        let past_id = db
-            .add_reminder("2020-01-01T00:00:00Z", "past reminder")
-            .unwrap();
-        let future_id = db
-            .add_reminder("2099-12-31T23:59:59Z", "future reminder")
-            .unwrap();
+        // 2020-01-01T00:00:00Z
+        let past_id = db.add_reminder(1_577_836_800, "past reminder").unwrap();
+        // 2099-12-31T23:59:59Z
+        let future_id = db.add_reminder(4_102_444_799, "future reminder").unwrap();
         assert!(past_id > 0);
         assert!(future_id > past_id);
 
@@ -2437,9 +2950,7 @@ mod tests {
     #[test]
     fn test_cancel_nonpending_reminder() {
         let db = test_db();
-        let id = db
-            .add_reminder("2020-01-01T00:00:00Z", "already delivered")
-            .unwrap();
+        let id = db.add_reminder(1_577_836_800, "already delivered").unwrap();
         db.mark_reminder_delivered(id).unwrap();
 
         // Cancelling a delivered reminder returns false
@@ -2450,9 +2961,7 @@ mod tests {
     #[test]
     fn test_mark_reminder_failed() {
         let db = test_db();
-        let id = db
-            .add_reminder("2020-01-01T00:00:00Z", "will fail")
-            .unwrap();
+        let id = db.add_reminder(1_577_836_800, "will fail").unwrap();
         db.mark_reminder_failed(id).unwrap();
 
         let pending = db.get_pending_reminders().unwrap();
@@ -2462,11 +2971,10 @@ mod tests {
     #[test]
     fn test_get_pending_reminders_excludes_cancelled() {
         let db = test_db();
-        db.add_reminder("2099-01-01T00:00:00Z", "active one")
-            .unwrap();
-        let id2 = db
-            .add_reminder("2099-02-01T00:00:00Z", "will cancel")
-            .unwrap();
+        // 2099-01-01T00:00:00Z
+        db.add_reminder(4_070_908_800, "active one").unwrap();
+        // 2099-02-01T00:00:00Z
+        let id2 = db.add_reminder(4_073_587_200, "will cancel").unwrap();
         db.cancel_reminder(id2).unwrap();
 
         let active = db.get_pending_reminders().unwrap();
@@ -3318,5 +3826,146 @@ mod tests {
             configs[1],
             ("timezone".to_string(), "Asia/Singapore".to_string())
         );
+    }
+
+    // -- Reflection --
+
+    #[test]
+    fn test_v10_reflection_runs_table_exists() {
+        let db = test_db();
+        // Table should exist after migration
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM reflection_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_record_and_check_reflection_run() {
+        let db = test_db();
+        db.record_reflection_run("completed", 3, Some("Promoted 2 facts, pruned 1"))
+            .unwrap();
+
+        let ran = db.last_reflection_run_today("UTC").unwrap();
+        assert!(ran, "should detect today's reflection run");
+    }
+
+    #[test]
+    fn test_last_reflection_run_today_none() {
+        let db = test_db();
+        let ran = db.last_reflection_run_today("UTC").unwrap();
+        assert!(!ran, "should return false when no reflection has run");
+    }
+
+    #[test]
+    fn test_last_reflection_run_today_with_timezone() {
+        let db = test_db();
+        db.record_reflection_run("completed", 1, None).unwrap();
+
+        // Should still be "today" regardless of timezone (just ran)
+        let ran = db.last_reflection_run_today("America/New_York").unwrap();
+        assert!(ran);
+
+        let ran = db.last_reflection_run_today("Asia/Tokyo").unwrap();
+        assert!(ran);
+    }
+
+    #[test]
+    fn test_last_reflection_run_today_invalid_tz_fallback() {
+        let db = test_db();
+        db.record_reflection_run("completed", 0, None).unwrap();
+
+        // Invalid timezone should fall back to UTC
+        let ran = db.last_reflection_run_today("Invalid/Zone").unwrap();
+        assert!(ran);
+    }
+
+    #[test]
+    fn test_get_conversations_since() {
+        let db = test_db();
+        db.save_message("user", "Hello", "cli").unwrap();
+        db.save_message("assistant", "Hi!", "cli").unwrap();
+        db.save_message("user", "Reflection msg", "reflection")
+            .unwrap();
+
+        // Use a past timestamp to get all messages
+        let msgs = db.get_conversations_since("2020-01-01 00:00:00").unwrap();
+        assert_eq!(msgs.len(), 2, "should exclude reflection channel_type");
+        assert_eq!(msgs[0].content, "Hello");
+        assert_eq!(msgs[1].content, "Hi!");
+    }
+
+    #[test]
+    fn test_get_conversations_since_future_returns_empty() {
+        let db = test_db();
+        db.save_message("user", "Hello", "cli").unwrap();
+
+        let msgs = db.get_conversations_since("2099-01-01 00:00:00").unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_get_memory_events_since() {
+        let db = test_db();
+        db.log_memory_event(
+            "s1",
+            "update_core_memory",
+            "user_summary",
+            None,
+            "Updated",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event(
+            "s1",
+            "store_fact",
+            "pref:coffee",
+            None,
+            "Likes coffee",
+            None,
+        )
+        .unwrap();
+
+        let events = db.get_memory_events_since("2020-01-01 00:00:00").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tool_name, "update_core_memory");
+        assert_eq!(events[1].tool_name, "store_fact");
+    }
+
+    #[test]
+    fn test_count_memory_events_for_session() {
+        let db = test_db();
+        db.log_memory_event(
+            "reflection-2026-03-03",
+            "update_core_memory",
+            "user_summary",
+            None,
+            "v1",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event(
+            "reflection-2026-03-03",
+            "store_fact",
+            "pref:x",
+            None,
+            "v2",
+            None,
+        )
+        .unwrap();
+        db.log_memory_event("other-session", "store_fact", "pref:y", None, "v3", None)
+            .unwrap();
+
+        let count = db
+            .count_memory_events_for_session("reflection-2026-03-03")
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let count = db.count_memory_events_for_session("other-session").unwrap();
+        assert_eq!(count, 1);
+
+        let count = db.count_memory_events_for_session("nonexistent").unwrap();
+        assert_eq!(count, 0);
     }
 }

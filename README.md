@@ -36,11 +36,11 @@ Each customer gets an isolated container with their own SQLite database. No cust
 
 - **Persistent memory** -- Core memory always in context, updated by the agent itself
 - **Structured knowledge** -- Tracks people, commitments, preferences, and events
-- **Skills system** -- Extensible filesystem-based tool registry (`~/.mika/skills/`)
+- **Skills system** -- Extensible filesystem-based tool registry with Git-based marketplace (`mika skills install`)
 - **Proactive heartbeat** -- Check-ins via silent agent loop with rate limiting
 - **Reminders** -- Time-based reminders with recovery on restart
 - **Conversation compaction** -- Automatic summarization of old messages
-- **Slash commands** -- 13 client-side commands with tab-completion in the TUI
+- **Slash commands** -- 20 client-side commands with shell-like Tab completion and argument completers
 - **Multi-channel** -- CLI (local) and Telegram (hosted) with WhatsApp planned
 - **Per-customer isolation** -- One container per customer
 
@@ -105,11 +105,13 @@ The agent has 8 builtin tools and 6 conditional management tools:
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (~703 tests)
+cargo test           # Run tests (~837 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, commit conventions, and quality gates.
 
 ## Documentation
 
@@ -121,6 +123,7 @@ cargo run --bin mika # Run TUI CLI
 | [Configuration](docs/configuration.md) | All | Settings reference, directory layout |
 | [Slash Commands](docs/slash-commands.md) | End users | TUI command reference |
 | [Deployment](docs/deployment.md) | Operators | Docker images, container deployment |
+| [Contributing](CONTRIBUTING.md) | Contributors | Development workflow, conventions, quality gates |
 
 ## Current Status
 

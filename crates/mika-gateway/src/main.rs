@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
     let _log_guard = mika_common::logging::init(
         &settings.log_level,
         settings.gateway_log_file.as_deref().map(Path::new),
+        None::<mika_common::logging::NoopLayer>,
     );
     info!(settings = ?settings, "starting mika-gateway");
 

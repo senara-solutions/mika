@@ -166,9 +166,12 @@ pub async fn handle_message(
     // Spawn flush of previously failed sends in parallel (best-effort, non-blocking)
     let flush_state = state.clone();
     let flush_agent = agent_state.clone();
-    tokio::spawn(async move {
-        flush_failed_sends(&flush_state, &flush_agent).await;
-    });
+    tokio::spawn(
+        async move {
+            flush_failed_sends(&flush_state, &flush_agent).await;
+        }
+        .instrument(tracing::info_span!("flush_failed_sends")),
+    );
 
     // Spawn async agent processing with request_id span for log correlation
     let s = state.clone();
@@ -249,11 +252,14 @@ pub async fn handle_message(
             drop(_lock);
             let db = a.db.clone();
             let claude = s.claude.clone();
-            tokio::spawn(async move {
-                if let Err(e) = compaction::maybe_compact(&db, &claude).await {
-                    warn!(error = %e, "post-turn compaction failed");
+            tokio::spawn(
+                async move {
+                    if let Err(e) = compaction::maybe_compact(&db, &claude).await {
+                        warn!(error = %e, "post-turn compaction failed");
+                    }
                 }
-            });
+                .instrument(tracing::info_span!("compaction")),
+            );
         }
         .instrument(span),
     );

@@ -2,9 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, validate_and_resolve_path};
 
 pub struct WriteWorkspaceTool {
     pub workspace_dir: PathBuf,
@@ -39,9 +39,6 @@ impl Tool for WriteWorkspaceTool {
 
     async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
-        if path.is_empty() {
-            return Ok(ToolOutput::error("'path' is required and cannot be empty."));
-        }
 
         let content = input["content"].as_str().unwrap_or("");
         if content.is_empty() {
@@ -55,86 +52,21 @@ impl Tool for WriteWorkspaceTool {
             )));
         }
 
-        // Reject absolute paths
-        if std::path::Path::new(path).is_absolute() {
-            return Ok(ToolOutput::error(
-                "Absolute paths are not allowed. Use a relative path within the workspace.",
-            ));
-        }
-
-        // Prevent path traversal using component inspection
-        for component in std::path::Path::new(path).components() {
-            match component {
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Ok(ToolOutput::error(
-                        "Path traversal components ('..', root, or prefix) are not allowed.",
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        let full_path = self.workspace_dir.join(path);
-
-        // Ensure workspace dir exists
-        if let Err(e) = tokio::fs::create_dir_all(&self.workspace_dir).await {
-            return Ok(ToolOutput::error(format!(
-                "Failed to create workspace directory: {e}"
-            )));
-        }
-
-        // Create parent directories if needed, then verify containment via canonicalize
-        if let Some(parent) = full_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to create parent directories: {e}"
-                )));
-            }
-
-            // Check for symlinks in the parent chain
-            match tokio::fs::symlink_metadata(parent).await {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        return Ok(ToolOutput::error(
-                            "Symbolic links are not allowed in the workspace.",
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Ok(ToolOutput::error(format!(
-                        "Failed to verify parent directory: {e}"
-                    )));
-                }
-            }
-
-            // Verify containment using canonicalize (parent now exists)
-            let canonical_parent = match parent.canonicalize() {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(ToolOutput::error(format!(
-                        "Failed to resolve parent directory: {e}"
-                    )));
-                }
-            };
-            let workspace_canonical = match self.workspace_dir.canonicalize() {
-                Ok(c) => c,
-                Err(_) => {
-                    return Ok(ToolOutput::error("Workspace directory does not exist."));
-                }
-            };
-            if !canonical_parent.starts_with(&workspace_canonical) {
-                return Ok(ToolOutput::error(
-                    "Path resolves outside the workspace directory.",
-                ));
-            }
-        }
+        let full_path = match validate_and_resolve_path(path, &self.workspace_dir).await {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
 
         let bytes_written = content.len();
         match tokio::fs::write(&full_path, content).await {
             Ok(()) => Ok(ToolOutput::success(format!(
-                "Wrote {bytes_written} bytes to '{path}'."
+                "Wrote {bytes_written} bytes to '{}'.",
+                full_path.display()
             ))),
-            Err(e) => Ok(ToolOutput::error(format!("Failed to write '{path}': {e}"))),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "Failed to write '{}': {e}",
+                full_path.display()
+            ))),
         }
     }
 }
@@ -318,5 +250,31 @@ mod tests {
 
         let written = fs::read_to_string(workspace.join("file..v2.md")).unwrap();
         assert_eq!(written, "version 2");
+    }
+
+    #[tokio::test]
+    async fn test_write_success_message_contains_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+
+        let tool = WriteWorkspaceTool {
+            workspace_dir: workspace.clone(),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "sub/file.md", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        let expected_path = workspace.join("sub/file.md");
+        assert!(
+            output
+                .content
+                .contains(&expected_path.display().to_string()),
+            "expected absolute path '{}' in message: {}",
+            expected_path.display(),
+            output.content
+        );
     }
 }
