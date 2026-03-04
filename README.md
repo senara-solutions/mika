@@ -105,7 +105,7 @@ The agent has 8 builtin tools and 6 conditional management tools:
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (~834 tests)
+cargo test           # Run tests (~837 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI
