@@ -609,14 +609,25 @@ impl TeamEngine {
                 Some(join_result) = join_set.join_next() => {
                     completed_count += 1;
                     match join_result {
-                        Ok((index, _agent_name, result)) => match result {
-                            Ok(_) => {
-                                self.run.tasks[index].status = TaskStatus::Completed;
+                        Ok((index, agent_name, result)) => {
+                            match result {
+                                Ok(_) => {
+                                    self.run.tasks[index].status = TaskStatus::Completed;
+                                }
+                                Err(e) => {
+                                    self.run.tasks[index].status =
+                                        TaskStatus::Failed(e.to_string());
+                                }
                             }
-                            Err(e) => {
-                                self.run.tasks[index].status = TaskStatus::Failed(e.to_string());
-                            }
-                        },
+                            let status_label = match &self.run.tasks[index].status {
+                                TaskStatus::Completed => "done",
+                                TaskStatus::Failed(_) => "failed",
+                                _ => "done",
+                            };
+                            self.emit_event(TeamEvent::Progress(format!(
+                                "{agent_name} {status_label} ({completed_count}/{total_count})"
+                            )));
+                        }
                         Err(join_error) => {
                             // A JoinError means the task panicked or was cancelled.
                             warn!(error = %join_error, "spawned task failed unexpectedly");
@@ -634,6 +645,10 @@ impl TeamEngine {
                 }
             }
         }
+
+        self.emit_event(TeamEvent::Progress(format!(
+            "All {total_count} specialists done."
+        )));
 
         // Any tasks still Running after all joins completed must have hit a JoinError.
         for task in &mut self.run.tasks {
