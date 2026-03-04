@@ -144,21 +144,35 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
 
 fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let now = chrono::Utc::now().format("%H:%M UTC");
-    let short_session = &app.session_id[..8.min(app.session_id.len())];
-    let header = Line::from(vec![
-        Span::styled(
-            format!(" \u{2726} {} ", app.identity_name),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("\u{2014} session {short_session}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("   "),
-        Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
-    ]);
+
+    let header = if app.is_team_mode() {
+        Line::from(vec![
+            Span::styled(
+                format!(" \u{2726} {} ", app.identity_name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        let short_session = &app.session_id[..8.min(app.session_id.len())];
+        Line::from(vec![
+            Span::styled(
+                format!(" \u{2726} {} ", app.identity_name),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("\u{2014} session {short_session}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("   "),
+            Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
+        ])
+    };
     f.render_widget(Paragraph::new(header), area);
 }
 
@@ -390,63 +404,86 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
 fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let status_text = match &app.status {
         AgentStatus::Idle => "ready",
-        AgentStatus::Thinking => "thinking...",
+        AgentStatus::Thinking => {
+            if app.is_team_mode() {
+                "running..."
+            } else {
+                "thinking..."
+            }
+        }
         AgentStatus::Responding(_) => "responding...",
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", app.agent_name),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{} ", app.model),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            status_text.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-
-    // Thinking level indicator (always shown)
-    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-    match app.thinking_level {
-        Some((_, level)) => {
-            spans.push(Span::styled(
-                format!("think: {level}"),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-        None => {
-            spans.push(Span::styled(
-                "think: off",
+    let mut spans = if app.is_team_mode() {
+        // Team mode: simpler footer (no model, no thinking level, no context)
+        let team_name = app.team_name.as_deref().unwrap_or("team");
+        vec![
+            Span::styled(
+                format!(" team: {team_name} "),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                status_text.to_string(),
                 Style::default().fg(Color::DarkGray),
+            ),
+        ]
+    } else {
+        let mut s = vec![
+            Span::styled(
+                format!(" {} ", app.agent_name),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ", app.model),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                status_text.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        // Thinking level indicator (always shown in agent mode)
+        s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        match app.thinking_level {
+            Some((_, level)) => {
+                s.push(Span::styled(
+                    format!("think: {level}"),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            None => {
+                s.push(Span::styled(
+                    "think: off",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
+        // Context usage indicator
+        if let Some(tokens) = app.context_tokens {
+            let limit = crate::tui::app::MODEL_CONTEXT_LIMIT;
+            let pct = (tokens as f64 / limit as f64 * 100.0) as u32;
+            let tokens_k = tokens / 1000;
+            let limit_k = limit / 1000;
+            let color = if pct > 80 {
+                Color::Red
+            } else if pct > 50 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            s.push(Span::styled(
+                format!("ctx: {tokens_k}k/{limit_k}k ({pct}%)"),
+                Style::default().fg(color),
             ));
         }
-    }
-
-    // Context usage indicator
-    if let Some(tokens) = app.context_tokens {
-        let limit = crate::tui::app::MODEL_CONTEXT_LIMIT;
-        let pct = (tokens as f64 / limit as f64 * 100.0) as u32;
-        let tokens_k = tokens / 1000;
-        let limit_k = limit / 1000;
-        let color = if pct > 80 {
-            Color::Red
-        } else if pct > 50 {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            format!("ctx: {tokens_k}k/{limit_k}k ({pct}%)"),
-            Style::default().fg(color),
-        ));
-    }
+        s
+    };
 
     // Scroll / new-message indicator
     if app.scroll_offset > 0 {

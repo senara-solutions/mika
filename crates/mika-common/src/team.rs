@@ -147,11 +147,6 @@ pub fn workspace_dir(home_dir: &Path, team_name: &str) -> PathBuf {
     team_dir(home_dir, team_name).join("workspace")
 }
 
-/// Returns the history directory for a team: `{team_dir}/history/`
-pub fn history_dir(home_dir: &Path, team_name: &str) -> PathBuf {
-    team_dir(home_dir, team_name).join("history")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,15 +218,6 @@ mod tests {
         assert_eq!(
             workspace_dir(home, "dev-team"),
             PathBuf::from("/home/user/.mika/teams/dev-team/workspace")
-        );
-    }
-
-    #[test]
-    fn test_history_dir() {
-        let home = Path::new("/home/user/.mika");
-        assert_eq!(
-            history_dir(home, "dev-team"),
-            PathBuf::from("/home/user/.mika/teams/dev-team/history")
         );
     }
 

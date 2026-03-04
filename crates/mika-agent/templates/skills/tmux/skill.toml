@@ -2,7 +2,7 @@
 name = "tmux"
 description = "Manage tmux sessions for long-running processes and background tasks"
 version = "0.1.0"
-always_on = true
+always_on = false
 timeout_secs = 30
 
 [triggers]

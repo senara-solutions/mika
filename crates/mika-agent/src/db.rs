@@ -7,6 +7,8 @@ use tracing::{debug, info};
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
 /// Idempotent — uses an internal Once guard so multiple calls are safe.
+/// Auto-called by [`Database::open`] and [`Database::open_in_memory`], so
+/// callers typically don't need to invoke this directly.
 pub fn init_sqlite_vec() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -23,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 /// Canonical list of valid commitment statuses at the database level.
 /// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
@@ -53,8 +55,9 @@ pub struct Database {
 
 impl Database {
     /// Open (or create) a per-customer SQLite database at `path`.
-    /// Runs migrations automatically.
+    /// Runs migrations automatically. Registers sqlite-vec if not already done.
     pub fn open(path: &Path) -> Result<Self> {
+        init_sqlite_vec();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
 
@@ -76,7 +79,9 @@ impl Database {
     }
 
     /// Open an in-memory database (for tests).
+    /// Registers sqlite-vec if not already done.
     pub fn open_in_memory() -> Result<Self> {
+        init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("failed to set pragmas")?;
@@ -145,6 +150,9 @@ impl Database {
         }
         if version < 10 {
             self.migrate_v10()?;
+        }
+        if version < 11 {
+            self.migrate_v11()?;
         }
 
         info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
@@ -489,6 +497,239 @@ impl Database {
             .context("failed to apply migration v10")?;
 
         Ok(())
+    }
+
+    fn migrate_v11(&self) -> Result<()> {
+        info!(
+            "applying migration v11: team_runs and team_messages tables for graph-structured team persistence"
+        );
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS team_runs (
+                id TEXT PRIMARY KEY,
+                team_name TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                failure_reason TEXT,
+                iteration INTEGER NOT NULL DEFAULT 0,
+                max_iterations INTEGER NOT NULL DEFAULT 3,
+                deliverable TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_team_runs_team_started ON team_runs(team_name, started_at);
+
+            CREATE TABLE IF NOT EXISTS team_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES team_runs(id),
+                parent_id INTEGER REFERENCES team_messages(id),
+                agent_name TEXT,
+                message_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                iteration INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_team_messages_run ON team_messages(run_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_team_messages_parent ON team_messages(parent_id);
+
+            INSERT INTO schema_version (version) VALUES (11);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply migration v11")?;
+
+        Ok(())
+    }
+
+    // -- Team Runs --
+
+    /// Insert a new team run record. Returns the run_id.
+    pub fn insert_team_run(
+        &self,
+        run_id: &str,
+        team_name: &str,
+        goal: &str,
+        max_iterations: u32,
+        started_at: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_name, goal, status, max_iterations, started_at)
+                 VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+                rusqlite::params![run_id, team_name, goal, max_iterations, started_at],
+            )
+            .context("failed to insert team run")?;
+        Ok(())
+    }
+
+    /// Update a team run's status, iteration, deliverable, and end time.
+    pub fn update_team_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        failure_reason: Option<&str>,
+        iteration: u32,
+        deliverable: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
+                 deliverable = ?4, ended_at = ?5 WHERE id = ?6",
+                rusqlite::params![
+                    status,
+                    failure_reason,
+                    iteration,
+                    deliverable,
+                    ended_at,
+                    run_id
+                ],
+            )
+            .context("failed to update team run")?;
+        Ok(())
+    }
+
+    /// Load recent team runs, most recent first.
+    pub fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
+                    deliverable, started_at, ended_at
+             FROM team_runs WHERE team_name = ?1
+             ORDER BY started_at DESC LIMIT ?2",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![team_name, limit], |row| {
+                Ok(TeamRunRow {
+                    id: row.get(0)?,
+                    team_name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    failure_reason: row.get(4)?,
+                    iteration: row.get(5)?,
+                    max_iterations: row.get(6)?,
+                    deliverable: row.get(7)?,
+                    started_at: row.get(8)?,
+                    ended_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to load team runs")?;
+
+        Ok(rows)
+    }
+
+    /// Load the latest team run for a team.
+    pub fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let mut runs = self.load_team_runs(team_name, 1)?;
+        Ok(runs.pop())
+    }
+
+    /// Load a specific team run by its ID.
+    pub fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
+                    deliverable, started_at, ended_at
+             FROM team_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([run_id], |row| {
+            Ok(TeamRunRow {
+                id: row.get(0)?,
+                team_name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                failure_reason: row.get(4)?,
+                iteration: row.get(5)?,
+                max_iterations: row.get(6)?,
+                deliverable: row.get(7)?,
+                started_at: row.get(8)?,
+                ended_at: row.get(9)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    // -- Team Messages --
+
+    /// Insert a team message and return its id.
+    pub fn insert_team_message(
+        &self,
+        run_id: &str,
+        parent_id: Option<i64>,
+        agent_name: Option<&str>,
+        message_type: &str,
+        content: &str,
+        iteration: u32,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO team_messages (run_id, parent_id, agent_name, message_type, content, iteration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![run_id, parent_id, agent_name, message_type, content, iteration],
+            )
+            .context("failed to insert team message")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Load all messages for a team run, ordered by creation time.
+    pub fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, parent_id, agent_name, message_type, content, iteration, created_at
+             FROM team_messages WHERE run_id = ?1 ORDER BY created_at, id",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![run_id], |row| {
+                Ok(TeamMessageRow {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    parent_id: row.get(2)?,
+                    agent_name: row.get(3)?,
+                    message_type: row.get(4)?,
+                    content: row.get(5)?,
+                    iteration: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to load team messages")?;
+
+        Ok(rows)
+    }
+
+    /// Load assignment message IDs for a specific run and iteration.
+    ///
+    /// Returns a map of agent_name -> message_id for assignment messages,
+    /// used for parent-linking agent responses to their assignments.
+    pub fn load_assignment_msg_ids(
+        &self,
+        run_id: &str,
+        iteration: u32,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_name FROM team_messages
+             WHERE run_id = ?1 AND message_type = 'assignment' AND iteration = ?2
+             ORDER BY id",
+        )?;
+        let map = stmt
+            .query_map(rusqlite::params![run_id, iteration], |row| {
+                let id: i64 = row.get(0)?;
+                let agent: Option<String> = row.get(1)?;
+                Ok((agent, id))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(agent, id)| agent.map(|name| (name, id)))
+            .collect();
+        Ok(map)
     }
 
     // -- Conversations --
@@ -2156,6 +2397,41 @@ pub struct ConversationMessage {
     pub created_at: String,
 }
 
+/// Format a Unix timestamp as an ISO 8601 UTC string.
+pub fn format_unix_ts(ts: i64) -> String {
+    DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|dt: DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// A row from the `team_runs` table.
+#[derive(Debug, Clone)]
+pub struct TeamRunRow {
+    pub id: String,
+    pub team_name: String,
+    pub goal: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub deliverable: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+/// A row from the `team_messages` table.
+#[derive(Debug, Clone)]
+pub struct TeamMessageRow {
+    pub id: i64,
+    pub run_id: String,
+    pub parent_id: Option<i64>,
+    pub agent_name: Option<String>,
+    pub message_type: String,
+    pub content: String,
+    pub iteration: u32,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreMemoryEntry {
     pub key: String,
@@ -2265,7 +2541,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2278,7 +2554,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]

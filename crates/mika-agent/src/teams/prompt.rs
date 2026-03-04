@@ -3,6 +3,8 @@ use std::path::Path;
 
 use mika_common::team::TeamDefinition;
 
+use crate::db::TeamRunRow;
+
 use super::types::TeamRun;
 
 /// Build the team context injected into the orchestrator's system prompt.
@@ -13,6 +15,7 @@ pub fn build_orchestrator_context(
     def: &TeamDefinition,
     workspace_listing: &str,
     previous_feedback: Option<&str>,
+    history: &[TeamRunRow],
 ) -> String {
     let mut members = String::new();
     for agent in &def.agents {
@@ -25,6 +28,41 @@ pub fn build_orchestrator_context(
             agent.name, agent.role, agent.mandate
         );
     }
+
+    let history_section = if history.is_empty() {
+        String::new()
+    } else {
+        let mut buf = String::from("\n## Conversation History\n");
+        let mut budget = 5000usize; // total character budget for history section
+        // Show oldest first (load_team_runs returns DESC, so reverse)
+        for run in history.iter().rev() {
+            if budget == 0 {
+                break;
+            }
+            let goal = if run.goal.len() > 500 {
+                &run.goal[..run.goal.floor_char_boundary(500)]
+            } else {
+                &run.goal
+            };
+            let entry_start = buf.len();
+            let _ = writeln!(buf, "<context type=\"history_goal\">{goal}</context>");
+            if let Some(ref d) = run.deliverable {
+                let truncated = if d.len() > 500 {
+                    &d[..d.floor_char_boundary(500)]
+                } else {
+                    d
+                };
+                let _ = writeln!(
+                    buf,
+                    "<context type=\"history_deliverable\">{truncated}</context>"
+                );
+            }
+            buf.push('\n');
+            let entry_len = buf.len() - entry_start;
+            budget = budget.saturating_sub(entry_len);
+        }
+        buf
+    };
 
     let feedback_section = match previous_feedback {
         Some(feedback) => format!(
@@ -51,9 +89,13 @@ pub fn build_orchestrator_context(
          \n\
          ## Workspace State\n\
          {workspace_section}\n\
+         {history_section}\
          {feedback_section}\n\
          ## Instructions\n\
-         Decompose the goal into tasks for your team members. \
+         If the input is NOT an actionable goal (e.g., a greeting, status question, \
+         or casual conversation), respond with: {{\"reply\": \"your response\"}}\n\
+         \n\
+         For actionable goals, decompose into tasks for your team members. \
          Respond with a JSON array of task assignments. Each assignment has:\n\
          - \"agent\": the team member's name\n\
          - \"task\": a clear, specific description of what to do\n\
@@ -61,8 +103,9 @@ pub fn build_orchestrator_context(
          \n\
          Use `list_workspace` to check the current workspace state before planning.\n\
          \n\
-         Respond ONLY with the JSON array. Example:\n\
-         [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
+         Respond ONLY with compact (single-line) JSON, not pretty-printed. Examples:\n\
+         Conversational: {{\"reply\": \"Hey! The team is ready and waiting for a goal.\"}}\n\
+         Actionable: [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
         team_name = def.team.name,
         mi = def.flow.max_iterations,
     )
@@ -90,8 +133,16 @@ pub fn build_specialist_context(
          ## Instructions\n\
          1. Use `list_workspace` to see what shared files are available.\n\
          2. Use `read_workspace` to read any relevant context from other team members.\n\
-         3. Do your work and write your results to `{output_file}` using `write_workspace`.\n\
-         4. Respond with a brief summary of what you accomplished.\n"
+         3. For deep codebase analysis, use `analyze_codebase` with a specific question \
+         instead of reading individual files.\n\
+         4. Do your work and write your results to `{output_file}` using `write_workspace`.\n\
+         5. Respond with a brief summary of what you accomplished.\n\
+         \n\
+         ## Important\n\
+         - ALWAYS write your deliverable to the workspace using `write_workspace`. \
+         Your text response alone is NOT visible to other team members.\n\
+         - Prefer deep-analysis tools (like `analyze_codebase`) over reading many files \
+         individually — it preserves your tool step budget.\n"
     )
 }
 
@@ -216,7 +267,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_includes_team_members() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", None);
+        let ctx = build_orchestrator_context(&def, "", None, &[]);
         assert!(ctx.contains("ORCHESTRATOR"));
         assert!(ctx.contains("researcher"));
         assert!(ctx.contains("Research topics"));
@@ -227,9 +278,57 @@ mod tests {
     #[test]
     fn test_orchestrator_context_with_feedback() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"));
+        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"), &[]);
         assert!(ctx.contains("Previous Review Feedback"));
         assert!(ctx.contains("Needs more detail"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_with_history() {
+        let def = test_def();
+        let history = vec![
+            TeamRunRow {
+                id: "run-1".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "How is the team?".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 0,
+                max_iterations: 3,
+                deliverable: Some("The team is ready!".to_string()),
+                started_at: 1000,
+                ended_at: Some(1001),
+            },
+            TeamRunRow {
+                id: "run-2".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Ping everyone".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: Some("Done, pinged all agents.".to_string()),
+                started_at: 1002,
+                ended_at: Some(1003),
+            },
+        ];
+        let ctx = build_orchestrator_context(&def, "", None, &history);
+        assert!(ctx.contains("## Conversation History"));
+        // History returned DESC, rendered oldest first — run-2 (index 0) is newer
+        assert!(ctx.contains("How is the team?"));
+        assert!(ctx.contains("The team is ready!"));
+        assert!(ctx.contains("Ping everyone"));
+        assert!(ctx.contains("Done, pinged all agents."));
+        // Entries should be wrapped in context delimiters
+        assert!(ctx.contains("<context type=\"history_goal\">"));
+        assert!(ctx.contains("<context type=\"history_deliverable\">"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_no_history_section_when_empty() {
+        let def = test_def();
+        let ctx = build_orchestrator_context(&def, "", None, &[]);
+        assert!(!ctx.contains("Conversation History"));
     }
 
     #[test]
@@ -245,6 +344,8 @@ mod tests {
         assert!(ctx.contains("Research topics"));
         assert!(ctx.contains("research.md"));
         assert!(ctx.contains("write_workspace"));
+        assert!(ctx.contains("analyze_codebase"));
+        assert!(ctx.contains("NOT visible to other team members"));
     }
 
     #[test]
@@ -263,7 +364,7 @@ mod tests {
                 output_file: "research.md".to_string(),
                 status: TaskStatus::Completed,
             }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
+            started_at: 1740474000,
             ended_at: None,
             deliverable: None,
         };
@@ -286,7 +387,7 @@ mod tests {
             iteration: 1,
             max_iterations: 3,
             tasks: vec![],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
+            started_at: 1740474000,
             ended_at: None,
             deliverable: None,
         };
@@ -295,6 +396,28 @@ mod tests {
         assert!(ctx.contains("FINAL DELIVERABLE"));
         assert!(ctx.contains("Write summary"));
         assert!(ctx.contains("deliverable.md"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_history_truncates_long_goals() {
+        let def = test_def();
+        let long_goal = "x".repeat(1000);
+        let history = vec![TeamRunRow {
+            id: "run-1".to_string(),
+            team_name: "dev-team".to_string(),
+            goal: long_goal,
+            status: "completed".to_string(),
+            failure_reason: None,
+            iteration: 0,
+            max_iterations: 3,
+            deliverable: Some("result".to_string()),
+            started_at: 1000,
+            ended_at: Some(1001),
+        }];
+        let ctx = build_orchestrator_context(&def, "", None, &history);
+        // Goal should be truncated to 500 chars, not the full 1000
+        assert!(!ctx.contains(&"x".repeat(1000)));
+        assert!(ctx.contains(&"x".repeat(500)));
     }
 
     #[test]

@@ -9,10 +9,45 @@ use cli::{Cli, Commands};
 use mika_common::agent;
 use mika_common::home;
 use mika_common::logging::LogOutput;
+use mika_common::team;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Team mode: branch early, before agent resolution.
+    // --team is mutually exclusive with --agent (enforced by clap).
+    if let Some(ref team_name) = cli.team {
+        let team_name = team::normalize_team_name(team_name);
+        team::validate_team_name(&team_name)?;
+        let global_home = home::resolve_home_dir()?;
+
+        if !team::team_exists(&global_home, &team_name) {
+            anyhow::bail!("Team '{team_name}' not found.");
+        }
+
+        // Only allow bare `mika --team` or `mika --team chat`
+        match cli.command {
+            None | Some(Commands::Chat) => {
+                let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+
+                let log_dir = team::team_dir(&global_home, &team_name).join("logs");
+                let _log_guard = mika_common::logging::init_pretty(
+                    &log_level,
+                    Some(&log_dir),
+                    LogOutput::FileOnly,
+                );
+
+                return commands::chat::run_team(&team_name, &global_home).await;
+            }
+            Some(_) => {
+                anyhow::bail!(
+                    "--team cannot be used with subcommands other than 'chat'. \
+                     Use 'mika teams run {team_name} \"goal\"' for non-interactive team runs."
+                );
+            }
+        }
+    }
 
     // Resolve agent name first — needed for correct log directory.
     // Priority: --agent flag > active_agent file > "main"
@@ -47,30 +82,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Read log_level from agent config. Uses toml crate (already a dependency)
-    // rather than full config-rs which needs DB.
-    let log_level = std::env::var("MIKA_LOG_LEVEL")
-        .ok()
-        .filter(|s| {
-            matches!(
-                s.as_str(),
-                "trace" | "debug" | "info" | "warn" | "error" | "off"
-            )
-        })
-        .or_else(|| {
-            agent_home
-                .as_ref()
-                .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
-                .and_then(|content| parse_log_level(&content))
-        })
-        .or_else(|| {
-            // Fall back to global config
-            global_home
-                .as_ref()
-                .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
-                .and_then(|content| parse_log_level(&content))
-        })
-        .unwrap_or_else(|| "warn".to_string());
+    // Read log_level from agent config, falling back to global config.
+    let mut config_paths = Vec::new();
+    if let Some(ref h) = agent_home {
+        config_paths.push(h.join("config.toml"));
+    }
+    if let Some(ref h) = global_home {
+        config_paths.push(h.join("config.toml"));
+    }
+    let log_level = resolve_log_level(&config_paths);
 
     // Initialize tracing with correct agent-specific directory and configured level.
     // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
@@ -111,6 +131,26 @@ async fn main() -> Result<()> {
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
     }
+}
+
+/// Resolve log level from env var or config files (first match wins).
+fn resolve_log_level(config_paths: &[std::path::PathBuf]) -> String {
+    std::env::var("MIKA_LOG_LEVEL")
+        .ok()
+        .filter(|s| {
+            matches!(
+                s.as_str(),
+                "trace" | "debug" | "info" | "warn" | "error" | "off"
+            )
+        })
+        .or_else(|| {
+            config_paths.iter().find_map(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_log_level(&content))
+            })
+        })
+        .unwrap_or_else(|| "warn".to_string())
 }
 
 /// Extract `log_level` value from a TOML config string.
@@ -229,5 +269,54 @@ mod tests {
                 "clap-markdown output missing command: {name}"
             );
         }
+    }
+
+    /// --agent and --team are mutually exclusive.
+    #[test]
+    fn test_agent_and_team_mutually_exclusive() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "--agent", "work", "--team", "research"]);
+        assert!(result.is_err(), "--agent and --team should conflict");
+    }
+
+    /// --team alone should parse successfully.
+    #[test]
+    fn test_team_flag_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "--team", "research"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.team.as_deref(), Some("research"));
+        assert!(cli.agent.is_none());
+    }
+
+    /// --agent alone should still work.
+    #[test]
+    fn test_agent_flag_still_works() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "--agent", "work"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("work"));
+        assert!(cli.team.is_none());
+    }
+
+    /// --team with a subcommand should parse (validation happens in main, not clap).
+    #[test]
+    fn test_team_with_subcommand_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "--team", "dev", "chat"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.team.as_deref(), Some("dev"));
+    }
+
+    /// clap-markdown output should include the --team flag.
+    #[test]
+    fn test_clap_markdown_contains_team_flag() {
+        use clap::CommandFactory;
+        let cmd = crate::cli::Cli::command();
+        let markdown = clap_markdown::help_markdown_command(&cmd);
+        assert!(
+            markdown.contains("--team"),
+            "clap-markdown output missing --team flag"
+        );
     }
 }

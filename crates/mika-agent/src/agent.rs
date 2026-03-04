@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
@@ -25,8 +25,13 @@ use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::embedding::EmbeddingClient;
 
 const MAX_TOOL_STEPS: usize = 10;
+const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Per-agent timeout for team sub-agents (matches AGENT_TOTAL_TIMEOUT_SECS).
+/// Since team agents run in parallel, the constraint is fitting within the global
+/// team run budget (max of agent times, not sum).
+const TEAM_AGENT_TIMEOUT_SECS: u64 = 300;
 /// Timeout for the continuation API call after max tool steps are exceeded.
 /// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
 const CONTINUATION_TIMEOUT_SECS: u64 = 60;
@@ -97,6 +102,13 @@ impl LoopMode<'_> {
                 Some(channel_type)
             }
             Self::Team => None,
+        }
+    }
+
+    fn max_steps(&self) -> usize {
+        match self {
+            Self::Team => MAX_TEAM_TOOL_STEPS,
+            _ => MAX_TOOL_STEPS,
         }
     }
 
@@ -317,7 +329,8 @@ async fn run_loop(
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
-    for step in 0..MAX_TOOL_STEPS {
+    let max_steps = mode.max_steps();
+    for step in 0..max_steps {
         debug!(
             step,
             label = mode.label(),
@@ -331,9 +344,9 @@ async fn run_loop(
             strip_prior_images(&mut request.messages);
         }
 
-        // Nudge the model to wrap up when approaching the step limit (conversation only)
-        if mode.is_conversation()
-            && step == MAX_TOOL_STEPS - 2
+        // Nudge the model to wrap up when approaching the step limit
+        if matches!(mode, LoopMode::Conversation { .. } | LoopMode::Team)
+            && step == max_steps - 2
             && let Some(ref mut system) = request.system
         {
             system.push_str(
@@ -446,7 +459,7 @@ async fn run_loop(
 
     warn!(
         label = mode.label(),
-        channel_type, "agent exceeded {MAX_TOOL_STEPS} steps"
+        max_steps, channel_type, "agent exceeded max tool steps"
     );
     Ok(LoopResult {
         text: None,
@@ -1310,6 +1323,8 @@ pub struct TeamAgentParams<'a> {
     pub skills_dirty: &'a AtomicBool,
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
+    /// Agent name for per-agent log filtering in team runs.
+    pub agent_name: &'a str,
 }
 
 /// Run an agent within a team execution context.
@@ -1323,7 +1338,7 @@ pub struct TeamAgentParams<'a> {
 ///   or `None` for tool-use-only turns.
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let timeout_result = tokio::time::timeout(
-        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
+        Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS),
         run_team_agent_inner(params),
     )
     .await;
@@ -1332,7 +1347,7 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
         Ok(result) => result,
         Err(_elapsed) => {
             warn!(
-                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
+                timeout_secs = TEAM_AGENT_TIMEOUT_SECS,
                 "team agent loop total timeout exceeded"
             );
             Ok(Some(
@@ -1343,6 +1358,12 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
 }
 
 async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
+    run_team_agent_inner_impl(params)
+        .instrument(tracing::info_span!("team_agent", agent = %params.agent_name))
+        .await
+}
+
+async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let claude = params.claude;
     let tools = params.tools;
 
@@ -1426,7 +1447,49 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
     .await?;
 
     if result.max_steps_exceeded {
-        return Ok(Some("Agent exceeded maximum tool steps.".to_string()));
+        // Continuation turn: strip tools, ask agent to summarize what it accomplished.
+        // Same pattern as the CLI conversation loop.
+        if let Some(ref mut system) = request.system {
+            system.truncate(result.system_prompt_original_len);
+        }
+        request.tools = None;
+        request.thinking = None;
+        request.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(
+                "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
+            ),
+        });
+
+        let continuation = tokio::time::timeout(
+            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
+            claude.send_message(&request),
+        )
+        .await;
+
+        let text = match continuation {
+            Ok(Ok(resp)) => {
+                let t = resp.text();
+                if t.is_empty() {
+                    format_step_exceeded_fallback(&result.tool_call_summaries)
+                } else {
+                    t
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "team agent continuation turn API error");
+                format_step_exceeded_fallback(&result.tool_call_summaries)
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                    "team agent continuation turn timed out"
+                );
+                format_step_exceeded_fallback(&result.tool_call_summaries)
+            }
+        };
+
+        return Ok(Some(text));
     }
 
     Ok(result.text)

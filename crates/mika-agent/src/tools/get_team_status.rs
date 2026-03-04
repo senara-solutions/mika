@@ -6,6 +6,9 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::path::PathBuf;
 
+use crate::db::{TeamRunRow, format_unix_ts};
+use crate::teams::{TeamDbError, open_team_db};
+
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct GetTeamStatusTool {
@@ -21,7 +24,7 @@ impl Tool for GetTeamStatusTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "get_team_status".to_string(),
-            description: "Get the status of a team's most recent run, or a specific run by ID. Shows status, goal, iteration, timestamps, and task summary.".to_string(),
+            description: "Get the status of a team's most recent run, or a specific run by ID. Shows status, goal, iteration, timestamps, and message graph.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -54,7 +57,6 @@ impl Tool for GetTeamStatusTool {
             return Ok(ToolOutput::error(format!("Invalid team name: {e}")));
         }
 
-        let history_dir = team::history_dir(&self.home_dir, team_name);
         let run_id_filter = input["run_id"].as_str().filter(|s| !s.is_empty());
         if let Some(id) = run_id_filter
             && id.len() > MAX_INPUT_LEN
@@ -65,21 +67,28 @@ impl Tool for GetTeamStatusTool {
             )));
         }
 
-        let run = if let Some(target_id) = run_id_filter {
-            // Find specific run by ID
-            match crate::teams::history::list_runs(&history_dir) {
-                Ok(runs) => runs.into_iter().find(|r| r.run_id == target_id),
+        // Open team DB
+        let team_db = match open_team_db(&self.home_dir, team_name) {
+            Ok(db) => db,
+            Err(TeamDbError::NoRuns(msg)) => return Ok(ToolOutput::success(msg)),
+            Err(TeamDbError::OpenFailed(msg)) => return Ok(ToolOutput::error(msg)),
+        };
+
+        let run: Option<TeamRunRow> = if let Some(target_id) = run_id_filter {
+            match team_db.load_team_run_by_id(target_id).await {
+                Ok(run) => run,
                 Err(e) => {
+                    team_db.shutdown();
                     return Ok(ToolOutput::error(format!(
-                        "Failed to load runs for team '{team_name}': {e}"
+                        "Failed to load run '{target_id}' for team '{team_name}': {e}"
                     )));
                 }
             }
         } else {
-            // Load most recent
-            match crate::teams::history::load_latest_run(&history_dir) {
+            match team_db.load_latest_team_run(team_name).await {
                 Ok(run) => run,
                 Err(e) => {
+                    team_db.shutdown();
                     return Ok(ToolOutput::error(format!(
                         "Failed to load status for team '{team_name}': {e}"
                     )));
@@ -88,29 +97,46 @@ impl Tool for GetTeamStatusTool {
         };
 
         let Some(run) = run else {
+            team_db.shutdown();
             return Ok(ToolOutput::success(format!(
                 "No runs found for team '{team_name}'."
             )));
         };
 
         let mut out = String::new();
-        writeln!(out, "Team: {}", run.team_name).unwrap();
-        writeln!(out, "Run ID: {}", run.run_id).unwrap();
+        writeln!(out, "Team: {team_name}").unwrap();
+        writeln!(out, "Run ID: {}", run.id).unwrap();
         writeln!(out, "Status: {}", run.status).unwrap();
         writeln!(out, "Goal: {}", run.goal).unwrap();
         writeln!(out, "Iteration: {}/{}", run.iteration, run.max_iterations).unwrap();
-        writeln!(out, "Started: {}", run.started_at).unwrap();
-        if let Some(ref ended) = run.ended_at {
-            writeln!(out, "Ended: {ended}").unwrap();
+        writeln!(out, "Started: {}", format_unix_ts(run.started_at)).unwrap();
+        if let Some(ended) = run.ended_at {
+            writeln!(out, "Ended: {}", format_unix_ts(ended)).unwrap();
         }
 
-        if !run.tasks.is_empty() {
-            writeln!(out, "\nTasks:").unwrap();
-            for task in &run.tasks {
+        if let Some(ref reason) = run.failure_reason {
+            writeln!(out, "Failure reason: {reason}").unwrap();
+        }
+
+        // Load messages for this run
+        if let Ok(messages) = team_db.load_team_messages(&run.id).await
+            && !messages.is_empty()
+        {
+            writeln!(out, "\nMessages ({}):", messages.len()).unwrap();
+            for msg in &messages {
+                let agent = msg.agent_name.as_deref().unwrap_or("system");
+                let preview = if msg.content.len() > 200 {
+                    format!(
+                        "{}...",
+                        &msg.content[..msg.content.floor_char_boundary(200)]
+                    )
+                } else {
+                    msg.content.clone()
+                };
                 writeln!(
                     out,
-                    "  - [{}] {} ({}): {}",
-                    task.status, task.agent, task.role, task.task
+                    "  - [{}] {agent} (iter {}): {}",
+                    msg.message_type, msg.iteration, preview
                 )
                 .unwrap();
             }
@@ -118,18 +144,17 @@ impl Tool for GetTeamStatusTool {
 
         if let Some(ref deliverable) = run.deliverable {
             let preview = if deliverable.len() > 500 {
-                // Find a valid UTF-8 char boundary near 500 bytes
-                let mut boundary = 500;
-                while boundary > 0 && !deliverable.is_char_boundary(boundary) {
-                    boundary -= 1;
-                }
-                format!("{}...", &deliverable[..boundary])
+                format!(
+                    "{}...",
+                    &deliverable[..deliverable.floor_char_boundary(500)]
+                )
             } else {
                 deliverable.clone()
             };
             writeln!(out, "\nDeliverable:\n{preview}").unwrap();
         }
 
+        team_db.shutdown();
         Ok(ToolOutput::success(out))
     }
 }
@@ -137,8 +162,7 @@ impl Tool for GetTeamStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::teams::history::save_run;
-    use crate::test_utils::test_helpers::{TestHarness, test_team_run};
+    use crate::test_utils::test_helpers::{TestHarness, setup_team_db};
 
     #[tokio::test]
     async fn test_get_team_status_no_runs() {
@@ -159,15 +183,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_team_status_latest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let history = team::history_dir(tmp.path(), "dev-team");
-        save_run(&history, &test_team_run()).unwrap();
+        let (_tmp, home) = setup_team_db("dev-team", 1);
 
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamStatusTool {
-            home_dir: tmp.path().to_path_buf(),
-        };
+        let tool = GetTeamStatusTool { home_dir: home };
 
         let result = tool
             .execute(serde_json::json!({"team_name": "dev-team"}), &ctx)
@@ -175,8 +195,8 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Status: completed"));
-        assert!(result.content.contains("abcd1234"));
-        assert!(result.content.contains("Test goal"));
+        assert!(result.content.contains("run-0000"));
+        assert!(result.content.contains("Goal 0"));
     }
 
     #[tokio::test]

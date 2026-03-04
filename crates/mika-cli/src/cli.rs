@@ -7,6 +7,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub agent: Option<String>,
 
+    /// Team to use (launches TUI in team mode)
+    #[arg(long, global = true, conflicts_with = "agent")]
+    pub team: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

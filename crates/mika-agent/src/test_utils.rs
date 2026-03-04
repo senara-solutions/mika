@@ -2,7 +2,6 @@
 pub mod test_helpers {
     use crate::async_db::AsyncDatabase;
     use crate::db::Database;
-    use crate::teams::types::{RunStatus, TaskAssignment, TaskStatus, TeamRun};
     use crate::tools::ToolContext;
     use mika_common::config::Settings;
     use std::path::PathBuf;
@@ -10,13 +9,11 @@ pub mod test_helpers {
 
     /// Create an in-memory database for tests (sync — for db module tests).
     pub fn test_db() -> Database {
-        crate::db::init_sqlite_vec();
         Database::open_in_memory().unwrap()
     }
 
     /// Create an async database for tool/agent tests.
     pub fn test_async_db() -> AsyncDatabase {
-        crate::db::init_sqlite_vec();
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new(db)
     }
@@ -137,25 +134,25 @@ pub mod test_helpers {
         }
     }
 
-    /// Sample TeamRun for history/status tests.
-    pub fn test_team_run() -> TeamRun {
-        TeamRun {
-            run_id: "abcd1234".to_string(),
-            team_name: "dev-team".to_string(),
-            goal: "Test goal".to_string(),
-            status: RunStatus::Completed,
-            iteration: 1,
-            max_iterations: 3,
-            tasks: vec![TaskAssignment {
-                agent: "researcher".to_string(),
-                role: "specialist".to_string(),
-                task: "Research".to_string(),
-                output_file: "research.md".to_string(),
-                status: TaskStatus::Completed,
-            }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
-            ended_at: Some("2026-02-25T10:05:00Z".to_string()),
-            deliverable: Some("Summary".to_string()),
+    /// Create a team DB on disk with `run_count` completed runs.
+    ///
+    /// Returns `(TempDir, home_dir)`. The `TempDir` must be kept alive
+    /// for the duration of the test to prevent cleanup. Each run is
+    /// spaced 5 minutes apart with IDs `run-0000`, `run-0001`, etc.
+    pub fn setup_team_db(team_name: &str, run_count: usize) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let data_dir = mika_common::team::team_dir(&home, team_name).join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = Database::open(&data_dir.join("mika.db")).unwrap();
+        for i in 0..run_count {
+            let run_id = format!("run-{i:04}");
+            let ts = 1_740_000_000 + (i as i64 * 300); // spaced 5 min apart
+            db.insert_team_run(&run_id, team_name, &format!("Goal {i}"), 3, ts)
+                .unwrap();
+            db.update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
+                .unwrap();
         }
+        (tmp, home)
     }
 }

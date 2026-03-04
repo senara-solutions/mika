@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::init::{self, AppContext};
-use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole};
+use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole, TeamRequest};
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
@@ -23,8 +23,12 @@ use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::prompt;
 use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
+use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::tools;
 use mika_common::claude::{ImageSource, ThinkingConfig};
+use mika_common::config::Settings;
+use mika_common::team;
+use std::path::Path;
 
 /// Holds the agent worker task handle, poller handle, and the AppContext (for DB shutdown).
 struct AgentWorker {
@@ -432,6 +436,180 @@ pub async fn run(agent_name: &str) -> Result<()> {
     }
 
     // Database shutdown happens automatically via Drop on worker._ctx
+    Ok(())
+}
+
+/// Run the TUI in team mode. Each user message is sent as a goal to `run_team()`.
+pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
+    let team_dir = team::team_dir(global_home, team_name);
+
+    let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
+    let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamEvent>();
+
+    // Open on-disk DB for team conversation persistence
+    let data_dir = team_dir.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let team_db = mika_agent::async_db::AsyncDatabase::open(&data_dir.join("mika.db"))?;
+
+    // Spawn team worker
+    let worker_home = global_home.to_path_buf();
+    let worker_name = team_name.to_string();
+    let worker_team_db = team_db.clone();
+    let team_worker_handle = tokio::spawn(async move {
+        let settings = match Settings::load(&worker_home) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = response_tx.send(TeamEvent::RunFailed(format!(
+                    "Failed to load settings: {e}"
+                )));
+                return;
+            }
+        };
+
+        while let Some(request) = team_rx_worker.recv().await {
+            match request {
+                TeamRequest::Goal(goal) => {
+                    let tx = response_tx.clone();
+                    let callback = move |event: TeamEvent| {
+                        let _ = tx.send(event);
+                    };
+
+                    match mika_agent::teams::run_team(
+                        &worker_name,
+                        &goal,
+                        &worker_home,
+                        &settings,
+                        Some(Box::new(callback)),
+                        worker_team_db.clone(),
+                    )
+                    .await
+                    {
+                        Ok(run) => {
+                            if let RunStatus::Failed(reason) = run.status {
+                                let _ = response_tx.send(TeamEvent::RunFailed(reason));
+                            } else {
+                                let deliverable = run.deliverable.unwrap_or_default();
+                                let _ = response_tx.send(TeamEvent::Deliverable(deliverable));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(TeamEvent::RunFailed(format!("{e}")));
+                        }
+                    }
+                }
+                TeamRequest::Quit => break,
+            }
+        }
+    });
+
+    // Build app in team mode
+    let mut app = App::new_team(
+        team_tx,
+        response_rx,
+        team_name,
+        team_dir.clone(),
+        global_home.to_path_buf(),
+        team_db,
+    );
+
+    // Insert session boundary marker so different TUI sessions are visually separated
+    app.db
+        .save_message("system", "--- New team session ---", "team")
+        .await
+        .ok();
+
+    // Load recent conversations from DB
+    if let Ok(history) = app
+        .db
+        .load_recent_messages(20, Some(vec!["team".into()]))
+        .await
+    {
+        for msg in history {
+            let role = match msg.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => ChatRole::System,
+            };
+            app.messages.push(ChatMessage {
+                role,
+                content: msg.content,
+                rendered: None,
+                channel: None,
+            });
+        }
+    }
+    // Install panic hook that restores terminal
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        original_hook(info);
+    }));
+
+    // Enter TUI mode
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    // Event reader (30ms tick rate for responsive progressive reveal)
+    let mut events = EventReader::new(Duration::from_millis(30));
+
+    // Main loop
+    loop {
+        if app.needs_redraw {
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            app.needs_redraw = false;
+        }
+
+        match events.next().await {
+            Some(AppEvent::Key(key)) => {
+                input::handle_key(&mut app, key);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Mouse(mouse)) => {
+                input::handle_mouse(&mut app, mouse);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Paste(text)) => {
+                input::handle_paste(&mut app, &text);
+                app.needs_redraw = true;
+            }
+            Some(AppEvent::Tick) => {
+                app.tick().await;
+            }
+            Some(AppEvent::Resize) => {
+                app.needs_redraw = true;
+            }
+            None => break,
+        }
+
+        if app.should_quit {
+            if let Some(ref tx) = app.team_tx {
+                let _ = tx.send(TeamRequest::Quit);
+            }
+            break;
+        }
+    }
+
+    // Shut down team DB (ensures pending writes complete)
+    app.db.shutdown();
+
+    // Restore terminal
+    restore_terminal()?;
+
+    // Shut down event reader thread
+    events.shutdown();
+
+    // Give team worker a brief window to shut down gracefully before aborting
+    let _ = tokio::time::timeout(Duration::from_secs(2), team_worker_handle).await;
+
     Ok(())
 }
 

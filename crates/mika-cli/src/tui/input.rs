@@ -208,7 +208,14 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
         match try_clipboard_image() {
             ClipboardResult::Image(attachment) => {
-                if let Some(err) = app.attach_image(attachment) {
+                if app.is_team_mode() {
+                    app.messages.push(crate::tui::app::ChatMessage {
+                        role: crate::tui::app::ChatRole::System,
+                        content: "Image attachments are not supported in team mode.".to_string(),
+                        rendered: None,
+                        channel: None,
+                    });
+                } else if let Some(err) = app.attach_image(attachment) {
                     app.messages.push(crate::tui::app::ChatMessage {
                         role: crate::tui::app::ChatRole::System,
                         content: err,

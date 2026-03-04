@@ -209,6 +209,8 @@ The most commonly used commands:
 | Command                      | Description                                      |
 |------------------------------|--------------------------------------------------|
 | `mika`                       | Auto-setup if needed, then open interactive chat  |
+| `mika --agent <name>`        | Launch TUI with a specific agent                  |
+| `mika --team <name>`         | Launch TUI in team mode (mutually exclusive with `--agent`) |
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
 | `mika ask "<message>"`       | Send a message non-interactively                  |

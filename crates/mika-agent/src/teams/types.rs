@@ -1,7 +1,5 @@
-use serde::{Deserialize, Serialize};
-
 /// Tracks the overall state of a team execution run.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TeamRun {
     pub run_id: String,
     pub team_name: String,
@@ -10,13 +8,13 @@ pub struct TeamRun {
     pub iteration: u32,
     pub max_iterations: u32,
     pub tasks: Vec<TaskAssignment>,
-    pub started_at: String,
-    pub ended_at: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
     pub deliverable: Option<String>,
 }
 
 /// Status of the overall team run.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RunStatus {
     Running,
     Completed,
@@ -24,7 +22,7 @@ pub enum RunStatus {
 }
 
 /// A task delegated to a specialist agent.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskAssignment {
     pub agent: String,
     pub role: String,
@@ -34,13 +32,45 @@ pub struct TaskAssignment {
 }
 
 /// Status of an individual task within a run.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TaskStatus {
     Pending,
     Running,
     Completed,
     Failed(String),
 }
+
+/// Events emitted by the team engine during execution.
+///
+/// Used to communicate structured progress to callers (TUI, management tools).
+/// The caller decides what to display vs persist.
+#[derive(Clone, Debug)]
+pub enum TeamEvent {
+    /// Transient progress message (e.g., "Decomposing goal...")
+    Progress(String),
+    /// Orchestrator decomposed goal into tasks.
+    TasksAssigned {
+        tasks: Vec<TaskAssignment>,
+        iteration: u32,
+    },
+    /// Individual agent completed its task.
+    AgentCompleted { agent: String, response: String },
+    /// Individual agent failed.
+    AgentFailed { agent: String, error: String },
+    /// Critic reviewed outputs.
+    CriticReview {
+        approved: bool,
+        feedback: String,
+        iteration: u32,
+    },
+    /// Final deliverable produced.
+    Deliverable(String),
+    /// Run failed with an error.
+    RunFailed(String),
+}
+
+/// Callback for receiving team events during execution.
+pub type TeamEventCallback = Box<dyn Fn(TeamEvent) + Send + Sync>;
 
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,35 +98,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_team_run_serialization() {
-        let run = TeamRun {
-            run_id: "abc123".to_string(),
-            team_name: "dev-team".to_string(),
-            goal: "Research Rust patterns".to_string(),
-            status: RunStatus::Completed,
-            iteration: 1,
-            max_iterations: 3,
-            tasks: vec![TaskAssignment {
-                agent: "researcher".to_string(),
-                role: "specialist".to_string(),
-                task: "Research async patterns".to_string(),
-                output_file: "research.md".to_string(),
-                status: TaskStatus::Completed,
-            }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
-            ended_at: Some("2026-02-25T10:05:00Z".to_string()),
-            deliverable: Some("Final summary".to_string()),
-        };
-
-        let toml_str = toml::to_string_pretty(&run).unwrap();
-        let deserialized: TeamRun = toml::from_str(&toml_str).unwrap();
-        assert_eq!(deserialized.run_id, "abc123");
-        assert_eq!(deserialized.status, RunStatus::Completed);
-        assert_eq!(deserialized.tasks.len(), 1);
-        assert_eq!(deserialized.tasks[0].status, TaskStatus::Completed);
-    }
-
-    #[test]
     fn test_run_status_display() {
         assert_eq!(RunStatus::Running.to_string(), "running");
         assert_eq!(RunStatus::Completed.to_string(), "completed");
@@ -115,5 +116,41 @@ mod tests {
             TaskStatus::Failed("error".to_string()).to_string(),
             "failed: error"
         );
+    }
+
+    #[test]
+    fn test_team_event_debug() {
+        let event = TeamEvent::Progress("Decomposing goal...".to_string());
+        let debug = format!("{event:?}");
+        assert!(debug.contains("Decomposing goal"));
+
+        let event = TeamEvent::AgentCompleted {
+            agent: "researcher".to_string(),
+            response: "Found 3 papers".to_string(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("researcher"));
+    }
+
+    #[test]
+    fn test_team_event_clone() {
+        let event = TeamEvent::CriticReview {
+            approved: true,
+            feedback: "Looks good".to_string(),
+            iteration: 2,
+        };
+        let cloned = event.clone();
+        if let TeamEvent::CriticReview {
+            approved,
+            feedback,
+            iteration,
+        } = cloned
+        {
+            assert!(approved);
+            assert_eq!(feedback, "Looks good");
+            assert_eq!(iteration, 2);
+        } else {
+            panic!("unexpected variant");
+        }
     }
 }

@@ -43,9 +43,6 @@ impl Drop for DbContext {
 
 /// Shared initialization for an agent: migrate, resolve agent home, load config, open DB.
 fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, PathBuf, PathBuf)> {
-    // Register sqlite-vec extension before any DB connections are opened.
-    mika_agent::db::init_sqlite_vec();
-
     let global_home = home::resolve_home_dir()?;
 
     // Auto-migrate legacy layout to multi-agent on every startup
