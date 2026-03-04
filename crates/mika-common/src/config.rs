@@ -65,6 +65,18 @@ pub struct Settings {
     #[serde(default)]
     pub disable_bundled_skills: bool,
 
+    /// Enable OpenTelemetry trace export (default: false, requires "telemetry" feature)
+    #[serde(default)]
+    pub telemetry_enabled: bool,
+
+    /// OTLP endpoint URL (e.g. "https://cloud.langfuse.com/api/public/otel")
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+
+    /// OTLP authorization header value (e.g. Base64-encoded "public:secret" for Langfuse)
+    #[serde(default)]
+    pub otlp_auth_header: Option<String>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -216,6 +228,12 @@ impl std::fmt::Debug for Settings {
             )
             .field("server_log_file", &self.server_log_file)
             .field("disable_bundled_skills", &self.disable_bundled_skills)
+            .field("telemetry_enabled", &self.telemetry_enabled)
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            .field(
+                "otlp_auth_header",
+                &self.otlp_auth_header.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("home_dir", &self.home_dir)
             .finish()
     }

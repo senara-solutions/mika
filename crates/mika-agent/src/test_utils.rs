@@ -131,6 +131,9 @@ pub mod test_helpers {
             home_dir: PathBuf::from("/tmp"),
             server_log_file: None,
             disable_bundled_skills: false,
+            telemetry_enabled: false,
+            otlp_endpoint: None,
+            otlp_auth_header: None,
         }
     }
 

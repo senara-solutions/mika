@@ -383,6 +383,9 @@ mod tests {
                 home_dir: std::path::PathBuf::from("/tmp/mika-test"),
                 server_log_file: None,
                 disable_bundled_skills: false,
+                telemetry_enabled: false,
+                otlp_endpoint: None,
+                otlp_auth_header: None,
             },
         }
     }
