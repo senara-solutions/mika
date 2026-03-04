@@ -251,7 +251,7 @@ impl TeamEngine {
         // Load recent conversation history for orchestrator context
         let history = self
             .team_db
-            .load_team_runs(&self.run.team_name, 10)
+            .load_team_runs_for_prompt(&self.run.team_name, 10, 500)
             .await
             .unwrap_or_default();
 

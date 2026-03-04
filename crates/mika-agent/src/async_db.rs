@@ -625,6 +625,17 @@ impl AsyncDatabase {
         self.with_db(move |db| db.load_team_runs(&tn, limit)).await
     }
 
+    pub async fn load_team_runs_for_prompt(
+        &self,
+        team_name: &str,
+        limit: usize,
+        max_text_len: usize,
+    ) -> Result<Vec<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.load_team_runs_for_prompt(&tn, limit, max_text_len))
+            .await
+    }
+
     pub async fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
         let tn = team_name.to_owned();
         self.with_db(move |db| db.load_latest_team_run(&tn)).await
