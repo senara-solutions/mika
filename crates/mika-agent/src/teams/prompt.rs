@@ -33,18 +33,33 @@ pub fn build_orchestrator_context(
         String::new()
     } else {
         let mut buf = String::from("\n## Conversation History\n");
+        let mut budget = 5000usize; // total character budget for history section
         // Show oldest first (load_team_runs returns DESC, so reverse)
         for run in history.iter().rev() {
-            let _ = writeln!(buf, "User: {}", run.goal);
+            if budget == 0 {
+                break;
+            }
+            let goal = if run.goal.len() > 500 {
+                &run.goal[..run.goal.floor_char_boundary(500)]
+            } else {
+                &run.goal
+            };
+            let entry_start = buf.len();
+            let _ = writeln!(buf, "<context type=\"history_goal\">{goal}</context>");
             if let Some(ref d) = run.deliverable {
                 let truncated = if d.len() > 500 {
                     &d[..d.floor_char_boundary(500)]
                 } else {
                     d
                 };
-                let _ = writeln!(buf, "Assistant: {truncated}");
+                let _ = writeln!(
+                    buf,
+                    "<context type=\"history_deliverable\">{truncated}</context>"
+                );
             }
             buf.push('\n');
+            let entry_len = buf.len() - entry_start;
+            budget = budget.saturating_sub(entry_len);
         }
         buf
     };
@@ -88,7 +103,7 @@ pub fn build_orchestrator_context(
          \n\
          Use `list_workspace` to check the current workspace state before planning.\n\
          \n\
-         Respond ONLY with JSON. Examples:\n\
+         Respond ONLY with compact (single-line) JSON, not pretty-printed. Examples:\n\
          Conversational: {{\"reply\": \"Hey! The team is ready and waiting for a goal.\"}}\n\
          Actionable: [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
         team_name = def.team.name,
@@ -300,10 +315,13 @@ mod tests {
         let ctx = build_orchestrator_context(&def, "", None, &history);
         assert!(ctx.contains("## Conversation History"));
         // History returned DESC, rendered oldest first — run-2 (index 0) is newer
-        assert!(ctx.contains("User: How is the team?"));
-        assert!(ctx.contains("Assistant: The team is ready!"));
-        assert!(ctx.contains("User: Ping everyone"));
-        assert!(ctx.contains("Assistant: Done, pinged all agents."));
+        assert!(ctx.contains("How is the team?"));
+        assert!(ctx.contains("The team is ready!"));
+        assert!(ctx.contains("Ping everyone"));
+        assert!(ctx.contains("Done, pinged all agents."));
+        // Entries should be wrapped in context delimiters
+        assert!(ctx.contains("<context type=\"history_goal\">"));
+        assert!(ctx.contains("<context type=\"history_deliverable\">"));
     }
 
     #[test]
@@ -346,7 +364,7 @@ mod tests {
                 output_file: "research.md".to_string(),
                 status: TaskStatus::Completed,
             }],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
+            started_at: 1740474000,
             ended_at: None,
             deliverable: None,
         };
@@ -369,7 +387,7 @@ mod tests {
             iteration: 1,
             max_iterations: 3,
             tasks: vec![],
-            started_at: "2026-02-25T10:00:00Z".to_string(),
+            started_at: 1740474000,
             ended_at: None,
             deliverable: None,
         };
@@ -378,6 +396,28 @@ mod tests {
         assert!(ctx.contains("FINAL DELIVERABLE"));
         assert!(ctx.contains("Write summary"));
         assert!(ctx.contains("deliverable.md"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_history_truncates_long_goals() {
+        let def = test_def();
+        let long_goal = "x".repeat(1000);
+        let history = vec![TeamRunRow {
+            id: "run-1".to_string(),
+            team_name: "dev-team".to_string(),
+            goal: long_goal,
+            status: "completed".to_string(),
+            failure_reason: None,
+            iteration: 0,
+            max_iterations: 3,
+            deliverable: Some("result".to_string()),
+            started_at: 1000,
+            ended_at: Some(1001),
+        }];
+        let ctx = build_orchestrator_context(&def, "", None, &history);
+        // Goal should be truncated to 500 chars, not the full 1000
+        assert!(!ctx.contains(&"x".repeat(1000)));
+        assert!(ctx.contains(&"x".repeat(500)));
     }
 
     #[test]

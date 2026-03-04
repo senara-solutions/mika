@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 use std::io::{self, Write};
 
-use mika_agent::db::{Database, format_unix_ts};
-use mika_agent::teams::open_or_create_team_db;
+use mika_agent::db::format_unix_ts;
 use mika_agent::teams::types::TeamEvent;
+use mika_agent::teams::{TeamDbError, open_or_create_team_db, open_team_db_sync};
 use mika_common::config::Settings;
 use mika_common::home;
 use mika_common::team;
@@ -168,18 +168,25 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
         TeamEvent::Progress(msg) => println!("  > {msg}"),
         TeamEvent::AgentCompleted { agent, .. } => println!("  > {agent} completed"),
         TeamEvent::AgentFailed { agent, error } => {
-            eprintln!("  > {agent} failed: {error}")
+            eprintln!("  > {agent} failed: {error}");
+        }
+        TeamEvent::TasksAssigned { tasks, iteration } => {
+            let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
+            println!(
+                "  > Iteration {iteration}: assigned tasks to {}",
+                names.join(", ")
+            );
         }
         TeamEvent::CriticReview {
-            approved, feedback, ..
+            approved,
+            feedback,
+            iteration,
         } => {
-            if approved {
-                println!("  > Critic approved");
-            } else {
-                println!("  > Critic rejected: {feedback}");
-            }
+            let verdict = if approved { "approved" } else { "rejected" };
+            println!("  > Critic (iteration {iteration}): {verdict}. {feedback}");
         }
-        _ => {}
+        TeamEvent::Deliverable(_) => {} // handled by run result
+        TeamEvent::RunFailed(_) => {}   // handled by run result
     };
 
     // Open team DB for persistence
@@ -240,11 +247,7 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
     println!("  Max iterations: {}", def.flow.max_iterations);
 
     // Show latest run if available from team DB
-    let team_db_path = team::team_dir(global_home, &name)
-        .join("data")
-        .join("mika.db");
-    if team_db_path.exists()
-        && let Ok(db) = Database::open(&team_db_path)
+    if let Ok(db) = open_team_db_sync(global_home, &name)
         && let Ok(Some(latest)) = db.load_latest_team_run(&name)
     {
         println!("\n  Latest run:");
@@ -268,15 +271,14 @@ fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
         bail!("Team '{name}' not found.");
     }
 
-    let team_db_path = team::team_dir(global_home, &name)
-        .join("data")
-        .join("mika.db");
-    if !team_db_path.exists() {
-        println!("\n  No runs found for team '{name}'.\n");
-        return Ok(());
-    }
-
-    let db = Database::open(&team_db_path)?;
+    let db = match open_team_db_sync(global_home, &name) {
+        Ok(db) => db,
+        Err(TeamDbError::NoRuns(_)) => {
+            println!("\n  No runs found for team '{name}'.\n");
+            return Ok(());
+        }
+        Err(TeamDbError::OpenFailed(msg)) => bail!(msg),
+    };
     let runs = db.load_team_runs(&name, 50)?;
 
     if runs.is_empty() {

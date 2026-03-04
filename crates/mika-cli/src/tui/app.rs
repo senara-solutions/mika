@@ -7,6 +7,7 @@ use tui_textarea::TextArea;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::skills::SkillRegistry;
+use mika_agent::teams::types::TeamEvent;
 use mika_common::claude::ClaudeClient;
 
 use crate::tui::attachment::ImageAttachment;
@@ -18,18 +19,6 @@ use crate::tui::markdown;
 pub enum TeamRequest {
     Goal(String),
     Quit,
-}
-
-/// Responses from the team worker to the TUI.
-pub enum TeamResponse {
-    /// Progress update from the team engine (e.g., "Decomposing goal...", "Running researcher...")
-    Progress(String),
-    /// Individual agent message (shown in verbose mode).
-    AgentMessage { agent: String, content: String },
-    /// Final deliverable text from the completed team run.
-    Deliverable(String),
-    /// Team execution failed with an error message.
-    Error(String),
 }
 
 /// Agent processing status.
@@ -287,8 +276,8 @@ pub struct App<'a> {
     // Team mode fields (None when in agent mode)
     /// Team worker channel for sending goals.
     pub team_tx: Option<mpsc::UnboundedSender<TeamRequest>>,
-    /// Team worker channel for receiving progress/deliverables.
-    pub team_rx: Option<mpsc::UnboundedReceiver<TeamResponse>>,
+    /// Team worker channel for receiving team events.
+    pub team_rx: Option<mpsc::UnboundedReceiver<TeamEvent>>,
     /// Team name (set when in team mode).
     pub team_name: Option<String>,
     /// Team directory path (e.g., ~/.mika/teams/{name}/).
@@ -368,7 +357,7 @@ impl<'a> App<'a> {
     /// Create a new App in team mode.
     pub fn new_team(
         team_tx: mpsc::UnboundedSender<TeamRequest>,
-        team_rx: mpsc::UnboundedReceiver<TeamResponse>,
+        team_rx: mpsc::UnboundedReceiver<TeamEvent>,
         team_name: &str,
         team_dir: PathBuf,
         global_home: PathBuf,
@@ -621,7 +610,7 @@ impl<'a> App<'a> {
             return;
         };
         match team_rx.try_recv() {
-            Ok(TeamResponse::Progress(msg)) => {
+            Ok(TeamEvent::Progress(msg)) => {
                 self.messages.push(ChatMessage {
                     role: ChatRole::System,
                     content: msg,
@@ -631,11 +620,11 @@ impl<'a> App<'a> {
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
             }
-            Ok(TeamResponse::AgentMessage { agent, content }) => {
+            Ok(TeamEvent::AgentCompleted { agent, response }) => {
                 if self.verbose_mode {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
-                        content: format!("[{agent}] {content}"),
+                        content: format!("[{agent}] {response}"),
                         rendered: None,
                         channel: None,
                     });
@@ -643,7 +632,59 @@ impl<'a> App<'a> {
                     self.needs_redraw = true;
                 }
             }
-            Ok(TeamResponse::Deliverable(text)) => {
+            Ok(TeamEvent::AgentFailed { agent, error }) => {
+                if self.verbose_mode {
+                    self.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: format!("[{agent}] [failed] {error}"),
+                        rendered: None,
+                        channel: None,
+                    });
+                    self.auto_scroll_to_bottom();
+                    self.needs_redraw = true;
+                }
+            }
+            Ok(TeamEvent::TasksAssigned { tasks, iteration }) => {
+                // In verbose mode, show individual assignments
+                if self.verbose_mode {
+                    for task in &tasks {
+                        self.messages.push(ChatMessage {
+                            role: ChatRole::System,
+                            content: format!("[{}] [assigned] {}", task.agent, task.task),
+                            rendered: None,
+                            channel: None,
+                        });
+                    }
+                }
+                let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!(
+                        "Iteration {iteration}: assigned tasks to {}",
+                        names.join(", ")
+                    ),
+                    rendered: None,
+                    channel: None,
+                });
+                self.auto_scroll_to_bottom();
+                self.needs_redraw = true;
+            }
+            Ok(TeamEvent::CriticReview {
+                approved,
+                feedback,
+                iteration,
+            }) => {
+                let verdict = if approved { "approved" } else { "rejected" };
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!("Critic (iteration {iteration}): {verdict}. {feedback}"),
+                    rendered: None,
+                    channel: None,
+                });
+                self.auto_scroll_to_bottom();
+                self.needs_redraw = true;
+            }
+            Ok(TeamEvent::Deliverable(text)) => {
                 if text.is_empty() {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
@@ -663,7 +704,7 @@ impl<'a> App<'a> {
                 }
                 self.needs_redraw = true;
             }
-            Ok(TeamResponse::Error(msg)) => {
+            Ok(TeamEvent::RunFailed(msg)) => {
                 self.messages.push(ChatMessage {
                     role: ChatRole::System,
                     content: format!("Team error: {msg}"),

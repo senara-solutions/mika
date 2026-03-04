@@ -14,7 +14,7 @@ use crate::db::Database;
 use self::engine::TeamEngine;
 use self::types::{TeamEventCallback, TeamRun};
 
-/// Error type for [`open_team_db`].
+/// Error type for [`open_team_db`] and [`open_team_db_sync`].
 pub enum TeamDbError {
     /// The team data directory does not exist (no runs recorded yet).
     /// Contains a user-facing "No runs found" message — not a hard error.
@@ -31,11 +31,11 @@ impl std::fmt::Display for TeamDbError {
     }
 }
 
-/// Open a team's SQLite database for read-only access.
+/// Open a team's SQLite database synchronously for read-only access.
 ///
 /// Returns [`TeamDbError::NoRuns`] if the team data directory does not
 /// exist and [`TeamDbError::OpenFailed`] if the database cannot be opened.
-pub fn open_team_db(home_dir: &Path, team_name: &str) -> Result<AsyncDatabase, TeamDbError> {
+pub fn open_team_db_sync(home_dir: &Path, team_name: &str) -> Result<Database, TeamDbError> {
     let team_data_dir = team::team_dir(home_dir, team_name).join("data");
     if !team_data_dir.exists() {
         return Err(TeamDbError::NoRuns(format!(
@@ -43,12 +43,16 @@ pub fn open_team_db(home_dir: &Path, team_name: &str) -> Result<AsyncDatabase, T
         )));
     }
     let team_db_path = team_data_dir.join("mika.db");
-    match Database::open(&team_db_path) {
-        Ok(db) => Ok(AsyncDatabase::new(db)),
-        Err(e) => Err(TeamDbError::OpenFailed(format!(
-            "Failed to open team database: {e}"
-        ))),
-    }
+    Database::open(&team_db_path)
+        .map_err(|e| TeamDbError::OpenFailed(format!("Failed to open team database: {e}")))
+}
+
+/// Open a team's SQLite database for read-only access, wrapped in [`AsyncDatabase`].
+///
+/// Returns [`TeamDbError::NoRuns`] if the team data directory does not
+/// exist and [`TeamDbError::OpenFailed`] if the database cannot be opened.
+pub fn open_team_db(home_dir: &Path, team_name: &str) -> Result<AsyncDatabase, TeamDbError> {
+    open_team_db_sync(home_dir, team_name).map(AsyncDatabase::new)
 }
 
 /// Open (or create) a team's SQLite database for read-write access.

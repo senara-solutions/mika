@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "438"
 tags: [code-review, duplication, refactor]

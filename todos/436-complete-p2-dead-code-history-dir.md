@@ -1,5 +1,5 @@
 ---
-status: pending
+status: wont_fix
 priority: p2
 issue_id: "436"
 tags: [code-review, dead-code, cleanup]

@@ -15,9 +15,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::init::{self, AppContext};
-use crate::tui::app::{
-    AgentRequest, AgentResponse, App, ChatMessage, ChatRole, TeamRequest, TeamResponse,
-};
+use crate::tui::app::{AgentRequest, AgentResponse, App, ChatMessage, ChatRole, TeamRequest};
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
@@ -446,7 +444,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let team_dir = team::team_dir(global_home, team_name);
 
     let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
-    let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamResponse>();
+    let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamEvent>();
 
     // Open on-disk DB for team conversation persistence
     let data_dir = team_dir.join("data");
@@ -461,8 +459,9 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         let settings = match Settings::load(&worker_home) {
             Ok(s) => s,
             Err(e) => {
-                let _ =
-                    response_tx.send(TeamResponse::Error(format!("Failed to load settings: {e}")));
+                let _ = response_tx.send(TeamEvent::RunFailed(format!(
+                    "Failed to load settings: {e}"
+                )));
                 return;
             }
         };
@@ -472,49 +471,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                 TeamRequest::Goal(goal) => {
                     let tx = response_tx.clone();
                     let callback = move |event: TeamEvent| {
-                        let msg = match event {
-                            TeamEvent::Progress(s) => TeamResponse::Progress(s),
-                            TeamEvent::AgentCompleted { agent, response } => {
-                                TeamResponse::AgentMessage {
-                                    agent,
-                                    content: response,
-                                }
-                            }
-                            TeamEvent::AgentFailed { agent, error } => TeamResponse::AgentMessage {
-                                agent: agent.clone(),
-                                content: format!("[failed] {error}"),
-                            },
-                            TeamEvent::CriticReview {
-                                approved,
-                                feedback,
-                                iteration,
-                            } => {
-                                let verdict = if approved { "approved" } else { "rejected" };
-                                TeamResponse::Progress(format!(
-                                    "Critic (iteration {iteration}): {verdict}. {feedback}"
-                                ))
-                            }
-                            TeamEvent::TasksAssigned { tasks, iteration } => {
-                                // In verbose mode, show individual assignments
-                                for task in &tasks {
-                                    let _ = tx.send(TeamResponse::AgentMessage {
-                                        agent: task.agent.clone(),
-                                        content: format!("[assigned] {}", task.task),
-                                    });
-                                }
-                                let names: Vec<_> =
-                                    tasks.iter().map(|t| t.agent.as_str()).collect();
-                                TeamResponse::Progress(format!(
-                                    "Iteration {iteration}: assigned tasks to {}",
-                                    names.join(", ")
-                                ))
-                            }
-                            TeamEvent::Deliverable(_) | TeamEvent::RunFailed(_) => {
-                                // Handled by the Ok/Err match below
-                                return;
-                            }
-                        };
-                        let _ = tx.send(msg);
+                        let _ = tx.send(event);
                     };
 
                     match mika_agent::teams::run_team(
@@ -529,14 +486,14 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                     {
                         Ok(run) => {
                             if let RunStatus::Failed(reason) = run.status {
-                                let _ = response_tx.send(TeamResponse::Error(reason));
+                                let _ = response_tx.send(TeamEvent::RunFailed(reason));
                             } else {
                                 let deliverable = run.deliverable.unwrap_or_default();
-                                let _ = response_tx.send(TeamResponse::Deliverable(deliverable));
+                                let _ = response_tx.send(TeamEvent::Deliverable(deliverable));
                             }
                         }
                         Err(e) => {
-                            let _ = response_tx.send(TeamResponse::Error(format!("{e}")));
+                            let _ = response_tx.send(TeamEvent::RunFailed(format!("{e}")));
                         }
                     }
                 }

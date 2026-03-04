@@ -8,8 +8,8 @@ pub struct TeamRun {
     pub iteration: u32,
     pub max_iterations: u32,
     pub tasks: Vec<TaskAssignment>,
-    pub started_at: String,
-    pub ended_at: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
     pub deliverable: Option<String>,
 }
 

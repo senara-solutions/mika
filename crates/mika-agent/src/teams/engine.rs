@@ -24,7 +24,7 @@ use super::prompt;
 use super::types::*;
 
 /// Maximum wall-clock time for the entire team run (all phases combined).
-const TEAM_RUN_TIMEOUT_SECS: u64 = 600; // 10 minutes
+const TEAM_RUN_TIMEOUT_SECS: u64 = 900; // 15 minutes
 
 /// Resources needed to run a specific agent.
 struct AgentResources {
@@ -112,7 +112,7 @@ impl TeamEngine {
             iteration: 0,
             max_iterations: team.flow.max_iterations,
             tasks: Vec::new(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: chrono::Utc::now().timestamp(),
             ended_at: None,
             deliverable: None,
         };
@@ -134,7 +134,6 @@ impl TeamEngine {
     /// Execute the full team orchestration flow.
     pub async fn execute(mut self) -> Result<TeamRun> {
         // Persist the team run to DB
-        let started_at = chrono::Utc::now().timestamp();
         if let Err(e) = self
             .team_db
             .insert_team_run(
@@ -142,7 +141,7 @@ impl TeamEngine {
                 &self.run.team_name,
                 &self.run.goal,
                 self.run.max_iterations,
-                started_at,
+                self.run.started_at,
             )
             .await
         {
@@ -184,8 +183,8 @@ impl TeamEngine {
                 self.emit_event(TeamEvent::RunFailed(e.to_string()));
 
                 // Persist error message to DB
-                if let Some(goal_id) = self.goal_msg_id {
-                    let _ = self
+                if let Some(goal_id) = self.goal_msg_id
+                    && let Err(e) = self
                         .team_db
                         .insert_team_message(
                             &self.run.run_id,
@@ -195,15 +194,17 @@ impl TeamEngine {
                             &e.to_string(),
                             self.run.iteration,
                         )
-                        .await;
+                        .await
+                {
+                    warn!(error = %e, "failed to persist team message");
                 }
             }
         }
 
-        self.run.ended_at = Some(chrono::Utc::now().to_rfc3339());
+        let ended_at = chrono::Utc::now().timestamp();
+        self.run.ended_at = Some(ended_at);
 
         // Update run status in DB
-        let ended_at = chrono::Utc::now().timestamp();
         let (status_str, failure_reason) = match &self.run.status {
             RunStatus::Running => ("running", None),
             RunStatus::Completed => ("completed", None),
@@ -228,6 +229,7 @@ impl TeamEngine {
         for resources in self.agents.values() {
             resources.db.shutdown();
         }
+        self.team_db.shutdown();
 
         match result {
             Ok(_) => Ok(self.run),
@@ -351,17 +353,18 @@ impl TeamEngine {
 
         let result = parse_task_assignments(&response, &self.team)?;
 
+        let iteration = if feedback.is_some() {
+            self.run.iteration + 1
+        } else {
+            1
+        };
+
         // For conversational replies, persist and return early
         let tasks = match result {
             DecomposeResult::Conversational(reply) => {
                 // Persist orchestrator conversational response to DB
-                let iteration = if feedback.is_some() {
-                    self.run.iteration + 1
-                } else {
-                    1
-                };
-                if let Some(goal_id) = self.goal_msg_id {
-                    let _ = self
+                if let Some(goal_id) = self.goal_msg_id
+                    && let Err(e) = self
                         .team_db
                         .insert_team_message(
                             &self.run.run_id,
@@ -371,7 +374,9 @@ impl TeamEngine {
                             &response,
                             iteration,
                         )
-                        .await;
+                        .await
+                {
+                    warn!(error = %e, "failed to persist team message");
                 }
                 return Ok(DecomposeResult::Conversational(reply));
             }
@@ -379,11 +384,6 @@ impl TeamEngine {
         };
 
         // Persist orchestrator decomposition to DB
-        let iteration = if feedback.is_some() {
-            self.run.iteration + 1
-        } else {
-            1
-        };
         if let Some(goal_id) = self.goal_msg_id {
             let orchestrator_msg_id = self
                 .team_db
@@ -401,7 +401,7 @@ impl TeamEngine {
             // Insert assignment messages as children of orchestrator
             if let Some(orch_id) = orchestrator_msg_id {
                 for task in &tasks {
-                    let _ = self
+                    if let Err(e) = self
                         .team_db
                         .insert_team_message(
                             &self.run.run_id,
@@ -411,7 +411,10 @@ impl TeamEngine {
                             &task.task,
                             iteration,
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(error = %e, "failed to persist team message");
+                    }
                 }
             }
         }
@@ -437,19 +440,11 @@ impl TeamEngine {
         let iteration = self.run.iteration;
 
         // Look up assignment message IDs from DB for parent linking.
-        // We find the most recent assignment message for each agent at this iteration.
-        let assignment_msg_ids: HashMap<String, i64> = {
-            let messages = self
-                .team_db
-                .load_team_messages(&self.run.run_id)
-                .await
-                .unwrap_or_default();
-            messages
-                .iter()
-                .filter(|m| m.message_type == "assignment" && m.iteration == iteration)
-                .filter_map(|m| m.agent_name.as_ref().map(|name| (name.clone(), m.id)))
-                .collect()
-        };
+        let assignment_msg_ids: HashMap<String, i64> = self
+            .team_db
+            .load_assignment_msg_ids(&self.run.run_id, iteration)
+            .await
+            .unwrap_or_default();
         let assignment_msg_ids = Arc::new(assignment_msg_ids);
 
         // Build per-task parameters upfront from self (avoids borrowing self in spawned tasks).
@@ -558,7 +553,7 @@ impl TeamEngine {
                             });
                         }
                         // Persist agent response
-                        let _ = team_db
+                        if let Err(e) = team_db
                             .insert_team_message(
                                 &run_id,
                                 parent_id,
@@ -567,7 +562,10 @@ impl TeamEngine {
                                 response,
                                 iteration,
                             )
-                            .await;
+                            .await
+                        {
+                            warn!(error = %e, "failed to persist team message");
+                        }
                     }
                     Err(e) => {
                         let error_str = e.to_string();
@@ -579,7 +577,7 @@ impl TeamEngine {
                             });
                         }
                         // Persist agent error
-                        let _ = team_db
+                        if let Err(e) = team_db
                             .insert_team_message(
                                 &run_id,
                                 parent_id,
@@ -588,7 +586,10 @@ impl TeamEngine {
                                 &error_str,
                                 iteration,
                             )
-                            .await;
+                            .await
+                        {
+                            warn!(error = %e, "failed to persist team message");
+                        }
                     }
                 }
 
@@ -690,8 +691,8 @@ impl TeamEngine {
         let (approved, feedback) = parse_review_response(&response)?;
 
         // Persist critic feedback to DB
-        if let Some(goal_id) = self.goal_msg_id {
-            let _ = self
+        if let Some(goal_id) = self.goal_msg_id
+            && let Err(e) = self
                 .team_db
                 .insert_team_message(
                     &self.run.run_id,
@@ -701,7 +702,9 @@ impl TeamEngine {
                     &response,
                     self.run.iteration,
                 )
-                .await;
+                .await
+        {
+            warn!(error = %e, "failed to persist team message");
         }
 
         self.emit_event(TeamEvent::CriticReview {
@@ -733,8 +736,8 @@ impl TeamEngine {
             .await?;
 
         // Persist deliverable to DB
-        if let Some(goal_id) = self.goal_msg_id {
-            let _ = self
+        if let Some(goal_id) = self.goal_msg_id
+            && let Err(e) = self
                 .team_db
                 .insert_team_message(
                     &self.run.run_id,
@@ -744,7 +747,9 @@ impl TeamEngine {
                     &response,
                     self.run.iteration,
                 )
-                .await;
+                .await
+        {
+            warn!(error = %e, "failed to persist team message");
         }
 
         Ok(response)
@@ -789,6 +794,9 @@ impl TeamEngine {
     }
 
     fn emit_event(&self, event: TeamEvent) {
+        // Single log line per event (#435). AgentCompleted / AgentFailed are
+        // logged in execute_tasks() spawned tasks (which bypass emit_event).
+        // RunFailed is logged in execute() after calling emit_event.
         match &event {
             TeamEvent::Progress(s) => {
                 info!(team = %self.run.team_name, "{s}");
@@ -796,20 +804,16 @@ impl TeamEngine {
             TeamEvent::TasksAssigned { .. } => {
                 info!(team = %self.run.team_name, "Tasks assigned");
             }
-            TeamEvent::AgentCompleted { agent, .. } => {
-                info!(team = %self.run.team_name, agent, "agent completed");
-            }
-            TeamEvent::AgentFailed { agent, error } => {
-                warn!(team = %self.run.team_name, agent, error, "agent failed");
+            TeamEvent::AgentCompleted { .. }
+            | TeamEvent::AgentFailed { .. }
+            | TeamEvent::RunFailed(_) => {
+                // Already logged at the call site; skip here to avoid duplicates.
             }
             TeamEvent::CriticReview { approved, .. } => {
                 info!(team = %self.run.team_name, approved, "Critic review");
             }
             TeamEvent::Deliverable(_) => {
                 info!(team = %self.run.team_name, "Deliverable ready");
-            }
-            TeamEvent::RunFailed(reason) => {
-                warn!(team = %self.run.team_name, reason, "run failed");
             }
         }
         if let Some(cb) = &self.callback {
@@ -878,8 +882,12 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Decom
             continue;
         }
 
-        // #252: Validate output_file (no path traversal or absolute paths)
-        if output_file.contains("..") || output_file.starts_with('/') {
+        // #252 + #448: Validate output_file (no path traversal, absolute paths, null bytes, or backslashes)
+        if output_file.contains("..")
+            || output_file.starts_with('/')
+            || output_file.contains('\0')
+            || output_file.contains('\\')
+        {
             warn!(output_file = %output_file, agent = %agent_name, "invalid output_file path, skipping");
             continue;
         }
@@ -887,7 +895,7 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Decom
         // #252: Enforce task length limit (5000 chars)
         let task = if task.len() > 5000 {
             warn!(agent = %agent_name, len = task.len(), "task description exceeds 5000 chars, truncating");
-            task[..5000].to_string()
+            task[..task.floor_char_boundary(5000)].to_string()
         } else {
             task
         };
@@ -947,10 +955,19 @@ fn parse_review_response(response: &str) -> Result<(bool, String)> {
 /// - For objects (`{`/`}`): looks for `{"` as the start pattern
 ///   Then searches backwards from the end for the matching close bracket. (#257)
 fn extract_json(text: &str, open: char, close: char) -> Option<&str> {
-    // Build a smarter start pattern to reduce false positives
-    let start_pattern = if open == '[' { "[{" } else { "{\"" };
+    let expected_inner = if open == '[' { '{' } else { '"' };
 
-    let start = text.find(start_pattern)?;
+    // Find the opening bracket where the next non-whitespace char is the expected inner.
+    // Handles both compact (`[{`) and pretty-printed (`[\n  {`) JSON.
+    let start = text.char_indices().find_map(|(i, c)| {
+        if c == open {
+            let rest = &text[i + c.len_utf8()..];
+            if rest.trim_start().starts_with(expected_inner) {
+                return Some(i);
+            }
+        }
+        None
+    })?;
 
     // Search backwards from end for the matching close bracket
     let end = text.rfind(close)?;
@@ -1076,6 +1093,25 @@ mod tests {
             DecomposeResult::Conversational(text) => assert_eq!(text, response),
             DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
         }
+    }
+
+    #[test]
+    fn test_parse_task_assignments_pretty_printed() {
+        let response = r#"[
+  {
+    "agent": "worker",
+    "task": "Do research",
+    "output_file": "research.md"
+  }
+]"#;
+        let team = test_team();
+        let result = parse_task_assignments(response, &team).unwrap();
+        let tasks = match result {
+            DecomposeResult::Tasks(tasks) => tasks,
+            DecomposeResult::Conversational(_) => panic!("expected Tasks, got Conversational"),
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].agent, "worker");
     }
 
     #[test]

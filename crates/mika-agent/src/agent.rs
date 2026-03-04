@@ -28,8 +28,10 @@ const MAX_TOOL_STEPS: usize = 10;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
-/// Shorter timeout for team sub-agents (must fit within the global team run budget).
-const TEAM_AGENT_TIMEOUT_SECS: u64 = 180;
+/// Per-agent timeout for team sub-agents (matches AGENT_TOTAL_TIMEOUT_SECS).
+/// Since team agents run in parallel, the constraint is fitting within the global
+/// team run budget (max of agent times, not sum).
+const TEAM_AGENT_TIMEOUT_SECS: u64 = 300;
 /// Timeout for the continuation API call after max tool steps are exceeded.
 /// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
 const CONTINUATION_TIMEOUT_SECS: u64 = 60;

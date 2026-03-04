@@ -706,6 +706,32 @@ impl Database {
         Ok(rows)
     }
 
+    /// Load assignment message IDs for a specific run and iteration.
+    ///
+    /// Returns a map of agent_name -> message_id for assignment messages,
+    /// used for parent-linking agent responses to their assignments.
+    pub fn load_assignment_msg_ids(
+        &self,
+        run_id: &str,
+        iteration: u32,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_name FROM team_messages
+             WHERE run_id = ?1 AND message_type = 'assignment' AND iteration = ?2
+             ORDER BY id",
+        )?;
+        let map = stmt
+            .query_map(rusqlite::params![run_id, iteration], |row| {
+                let id: i64 = row.get(0)?;
+                let agent: Option<String> = row.get(1)?;
+                Ok((agent, id))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(agent, id)| agent.map(|name| (name, id)))
+            .collect();
+        Ok(map)
+    }
+
     // -- Conversations --
 
     /// Save a conversation message.

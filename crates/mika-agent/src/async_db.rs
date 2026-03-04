@@ -658,6 +658,16 @@ impl AsyncDatabase {
         .await
     }
 
+    pub async fn load_assignment_msg_ids(
+        &self,
+        run_id: &str,
+        iteration: u32,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.load_assignment_msg_ids(&ri, iteration))
+            .await
+    }
+
     pub async fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
         let ri = run_id.to_owned();
         self.with_db(move |db| db.load_team_messages(&ri)).await
