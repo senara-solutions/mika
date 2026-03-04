@@ -31,3 +31,6 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Test (with telemetry feature)
+        run: cargo test --workspace --features telemetry

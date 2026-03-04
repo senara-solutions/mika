@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
-use crate::tui::app::{AgentStatus, App, ChatRole};
+use crate::tui::app::{AgentStatus, App, ChatRole, DashboardAgentStatus};
 use crate::tui::markdown;
 
 /// Build a yellow `[channel] ` prefix span for non-CLI messages.
@@ -132,7 +132,18 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     .split(f.area());
 
     draw_header(f, app, chunks[0]);
-    draw_messages(f, app, chunks[1]);
+
+    // Split-pane: show dashboard panel when team dashboard is active and terminal is wide enough
+    let show_dashboard = app.team_dashboard.is_some() && chunks[1].width >= 80;
+    if show_dashboard {
+        let horiz = Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(chunks[1]);
+        draw_messages(f, app, horiz[0]);
+        draw_team_dashboard(f, app, horiz[1]);
+    } else {
+        draw_messages(f, app, chunks[1]);
+    }
+
     draw_input(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
 
@@ -415,9 +426,9 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     };
 
     let mut spans = if app.is_team_mode() {
-        // Team mode: simpler footer (no model, no thinking level, no context)
+        // Team mode: show dashboard summary when active
         let team_name = app.team_name.as_deref().unwrap_or("team");
-        vec![
+        let mut s = vec![
             Span::styled(
                 format!(" team: {team_name} "),
                 Style::default().fg(Color::Yellow),
@@ -427,7 +438,36 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                 status_text.to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
-        ]
+        ];
+        if let Some(ref dash) = app.team_dashboard {
+            let elapsed = dash.run_started.elapsed().as_secs();
+            let total = dash.agents.len();
+            let done = dash
+                .agents
+                .iter()
+                .filter(|a| a.status == DashboardAgentStatus::Completed)
+                .count();
+            if total > 0 {
+                s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                s.push(Span::styled(
+                    format!("agents: {done}/{total}"),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            s.push(Span::styled(
+                format!("{elapsed}s"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            if let Some(ref phase) = dash.phase {
+                s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                s.push(Span::styled(
+                    format!("{phase}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+        s
     } else {
         let mut s = vec![
             Span::styled(
@@ -516,6 +556,105 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
 
     let footer = Line::from(spans);
     f.render_widget(Paragraph::new(footer), area);
+}
+
+fn draw_team_dashboard(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
+    let dash = match &app.team_dashboard {
+        Some(d) => d,
+        None => return,
+    };
+
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Dashboard ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Phase + iteration
+    let phase_str = dash
+        .phase
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "starting".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("Phase: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(phase_str, Style::default().fg(Color::Cyan)),
+    ]));
+    if dash.iteration > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Iter:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", dash.iteration),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // Agent status grid
+    if !dash.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Agents:",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for agent in &dash.agents {
+            let (icon, color) = match agent.status {
+                DashboardAgentStatus::Running => ("\u{2026}", Color::Yellow), // …
+                DashboardAgentStatus::Completed => ("\u{2713}", Color::Green), // ✓
+                DashboardAgentStatus::Failed => ("\u{2717}", Color::Red),     // ✗
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                Span::styled(agent.name.clone(), Style::default().fg(color)),
+                Span::styled(
+                    format!(" ({})", agent.role),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Elapsed time
+    let elapsed = dash.run_started.elapsed();
+    let secs = elapsed.as_secs();
+    let elapsed_str = if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Elapsed: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(elapsed_str, Style::default().fg(Color::White)),
+    ]));
+
+    // Agent completion summary
+    let total = dash.agents.len();
+    let done = dash
+        .agents
+        .iter()
+        .filter(|a| a.status == DashboardAgentStatus::Completed)
+        .count();
+    if total > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Done:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{done}/{total}"), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(paragraph, inner);
 }
 
 fn draw_autocomplete(f: &mut Frame<'_>, app: &App<'_>, input_area: Rect) {

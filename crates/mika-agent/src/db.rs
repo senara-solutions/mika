@@ -624,6 +624,45 @@ impl Database {
         Ok(rows)
     }
 
+    /// Load recent team runs with goal and deliverable truncated in SQL.
+    ///
+    /// Used for prompt injection where full text is unnecessary.
+    /// `max_text_len` controls the `SUBSTR` limit for both fields.
+    pub fn load_team_runs_for_prompt(
+        &self,
+        team_name: &str,
+        limit: usize,
+        max_text_len: usize,
+    ) -> Result<Vec<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, team_name, SUBSTR(goal, 1, ?3), status, failure_reason,
+                    iteration, max_iterations, SUBSTR(deliverable, 1, ?3),
+                    started_at, ended_at
+             FROM team_runs WHERE team_name = ?1
+             ORDER BY started_at DESC LIMIT ?2",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![team_name, limit, max_text_len], |row| {
+                Ok(TeamRunRow {
+                    id: row.get(0)?,
+                    team_name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    failure_reason: row.get(4)?,
+                    iteration: row.get(5)?,
+                    max_iterations: row.get(6)?,
+                    deliverable: row.get(7)?,
+                    started_at: row.get(8)?,
+                    ended_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to load team runs for prompt")?;
+
+        Ok(rows)
+    }
+
     /// Load the latest team run for a team.
     pub fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
         let mut runs = self.load_team_runs(team_name, 1)?;

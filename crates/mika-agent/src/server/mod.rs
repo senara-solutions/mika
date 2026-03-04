@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use mika_common::agent;
@@ -49,6 +50,7 @@ fn build_router(state: AppState) -> Router {
         ))
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -381,6 +383,9 @@ mod tests {
                 home_dir: std::path::PathBuf::from("/tmp/mika-test"),
                 server_log_file: None,
                 disable_bundled_skills: false,
+                telemetry_enabled: false,
+                otlp_endpoint: None,
+                otlp_auth_header: None,
             },
         }
     }

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "450"
 tags: [code-review, performance]
@@ -18,4 +18,4 @@ Add a `load_team_runs_for_prompt()` variant that uses `SUBSTR()` in SQL, or add 
 
 ## Acceptance Criteria
 
-- [ ] Deliverable truncation moved to SQL layer
+- [x] Deliverable truncation moved to SQL layer

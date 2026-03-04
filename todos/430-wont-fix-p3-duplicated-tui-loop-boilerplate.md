@@ -1,5 +1,5 @@
 ---
-status: pending
+status: wont_fix
 priority: p3
 issue_id: 430
 tags: [code-review, quality, duplication, tui]

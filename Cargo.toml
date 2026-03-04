@@ -43,6 +43,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 
+# OpenTelemetry (optional per-crate via "telemetry" feature)
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["http-proto"] }
+tracing-opentelemetry = "0.32"
+
 # Error handling
 anyhow = "1"
 thiserror = "2"

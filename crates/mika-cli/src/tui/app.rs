@@ -7,7 +7,7 @@ use tui_textarea::TextArea;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::skills::SkillRegistry;
-use mika_agent::teams::types::TeamEvent;
+use mika_agent::teams::types::{TeamEvent, TeamPhase};
 use mika_common::claude::ClaudeClient;
 
 use crate::tui::attachment::ImageAttachment;
@@ -209,6 +209,42 @@ impl InputHistory {
     }
 }
 
+/// Status of an agent in the team dashboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DashboardAgentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Entry for a single agent in the team dashboard.
+#[derive(Debug)]
+pub struct DashboardAgentEntry {
+    pub name: String,
+    pub role: String,
+    pub status: DashboardAgentStatus,
+}
+
+/// Live dashboard state during team runs.
+#[derive(Debug)]
+pub struct TeamDashboardState {
+    pub phase: Option<TeamPhase>,
+    pub iteration: u32,
+    pub agents: Vec<DashboardAgentEntry>,
+    pub run_started: std::time::Instant,
+}
+
+impl TeamDashboardState {
+    pub fn new() -> Self {
+        Self {
+            phase: None,
+            iteration: 0,
+            agents: Vec::new(),
+            run_started: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Main application state.
 pub struct App<'a> {
     pub messages: Vec<ChatMessage>,
@@ -284,6 +320,8 @@ pub struct App<'a> {
     pub team_dir: Option<PathBuf>,
     /// Verbose mode: show individual agent responses in team mode.
     pub verbose_mode: bool,
+    /// Live dashboard state during team runs (created on first PhaseChanged event).
+    pub team_dashboard: Option<TeamDashboardState>,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -351,6 +389,7 @@ impl<'a> App<'a> {
             team_name: None,
             team_dir: None,
             verbose_mode: false,
+            team_dashboard: None,
         }
     }
 
@@ -409,6 +448,7 @@ impl<'a> App<'a> {
             team_name: Some(team_name.to_string()),
             team_dir: Some(team_dir),
             verbose_mode: false,
+            team_dashboard: None,
         }
     }
 
@@ -620,7 +660,39 @@ impl<'a> App<'a> {
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
             }
+            Ok(TeamEvent::PhaseChanged { phase, iteration }) => {
+                let dash = self
+                    .team_dashboard
+                    .get_or_insert_with(TeamDashboardState::new);
+                dash.phase = Some(phase.clone());
+                dash.iteration = iteration;
+                dash.agents.clear();
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!("Phase: {phase} (iteration {iteration})"),
+                    rendered: None,
+                    channel: None,
+                });
+                self.auto_scroll_to_bottom();
+                self.needs_redraw = true;
+            }
+            Ok(TeamEvent::AgentStarted { agent, role }) => {
+                if let Some(ref mut dash) = self.team_dashboard {
+                    dash.agents.push(DashboardAgentEntry {
+                        name: agent.clone(),
+                        role: role.clone(),
+                        status: DashboardAgentStatus::Running,
+                    });
+                }
+                self.needs_redraw = true;
+            }
             Ok(TeamEvent::AgentCompleted { agent, response }) => {
+                // Update dashboard agent status
+                if let Some(ref mut dash) = self.team_dashboard
+                    && let Some(entry) = dash.agents.iter_mut().find(|a| a.name == agent)
+                {
+                    entry.status = DashboardAgentStatus::Completed;
+                }
                 if self.verbose_mode {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
@@ -629,10 +701,16 @@ impl<'a> App<'a> {
                         channel: None,
                     });
                     self.auto_scroll_to_bottom();
-                    self.needs_redraw = true;
                 }
+                self.needs_redraw = true;
             }
             Ok(TeamEvent::AgentFailed { agent, error }) => {
+                // Update dashboard agent status
+                if let Some(ref mut dash) = self.team_dashboard
+                    && let Some(entry) = dash.agents.iter_mut().find(|a| a.name == agent)
+                {
+                    entry.status = DashboardAgentStatus::Failed;
+                }
                 if self.verbose_mode {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
@@ -641,8 +719,8 @@ impl<'a> App<'a> {
                         channel: None,
                     });
                     self.auto_scroll_to_bottom();
-                    self.needs_redraw = true;
                 }
+                self.needs_redraw = true;
             }
             Ok(TeamEvent::TasksAssigned { tasks, iteration }) => {
                 // In verbose mode, show individual assignments
@@ -685,6 +763,7 @@ impl<'a> App<'a> {
                 self.needs_redraw = true;
             }
             Ok(TeamEvent::Deliverable(text)) => {
+                self.team_dashboard = None;
                 if text.is_empty() {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
@@ -705,6 +784,7 @@ impl<'a> App<'a> {
                 self.needs_redraw = true;
             }
             Ok(TeamEvent::RunFailed(msg)) => {
+                self.team_dashboard = None;
                 self.messages.push(ChatMessage {
                     role: ChatRole::System,
                     content: format!("Team error: {msg}"),

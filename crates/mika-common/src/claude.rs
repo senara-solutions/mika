@@ -3,7 +3,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -294,6 +294,12 @@ impl ClaudeClient {
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+        info!(
+            model = %request.model,
+            max_tokens = request.max_tokens,
+            "llm_call started"
+        );
+
         // Build the final auth header value upfront (non-retryable configuration error).
         // OAuth needs "Bearer <token>"; API key is the raw value.
         // Use an opaque error to avoid leaking the actual key/token value.
@@ -320,11 +326,12 @@ impl ClaudeClient {
 
             match self.send_once(request, auth_header.clone()).await {
                 Ok(response) => {
-                    debug!(
+                    info!(
+                        model = %request.model,
                         input_tokens = response.usage.input_tokens,
                         output_tokens = response.usage.output_tokens,
                         stop_reason = ?response.stop_reason,
-                        "Claude API response"
+                        "llm_call completed"
                     );
                     return Ok(response);
                 }

@@ -39,23 +39,10 @@ pub fn build_orchestrator_context(
             if budget == 0 {
                 break;
             }
-            let goal = if run.goal.len() > 500 {
-                &run.goal[..run.goal.floor_char_boundary(500)]
-            } else {
-                &run.goal
-            };
             let entry_start = buf.len();
-            let _ = writeln!(buf, "<context type=\"history_goal\">{goal}</context>");
+            let _ = writeln!(buf, "<context type=\"history_goal\">{}</context>", run.goal);
             if let Some(ref d) = run.deliverable {
-                let truncated = if d.len() > 500 {
-                    &d[..d.floor_char_boundary(500)]
-                } else {
-                    d
-                };
-                let _ = writeln!(
-                    buf,
-                    "<context type=\"history_deliverable\">{truncated}</context>"
-                );
+                let _ = writeln!(buf, "<context type=\"history_deliverable\">{d}</context>");
             }
             buf.push('\n');
             let entry_len = buf.len() - entry_start;
@@ -399,13 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn test_orchestrator_context_history_truncates_long_goals() {
+    fn test_orchestrator_context_history_renders_goals_as_is() {
+        // Truncation is handled by `load_team_runs_for_prompt` in SQL,
+        // so `build_orchestrator_context` renders whatever it receives.
         let def = test_def();
-        let long_goal = "x".repeat(1000);
+        let goal = "x".repeat(500); // pre-truncated by SQL
         let history = vec![TeamRunRow {
             id: "run-1".to_string(),
             team_name: "dev-team".to_string(),
-            goal: long_goal,
+            goal: goal.clone(),
             status: "completed".to_string(),
             failure_reason: None,
             iteration: 0,
@@ -415,9 +404,7 @@ mod tests {
             ended_at: Some(1001),
         }];
         let ctx = build_orchestrator_context(&def, "", None, &history);
-        // Goal should be truncated to 500 chars, not the full 1000
-        assert!(!ctx.contains(&"x".repeat(1000)));
-        assert!(ctx.contains(&"x".repeat(500)));
+        assert!(ctx.contains(&goal));
     }
 
     #[test]

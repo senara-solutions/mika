@@ -5,3 +5,4 @@ pub mod embedding;
 pub mod home;
 pub mod logging;
 pub mod team;
+pub mod telemetry;

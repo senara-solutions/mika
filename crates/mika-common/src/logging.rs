@@ -3,6 +3,9 @@ use std::path::Path;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Re-export for callers that need a type hint for `None` OTel layers.
+pub use tracing_subscriber::layer::Identity as NoopLayer;
+
 /// Controls where log output is sent.
 pub enum LogOutput {
     /// Pretty stderr + file (non-TUI CLI commands)
@@ -20,7 +23,14 @@ pub enum LogOutput {
 /// duration of the program — dropping it flushes and stops the file writer.
 ///
 /// When `log_file` is `None`, logs go to stdout only and returns `None`.
-pub fn init(default_level: &str, log_file: Option<&Path>) -> Option<WorkerGuard> {
+pub fn init<OL>(
+    default_level: &str,
+    log_file: Option<&Path>,
+    otel_layer: Option<OL>,
+) -> Option<WorkerGuard>
+where
+    OL: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
@@ -39,6 +49,7 @@ pub fn init(default_level: &str, log_file: Option<&Path>) -> Option<WorkerGuard>
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
             tracing_subscriber::registry()
+                .with(otel_layer)
                 .with(filter)
                 .with(fmt::layer().json().flatten_event(true))
                 .with(
@@ -53,6 +64,7 @@ pub fn init(default_level: &str, log_file: Option<&Path>) -> Option<WorkerGuard>
         }
         None => {
             tracing_subscriber::registry()
+                .with(otel_layer)
                 .with(filter)
                 .with(fmt::layer().json().flatten_event(true))
                 .init();
@@ -72,11 +84,15 @@ pub fn init(default_level: &str, log_file: Option<&Path>) -> Option<WorkerGuard>
 /// Note: the four match arms below look duplicative, but tracing_subscriber's
 /// type-level layer composition creates distinct types for each combination,
 /// preventing extraction of shared setup code.
-pub fn init_pretty(
+pub fn init_pretty<OL>(
     default_level: &str,
     log_dir: Option<&Path>,
     output: LogOutput,
-) -> Option<WorkerGuard> {
+    otel_layer: Option<OL>,
+) -> Option<WorkerGuard>
+where
+    OL: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
@@ -88,6 +104,7 @@ pub fn init_pretty(
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
             tracing_subscriber::registry()
+                .with(otel_layer)
                 .with(filter)
                 .with(fmt::layer().pretty().with_writer(std::io::stderr))
                 .with(
@@ -107,6 +124,7 @@ pub fn init_pretty(
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
             tracing_subscriber::registry()
+                .with(otel_layer)
                 .with(filter)
                 .with(
                     fmt::layer()
@@ -121,6 +139,7 @@ pub fn init_pretty(
         (None, LogOutput::PrettyAndFile) => {
             // Stderr only — no log dir available, non-TUI
             tracing_subscriber::registry()
+                .with(otel_layer)
                 .with(filter)
                 .with(fmt::layer().pretty())
                 .init();
@@ -130,7 +149,10 @@ pub fn init_pretty(
         (None, LogOutput::FileOnly) => {
             // TUI mode but no log dir — drop events silently.
             // If home dir is missing, init_for_agent will fail before TUI starts.
-            tracing_subscriber::registry().with(filter).init();
+            tracing_subscriber::registry()
+                .with(otel_layer)
+                .with(filter)
+                .init();
             None
         }
     }

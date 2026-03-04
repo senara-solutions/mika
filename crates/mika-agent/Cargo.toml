@@ -15,6 +15,9 @@ readme = "../../README.md"
 name = "mika-server"
 path = "src/bin/mika-server.rs"
 
+[features]
+telemetry = ["mika-common/telemetry"]
+
 [dependencies]
 mika-common.workspace = true
 tokio.workspace = true

@@ -31,11 +31,19 @@ async fn main() -> Result<()> {
             None | Some(Commands::Chat) => {
                 let log_level = resolve_log_level(&[global_home.join("config.toml")]);
 
+                // Build optional OTel export layer (feature-gated, graceful degradation)
+                let (otel_layer, _telemetry_guard) =
+                    mika_common::config::Settings::load(&global_home)
+                        .ok()
+                        .map(|s| mika_common::telemetry::try_init_otel(&s))
+                        .unwrap_or((None, None));
+
                 let log_dir = team::team_dir(&global_home, &team_name).join("logs");
                 let _log_guard = mika_common::logging::init_pretty(
                     &log_level,
                     Some(&log_dir),
                     LogOutput::FileOnly,
+                    otel_layer,
                 );
 
                 return commands::chat::run_team(&team_name, &global_home).await;
@@ -92,6 +100,13 @@ async fn main() -> Result<()> {
     }
     let log_level = resolve_log_level(&config_paths);
 
+    // Build optional OTel export layer (feature-gated, graceful degradation)
+    let (otel_layer, _telemetry_guard) = global_home
+        .as_ref()
+        .and_then(|h| mika_common::config::Settings::load(h).ok())
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+
     // Initialize tracing with correct agent-specific directory and configured level.
     // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
     // so stderr output would corrupt the TUI display.
@@ -102,7 +117,8 @@ async fn main() -> Result<()> {
     } else {
         LogOutput::PrettyAndFile
     };
-    let _log_guard = mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), log_output);
+    let _log_guard =
+        mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), log_output, otel_layer);
 
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat
