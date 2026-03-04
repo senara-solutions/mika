@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
                     &log_level,
                     Some(&log_dir),
                     LogOutput::FileOnly,
+                    None::<mika_common::logging::NoopLayer>,
                 );
 
                 return commands::chat::run_team(&team_name, &global_home).await;
@@ -102,7 +103,12 @@ async fn main() -> Result<()> {
     } else {
         LogOutput::PrettyAndFile
     };
-    let _log_guard = mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), log_output);
+    let _log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        log_dir.as_deref(),
+        log_output,
+        None::<mika_common::logging::NoopLayer>,
+    );
 
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat

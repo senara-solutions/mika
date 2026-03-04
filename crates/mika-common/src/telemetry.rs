@@ -18,15 +18,15 @@ impl Drop for TelemetryGuard {
 /// Returns `None` when telemetry is disabled, the endpoint is not configured,
 /// or the exporter fails to build (graceful degradation).
 #[cfg(feature = "telemetry")]
-pub fn build_otel_layer(
+pub fn build_otel_layer<S>(
     settings: &Settings,
 ) -> Option<(
-    tracing_opentelemetry::OpenTelemetryLayer<
-        tracing_subscriber::Registry,
-        opentelemetry_sdk::trace::SdkTracer,
-    >,
+    tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>,
     TelemetryGuard,
-)> {
+)>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
     use opentelemetry::KeyValue;
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};

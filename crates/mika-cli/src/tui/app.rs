@@ -218,14 +218,15 @@ pub enum DashboardAgentStatus {
 }
 
 /// Entry for a single agent in the team dashboard.
+#[derive(Debug)]
 pub struct DashboardAgentEntry {
     pub name: String,
     pub role: String,
     pub status: DashboardAgentStatus,
-    pub started_at: std::time::Instant,
 }
 
 /// Live dashboard state during team runs.
+#[derive(Debug)]
 pub struct TeamDashboardState {
     pub phase: Option<TeamPhase>,
     pub iteration: u32,
@@ -689,7 +690,6 @@ impl<'a> App<'a> {
                         name: agent.clone(),
                         role: role.clone(),
                         status: DashboardAgentStatus::Running,
-                        started_at: std::time::Instant::now(),
                     });
                 }
                 self.needs_redraw = true;
