@@ -75,7 +75,7 @@ pub struct Settings {
 
     /// OTLP authorization header value (e.g. Base64-encoded "public:secret" for Langfuse)
     #[serde(default)]
-    pub otlp_auth_header: Option<String>,
+    pub otlp_auth_header: Option<SecretString>,
 
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]

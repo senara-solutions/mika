@@ -132,12 +132,17 @@ impl TeamEngine {
     }
 
     /// Execute the full team orchestration flow.
-    pub async fn execute(mut self) -> Result<TeamRun> {
-        info!(
+    #[tracing::instrument(
+        name = "team_run",
+        skip_all,
+        fields(
             team = %self.run.team_name,
             run_id = %self.run.run_id,
-            "team_run started"
-        );
+            goal_len = self.run.goal.len(),
+        )
+    )]
+    pub async fn execute(mut self) -> Result<TeamRun> {
+        info!("team_run started");
 
         // Persist the team run to DB
         if let Err(e) = self
@@ -256,11 +261,8 @@ impl TeamEngine {
             .unwrap_or_default();
 
         // Step 1: Decompose -- orchestrator produces task assignments
-        info!(phase = "decompose", iteration = 1, "team_phase");
-        self.emit_event(TeamEvent::PhaseChanged {
-            phase: TeamPhase::Decompose,
-            iteration: 1,
-        });
+        self.run.iteration = 1;
+        self.transition_phase(TeamPhase::Decompose);
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
         match self.decompose(None, &history).await? {
             DecomposeResult::Tasks(tasks) => {
@@ -281,30 +283,12 @@ impl TeamEngine {
 
         // Iterate: execute -> review -> (retry if rejected)
         loop {
-            self.run.iteration += 1;
-
             // Step 2: Execute -- run each specialist
-            info!(
-                phase = "execute",
-                iteration = self.run.iteration,
-                "team_phase"
-            );
-            self.emit_event(TeamEvent::PhaseChanged {
-                phase: TeamPhase::Execute,
-                iteration: self.run.iteration,
-            });
+            self.transition_phase(TeamPhase::Execute);
             self.execute_tasks().await?;
 
             // Step 3: Review -- critic evaluates outputs
-            info!(
-                phase = "review",
-                iteration = self.run.iteration,
-                "team_phase"
-            );
-            self.emit_event(TeamEvent::PhaseChanged {
-                phase: TeamPhase::Review,
-                iteration: self.run.iteration,
-            });
+            self.transition_phase(TeamPhase::Review);
             let (approved, feedback) = self.review().await?;
 
             if approved {
@@ -321,15 +305,7 @@ impl TeamEngine {
             }
 
             // Re-decompose with feedback
-            info!(
-                phase = "re-decompose",
-                iteration = self.run.iteration,
-                "team_phase"
-            );
-            self.emit_event(TeamEvent::PhaseChanged {
-                phase: TeamPhase::ReDecompose,
-                iteration: self.run.iteration,
-            });
+            self.transition_phase(TeamPhase::ReDecompose);
             self.emit_event(TeamEvent::Progress(format!(
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
@@ -349,18 +325,12 @@ impl TeamEngine {
                 tasks: self.run.tasks.clone(),
                 iteration: self.run.iteration + 1,
             });
+
+            self.run.iteration += 1;
         }
 
         // Step 4: Deliver -- produce final output
-        info!(
-            phase = "deliver",
-            iteration = self.run.iteration,
-            "team_phase"
-        );
-        self.emit_event(TeamEvent::PhaseChanged {
-            phase: TeamPhase::Deliver,
-            iteration: self.run.iteration,
-        });
+        self.transition_phase(TeamPhase::Deliver);
         self.emit_event(TeamEvent::Progress(
             "Producing final deliverable...".to_string(),
         ));
@@ -849,6 +819,15 @@ impl TeamEngine {
         Ok(crate::agent::run_team_agent(&params)
             .await?
             .unwrap_or_default())
+    }
+
+    /// Log and emit a phase transition event.
+    fn transition_phase(&mut self, phase: TeamPhase) {
+        info!(phase = %phase, iteration = self.run.iteration, "team_phase");
+        self.emit_event(TeamEvent::PhaseChanged {
+            phase,
+            iteration: self.run.iteration,
+        });
     }
 
     fn emit_event(&self, event: TeamEvent) {

@@ -12,15 +12,7 @@ async fn main() -> Result<()> {
         .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY (API key or OAuth token) and MIKA_INTERNAL_TOKEN.")?;
 
     // Build optional OTel export layer (feature-gated, graceful degradation)
-    #[cfg(feature = "telemetry")]
-    let (otel_layer, _telemetry_guard) = match mika_common::telemetry::build_otel_layer(&settings) {
-        Some((layer, guard)) => (Some(layer), Some(guard)),
-        None => (None, None),
-    };
-    #[cfg(not(feature = "telemetry"))]
-    let otel_layer = None::<mika_common::logging::NoopLayer>;
-    #[cfg(not(feature = "telemetry"))]
-    let _telemetry_guard: Option<()> = None;
+    let (otel_layer, _telemetry_guard) = mika_common::telemetry::try_init_otel(&settings);
 
     // Server mode uses structured JSON logging (+ optional file output + optional OTel export)
     let _log_guard = mika_common::logging::init(

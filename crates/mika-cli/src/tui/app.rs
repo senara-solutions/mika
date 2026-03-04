@@ -661,20 +661,12 @@ impl<'a> App<'a> {
                 self.needs_redraw = true;
             }
             Ok(TeamEvent::PhaseChanged { phase, iteration }) => {
-                // Update dashboard state if present
-                if let Some(ref mut dash) = self.team_dashboard {
-                    dash.phase = Some(phase.clone());
-                    dash.iteration = iteration;
-                    // Clear agent list on new phase
-                    dash.agents.clear();
-                } else {
-                    // Create dashboard on first phase change
-                    self.team_dashboard = Some(TeamDashboardState::new());
-                    if let Some(ref mut dash) = self.team_dashboard {
-                        dash.phase = Some(phase.clone());
-                        dash.iteration = iteration;
-                    }
-                }
+                let dash = self
+                    .team_dashboard
+                    .get_or_insert_with(TeamDashboardState::new);
+                dash.phase = Some(phase.clone());
+                dash.iteration = iteration;
+                dash.agents.clear();
                 self.messages.push(ChatMessage {
                     role: ChatRole::System,
                     content: format!("Phase: {phase} (iteration {iteration})"),

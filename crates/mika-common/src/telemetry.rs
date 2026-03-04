@@ -52,7 +52,8 @@ where
     // Auto-detect raw "publicKey:secretKey" vs pre-encoded base64: if the value
     // contains ':' it's raw (base64 alphabet never includes ':'), so encode it.
     if let Some(ref auth) = settings.otlp_auth_header {
-        let encoded = normalize_auth_header(auth);
+        use secrecy::ExposeSecret;
+        let encoded = normalize_auth_header(auth.expose_secret());
         let mut headers = std::collections::HashMap::new();
         headers.insert("Authorization".to_string(), format!("Basic {encoded}"));
         exporter_builder = exporter_builder.with_headers(headers);
@@ -94,6 +95,41 @@ fn normalize_auth_header(value: &str) -> String {
     }
 }
 
+/// Convenience wrapper that builds the OTel layer + guard pair, returning
+/// uniform types regardless of the `telemetry` feature flag.
+///
+/// When `telemetry` is enabled: builds the OTLP export layer from settings,
+/// returns both the layer and guard as `Option`s.
+/// When `telemetry` is disabled: returns `(None, None)` with concrete types
+/// that satisfy the generic bounds on `logging::init` / `logging::init_pretty`.
+///
+/// Callers replace the ~10-line `#[cfg(feature)]` / `#[cfg(not)]` block with:
+/// ```ignore
+/// let (otel_layer, _telemetry_guard) = mika_common::telemetry::try_init_otel(&settings);
+/// ```
+#[cfg(feature = "telemetry")]
+pub fn try_init_otel(
+    settings: &Settings,
+) -> (
+    Option<
+        tracing_opentelemetry::OpenTelemetryLayer<
+            tracing_subscriber::Registry,
+            opentelemetry_sdk::trace::SdkTracer,
+        >,
+    >,
+    Option<TelemetryGuard>,
+) {
+    match build_otel_layer(settings) {
+        Some((layer, guard)) => (Some(layer), Some(guard)),
+        None => (None, None),
+    }
+}
+
+#[cfg(not(feature = "telemetry"))]
+pub fn try_init_otel(_settings: &Settings) -> (Option<crate::logging::NoopLayer>, Option<()>) {
+    (None, None)
+}
+
 /// No-op when the telemetry feature is not enabled.
 #[cfg(not(feature = "telemetry"))]
 pub fn build_otel_layer(_settings: &Settings) -> Option<()> {
@@ -103,6 +139,7 @@ pub fn build_otel_layer(_settings: &Settings) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[cfg(feature = "telemetry")]
     #[test]
@@ -130,7 +167,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_build_otel_layer_disabled() {
+        // Safety: tests manipulate env vars; no production thread reads these.
+        unsafe {
+            std::env::remove_var("MIKA_TELEMETRY_ENABLED");
+            std::env::remove_var("MIKA_OTLP_ENDPOINT");
+            std::env::remove_var("MIKA_OTLP_AUTH_HEADER");
+        }
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::load(tmp.path()).unwrap();
         // telemetry_enabled defaults to false
