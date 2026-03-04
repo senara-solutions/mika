@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -787,10 +787,21 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Decom
     }
 
     // Try to extract JSON array from the response (#257: unified extract_json)
-    let json_str = extract_json(response, '[', ']').unwrap_or(response);
+    let json_str = match extract_json(response, '[', ']') {
+        Some(s) => s,
+        None => {
+            warn!("orchestrator response contains no JSON array, treating as conversational");
+            return Ok(DecomposeResult::Conversational(response.to_string()));
+        }
+    };
 
-    let parsed: Vec<serde_json::Value> = serde_json::from_str(json_str)
-        .with_context(|| format!("failed to parse orchestrator task assignments: {response}"))?;
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to parse orchestrator task array, treating as conversational");
+            return Ok(DecomposeResult::Conversational(response.to_string()));
+        }
+    };
 
     let agent_names: Vec<&str> = team.agents.iter().map(|a| a.name.as_str()).collect();
 
@@ -845,7 +856,8 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Decom
     }
 
     if tasks.is_empty() {
-        bail!("Orchestrator produced no valid task assignments");
+        warn!("orchestrator produced no valid task assignments, treating as conversational");
+        return Ok(DecomposeResult::Conversational(response.to_string()));
     }
 
     Ok(DecomposeResult::Tasks(tasks))
@@ -956,16 +968,22 @@ mod tests {
     fn test_parse_task_assignments_empty() {
         let response = "[]";
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err());
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => assert_eq!(text, response),
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
     fn test_parse_task_assignments_invalid_json() {
         let response = "not json at all";
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err());
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => assert_eq!(text, response),
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
@@ -973,8 +991,11 @@ mod tests {
         // #252: Tasks assigned to agents not in the team should be skipped
         let response = r#"[{"agent": "unknown", "task": "Do something", "output_file": "out.md"}]"#;
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err()); // No valid tasks remain
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => assert_eq!(text, response),
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
@@ -983,8 +1004,11 @@ mod tests {
         let response =
             r#"[{"agent": "worker", "task": "Do research", "output_file": "../etc/passwd"}]"#;
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err());
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => assert_eq!(text, response),
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
@@ -993,8 +1017,11 @@ mod tests {
         let response =
             r#"[{"agent": "worker", "task": "Do research", "output_file": "/tmp/evil.md"}]"#;
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        assert!(result.is_err());
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => assert_eq!(text, response),
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]
@@ -1083,13 +1110,32 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_task_assignments_reply_without_reply_key_is_not_conversational() {
-        // A JSON object without "reply" key should NOT be treated as conversational
+    fn test_parse_task_assignments_reply_without_reply_key_is_conversational() {
+        // A JSON object without "reply" key and no array falls through to conversational
         let response = r#"{"approved": true, "feedback": "ok"}"#;
         let team = test_team();
-        let result = parse_task_assignments(response, &team);
-        // Should fail as normal invalid task assignments, not conversational
-        assert!(result.is_err());
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => assert_eq!(text, response),
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
+    }
+
+    #[test]
+    fn test_parse_task_assignments_prose_fallback() {
+        // Orchestrator responds with prose task descriptions instead of JSON
+        let response = "Both briefs are live in the workspace. Here's what I've dispatched:\n\n\
+            **CTO Agent:** Analyze the technical architecture...\n\n\
+            **Quant Agent:** Build the pricing model...";
+        let team = test_team();
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Conversational(text) => {
+                assert!(text.contains("Both briefs are live"));
+                assert!(text.contains("CTO Agent"));
+            }
+            DecomposeResult::Tasks(_) => panic!("expected Conversational, got Tasks"),
+        }
     }
 
     #[test]

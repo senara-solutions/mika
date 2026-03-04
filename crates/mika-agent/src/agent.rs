@@ -25,6 +25,7 @@ use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::embedding::EmbeddingClient;
 
 const MAX_TOOL_STEPS: usize = 10;
+const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 /// Timeout for the continuation API call after max tool steps are exceeded.
@@ -97,6 +98,13 @@ impl LoopMode<'_> {
                 Some(channel_type)
             }
             Self::Team => None,
+        }
+    }
+
+    fn max_steps(&self) -> usize {
+        match self {
+            Self::Team => MAX_TEAM_TOOL_STEPS,
+            _ => MAX_TOOL_STEPS,
         }
     }
 
@@ -317,7 +325,8 @@ async fn run_loop(
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
-    for step in 0..MAX_TOOL_STEPS {
+    let max_steps = mode.max_steps();
+    for step in 0..max_steps {
         debug!(
             step,
             label = mode.label(),
@@ -331,9 +340,9 @@ async fn run_loop(
             strip_prior_images(&mut request.messages);
         }
 
-        // Nudge the model to wrap up when approaching the step limit (conversation only)
-        if mode.is_conversation()
-            && step == MAX_TOOL_STEPS - 2
+        // Nudge the model to wrap up when approaching the step limit
+        if matches!(mode, LoopMode::Conversation { .. } | LoopMode::Team)
+            && step == max_steps - 2
             && let Some(ref mut system) = request.system
         {
             system.push_str(
@@ -446,7 +455,7 @@ async fn run_loop(
 
     warn!(
         label = mode.label(),
-        channel_type, "agent exceeded {MAX_TOOL_STEPS} steps"
+        max_steps, channel_type, "agent exceeded max tool steps"
     );
     Ok(LoopResult {
         text: None,

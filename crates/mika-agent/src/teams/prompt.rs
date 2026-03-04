@@ -118,8 +118,16 @@ pub fn build_specialist_context(
          ## Instructions\n\
          1. Use `list_workspace` to see what shared files are available.\n\
          2. Use `read_workspace` to read any relevant context from other team members.\n\
-         3. Do your work and write your results to `{output_file}` using `write_workspace`.\n\
-         4. Respond with a brief summary of what you accomplished.\n"
+         3. For deep codebase analysis, use `analyze_codebase` with a specific question \
+         instead of reading individual files.\n\
+         4. Do your work and write your results to `{output_file}` using `write_workspace`.\n\
+         5. Respond with a brief summary of what you accomplished.\n\
+         \n\
+         ## Important\n\
+         - ALWAYS write your deliverable to the workspace using `write_workspace`. \
+         Your text response alone is NOT visible to other team members.\n\
+         - Prefer deep-analysis tools (like `analyze_codebase`) over reading many files \
+         individually — it preserves your tool step budget.\n"
     )
 }
 
@@ -318,6 +326,8 @@ mod tests {
         assert!(ctx.contains("Research topics"));
         assert!(ctx.contains("research.md"));
         assert!(ctx.contains("write_workspace"));
+        assert!(ctx.contains("analyze_codebase"));
+        assert!(ctx.contains("NOT visible to other team members"));
     }
 
     #[test]
