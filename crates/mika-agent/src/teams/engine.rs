@@ -257,6 +257,10 @@ impl TeamEngine {
 
         // Step 1: Decompose -- orchestrator produces task assignments
         info!(phase = "decompose", iteration = 1, "team_phase");
+        self.emit_event(TeamEvent::PhaseChanged {
+            phase: TeamPhase::Decompose,
+            iteration: 1,
+        });
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
         match self.decompose(None, &history).await? {
             DecomposeResult::Tasks(tasks) => {
@@ -280,11 +284,27 @@ impl TeamEngine {
             self.run.iteration += 1;
 
             // Step 2: Execute -- run each specialist
-            info!(phase = "execute", iteration = self.run.iteration, "team_phase");
+            info!(
+                phase = "execute",
+                iteration = self.run.iteration,
+                "team_phase"
+            );
+            self.emit_event(TeamEvent::PhaseChanged {
+                phase: TeamPhase::Execute,
+                iteration: self.run.iteration,
+            });
             self.execute_tasks().await?;
 
             // Step 3: Review -- critic evaluates outputs
-            info!(phase = "review", iteration = self.run.iteration, "team_phase");
+            info!(
+                phase = "review",
+                iteration = self.run.iteration,
+                "team_phase"
+            );
+            self.emit_event(TeamEvent::PhaseChanged {
+                phase: TeamPhase::Review,
+                iteration: self.run.iteration,
+            });
             let (approved, feedback) = self.review().await?;
 
             if approved {
@@ -301,7 +321,15 @@ impl TeamEngine {
             }
 
             // Re-decompose with feedback
-            info!(phase = "re-decompose", iteration = self.run.iteration, "team_phase");
+            info!(
+                phase = "re-decompose",
+                iteration = self.run.iteration,
+                "team_phase"
+            );
+            self.emit_event(TeamEvent::PhaseChanged {
+                phase: TeamPhase::ReDecompose,
+                iteration: self.run.iteration,
+            });
             self.emit_event(TeamEvent::Progress(format!(
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
@@ -324,7 +352,15 @@ impl TeamEngine {
         }
 
         // Step 4: Deliver -- produce final output
-        info!(phase = "deliver", iteration = self.run.iteration, "team_phase");
+        info!(
+            phase = "deliver",
+            iteration = self.run.iteration,
+            "team_phase"
+        );
+        self.emit_event(TeamEvent::PhaseChanged {
+            phase: TeamPhase::Deliver,
+            iteration: self.run.iteration,
+        });
         self.emit_event(TeamEvent::Progress(
             "Producing final deliverable...".to_string(),
         ));
@@ -462,6 +498,7 @@ impl TeamEngine {
         struct TaskInput {
             index: usize,
             agent_name: String,
+            role: String,
             task_desc: String,
             context: String,
         }
@@ -488,6 +525,7 @@ impl TeamEngine {
             inputs.push(TaskInput {
                 index: i,
                 agent_name: task.agent.clone(),
+                role: task.role.clone(),
                 task_desc: task.task.clone(),
                 context,
             });
@@ -502,6 +540,11 @@ impl TeamEngine {
         let mut join_set = tokio::task::JoinSet::new();
 
         for input in inputs {
+            self.emit_event(TeamEvent::AgentStarted {
+                agent: input.agent_name.clone(),
+                role: input.role.clone(),
+            });
+
             let agents = Arc::clone(&agents);
             let claude = claude.clone();
             let tool_registry = Arc::clone(&tool_registry);
@@ -513,100 +556,103 @@ impl TeamEngine {
             let assignment_msg_ids = Arc::clone(&assignment_msg_ids);
 
             let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
-            join_set.spawn(async move {
-                let agent_name = &input.agent_name;
+            join_set.spawn(
+                async move {
+                    let agent_name = &input.agent_name;
 
-                // Report that this agent is starting.
-                info!(team = %team_name, "Running {agent_name}...");
-                if let Some(ref cb) = callback {
-                    cb(TeamEvent::Progress(format!("Running {agent_name}...")));
+                    // Report that this agent is starting.
+                    info!(team = %team_name, "Running {agent_name}...");
+                    if let Some(ref cb) = callback {
+                        cb(TeamEvent::Progress(format!("Running {agent_name}...")));
+                    }
+
+                    let resources = agents.get(agent_name.as_str()).with_context(|| {
+                        format!("agent '{}' not found in team resources", agent_name)
+                    });
+
+                    let result: Result<String> = match resources {
+                        Ok(resources) => {
+                            let session_id = format!("team-{}-{}", run_id, agent_name);
+                            let skills_dirty = AtomicBool::new(false);
+                            let params = TeamAgentParams {
+                                db: &resources.db,
+                                claude: &claude,
+                                tools: &tool_registry,
+                                skills: &resources.skills,
+                                home_dir: &resources.home_dir,
+                                task_message: &input.task_desc,
+                                team_context: &input.context,
+                                session_id: &session_id,
+                                embedding_client: resources.embedding_client.as_ref(),
+                                brave_api_key: brave_api_key.as_deref(),
+                                skills_dirty: &skills_dirty,
+                                mcp_manager: None,
+                                agent_name,
+                            };
+                            crate::agent::run_team_agent(&params)
+                                .await
+                                .map(|opt| opt.unwrap_or_default())
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    // Persist and report completion/failure for this agent.
+                    let parent_id = assignment_msg_ids.get(agent_name.as_str()).copied();
+
+                    match &result {
+                        Ok(response) => {
+                            info!(agent = %agent_name, "task completed");
+                            if let Some(ref cb) = callback {
+                                cb(TeamEvent::AgentCompleted {
+                                    agent: agent_name.to_string(),
+                                    response: response.clone(),
+                                });
+                            }
+                            // Persist agent response
+                            if let Err(e) = team_db
+                                .insert_team_message(
+                                    &run_id,
+                                    parent_id,
+                                    Some(agent_name),
+                                    "agent_response",
+                                    response,
+                                    iteration,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "failed to persist team message");
+                            }
+                        }
+                        Err(e) => {
+                            let error_str = e.to_string();
+                            warn!(agent = %agent_name, error = %error_str, "task failed");
+                            if let Some(ref cb) = callback {
+                                cb(TeamEvent::AgentFailed {
+                                    agent: agent_name.to_string(),
+                                    error: error_str.clone(),
+                                });
+                            }
+                            // Persist agent error
+                            if let Err(e) = team_db
+                                .insert_team_message(
+                                    &run_id,
+                                    parent_id,
+                                    Some(agent_name),
+                                    "error",
+                                    &error_str,
+                                    iteration,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "failed to persist team message");
+                            }
+                        }
+                    }
+
+                    (input.index, input.agent_name, result)
                 }
-
-                let resources = agents
-                    .get(agent_name.as_str())
-                    .with_context(|| format!("agent '{}' not found in team resources", agent_name));
-
-                let result: Result<String> = match resources {
-                    Ok(resources) => {
-                        let session_id = format!("team-{}-{}", run_id, agent_name);
-                        let skills_dirty = AtomicBool::new(false);
-                        let params = TeamAgentParams {
-                            db: &resources.db,
-                            claude: &claude,
-                            tools: &tool_registry,
-                            skills: &resources.skills,
-                            home_dir: &resources.home_dir,
-                            task_message: &input.task_desc,
-                            team_context: &input.context,
-                            session_id: &session_id,
-                            embedding_client: resources.embedding_client.as_ref(),
-                            brave_api_key: brave_api_key.as_deref(),
-                            skills_dirty: &skills_dirty,
-                            mcp_manager: None,
-                            agent_name,
-                        };
-                        crate::agent::run_team_agent(&params)
-                            .await
-                            .map(|opt| opt.unwrap_or_default())
-                    }
-                    Err(e) => Err(e),
-                };
-
-                // Persist and report completion/failure for this agent.
-                let parent_id = assignment_msg_ids.get(agent_name.as_str()).copied();
-
-                match &result {
-                    Ok(response) => {
-                        info!(agent = %agent_name, "task completed");
-                        if let Some(ref cb) = callback {
-                            cb(TeamEvent::AgentCompleted {
-                                agent: agent_name.to_string(),
-                                response: response.clone(),
-                            });
-                        }
-                        // Persist agent response
-                        if let Err(e) = team_db
-                            .insert_team_message(
-                                &run_id,
-                                parent_id,
-                                Some(agent_name),
-                                "agent_response",
-                                response,
-                                iteration,
-                            )
-                            .await
-                        {
-                            warn!(error = %e, "failed to persist team message");
-                        }
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        warn!(agent = %agent_name, error = %error_str, "task failed");
-                        if let Some(ref cb) = callback {
-                            cb(TeamEvent::AgentFailed {
-                                agent: agent_name.to_string(),
-                                error: error_str.clone(),
-                            });
-                        }
-                        // Persist agent error
-                        if let Err(e) = team_db
-                            .insert_team_message(
-                                &run_id,
-                                parent_id,
-                                Some(agent_name),
-                                "error",
-                                &error_str,
-                                iteration,
-                            )
-                            .await
-                        {
-                            warn!(error = %e, "failed to persist team message");
-                        }
-                    }
-                }
-
-                (input.index, input.agent_name, result)
-            }.instrument(agent_span));
+                .instrument(agent_span),
+            );
         }
 
         // Collect results as tasks complete, emitting periodic heartbeats so the
@@ -812,6 +858,12 @@ impl TeamEngine {
         match &event {
             TeamEvent::Progress(s) => {
                 info!(team = %self.run.team_name, "{s}");
+            }
+            TeamEvent::PhaseChanged { phase, iteration } => {
+                info!(team = %self.run.team_name, %phase, iteration, "Phase changed");
+            }
+            TeamEvent::AgentStarted { agent, role } => {
+                info!(team = %self.run.team_name, agent, role, "Agent started");
             }
             TeamEvent::TasksAssigned { .. } => {
                 info!(team = %self.run.team_name, "Tasks assigned");

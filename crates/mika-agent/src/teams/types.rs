@@ -40,6 +40,28 @@ pub enum TaskStatus {
     Failed(String),
 }
 
+/// Phase of the team execution pipeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TeamPhase {
+    Decompose,
+    Execute,
+    Review,
+    Deliver,
+    ReDecompose,
+}
+
+impl std::fmt::Display for TeamPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decompose => write!(f, "decomposing"),
+            Self::Execute => write!(f, "executing"),
+            Self::Review => write!(f, "reviewing"),
+            Self::Deliver => write!(f, "delivering"),
+            Self::ReDecompose => write!(f, "re-decomposing"),
+        }
+    }
+}
+
 /// Events emitted by the team engine during execution.
 ///
 /// Used to communicate structured progress to callers (TUI, management tools).
@@ -48,6 +70,10 @@ pub enum TaskStatus {
 pub enum TeamEvent {
     /// Transient progress message (e.g., "Decomposing goal...")
     Progress(String),
+    /// Phase transition in the team pipeline.
+    PhaseChanged { phase: TeamPhase, iteration: u32 },
+    /// An agent has started working on its task.
+    AgentStarted { agent: String, role: String },
     /// Orchestrator decomposed goal into tasks.
     TasksAssigned {
         tasks: Vec<TaskAssignment>,
@@ -130,6 +156,37 @@ mod tests {
         };
         let debug = format!("{event:?}");
         assert!(debug.contains("researcher"));
+    }
+
+    #[test]
+    fn test_team_phase_display() {
+        assert_eq!(TeamPhase::Decompose.to_string(), "decomposing");
+        assert_eq!(TeamPhase::Execute.to_string(), "executing");
+        assert_eq!(TeamPhase::Review.to_string(), "reviewing");
+        assert_eq!(TeamPhase::Deliver.to_string(), "delivering");
+        assert_eq!(TeamPhase::ReDecompose.to_string(), "re-decomposing");
+    }
+
+    #[test]
+    fn test_phase_changed_event() {
+        let event = TeamEvent::PhaseChanged {
+            phase: TeamPhase::Execute,
+            iteration: 2,
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("Execute"));
+        assert!(debug.contains("2"));
+    }
+
+    #[test]
+    fn test_agent_started_event() {
+        let event = TeamEvent::AgentStarted {
+            agent: "researcher".to_string(),
+            role: "analyst".to_string(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("researcher"));
+        assert!(debug.contains("analyst"));
     }
 
     #[test]

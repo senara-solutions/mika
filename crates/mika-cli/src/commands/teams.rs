@@ -166,6 +166,12 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
 
     let callback = |event: TeamEvent| match event {
         TeamEvent::Progress(msg) => println!("  > {msg}"),
+        TeamEvent::PhaseChanged { phase, iteration } => {
+            println!("  > Phase: {phase} (iteration {iteration})");
+        }
+        TeamEvent::AgentStarted { agent, role } => {
+            println!("  > Agent {agent} ({role}) started");
+        }
         TeamEvent::AgentCompleted { agent, .. } => println!("  > {agent} completed"),
         TeamEvent::AgentFailed { agent, error } => {
             eprintln!("  > {agent} failed: {error}");

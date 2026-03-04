@@ -538,7 +538,11 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .save_message("user", &save_text, params.channel_type)
         .await?;
 
-    let agent_name = params.home_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let agent_name = params
+        .home_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     let span = info_span!(
         "agent_turn",
         agent = %agent_name,
