@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use mika_common::agent;
@@ -21,6 +22,9 @@ use crate::tools::ToolRegistry;
 
 use super::prompt;
 use super::types::*;
+
+/// Maximum wall-clock time for the entire team run (all phases combined).
+const TEAM_RUN_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
 /// Resources needed to run a specific agent.
 struct AgentResources {
@@ -155,7 +159,21 @@ impl TeamEngine {
             Err(e) => warn!(error = %e, "failed to persist goal message"),
         }
 
-        let result = self.execute_inner().await;
+        let result = match tokio::time::timeout(
+            Duration::from_secs(TEAM_RUN_TIMEOUT_SECS),
+            self.execute_inner(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!("team run timed out after {TEAM_RUN_TIMEOUT_SECS}s");
+                Err(anyhow::anyhow!(
+                    "Team run timed out after {} minutes. Check workspace for partial results.",
+                    TEAM_RUN_TIMEOUT_SECS / 60,
+                ))
+            }
+        };
 
         match &result {
             Ok(_) => {
@@ -578,20 +596,41 @@ impl TeamEngine {
             });
         }
 
-        // Collect results as tasks complete and update statuses.
-        while let Some(join_result) = join_set.join_next().await {
-            match join_result {
-                Ok((index, _agent_name, result)) => match result {
-                    Ok(_) => {
-                        self.run.tasks[index].status = TaskStatus::Completed;
+        // Collect results as tasks complete, emitting periodic heartbeats so the
+        // user knows the run is still alive.
+        let mut completed_count = 0usize;
+        let total_count = self.run.tasks.len();
+        let start = tokio::time::Instant::now();
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        heartbeat.tick().await; // skip the immediate first tick
+
+        loop {
+            tokio::select! {
+                Some(join_result) = join_set.join_next() => {
+                    completed_count += 1;
+                    match join_result {
+                        Ok((index, _agent_name, result)) => match result {
+                            Ok(_) => {
+                                self.run.tasks[index].status = TaskStatus::Completed;
+                            }
+                            Err(e) => {
+                                self.run.tasks[index].status = TaskStatus::Failed(e.to_string());
+                            }
+                        },
+                        Err(join_error) => {
+                            // A JoinError means the task panicked or was cancelled.
+                            warn!(error = %join_error, "spawned task failed unexpectedly");
+                        }
                     }
-                    Err(e) => {
-                        self.run.tasks[index].status = TaskStatus::Failed(e.to_string());
+                    if completed_count >= total_count {
+                        break;
                     }
-                },
-                Err(join_error) => {
-                    // A JoinError means the task panicked or was cancelled.
-                    warn!(error = %join_error, "spawned task failed unexpectedly");
+                }
+                _ = heartbeat.tick() => {
+                    let elapsed = start.elapsed().as_secs();
+                    self.emit_event(TeamEvent::Progress(format!(
+                        "Specialists working... ({completed_count}/{total_count} done, {elapsed}s elapsed)"
+                    )));
                 }
             }
         }

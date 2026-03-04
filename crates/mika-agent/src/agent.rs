@@ -28,6 +28,8 @@ const MAX_TOOL_STEPS: usize = 10;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Shorter timeout for team sub-agents (must fit within the global team run budget).
+const TEAM_AGENT_TIMEOUT_SECS: u64 = 180;
 /// Timeout for the continuation API call after max tool steps are exceeded.
 /// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
 const CONTINUATION_TIMEOUT_SECS: u64 = 60;
@@ -1334,7 +1336,7 @@ pub struct TeamAgentParams<'a> {
 ///   or `None` for tool-use-only turns.
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     let timeout_result = tokio::time::timeout(
-        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
+        Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS),
         run_team_agent_inner(params),
     )
     .await;
@@ -1343,7 +1345,7 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
         Ok(result) => result,
         Err(_elapsed) => {
             warn!(
-                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
+                timeout_secs = TEAM_AGENT_TIMEOUT_SECS,
                 "team agent loop total timeout exceeded"
             );
             Ok(Some(
