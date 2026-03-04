@@ -40,16 +40,9 @@ pub fn build_orchestrator_context(
                 break;
             }
             let entry_start = buf.len();
-            let _ = writeln!(
-                buf,
-                "<context type=\"history_goal\">{}</context>",
-                run.goal
-            );
+            let _ = writeln!(buf, "<context type=\"history_goal\">{}</context>", run.goal);
             if let Some(ref d) = run.deliverable {
-                let _ = writeln!(
-                    buf,
-                    "<context type=\"history_deliverable\">{d}</context>"
-                );
+                let _ = writeln!(buf, "<context type=\"history_deliverable\">{d}</context>");
             }
             buf.push('\n');
             let entry_len = buf.len() - entry_start;
