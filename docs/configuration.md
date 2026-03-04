@@ -150,7 +150,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
-| `otlp_endpoint` | `Option<String>` | None | `MIKA_OTLP_ENDPOINT` | OTLP endpoint URL for trace export (e.g. `https://cloud.langfuse.com/api/public/otel`). Required when `telemetry_enabled` is true. |
+| `otlp_endpoint` | `Option<String>` | None | `MIKA_OTLP_ENDPOINT` | OTLP endpoint URL for trace export — must include `/v1/traces` (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` for Langfuse, `http://localhost:4318/v1/traces` for Jaeger). Required when `telemetry_enabled` is true. |
 | `otlp_auth_header` | `Option<String>` | None | `MIKA_OTLP_AUTH_HEADER` | OTLP authorization header value. For Langfuse, this is the Base64-encoded `public_key:secret_key`. Sent as `Authorization: Basic <value>`. |
 
 The `home_dir` field is also present on the struct but is not configurable via
@@ -312,7 +312,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
-| `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL (required when telemetry enabled) |
+| `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
 
 ### Server mode
@@ -333,7 +333,7 @@ are required for inter-service communication:
 | `MIKA_LOG_LEVEL` | No | Override log level |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
-| `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL (required when telemetry enabled) |
+| `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
 
 ### Token Generation

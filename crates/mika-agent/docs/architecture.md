@@ -58,7 +58,7 @@ from the `mika-agent` crate.
 
 | Crate | Path | Responsibility |
 |-------|------|---------------|
-| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), home directory resolution |
+| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel/OTLP export), home directory resolution |
 | `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
@@ -327,9 +327,49 @@ sends in a background task (does not block message processing).
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
 
+## 14. Observability & Telemetry
+
+Mika follows an "always instrument, optionally export" pattern. Tracing spans are
+compiled unconditionally into the binary — no feature flags needed. Spans cover the
+agent loop (`agent_turn`), Claude API calls, per-tool execution, team engine
+(`team_run`, `team_agent_task`), and server HTTP handlers (`tower_http::TraceLayer`).
+
+### Optional OTLP Export
+
+Export is feature-gated behind `--features telemetry`. When enabled,
+`mika_common::telemetry::build_otel_layer()` builds an OpenTelemetry tracing layer
+that exports spans via OTLP/HTTP. The layer composes into the tracing subscriber
+alongside the normal log layer.
+
+Three environment variables control export:
+
+| Variable | Purpose |
+|----------|---------|
+| `MIKA_TELEMETRY_ENABLED` | Enable trace export (`true`/`false`, default: false) |
+| `MIKA_OTLP_ENDPOINT` | OTLP HTTP endpoint URL (must include `/v1/traces` path) |
+| `MIKA_OTLP_AUTH_HEADER` | Authorization header value (e.g., Base64 credentials) |
+
+`build_otel_layer()` returns a `TelemetryGuard` that flushes pending spans on drop,
+ensuring no traces are lost at shutdown. Both `mika-server` and `mika` CLI hold
+the guard alive until process exit.
+
+### Langfuse Compatibility
+
+The OTLP export is compatible with Langfuse's OpenTelemetry ingestion endpoint.
+Set `MIKA_OTLP_ENDPOINT` to `https://cloud.langfuse.com/api/public/otel/v1/traces`
+and `MIKA_OTLP_AUTH_HEADER` to `publicKey:secretKey` (auto-encoded to Base64) for
+authentication. For Jaeger, use `http://localhost:4318/v1/traces` (no auth needed).
+
+### Graceful Degradation
+
+When the `telemetry` feature is not compiled in, `build_otel_layer()` is a no-op
+that returns `None`. When compiled but `MIKA_TELEMETRY_ENABLED` is false or unset,
+no exporter is created. Spans still flow to the normal log subscriber either way.
+
+
 ## Appendix: Database Schema
 
-**Schema version:** 8
+**Schema version:** 11
 
 ### Tables
 
@@ -353,6 +393,9 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 | `search_content` | Unified search content for Layer 3 hybrid search | v8 |
 | `fts_search` | FTS5 virtual table for full-text search | v8 |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity | v8 |
+| `reflection_runs` | Periodic memory reflection tracking | v10 |
+| `team_runs` | Team execution run metadata | v11 |
+| `team_messages` | Graph-structured team messages with parent_id links | v11 |
 
 ### SQLite Pragmas
 

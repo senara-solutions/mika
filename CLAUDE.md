@@ -103,7 +103,7 @@ Optional (startup behavior):
 
 Optional (telemetry — requires `--features telemetry` build):
 - `MIKA_TELEMETRY_ENABLED` — Enable OpenTelemetry trace export (default: false)
-- `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint URL (e.g. `https://cloud.langfuse.com/api/public/otel`)
+- `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint URL with `/v1/traces` path (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` or `http://localhost:4318/v1/traces`)
 - `MIKA_OTLP_AUTH_HEADER` — OTLP auth header value (Base64-encoded credentials for Langfuse)
 
 Optional (log files — logs go to stdout + file when set):

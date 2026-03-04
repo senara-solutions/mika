@@ -155,7 +155,7 @@ let otel_layer = None::<mika_common::logging::NoopLayer>;
 
 Three new env vars / config fields:
 - `MIKA_TELEMETRY_ENABLED` — master switch (default: false)
-- `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint (e.g., `https://cloud.langfuse.com/api/public/otel`)
+- `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint with `/v1/traces` path (e.g., `https://cloud.langfuse.com/api/public/otel/v1/traces` or `http://localhost:4318/v1/traces`)
 - `MIKA_OTLP_AUTH_HEADER` — Base64-encoded auth header (redacted in Debug output)
 
 Build with: `cargo build --features telemetry`

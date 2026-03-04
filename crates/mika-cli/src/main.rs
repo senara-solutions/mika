@@ -31,12 +31,26 @@ async fn main() -> Result<()> {
             None | Some(Commands::Chat) => {
                 let log_level = resolve_log_level(&[global_home.join("config.toml")]);
 
+                // Build optional OTel export layer (feature-gated, graceful degradation)
+                #[cfg(feature = "telemetry")]
+                let (otel_layer, _telemetry_guard) = match mika_common::config::Settings::load(&global_home)
+                    .ok()
+                    .and_then(|s| mika_common::telemetry::build_otel_layer(&s))
+                {
+                    Some((layer, guard)) => (Some(layer), Some(guard)),
+                    None => (None, None),
+                };
+                #[cfg(not(feature = "telemetry"))]
+                let otel_layer = None::<mika_common::logging::NoopLayer>;
+                #[cfg(not(feature = "telemetry"))]
+                let _telemetry_guard: Option<()> = None;
+
                 let log_dir = team::team_dir(&global_home, &team_name).join("logs");
                 let _log_guard = mika_common::logging::init_pretty(
                     &log_level,
                     Some(&log_dir),
                     LogOutput::FileOnly,
-                    None::<mika_common::logging::NoopLayer>,
+                    otel_layer,
                 );
 
                 return commands::chat::run_team(&team_name, &global_home).await;
@@ -93,6 +107,21 @@ async fn main() -> Result<()> {
     }
     let log_level = resolve_log_level(&config_paths);
 
+    // Build optional OTel export layer (feature-gated, graceful degradation)
+    #[cfg(feature = "telemetry")]
+    let (otel_layer, _telemetry_guard) = match global_home
+        .as_ref()
+        .and_then(|h| mika_common::config::Settings::load(h).ok())
+        .and_then(|s| mika_common::telemetry::build_otel_layer(&s))
+    {
+        Some((layer, guard)) => (Some(layer), Some(guard)),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "telemetry"))]
+    let otel_layer = None::<mika_common::logging::NoopLayer>;
+    #[cfg(not(feature = "telemetry"))]
+    let _telemetry_guard: Option<()> = None;
+
     // Initialize tracing with correct agent-specific directory and configured level.
     // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
     // so stderr output would corrupt the TUI display.
@@ -107,7 +136,7 @@ async fn main() -> Result<()> {
         &log_level,
         log_dir.as_deref(),
         log_output,
-        None::<mika_common::logging::NoopLayer>,
+        otel_layer,
     );
 
     match cli.command {

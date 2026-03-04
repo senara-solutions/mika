@@ -48,10 +48,13 @@ where
     // Build OTLP HTTP exporter
     let mut exporter_builder = SpanExporter::builder().with_http().with_endpoint(&endpoint);
 
-    // Add auth header if configured (Langfuse uses Basic auth encoded as Base64)
+    // Add auth header if configured (Langfuse uses Basic auth encoded as Base64).
+    // Auto-detect raw "publicKey:secretKey" vs pre-encoded base64: if the value
+    // contains ':' it's raw (base64 alphabet never includes ':'), so encode it.
     if let Some(ref auth) = settings.otlp_auth_header {
+        let encoded = normalize_auth_header(auth);
         let mut headers = std::collections::HashMap::new();
-        headers.insert("Authorization".to_string(), format!("Basic {auth}"));
+        headers.insert("Authorization".to_string(), format!("Basic {encoded}"));
         exporter_builder = exporter_builder.with_headers(headers);
     }
 
@@ -78,6 +81,19 @@ where
     Some((layer, TelemetryGuard(provider)))
 }
 
+/// Normalize an OTLP auth header value: if it contains `:` it's a raw
+/// `publicKey:secretKey` pair and needs base64 encoding; otherwise it's
+/// already encoded and is returned as-is.
+#[cfg(feature = "telemetry")]
+fn normalize_auth_header(value: &str) -> String {
+    use base64::Engine;
+    if value.contains(':') {
+        base64::engine::general_purpose::STANDARD.encode(value)
+    } else {
+        value.to_string()
+    }
+}
+
 /// No-op when the telemetry feature is not enabled.
 #[cfg(not(feature = "telemetry"))]
 pub fn build_otel_layer(_settings: &Settings) -> Option<()> {
@@ -87,6 +103,31 @@ pub fn build_otel_layer(_settings: &Settings) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn test_normalize_auth_header_raw_keys() {
+        let raw = "pk-lf-abc123:sk-lf-xyz789";
+        let result = super::normalize_auth_header(raw);
+        // Should be base64-encoded
+        assert!(!result.contains(':'));
+        // Decode and verify round-trip
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result)
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), raw);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn test_normalize_auth_header_already_encoded() {
+        // Pre-encoded base64 of "pk:sk" — no colon in the encoded form
+        use base64::Engine;
+        let pre_encoded = base64::engine::general_purpose::STANDARD.encode("pk:sk");
+        let result = super::normalize_auth_header(&pre_encoded);
+        assert_eq!(result, pre_encoded);
+    }
 
     #[test]
     fn test_build_otel_layer_disabled() {
