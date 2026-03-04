@@ -93,6 +93,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::load(tmp.path()).unwrap();
         // telemetry_enabled defaults to false
+        #[cfg(feature = "telemetry")]
         assert!(build_otel_layer::<tracing_subscriber::Registry>(&settings).is_none());
+        #[cfg(not(feature = "telemetry"))]
+        assert!(build_otel_layer(&settings).is_none());
     }
 }
