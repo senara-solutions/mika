@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
@@ -336,7 +336,7 @@ async fn run_loop(
             label = mode.label(),
             channel_type,
             messages_len = request.messages.len(),
-            "agent loop step"
+            "agent_step"
         );
 
         // Strip images from prior turns to prevent unbounded memory growth
@@ -538,9 +538,17 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .save_message("user", &save_text, params.channel_type)
         .await?;
 
+    let agent_name = params.home_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let span = info_span!(
+        "agent_turn",
+        agent = %agent_name,
+        mode = "conversation",
+        channel = %params.channel_type,
+    );
+
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_agent_inner(params),
+        run_agent_inner(params).instrument(span),
     )
     .await;
 
@@ -921,6 +929,8 @@ async fn execute_tool(
     skill_timeout: u64,
     mcp_manager: Option<&McpManager>,
 ) -> ToolOutput {
+    debug!(tool = %name, "tool_execution");
+
     // 1. Try builtin tool
     if let Some(tool) = tools.get(name) {
         let timeout = tool.timeout_secs().unwrap_or(TOOL_TIMEOUT_SECS);
@@ -1025,9 +1035,16 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::Reflection => "reflection",
     };
 
+    let silent_span = info_span!(
+        "agent_turn",
+        agent = %params.home_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
+        mode = "silent",
+        trigger = %channel_type,
+    );
+
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_silent_inner(params, channel_type),
+        run_silent_inner(params, channel_type).instrument(silent_span),
     )
     .await;
 

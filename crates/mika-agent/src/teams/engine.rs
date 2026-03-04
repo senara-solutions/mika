@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 use mika_common::agent;
 use mika_common::claude::ClaudeClient;
@@ -133,6 +133,12 @@ impl TeamEngine {
 
     /// Execute the full team orchestration flow.
     pub async fn execute(mut self) -> Result<TeamRun> {
+        info!(
+            team = %self.run.team_name,
+            run_id = %self.run.run_id,
+            "team_run started"
+        );
+
         // Persist the team run to DB
         if let Err(e) = self
             .team_db
@@ -250,6 +256,7 @@ impl TeamEngine {
             .unwrap_or_default();
 
         // Step 1: Decompose -- orchestrator produces task assignments
+        info!(phase = "decompose", iteration = 1, "team_phase");
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
         match self.decompose(None, &history).await? {
             DecomposeResult::Tasks(tasks) => {
@@ -273,9 +280,11 @@ impl TeamEngine {
             self.run.iteration += 1;
 
             // Step 2: Execute -- run each specialist
+            info!(phase = "execute", iteration = self.run.iteration, "team_phase");
             self.execute_tasks().await?;
 
             // Step 3: Review -- critic evaluates outputs
+            info!(phase = "review", iteration = self.run.iteration, "team_phase");
             let (approved, feedback) = self.review().await?;
 
             if approved {
@@ -292,6 +301,7 @@ impl TeamEngine {
             }
 
             // Re-decompose with feedback
+            info!(phase = "re-decompose", iteration = self.run.iteration, "team_phase");
             self.emit_event(TeamEvent::Progress(format!(
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
@@ -314,6 +324,7 @@ impl TeamEngine {
         }
 
         // Step 4: Deliver -- produce final output
+        info!(phase = "deliver", iteration = self.run.iteration, "team_phase");
         self.emit_event(TeamEvent::Progress(
             "Producing final deliverable...".to_string(),
         ));
@@ -501,6 +512,7 @@ impl TeamEngine {
             let team_db = team_db.clone();
             let assignment_msg_ids = Arc::clone(&assignment_msg_ids);
 
+            let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
             join_set.spawn(async move {
                 let agent_name = &input.agent_name;
 
@@ -594,7 +606,7 @@ impl TeamEngine {
                 }
 
                 (input.index, input.agent_name, result)
-            });
+            }.instrument(agent_span));
         }
 
         // Collect results as tasks complete, emitting periodic heartbeats so the
