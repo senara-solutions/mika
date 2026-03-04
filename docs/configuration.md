@@ -151,7 +151,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
 | `otlp_endpoint` | `Option<String>` | None | `MIKA_OTLP_ENDPOINT` | OTLP endpoint URL for trace export — must include `/v1/traces` (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` for Langfuse, `http://localhost:4318/v1/traces` for Jaeger). Required when `telemetry_enabled` is true. |
-| `otlp_auth_header` | `Option<String>` | None | `MIKA_OTLP_AUTH_HEADER` | OTLP authorization header value. For Langfuse, this is the Base64-encoded `public_key:secret_key`. Sent as `Authorization: Basic <value>`. |
+| `otlp_auth_header` | `Option<SecretString>` | None | `MIKA_OTLP_AUTH_HEADER` | OTLP authorization header value. For Langfuse, pass raw `publicKey:secretKey` (auto-encoded to Base64) or pre-encoded Base64. Sent as `Authorization: Basic <value>`. Zeroized on drop. |
 
 The `home_dir` field is also present on the struct but is not configurable via
 file or environment variable. It is resolved automatically from `$MIKA_HOME` or
