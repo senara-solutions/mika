@@ -223,6 +223,12 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_expired_child_task_ids(&self) -> Result<Vec<String>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_expired_child_task_ids(&id))
+            .await
+    }
+
     pub async fn count_pending_tasks(&self) -> Result<i64> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.count_pending_tasks(&id)).await
@@ -243,6 +249,42 @@ impl AsyncDatabase {
     pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         let i = id.to_owned();
         self.with_db(move |db| db.set_task_process_id(&i, process_id))
+            .await
+    }
+
+    pub async fn get_expired_tasks_with_process_id(&self) -> Result<Vec<(String, i64)>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_expired_tasks_with_process_id(&id))
+            .await
+    }
+
+    pub async fn clear_task_process_id(&self, id: &str) -> Result<()> {
+        let i = id.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.clear_task_process_id(&i, &a))
+            .await
+    }
+
+    pub async fn try_complete_parent_on_sibling_done(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>> {
+        let i = task_id.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.try_complete_parent_on_sibling_done(&i, &a))
+            .await
+    }
+
+    pub async fn get_child_tasks(&self, parent_task_id: &str) -> Result<Vec<Task>> {
+        let p = parent_task_id.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_child_tasks(&p, &a)).await
+    }
+
+    pub async fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
+        let r = team_run_id.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_pending_callback_tasks_by_team_run(&r, &a))
             .await
     }
 
@@ -798,6 +840,22 @@ impl AsyncDatabase {
             db.update_team_run(&ri, &s, fr.as_deref(), iteration, d.as_deref(), ended_at)
         })
         .await
+    }
+
+    pub async fn suspend_team_run(&self, run_id: &str, checkpoint: &str) -> Result<()> {
+        let (r, c) = (run_id.to_owned(), checkpoint.to_owned());
+        self.with_db(move |db| db.suspend_team_run(&r, &c)).await
+    }
+
+    pub async fn load_team_run_checkpoint(&self, run_id: &str) -> Result<Option<String>> {
+        let r = run_id.to_owned();
+        self.with_db(move |db| db.load_team_run_checkpoint(&r))
+            .await
+    }
+
+    pub async fn resume_team_run_status(&self, run_id: &str) -> Result<()> {
+        let r = run_id.to_owned();
+        self.with_db(move |db| db.resume_team_run_status(&r)).await
     }
 
     pub async fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {

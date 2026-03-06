@@ -131,6 +131,7 @@ impl Tool for DelegateTaskTool {
             skills_dirty: &skills_dirty,
             mcp_manager: None,
             agent_name,
+            child_task_id: None,
         };
 
         let result = crate::agent::run_team_agent(&params).await;

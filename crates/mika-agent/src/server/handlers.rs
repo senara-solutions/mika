@@ -7,13 +7,14 @@ use axum::{
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::Instrument;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use mika_common::claude::ImageSource;
 
 use crate::agent::{self, AgentParams, check_onboarding};
 use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
+use crate::task_engine::types::{task_status, trigger_type};
 
 use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
@@ -349,7 +350,7 @@ pub async fn handle_task_complete(
     };
 
     // Validate trigger_type
-    if task.trigger_type != "callback" {
+    if task.trigger_type != trigger_type::CALLBACK {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -361,7 +362,10 @@ pub async fn handle_task_complete(
     }
 
     // Validate status — only pending or in_progress tasks can be completed
-    if !matches!(task.status.as_str(), "pending" | "in_progress") {
+    if !matches!(
+        task.status.as_str(),
+        task_status::PENDING | task_status::IN_PROGRESS
+    ) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -375,7 +379,7 @@ pub async fn handle_task_complete(
     // Transition to in_progress before spawning dispatch so startup_recovery can detect stuck tasks
     if let Err(e) = agent_state
         .db
-        .update_task_status(&task_id, "in_progress")
+        .update_task_status(&task_id, task_status::IN_PROGRESS)
         .await
     {
         error!(error = %e, task_id, "failed to transition task to in_progress");
@@ -392,7 +396,7 @@ pub async fn handle_task_complete(
         // Build the task struct with result set for dispatch
         let mut completed_task = task;
         completed_task.result = Some(req.result.clone());
-        completed_task.status = "in_progress".to_string();
+        completed_task.status = task_status::IN_PROGRESS.to_string();
 
         let db = agent_state.db.clone();
         let dispatcher = agent_state.dispatcher.clone();
@@ -410,15 +414,48 @@ pub async fn handle_task_complete(
                 }
                 Err(e) => {
                     warn!(task_id = %task_id_clone, error = %e, "failed to mark task completed before dispatch");
-                    let _ = db.update_task_status(&task_id_clone, "failed").await;
+                    let _ = db
+                        .update_task_status(&task_id_clone, task_status::FAILED)
+                        .await;
                     return;
                 }
                 Ok(true) => {}
             }
 
-            if let Err(e) = dispatcher.dispatch_resume_agent(&completed_task).await {
-                warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
+            match dispatcher.dispatch_resume_agent(&completed_task).await {
+                Err(crate::task_engine::DispatchError::AgentBusy(_)) => {
+                    // Check if the task has expired before re-queuing
+                    let now = chrono::Utc::now().timestamp();
+                    let is_expired = completed_task.timeout_at.is_some_and(|ts| ts <= now);
+
+                    if is_expired {
+                        warn!(task_id = %completed_task.id, "task timed out while waiting for agent, marking failed");
+                        let _ = db
+                            .update_task_failed(
+                                &completed_task.id,
+                                "task timed out while waiting for agent",
+                            )
+                            .await;
+                    } else {
+                        // Agent is busy — reset task to pending for the tick loop to retry
+                        debug!(task_id = %completed_task.id, "agent busy, deferring resume_agent to tick loop in 30s");
+                        let retry_at = now + 30;
+                        let _ = db
+                            .update_task_status(&completed_task.id, task_status::PENDING)
+                            .await;
+                        let _ = db
+                            .update_task_next_fire_at(&completed_task.id, retry_at)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
+                }
+                Ok(()) => {}
             }
+
+            // Check if all siblings are done → fire parent
+            dispatcher.check_and_dispatch_parent(&task_id_clone).await;
         });
     } else {
         // Non-resume_agent callback: persist result and mark completed directly
@@ -447,7 +484,14 @@ pub async fn handle_task_complete(
                 )
                     .into_response();
             }
-            Ok(true) => {}
+            Ok(true) => {
+                // Check if all siblings are done → fire parent
+                let dispatcher = agent_state.dispatcher.clone();
+                let tid = task_id.clone();
+                tokio::spawn(async move {
+                    dispatcher.check_and_dispatch_parent(&tid).await;
+                });
+            }
         }
     }
 
@@ -455,7 +499,7 @@ pub async fn handle_task_complete(
         StatusCode::OK,
         Json(TaskCompleteResponse {
             task_id: task_id.to_string(),
-            status: "completed".to_string(),
+            status: task_status::COMPLETED.to_string(),
         }),
     )
         .into_response()

@@ -234,6 +234,9 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
         mika_agent::teams::types::RunStatus::Failed(msg) => {
             println!("  Status: failed - {msg}");
         }
+        mika_agent::teams::types::RunStatus::Suspended => {
+            println!("  Status: suspended (waiting for background tasks)");
+        }
         mika_agent::teams::types::RunStatus::Running => {
             println!("  Status: running (unexpected)");
         }

@@ -74,6 +74,9 @@ impl TaskEngine {
             Err(e) => warn!(error = %e, "failed to expire timed-out tasks"),
         }
 
+        // 1b. Kill orphan processes for newly expired tasks
+        self.kill_orphan_processes().await;
+
         // 2. Recover in_progress tasks (process couldn't have survived container restart)
         let in_progress = self
             .db
@@ -174,8 +177,11 @@ impl TaskEngine {
         }
 
         // Periodic DB scan: pick up tasks created outside the engine (e.g. by tools)
+        // and expire timed-out tasks (long_running callbacks past their deadline).
         self.tick_count = self.tick_count.wrapping_add(1);
         if self.tick_count.is_multiple_of(DB_SCAN_INTERVAL_TICKS) {
+            self.expire_timed_out_tasks().await;
+            self.kill_orphan_processes().await;
             self.scan_db_for_new_tasks().await;
         }
 
@@ -195,6 +201,66 @@ impl TaskEngine {
 
         if fired > 0 {
             debug!(fired, "tick fired tasks");
+        }
+    }
+
+    /// Expire tasks past their `timeout_at` deadline.
+    ///
+    /// Runs periodically (every `DB_SCAN_INTERVAL_TICKS` seconds) to catch
+    /// long_running callback tasks that never completed. After expiring, checks
+    /// sibling completion so parent tasks can fire even when a child times out.
+    async fn expire_timed_out_tasks(&mut self) {
+        let now = chrono::Utc::now().timestamp();
+        match self.db.mark_tasks_expired(now).await {
+            Ok(n) if n > 0 => {
+                info!(count = n, "expired timed-out tasks in tick loop");
+                // Check if any expired tasks unblock their parent
+                self.check_expired_siblings().await;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to expire timed-out tasks in tick loop"),
+        }
+    }
+
+    /// After expiring tasks, check if any parent tasks now have all children
+    /// in terminal states (completed/failed/expired/cancelled).
+    async fn check_expired_siblings(&self) {
+        let expired_ids = self
+            .db
+            .get_expired_child_task_ids()
+            .await
+            .unwrap_or_default();
+
+        for task_id in expired_ids {
+            let d = self.dispatcher.clone();
+            let tid = task_id.clone();
+            tokio::spawn(async move {
+                d.check_and_dispatch_parent(&tid).await;
+            });
+        }
+    }
+
+    /// Send SIGTERM to orphan processes for expired tasks that still have a process_id set,
+    /// then clear the process_id to prevent repeated kill attempts.
+    async fn kill_orphan_processes(&self) {
+        match self.db.get_expired_tasks_with_process_id().await {
+            Ok(tasks) => {
+                for (task_id, pid) in tasks {
+                    info!(task_id = %task_id, pid = pid, "killing orphan process for expired task");
+                    // Use std::process::Command to send SIGTERM without adding a libc dependency
+                    let _ = std::process::Command::new("kill")
+                        .arg("-TERM")
+                        .arg(pid.to_string())
+                        .output();
+                    // Clear process_id so we don't attempt to kill again on next tick
+                    if let Err(e) = self.db.clear_task_process_id(&task_id).await {
+                        warn!(task_id = %task_id, error = %e, "failed to clear process_id after kill");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to query expired tasks with process_id");
+            }
         }
     }
 
@@ -358,14 +424,51 @@ impl TaskEngine {
                             Err(e) => {
                                 warn!(task_id = %task_id, error = %e, "failed to mark task completed");
                             }
-                            Ok(true) => {}
+                            Ok(true) => {
+                                dispatcher.check_and_dispatch_parent(&task_id).await;
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(task_id = %task_id, error = %e, "task dispatch failed");
-                    if let Err(db_err) = db.update_task_failed(&task_id, &e.to_string()).await {
-                        warn!(task_id = %task_id, error = %db_err, "failed to mark task as failed in DB");
+                    if matches!(e, super::dispatcher::DispatchError::AgentBusy(_)) {
+                        // Check if the task has expired before re-queuing
+                        let now = chrono::Utc::now().timestamp();
+                        let is_expired = match db.get_task(&task_id).await {
+                            Ok(Some(t)) => t.timeout_at.is_some_and(|ts| ts <= now),
+                            _ => false,
+                        };
+
+                        if is_expired {
+                            warn!(task_id = %task_id, "task timed out while waiting for agent, marking failed");
+                            let _ = db
+                                .update_task_failed(
+                                    &task_id,
+                                    "task timed out while waiting for agent",
+                                )
+                                .await;
+                        } else {
+                            // Agent is busy — reset task to pending and re-enqueue for retry
+                            debug!(task_id = %task_id, "agent busy, re-queuing task for retry in 30s");
+                            let retry_at = now + 30;
+                            let _ = db.update_task_status(&task_id, task_status::PENDING).await;
+                            let _ = db.update_task_next_fire_at(&task_id, retry_at).await;
+                            let _ = reenqueue_tx
+                                .send(QueuedTask {
+                                    task_id,
+                                    next_fire_at: retry_at,
+                                    trigger_type: trigger_type_val,
+                                    action_type: action_type_val,
+                                    cron_expr,
+                                })
+                                .await;
+                        }
+                    } else {
+                        let err_msg = e.to_string();
+                        warn!(task_id = %task_id, error = %err_msg, "task dispatch failed");
+                        if let Err(db_err) = db.update_task_failed(&task_id, &err_msg).await {
+                            warn!(task_id = %task_id, error = %db_err, "failed to mark task as failed in DB");
+                        }
                     }
                 }
             }
@@ -559,6 +662,164 @@ mod tests {
         // Second scan should not double-add
         engine.scan_db_for_new_tasks().await;
         assert_eq!(engine.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_expire_timed_out_tasks() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Create a callback task with timeout_at in the past
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long-running-job".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(chrono::Utc::now().timestamp() - 60), // expired 60s ago
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+
+        engine.expire_timed_out_tasks().await;
+
+        let t = db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(t.status, task_status::EXPIRED);
+    }
+
+    #[tokio::test]
+    async fn test_expire_does_not_touch_active_tasks() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Task with timeout_at in the future — should NOT be expired
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "still-running".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(chrono::Utc::now().timestamp() + 3600),
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+
+        engine.expire_timed_out_tasks().await;
+
+        let t = db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(t.status, task_status::PENDING);
+    }
+
+    #[tokio::test]
+    async fn test_expired_child_unblocks_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Create parent task
+        let parent = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "parent".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::INVOKE_ORCHESTRATOR.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        // Create two children: one completed, one expired
+        let child1 = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "child-ok".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let c1_id = db.create_task(child1).await.unwrap();
+        db.update_task_completed(&c1_id, Some("done"))
+            .await
+            .unwrap();
+
+        let child2 = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "child-expired".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(chrono::Utc::now().timestamp() - 60),
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let c2_id = db.create_task(child2).await.unwrap();
+        // Mark expired manually (in real flow, expire_timed_out_tasks does this)
+        db.update_task_status(&c2_id, task_status::EXPIRED)
+            .await
+            .unwrap();
+
+        // check_expired_siblings should detect that both children are terminal
+        engine.check_expired_siblings().await;
+
+        // Parent should have been claimed (dispatched) — status changed from pending
+        // Note: dispatch will fail (no real agent), but the attempt proves the logic works.
+        // Give spawned task a moment to run
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let parent_task = db.get_task(&parent_id).await.unwrap().unwrap();
+        // Parent should be in_progress (claimed by dispatch) or failed (dispatch error)
+        assert!(
+            parent_task.status == "in_progress" || parent_task.status == "failed",
+            "expected in_progress or failed, got: {}",
+            parent_task.status
+        );
     }
 
     #[tokio::test]

@@ -9,6 +9,11 @@ use crate::db::NewTask;
 use crate::task_engine::types::action_type;
 use crate::task_engine::types::trigger_type as tt;
 
+/// Agent tool for creating scheduled/callback tasks.
+///
+/// Removed from `default_tools()` — long-running skills auto-create callback tasks.
+/// Retained for tests (e.g. `complete_task::tests`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct CreateTaskTool;
 
 #[async_trait]

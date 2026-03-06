@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -8,10 +9,25 @@ use tracing::{info, warn};
 
 use super::index::ResolvedSkillTool;
 use super::manifest::ToolHandler;
+use crate::async_db::AsyncDatabase;
+use crate::db::NewTask;
+use crate::task_engine::types::{action_type, trigger_type};
 use crate::tools::{ImageData, ToolOutput};
 
 /// Maximum output size from a skill tool (10,000 characters).
 const MAX_OUTPUT_LEN: usize = 10_000;
+
+/// Scrub all `MIKA_*` environment variables from a tokio Command (defense-in-depth).
+///
+/// Prevents leaking secrets like `MIKA_ANTHROPIC_API_KEY`, `MIKA_INTERNAL_TOKEN`,
+/// and `MIKA_OPENAI_API_KEY` to child processes.
+fn scrub_mika_env_vars(cmd: &mut tokio::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MIKA_") {
+            cmd.env_remove(&key);
+        }
+    }
+}
 
 /// Maximum raw image file size (5 MB).
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
@@ -36,14 +52,40 @@ struct MikaOutput {
     images: Vec<String>,
 }
 
+/// Context for spawning long-running background exec handlers.
+///
+/// When present and the handler has `long_running: true`, the executor creates
+/// a callback task and spawns the subprocess in the background instead of
+/// blocking the agent loop.
+pub struct LongRunningContext {
+    pub db: AsyncDatabase,
+    pub agent_name: String,
+    pub session_id: String,
+}
+
 /// Execute a skill tool with the appropriate handler.
 ///
 /// Applies a per-skill timeout wrapping the inner execution.
+/// If `long_running_ctx` is Some and the handler is `Exec { long_running: true }`,
+/// the subprocess is spawned in the background with a callback task.
 pub async fn execute_skill_tool(
     skill_tool: &ResolvedSkillTool,
     input: serde_json::Value,
     timeout_secs: u64,
+    long_running_ctx: Option<&LongRunningContext>,
 ) -> ToolOutput {
+    // Check for long-running exec handler
+    if let ToolHandler::Exec {
+        command,
+        long_running: true,
+        estimated_duration_secs,
+    } = &skill_tool.handler
+        && let Some(ctx) = long_running_ctx
+    {
+        return execute_long_running(skill_tool, command, input, *estimated_duration_secs, ctx)
+            .await;
+    }
+
     let timeout = Duration::from_secs(timeout_secs);
     match tokio::time::timeout(timeout, execute_inner(skill_tool, input)).await {
         Ok(Ok(output)) => output,
@@ -79,7 +121,7 @@ async fn execute_inner(
         "executing skill tool"
     );
     match &skill_tool.handler {
-        ToolHandler::Exec { command } => {
+        ToolHandler::Exec { command, .. } => {
             execute_exec(
                 command,
                 &skill_tool.skill_dir,
@@ -244,16 +286,16 @@ async fn execute_exec(
     }
 
     let mut child = loop {
-        match tokio::process::Command::new(&cmd_path)
-            .current_dir(skill_dir)
+        let mut cmd = tokio::process::Command::new(&cmd_path);
+        cmd.current_dir(skill_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        scrub_mika_env_vars(&mut cmd);
+        match cmd.spawn() {
             Ok(child) => break child,
             Err(e) if e.raw_os_error() == Some(26 /* ETXTBSY */) => {
                 // ETXTBSY — another process has the file open for writing.
@@ -402,6 +444,180 @@ fn truncate_output(s: &str) -> String {
     }
 }
 
+/// Execute a long-running exec handler by creating a callback task and spawning
+/// the subprocess in the background. Returns immediately with the task ID.
+async fn execute_long_running(
+    skill_tool: &ResolvedSkillTool,
+    command: &str,
+    input: serde_json::Value,
+    estimated_duration_secs: Option<u64>,
+    ctx: &LongRunningContext,
+) -> ToolOutput {
+    let estimated = estimated_duration_secs.unwrap_or(3600);
+    let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
+    let now = chrono::Utc::now().timestamp();
+
+    let task = NewTask {
+        agent_id: ctx.db.agent_id.clone(),
+        team_run_id: None,
+        parent_task_id: None,
+        depth: 0,
+        label: format!("long_running:{}", skill_tool.definition.name),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: Some(now + timeout_secs as i64),
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config: "{}".to_string(),
+        input_context: Some(serde_json::to_string(&input).unwrap_or_default()),
+        created_by_session: Some(ctx.session_id.clone()),
+    };
+
+    let task_id = match ctx.db.create_task(task).await {
+        Ok(id) => id,
+        Err(e) => {
+            return ToolOutput::error(format!("Failed to create callback task: {e}"));
+        }
+    };
+
+    let cmd_path = skill_tool.skill_dir.join(command);
+    if !cmd_path.exists() {
+        let _ = ctx
+            .db
+            .update_task_failed(
+                &task_id,
+                &format!("handler not found: {}", cmd_path.display()),
+            )
+            .await;
+        return ToolOutput::error(format!(
+            "handler command not found: {} (resolved to {})",
+            command,
+            cmd_path.display()
+        ));
+    }
+
+    // Inject task metadata into input for the subprocess
+    let mut enriched_input = input;
+    if let serde_json::Value::Object(ref mut map) = enriched_input {
+        map.insert(
+            "__mika_task_id".to_string(),
+            serde_json::Value::String(task_id.clone()),
+        );
+        map.insert(
+            "__mika_agent".to_string(),
+            serde_json::Value::String(ctx.agent_name.clone()),
+        );
+    }
+
+    spawn_long_running_exec(
+        cmd_path,
+        skill_tool.skill_dir.clone(),
+        enriched_input,
+        task_id.clone(),
+        ctx.db.clone(),
+    );
+
+    ToolOutput::success(format!(
+        "Task submitted (long-running). ID: {task_id}\n\
+         The subprocess is running in the background. \
+         Results will be delivered via callback when complete."
+    ))
+}
+
+/// Spawn a monitored background task for a long-running exec handler.
+///
+/// The subprocess runs with `kill_on_drop(false)` so it survives if the
+/// parent agent task ends. A monitor task records the PID and handles
+/// failure (non-zero exit → task marked failed).
+fn spawn_long_running_exec(
+    cmd_path: PathBuf,
+    skill_dir: PathBuf,
+    input: serde_json::Value,
+    task_id: String,
+    db: AsyncDatabase,
+) {
+    tokio::spawn(async move {
+        let mut cmd = tokio::process::Command::new(&cmd_path);
+        cmd.current_dir(&skill_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .kill_on_drop(false);
+        scrub_mika_env_vars(&mut cmd);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                warn!(task_id = %task_id, error = %e, "failed to spawn long-running exec");
+                let _ = db
+                    .update_task_failed(&task_id, &format!("spawn failed: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        // Record PID
+        if let Some(pid) = child.id() {
+            let _ = db.set_task_process_id(&task_id, Some(pid as i64)).await;
+        }
+
+        // Write input JSON to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            let input_bytes = serde_json::to_vec(&input).unwrap_or_default();
+            match stdin.write_all(&input_bytes).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "failed to write stdin to long-running exec");
+                }
+            }
+        }
+
+        // Take stderr handle so we can read it (capped) on failure.
+        let stderr_handle = child.stderr.take();
+
+        // Wait for the subprocess to finish — only handle failure here.
+        // On success, the script itself should call `mika ask --task-id`
+        // to deliver results via the callback mechanism.
+        let status = match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(task_id = %task_id, error = %e, "failed to wait on long-running exec");
+                let _ = db
+                    .update_task_failed(&task_id, &format!("wait failed: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        if !status.success() {
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = stderr_handle {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::with_capacity(MAX_OUTPUT_LEN);
+                AsyncReadExt::take(&mut stderr, MAX_OUTPUT_LEN as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                    .ok();
+                stderr_text = String::from_utf8_lossy(&buf).to_string();
+            }
+            let exit_code = status.code().unwrap_or(-1);
+            let err_msg = format!(
+                "Process exited with code {exit_code}: {}",
+                truncate_output(&stderr_text)
+            );
+            warn!(task_id = %task_id, exit_code, "long-running exec failed");
+            let _ = db.update_task_failed(&task_id, &err_msg).await;
+        }
+        // If success, the script called `mika ask --task-id` which completes the task.
+        // If the script didn't call it, the task will eventually expire via timeout_at.
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +651,8 @@ mod tests {
             },
             handler: ToolHandler::Exec {
                 command: command.to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
             },
             skill_dir: skill_dir.to_path_buf(),
         }
@@ -451,7 +669,8 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "handlers/handler.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("hello from handler"));
     }
@@ -465,7 +684,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "fail.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("exit"));
         assert!(output.content.contains("error msg"));
@@ -475,7 +694,7 @@ mod tests {
     async fn test_exec_handler_missing_command() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_exec_tool(tmp.path(), "nonexistent.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("not found"));
     }
@@ -489,7 +708,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "slow.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 2).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 2, None).await;
         assert!(
             output.is_error,
             "expected timeout error, got: {}",
@@ -505,7 +724,7 @@ mod tests {
 
         let tool = make_exec_tool(tmp.path(), "echo_input.sh");
         let input = serde_json::json!({"query": "hello world"});
-        let output = execute_skill_tool(&tool, input.clone(), 30).await;
+        let output = execute_skill_tool(&tool, input.clone(), 30, None).await;
         assert!(!output.is_error);
         // The output should contain the JSON input
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
@@ -516,7 +735,7 @@ mod tests {
     async fn test_exec_handler_command_with_quotes() {
         let (_tmp, tool) = setup_shell_exec_handler();
         let input = serde_json::json!({"command": "echo \"hello world\""});
-        let output = execute_skill_tool(&tool, input, 30).await;
+        let output = execute_skill_tool(&tool, input, 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("hello world"),
@@ -543,7 +762,7 @@ mod tests {
         let (_tmp, tool) = setup_shell_exec_handler();
         // CSS selectors and hex colors contain # which must survive JSON → jq → eval
         let input = serde_json::json!({"command": "echo '#custom-relay { color: #a6e3a1; }'"});
-        let output = execute_skill_tool(&tool, input, 30).await;
+        let output = execute_skill_tool(&tool, input, 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#custom-relay"),
@@ -564,7 +783,7 @@ mod tests {
         let input = serde_json::json!({
             "command": "cat << 'EOF'\n#selector { color: #fff; }\nEOF"
         });
-        let output = execute_skill_tool(&tool, input, 30).await;
+        let output = execute_skill_tool(&tool, input, 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#selector"),
@@ -589,7 +808,7 @@ mod tests {
             css_file.display()
         );
         let input = serde_json::json!({"command": cmd});
-        let output = execute_skill_tool(&tool, input, 30).await;
+        let output = execute_skill_tool(&tool, input, 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#new-selector"),
@@ -603,7 +822,7 @@ mod tests {
         let (_tmp, tool) = setup_shell_exec_handler();
         // printf with \n format specifiers: backslashes must survive JSON → jq → eval → printf
         let input = serde_json::json!({"command": "printf 'line1\\nline2\\n'"});
-        let output = execute_skill_tool(&tool, input, 30).await;
+        let output = execute_skill_tool(&tool, input, 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("line1"),
@@ -641,7 +860,7 @@ mod tests {
             },
             skill_dir: PathBuf::from("/tmp"),
         };
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 5).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 5, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("unsupported HTTP method"));
     }
@@ -807,7 +1026,7 @@ mod tests {
         write_script(&handler_dir.join("screenshot.sh"), &script);
 
         let tool = make_exec_tool(tmp.path(), "handlers/screenshot.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("Screenshot taken."));
         assert_eq!(output.images.len(), 1);
@@ -824,7 +1043,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "plain.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
         assert!(!output.is_error);
         assert!(output.content.contains("just plain text"));
         assert!(output.images.is_empty());
@@ -847,7 +1066,7 @@ mod tests {
         }
 
         let tool = make_exec_tool(tmp.path(), "check_env.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         // Both vars should be empty because env_remove strips them
         assert_eq!(output.content.trim(), "TMUX= TMUX_PANE=");
@@ -857,5 +1076,139 @@ mod tests {
             std::env::remove_var("TMUX");
             std::env::remove_var("TMUX_PANE");
         }
+    }
+
+    // -- Long-running exec tests --
+
+    fn make_long_running_tool(skill_dir: &std::path::Path, command: &str) -> ResolvedSkillTool {
+        ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "long_test".to_string(),
+                description: "Long-running test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: command.to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(60),
+            },
+            skill_dir: skill_dir.to_path_buf(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_creates_callback_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "main");
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "main".to_string(),
+            session_id: "test-session".to_string(),
+        };
+
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, Some(&ctx)).await;
+
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("Task submitted"),
+            "expected task submission message, got: {}",
+            output.content
+        );
+
+        // Verify a callback task was created
+        let tasks = async_db
+            .get_tasks_by_status(vec!["pending".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].trigger_type, "callback");
+        assert_eq!(tasks[0].action_type, "resume_agent");
+        assert!(tasks[0].label.starts_with("long_running:"));
+        assert!(tasks[0].timeout_at.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_false_blocks_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("handler.sh"),
+            "#!/bin/sh\necho 'sync result'",
+        );
+
+        // long_running: false — should execute synchronously even with LongRunningContext
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "sync_test".to_string(),
+                description: "Sync test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        };
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "main");
+        let ctx = LongRunningContext {
+            db: async_db,
+            agent_name: "main".to_string(),
+            session_id: "test-session".to_string(),
+        };
+
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx)).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("sync result"),
+            "expected sync output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_failure_marks_task_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("fail.sh"),
+            "#!/bin/sh\necho 'error msg' >&2\nexit 1",
+        );
+
+        let tool = make_long_running_tool(tmp.path(), "fail.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "main");
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "main".to_string(),
+            session_id: "test-session".to_string(),
+        };
+
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx)).await;
+
+        // Should return success immediately (task submitted)
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Wait briefly for the background monitor to detect the failure
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let tasks = async_db
+            .get_tasks_by_status(vec!["failed".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "expected 1 failed task, got {}",
+            tasks.len()
+        );
+        assert!(tasks[0].result.as_ref().unwrap().contains("exit"));
     }
 }

@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(entries[0].skill_tools[0].skill_dir, skill_dir);
         assert!(matches!(
             &entries[0].skill_tools[0].handler,
-            super::super::manifest::ToolHandler::Exec { command } if command == "./handlers/search.sh"
+            super::super::manifest::ToolHandler::Exec { command, .. } if command == "./handlers/search.sh"
         ));
     }
 

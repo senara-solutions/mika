@@ -184,6 +184,8 @@ mod tests {
             definition: dummy_def.clone(),
             handler: ToolHandler::Exec {
                 command: "./run.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
             },
             skill_dir: PathBuf::from("/skills/tmux"),
         }];

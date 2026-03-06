@@ -319,6 +319,7 @@ async fn run_loop(
     mode: &LoopMode<'_>,
     db: &AsyncDatabase,
     mcp_manager: Option<&McpManager>,
+    long_running_ctx: Option<&executor::LongRunningContext>,
 ) -> Result<LoopResult> {
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
@@ -450,6 +451,7 @@ async fn run_loop(
                     request,
                     step as u32,
                     mcp_manager,
+                    long_running_ctx,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -719,6 +721,11 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     };
 
     let mode = LoopMode::Conversation { channel_type };
+    let lr_ctx = executor::LongRunningContext {
+        db: db.clone(),
+        agent_name: db.agent_id.clone(),
+        session_id: params.session_id.to_string(),
+    };
     let result = run_loop(
         claude,
         tools,
@@ -729,6 +736,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         &mode,
         db,
         params.mcp_manager,
+        Some(&lr_ctx),
     )
     .await?;
 
@@ -817,6 +825,7 @@ async fn process_tool_calls(
     request: &mut MessagesRequest,
     step: u32,
     mcp_manager: Option<&McpManager>,
+    long_running_ctx: Option<&executor::LongRunningContext>,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results = Vec::new();
     let mut summaries = Vec::new();
@@ -825,16 +834,15 @@ async fn process_tool_calls(
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
             let input_summary = truncate_summary(&input.to_string(), TOOL_INPUT_SUMMARY_MAX);
-            let output = execute_tool(
+            let dispatch = ToolDispatchCtx {
                 tools,
                 skill_tools,
-                name,
-                input.clone(),
-                tool_ctx,
+                ctx: tool_ctx,
                 skill_timeout,
                 mcp_manager,
-            )
-            .await;
+                long_running_ctx,
+            };
+            let output = execute_tool(&dispatch, name, input.clone()).await;
             let image_count = output.images.len();
             let output_summary = if image_count > 0 {
                 format!(
@@ -920,27 +928,33 @@ async fn process_tool_calls(
     summaries
 }
 
+/// Resources for tool dispatch, bundled to reduce argument count.
+struct ToolDispatchCtx<'a> {
+    tools: &'a ToolRegistry,
+    skill_tools: &'a HashMap<String, &'a ResolvedSkillTool>,
+    ctx: &'a ToolContext<'a>,
+    skill_timeout: u64,
+    mcp_manager: Option<&'a McpManager>,
+    long_running_ctx: Option<&'a executor::LongRunningContext>,
+}
+
 /// Execute a single tool with timeout.
 ///
 /// Routing: builtin tools (from ToolRegistry) first, then skill-defined tools,
 /// then "unknown tool" error.
 async fn execute_tool(
-    tools: &ToolRegistry,
-    skill_tools: &HashMap<String, &ResolvedSkillTool>,
+    dispatch: &ToolDispatchCtx<'_>,
     name: &str,
     input: serde_json::Value,
-    ctx: &ToolContext<'_>,
-    skill_timeout: u64,
-    mcp_manager: Option<&McpManager>,
 ) -> ToolOutput {
     debug!(tool = %name, "tool_execution");
 
     // 1. Try builtin tool
-    if let Some(tool) = tools.get(name) {
+    if let Some(tool) = dispatch.tools.get(name) {
         let timeout = tool.timeout_secs().unwrap_or(TOOL_TIMEOUT_SECS);
         return match tokio::time::timeout(
             std::time::Duration::from_secs(timeout),
-            tool.execute(input, ctx),
+            tool.execute(input, dispatch.ctx),
         )
         .await
         {
@@ -957,12 +971,12 @@ async fn execute_tool(
     }
 
     // 2. Try skill-defined tool
-    if let Some(skill_tool) = skill_tools.get(name) {
+    if let Some(skill_tool) = dispatch.skill_tools.get(name) {
         // Builtin skill handlers dispatch to Rust functions with ToolContext access
         if let ToolHandler::Builtin { function } = &skill_tool.handler {
             return match tokio::time::timeout(
                 std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                builtin_handlers::execute(function, input, ctx),
+                builtin_handlers::execute(function, input, dispatch.ctx),
             )
             .await
             {
@@ -975,11 +989,17 @@ async fn execute_tool(
                 }
             };
         }
-        return executor::execute_skill_tool(skill_tool, input, skill_timeout).await;
+        return executor::execute_skill_tool(
+            skill_tool,
+            input,
+            dispatch.skill_timeout,
+            dispatch.long_running_ctx,
+        )
+        .await;
     }
 
     // 3. Try MCP tool (external server)
-    if let Some(mcp) = mcp_manager
+    if let Some(mcp) = dispatch.mcp_manager
         && mcp.is_mcp_tool(name)
     {
         return match tokio::time::timeout(
@@ -1014,6 +1034,10 @@ pub enum SilentTrigger {
         label: String,
         result: String,
     },
+    /// A named skill is being run as a background task.
+    SkillRun {
+        skill_name: String,
+    },
 }
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
@@ -1042,6 +1066,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
         SilentTrigger::Callback { .. } => "callback",
+        SilentTrigger::SkillRun { .. } => "skill_run",
     };
 
     let silent_span = info_span!(
@@ -1185,6 +1210,14 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
              - Prioritize: you have a maximum of 5 core memory edits this session"
                 .to_string()
         }
+        SilentTrigger::SkillRun { skill_name } => {
+            format!(
+                "This is a scheduled SKILL RUN for skill '{skill_name}'. \
+                 Find and execute the '{skill_name}' skill tool. \
+                 Process the results and take any appropriate follow-up actions. \
+                 If the skill produces output that should be shared with the user, use send_message."
+            )
+        }
     };
 
     let chat_id = db.get_customer_config("chat_id").await?;
@@ -1223,6 +1256,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         SilentTrigger::Heartbeat => "[heartbeat trigger]".to_string(),
         SilentTrigger::Reflection => "[reflection trigger]".to_string(),
         SilentTrigger::Callback { label, .. } => format!("[callback: {label}]"),
+        SilentTrigger::SkillRun { skill_name } => format!("[skill_run: {skill_name}]"),
     };
 
     let messages = vec![Message {
@@ -1269,6 +1303,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         &mode,
         db,
         None, // MCP tools excluded from silent mode
+        None, // long_running not supported in silent mode
     )
     .await?;
 
@@ -1336,6 +1371,9 @@ pub struct TeamAgentParams<'a> {
     pub mcp_manager: Option<&'a McpManager>,
     /// Agent name for per-agent log filtering in team runs.
     pub agent_name: &'a str,
+    /// Optional task ID to auto-complete when the agent turn ends.
+    /// Used by team engine to mark child tasks as completed with the agent's response.
+    pub child_task_id: Option<&'a str>,
 }
 
 /// Run an agent within a team execution context.
@@ -1454,6 +1492,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         &mode,
         params.db,
         params.mcp_manager,
+        None, // long_running: team agents will be wired in Phase 4
     )
     .await?;
 
@@ -1500,7 +1539,21 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
             }
         };
 
+        // Auto-complete child task if this agent was spawned as part of a team task tree
+        if let Some(task_id) = params.child_task_id {
+            let _ = params.db.update_task_completed(task_id, Some(&text)).await;
+        }
+
         return Ok(Some(text));
+    }
+
+    // Auto-complete child task if this agent was spawned as part of a team task tree
+    if let Some(task_id) = params.child_task_id {
+        let result_text = result.text.as_deref().unwrap_or("");
+        let _ = params
+            .db
+            .update_task_completed(task_id, Some(result_text))
+            .await;
     }
 
     Ok(result.text)

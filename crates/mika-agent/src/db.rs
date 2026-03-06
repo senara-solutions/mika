@@ -299,16 +299,12 @@ impl Database {
             target_version = CURRENT_SCHEMA_VERSION,
             "checking migrations"
         );
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 1 {
             if version > 0 {
-                info!(
-                    from = version,
-                    to = CURRENT_SCHEMA_VERSION,
-                    "applying clean-slate migration"
-                );
+                info!(from = version, to = 1, "applying clean-slate migration");
             }
             self.migrate_v1()?;
-            info!(version = CURRENT_SCHEMA_VERSION, "database migrated to v1");
+            info!(version = 1, "database migrated to v1");
         }
         Ok(())
     }
@@ -377,11 +373,12 @@ impl Database {
                 team_id TEXT NOT NULL REFERENCES teams(id),
                 goal TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'running'
-                    CHECK (status IN ('running','completed','failed','cancelled')),
+                    CHECK (status IN ('running','completed','failed','cancelled','suspended')),
                 failure_reason TEXT,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 max_iterations INTEGER NOT NULL DEFAULT 3,
                 deliverable TEXT,
+                checkpoint TEXT,
                 started_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 ended_at INTEGER
             );
@@ -429,6 +426,8 @@ impl Database {
             CREATE INDEX idx_tasks_schedulable
                 ON tasks(agent_id, next_fire_at ASC)
                 WHERE status IN ('pending','recurring_active');
+            CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
 
             CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -873,6 +872,22 @@ impl Database {
         Ok(n)
     }
 
+    /// Get IDs of expired tasks whose parent is still pending (for sibling completion checks).
+    pub fn get_expired_child_task_ids(&self, agent_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id FROM tasks t
+             JOIN tasks p ON t.parent_task_id = p.id AND p.agent_id = t.agent_id
+             WHERE t.agent_id = ?1
+               AND t.status = 'expired'
+               AND t.parent_task_id IS NOT NULL
+               AND p.status = 'pending'",
+        )?;
+        let ids = stmt
+            .query_map(params![agent_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
     pub fn count_pending_tasks(&self, agent_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
@@ -921,6 +936,122 @@ impl Database {
             params![process_id, id],
         )?;
         Ok(())
+    }
+
+    /// Returns (task_id, process_id) pairs for expired tasks that still have a process_id set.
+    pub fn get_expired_tasks_with_process_id(&self, agent_id: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, process_id FROM tasks
+             WHERE agent_id = ?1 AND status = 'expired' AND process_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Clear the process_id after killing an orphan process to prevent repeated kill attempts.
+    pub fn clear_task_process_id(&self, id: &str, agent_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET process_id = NULL, updated_at = unixepoch()
+             WHERE id = ?1 AND agent_id = ?2",
+            params![id, agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if all siblings of a completed task are done. If so, atomically
+    /// claim the parent task for dispatch.
+    ///
+    /// Returns `Some(parent_id)` when the parent was claimed, `None` otherwise.
+    /// Uses a single SQLite transaction to prevent races.
+    pub fn try_complete_parent_on_sibling_done(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // 1. Get parent_task_id for this task
+        let parent_id: Option<String> = tx
+            .query_row(
+                "SELECT parent_task_id FROM tasks WHERE id = ?1 AND agent_id = ?2",
+                params![task_id, agent_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let parent_id = match parent_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // 2. Count incomplete siblings (same parent, not in terminal state)
+        let incomplete: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE parent_task_id = ?1 AND agent_id = ?2
+             AND status NOT IN ('completed','failed','cancelled','expired')",
+            params![&parent_id, agent_id],
+            |row| row.get(0),
+        )?;
+
+        if incomplete > 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        // 3. Atomically claim parent task (only if still pending)
+        let changed = tx.execute(
+            "UPDATE tasks SET status = 'in_progress', fired_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ?1 AND agent_id = ?2 AND status = 'pending'",
+            params![&parent_id, agent_id],
+        )?;
+
+        tx.commit()?;
+
+        if changed > 0 {
+            Ok(Some(parent_id))
+        } else {
+            Ok(None) // already claimed by another thread
+        }
+    }
+
+    /// Get all child tasks for a given parent task.
+    pub fn get_child_tasks(&self, parent_task_id: &str, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE parent_task_id = ?1 AND agent_id = ?2
+             ORDER BY created_at ASC",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![parent_task_id, agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count pending callback tasks for a given team run with depth > 1.
+    /// Used to detect grandchild long-running tasks spawned during a team run.
+    pub fn count_pending_callback_tasks_by_team_run(
+        &self,
+        team_run_id: &str,
+        agent_id: &str,
+    ) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND team_run_id = ?2
+               AND trigger_type = 'callback'
+               AND status = 'pending'
+               AND depth > 1",
+            params![agent_id, team_run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
@@ -1984,6 +2115,37 @@ impl Database {
         Ok(())
     }
 
+    /// Suspend a team run, saving a serialized checkpoint for later resume.
+    pub fn suspend_team_run(&self, run_id: &str, checkpoint: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE team_runs SET status = 'suspended', checkpoint = ?1 WHERE id = ?2",
+            params![checkpoint, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Load the serialized checkpoint from a suspended team run.
+    pub fn load_team_run_checkpoint(&self, run_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT checkpoint FROM team_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
+            .map_err(Into::into)
+    }
+
+    /// Resume a suspended team run (set status back to 'running').
+    pub fn resume_team_run_status(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE team_runs SET status = 'running', checkpoint = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
     fn row_to_team_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRunRow> {
         Ok(TeamRunRow {
             id: r.get(0)?,
@@ -2960,5 +3122,239 @@ mod tests {
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("main").unwrap(), 1);
+    }
+
+    fn make_task(label: &str) -> NewTask {
+        NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        }
+    }
+
+    #[test]
+    fn test_sibling_completion_all_done_fires_parent() {
+        let db = db();
+        let parent_id = db.create_task(&make_task("parent")).unwrap();
+
+        let mut c1 = make_task("child1");
+        c1.parent_task_id = Some(parent_id.clone());
+        c1.depth = 1;
+        let c1_id = db.create_task(&c1).unwrap();
+
+        let mut c2 = make_task("child2");
+        c2.parent_task_id = Some(parent_id.clone());
+        c2.depth = 1;
+        let c2_id = db.create_task(&c2).unwrap();
+
+        let mut c3 = make_task("child3");
+        c3.parent_task_id = Some(parent_id.clone());
+        c3.depth = 1;
+        let c3_id = db.create_task(&c3).unwrap();
+
+        // Complete 2 of 3 — parent should NOT fire
+        db.update_task_completed(&c1_id, "main", Some("done"))
+            .unwrap();
+        db.update_task_completed(&c2_id, "main", Some("done"))
+            .unwrap();
+        assert_eq!(
+            db.try_complete_parent_on_sibling_done(&c2_id, "main")
+                .unwrap(),
+            None
+        );
+
+        // Complete the 3rd — parent should fire
+        db.update_task_completed(&c3_id, "main", Some("done"))
+            .unwrap();
+        let result = db
+            .try_complete_parent_on_sibling_done(&c3_id, "main")
+            .unwrap();
+        assert_eq!(result, Some(parent_id));
+    }
+
+    #[test]
+    fn test_sibling_completion_no_parent_returns_none() {
+        let db = db();
+        let task_id = db.create_task(&make_task("orphan")).unwrap();
+        assert_eq!(
+            db.try_complete_parent_on_sibling_done(&task_id, "main")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sibling_completion_failed_child_counts_as_done() {
+        let db = db();
+        let parent_id = db.create_task(&make_task("parent")).unwrap();
+
+        let mut c1 = make_task("child1");
+        c1.parent_task_id = Some(parent_id.clone());
+        let c1_id = db.create_task(&c1).unwrap();
+
+        let mut c2 = make_task("child2");
+        c2.parent_task_id = Some(parent_id.clone());
+        let c2_id = db.create_task(&c2).unwrap();
+
+        // One completed, one failed — both are "done"
+        db.update_task_completed(&c1_id, "main", Some("ok"))
+            .unwrap();
+        db.update_task_failed(&c2_id, "main", "error").unwrap();
+        let result = db
+            .try_complete_parent_on_sibling_done(&c2_id, "main")
+            .unwrap();
+        assert_eq!(result, Some(parent_id));
+    }
+
+    #[test]
+    fn test_get_child_tasks() {
+        let db = db();
+        let parent_id = db.create_task(&make_task("parent")).unwrap();
+
+        let mut c1 = make_task("child1");
+        c1.parent_task_id = Some(parent_id.clone());
+        db.create_task(&c1).unwrap();
+
+        let mut c2 = make_task("child2");
+        c2.parent_task_id = Some(parent_id.clone());
+        db.create_task(&c2).unwrap();
+
+        let children = db.get_child_tasks(&parent_id, "main").unwrap();
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn test_count_pending_callback_tasks_by_team_run() {
+        let db = Database::open_in_memory().unwrap();
+        db.register_agent("main", "main", "/tmp").unwrap();
+
+        // Insert team + team runs so FK constraints are satisfied
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO teams (id, name) VALUES ('team1', 'team1')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_id, goal, started_at)
+                 VALUES ('run123', 'team1', 'test goal', unixepoch())",
+                [],
+            )
+            .unwrap();
+
+        // Create a pending callback task with matching team_run_id and depth > 1
+        let mut t = make_task("grandchild");
+        t.trigger_type = "callback".to_string();
+        t.depth = 2;
+        t.team_run_id = Some("run123".to_string());
+        db.create_task(&t).unwrap();
+
+        // Create a completed callback task (should NOT be counted)
+        let mut t2 = make_task("done-grandchild");
+        t2.trigger_type = "callback".to_string();
+        t2.depth = 2;
+        t2.team_run_id = Some("run123".to_string());
+        let t2_id = db.create_task(&t2).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![t2_id],
+            )
+            .unwrap();
+
+        // Create a depth=1 callback (should NOT be counted -- only depth > 1)
+        let mut t3 = make_task("child-not-grandchild");
+        t3.trigger_type = "callback".to_string();
+        t3.depth = 1;
+        t3.team_run_id = Some("run123".to_string());
+        db.create_task(&t3).unwrap();
+
+        // Create a pending callback for a DIFFERENT team run (should NOT be counted)
+        db.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_id, goal, started_at)
+                 VALUES ('other-run', 'team1', 'other goal', unixepoch())",
+                [],
+            )
+            .unwrap();
+        let mut t4 = make_task("other-run-grandchild");
+        t4.trigger_type = "callback".to_string();
+        t4.depth = 2;
+        t4.team_run_id = Some("other-run".to_string());
+        db.create_task(&t4).unwrap();
+
+        let count = db
+            .count_pending_callback_tasks_by_team_run("run123", "main")
+            .unwrap();
+        assert_eq!(count, 1); // only the pending depth=2 grandchild for run123
+    }
+
+    #[test]
+    fn test_get_expired_child_task_ids() {
+        let db = Database::open_in_memory().unwrap();
+        db.register_agent("main", "main", "/tmp").unwrap();
+
+        // Parent still pending — its expired child SHOULD appear
+        let parent_id = db.create_task(&make_task("parent")).unwrap();
+
+        let mut c = make_task("expired-child");
+        c.parent_task_id = Some(parent_id.clone());
+        let c_id = db.create_task(&c).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'expired' WHERE id = ?1",
+                params![c_id],
+            )
+            .unwrap();
+
+        // Expired task without parent (should NOT appear)
+        let o_id = db.create_task(&make_task("expired-orphan")).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'expired' WHERE id = ?1",
+                params![o_id],
+            )
+            .unwrap();
+
+        // Parent already completed — its expired child should NOT appear
+        let done_parent_id = db.create_task(&make_task("done-parent")).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![done_parent_id],
+            )
+            .unwrap();
+
+        let mut c2 = make_task("expired-child-done-parent");
+        c2.parent_task_id = Some(done_parent_id.clone());
+        let c2_id = db.create_task(&c2).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'expired' WHERE id = ?1",
+                params![c2_id],
+            )
+            .unwrap();
+
+        let ids = db.get_expired_child_task_ids("main").unwrap();
+        assert_eq!(
+            ids.len(),
+            1,
+            "should only return expired children whose parent is still pending"
+        );
+        assert_eq!(ids[0], c_id);
     }
 }

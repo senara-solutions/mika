@@ -4,7 +4,7 @@ pub mod engine;
 pub mod queue;
 pub mod types;
 
-pub use dispatcher::TaskDispatcher;
+pub use dispatcher::{DispatchError, TaskDispatcher};
 pub use engine::TaskEngine;
 pub use queue::QueuedTask;
 pub use types::{action_type, task_status, trigger_type};

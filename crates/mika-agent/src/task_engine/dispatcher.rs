@@ -7,6 +7,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tracing::{debug, info, warn};
 
+/// Typed dispatch errors so callers can match on specific failure modes
+/// (e.g. "agent busy") without fragile string matching.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("agent busy, defer task {0}")]
+    AgentBusy(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 use crate::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
 use crate::async_db::AsyncDatabase;
 use crate::db::Task;
@@ -36,8 +46,32 @@ pub struct TaskDispatcher {
 }
 
 impl TaskDispatcher {
+    /// Check if all sibling tasks of the given task are done, and if so,
+    /// dispatch the parent task.
+    ///
+    /// This is a convenience wrapper around `try_complete_parent_on_sibling_done`
+    /// that handles logging and error cases. Call sites only need a single line.
+    pub async fn check_and_dispatch_parent(&self, task_id: &str) {
+        match self.db.try_complete_parent_on_sibling_done(task_id).await {
+            Ok(Some(parent_id)) => {
+                info!(
+                    task_id = task_id,
+                    parent_id = %parent_id,
+                    "all siblings done, dispatching parent task"
+                );
+                if let Err(e) = self.dispatch(&parent_id).await {
+                    warn!(parent_id = %parent_id, error = %e, "failed to dispatch parent task");
+                }
+            }
+            Ok(None) => {} // not all siblings done, or no parent
+            Err(e) => {
+                warn!(task_id = task_id, error = %e, "failed sibling completion check");
+            }
+        }
+    }
+
     /// Dispatch a task by its ID: load from DB, match on `action_type`, execute.
-    pub async fn dispatch(&self, task_id: &str) -> Result<()> {
+    pub async fn dispatch(&self, task_id: &str) -> Result<(), DispatchError> {
         let task = self
             .db
             .get_task(task_id)
@@ -48,11 +82,14 @@ impl TaskDispatcher {
             serde_json::from_str(&task.action_config).unwrap_or(serde_json::Value::Null);
 
         match task.action_type.as_str() {
-            action_type::SEND_MESSAGE => self.dispatch_send_message(&task, &config).await,
-            action_type::INJECT_CONTEXT => self.dispatch_inject_context(&task, &config).await,
+            action_type::SEND_MESSAGE => Ok(self.dispatch_send_message(&task, &config).await?),
+            action_type::INJECT_CONTEXT => Ok(self.dispatch_inject_context(&task, &config).await?),
             action_type::RUN_SKILL => self.dispatch_run_skill(&task, &config).await,
             action_type::RESUME_AGENT => self.dispatch_resume_agent(&task).await,
-            other => Err(anyhow!("unknown action_type: {}", other)),
+            action_type::INVOKE_ORCHESTRATOR => {
+                Ok(self.dispatch_invoke_orchestrator(&task, &config).await?)
+            }
+            other => Err(anyhow!("unknown action_type: {}", other).into()),
         }
     }
 
@@ -107,7 +144,11 @@ impl TaskDispatcher {
     /// Supports two modes via `action_config`:
     /// - Built-in triggers: `{"trigger": "heartbeat" | "reflection"}` — pre-filtered
     /// - Arbitrary skills: `{"skill_name": "...", "args": {...}}` — runs the named skill
-    async fn dispatch_run_skill(&self, task: &Task, config: &serde_json::Value) -> Result<()> {
+    async fn dispatch_run_skill(
+        &self,
+        task: &Task,
+        config: &serde_json::Value,
+    ) -> Result<(), DispatchError> {
         // Check for arbitrary skill_name first
         if let Some(skill_name) = config["skill_name"].as_str() {
             return self.dispatch_skill_by_name(task, skill_name, config).await;
@@ -122,29 +163,29 @@ impl TaskDispatcher {
         })?;
 
         match trigger_name {
-            "heartbeat" => self.dispatch_heartbeat(task).await,
-            "reflection" => self.dispatch_reflection(task).await,
-            other => Err(anyhow!("unknown run_skill trigger: {}", other)),
+            "heartbeat" => Ok(self.dispatch_heartbeat(task).await?),
+            "reflection" => Ok(self.dispatch_reflection(task).await?),
+            other => Err(anyhow!("unknown run_skill trigger: {}", other).into()),
         }
     }
 
     /// Run an arbitrary skill as a silent background agent turn.
     ///
     /// The skill name is looked up in the skill registry. If not found, returns an error.
-    /// Skips if the agent is busy (try_lock).
+    /// Returns `DispatchError::AgentBusy` if the agent is busy so the caller can re-queue.
     async fn dispatch_skill_by_name(
         &self,
         task: &Task,
         skill_name: &str,
         _config: &serde_json::Value,
-    ) -> Result<()> {
-        // Acquire agent lock (skip if busy)
+    ) -> Result<(), DispatchError> {
+        // Acquire agent lock — return error if busy so caller can re-queue
         let _guard = if let Some(ref lock) = self.agent_lock {
             match lock.try_lock() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
                     debug!(task_id = %task.id, skill = skill_name, "agent busy, deferring skill run");
-                    return Ok(());
+                    return Err(DispatchError::AgentBusy(task.id.clone()));
                 }
             }
         } else {
@@ -159,7 +200,9 @@ impl TaskDispatcher {
             claude: &self.claude,
             tools: &self.tools,
             skills: &self.skills,
-            trigger: SilentTrigger::Heartbeat, // use heartbeat mode for skill runs
+            trigger: SilentTrigger::SkillRun {
+                skill_name: skill_name.to_string(),
+            },
             home_dir: &self.home_dir,
             session_id: &session_id,
             message_sender: self.message_sender.clone(),
@@ -179,22 +222,26 @@ impl TaskDispatcher {
     ///
     /// Reads `task.result` (set by the callback) and runs a silent agent turn with
     /// the result injected as context. Uses `send_message` to deliver the response.
-    pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<()> {
+    ///
+    /// Returns `Err` with a specific message when the agent is busy so the caller
+    /// can re-queue the task instead of losing the callback result.
+    pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
         let result = task.result.clone().unwrap_or_default();
         if result.is_empty() {
             return Err(anyhow!(
                 "resume_agent task {} has no result — callback may not have completed yet",
                 task.id
-            ));
+            )
+            .into());
         }
 
-        // Acquire agent lock (skip if busy)
+        // Acquire agent lock — return error if busy so caller can re-queue
         let _guard = if let Some(ref lock) = self.agent_lock {
             match lock.try_lock() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
                     debug!(task_id = %task.id, "agent busy, deferring resume_agent");
-                    return Ok(());
+                    return Err(DispatchError::AgentBusy(task.id.clone()));
                 }
             }
         } else {
@@ -227,6 +274,101 @@ impl TaskDispatcher {
         }
 
         Ok(())
+    }
+
+    /// Resume a team run after all child tasks (agent delegations) have completed.
+    ///
+    /// Loads child task results, deserializes the checkpoint from `input_context`,
+    /// and calls `resume_team_run` to continue the team pipeline from the specified phase.
+    ///
+    /// **Race guard:** Only proceeds if the team run is in `suspended` status. When agents
+    /// complete synchronously, `execute_tasks()` cancels this parent task and continues
+    /// the pipeline directly. If the task fires anyway (race window), this check prevents
+    /// a duplicate review/deliver phase.
+    async fn dispatch_invoke_orchestrator(
+        &self,
+        task: &Task,
+        config: &serde_json::Value,
+    ) -> Result<()> {
+        let team_run_id = task
+            .team_run_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("invoke_orchestrator task {} has no team_run_id", task.id))?;
+        let team_name = config["team_name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing team_name in action_config"))?;
+        let next_phase = config["next_phase"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing next_phase in action_config"))?;
+
+        // Race guard: only resume if the team run is actually suspended.
+        // When agents complete synchronously, execute_tasks() cancels this task and
+        // continues the pipeline directly. If we still fire (race window), bail out.
+        match self.db.load_team_run_by_id(team_run_id).await? {
+            Some(run) if run.status == "suspended" => {
+                // Expected path for async resumption — proceed.
+            }
+            Some(run) => {
+                warn!(
+                    task_id = %task.id,
+                    team_run_id,
+                    status = %run.status,
+                    "invoke_orchestrator fired but team run is not suspended, skipping"
+                );
+                // Mark as completed so it doesn't re-fire.
+                self.db.update_task_status(&task.id, "completed").await.ok();
+                return Ok(());
+            }
+            None => {
+                warn!(
+                    task_id = %task.id,
+                    team_run_id,
+                    "invoke_orchestrator fired but team run not found, skipping"
+                );
+                self.db.update_task_status(&task.id, "completed").await.ok();
+                return Ok(());
+            }
+        }
+
+        // Load child task results (each child = one agent's output)
+        let children = self.db.get_child_tasks(&task.id).await?;
+        let child_results: Vec<_> = children
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "agent": c.label.strip_prefix("team-agent-").unwrap_or(&c.label),
+                    "status": c.status,
+                    "result": c.result.as_deref().unwrap_or("")
+                })
+            })
+            .collect();
+
+        let team_state = task.input_context.as_deref().ok_or_else(|| {
+            anyhow!(
+                "invoke_orchestrator task {} has no input_context (checkpoint)",
+                task.id
+            )
+        })?;
+
+        info!(
+            task_id = %task.id,
+            team_run_id,
+            team_name,
+            next_phase,
+            children = children.len(),
+            "resuming team run from checkpoint"
+        );
+
+        crate::teams::resume_team_run(
+            team_run_id,
+            team_name,
+            next_phase,
+            team_state,
+            &serde_json::to_string(&child_results)?,
+            &self.home_dir,
+            &self.db,
+        )
+        .await
     }
 
     /// Run the heartbeat silent agent with all pre-filter checks.

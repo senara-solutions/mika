@@ -309,6 +309,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
     );
+    prompt.push_str(
+        "- Some tools are long-running and return a task ID instead of immediate results. \
+         When this happens, inform the user that a background task is running and you'll follow up \
+         when results arrive. Do not retry the tool.\n",
+    );
     if let Some(home) = ctx.home_dir {
         writeln!(
             prompt,

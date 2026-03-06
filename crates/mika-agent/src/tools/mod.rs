@@ -361,7 +361,6 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(create_reminder::CreateReminderTool));
     registry.register(Box::new(list_reminders::ListRemindersTool));
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
-    registry.register(Box::new(create_task::CreateTaskTool));
     registry.register(Box::new(cancel_task::CancelTaskTool));
     registry.register(Box::new(complete_task::CompleteTaskTool));
     registry.register(Box::new(get_task::GetTaskTool));
