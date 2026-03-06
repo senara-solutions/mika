@@ -395,7 +395,7 @@ pub async fn handle_task_complete(
         completed_task.status = "in_progress".to_string();
 
         let db = agent_state.db.clone();
-        let engine = agent_state.task_engine.clone();
+        let dispatcher = agent_state.dispatcher.clone();
         let task_id_clone = task_id.clone();
         let result_clone = req.result.clone();
         tokio::spawn(async move {
@@ -416,12 +416,8 @@ pub async fn handle_task_complete(
                 Ok(true) => {}
             }
 
-            let dispatcher = {
-                let eng = engine.lock().await;
-                eng.dispatcher()
-            };
             if let Err(e) = dispatcher
-                .dispatch_completed_callback(&completed_task)
+                .dispatch_resume_agent(&completed_task)
                 .await
             {
                 warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");

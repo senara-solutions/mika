@@ -177,8 +177,6 @@ log_level = "info"
 /// Create the ~/.mika/ directory structure with default files.
 /// Sets permissions to 0700 for directories, 0600 for files on Unix.
 pub fn bootstrap(home_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(home_dir.join("data"))
-        .with_context(|| format!("failed to create {}/data/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("logs"))
         .with_context(|| format!("failed to create {}/logs/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("skills"))
@@ -336,7 +334,6 @@ mod tests {
 
         bootstrap(&home).unwrap();
 
-        assert!(home.join("data").is_dir());
         assert!(home.join("logs").is_dir());
         assert!(home.join("config.toml").is_file());
         assert!(home.join("identity.toml").is_file());
@@ -422,7 +419,6 @@ mod tests {
         bootstrap_agent(tmp.path(), "work").unwrap();
 
         let agent = tmp.path().join("agents").join("work");
-        assert!(agent.join("data").is_dir());
         assert!(agent.join("logs").is_dir());
         assert!(agent.join("skills").is_dir());
         assert!(agent.join("config.toml").is_file());
@@ -471,8 +467,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        // Set up legacy layout
+        // Set up legacy layout (bootstrap no longer creates data/, so create it
+        // manually to simulate the legacy layout that had a per-root data/ dir)
         bootstrap(home).unwrap();
+        fs::create_dir_all(home.join("data")).unwrap();
         // Write a marker into the DB so we can verify it stays at root
         fs::write(home.join("data").join("mika.db"), "test-db-content").unwrap();
         fs::write(home.join("soul.md"), "custom soul").unwrap();
@@ -515,8 +513,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        // Set up legacy layout and migrate
+        // Set up legacy layout and migrate (bootstrap no longer creates data/,
+        // so create it manually to simulate the legacy layout)
         bootstrap(home).unwrap();
+        fs::create_dir_all(home.join("data")).unwrap();
         fs::write(home.join("data").join("mika.db"), "test-db").unwrap();
         migrate_to_multi_agent(home).unwrap();
 

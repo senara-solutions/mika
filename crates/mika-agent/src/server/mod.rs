@@ -115,7 +115,7 @@ async fn init_agent(
 
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         async_db.clone(),
-        dispatcher,
+        dispatcher.clone(),
     )));
 
     // Load MCP configuration and connect to configured servers
@@ -136,6 +136,7 @@ async fn init_agent(
         skills: std::sync::Mutex::new(skill_registry),
         skills_dirty,
         task_engine,
+        dispatcher,
         agent_lock,
         home_dir: agent_home.to_path_buf(),
         embedding_client,
@@ -416,7 +417,9 @@ mod tests {
     use secrecy::SecretString;
     use tower::ServiceExt;
 
-    fn test_task_engine(db: AsyncDatabase) -> Arc<tokio::sync::Mutex<TaskEngine>> {
+    fn test_task_engine(
+        db: AsyncDatabase,
+    ) -> (Arc<tokio::sync::Mutex<TaskEngine>>, Arc<TaskDispatcher>) {
         let claude = ClaudeClient::new(
             Some("test-key".to_string()),
             "claude-sonnet-4-6".to_string(),
@@ -435,7 +438,11 @@ mod tests {
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
         });
-        Arc::new(tokio::sync::Mutex::new(TaskEngine::new(db, dispatcher)))
+        let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
+            db,
+            dispatcher.clone(),
+        )));
+        (engine, dispatcher)
     }
 
     fn test_state() -> AppState {
@@ -450,13 +457,14 @@ mod tests {
         let skills_reg = Arc::new(SkillRegistry::empty());
         let skills_dirty = Arc::new(AtomicBool::new(false));
         let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let task_engine = test_task_engine(db.clone());
+        let (task_engine, dispatcher) = test_task_engine(db.clone());
 
         let agent_state = AgentState {
             db,
             skills: std::sync::Mutex::new(skills_reg),
             skills_dirty,
             task_engine,
+            dispatcher,
             agent_lock,
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,

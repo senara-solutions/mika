@@ -12,7 +12,7 @@ use secrecy::SecretString;
 use crate::async_db::AsyncDatabase;
 use crate::mcp::McpManager;
 use crate::skills::SkillRegistry;
-use crate::task_engine::TaskEngine;
+use crate::task_engine::{TaskDispatcher, TaskEngine};
 use crate::tools::ToolRegistry;
 
 /// Per-agent state bundle. Each agent gets its own DB, skills, task engine, and lock.
@@ -22,6 +22,7 @@ pub struct AgentState {
     pub skills: std::sync::Mutex<Arc<SkillRegistry>>,
     pub skills_dirty: Arc<AtomicBool>,
     pub task_engine: Arc<tokio::sync::Mutex<TaskEngine>>,
+    pub dispatcher: Arc<TaskDispatcher>,
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,
     pub home_dir: PathBuf,
     pub embedding_client: Option<EmbeddingClient>,

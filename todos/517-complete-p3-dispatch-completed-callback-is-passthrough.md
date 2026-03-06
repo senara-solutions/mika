@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "517"
 tags: [code-review, simplicity, refactor]
@@ -52,10 +52,11 @@ After `update_task_completed` writes the result to DB, call `dispatch(task_id)` 
 
 ## Acceptance Criteria
 
-- [ ] `dispatch_completed_callback` is removed
-- [ ] Handler calls `dispatch_resume_agent` (pub(crate)) or `dispatch(task_id)` directly
-- [ ] Existing callback dispatch tests pass
+- [x] `dispatch_completed_callback` is removed
+- [x] Handler calls `dispatch_resume_agent` (pub(crate)) directly
+- [x] Existing callback dispatch tests pass
 
 ## Work Log
 
 - 2026-03-06: Identified by simplicity-reviewer of feat/unified-task-engine
+- 2026-03-06: Resolved via Option A — made `dispatch_resume_agent` pub(crate), removed `dispatch_completed_callback` wrapper, updated handler to call `dispatch_resume_agent` directly. All 612 tests pass, clippy clean.

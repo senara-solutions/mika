@@ -179,7 +179,7 @@ impl TaskDispatcher {
     ///
     /// Reads `task.result` (set by the callback) and runs a silent agent turn with
     /// the result injected as context. Uses `send_message` to deliver the response.
-    async fn dispatch_resume_agent(&self, task: &Task) -> Result<()> {
+    pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<()> {
         let result = task.result.clone().unwrap_or_default();
         if result.is_empty() {
             return Err(anyhow!(
@@ -227,15 +227,6 @@ impl TaskDispatcher {
         }
 
         Ok(())
-    }
-
-    /// Trigger `resume_agent` dispatch for a task that has already been marked complete.
-    ///
-    /// Called by `POST /tasks/{id}/complete` handler after storing the result.
-    /// Unlike `dispatch()`, this does not re-load the task status — it uses the
-    /// task as passed (already validated by the handler).
-    pub async fn dispatch_completed_callback(&self, task: &Task) -> Result<()> {
-        self.dispatch_resume_agent(task).await
     }
 
     /// Run the heartbeat silent agent with all pre-filter checks.

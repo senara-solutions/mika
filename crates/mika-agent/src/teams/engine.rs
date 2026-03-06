@@ -76,6 +76,10 @@ impl TeamEngine {
         // Use the single shared container database
         let db_path = home::container_db_path(global_home);
 
+        // N+1 DB connections: each agent gets its own SQLite connection (+ 1 for team_db).
+        // This is intentional — AsyncDatabase::shutdown() kills the inner OS thread, so we
+        // cannot share a single connection across agent shutdown boundaries. WAL mode handles
+        // concurrent readers correctly, and busy_timeout covers write contention.
         for ta in &team.agents {
             let home_dir = agent::agent_dir(global_home, &ta.name);
             let db = Database::open(&db_path)
