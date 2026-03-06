@@ -59,6 +59,14 @@ impl TaskEngine {
         }
     }
 
+    /// Return a clone of the inner dispatcher Arc for direct dispatch outside the engine tick loop.
+    ///
+    /// Used by the `POST /tasks/{id}/complete` handler to trigger `resume_agent` dispatch
+    /// immediately when a callback arrives, without waiting for the next tick.
+    pub fn dispatcher(&self) -> Arc<TaskDispatcher> {
+        self.dispatcher.clone()
+    }
+
     /// Called at startup.
     ///
     /// 1. Expires tasks past their `timeout_at`.

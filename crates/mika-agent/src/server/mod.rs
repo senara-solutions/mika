@@ -50,6 +50,7 @@ fn build_router(state: AppState) -> Router {
             "/message",
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
+        .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
@@ -1009,5 +1010,181 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -- POST /tasks/{id}/complete tests --
+
+    async fn create_callback_task(db: &AsyncDatabase) -> String {
+        db.create_task(crate::db::NewTask {
+            agent_id: db.agent_id.clone(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "analyze-codebase".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_not_found() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks/00000000-0000-0000-0000-000000000000/complete")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"result":"analysis done"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_success() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("main").unwrap().db.clone();
+        let task_id = create_callback_task(&db).await;
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/complete"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"result":"3 vulnerabilities found"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["task_id"], task_id);
+
+        // Verify the task was marked completed in DB
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.result.as_deref(), Some("3 vulnerabilities found"));
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_empty_result_rejected() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("main").unwrap().db.clone();
+        let task_id = create_callback_task(&db).await;
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/complete"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"result":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_requires_auth() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks/some-task-id/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"result":"done"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_non_callback_task_rejected() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("main").unwrap().db.clone();
+
+        // Create a time-triggered task (not callback)
+        let task_id = db
+            .create_task(crate::db::NewTask {
+                agent_id: db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "reminder".to_string(),
+                trigger_type: "time".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(9_999_999_999),
+                timeout_at: None,
+                action_type: "send_message".to_string(),
+                action_config: r#"{"text":"hi"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+            })
+            .await
+            .unwrap();
+
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/complete"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"result":"done"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("callback"));
     }
 }

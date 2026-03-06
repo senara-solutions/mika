@@ -37,3 +37,23 @@ pub struct HealthResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
 }
+
+/// Request body for POST /tasks/{id}/complete.
+///
+/// Marks a `callback` trigger task as completed with an optional result payload,
+/// then triggers `resume_agent` dispatch if the task's action_type is `resume_agent`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TaskCompleteRequest {
+    /// Result payload from the background process (required for resume_agent tasks).
+    pub result: String,
+    /// Target agent name (defaults to the server's default agent if absent or empty).
+    #[serde(default)]
+    pub agent: String,
+}
+
+/// Response body for POST /tasks/{id}/complete.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskCompleteResponse {
+    pub task_id: String,
+    pub status: String,
+}

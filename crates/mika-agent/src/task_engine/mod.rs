@@ -7,7 +7,7 @@ pub mod types;
 pub use dispatcher::TaskDispatcher;
 pub use engine::TaskEngine;
 pub use queue::QueuedTask;
-pub use types::{action_type, task_status};
+pub use types::{action_type, task_status, trigger_type};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;

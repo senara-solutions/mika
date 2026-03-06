@@ -35,6 +35,10 @@ pub enum Commands {
     Ask {
         /// The message to send (use "-" to read from stdin)
         message: String,
+        /// Mark a callback task complete with this message as the result before running the agent.
+        /// Used by background processes: mika ask --task-id <uuid> "findings..."
+        #[arg(long)]
+        task_id: Option<String>,
     },
     /// Manage agents
     Agents(AgentsArgs),

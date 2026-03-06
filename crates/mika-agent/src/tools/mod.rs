@@ -1,6 +1,8 @@
 mod cancel_reminder;
+mod cancel_task;
 mod create_reminder;
 pub(crate) mod create_skill;
+mod create_task;
 mod delegate_task;
 mod delete_skill;
 mod get_config;
@@ -236,12 +238,11 @@ pub(crate) async fn validate_and_resolve_path(
 
     if let Some(parent) = full_path.parent() {
         // Create parent directories only for write operations
-        if create_parents
-            && let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return Err(ToolOutput::error(format!(
-                    "Failed to create parent directories: {e}"
-                )));
-            }
+        if create_parents && let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(ToolOutput::error(format!(
+                "Failed to create parent directories: {e}"
+            )));
+        }
 
         // Check for symlinks in the parent chain (only when parent exists)
         match tokio::fs::symlink_metadata(parent).await {
@@ -358,6 +359,8 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(create_reminder::CreateReminderTool));
     registry.register(Box::new(list_reminders::ListRemindersTool));
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
+    registry.register(Box::new(create_task::CreateTaskTool));
+    registry.register(Box::new(cancel_task::CancelTaskTool));
     registry.register(Box::new(send_message::SendMessageTool));
     registry.register(Box::new(create_skill::CreateSkillTool));
     registry.register(Box::new(delete_skill::DeleteSkillTool));

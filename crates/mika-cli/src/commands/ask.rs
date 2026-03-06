@@ -10,7 +10,7 @@ use mika_agent::tools;
 
 use crate::init;
 
-pub async fn run(message: &str, agent_name: &str) -> Result<()> {
+pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
     let session_id = Uuid::new_v4().to_string();
     let mut tool_registry = tools::default_tools();
@@ -35,6 +35,40 @@ pub async fn run(message: &str, agent_name: &str) -> Result<()> {
 
     if user_message.is_empty() {
         anyhow::bail!("Empty message. Provide a message argument or pipe via stdin with \"-\".");
+    }
+
+    // If --task-id is provided, mark the task as completed with the message as result.
+    // This is used by background processes to deliver callback results:
+    //   mika ask --agent <agent> --task-id <uuid> "Analysis complete: ..."
+    if let Some(tid) = task_id {
+        match ctx.async_db.get_task(tid).await {
+            Ok(Some(task)) => {
+                if task.trigger_type != "callback" {
+                    anyhow::bail!(
+                        "Task '{}' has trigger_type '{}', not 'callback'. \
+                         --task-id is only for callback tasks.",
+                        tid,
+                        task.trigger_type
+                    );
+                }
+                if !matches!(task.status.as_str(), "pending" | "in_progress") {
+                    anyhow::bail!(
+                        "Task '{}' has status '{}' and cannot be completed.",
+                        tid,
+                        task.status
+                    );
+                }
+                ctx.async_db
+                    .update_task_completed(tid, Some(&user_message))
+                    .await?;
+            }
+            Ok(None) => {
+                anyhow::bail!("Task '{}' not found.", tid);
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to load task '{}': {}", tid, e);
+            }
+        }
     }
 
     let is_onboarding = check_onboarding(&ctx.async_db).await;

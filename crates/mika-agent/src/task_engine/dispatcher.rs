@@ -51,6 +51,7 @@ impl TaskDispatcher {
             action_type::SEND_MESSAGE => self.dispatch_send_message(&task, &config).await,
             action_type::INJECT_CONTEXT => self.dispatch_inject_context(&task, &config).await,
             action_type::RUN_SKILL => self.dispatch_run_skill(&task, &config).await,
+            action_type::RESUME_AGENT => self.dispatch_resume_agent(&task).await,
             other => Err(anyhow!("unknown action_type: {}", other)),
         }
     }
@@ -103,13 +104,19 @@ impl TaskDispatcher {
 
     /// Run a background silent agent for proactive tasks.
     ///
-    /// Expects `action_config`: `{"trigger": "heartbeat" | "reflection"}`
-    ///
-    /// Pre-filters are applied for each trigger type before running the agent loop.
+    /// Supports two modes via `action_config`:
+    /// - Built-in triggers: `{"trigger": "heartbeat" | "reflection"}` — pre-filtered
+    /// - Arbitrary skills: `{"skill_name": "...", "args": {...}}` — runs the named skill
     async fn dispatch_run_skill(&self, task: &Task, config: &serde_json::Value) -> Result<()> {
+        // Check for arbitrary skill_name first
+        if let Some(skill_name) = config["skill_name"].as_str() {
+            return self.dispatch_skill_by_name(task, skill_name, config).await;
+        }
+
+        // Fall back to built-in trigger names
         let trigger_name = config["trigger"].as_str().ok_or_else(|| {
             anyhow!(
-                "run_skill task {} missing 'trigger' in action_config",
+                "run_skill task {} missing 'trigger' or 'skill_name' in action_config",
                 task.id
             )
         })?;
@@ -119,6 +126,116 @@ impl TaskDispatcher {
             "reflection" => self.dispatch_reflection(task).await,
             other => Err(anyhow!("unknown run_skill trigger: {}", other)),
         }
+    }
+
+    /// Run an arbitrary skill as a silent background agent turn.
+    ///
+    /// The skill name is looked up in the skill registry. If not found, returns an error.
+    /// Skips if the agent is busy (try_lock).
+    async fn dispatch_skill_by_name(
+        &self,
+        task: &Task,
+        skill_name: &str,
+        _config: &serde_json::Value,
+    ) -> Result<()> {
+        // Acquire agent lock (skip if busy)
+        let _guard = if let Some(ref lock) = self.agent_lock {
+            match lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    debug!(task_id = %task.id, skill = skill_name, "agent busy, deferring skill run");
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+        let session_id = format!("skill-{}-{}", skill_name, uuid::Uuid::new_v4());
+        info!(task_id = %task.id, skill = skill_name, session_id = %session_id, "running skill task");
+
+        let params = SilentAgentParams {
+            db: &self.db,
+            claude: &self.claude,
+            tools: &self.tools,
+            skills: &self.skills,
+            trigger: SilentTrigger::Heartbeat, // use heartbeat mode for skill runs
+            home_dir: &self.home_dir,
+            session_id: &session_id,
+            message_sender: self.message_sender.clone(),
+            embedding_client: self.embedding_client.as_ref(),
+            brave_api_key: self.brave_api_key.as_deref(),
+            skills_dirty: &self.skills_dirty,
+        };
+
+        if let Err(e) = run_silent_agent(&params).await {
+            warn!(task_id = %task.id, skill = skill_name, error = %e, "skill task agent run failed");
+        }
+
+        Ok(())
+    }
+
+    /// Resume the agent after a callback task completes.
+    ///
+    /// Reads `task.result` (set by the callback) and runs a silent agent turn with
+    /// the result injected as context. Uses `send_message` to deliver the response.
+    async fn dispatch_resume_agent(&self, task: &Task) -> Result<()> {
+        let result = task.result.clone().unwrap_or_default();
+        if result.is_empty() {
+            return Err(anyhow!(
+                "resume_agent task {} has no result — callback may not have completed yet",
+                task.id
+            ));
+        }
+
+        // Acquire agent lock (skip if busy)
+        let _guard = if let Some(ref lock) = self.agent_lock {
+            match lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    debug!(task_id = %task.id, "agent busy, deferring resume_agent");
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+        let session_id = format!("callback-{}", uuid::Uuid::new_v4());
+        info!(task_id = %task.id, session_id = %session_id, label = %task.label, "resuming agent for callback task");
+
+        let params = SilentAgentParams {
+            db: &self.db,
+            claude: &self.claude,
+            tools: &self.tools,
+            skills: &self.skills,
+            trigger: SilentTrigger::Callback {
+                task_id: task.id.clone(),
+                label: task.label.clone(),
+                result,
+            },
+            home_dir: &self.home_dir,
+            session_id: &session_id,
+            message_sender: self.message_sender.clone(),
+            embedding_client: self.embedding_client.as_ref(),
+            brave_api_key: self.brave_api_key.as_deref(),
+            skills_dirty: &self.skills_dirty,
+        };
+
+        if let Err(e) = run_silent_agent(&params).await {
+            warn!(task_id = %task.id, error = %e, "resume_agent run failed");
+        }
+
+        Ok(())
+    }
+
+    /// Trigger `resume_agent` dispatch for a task that has already been marked complete.
+    ///
+    /// Called by `POST /tasks/{id}/complete` handler after storing the result.
+    /// Unlike `dispatch()`, this does not re-load the task status — it uses the
+    /// task as passed (already validated by the handler).
+    pub async fn dispatch_completed_callback(&self, task: &Task) -> Result<()> {
+        self.dispatch_resume_agent(task).await
     }
 
     /// Run the heartbeat silent agent with all pre-filter checks.

@@ -1260,9 +1260,10 @@ impl Database {
             }
         }
         if let Some(md) = user_md_content
-            && !md.trim().is_empty() {
-                self.set_core_memory(agent_id, "user_summary", md.trim())?;
-            }
+            && !md.trim().is_empty()
+        {
+            self.set_core_memory(agent_id, "user_summary", md.trim())?;
+        }
         Ok(())
     }
 
@@ -2003,9 +2004,10 @@ impl Database {
         let mut runs = self.load_team_runs(team_name, limit)?;
         for run in &mut runs {
             if let Some(ref d) = run.deliverable
-                && d.len() > max_text_len {
-                    run.deliverable = Some(format!("{}...", &d[..max_text_len]));
-                }
+                && d.len() > max_text_len
+            {
+                run.deliverable = Some(format!("{}...", &d[..max_text_len]));
+            }
         }
         Ok(runs)
     }

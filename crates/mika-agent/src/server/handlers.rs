@@ -1,4 +1,9 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::Instrument;
@@ -12,7 +17,9 @@ use crate::messaging::{GatewayMessageSender, MessageSender};
 
 use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
-use super::types::{AcceptedResponse, HealthResponse, MessageRequest};
+use super::types::{
+    AcceptedResponse, HealthResponse, MessageRequest, TaskCompleteRequest, TaskCompleteResponse,
+};
 
 /// Media types accepted by the Claude API for image content blocks.
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -265,6 +272,145 @@ pub async fn handle_message(
         Json(AcceptedResponse {
             request_id,
             status: "accepted".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// POST /tasks/{id}/complete — mark a callback task complete and trigger resume_agent.
+///
+/// Called by background processes (exec handlers, scripts) to deliver results back
+/// to the agent. Validates the task exists and has trigger_type="callback", stores
+/// the result, marks the task completed, then spawns the resume_agent dispatch.
+#[utoipa::path(
+    post,
+    path = "/tasks/{id}/complete",
+    params(("id" = String, Path, description = "Task UUID")),
+    request_body = TaskCompleteRequest,
+    responses(
+        (status = 200, description = "Task marked complete, resume_agent dispatched", body = TaskCompleteResponse),
+        (status = 400, description = "Task is not a callback task or result is empty"),
+        (status = 401, description = "Missing or invalid Bearer token"),
+        (status = 404, description = "Task not found"),
+        (status = 409, description = "Task already completed or cancelled"),
+    ),
+    security(("bearer" = []))
+)]
+pub async fn handle_task_complete(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    JsonBody(req): JsonBody<TaskCompleteRequest>,
+) -> impl IntoResponse {
+    if req.result.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "result must not be empty"})),
+        )
+            .into_response();
+    }
+
+    if req.result.len() > 100_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "result must be at most 100000 characters"})),
+        )
+            .into_response();
+    }
+
+    let agent_state = match state.resolve_agent(&req.agent) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("agent '{}' not found", req.agent)})),
+            )
+                .into_response();
+        }
+    };
+
+    // Load the task
+    let task = match agent_state.db.get_task(&task_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("task '{}' not found", task_id)})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!(error = %e, task_id, "failed to load task");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to load task"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate trigger_type
+    if task.trigger_type != "callback" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("task '{}' has trigger_type '{}', not 'callback'", task_id, task.trigger_type)
+            })),
+        )
+            .into_response();
+    }
+
+    // Validate status
+    if !matches!(task.status.as_str(), "pending" | "in_progress") {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("task '{}' has status '{}' and cannot be completed", task_id, task.status)
+            })),
+        )
+            .into_response();
+    }
+
+    // Mark task completed with the result
+    if let Err(e) = agent_state
+        .db
+        .update_task_completed(&task_id, Some(&req.result))
+        .await
+    {
+        error!(error = %e, task_id, "failed to mark task completed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to complete task"})),
+        )
+            .into_response();
+    }
+
+    // If action_type is resume_agent, spawn the dispatch in background
+    if task.action_type == crate::task_engine::types::action_type::RESUME_AGENT {
+        // Build the task with the result set (update_task_completed stores it but doesn't return it)
+        let mut completed_task = task;
+        completed_task.result = Some(req.result);
+        completed_task.status = "completed".to_string();
+
+        let engine = agent_state.task_engine.clone();
+        tokio::spawn(async move {
+            let dispatcher = {
+                let eng = engine.lock().await;
+                eng.dispatcher()
+            };
+            if let Err(e) = dispatcher
+                .dispatch_completed_callback(&completed_task)
+                .await
+            {
+                warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
+            }
+        });
+    }
+
+    (
+        StatusCode::OK,
+        Json(TaskCompleteResponse {
+            task_id: task_id.to_string(),
+            status: "completed".to_string(),
         }),
     )
         .into_response()

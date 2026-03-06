@@ -20,4 +20,16 @@ pub mod action_type {
     pub const SEND_MESSAGE: &str = "send_message";
     pub const RUN_SKILL: &str = "run_skill";
     pub const INJECT_CONTEXT: &str = "inject_context";
+    pub const RESUME_AGENT: &str = "resume_agent";
+    pub const INVOKE_ORCHESTRATOR: &str = "invoke_orchestrator";
+}
+
+/// String constants for task trigger type values stored in the `tasks.trigger_type` column.
+pub mod trigger_type {
+    pub const TIME: &str = "time";
+    pub const RECURRING: &str = "recurring";
+    pub const CALLBACK: &str = "callback";
+    pub const USER_REPLY: &str = "user_reply";
+    pub const EVENT: &str = "event";
+    pub const CONDITION: &str = "condition";
 }

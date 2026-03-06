@@ -1008,6 +1008,12 @@ async fn execute_tool(
 pub enum SilentTrigger {
     Heartbeat,
     Reflection,
+    /// A background callback task completed and the agent should process the result.
+    Callback {
+        task_id: String,
+        label: String,
+        result: String,
+    },
 }
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
@@ -1035,6 +1041,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     let channel_type = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
+        SilentTrigger::Callback { .. } => "callback",
     };
 
     let silent_span = info_span!(
@@ -1139,6 +1146,19 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
              worthwhile to share, use send_message. Otherwise, do nothing."
                 .to_string()
         }
+        SilentTrigger::Callback {
+            task_id,
+            label,
+            result,
+        } => {
+            format!(
+                "A background task has completed and you must process the result.\n\n\
+                 Task: '{label}' (ID: {task_id})\n\n\
+                 Result:\n{result}\n\n\
+                 Analyze the result and use send_message to notify the user with a clear, \
+                 concise summary. Include the key findings and any recommended actions."
+            )
+        }
         SilentTrigger::Reflection => {
             "You are in REFLECTION mode. This is your daily end-of-day review.\n\n\
              Your job: Review today's conversations and recently stored facts. Update your\n\
@@ -1202,6 +1222,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     let user_msg = match &params.trigger {
         SilentTrigger::Heartbeat => "[heartbeat trigger]".to_string(),
         SilentTrigger::Reflection => "[reflection trigger]".to_string(),
+        SilentTrigger::Callback { label, .. } => format!("[callback: {label}]"),
     };
 
     let messages = vec![Message {
