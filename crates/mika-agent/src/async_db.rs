@@ -26,7 +26,7 @@ type DbClosure = Box<dyn FnOnce(&Database) + Send>;
 #[derive(Clone)]
 pub struct AsyncDatabase {
     inner: Arc<AsyncDatabaseInner>,
-    /// The agent context for all operations on this handle (default: "main").
+    /// The agent context for all operations on this handle (default: "mika").
     pub agent_id: String,
 }
 
@@ -38,7 +38,7 @@ struct AsyncDatabaseInner {
 impl AsyncDatabase {
     /// Spawn a dedicated OS thread that owns `db` and processes closures.
     pub fn new(db: Database) -> Self {
-        Self::new_with_agent(db, "main")
+        Self::new_with_agent(db, "mika")
     }
 
     /// Spawn with a specific agent_id.
@@ -68,7 +68,7 @@ impl AsyncDatabase {
         }
     }
 
-    /// Open a database at `path` and wrap it in an async handle (agent_id = "main").
+    /// Open a database at `path` and wrap it in an async handle (agent_id = "mika").
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::open(path)?;
         Ok(Self::new(db))
@@ -398,6 +398,13 @@ impl AsyncDatabase {
     pub async fn set_core_memory(&self, key: &str, value: &str) -> Result<i32> {
         let (a, k, v) = (self.agent_id.clone(), key.to_owned(), value.to_owned());
         self.with_db(move |db| db.set_core_memory(&a, &k, &v)).await
+    }
+
+    pub async fn get_agent_display_name(&self) -> String {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| Ok(db.get_agent_display_name(&a)))
+            .await
+            .unwrap_or_else(|_| self.agent_id.clone())
     }
 
     pub async fn seed_core_memory(&self, user_md_content: Option<String>) -> Result<()> {
@@ -1080,7 +1087,7 @@ mod tests {
     async fn test_create_and_get_task() {
         let db = test_async_db();
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,

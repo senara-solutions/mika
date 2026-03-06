@@ -350,7 +350,7 @@ mod tests {
             home_dir: Path::new("/tmp/mika-test"),
             global_home: Path::new("/tmp/mika-test"),
             skills,
-            current_agent: "main",
+            current_agent: "mika",
             cwd,
             args_str,
         }

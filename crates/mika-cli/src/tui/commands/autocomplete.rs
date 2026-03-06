@@ -7,7 +7,7 @@ use super::{SlashCommand, filter_commands};
 /// A single completion candidate.
 #[derive(Clone, Debug)]
 pub struct CompletionItem {
-    /// The value to insert (e.g., "sonnet", "main", "~/Documents").
+    /// The value to insert (e.g., "sonnet", "mika", "~/Documents").
     pub value: String,
     /// Optional description shown alongside (e.g., "Claude Sonnet 4.6").
     pub description: Option<String>,

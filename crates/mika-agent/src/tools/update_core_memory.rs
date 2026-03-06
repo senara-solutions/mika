@@ -165,7 +165,8 @@ impl Tool for UpdateCoreMemoryTool {
                     .map(|(_, v)| *v)
                     .expect("section already validated above");
                 if section == "self_model" {
-                    format!("I am {}. No interaction history yet.", ctx.db.agent_id())
+                    let display_name = ctx.db.get_agent_display_name().await;
+                    format!("I am {display_name}. No interaction history yet.")
                 } else {
                     static_default.to_string()
                 }

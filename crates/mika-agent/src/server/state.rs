@@ -35,7 +35,7 @@ pub struct AgentState {
 /// state across handler tasks.
 #[derive(Clone)]
 pub struct AppState {
-    /// Per-agent state, keyed by agent name (e.g. "main", "work").
+    /// Per-agent state, keyed by agent name (e.g. "mika", "work").
     /// Each AgentState is Arc-wrapped so handler clones are a cheap atomic increment
     /// instead of 3 heap allocations (PathBuf + EmbeddingClient strings).
     pub agents: Arc<HashMap<String, Arc<AgentState>>>,

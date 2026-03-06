@@ -472,11 +472,11 @@ mod tests {
         };
 
         let mut agents = HashMap::new();
-        agents.insert("main".to_string(), Arc::new(agent_state));
+        agents.insert("mika".to_string(), Arc::new(agent_state));
 
         AppState {
             agents: Arc::new(agents),
-            default_agent: "main".to_string(),
+            default_agent: "mika".to_string(),
             claude,
             tools: tools_reg,
             ready: Arc::new(AtomicBool::new(false)),
@@ -661,7 +661,7 @@ mod tests {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
 
-        let agent_state = state.agents.get("main").unwrap();
+        let agent_state = state.agents.get("mika").unwrap();
         let _guard = agent_state.agent_lock.clone().lock_owned().await;
 
         let app = test_app(state);
@@ -692,7 +692,7 @@ mod tests {
     async fn test_message_stores_chat_id() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("main").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().db.clone();
         let app = test_app(state);
 
         let _resp = app
@@ -759,7 +759,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer test-token-secret")
                     .body(Body::from(
-                        r#"{"text":"hi","chat_id":123,"channel":"telegram","request_id":"r-agent","agent":"main"}"#,
+                        r#"{"text":"hi","chat_id":123,"channel":"telegram","request_id":"r-agent","agent":"mika"}"#,
                     ))
                     .unwrap(),
             )
@@ -1082,7 +1082,7 @@ mod tests {
     async fn test_task_complete_success() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("main").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().db.clone();
         let task_id = create_callback_task(&db).await;
         let app = test_app(state);
 
@@ -1116,7 +1116,7 @@ mod tests {
     async fn test_task_complete_empty_result_rejected() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("main").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().db.clone();
         let task_id = create_callback_task(&db).await;
         let app = test_app(state);
 
@@ -1161,7 +1161,7 @@ mod tests {
     async fn test_task_complete_already_completed_returns_conflict() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("main").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().db.clone();
         let task_id = create_callback_task(&db).await;
 
         // Mark the task completed before the HTTP request
@@ -1203,7 +1203,7 @@ mod tests {
     async fn test_task_complete_non_callback_task_rejected() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("main").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().db.clone();
 
         // Create a time-triggered task (not callback)
         let task_id = db

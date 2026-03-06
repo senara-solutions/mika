@@ -1104,10 +1104,10 @@ mod tests {
         let tool = make_long_running_tool(tmp.path(), "analyze.sh");
 
         let db = crate::db::Database::open_in_memory().unwrap();
-        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "main");
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
         let ctx = LongRunningContext {
             db: async_db.clone(),
-            agent_name: "main".to_string(),
+            agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
         };
 
@@ -1157,10 +1157,10 @@ mod tests {
         };
 
         let db = crate::db::Database::open_in_memory().unwrap();
-        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "main");
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
         let ctx = LongRunningContext {
             db: async_db,
-            agent_name: "main".to_string(),
+            agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
         };
 
@@ -1184,10 +1184,10 @@ mod tests {
         let tool = make_long_running_tool(tmp.path(), "fail.sh");
 
         let db = crate::db::Database::open_in_memory().unwrap();
-        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "main");
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
         let ctx = LongRunningContext {
             db: async_db.clone(),
-            agent_name: "main".to_string(),
+            agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
         };
 

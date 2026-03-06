@@ -1,8 +1,11 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
-/// Default agent name used when no agent is specified.
-pub const DEFAULT_AGENT: &str = "main";
+/// Default agent ID used when no agent is specified.
+pub const DEFAULT_AGENT: &str = "mika";
+
+/// Display name for the default agent (used in self_model, TUI, user-facing messages).
+pub const DEFAULT_AGENT_NAME: &str = "Mika";
 
 /// Validate an agent name.
 ///
@@ -77,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_validate_valid_names() {
-        assert!(validate_agent_name("main").is_ok());
+        assert!(validate_agent_name("mika").is_ok());
         assert!(validate_agent_name("work").is_ok());
         assert!(validate_agent_name("my-agent").is_ok());
         assert!(validate_agent_name("agent1").is_ok());
@@ -110,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_normalize_agent_name() {
-        assert_eq!(normalize_agent_name("  Main  "), "main");
+        assert_eq!(normalize_agent_name("  Mika  "), "mika");
         assert_eq!(normalize_agent_name("WORK"), "work");
         assert_eq!(normalize_agent_name("my-agent"), "my-agent");
     }
@@ -119,8 +122,8 @@ mod tests {
     fn test_agent_dir() {
         let home = Path::new("/home/user/.mika");
         assert_eq!(
-            agent_dir(home, "main"),
-            PathBuf::from("/home/user/.mika/agents/main")
+            agent_dir(home, "mika"),
+            PathBuf::from("/home/user/.mika/agents/mika")
         );
         assert_eq!(
             agent_dir(home, "work"),
@@ -131,24 +134,24 @@ mod tests {
     #[test]
     fn test_agent_exists_false_when_no_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(!agent_exists(tmp.path(), "main"));
+        assert!(!agent_exists(tmp.path(), "mika"));
     }
 
     #[test]
     fn test_agent_exists_true_when_bootstrapped() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent = agent_dir(tmp.path(), "main");
+        let agent = agent_dir(tmp.path(), "mika");
         fs::create_dir_all(&agent).unwrap();
         fs::write(agent.join("config.toml"), "# config").unwrap();
-        assert!(agent_exists(tmp.path(), "main"));
+        assert!(agent_exists(tmp.path(), "mika"));
     }
 
     #[test]
     fn test_agent_exists_false_when_dir_but_no_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent = agent_dir(tmp.path(), "main");
+        let agent = agent_dir(tmp.path(), "mika");
         fs::create_dir_all(&agent).unwrap();
-        assert!(!agent_exists(tmp.path(), "main"));
+        assert!(!agent_exists(tmp.path(), "mika"));
     }
 
     #[test]
@@ -161,25 +164,25 @@ mod tests {
     fn test_list_agents_returns_sorted() {
         let tmp = tempfile::tempdir().unwrap();
         // Create agents out of order
-        for name in &["work", "main", "code"] {
+        for name in &["work", "mika", "code"] {
             let agent = agent_dir(tmp.path(), name);
             fs::create_dir_all(&agent).unwrap();
             fs::write(agent.join("config.toml"), "# config").unwrap();
         }
-        assert_eq!(list_agents(tmp.path()), vec!["code", "main", "work"]);
+        assert_eq!(list_agents(tmp.path()), vec!["code", "mika", "work"]);
     }
 
     #[test]
     fn test_list_agents_skips_dirs_without_config() {
         let tmp = tempfile::tempdir().unwrap();
         // Agent with config (bootstrapped)
-        let main = agent_dir(tmp.path(), "main");
-        fs::create_dir_all(&main).unwrap();
-        fs::write(main.join("config.toml"), "# config").unwrap();
+        let mika = agent_dir(tmp.path(), "mika");
+        fs::create_dir_all(&mika).unwrap();
+        fs::write(mika.join("config.toml"), "# config").unwrap();
         // Agent without config (incomplete)
         let incomplete = agent_dir(tmp.path(), "incomplete");
         fs::create_dir_all(&incomplete).unwrap();
 
-        assert_eq!(list_agents(tmp.path()), vec!["main"]);
+        assert_eq!(list_agents(tmp.path()), vec!["mika"]);
     }
 }

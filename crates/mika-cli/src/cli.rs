@@ -65,7 +65,7 @@ pub enum AgentsCommand {
         /// Name for the new agent (lowercase, alphanumeric, hyphens)
         name: String,
     },
-    /// Delete an agent (cannot delete "main")
+    /// Delete an agent (cannot delete "mika")
     Delete {
         /// Name of the agent to delete
         name: String,

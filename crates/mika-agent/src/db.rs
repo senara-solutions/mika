@@ -576,8 +576,8 @@ impl Database {
                 ON tasks(agent_id, label)
                 WHERE trigger_type = 'recurring';
 
-            -- Pre-register the default 'main' agent
-            INSERT INTO agents (id, name, home_dir) VALUES ('main', 'main', '');
+            -- Pre-register the default 'mika' agent
+            INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
 
             COMMIT;
             ",
@@ -605,6 +605,15 @@ impl Database {
             params![id, name, home_dir],
         )?;
         Ok(())
+    }
+
+    /// Get the display name for an agent, falling back to the ID if not found.
+    pub fn get_agent_display_name(&self, id: &str) -> String {
+        self.conn
+            .query_row("SELECT name FROM agents WHERE id = ?1", params![id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap_or_else(|_| id.to_string())
     }
 
     pub fn update_agent_last_seen(&self, id: &str) -> Result<()> {
@@ -1411,10 +1420,11 @@ impl Database {
         if let Some(entry) = self.get_core_memory(agent_id, "self_model")?
             && entry.value == "No interaction history yet."
         {
+            let display_name = self.get_agent_display_name(agent_id);
             self.set_core_memory(
                 agent_id,
                 "self_model",
-                &format!("I am {agent_id}. No interaction history yet."),
+                &format!("I am {display_name}. No interaction history yet."),
             )?;
         }
         if let Some(md) = user_md_content
@@ -2630,7 +2640,7 @@ mod tests {
         let db = db();
         let agents = db.list_agents_db().unwrap();
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, "main");
+        assert_eq!(agents[0].id, "mika");
     }
 
     #[test]
@@ -2669,9 +2679,9 @@ mod tests {
     #[test]
     fn test_save_and_load_messages() {
         let db = db();
-        db.save_message("main", "user", "Hello!", "cli").unwrap();
-        db.save_message("main", "assistant", "Hi!", "cli").unwrap();
-        let msgs = db.load_recent_messages("main", 10, None).unwrap();
+        db.save_message("mika", "user", "Hello!", "cli").unwrap();
+        db.save_message("mika", "assistant", "Hi!", "cli").unwrap();
+        let msgs = db.load_recent_messages("mika", 10, None).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
@@ -2681,10 +2691,10 @@ mod tests {
     fn test_load_recent_messages_limit() {
         let db = db();
         for i in 0..5 {
-            db.save_message("main", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", "user", &format!("msg {i}"), "cli")
                 .unwrap();
         }
-        let msgs = db.load_recent_messages("main", 3, None).unwrap();
+        let msgs = db.load_recent_messages("mika", 3, None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[2].content, "msg 4");
     }
@@ -2692,11 +2702,11 @@ mod tests {
     #[test]
     fn test_load_recent_messages_channel_filter() {
         let db = db();
-        db.save_message("main", "user", "telegram msg", "telegram")
+        db.save_message("mika", "user", "telegram msg", "telegram")
             .unwrap();
-        db.save_message("main", "user", "cli msg", "cli").unwrap();
+        db.save_message("mika", "user", "cli msg", "cli").unwrap();
         let tg = db
-            .load_recent_messages("main", 10, Some(&["telegram"]))
+            .load_recent_messages("mika", 10, Some(&["telegram"]))
             .unwrap();
         assert_eq!(tg.len(), 1);
         assert_eq!(tg[0].content, "telegram msg");
@@ -2706,17 +2716,17 @@ mod tests {
     fn test_load_messages_after_with_channel_filter() {
         let db = db();
         // Insert messages across different channels
-        db.save_message("main", "user", "telegram msg 1", "telegram")
+        db.save_message("mika", "user", "telegram msg 1", "telegram")
             .unwrap();
-        db.save_message("main", "user", "cli msg 1", "cli").unwrap();
-        db.save_message("main", "user", "api msg 1", "api").unwrap();
-        db.save_message("main", "user", "telegram msg 2", "telegram")
+        db.save_message("mika", "user", "cli msg 1", "cli").unwrap();
+        db.save_message("mika", "user", "api msg 1", "api").unwrap();
+        db.save_message("mika", "user", "telegram msg 2", "telegram")
             .unwrap();
-        db.save_message("main", "user", "cli msg 2", "cli").unwrap();
+        db.save_message("mika", "user", "cli msg 2", "cli").unwrap();
 
         // Filter to telegram + cli only (should exclude api)
         let msgs = db
-            .load_messages_after("main", 0, Some(&["telegram", "cli"]))
+            .load_messages_after("mika", 0, Some(&["telegram", "cli"]))
             .unwrap();
         assert_eq!(msgs.len(), 4);
         for msg in &msgs {
@@ -2728,13 +2738,13 @@ mod tests {
         }
 
         // No filter returns all messages
-        let all = db.load_messages_after("main", 0, None).unwrap();
+        let all = db.load_messages_after("mika", 0, None).unwrap();
         assert_eq!(all.len(), 5);
 
         // after_id filtering works with channel filter
         let first_id = msgs[0].id;
         let after = db
-            .load_messages_after("main", first_id, Some(&["cli"]))
+            .load_messages_after("mika", first_id, Some(&["cli"]))
             .unwrap();
         // Should get only cli messages after first_id
         for msg in &after {
@@ -2750,18 +2760,18 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO conversations (agent_id, role, content, channel_type, created_at)
-                  VALUES ('main', 'user', 'old', 'cli', 1000)",
+                  VALUES ('mika', 'user', 'old', 'cli', 1000)",
                 [],
             )
             .unwrap();
         db.conn
             .execute(
                 "INSERT INTO conversations (agent_id, role, content, channel_type, created_at)
-                  VALUES ('main', 'user', 'new', 'cli', 2000)",
+                  VALUES ('mika', 'user', 'new', 'cli', 2000)",
                 [],
             )
             .unwrap();
-        let msgs = db.get_conversations_since("main", 1500).unwrap();
+        let msgs = db.get_conversations_since("mika", 1500).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "new");
     }
@@ -2769,9 +2779,9 @@ mod tests {
     #[test]
     fn test_last_user_message_time() {
         let db = db();
-        assert!(db.last_user_message_time("main").unwrap().is_none());
-        db.save_message("main", "user", "hello", "cli").unwrap();
-        let ts = db.last_user_message_time("main").unwrap();
+        assert!(db.last_user_message_time("mika").unwrap().is_none());
+        db.save_message("mika", "user", "hello", "cli").unwrap();
+        let ts = db.last_user_message_time("mika").unwrap();
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
     }
@@ -2779,63 +2789,63 @@ mod tests {
     #[test]
     fn test_replace_with_summary() {
         let db = db();
-        let id1 = db.save_message("main", "user", "msg1", "cli").unwrap();
-        db.save_message("main", "assistant", "reply1", "cli")
+        let id1 = db.save_message("mika", "user", "msg1", "cli").unwrap();
+        db.save_message("mika", "assistant", "reply1", "cli")
             .unwrap();
-        db.replace_with_summary("main", "Summary text", id1)
+        db.replace_with_summary("mika", "Summary text", id1)
             .unwrap();
-        let summary = db.load_conversation_summary("main").unwrap().unwrap();
+        let summary = db.load_conversation_summary("mika").unwrap().unwrap();
         assert_eq!(summary.role, "summary");
         assert_eq!(summary.content, "Summary text");
-        let count = db.count_messages("main").unwrap();
+        let count = db.count_messages("mika").unwrap();
         assert_eq!(count, 1); // only the second message remains + summary excluded
     }
 
     #[test]
     fn test_count_messages_excludes_summary() {
         let db = db();
-        db.save_message("main", "user", "a", "cli").unwrap();
-        db.save_message("main", "assistant", "b", "cli").unwrap();
+        db.save_message("mika", "user", "a", "cli").unwrap();
+        db.save_message("mika", "assistant", "b", "cli").unwrap();
         db.conn
             .execute(
                 "INSERT INTO conversations (agent_id, role, content, channel_type)
-                  VALUES ('main', 'summary', 'S', 'cli')",
+                  VALUES ('mika', 'summary', 'S', 'cli')",
                 [],
             )
             .unwrap();
-        assert_eq!(db.count_messages("main").unwrap(), 2);
+        assert_eq!(db.count_messages("mika").unwrap(), 2);
     }
 
     #[test]
     fn test_core_memory_set_and_get() {
         let db = db();
-        db.set_core_memory("main", "user_summary", "Alice").unwrap();
-        let entry = db.get_core_memory("main", "user_summary").unwrap().unwrap();
+        db.set_core_memory("mika", "user_summary", "Alice").unwrap();
+        let entry = db.get_core_memory("mika", "user_summary").unwrap().unwrap();
         assert_eq!(entry.value, "Alice");
     }
 
     #[test]
     fn test_seed_core_memory() {
         let db = db();
-        db.seed_core_memory("main", None).unwrap();
-        let entries = db.get_all_core_memory("main").unwrap();
+        db.seed_core_memory("mika", None).unwrap();
+        let entries = db.get_all_core_memory("mika").unwrap();
         assert_eq!(entries.len(), CORE_MEMORY_SECTIONS.len());
     }
 
     #[test]
     fn test_seed_core_memory_custom_user_summary() {
         let db = db();
-        db.seed_core_memory("main", Some("Bob")).unwrap();
-        let entry = db.get_core_memory("main", "user_summary").unwrap().unwrap();
+        db.seed_core_memory("mika", Some("Bob")).unwrap();
+        let entry = db.get_core_memory("mika", "user_summary").unwrap().unwrap();
         assert_eq!(entry.value, "Bob");
     }
 
     #[test]
     fn test_upsert_and_get_person() {
         let db = db();
-        db.upsert_person("main", "Alice", Some("colleague"), Some("Works at Acme"))
+        db.upsert_person("mika", "Alice", Some("colleague"), Some("Works at Acme"))
             .unwrap();
-        let p = db.get_person("main", "Alice").unwrap().unwrap();
+        let p = db.get_person("mika", "Alice").unwrap().unwrap();
         assert_eq!(p.canonical_name, "Alice");
         assert_eq!(p.relationship.unwrap(), "colleague");
     }
@@ -2843,9 +2853,9 @@ mod tests {
     #[test]
     fn test_add_commitment_and_list() {
         let db = db();
-        db.add_commitment("main", "Write report", Some("2026-04-01"), None)
+        db.add_commitment("mika", "Write report", Some("2026-04-01"), None)
             .unwrap();
-        let items = db.list_commitments("main", "pending").unwrap();
+        let items = db.list_commitments("mika", "pending").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].description, "Write report");
     }
@@ -2853,29 +2863,29 @@ mod tests {
     #[test]
     fn test_update_commitment_status() {
         let db = db();
-        let id = db.add_commitment("main", "Task A", None, None).unwrap();
+        let id = db.add_commitment("mika", "Task A", None, None).unwrap();
         assert!(
-            db.update_commitment_status("main", id, "completed")
+            db.update_commitment_status("mika", id, "completed")
                 .unwrap()
         );
-        let status = db.get_commitment_status("main", id).unwrap().unwrap();
+        let status = db.get_commitment_status("mika", id).unwrap().unwrap();
         assert_eq!(status, "completed");
     }
 
     #[test]
     fn test_set_and_get_preference() {
         let db = db();
-        db.set_preference("main", "timezone", "UTC").unwrap();
-        let v = db.get_preference("main", "timezone").unwrap().unwrap();
+        db.set_preference("mika", "timezone", "UTC").unwrap();
+        let v = db.get_preference("mika", "timezone").unwrap().unwrap();
         assert_eq!(v, "UTC");
     }
 
     #[test]
     fn test_add_and_list_events() {
         let db = db();
-        db.add_event("main", "Team meeting", Some("2026-04-15"), None)
+        db.add_event("mika", "Team meeting", Some("2026-04-15"), None)
             .unwrap();
-        let evts = db.list_events("main").unwrap();
+        let evts = db.list_events("mika").unwrap();
         assert_eq!(evts.len(), 1);
         assert_eq!(evts[0].description, "Team meeting");
     }
@@ -2884,7 +2894,7 @@ mod tests {
     fn test_log_and_get_memory_events() {
         let db = db();
         db.log_memory_event(
-            "main",
+            "mika",
             "sess1",
             "update_core_memory",
             "user_summary",
@@ -2893,7 +2903,7 @@ mod tests {
             Some("reason"),
         )
         .unwrap();
-        let events = db.get_memory_events("main", "sess1").unwrap();
+        let events = db.get_memory_events("mika", "sess1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_core_memory");
     }
@@ -2905,7 +2915,7 @@ mod tests {
             .execute(
                 "INSERT INTO memory_events
                   (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('main', 's1', 'tool', 'key', 'val', 1000)",
+                  VALUES ('mika', 's1', 'tool', 'key', 'val', 1000)",
                 [],
             )
             .unwrap();
@@ -2913,11 +2923,11 @@ mod tests {
             .execute(
                 "INSERT INTO memory_events
                   (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('main', 's2', 'tool', 'key', 'val', 2000)",
+                  VALUES ('mika', 's2', 'tool', 'key', 'val', 2000)",
                 [],
             )
             .unwrap();
-        let evs = db.get_memory_events_since("main", 1500).unwrap();
+        let evs = db.get_memory_events_since("mika", 1500).unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].session_id, "s2");
     }
@@ -2925,9 +2935,9 @@ mod tests {
     #[test]
     fn test_record_and_count_heartbeat_sends() {
         let db = db();
-        db.record_heartbeat_send("main").unwrap();
-        db.record_heartbeat_send("main").unwrap();
-        let count = db.count_heartbeat_sends_last_hour("main").unwrap();
+        db.record_heartbeat_send("mika").unwrap();
+        db.record_heartbeat_send("mika").unwrap();
+        let count = db.count_heartbeat_sends_last_hour("mika").unwrap();
         assert_eq!(count, 2);
     }
 
@@ -2937,13 +2947,13 @@ mod tests {
         // Insert old record manually
         db.conn
             .execute(
-                "INSERT INTO heartbeat_sends (agent_id, sent_at) VALUES ('main', 1000)",
+                "INSERT INTO heartbeat_sends (agent_id, sent_at) VALUES ('mika', 1000)",
                 [],
             )
             .unwrap();
-        db.record_heartbeat_send("main").unwrap();
-        db.prune_old_heartbeat_sends("main", 30).unwrap();
-        let count = db.count_heartbeat_sends_last_hour("main").unwrap();
+        db.record_heartbeat_send("mika").unwrap();
+        db.prune_old_heartbeat_sends("mika", 30).unwrap();
+        let count = db.count_heartbeat_sends_last_hour("mika").unwrap();
         // Old entry gone, recent one stays
         assert!(count <= 1);
     }
@@ -2951,7 +2961,7 @@ mod tests {
     #[test]
     fn test_record_reflection_run() {
         let db = db();
-        db.record_reflection_run("main", "completed", 3, Some("Updated 3 keys"))
+        db.record_reflection_run("mika", "completed", 3, Some("Updated 3 keys"))
             .unwrap();
     }
 
@@ -2959,24 +2969,24 @@ mod tests {
     fn test_save_and_get_failed_send() {
         let db = db();
         let id = db
-            .save_failed_send("main", "Failed message", Some("req-1"))
+            .save_failed_send("mika", "Failed message", Some("req-1"))
             .unwrap();
-        let pending = db.get_pending_failed_sends("main", 10).unwrap();
+        let pending = db.get_pending_failed_sends("mika", 10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "Failed message");
-        db.delete_failed_send("main", id).unwrap();
-        let pending = db.get_pending_failed_sends("main", 10).unwrap();
+        db.delete_failed_send("mika", id).unwrap();
+        let pending = db.get_pending_failed_sends("mika", 10).unwrap();
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_customer_config() {
         let db = db();
-        db.set_customer_config("main", "timezone", "America/New_York")
+        db.set_customer_config("mika", "timezone", "America/New_York")
             .unwrap();
-        let v = db.get_customer_config("main", "timezone").unwrap().unwrap();
+        let v = db.get_customer_config("mika", "timezone").unwrap().unwrap();
         assert_eq!(v, "America/New_York");
-        let all = db.list_customer_config("main").unwrap();
+        let all = db.list_customer_config("mika").unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -3011,7 +3021,7 @@ mod tests {
         let db = db();
         db.insert_team_run("run-001", "eng", "Goal", 3, 0).unwrap();
         let id = db
-            .insert_team_message("run-001", None, Some("main"), "plan", "Do this", 1)
+            .insert_team_message("run-001", None, Some("mika"), "plan", "Do this", 1)
             .unwrap();
         let msgs = db.load_team_messages("run-001").unwrap();
         assert_eq!(msgs.len(), 1);
@@ -3023,7 +3033,7 @@ mod tests {
     fn test_create_and_get_task() {
         let db = db();
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -3041,7 +3051,7 @@ mod tests {
             created_by_session: None,
         };
         let id = db.create_task(&task).unwrap();
-        let t = db.get_task(&id, "main").unwrap().unwrap();
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
         assert_eq!(t.label, "Send reminder");
         assert_eq!(t.trigger_type, "time");
         assert_eq!(t.status, "pending");
@@ -3051,7 +3061,7 @@ mod tests {
     fn test_cancel_task() {
         let db = db();
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -3069,11 +3079,11 @@ mod tests {
             created_by_session: None,
         };
         let id = db.create_task(&task).unwrap();
-        assert!(db.cancel_task(&id, "main").unwrap());
-        let t = db.get_task(&id, "main").unwrap().unwrap();
+        assert!(db.cancel_task(&id, "mika").unwrap());
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
         assert_eq!(t.status, "cancelled");
         // Cancelling again returns false
-        assert!(!db.cancel_task(&id, "main").unwrap());
+        assert!(!db.cancel_task(&id, "mika").unwrap());
     }
 
     #[test]
@@ -3088,23 +3098,23 @@ mod tests {
     #[test]
     fn test_register_agent_upserts_home_dir() {
         let db = db();
-        // "main" was pre-registered with empty home_dir by schema init
+        // "mika" was pre-registered with empty home_dir by schema init
         let agents = db.list_agents_db().unwrap();
-        let main = agents.iter().find(|a| a.id == "main").unwrap();
-        assert_eq!(main.home_dir, "");
+        let mika = agents.iter().find(|a| a.id == "mika").unwrap();
+        assert_eq!(mika.home_dir, "");
 
         // Re-register with a real path — should update
-        db.register_agent("main", "main", "/home/mika/agents/main")
+        db.register_agent("mika", "Mika", "/home/user/.mika/agents/mika")
             .unwrap();
         let agents = db.list_agents_db().unwrap();
-        let main = agents.iter().find(|a| a.id == "main").unwrap();
-        assert_eq!(main.home_dir, "/home/mika/agents/main");
+        let mika = agents.iter().find(|a| a.id == "mika").unwrap();
+        assert_eq!(mika.home_dir, "/home/user/.mika/agents/mika");
 
         // Re-register with empty string — should NOT overwrite
-        db.register_agent("main", "main", "").unwrap();
+        db.register_agent("mika", "Mika", "").unwrap();
         let agents = db.list_agents_db().unwrap();
-        let main = agents.iter().find(|a| a.id == "main").unwrap();
-        assert_eq!(main.home_dir, "/home/mika/agents/main");
+        let mika = agents.iter().find(|a| a.id == "mika").unwrap();
+        assert_eq!(mika.home_dir, "/home/user/.mika/agents/mika");
     }
 
     #[test]
@@ -3121,11 +3131,11 @@ mod tests {
     fn test_fts_search_agent_isolation() {
         let db = db();
         db.register_agent("other", "Other", "").unwrap();
-        db.index_content("main", "person", Some(1), "Alice in Wonderland")
+        db.index_content("mika", "person", Some(1), "Alice in Wonderland")
             .unwrap();
         db.index_content("other", "person", Some(1), "Bob the Builder")
             .unwrap();
-        let results = db.fts_search("main", "Alice", 10, None).unwrap();
+        let results = db.fts_search("mika", "Alice", 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Alice"));
     }
@@ -3133,11 +3143,11 @@ mod tests {
     #[test]
     fn test_get_all_facts_for_indexing() {
         let db = db();
-        db.upsert_person("main", "Alice", Some("friend"), None)
+        db.upsert_person("mika", "Alice", Some("friend"), None)
             .unwrap();
-        db.add_commitment("main", "Write docs", None, None).unwrap();
-        db.set_preference("main", "theme", "dark").unwrap();
-        let facts = db.get_all_facts_for_indexing("main").unwrap();
+        db.add_commitment("mika", "Write docs", None, None).unwrap();
+        db.set_preference("mika", "theme", "dark").unwrap();
+        let facts = db.get_all_facts_for_indexing("mika").unwrap();
         assert_eq!(facts.len(), 3);
         let types: Vec<&str> = facts.iter().map(|(t, _, _)| t.as_str()).collect();
         assert!(types.contains(&"person"));
@@ -3152,18 +3162,18 @@ mod tests {
         db.conn
             .execute_batch(
                 "INSERT INTO memory_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('main', 's1', 'tool', 'k1', 'v1', 1580000000);
+                  VALUES ('mika', 's1', 'tool', 'k1', 'v1', 1580000000);
                  INSERT INTO memory_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('main', 's1', 'tool', 'k2', 'v2', 1580000001);",
+                  VALUES ('mika', 's1', 'tool', 'k2', 'v2', 1580000001);",
             )
             .unwrap();
         // Insert recent event
-        db.log_memory_event("main", "s2", "tool", "k3", None, "v3", None)
+        db.log_memory_event("mika", "s2", "tool", "k3", None, "v3", None)
             .unwrap();
-        let compacted = db.compact_old_memory_events("main", 30).unwrap();
+        let compacted = db.compact_old_memory_events("mika", 30).unwrap();
         assert!(compacted > 0);
         // Old events gone, recent one stays
-        let recent = db.get_memory_events("main", "s2").unwrap();
+        let recent = db.get_memory_events("mika", "s2").unwrap();
         assert_eq!(recent.len(), 1);
     }
 
@@ -3171,10 +3181,10 @@ mod tests {
     fn test_load_messages_before_window() {
         let db = db();
         for i in 0..5 {
-            db.save_message("main", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", "user", &format!("msg {i}"), "cli")
                 .unwrap();
         }
-        let before = db.load_messages_before_window("main", 2).unwrap();
+        let before = db.load_messages_before_window("mika", 2).unwrap();
         // Window is last 2, so before window is first 3
         assert_eq!(before.len(), 3);
         assert_eq!(before[0].content, "msg 0");
@@ -3184,7 +3194,7 @@ mod tests {
     fn test_count_pending_tasks() {
         let db = db();
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -3202,12 +3212,12 @@ mod tests {
             created_by_session: None,
         };
         db.create_task(&task).unwrap();
-        assert_eq!(db.count_pending_tasks("main").unwrap(), 1);
+        assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
     }
 
     fn make_task(label: &str) -> NewTask {
         NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -3247,21 +3257,21 @@ mod tests {
         let c3_id = db.create_task(&c3).unwrap();
 
         // Complete 2 of 3 — parent should NOT fire
-        db.update_task_completed(&c1_id, "main", Some("done"))
+        db.update_task_completed(&c1_id, "mika", Some("done"))
             .unwrap();
-        db.update_task_completed(&c2_id, "main", Some("done"))
+        db.update_task_completed(&c2_id, "mika", Some("done"))
             .unwrap();
         assert_eq!(
-            db.try_complete_parent_on_sibling_done(&c2_id, "main")
+            db.try_complete_parent_on_sibling_done(&c2_id, "mika")
                 .unwrap(),
             None
         );
 
         // Complete the 3rd — parent should fire
-        db.update_task_completed(&c3_id, "main", Some("done"))
+        db.update_task_completed(&c3_id, "mika", Some("done"))
             .unwrap();
         let result = db
-            .try_complete_parent_on_sibling_done(&c3_id, "main")
+            .try_complete_parent_on_sibling_done(&c3_id, "mika")
             .unwrap();
         assert_eq!(result, Some(parent_id));
     }
@@ -3271,7 +3281,7 @@ mod tests {
         let db = db();
         let task_id = db.create_task(&make_task("orphan")).unwrap();
         assert_eq!(
-            db.try_complete_parent_on_sibling_done(&task_id, "main")
+            db.try_complete_parent_on_sibling_done(&task_id, "mika")
                 .unwrap(),
             None
         );
@@ -3291,11 +3301,11 @@ mod tests {
         let c2_id = db.create_task(&c2).unwrap();
 
         // One completed, one failed — both are "done"
-        db.update_task_completed(&c1_id, "main", Some("ok"))
+        db.update_task_completed(&c1_id, "mika", Some("ok"))
             .unwrap();
-        db.update_task_failed(&c2_id, "main", "error").unwrap();
+        db.update_task_failed(&c2_id, "mika", "error").unwrap();
         let result = db
-            .try_complete_parent_on_sibling_done(&c2_id, "main")
+            .try_complete_parent_on_sibling_done(&c2_id, "mika")
             .unwrap();
         assert_eq!(result, Some(parent_id));
     }
@@ -3313,14 +3323,14 @@ mod tests {
         c2.parent_task_id = Some(parent_id.clone());
         db.create_task(&c2).unwrap();
 
-        let children = db.get_child_tasks(&parent_id, "main").unwrap();
+        let children = db.get_child_tasks(&parent_id, "mika").unwrap();
         assert_eq!(children.len(), 2);
     }
 
     #[test]
     fn test_count_pending_callback_tasks_by_team_run() {
         let db = Database::open_in_memory().unwrap();
-        db.register_agent("main", "main", "/tmp").unwrap();
+        db.register_agent("mika", "Mika", "/tmp").unwrap();
 
         // Insert team + team runs so FK constraints are satisfied
         db.conn
@@ -3379,7 +3389,7 @@ mod tests {
         db.create_task(&t4).unwrap();
 
         let count = db
-            .count_pending_callback_tasks_by_team_run("run123", "main")
+            .count_pending_callback_tasks_by_team_run("run123", "mika")
             .unwrap();
         assert_eq!(count, 1); // only the pending depth=2 grandchild for run123
     }
@@ -3387,7 +3397,7 @@ mod tests {
     #[test]
     fn test_get_expired_child_task_ids() {
         let db = Database::open_in_memory().unwrap();
-        db.register_agent("main", "main", "/tmp").unwrap();
+        db.register_agent("mika", "Mika", "/tmp").unwrap();
 
         // Parent still pending — its expired child SHOULD appear
         let parent_id = db.create_task(&make_task("parent")).unwrap();
@@ -3430,7 +3440,7 @@ mod tests {
             )
             .unwrap();
 
-        let ids = db.get_expired_child_task_ids("main").unwrap();
+        let ids = db.get_expired_child_task_ids("mika").unwrap();
         assert_eq!(
             ids.len(),
             1,

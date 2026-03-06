@@ -488,7 +488,7 @@ mod tests {
 
     fn test_db() -> AsyncDatabase {
         let db = Database::open_in_memory().unwrap();
-        AsyncDatabase::new_with_agent(db, "main")
+        AsyncDatabase::new_with_agent(db, "mika")
     }
 
     struct NoopSender;
@@ -522,7 +522,7 @@ mod tests {
 
     fn make_task(label: &str, next_fire_at: i64) -> NewTask {
         NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -672,7 +672,7 @@ mod tests {
 
         // Create a callback task with timeout_at in the past
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -705,7 +705,7 @@ mod tests {
 
         // Task with timeout_at in the future — should NOT be expired
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -738,7 +738,7 @@ mod tests {
 
         // Create parent task
         let parent = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -759,7 +759,7 @@ mod tests {
 
         // Create two children: one completed, one expired
         let child1 = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: Some(parent_id.clone()),
             depth: 1,
@@ -782,7 +782,7 @@ mod tests {
             .unwrap();
 
         let child2 = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: Some(parent_id.clone()),
             depth: 1,

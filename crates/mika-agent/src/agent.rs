@@ -559,7 +559,7 @@ pub struct AgentParams<'a> {
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
     /// Global Mika home directory (e.g. `~/.mika/`), used for team/agent discovery in the prompt.
-    /// Distinct from `home_dir` which is the per-agent home (e.g. `~/.mika/agents/main/`).
+    /// Distinct from `home_dir` which is the per-agent home (e.g. `~/.mika/agents/mika/`).
     pub global_home_dir: Option<&'a Path>,
 }
 

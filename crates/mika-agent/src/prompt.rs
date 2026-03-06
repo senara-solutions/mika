@@ -103,7 +103,7 @@ pub struct PromptContext<'a> {
     pub channel_type: Option<&'a str>,
     /// Whether Telegram integration is configured (chat_id exists in customer_config).
     pub telegram_configured: bool,
-    /// Per-agent home directory (e.g. `~/.mika/agents/main/`).
+    /// Per-agent home directory (e.g. `~/.mika/agents/mika/`).
     /// Surfaced in the Tool Usage section so the agent knows write_file's base path.
     pub home_dir: Option<&'a Path>,
 }
@@ -479,7 +479,7 @@ mod tests {
             },
             CoreMemoryEntry {
                 key: "self_model".to_string(),
-                value: "I am main. No interaction history yet.".to_string(),
+                value: "I am Mika. No interaction history yet.".to_string(),
                 token_count: 8,
                 updated_at: "2026-01-01".to_string(),
             },
@@ -528,7 +528,7 @@ mod tests {
         assert!(prompt.contains("### user_summary"));
         assert!(prompt.contains("Loves coffee."));
         assert!(prompt.contains("### self_model"));
-        assert!(prompt.contains("I am main. No interaction history yet."));
+        assert!(prompt.contains("I am Mika. No interaction history yet."));
     }
 
     #[test]
@@ -929,11 +929,11 @@ max_iterations = 3
         let tmp = tempfile::tempdir().unwrap();
 
         // Create two agents
-        let main_dir = tmp.path().join("agents").join("main");
-        std::fs::create_dir_all(&main_dir).unwrap();
-        std::fs::write(main_dir.join("config.toml"), "# config").unwrap();
+        let mika_dir = tmp.path().join("agents").join("mika");
+        std::fs::create_dir_all(&mika_dir).unwrap();
+        std::fs::write(mika_dir.join("config.toml"), "# config").unwrap();
         std::fs::write(
-            main_dir.join("identity.toml"),
+            mika_dir.join("identity.toml"),
             "name = \"Mika\"\nemoji = \"✦\"\n",
         )
         .unwrap();
@@ -964,7 +964,7 @@ max_iterations = 3
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Agents & Teams"));
         assert!(prompt.contains("delegate_task"));
-        assert!(prompt.contains("main (✦ Mika)"));
+        assert!(prompt.contains("mika (✦ Mika)"));
         assert!(prompt.contains("researcher (🔬 Rex)"));
     }
 
@@ -973,9 +973,9 @@ max_iterations = 3
         let tmp = tempfile::tempdir().unwrap();
 
         // Single agent only
-        let main_dir = tmp.path().join("agents").join("main");
-        std::fs::create_dir_all(&main_dir).unwrap();
-        std::fs::write(main_dir.join("config.toml"), "# config").unwrap();
+        let mika_dir = tmp.path().join("agents").join("mika");
+        std::fs::create_dir_all(&mika_dir).unwrap();
+        std::fs::write(mika_dir.join("config.toml"), "# config").unwrap();
 
         let identity = test_identity();
         let ctx = PromptContext {
@@ -1113,16 +1113,16 @@ max_iterations = 3
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
-            home_dir: Some(std::path::Path::new("/home/user/.mika/agents/main")),
+            home_dir: Some(std::path::Path::new("/home/user/.mika/agents/mika")),
         };
 
         let prompt = build_system_prompt(&ctx);
         assert!(
-            prompt.contains("/home/user/.mika/agents/main"),
+            prompt.contains("/home/user/.mika/agents/mika"),
             "prompt should include the home directory path"
         );
         assert!(
-            prompt.contains("Your home directory is /home/user/.mika/agents/main"),
+            prompt.contains("Your home directory is /home/user/.mika/agents/mika"),
             "prompt should include the home directory in write_file instruction"
         );
     }

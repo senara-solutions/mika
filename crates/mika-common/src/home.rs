@@ -79,9 +79,9 @@ pub fn resolve_agent_home(home_dir: &Path, agent_name: &str) -> PathBuf {
 /// Migrate a legacy layout to multi-agent layout (idempotent).
 ///
 /// If already multi-agent layout → no-op.
-/// If legacy layout: creates `agents/main/`, moves data/, logs/, skills/, exports/,
+/// If legacy layout: creates `agents/mika/`, moves data/, logs/, skills/, exports/,
 /// config.toml, identity.toml, soul.md, heartbeat.md, user.md into it.
-/// Writes `active_agent` file with "main".
+/// Writes `active_agent` file with "mika".
 /// Creates a root-level config.toml with shared settings.
 pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
     if is_multi_agent_layout(home_dir) {
@@ -146,7 +146,7 @@ pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
 }
 
 /// Read the active agent name from `{home_dir}/active_agent`.
-/// Returns DEFAULT_AGENT ("main") if file doesn't exist or is empty.
+/// Returns DEFAULT_AGENT ("mika") if file doesn't exist or is empty.
 pub fn read_active_agent(home_dir: &Path) -> String {
     let path = home_dir.join("active_agent");
     std::fs::read_to_string(&path)
@@ -438,7 +438,7 @@ mod tests {
     fn test_resolve_agent_home_legacy() {
         let tmp = tempfile::tempdir().unwrap();
         // No agents/ dir → legacy layout → returns home_dir
-        let resolved = resolve_agent_home(tmp.path(), "main");
+        let resolved = resolve_agent_home(tmp.path(), "mika");
         assert_eq!(resolved, tmp.path());
     }
 
@@ -456,7 +456,7 @@ mod tests {
         assert!(!is_initialized(tmp.path()));
 
         // Create a multi-agent layout with one bootstrapped agent
-        let agent = tmp.path().join("agents").join("main");
+        let agent = tmp.path().join("agents").join("mika");
         fs::create_dir_all(&agent).unwrap();
         fs::write(agent.join("config.toml"), "# config").unwrap();
         assert!(is_initialized(tmp.path()));
@@ -490,18 +490,18 @@ mod tests {
             "test-db-content"
         );
 
-        // Agent files moved to agents/main/
-        let main_agent = home.join("agents").join("main");
+        // Agent files moved to agents/mika/
+        let mika_agent = home.join("agents").join("mika");
         assert_eq!(
-            fs::read_to_string(main_agent.join("soul.md")).unwrap(),
+            fs::read_to_string(mika_agent.join("soul.md")).unwrap(),
             "custom soul"
         );
-        assert!(main_agent.join("identity.toml").is_file());
-        assert!(main_agent.join("config.toml").is_file());
-        assert!(main_agent.join("skills").is_dir());
+        assert!(mika_agent.join("identity.toml").is_file());
+        assert!(mika_agent.join("config.toml").is_file());
+        assert!(mika_agent.join("skills").is_dir());
 
         // active_agent file should exist
-        assert_eq!(read_active_agent(home), "main");
+        assert_eq!(read_active_agent(home), "mika");
 
         // Root config.toml should be the global one
         let root_config = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -545,7 +545,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // Default when no file
-        assert_eq!(read_active_agent(tmp.path()), "main");
+        assert_eq!(read_active_agent(tmp.path()), "mika");
 
         // Write and read back
         write_active_agent(tmp.path(), "work").unwrap();
@@ -560,7 +560,7 @@ mod tests {
     fn test_read_active_agent_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("active_agent"), "  \n").unwrap();
-        assert_eq!(read_active_agent(tmp.path()), "main");
+        assert_eq!(read_active_agent(tmp.path()), "mika");
     }
 
     #[test]
@@ -577,14 +577,14 @@ mod tests {
         assert!(home.join("data").is_dir());
 
         // Default agent bootstrapped
-        let main_agent = home.join("agents").join("main");
-        assert!(main_agent.join("logs").is_dir());
-        assert!(main_agent.join("skills").is_dir());
-        assert!(main_agent.join("config.toml").is_file());
-        assert!(main_agent.join("soul.md").is_file());
+        let mika_agent = home.join("agents").join("mika");
+        assert!(mika_agent.join("logs").is_dir());
+        assert!(mika_agent.join("skills").is_dir());
+        assert!(mika_agent.join("config.toml").is_file());
+        assert!(mika_agent.join("soul.md").is_file());
 
-        // Active agent set to "main"
-        assert_eq!(read_active_agent(home), "main");
+        // Active agent set to "mika"
+        assert_eq!(read_active_agent(home), "mika");
 
         // Root-level global config written
         let root_config = fs::read_to_string(home.join("config.toml")).unwrap();

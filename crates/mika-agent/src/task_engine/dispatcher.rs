@@ -609,7 +609,7 @@ mod tests {
 
     fn test_db() -> AsyncDatabase {
         let db = Database::open_in_memory().unwrap();
-        AsyncDatabase::new_with_agent(db, "main")
+        AsyncDatabase::new_with_agent(db, "mika")
     }
 
     fn test_dispatcher(db: AsyncDatabase) -> TaskDispatcher {
@@ -639,7 +639,7 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
 
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -668,7 +668,7 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
 
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
@@ -696,7 +696,7 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
 
         let task = NewTask {
-            agent_id: "main".to_string(),
+            agent_id: "mika".to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,

@@ -180,7 +180,8 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
                         .filter(|s| !s.starts_with("# Tell Mika about yourself"));
                     from_file.unwrap_or(default_value).to_string()
                 } else if block == "self_model" {
-                    format!("I am {}. {default_value}", db.agent_id())
+                    let display_name = db.get_agent_display_name().await;
+                    format!("I am {display_name}. {default_value}")
                 } else {
                     default_value.to_string()
                 };
