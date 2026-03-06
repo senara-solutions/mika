@@ -1267,7 +1267,7 @@ impl Database {
         channel_types: Option<&[&str]>,
     ) -> Result<Vec<ConversationMessage>> {
         if let Some(types) = channel_types {
-            let placeholders: String = (1..=types.len())
+            let placeholders: String = (0..types.len())
                 .map(|i| format!("?{}", i + 3))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -2682,6 +2682,47 @@ mod tests {
             .unwrap();
         assert_eq!(tg.len(), 1);
         assert_eq!(tg[0].content, "telegram msg");
+    }
+
+    #[test]
+    fn test_load_messages_after_with_channel_filter() {
+        let db = db();
+        // Insert messages across different channels
+        db.save_message("main", "user", "telegram msg 1", "telegram")
+            .unwrap();
+        db.save_message("main", "user", "cli msg 1", "cli").unwrap();
+        db.save_message("main", "user", "api msg 1", "api").unwrap();
+        db.save_message("main", "user", "telegram msg 2", "telegram")
+            .unwrap();
+        db.save_message("main", "user", "cli msg 2", "cli").unwrap();
+
+        // Filter to telegram + cli only (should exclude api)
+        let msgs = db
+            .load_messages_after("main", 0, Some(&["telegram", "cli"]))
+            .unwrap();
+        assert_eq!(msgs.len(), 4);
+        for msg in &msgs {
+            assert!(
+                msg.channel_type == "telegram" || msg.channel_type == "cli",
+                "unexpected channel_type: {}",
+                msg.channel_type
+            );
+        }
+
+        // No filter returns all messages
+        let all = db.load_messages_after("main", 0, None).unwrap();
+        assert_eq!(all.len(), 5);
+
+        // after_id filtering works with channel filter
+        let first_id = msgs[0].id;
+        let after = db
+            .load_messages_after("main", first_id, Some(&["cli"]))
+            .unwrap();
+        // Should get only cli messages after first_id
+        for msg in &after {
+            assert_eq!(msg.channel_type, "cli");
+            assert!(msg.id > first_id);
+        }
     }
 
     #[test]
