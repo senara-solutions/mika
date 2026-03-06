@@ -39,7 +39,7 @@ impl Tool for ReadWorkspaceTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
 
-        let full_path = match validate_and_resolve_path(path, &self.workspace_dir).await {
+        let full_path = match validate_and_resolve_path(path, &self.workspace_dir, false).await {
             Ok(p) => p,
             Err(e) => return Ok(e),
         };

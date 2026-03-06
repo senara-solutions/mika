@@ -20,6 +20,4 @@ pub mod action_type {
     pub const SEND_MESSAGE: &str = "send_message";
     pub const RUN_SKILL: &str = "run_skill";
     pub const INJECT_CONTEXT: &str = "inject_context";
-    pub const RESUME_AGENT: &str = "resume_agent";
-    pub const INVOKE_ORCHESTRATOR: &str = "invoke_orchestrator";
 }

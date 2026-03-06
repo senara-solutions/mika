@@ -35,12 +35,11 @@ impl Tool for ListRemindersTool {
 
         let mut output = String::from("Active reminders:\n");
         for t in &tasks {
-            let short_id = &t.id[..8.min(t.id.len())];
             let fire_at = t
                 .next_fire_at
                 .map(format_unix_ts)
                 .unwrap_or_else(|| "unknown".to_string());
-            output.push_str(&format!("- {}: \"{}\" at {}\n", short_id, t.label, fire_at));
+            output.push_str(&format!("- {}: \"{}\" at {}\n", t.id, t.label, fire_at));
         }
 
         Ok(ToolOutput::success(output))

@@ -16,13 +16,13 @@ impl Tool for CancelReminderTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "cancel_reminder".to_string(),
-            description: "Cancel a pending reminder by its ID (from list_reminders).".to_string(),
+            description: "Cancel a pending reminder by its full UUID (from list_reminders or create_reminder).".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "The ID of the reminder to cancel (from list_reminders)"
+                        "description": "The full UUID of the reminder to cancel (as returned by list_reminders or create_reminder)"
                     }
                 },
                 "required": ["id"]

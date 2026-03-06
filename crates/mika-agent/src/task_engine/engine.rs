@@ -20,16 +20,6 @@ const MAX_PER_TICK: usize = 10;
 /// How many ticks between periodic DB scans for tasks created outside the engine.
 const DB_SCAN_INTERVAL_TICKS: u64 = 60;
 
-/// Message sent from a dispatched task back to the engine to re-enqueue a
-/// recurring task after it completes.
-struct ReEnqueue {
-    task_id: String,
-    next_fire_at: i64,
-    trigger_type: String,
-    action_type: String,
-    cron_expr: Option<String>,
-}
-
 /// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
 /// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
 ///
@@ -49,8 +39,8 @@ pub struct TaskEngine {
     /// Task IDs currently in the heap (prevents duplicates on periodic DB scan).
     queued_ids: HashSet<String>,
     dispatcher: Arc<TaskDispatcher>,
-    reenqueue_tx: mpsc::Sender<ReEnqueue>,
-    reenqueue_rx: mpsc::Receiver<ReEnqueue>,
+    reenqueue_tx: mpsc::Sender<QueuedTask>,
+    reenqueue_rx: mpsc::Receiver<QueuedTask>,
     /// Tick counter used to trigger periodic DB scans.
     tick_count: u64,
 }
@@ -168,14 +158,8 @@ impl TaskEngine {
     /// all due tasks (up to MAX_PER_TICK).
     async fn tick(&mut self) {
         // Drain re-enqueue messages from completed recurring tasks
-        while let Ok(re) = self.reenqueue_rx.try_recv() {
-            self.push_to_heap(QueuedTask {
-                task_id: re.task_id,
-                next_fire_at: re.next_fire_at,
-                trigger_type: re.trigger_type,
-                action_type: re.action_type,
-                cron_expr: re.cron_expr,
-            });
+        while let Ok(task) = self.reenqueue_rx.try_recv() {
+            self.push_to_heap(task);
         }
 
         // Periodic DB scan: pick up tasks created outside the engine (e.g. by tools)
@@ -288,13 +272,13 @@ impl TaskEngine {
     /// Mark the task `in_progress` in DB, then spawn a task to dispatch it.
     ///
     /// Dispatch runs in a spawned task so the engine lock is released immediately.
-    /// Long-running dispatchers (resume_agent, run_skill) can hold the spawned
-    /// task for up to 300s without blocking the tick loop.
+    /// Long-running dispatchers (run_skill) can hold the spawned task for up to
+    /// 300s without blocking the tick loop.
     async fn fire_task(&mut self, queued: QueuedTask) {
         let task_id = queued.task_id.clone();
 
-        // Atomically claim the task (only succeeds if status is pending/recurring_active)
-        match self.db.try_claim_task(&task_id).await {
+        // Atomically claim the task and record fired_at in one DB round-trip
+        match self.db.claim_and_fire_task(&task_id).await {
             Ok(true) => {} // claimed successfully
             Ok(false) => {
                 debug!(task_id = %task_id, "task no longer claimable (cancelled/completed/expired), skipping");
@@ -304,9 +288,6 @@ impl TaskEngine {
                 warn!(task_id = %task_id, error = %e, "failed to claim task");
                 return;
             }
-        }
-        if let Err(e) = self.db.set_task_fired(&task_id).await {
-            warn!(task_id = %task_id, error = %e, "failed to set task fired_at");
         }
 
         let dispatcher = self.dispatcher.clone();
@@ -344,7 +325,7 @@ impl TaskEngine {
 
                         // Send back to engine for re-enqueue on next tick
                         let _ = reenqueue_tx
-                            .send(ReEnqueue {
+                            .send(QueuedTask {
                                 task_id,
                                 next_fire_at: next,
                                 trigger_type,

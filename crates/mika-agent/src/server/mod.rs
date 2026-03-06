@@ -322,50 +322,58 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     ready.store(true, Ordering::Release);
     info!("server ready");
 
-    // Start task engines for all agents in the background:
+    // Start task engines for all agents:
     // 1. Register recurring tasks (heartbeat, reflection) if missing
     // 2. Run startup recovery (expire/recover in_progress, load heap)
-    // 3. Spawn 1-second tick loop
-    // 4. Run background cleanup (pruning, vacuum, backfill)
+    // 3. Spawn 1-second tick loop — collect JoinHandle for shutdown abort
+    // 4. Spawn background cleanup (pruning, vacuum, backfill) as a fire-and-forget task
+    let mut tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     for (name, agent_state) in state.agents.iter() {
         let engine = agent_state.task_engine.clone();
         let db = agent_state.db.clone();
         let agent_name = name.clone();
 
-        tokio::spawn(async move {
-            // Register recurring built-in tasks
-            task_engine::ensure_recurring_task(
-                &db,
-                "heartbeat",
-                HEARTBEAT_CRON,
-                r#"{"trigger":"heartbeat"}"#,
-            )
-            .await;
-            task_engine::ensure_recurring_task(
-                &db,
-                "reflection",
-                REFLECTION_CRON,
-                r#"{"trigger":"reflection"}"#,
-            )
-            .await;
+        // Register recurring built-in tasks
+        task_engine::ensure_recurring_task(
+            &db,
+            "heartbeat",
+            HEARTBEAT_CRON,
+            r#"{"trigger":"heartbeat"}"#,
+        )
+        .await;
+        task_engine::ensure_recurring_task(
+            &db,
+            "reflection",
+            REFLECTION_CRON,
+            r#"{"trigger":"reflection"}"#,
+        )
+        .await;
 
-            // Recovery + tick loop
-            {
-                let mut eng = engine.lock().await;
-                if let Err(e) = eng.startup_recovery().await {
-                    warn!(agent = %agent_name, error = %e, "task engine startup recovery failed");
-                }
+        // Startup recovery (expire timed-out tasks, mark orphaned in_progress as failed, load heap)
+        {
+            let mut eng = engine.lock().await;
+            if let Err(e) = eng.startup_recovery().await {
+                warn!(agent = %agent_name, error = %e, "task engine startup recovery failed");
             }
-            TaskEngine::spawn_tick_loop(engine);
+        }
 
-            // Background cleanup
-            startup_cleanup(db).await;
-        });
+        // Spawn tick loop and retain the handle so we can abort it on shutdown
+        let handle = TaskEngine::spawn_tick_loop(engine);
+        tick_handles.push(handle);
+
+        // Background cleanup runs concurrently — fire and forget
+        tokio::spawn(startup_cleanup(db));
     }
 
-    // Serve with graceful shutdown
+    // Serve with graceful shutdown; abort all tick loops once the signal fires
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            for handle in &tick_handles {
+                handle.abort();
+            }
+        })
         .await?;
 
     info!("server shut down cleanly");

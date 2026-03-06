@@ -101,17 +101,21 @@ impl AsyncDatabase {
         f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        {
+        // Clone the sender while holding the lock, then release the lock before
+        // calling send(). This prevents blocking the tokio worker thread with the
+        // mutex held if the channel is full (bounded backpressure).
+        let sender = {
             let sender_guard = self.inner.sender.lock().expect("sender lock poisoned");
-            let sender = sender_guard
+            sender_guard
                 .as_ref()
-                .ok_or_else(|| anyhow!("database has been shut down"))?;
-            sender
-                .send(Box::new(move |db| {
-                    let _ = tx.send(f(db));
-                }))
-                .map_err(|_| anyhow!("database thread has stopped"))?;
-        }
+                .ok_or_else(|| anyhow!("database has been shut down"))?
+                .clone()
+        };
+        sender
+            .send(Box::new(move |db| {
+                let _ = tx.send(f(db));
+            }))
+            .map_err(|_| anyhow!("database thread has stopped"))?;
         rx.await
             .map_err(|_| anyhow!("database thread dropped reply"))?
     }
@@ -158,18 +162,14 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task(&i)).await
     }
 
-    pub async fn get_due_tasks(&self, now_unix: i64, limit: usize) -> Result<Vec<Task>> {
-        self.with_db(move |db| db.get_due_tasks(now_unix, limit)).await
-    }
-
     pub async fn get_schedulable_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_schedulable_tasks(&id)).await
     }
 
-    pub async fn try_claim_task(&self, id: &str) -> Result<bool> {
+    pub async fn claim_and_fire_task(&self, id: &str) -> Result<bool> {
         let id = id.to_string();
-        self.with_db(move |db| db.try_claim_task(&id)).await
+        self.with_db(move |db| db.claim_and_fire_task(&id)).await
     }
 
     pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
@@ -193,11 +193,6 @@ impl AsyncDatabase {
         self.with_db(move |db| db.update_task_next_fire_at(&i, next_fire_at)).await
     }
 
-    pub async fn set_task_fired(&self, id: &str) -> Result<()> {
-        let i = id.to_owned();
-        self.with_db(move |db| db.set_task_fired(&i)).await
-    }
-
     pub async fn cancel_task(&self, id: &str) -> Result<bool> {
         let i = id.to_owned();
         self.with_db(move |db| db.cancel_task(&i)).await
@@ -211,11 +206,6 @@ impl AsyncDatabase {
     pub async fn count_pending_tasks(&self) -> Result<i64> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.count_pending_tasks(&id)).await
-    }
-
-    pub async fn get_pending_user_reply_task(&self) -> Result<Option<Task>> {
-        let id = self.agent_id.clone();
-        self.with_db(move |db| db.get_pending_user_reply_task(&id)).await
     }
 
     pub async fn get_pending_reminder_tasks(&self) -> Result<Vec<Task>> {

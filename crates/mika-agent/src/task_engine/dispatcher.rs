@@ -20,7 +20,6 @@ use super::types::action_type;
 ///
 /// `send_message` and `inject_context` are fully implemented.
 /// `run_skill` is implemented for "heartbeat" and "reflection" triggers.
-/// Other action types (`resume_agent`, `invoke_orchestrator`) are stubs for Phase 4.
 pub struct TaskDispatcher {
     pub db: AsyncDatabase,
     pub claude: ClaudeClient,
@@ -50,10 +49,8 @@ impl TaskDispatcher {
 
         match task.action_type.as_str() {
             action_type::SEND_MESSAGE => self.dispatch_send_message(&task, &config).await,
-            action_type::RESUME_AGENT => self.dispatch_resume_agent(&task, &config).await,
             action_type::INJECT_CONTEXT => self.dispatch_inject_context(&task, &config).await,
             action_type::RUN_SKILL => self.dispatch_run_skill(&task, &config).await,
-            action_type::INVOKE_ORCHESTRATOR => self.dispatch_invoke_orchestrator(&task, &config).await,
             other => Err(anyhow!("unknown action_type: {}", other)),
         }
     }
@@ -66,20 +63,20 @@ impl TaskDispatcher {
             .as_str()
             .ok_or_else(|| anyhow!("send_message task {} missing 'text' in action_config", task.id))?;
 
+        const MAX_MESSAGE_LEN: usize = 50_000;
+        if text.len() > MAX_MESSAGE_LEN {
+            return Err(anyhow!(
+                "send_message task {} text exceeds {} chars (got {})",
+                task.id, MAX_MESSAGE_LEN, text.len()
+            ));
+        }
+
         if let Some(sender) = &self.message_sender {
             sender.send(text).await?;
         } else {
             debug!(task_id = %task.id, "send_message: no sender configured, dropping message");
         }
         Ok(())
-    }
-
-    /// Resume an agent loop from a saved conversation context (e.g. after a callback or user reply).
-    ///
-    /// Phase 4 implementation.
-    async fn dispatch_resume_agent(&self, task: &Task, _config: &serde_json::Value) -> Result<()> {
-        warn!(task_id = %task.id, "dispatch_resume_agent not yet implemented (Phase 4)");
-        Err(anyhow!("resume_agent action type not yet implemented"))
     }
 
     /// Inject-context tasks have a two-phase lifecycle.
@@ -320,18 +317,6 @@ impl TaskDispatcher {
         true
     }
 
-    /// Check if all sibling tasks for an orchestrator task have completed, then run
-    /// the orchestrator agent to assemble results.
-    ///
-    /// Phase 4 implementation.
-    async fn dispatch_invoke_orchestrator(
-        &self,
-        task: &Task,
-        _config: &serde_json::Value,
-    ) -> Result<()> {
-        warn!(task_id = %task.id, "dispatch_invoke_orchestrator not yet implemented (Phase 4)");
-        Err(anyhow!("invoke_orchestrator action type not yet implemented"))
-    }
 }
 
 #[cfg(test)]
@@ -463,31 +448,4 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_dispatch_resume_agent_returns_error() {
-        let db = test_db();
-        let dispatcher = test_dispatcher(db.clone());
-
-        let task = NewTask {
-            agent_id: "main".to_string(),
-            team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: "test".to_string(),
-            trigger_type: "time".to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: Some(chrono::Utc::now().timestamp()),
-            timeout_at: None,
-            action_type: "resume_agent".to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: None,
-        };
-        let id = db.create_task(task).await.unwrap();
-        let result = dispatcher.dispatch(&id).await;
-        assert!(result.is_err());
-    }
 }

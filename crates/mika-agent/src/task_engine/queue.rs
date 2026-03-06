@@ -32,18 +32,6 @@ impl PartialOrd for QueuedTask {
     }
 }
 
-impl QueuedTask {
-    pub fn from_task(task: &crate::db::Task) -> Option<Self> {
-        let next_fire_at = task.next_fire_at?;
-        Some(Self {
-            task_id: task.id.clone(),
-            next_fire_at,
-            trigger_type: task.trigger_type.clone(),
-            action_type: task.action_type.clone(),
-            cron_expr: task.cron_expr.clone(),
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {

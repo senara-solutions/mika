@@ -1180,6 +1180,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         has_message_sender: params.message_sender.is_some(),
         recent_conversations: conversations_digest.as_deref(),
         recent_memory_events: memory_events_digest.as_deref(),
+        home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 

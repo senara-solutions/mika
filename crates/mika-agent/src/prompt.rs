@@ -304,7 +304,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- Tools may return images (screenshots, image files); you will see and can describe their contents.\n",
     );
     prompt.push_str(
-        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_file on that path to view the image contents.\n",
+        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_home_file on that path to view the image contents.\n",
     );
     prompt.push_str(
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
@@ -321,7 +321,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         .unwrap();
         writeln!(
             prompt,
-            "- You can read files from your home directory with read_file (path relative to {}). \
+            "- You can read files from your home directory with read_home_file (path relative to {}). \
              Files larger than 100 KB are rejected.",
             home.display()
         )
@@ -332,12 +332,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
              If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
         );
         prompt.push_str(
-            "- You can read files from your home directory with read_file (relative paths only). \
+            "- You can read files from your home directory with read_home_file (relative paths only). \
              Files larger than 100 KB are rejected.\n",
         );
     }
     prompt.push_str(
-        "- You can list files in your home directory with list_files. \
+        "- You can list files in your home directory with list_home_files. \
          Omit path or pass an empty string to list the root. Pass a relative subdirectory path to list that directory.\n",
     );
 
@@ -362,6 +362,8 @@ pub struct SilentPromptContext<'a> {
     pub recent_conversations: Option<&'a str>,
     /// Pre-formatted digest of today's memory events (reflection mode only).
     pub recent_memory_events: Option<&'a str>,
+    /// Agent home directory. When set, file tool instructions include the absolute path.
+    pub home_dir: Option<&'a std::path::Path>,
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -415,6 +417,24 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         prompt.push_str(events);
         prompt.push_str("\n</memory-events>\n\n");
     }
+
+    // File tools — mention home-scoped file tools so heartbeat agents can discover them
+    prompt.push_str("## File Tools\n");
+    if let Some(home) = ctx.home_dir {
+        writeln!(
+            prompt,
+            "- read_home_file: Read a file from your home directory ({}). Paths are relative to that directory.\n\
+             - list_home_files: List files and directories in your home directory. Omit path to list the root.",
+            home.display()
+        )
+        .unwrap();
+    } else {
+        prompt.push_str(
+            "- read_home_file: Read a file from your home directory. Paths are relative to your home.\n\
+             - list_home_files: List files and directories in your home directory. Omit path to list the root.\n",
+        );
+    }
+    prompt.push('\n');
 
     // Trigger-specific context
     prompt.push_str("## Trigger\n");
@@ -626,6 +646,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -650,6 +671,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -682,6 +704,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -811,6 +834,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -834,6 +858,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1131,6 +1156,7 @@ max_iterations = 3
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1152,6 +1178,7 @@ max_iterations = 3
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1173,6 +1200,7 @@ max_iterations = 3
             has_message_sender: false,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1273,6 +1301,7 @@ notify = true
             has_message_sender: false,
             recent_conversations: Some("User discussed Series A fundraise with Alice."),
             recent_memory_events: Some("update_core_memory: current_priorities -> fundraise"),
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1297,6 +1326,7 @@ notify = true
             has_message_sender: false,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);

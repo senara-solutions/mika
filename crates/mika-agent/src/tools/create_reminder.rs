@@ -96,7 +96,6 @@ impl Tool for CreateReminderTool {
         };
 
         let id = ctx.db.create_task(task).await?;
-        let short_id = &id[..8];
 
         let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC");
         ctx.db
@@ -111,7 +110,7 @@ impl Tool for CreateReminderTool {
             .await?;
 
         Ok(ToolOutput::success(format!(
-            "Reminder {short_id} scheduled for {display_time}."
+            "Reminder {id} scheduled for {display_time}."
         )))
     }
 }

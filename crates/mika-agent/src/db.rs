@@ -247,10 +247,14 @@ impl Database {
                     backup = %backup_path.display(),
                     "auto-backed up DB before schema migration"
                 ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "could not auto-backup DB before migration — proceeding anyway"
-                ),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Cannot auto-backup database before migration ({}). \
+                         Aborting to protect data. Free disk space or manually backup '{}' before retrying.",
+                        e,
+                        path.display()
+                    ));
+                }
             }
         }
         db.migrate()?;
@@ -415,6 +419,9 @@ impl Database {
             CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
                 WHERE status IN ('pending','recurring_active');
+            CREATE INDEX idx_tasks_schedulable
+                ON tasks(agent_id, next_fire_at ASC)
+                WHERE status IN ('pending','recurring_active');
 
             CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -520,7 +527,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
                 parent_id INTEGER REFERENCES team_messages(id),
-                agent_id TEXT REFERENCES agents(id),
+                agent_name TEXT,
                 message_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 iteration INTEGER NOT NULL DEFAULT 1,
@@ -758,22 +765,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn get_due_tasks(&self, now_unix: i64, limit: usize) -> Result<Vec<Task>> {
-        let sql = format!(
-            "SELECT {} FROM tasks
-             WHERE next_fire_at <= ?1
-               AND status IN ('pending','recurring_active')
-             ORDER BY next_fire_at ASC
-             LIMIT ?2",
-            Self::TASK_COLUMNS
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![now_unix, limit as i64], Self::row_to_task)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
-    }
-
     pub fn get_schedulable_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
@@ -796,12 +787,14 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically claim a task by setting status to 'in_progress'.
+    /// Atomically claim a task and record its fired_at in a single UPDATE.
     /// Returns true if the task was claimed (was in 'pending' or 'recurring_active' state).
     /// Returns false if the task was already claimed, cancelled, or completed.
-    pub fn try_claim_task(&self, id: &str) -> Result<bool> {
+    pub fn claim_and_fire_task(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE tasks SET status = 'in_progress', updated_at = unixepoch()
+            "UPDATE tasks SET status = 'in_progress',
+                              fired_at = unixepoch(),
+                              updated_at = unixepoch()
              WHERE id = ?1 AND status IN ('pending', 'recurring_active')",
             params![id],
         )?;
@@ -836,14 +829,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_task_fired(&self, id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tasks SET fired_at = unixepoch(), updated_at = unixepoch() WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
     pub fn cancel_task(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
@@ -872,19 +857,6 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n)
-    }
-
-    pub fn get_pending_user_reply_task(&self, agent_id: &str) -> Result<Option<Task>> {
-        let sql = format!(
-            "SELECT {} FROM tasks
-             WHERE agent_id = ?1 AND trigger_type = 'user_reply' AND status = 'pending'
-             ORDER BY created_at ASC LIMIT 1",
-            Self::TASK_COLUMNS
-        );
-        self.conn
-            .query_row(&sql, params![agent_id], Self::row_to_task)
-            .optional()
-            .map_err(Into::into)
     }
 
     pub fn get_pending_reminder_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
@@ -2058,7 +2030,7 @@ impl Database {
         iteration: u32,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO team_messages (run_id, parent_id, agent_id, message_type, content, iteration)
+            "INSERT INTO team_messages (run_id, parent_id, agent_name, message_type, content, iteration)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![run_id, parent_id, agent_name, message_type, content, iteration],
         )?;
@@ -2071,9 +2043,9 @@ impl Database {
         iteration: u32,
     ) -> Result<HashMap<String, i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT agent_id, id FROM team_messages
+            "SELECT agent_name, id FROM team_messages
              WHERE run_id = ?1 AND iteration = ?2 AND message_type = 'assignment'
-             AND agent_id IS NOT NULL",
+             AND agent_name IS NOT NULL",
         )?;
         let rows: Vec<(String, i64)> = stmt
             .query_map(params![run_id, iteration], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -2083,7 +2055,7 @@ impl Database {
 
     pub fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, parent_id, agent_id AS agent_name,
+            "SELECT id, run_id, parent_id, agent_name,
                      message_type, content, iteration, created_at
               FROM team_messages WHERE run_id = ?1
               ORDER BY created_at ASC",
@@ -2791,33 +2763,6 @@ mod tests {
         assert_eq!(t.label, "Send reminder");
         assert_eq!(t.trigger_type, "time");
         assert_eq!(t.status, "pending");
-    }
-
-    #[test]
-    fn test_get_due_tasks() {
-        let db = db();
-        let past_task = NewTask {
-            agent_id: "main".to_string(),
-            team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: "Past reminder".to_string(),
-            trigger_type: "time".to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: Some(1_000),
-            timeout_at: None,
-            action_type: "send_message".to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: None,
-        };
-        db.create_task(&past_task).unwrap();
-        let due = db.get_due_tasks(Utc::now().timestamp(), 10).unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].label, "Past reminder");
     }
 
     #[test]

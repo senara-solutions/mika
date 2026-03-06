@@ -7,12 +7,13 @@ mod get_config;
 mod get_team_history;
 mod get_team_status;
 mod list_agents;
-mod list_files;
+mod list_home_files;
 mod list_reminders;
 mod list_skills;
+mod list_tasks;
 mod list_teams;
 mod list_workspace;
-mod read_file;
+mod read_home_file;
 mod read_workspace;
 mod run_team;
 mod search_memory;
@@ -190,14 +191,18 @@ pub(crate) fn check_reflection_evidence(
 /// 2. Path length within `MAX_INPUT_LEN`
 /// 3. Absolute paths rejected
 /// 4. Path traversal components (`..`, root, prefix) rejected
-/// 5. Parent directories created (idempotent)
-/// 6. Parent directory symlink check
-/// 7. Canonicalize containment check (resolved parent must be within `base_dir`)
+/// 5. Parent directories created only when `create_parents` is `true`
+/// 6. Parent directory symlink check (when parent exists)
+/// 7. Canonicalize containment check (resolved parent must be within `base_dir`, when parent exists)
+///
+/// `create_parents` should be `true` for write operations and `false` for read-only operations
+/// to avoid creating directories as a side effect of reading.
 ///
 /// Returns `Ok(full_path)` on success or `Err(ToolOutput::error(...))` on failure.
 pub(crate) async fn validate_and_resolve_path(
     path: &str,
     base_dir: &Path,
+    create_parents: bool,
 ) -> std::result::Result<PathBuf, ToolOutput> {
     if path.is_empty() {
         return Err(ToolOutput::error("'path' is required and cannot be empty."));
@@ -229,15 +234,17 @@ pub(crate) async fn validate_and_resolve_path(
 
     let full_path = base_dir.join(path);
 
-    // Create parent directories if needed
     if let Some(parent) = full_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err(ToolOutput::error(format!(
-                "Failed to create parent directories: {e}"
-            )));
+        // Create parent directories only for write operations
+        if create_parents {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return Err(ToolOutput::error(format!(
+                    "Failed to create parent directories: {e}"
+                )));
+            }
         }
 
-        // Check for symlinks in the parent chain
+        // Check for symlinks in the parent chain (only when parent exists)
         match tokio::fs::symlink_metadata(parent).await {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -245,33 +252,38 @@ pub(crate) async fn validate_and_resolve_path(
                         "Symbolic links are not allowed in the path.",
                     ));
                 }
-            }
-            Err(e) => {
-                return Err(ToolOutput::error(format!(
-                    "Failed to verify parent directory: {e}"
-                )));
-            }
-        }
 
-        // Verify containment using canonicalize (parent now exists)
-        let canonical_parent = match parent.canonicalize() {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(ToolOutput::error(format!(
-                    "Failed to resolve parent directory: {e}"
-                )));
+                // Verify containment using canonicalize (parent exists)
+                let canonical_parent = match parent.canonicalize() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(ToolOutput::error(format!(
+                            "Failed to resolve parent directory: {e}"
+                        )));
+                    }
+                };
+                let base_canonical = match base_dir.canonicalize() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Err(ToolOutput::error("Base directory does not exist."));
+                    }
+                };
+                if !canonical_parent.starts_with(&base_canonical) {
+                    return Err(ToolOutput::error(
+                        "Path resolves outside the base directory.",
+                    ));
+                }
             }
-        };
-        let base_canonical = match base_dir.canonicalize() {
-            Ok(c) => c,
             Err(_) => {
-                return Err(ToolOutput::error("Base directory does not exist."));
+                // Parent does not exist — only an error for write operations (create_parents would
+                // have already failed above). For read operations, the file-not-found error will
+                // be returned by the caller when it tries to open the file.
+                if create_parents {
+                    return Err(ToolOutput::error(
+                        "Failed to verify parent directory.",
+                    ));
+                }
             }
-        };
-        if !canonical_parent.starts_with(&base_canonical) {
-            return Err(ToolOutput::error(
-                "Path resolves outside the base directory.",
-            ));
         }
     }
 
@@ -358,8 +370,9 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(get_config::GetConfigTool));
     registry.register(Box::new(set_config::SetConfigTool));
     registry.register(Box::new(write_file::WriteFileTool));
-    registry.register(Box::new(read_file::ReadFileTool));
-    registry.register(Box::new(list_files::ListFilesTool));
+    registry.register(Box::new(read_home_file::ReadHomeFileTool));
+    registry.register(Box::new(list_home_files::ListHomeFilesTool));
+    registry.register(Box::new(list_tasks::ListTasksTool));
     registry
 }
 

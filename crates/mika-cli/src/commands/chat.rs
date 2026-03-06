@@ -80,7 +80,11 @@ async fn spawn_agent_worker(
         embedding_client: embedding_client.clone(),
         brave_api_key: brave_api_key.clone(),
         skills_dirty: skills_dirty.clone(),
-        agent_lock: None, // CLI serializes via channel, no lock needed
+        // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
+        // concurrently with user message processing (both use the same AsyncDatabase,
+        // which serializes at the DB thread level). Concurrent Claude API calls are
+        // accepted in CLI mode; rate-limit errors are handled by the Claude client.
+        agent_lock: None,
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         ctx.async_db.clone(),

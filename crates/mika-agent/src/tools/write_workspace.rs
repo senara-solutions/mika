@@ -52,7 +52,7 @@ impl Tool for WriteWorkspaceTool {
             )));
         }
 
-        let full_path = match validate_and_resolve_path(path, &self.workspace_dir).await {
+        let full_path = match validate_and_resolve_path(path, &self.workspace_dir, true).await {
             Ok(p) => p,
             Err(e) => return Ok(e),
         };

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "485"
 tags: [code-review, agent-native, tools, security]

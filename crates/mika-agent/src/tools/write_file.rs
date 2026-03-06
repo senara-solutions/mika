@@ -58,7 +58,7 @@ impl Tool for WriteFileTool {
 
         let confirm = input["confirm"].as_bool().unwrap_or(false);
 
-        let full_path = match validate_and_resolve_path(path, ctx.home_dir).await {
+        let full_path = match validate_and_resolve_path(path, ctx.home_dir, true).await {
             Ok(p) => p,
             Err(e) => return Ok(e),
         };
