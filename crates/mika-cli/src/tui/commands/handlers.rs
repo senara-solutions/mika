@@ -35,6 +35,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "compact" => Some(handle_compact(app).await),
         "memory" | "mem" => Some(handle_memory(app, args).await),
         "reminders" | "remind" => Some(handle_reminders(app).await),
+        "tasks" => Some(handle_tasks(app, args).await),
         "status" | "stat" => {
             if app.is_team_mode() {
                 Some(handle_team_info(app))
@@ -200,46 +201,70 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
 }
 
 async fn handle_reminders(app: &mut App<'_>) -> String {
-    let pending = app.db.get_pending_reminders().await;
-    let future = app.db.get_future_reminders().await;
+    let tasks = match app.db.get_pending_reminder_tasks().await {
+        Ok(t) => t,
+        Err(_) => return "Failed to load reminders.".to_string(),
+    };
+
+    if tasks.is_empty() {
+        return "No active reminders.".to_string();
+    }
 
     let mut out = String::new();
-    match pending {
-        Ok(reminders) if !reminders.is_empty() => {
-            let _ = writeln!(out, "Pending reminders:");
-            for r in &reminders {
-                let _ = writeln!(
-                    out,
-                    "  #{}: {} (due: {})",
-                    r.id,
-                    r.message,
-                    r.display_fire_at()
-                );
-            }
-        }
-        _ => {}
+    let _ = writeln!(out, "Active reminders:");
+    for t in &tasks {
+        let short_id = &t.id[..12.min(t.id.len())];
+        let fire_at = t
+            .next_fire_at
+            .map(mika_agent::db::format_unix_ts)
+            .unwrap_or_else(|| "unknown".to_string());
+        let _ = writeln!(out, "  {}: {} (fires: {})", short_id, t.label, fire_at);
     }
-    match future {
-        Ok(reminders) if !reminders.is_empty() => {
-            let _ = writeln!(out, "Upcoming reminders:");
-            for r in &reminders {
-                let _ = writeln!(
-                    out,
-                    "  #{}: {} (fires: {})",
-                    r.id,
-                    r.message,
-                    r.display_fire_at()
-                );
-            }
+    out
+}
+
+async fn handle_tasks(app: &mut App<'_>, args: &str) -> String {
+    if let Some(id) = args.strip_prefix("cancel").map(|s| s.trim()) {
+        if id.is_empty() {
+            return "Usage: /tasks cancel <id>".to_string();
         }
-        _ => {}
+        return match app.db.cancel_task(id).await {
+            Ok(true) => format!("Cancelled task {id}."),
+            Ok(false) => format!("Task {id} not found or already completed."),
+            Err(e) => format!("Failed to cancel task: {e}"),
+        };
     }
 
-    if out.is_empty() {
-        "No active reminders.".to_string()
-    } else {
-        out
+    let tasks = match app.db.get_schedulable_tasks().await {
+        Ok(t) => t,
+        Err(e) => return format!("Failed to load tasks: {e}"),
+    };
+
+    let pending: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.status == "pending" || t.status == "in_progress")
+        .collect();
+
+    if pending.is_empty() {
+        return "No pending tasks.".to_string();
     }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Pending tasks ({}):", pending.len());
+    for t in &pending {
+        let short_id = &t.id[..12.min(t.id.len())];
+        let when = t
+            .next_fire_at
+            .map(mika_agent::db::format_unix_ts)
+            .unwrap_or_else(|| t.trigger_type.clone());
+        let _ = writeln!(
+            out,
+            "  {}: [{}] \"{}\" ({})",
+            short_id, t.action_type, t.label, when
+        );
+    }
+    out.push_str("  Use /tasks cancel <id> to cancel.");
+    out
 }
 
 async fn handle_status(app: &mut App<'_>) -> String {

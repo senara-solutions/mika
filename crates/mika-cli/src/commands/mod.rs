@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod memory;
 pub mod reminders;
 pub mod setup;
+pub mod tasks;
 pub mod skills;
 pub mod status;
 pub mod teams;

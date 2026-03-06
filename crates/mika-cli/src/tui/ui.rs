@@ -522,6 +522,15 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                 Style::default().fg(color),
             ));
         }
+
+        // Pending task badge
+        if app.pending_task_count > 0 {
+            s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            s.push(Span::styled(
+                format!("[{} tasks]", app.pending_task_count),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
         s
     };
 

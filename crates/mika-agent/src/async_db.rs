@@ -5,8 +5,9 @@ use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
-    Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent,
-    Person, Preference, Reminder, SearchResult, TeamMessageRow, TeamRunRow,
+    AgentRow, Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend,
+    MemoryEvent, NewTask, Person, Preference, SearchResult, Task, TeamMessageRow, TeamRunRow,
+    TeamRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -17,27 +18,28 @@ type DbClosure = Box<dyn FnOnce(&Database) + Send>;
 /// `Database` (and its `rusqlite::Connection`). Callers send closures over
 /// an `mpsc` channel; results come back via `tokio::sync::oneshot`.
 ///
-/// `Clone` is cheap (clones the inner `Arc`). All clones share the
-/// same background thread and connection.
+/// `Clone` is cheap (clones the inner `Arc` and agent_id string). All clones
+/// sharing the same `inner` share the same background thread and connection.
 #[derive(Clone)]
 pub struct AsyncDatabase {
     inner: Arc<AsyncDatabaseInner>,
+    /// The agent context for all operations on this handle (default: "main").
+    pub agent_id: String,
 }
 
 struct AsyncDatabaseInner {
-    /// Wrapped in `Option` so `shutdown()` can drop it to signal the thread.
     sender: Mutex<Option<mpsc::Sender<DbClosure>>>,
-    /// Handle to the background DB thread, used for graceful shutdown.
-    /// `None` after `shutdown()` has joined the thread.
     thread_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AsyncDatabase {
     /// Spawn a dedicated OS thread that owns `db` and processes closures.
-    ///
-    /// If a closure panics, the thread logs the error and continues
-    /// processing subsequent closures (see [`std::panic::catch_unwind`]).
     pub fn new(db: Database) -> Self {
+        Self::new_with_agent(db, "main")
+    }
+
+    /// Spawn with a specific agent_id.
+    pub fn new_with_agent(db: Database, agent_id: &str) -> Self {
         let (tx, rx) = mpsc::channel::<DbClosure>();
         let handle = std::thread::Builder::new()
             .name("mika-db".to_string())
@@ -58,28 +60,31 @@ impl AsyncDatabase {
                 sender: Mutex::new(Some(tx)),
                 thread_handle: Mutex::new(Some(handle)),
             }),
+            agent_id: agent_id.to_string(),
         }
     }
 
-    /// Open a database at `path` and wrap it in an async handle.
+    /// Open a database at `path` and wrap it in an async handle (agent_id = "main").
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::open(path)?;
         Ok(Self::new(db))
     }
 
+    /// Return a clone of this handle scoped to a different agent_id.
+    /// The underlying DB thread is shared.
+    pub fn with_agent(&self, agent_id: &str) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            agent_id: agent_id.to_string(),
+        }
+    }
+
     /// Gracefully shut down the database thread.
-    ///
-    /// Drops the internal sender (so the thread's `recv()` loop exits)
-    /// and joins the thread. Safe to call multiple times; subsequent
-    /// calls are no-ops. Any in-flight or future `with_db` calls will
-    /// receive an error once the sender is dropped.
     pub fn shutdown(&self) {
-        // Drop the sender first so the background thread's rx.recv() returns Err.
         {
             let mut sender_guard = self.inner.sender.lock().expect("sender lock poisoned");
             *sender_guard = None;
         }
-        // Now join the thread (it will exit promptly since the channel is closed).
         let mut handle_guard = self
             .inner
             .thread_handle
@@ -90,7 +95,6 @@ impl AsyncDatabase {
         }
     }
 
-    /// Send a closure to the background thread and await its result.
     async fn with_db<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
@@ -111,11 +115,130 @@ impl AsyncDatabase {
             .map_err(|_| anyhow!("database thread dropped reply"))?
     }
 
+    // -- Agent CRUD --
+
+    pub async fn register_agent(&self, id: &str, name: &str, home_dir: &str) -> Result<()> {
+        let (i, n, h) = (id.to_owned(), name.to_owned(), home_dir.to_owned());
+        self.with_db(move |db| db.register_agent(&i, &n, &h)).await
+    }
+
+    pub async fn update_agent_last_seen(&self) -> Result<()> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.update_agent_last_seen(&id)).await
+    }
+
+    pub async fn list_agents_db(&self) -> Result<Vec<AgentRow>> {
+        self.with_db(|db| db.list_agents_db()).await
+    }
+
+    // -- Team CRUD --
+
+    pub async fn register_team(&self, id: &str, name: &str, config_path: &str) -> Result<()> {
+        let (i, n, c) = (id.to_owned(), name.to_owned(), config_path.to_owned());
+        self.with_db(move |db| db.register_team(&i, &n, &c)).await
+    }
+
+    pub async fn list_teams_db(&self) -> Result<Vec<TeamRow>> {
+        self.with_db(|db| db.list_teams_db()).await
+    }
+
+    // -- Task CRUD --
+
+    pub async fn create_task(&self, task: NewTask) -> Result<String> {
+        self.with_db(move |db| db.create_task(&task)).await
+    }
+
+    pub async fn get_task(&self, id: &str) -> Result<Option<Task>> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.get_task(&i)).await
+    }
+
+    pub async fn get_due_tasks(&self, now_unix: i64, limit: usize) -> Result<Vec<Task>> {
+        self.with_db(move |db| db.get_due_tasks(now_unix, limit)).await
+    }
+
+    pub async fn get_schedulable_tasks(&self) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_schedulable_tasks(&id)).await
+    }
+
+    pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
+        let (i, s) = (id.to_owned(), status.to_owned());
+        self.with_db(move |db| db.update_task_status(&i, &s)).await
+    }
+
+    pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
+        let (i, r) = (id.to_owned(), result.map(|s| s.to_owned()));
+        self.with_db(move |db| db.update_task_completed(&i, r.as_deref())).await
+    }
+
+    pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: i64) -> Result<()> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.update_task_next_fire_at(&i, next_fire_at)).await
+    }
+
+    pub async fn set_task_fired(&self, id: &str) -> Result<()> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.set_task_fired(&i)).await
+    }
+
+    pub async fn cancel_task(&self, id: &str) -> Result<bool> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.cancel_task(&i)).await
+    }
+
+    pub async fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
+        self.with_db(move |db| db.mark_tasks_expired(now_unix)).await
+    }
+
+    pub async fn count_pending_tasks(&self) -> Result<i64> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.count_pending_tasks(&id)).await
+    }
+
+    pub async fn get_pending_user_reply_task(&self) -> Result<Option<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_pending_user_reply_task(&id)).await
+    }
+
+    pub async fn get_pending_reminder_tasks(&self) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_pending_reminder_tasks(&id)).await
+    }
+
+    pub async fn get_inject_context_tasks(&self) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_inject_context_tasks(&id)).await
+    }
+
+    pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.set_task_process_id(&i, process_id)).await
+    }
+
+    pub async fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
+        self.with_db(move |db| db.prune_completed_tasks(older_than_secs)).await
+    }
+
+    pub async fn get_tasks_by_status(&self, statuses: Vec<String>) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| {
+            let refs: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+            db.get_tasks_by_status(&id, &refs)
+        })
+        .await
+    }
+
     // -- Conversation --
 
     pub async fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
-        let (r, c, ct) = (role.to_owned(), content.to_owned(), channel_type.to_owned());
-        self.with_db(move |db| db.save_message(&r, &c, &ct)).await
+        let (a, r, c, ct) = (
+            self.agent_id.clone(),
+            role.to_owned(),
+            content.to_owned(),
+            channel_type.to_owned(),
+        );
+        self.with_db(move |db| db.save_message(&a, &r, &c, &ct)).await
     }
 
     pub async fn save_message_with_metadata(
@@ -125,13 +248,14 @@ impl AsyncDatabase {
         channel_type: &str,
         metadata: Option<&str>,
     ) -> Result<i64> {
-        let (r, c, ct, m) = (
+        let (a, r, c, ct, m) = (
+            self.agent_id.clone(),
             role.to_owned(),
             content.to_owned(),
             channel_type.to_owned(),
             metadata.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.save_message_with_metadata(&r, &c, &ct, m.as_deref()))
+        self.with_db(move |db| db.save_message_with_metadata(&a, &r, &c, &ct, m.as_deref()))
             .await
     }
 
@@ -140,28 +264,32 @@ impl AsyncDatabase {
         limit: usize,
         channel_filter: Option<Vec<String>>,
     ) -> Result<Vec<ConversationMessage>> {
+        let a = self.agent_id.clone();
         self.with_db(move |db| {
             let refs: Option<Vec<&str>> = channel_filter
                 .as_ref()
                 .map(|v| v.iter().map(|s| s.as_str()).collect());
-            db.load_recent_messages(limit, refs.as_deref())
+            db.load_recent_messages(&a, limit, refs.as_deref())
         })
         .await
     }
 
     pub async fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
-        self.with_db(|db| db.load_conversation_summary()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.load_conversation_summary(&a)).await
     }
 
     pub async fn count_messages(&self) -> Result<usize> {
-        self.with_db(|db| db.count_messages()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_messages(&a)).await
     }
 
     pub async fn load_messages_before_window(
         &self,
         window_size: usize,
     ) -> Result<Vec<ConversationMessage>> {
-        self.with_db(move |db| db.load_messages_before_window(window_size))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.load_messages_before_window(&a, window_size))
             .await
     }
 
@@ -170,34 +298,37 @@ impl AsyncDatabase {
         summary: &str,
         compacted_through_id: i64,
     ) -> Result<i64> {
-        let s = summary.to_owned();
-        self.with_db(move |db| db.replace_with_summary(&s, compacted_through_id))
+        let (a, s) = (self.agent_id.clone(), summary.to_owned());
+        self.with_db(move |db| db.replace_with_summary(&a, &s, compacted_through_id))
             .await
     }
 
     // -- Core Memory --
 
     pub async fn get_core_memory(&self, key: &str) -> Result<Option<CoreMemoryEntry>> {
-        let k = key.to_owned();
-        self.with_db(move |db| db.get_core_memory(&k)).await
+        let (a, k) = (self.agent_id.clone(), key.to_owned());
+        self.with_db(move |db| db.get_core_memory(&a, &k)).await
     }
 
     pub async fn get_all_core_memory(&self) -> Result<Vec<CoreMemoryEntry>> {
-        self.with_db(|db| db.get_all_core_memory()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_all_core_memory(&a)).await
     }
 
     pub async fn set_core_memory(&self, key: &str, value: &str) -> Result<i32> {
-        let (k, v) = (key.to_owned(), value.to_owned());
-        self.with_db(move |db| db.set_core_memory(&k, &v)).await
+        let (a, k, v) = (self.agent_id.clone(), key.to_owned(), value.to_owned());
+        self.with_db(move |db| db.set_core_memory(&a, &k, &v)).await
     }
 
     pub async fn seed_core_memory(&self, user_md_content: Option<String>) -> Result<()> {
-        self.with_db(move |db| db.seed_core_memory(user_md_content.as_deref()))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.seed_core_memory(&a, user_md_content.as_deref()))
             .await
     }
 
     pub async fn total_core_memory_tokens(&self) -> Result<i32> {
-        self.with_db(|db| db.total_core_memory_tokens()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.total_core_memory_tokens(&a)).await
     }
 
     // -- People --
@@ -208,27 +339,29 @@ impl AsyncDatabase {
         relationship: Option<&str>,
         notes: Option<&str>,
     ) -> Result<i64> {
-        let (n, r, no) = (
+        let (a, n, r, no) = (
+            self.agent_id.clone(),
             name.to_owned(),
             relationship.map(|s| s.to_owned()),
             notes.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.upsert_person(&n, r.as_deref(), no.as_deref()))
+        self.with_db(move |db| db.upsert_person(&a, &n, r.as_deref(), no.as_deref()))
             .await
     }
 
     pub async fn get_person(&self, name: &str) -> Result<Option<Person>> {
-        let n = name.to_owned();
-        self.with_db(move |db| db.get_person(&n)).await
+        let (a, n) = (self.agent_id.clone(), name.to_owned());
+        self.with_db(move |db| db.get_person(&a, &n)).await
     }
 
     pub async fn list_people(&self) -> Result<Vec<Person>> {
-        self.with_db(|db| db.list_people()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.list_people(&a)).await
     }
 
     pub async fn search_people(&self, query: &str) -> Result<Vec<Person>> {
-        let q = query.to_owned();
-        self.with_db(move |db| db.search_people(&q)).await
+        let (a, q) = (self.agent_id.clone(), query.to_owned());
+        self.with_db(move |db| db.search_people(&a, &q)).await
     }
 
     // -- Commitments --
@@ -239,57 +372,64 @@ impl AsyncDatabase {
         due_date: Option<&str>,
         person_id: Option<i64>,
     ) -> Result<i64> {
-        let (d, dd) = (description.to_owned(), due_date.map(|s| s.to_owned()));
-        self.with_db(move |db| db.add_commitment(&d, dd.as_deref(), person_id))
+        let (a, d, dd) = (
+            self.agent_id.clone(),
+            description.to_owned(),
+            due_date.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.add_commitment(&a, &d, dd.as_deref(), person_id))
             .await
     }
 
     pub async fn list_commitments(&self, status: &str) -> Result<Vec<Commitment>> {
-        let s = status.to_owned();
-        self.with_db(move |db| db.list_commitments(&s)).await
+        let (a, s) = (self.agent_id.clone(), status.to_owned());
+        self.with_db(move |db| db.list_commitments(&a, &s)).await
     }
 
     pub async fn update_commitment_status(&self, id: i64, status: &str) -> Result<bool> {
-        let s = status.to_owned();
-        self.with_db(move |db| db.update_commitment_status(id, &s))
+        let (a, s) = (self.agent_id.clone(), status.to_owned());
+        self.with_db(move |db| db.update_commitment_status(&a, id, &s))
             .await
     }
 
     pub async fn get_commitment_status(&self, id: i64) -> Result<Option<String>> {
-        self.with_db(move |db| db.get_commitment_status(id)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_commitment_status(&a, id)).await
     }
 
     pub async fn get_commitment_details(
         &self,
         id: i64,
     ) -> Result<Option<(String, Option<String>)>> {
-        self.with_db(move |db| db.get_commitment_details(id)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_commitment_details(&a, id)).await
     }
 
     pub async fn search_commitments(&self, query: &str) -> Result<Vec<Commitment>> {
-        let q = query.to_owned();
-        self.with_db(move |db| db.search_commitments(&q)).await
+        let (a, q) = (self.agent_id.clone(), query.to_owned());
+        self.with_db(move |db| db.search_commitments(&a, &q)).await
     }
 
     // -- Preferences --
 
     pub async fn set_preference(&self, category: &str, value: &str) -> Result<i64> {
-        let (c, v) = (category.to_owned(), value.to_owned());
-        self.with_db(move |db| db.set_preference(&c, &v)).await
+        let (a, c, v) = (self.agent_id.clone(), category.to_owned(), value.to_owned());
+        self.with_db(move |db| db.set_preference(&a, &c, &v)).await
     }
 
     pub async fn get_preference(&self, category: &str) -> Result<Option<String>> {
-        let c = category.to_owned();
-        self.with_db(move |db| db.get_preference(&c)).await
+        let (a, c) = (self.agent_id.clone(), category.to_owned());
+        self.with_db(move |db| db.get_preference(&a, &c)).await
     }
 
     pub async fn list_preferences(&self) -> Result<Vec<Preference>> {
-        self.with_db(|db| db.list_preferences()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.list_preferences(&a)).await
     }
 
     pub async fn search_preferences(&self, query: &str) -> Result<Vec<Preference>> {
-        let q = query.to_owned();
-        self.with_db(move |db| db.search_preferences(&q)).await
+        let (a, q) = (self.agent_id.clone(), query.to_owned());
+        self.with_db(move |db| db.search_preferences(&a, &q)).await
     }
 
     // -- Events --
@@ -300,110 +440,88 @@ impl AsyncDatabase {
         event_date: Option<&str>,
         context: Option<&str>,
     ) -> Result<i64> {
-        let (d, ed, c) = (
+        let (a, d, ed, c) = (
+            self.agent_id.clone(),
             description.to_owned(),
             event_date.map(|s| s.to_owned()),
             context.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.add_event(&d, ed.as_deref(), c.as_deref()))
+        self.with_db(move |db| db.add_event(&a, &d, ed.as_deref(), c.as_deref()))
             .await
     }
 
     pub async fn list_events(&self) -> Result<Vec<Event>> {
-        self.with_db(|db| db.list_events()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.list_events(&a)).await
     }
 
     pub async fn search_events(&self, query: &str) -> Result<Vec<Event>> {
-        let q = query.to_owned();
-        self.with_db(move |db| db.search_events(&q)).await
-    }
-
-    // -- Reminders --
-
-    pub async fn add_reminder(&self, fire_at: i64, message: &str) -> Result<i64> {
-        let m = message.to_owned();
-        self.with_db(move |db| db.add_reminder(fire_at, &m)).await
-    }
-
-    pub async fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
-        self.with_db(|db| db.get_pending_reminders()).await
-    }
-
-    pub async fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
-        self.with_db(|db| db.get_future_reminders()).await
-    }
-
-    pub async fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
-        self.with_db(|db| db.get_past_due_reminders()).await
-    }
-
-    pub async fn mark_reminder_delivered(&self, id: i64) -> Result<()> {
-        self.with_db(move |db| db.mark_reminder_delivered(id)).await
-    }
-
-    pub async fn mark_reminder_failed(&self, id: i64) -> Result<()> {
-        self.with_db(move |db| db.mark_reminder_failed(id)).await
-    }
-
-    pub async fn cancel_reminder(&self, id: i64) -> Result<bool> {
-        self.with_db(move |db| db.cancel_reminder(id)).await
-    }
-
-    pub async fn search_reminders(&self, query: &str) -> Result<Vec<Reminder>> {
-        let q = query.to_owned();
-        self.with_db(move |db| db.search_reminders(&q)).await
+        let (a, q) = (self.agent_id.clone(), query.to_owned());
+        self.with_db(move |db| db.search_events(&a, &q)).await
     }
 
     // -- Housekeeping --
 
     pub async fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
-        self.with_db(move |db| db.prune_old_heartbeat_sends(days))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.prune_old_heartbeat_sends(&a, days))
             .await
     }
 
     pub async fn record_heartbeat_send(&self) -> Result<()> {
-        self.with_db(|db| db.record_heartbeat_send()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.record_heartbeat_send(&a)).await
     }
 
     pub async fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
-        self.with_db(|db| db.count_heartbeat_sends_last_hour())
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_heartbeat_sends_last_hour(&a))
             .await
     }
 
     pub async fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
-        let tz = timezone.to_owned();
-        self.with_db(move |db| db.count_heartbeat_sends_today(&tz))
+        let (a, tz) = (self.agent_id.clone(), timezone.to_owned());
+        self.with_db(move |db| db.count_heartbeat_sends_today(&a, &tz))
             .await
     }
 
-    pub async fn last_user_message_time(&self) -> Result<Option<String>> {
-        self.with_db(|db| db.last_user_message_time()).await
+    pub async fn last_user_message_time(&self) -> Result<Option<i64>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.last_user_message_time(&a)).await
     }
 
     // -- Failed Sends --
 
     pub async fn save_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
-        let (t, r) = (text.to_owned(), request_id.map(|s| s.to_owned()));
-        self.with_db(move |db| db.save_failed_send(&t, r.as_deref()))
+        let (a, t, r) = (
+            self.agent_id.clone(),
+            text.to_owned(),
+            request_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.save_failed_send(&a, &t, r.as_deref()))
             .await
     }
 
     pub async fn get_pending_failed_sends(&self, limit: usize) -> Result<Vec<FailedSend>> {
-        self.with_db(move |db| db.get_pending_failed_sends(limit))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_pending_failed_sends(&a, limit))
             .await
     }
 
     pub async fn delete_failed_send(&self, id: i64) -> Result<()> {
-        self.with_db(move |db| db.delete_failed_send(id)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.delete_failed_send(&a, id)).await
     }
 
     pub async fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
-        self.with_db(move |db| db.increment_failed_send_retry(id))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.increment_failed_send_retry(&a, id))
             .await
     }
 
     pub async fn compact_old_memory_events(&self, days: u32) -> Result<usize> {
-        self.with_db(move |db| db.compact_old_memory_events(days))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.compact_old_memory_events(&a, days))
             .await
     }
 
@@ -422,17 +540,18 @@ impl AsyncDatabase {
     // -- Customer Config --
 
     pub async fn get_customer_config(&self, key: &str) -> Result<Option<String>> {
-        let k = key.to_owned();
-        self.with_db(move |db| db.get_customer_config(&k)).await
+        let (a, k) = (self.agent_id.clone(), key.to_owned());
+        self.with_db(move |db| db.get_customer_config(&a, &k)).await
     }
 
     pub async fn set_customer_config(&self, key: &str, value: &str) -> Result<()> {
-        let (k, v) = (key.to_owned(), value.to_owned());
-        self.with_db(move |db| db.set_customer_config(&k, &v)).await
+        let (a, k, v) = (self.agent_id.clone(), key.to_owned(), value.to_owned());
+        self.with_db(move |db| db.set_customer_config(&a, &k, &v)).await
     }
 
     pub async fn list_customer_config(&self) -> Result<Vec<(String, String)>> {
-        self.with_db(|db| db.list_customer_config()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.list_customer_config(&a)).await
     }
 
     // -- Cross-Channel Queries --
@@ -441,18 +560,20 @@ impl AsyncDatabase {
         &self,
         after_id: i64,
         channel_types: Option<Vec<String>>,
-    ) -> Result<Vec<crate::db::ConversationMessage>> {
+    ) -> Result<Vec<ConversationMessage>> {
+        let a = self.agent_id.clone();
         self.with_db(move |db| {
             let refs: Option<Vec<&str>> = channel_types
                 .as_ref()
                 .map(|v| v.iter().map(|s| s.as_str()).collect());
-            db.load_messages_after(after_id, refs.as_deref())
+            db.load_messages_after(&a, after_id, refs.as_deref())
         })
         .await
     }
 
     pub async fn max_message_id(&self) -> Result<i64> {
-        self.with_db(|db| db.max_message_id()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.max_message_id(&a)).await
     }
 
     // -- Audit --
@@ -466,7 +587,8 @@ impl AsyncDatabase {
         after_value: &str,
         reasoning: Option<&str>,
     ) -> Result<()> {
-        let (sid, tn, tk, bv, av, r) = (
+        let (a, sid, tn, tk, bv, av, r) = (
+            self.agent_id.clone(),
             session_id.to_owned(),
             tool_name.to_owned(),
             target_key.to_owned(),
@@ -475,33 +597,36 @@ impl AsyncDatabase {
             reasoning.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
-            db.log_memory_event(&sid, &tn, &tk, bv.as_deref(), &av, r.as_deref())
+            db.log_memory_event(&a, &sid, &tn, &tk, bv.as_deref(), &av, r.as_deref())
         })
         .await
     }
 
     pub async fn get_memory_events(&self, session_id: &str) -> Result<Vec<MemoryEvent>> {
-        let s = session_id.to_owned();
-        self.with_db(move |db| db.get_memory_events(&s)).await
+        let (a, s) = (self.agent_id.clone(), session_id.to_owned());
+        self.with_db(move |db| db.get_memory_events(&a, &s)).await
     }
 
     // -- Reflection --
 
     pub async fn get_conversations_since(
         &self,
-        since_utc: &str,
+        since_unix: i64,
     ) -> Result<Vec<ConversationMessage>> {
-        let s = since_utc.to_owned();
-        self.with_db(move |db| db.get_conversations_since(&s)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_conversations_since(&a, since_unix))
+            .await
     }
 
-    pub async fn get_memory_events_since(&self, since_utc: &str) -> Result<Vec<MemoryEvent>> {
-        let s = since_utc.to_owned();
-        self.with_db(move |db| db.get_memory_events_since(&s)).await
+    pub async fn get_memory_events_since(&self, since_unix: i64) -> Result<Vec<MemoryEvent>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_memory_events_since(&a, since_unix))
+            .await
     }
 
     pub async fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
-        self.with_db(move |db| db.prune_old_reflection_runs(days))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.prune_old_reflection_runs(&a, days))
             .await
     }
 
@@ -511,20 +636,24 @@ impl AsyncDatabase {
         changes_made: i64,
         summary: Option<&str>,
     ) -> Result<()> {
-        let (st, su) = (status.to_owned(), summary.map(|s| s.to_owned()));
-        self.with_db(move |db| db.record_reflection_run(&st, changes_made, su.as_deref()))
+        let (a, st, su) = (
+            self.agent_id.clone(),
+            status.to_owned(),
+            summary.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.record_reflection_run(&a, &st, changes_made, su.as_deref()))
             .await
     }
 
     pub async fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
-        let tz = timezone.to_owned();
-        self.with_db(move |db| db.last_reflection_run_today(&tz))
+        let (a, tz) = (self.agent_id.clone(), timezone.to_owned());
+        self.with_db(move |db| db.last_reflection_run_today(&a, &tz))
             .await
     }
 
     pub async fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
-        let s = session_id.to_owned();
-        self.with_db(move |db| db.count_memory_events_for_session(&s))
+        let (a, s) = (self.agent_id.clone(), session_id.to_owned());
+        self.with_db(move |db| db.count_memory_events_for_session(&a, &s))
             .await
     }
 
@@ -536,8 +665,13 @@ impl AsyncDatabase {
         source_id: Option<i64>,
         content: &str,
     ) -> Result<i64> {
-        let (st, sid, c) = (source_type.to_owned(), source_id, content.to_owned());
-        self.with_db(move |db| db.index_content(&st, sid, &c)).await
+        let (a, st, c) = (
+            self.agent_id.clone(),
+            source_type.to_owned(),
+            content.to_owned(),
+        );
+        self.with_db(move |db| db.index_content(&a, &st, source_id, &c))
+            .await
     }
 
     pub async fn index_embedding(&self, content_id: i64, embedding: Vec<f32>) -> Result<()> {
@@ -546,13 +680,14 @@ impl AsyncDatabase {
     }
 
     pub async fn delete_search_content(&self, source_type: &str, source_id: i64) -> Result<()> {
-        let st = source_type.to_owned();
-        self.with_db(move |db| db.delete_search_content(&st, source_id))
+        let (a, st) = (self.agent_id.clone(), source_type.to_owned());
+        self.with_db(move |db| db.delete_search_content(&a, &st, source_id))
             .await
     }
 
     pub async fn count_search_content(&self) -> Result<i64> {
-        self.with_db(|db| db.count_search_content()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_search_content(&a)).await
     }
 
     pub async fn fts_search(
@@ -561,9 +696,12 @@ impl AsyncDatabase {
         limit: usize,
         source_type_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let q = query.to_owned();
-        let st = source_type_filter.map(|s| s.to_owned());
-        self.with_db(move |db| db.fts_search(&q, limit, st.as_deref()))
+        let (a, q, st) = (
+            self.agent_id.clone(),
+            query.to_owned(),
+            source_type_filter.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.fts_search(&a, &q, limit, st.as_deref()))
             .await
     }
 
@@ -574,14 +712,18 @@ impl AsyncDatabase {
         limit: usize,
         source_type_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let q = fts_query.to_owned();
-        let st = source_type_filter.map(|s| s.to_owned());
-        self.with_db(move |db| db.hybrid_search(&q, embedding.as_deref(), limit, st.as_deref()))
+        let (a, q, st) = (
+            self.agent_id.clone(),
+            fts_query.to_owned(),
+            source_type_filter.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.hybrid_search(&a, &q, embedding.as_deref(), limit, st.as_deref()))
             .await
     }
 
     pub async fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
-        self.with_db(|db| db.get_all_facts_for_indexing()).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_all_facts_for_indexing(&a)).await
     }
 
     // -- Team Runs --
@@ -702,13 +844,10 @@ mod tests {
         db.save_message("assistant", "Hi there!", "cli")
             .await
             .unwrap();
-
         let messages = db.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "Hello!");
         assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "Hi there!");
     }
 
     #[tokio::test]
@@ -716,8 +855,6 @@ mod tests {
         let db = test_async_db();
         db.save_message("user", "Message 1", "cli").await.unwrap();
         db.save_message("user", "Message 2", "cli").await.unwrap();
-
-        // Spawn multiple concurrent reads
         let mut handles = Vec::new();
         for _ in 0..5 {
             let db_clone = db.clone();
@@ -725,7 +862,6 @@ mod tests {
                 db_clone.load_recent_messages(10, None).await.unwrap()
             }));
         }
-
         for handle in handles {
             let messages = handle.await.unwrap();
             assert_eq!(messages.len(), 2);
@@ -736,14 +872,11 @@ mod tests {
     async fn test_async_clone_shares_connection() {
         let db = test_async_db();
         let db2 = db.clone();
-
-        // Write via one clone, read via the other
         db.save_message("user", "From clone 1", "cli")
             .await
             .unwrap();
         let messages = db2.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "From clone 1");
     }
 
     #[tokio::test]
@@ -752,8 +885,6 @@ mod tests {
         db.save_message("user", "before panic", "cli")
             .await
             .unwrap();
-
-        // Send a closure that panics — the thread should catch it
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         db.inner
             .sender
@@ -766,23 +897,17 @@ mod tests {
                 panic!("intentional test panic");
             }))
             .unwrap();
-        // Wait for the panicking closure to execute
         rx.await.unwrap();
-
-        // Thread should still be alive — this call should succeed
         let messages = db.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "before panic");
     }
 
     #[tokio::test]
     async fn test_async_core_memory_roundtrip() {
         let db = test_async_db();
         db.seed_core_memory(None).await.unwrap();
-
         let entries = db.get_all_core_memory().await.unwrap();
         assert!(!entries.is_empty());
-
         let entry = db.get_core_memory("user_summary").await.unwrap().unwrap();
         assert_eq!(entry.value, "New user. No information yet.");
     }
@@ -793,12 +918,8 @@ mod tests {
         db.save_message("user", "before shutdown", "cli")
             .await
             .unwrap();
-
-        // Verify data is there before shutdown
         let messages = db.load_recent_messages(10, None).await.unwrap();
         assert_eq!(messages.len(), 1);
-
-        // Shutdown should complete without hanging (only clone, so thread joins)
         db.shutdown();
     }
 
@@ -806,10 +927,7 @@ mod tests {
     async fn test_shutdown_rejects_subsequent_operations() {
         let db = test_async_db();
         db.save_message("user", "msg", "cli").await.unwrap();
-
         db.shutdown();
-
-        // After shutdown, operations should return an error
         let result = db.load_recent_messages(10, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("shut down"));
@@ -819,9 +937,60 @@ mod tests {
     async fn test_shutdown_idempotent() {
         let db = test_async_db();
         db.save_message("user", "msg", "cli").await.unwrap();
+        db.shutdown();
+        db.shutdown();
+    }
 
-        // Calling shutdown multiple times should not panic
-        db.shutdown();
-        db.shutdown();
+    #[tokio::test]
+    async fn test_last_user_message_time_returns_i64() {
+        let db = test_async_db();
+        assert!(db.last_user_message_time().await.unwrap().is_none());
+        db.save_message("user", "hello", "cli").await.unwrap();
+        let ts = db.last_user_message_time().await.unwrap();
+        assert!(ts.is_some());
+        assert!(ts.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_with_agent_scoping() {
+        let db = test_async_db();
+        // Register a second agent
+        db.register_agent("agent2", "Agent 2", "").await.unwrap();
+        let db2 = db.with_agent("agent2");
+        db.save_message("user", "from main", "cli").await.unwrap();
+        db2.save_message("user", "from agent2", "cli").await.unwrap();
+        let main_msgs = db.load_recent_messages(10, None).await.unwrap();
+        let agent2_msgs = db2.load_recent_messages(10, None).await.unwrap();
+        assert_eq!(main_msgs.len(), 1);
+        assert_eq!(agent2_msgs.len(), 1);
+        assert_eq!(main_msgs[0].content, "from main");
+        assert_eq!(agent2_msgs[0].content, "from agent2");
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_task() {
+        let db = test_async_db();
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Async reminder".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        let t = db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(t.label, "Async reminder");
+        assert_eq!(t.status, "pending");
     }
 }

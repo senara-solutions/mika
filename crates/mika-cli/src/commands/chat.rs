@@ -21,8 +21,8 @@ use crate::tui::input;
 use crate::tui::ui;
 use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::prompt;
-use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
+use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::tools;
 use mika_common::claude::{ImageSource, ThinkingConfig};
@@ -69,8 +69,8 @@ async fn spawn_agent_worker(
     // Connect to MCP servers
     let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
 
-    // Recover reminders on startup and start background poller
-    let scheduler = Arc::new(ReminderScheduler {
+    // Set up task engine for background tasks (reminders, reflection)
+    let dispatcher = Arc::new(TaskDispatcher {
         db: ctx.async_db.clone(),
         claude: ctx.claude.clone(),
         tools: tool_registry.clone(),
@@ -81,12 +81,27 @@ async fn spawn_agent_worker(
         brave_api_key: brave_api_key.clone(),
         skills_dirty: skills_dirty.clone(),
         agent_lock: None, // CLI serializes via channel, no lock needed
-        reflection_config: identity.reflection.clone(),
     });
-    if let Err(e) = scheduler.recover().await {
-        tracing::warn!(error = %e, "reminder recovery failed");
+    let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
+        ctx.async_db.clone(),
+        dispatcher,
+    )));
+
+    // Register recurring reflection task and run startup recovery
+    task_engine::ensure_recurring_task(
+        &ctx.async_db,
+        "reflection",
+        "0 0 2 * * *",
+        r#"{"trigger":"reflection"}"#,
+    )
+    .await;
+    {
+        let mut eng = task_engine.lock().await;
+        if let Err(e) = eng.startup_recovery().await {
+            tracing::warn!(error = %e, "task engine startup recovery failed");
+        }
     }
-    let poller_handle = scheduler.spawn_poller();
+    let poller_handle = TaskEngine::spawn_tick_loop(task_engine);
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();

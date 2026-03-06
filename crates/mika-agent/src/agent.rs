@@ -1007,7 +1007,6 @@ async fn execute_tool(
 /// What triggered a silent-mode agent run.
 pub enum SilentTrigger {
     Heartbeat,
-    Reminder { id: i64, message: String },
     Reflection,
 }
 
@@ -1035,7 +1034,6 @@ pub struct SilentAgentParams<'a> {
 pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     let channel_type = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
-        SilentTrigger::Reminder { .. } => "reminder",
         SilentTrigger::Reflection => "reflection",
     };
 
@@ -1053,24 +1051,12 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     .await;
 
     match timeout_result {
-        Ok(result) => {
-            // For reminders, mark delivered/failed based on result
-            if let SilentTrigger::Reminder { id, .. } = &params.trigger {
-                match &result {
-                    Ok(_) => params.db.mark_reminder_delivered(*id).await?,
-                    Err(_) => params.db.mark_reminder_failed(*id).await?,
-                }
-            }
-            result
-        }
+        Ok(result) => result,
         Err(_elapsed) => {
             warn!(
                 timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
                 channel_type, "silent agent timeout exceeded"
             );
-            if let SilentTrigger::Reminder { id, .. } = &params.trigger {
-                params.db.mark_reminder_failed(*id).await?;
-            }
             // Record failed reflection run on timeout
             if matches!(&params.trigger, SilentTrigger::Reflection) {
                 let _ = params
@@ -1098,12 +1084,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
                 .get_customer_config("timezone")
                 .await?
                 .unwrap_or_else(|| "UTC".to_string());
-            let midnight_str = crate::db::today_midnight_utc(&tz_str)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string();
+            let midnight_unix = crate::db::today_midnight_utc(&tz_str).timestamp();
 
             // Load today's conversations (capped at 50,000 chars)
-            let conversations = db.get_conversations_since(&midnight_str).await?;
+            let conversations = db.get_conversations_since(midnight_unix).await?;
             let conv_digest = if conversations.is_empty() {
                 None
             } else {
@@ -1120,7 +1104,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
             };
 
             // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
-            let memory_events = db.get_memory_events_since(&midnight_str).await?;
+            let memory_events = db.get_memory_events_since(midnight_unix).await?;
             let mem_digest = if memory_events.is_empty() {
                 None
             } else {
@@ -1154,13 +1138,6 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
              upcoming events, and recent context. If there is something timely and \
              worthwhile to share, use send_message. Otherwise, do nothing."
                 .to_string()
-        }
-        SilentTrigger::Reminder { message, .. } => {
-            format!(
-                "This is a REMINDER firing. The user asked to be reminded:\n\
-                 <reminder-data>{message}</reminder-data>\n\
-                 Deliver this reminder using send_message, adding any relevant context."
-            )
         }
         SilentTrigger::Reflection => {
             "You are in REFLECTION mode. This is your daily end-of-day review.\n\n\
@@ -1214,14 +1191,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         system.push_str("\n</context>\n");
     }
 
-    // Match skills: heartbeat/reflection use safe always-on skills (no exec/http handlers),
-    // reminders use keyword matching against the reminder message.
-    let matched = match &params.trigger {
-        SilentTrigger::Heartbeat | SilentTrigger::Reflection => {
-            params.skills.safe_always_on_skills()
-        }
-        SilentTrigger::Reminder { message, .. } => params.skills.match_message(message),
-    };
+    // Match skills: use safe always-on skills (no exec/http handlers).
+    let matched = params.skills.safe_always_on_skills();
     let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched);
@@ -1229,9 +1200,6 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
     // For silent mode, provide a brief "trigger" as the user message
     let user_msg = match &params.trigger {
         SilentTrigger::Heartbeat => "[heartbeat trigger]".to_string(),
-        SilentTrigger::Reminder { message, .. } => {
-            format!("[reminder trigger: <reminder-data>{message}</reminder-data>]")
-        }
         SilentTrigger::Reflection => "[reflection trigger]".to_string(),
     };
 

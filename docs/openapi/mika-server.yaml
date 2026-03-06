@@ -26,30 +26,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
-  /heartbeat:
-    post:
-      tags:
-      - handlers
-      summary: POST /heartbeat — Scheduled job triggers proactive check-in.
-      description: |-
-        Pre-filters (active hours, rate limits) without acquiring Mutex.
-        Returns 204 if skipped, 200 if accepted for processing.
-      operationId: handle_heartbeat
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/HeartbeatRequest'
-        required: true
-      responses:
-        '200':
-          description: Heartbeat accepted for processing
-        '204':
-          description: Heartbeat skipped (rate limit, inactive hours, or agent busy)
-        '401':
-          description: Missing or invalid Bearer token
-      security:
-      - bearer: []
   /message:
     post:
       tags:
@@ -109,17 +85,6 @@ components:
           - 'null'
           format: int64
           minimum: 0
-    HeartbeatRequest:
-      type: object
-      description: Inbound heartbeat trigger from the gateway or external scheduler.
-      required:
-      - request_id
-      properties:
-        agent:
-          type: string
-          description: Target agent name (defaults to the server's default agent if absent).
-        request_id:
-          type: string
     ImagePayload:
       type: object
       description: Image payload forwarded from the gateway.

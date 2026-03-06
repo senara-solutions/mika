@@ -30,15 +30,6 @@ pub struct AcceptedResponse {
     pub status: String,
 }
 
-/// Inbound heartbeat trigger from the gateway or external scheduler.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct HeartbeatRequest {
-    pub request_id: String,
-    /// Target agent name (defaults to the server's default agent if absent).
-    #[serde(default)]
-    pub agent: String,
-}
-
 /// Health check response body.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {

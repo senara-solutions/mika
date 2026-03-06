@@ -12,6 +12,12 @@ pub fn resolve_home_dir() -> Result<PathBuf> {
     Ok(home.join(".mika"))
 }
 
+/// Path to the single shared container database: `{home_dir}/data/mika.db`.
+/// This is the unified schema v1 database that replaces per-agent databases.
+pub fn container_db_path(home_dir: &Path) -> PathBuf {
+    home_dir.join("data").join("mika.db")
+}
+
 /// Check if Mika has been initialized (database exists).
 /// Supports both legacy layout (data/mika.db at root) and multi-agent layout.
 pub fn is_initialized(home_dir: &Path) -> bool {

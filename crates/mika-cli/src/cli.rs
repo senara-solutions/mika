@@ -42,6 +42,8 @@ pub enum Commands {
     Teams(TeamsArgs),
     /// Manage MCP (Model Context Protocol) servers
     Mcp(McpArgs),
+    /// List or cancel pending tasks
+    Tasks(TaskArgs),
 }
 
 #[derive(clap::Args)]
@@ -217,8 +219,20 @@ pub struct ReminderArgs {
 
 #[derive(Subcommand)]
 pub enum ReminderCommand {
-    /// Cancel a reminder by ID
-    Cancel { id: i64 },
+    /// Cancel a reminder by ID (from `mika reminders`)
+    Cancel { id: String },
+}
+
+#[derive(clap::Args)]
+pub struct TaskArgs {
+    #[command(subcommand)]
+    pub command: Option<TaskCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum TaskCommand {
+    /// Cancel a task by ID (from `mika tasks`)
+    Cancel { id: String },
 }
 
 #[derive(clap::Args)]

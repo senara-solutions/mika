@@ -1,5 +1,4 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use chrono::Timelike;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::Instrument;
@@ -7,16 +6,13 @@ use tracing::{error, info, warn};
 
 use mika_common::claude::ImageSource;
 
-use crate::agent::{
-    self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent,
-};
-use crate::async_db::AsyncDatabase;
+use crate::agent::{self, AgentParams, check_onboarding};
 use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 
 use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
-use super::types::{AcceptedResponse, HealthResponse, HeartbeatRequest, MessageRequest};
+use super::types::{AcceptedResponse, HealthResponse, MessageRequest};
 
 /// Media types accepted by the Claude API for image content blocks.
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -274,104 +270,6 @@ pub async fn handle_message(
         .into_response()
 }
 
-/// POST /heartbeat — Scheduled job triggers proactive check-in.
-///
-/// Pre-filters (active hours, rate limits) without acquiring Mutex.
-/// Returns 204 if skipped, 200 if accepted for processing.
-#[utoipa::path(
-    post,
-    path = "/heartbeat",
-    request_body = HeartbeatRequest,
-    responses(
-        (status = 200, description = "Heartbeat accepted for processing"),
-        (status = 204, description = "Heartbeat skipped (rate limit, inactive hours, or agent busy)"),
-        (status = 401, description = "Missing or invalid Bearer token"),
-    ),
-    security(("bearer" = []))
-)]
-pub async fn handle_heartbeat(
-    State(state): State<AppState>,
-    JsonBody(req): JsonBody<HeartbeatRequest>,
-) -> impl IntoResponse {
-    info!(request_id = %req.request_id, "heartbeat received");
-
-    // Resolve agent state (Arc clone — cheap atomic increment)
-    let agent_state = match state.resolve_agent(&req.agent) {
-        Some(a) => a,
-        None => {
-            info!(request_id = %req.request_id, agent = %req.agent, "heartbeat for unknown agent, skipping");
-            return StatusCode::NO_CONTENT;
-        }
-    };
-
-    // Pre-filter: check if heartbeat should run (no Mutex, no Claude call)
-    if !heartbeat_should_run(&agent_state.db).await {
-        info!(request_id = %req.request_id, "heartbeat skipped by pre-filter");
-        return StatusCode::NO_CONTENT;
-    }
-
-    // try_lock — heartbeat is skippable if agent is busy
-    let lock = match agent_state.agent_lock.clone().try_lock_owned() {
-        Ok(guard) => guard,
-        Err(_) => return StatusCode::NO_CONTENT,
-    };
-
-    // Spawn silent agent loop
-    let s = state.clone();
-    let a = agent_state.clone();
-    tokio::spawn(async move {
-        let _lock = lock;
-
-        // Hot-reload skills if the dirty flag was set by a previous turn
-        let skills = if a.skills_dirty.load(Ordering::Acquire) {
-            a.skills_dirty.store(false, Ordering::Release);
-            let new = Arc::new(crate::skills::SkillRegistry::from_dir(
-                &a.home_dir.join("skills"),
-            ));
-            *a.skills.lock().unwrap() = new.clone();
-            new
-        } else {
-            a.skills.lock().unwrap().clone()
-        };
-
-        let session_id = uuid::Uuid::new_v4().to_string();
-
-        let sender = GatewayMessageSender::new(
-            s.gateway_url.clone(),
-            s.internal_token.clone(),
-            a.db.clone(),
-            s.http_client.clone(),
-            Some(req.request_id.clone()),
-        );
-        let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
-
-        let params = SilentAgentParams {
-            db: &a.db,
-            claude: &s.claude,
-            tools: &s.tools,
-            skills: &skills,
-            trigger: SilentTrigger::Heartbeat,
-            home_dir: &a.home_dir,
-            session_id: &session_id,
-            message_sender: Some(sender_arc),
-            embedding_client: a.embedding_client.as_ref(),
-            brave_api_key: s.brave_api_key.as_deref(),
-            skills_dirty: &a.skills_dirty,
-        };
-
-        if let Err(e) = run_silent_agent(&params).await {
-            warn!(error = %e, "heartbeat agent loop failed");
-        }
-
-        // Record the heartbeat send for rate limiting
-        if let Err(e) = a.db.record_heartbeat_send().await {
-            warn!(error = %e, "failed to record heartbeat send");
-        }
-    });
-
-    StatusCode::OK
-}
-
 /// Flush previously failed outbound sends (best-effort, up to 5).
 async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
     let sends = match agent_state.db.get_pending_failed_sends(5).await {
@@ -400,44 +298,3 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
     }
 }
 
-/// Pre-filter for heartbeat: checks active hours, rate limits, and recent activity.
-/// Returns false if the heartbeat should be skipped (cheap — no Mutex or Claude call).
-async fn heartbeat_should_run(db: &AsyncDatabase) -> bool {
-    let tz_str = db
-        .get_customer_config("timezone")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "UTC".to_string());
-
-    // 1. Active hours check (8:00-21:00 in customer's timezone)
-    let now_utc = chrono::Utc::now();
-    let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
-    let now_local = now_utc.with_timezone(&tz);
-    let hour = now_local.hour();
-    if !(8..21).contains(&hour) {
-        return false;
-    }
-
-    // 2. Rate limit: max 1 heartbeat per hour
-    if db.count_heartbeat_sends_last_hour().await.unwrap_or(0) >= 1 {
-        return false;
-    }
-
-    // 3. Rate limit: max 3 heartbeats per day
-    if db.count_heartbeat_sends_today(&tz_str).await.unwrap_or(0) >= 3 {
-        return false;
-    }
-
-    // 4. Skip if user messaged recently (within last 2 hours)
-    if let Ok(Some(last_msg)) = db.last_user_message_time().await
-        && let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&last_msg, "%Y-%m-%d %H:%M:%S")
-    {
-        let elapsed = now_utc.naive_utc() - parsed;
-        if elapsed < chrono::TimeDelta::hours(2) {
-            return false;
-        }
-    }
-
-    true
-}

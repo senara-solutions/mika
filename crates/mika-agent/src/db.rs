@@ -1,21 +1,16 @@
 use anyhow::{Context, Result};
-use chrono::DateTime;
-use rusqlite::Connection;
+use chrono::{TimeZone, Utc};
+use chrono_tz::Tz;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
 use tracing::{debug, info};
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
-/// Idempotent — uses an internal Once guard so multiple calls are safe.
-/// Auto-called by [`Database::open`] and [`Database::open_in_memory`], so
-/// callers typically don't need to invoke this directly.
 pub fn init_sqlite_vec() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // SAFETY: sqlite3_auto_extension requires a function pointer matching
-        // the sqlite3 extension init signature. sqlite_vec::sqlite3_vec_init
-        // is provided by the sqlite-vec crate and matches this signature.
-        // This must run before any DB connections are opened.
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(
                 #[allow(clippy::missing_transmute_annotations)]
@@ -25,14 +20,10 @@ pub fn init_sqlite_vec() {
     });
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 
-/// Canonical list of valid commitment statuses at the database level.
-/// "pending" is the default for new commitments; "completed" and "cancelled" are terminal states.
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
-/// Canonical list of core memory section names and their default values.
-/// Used by seed_core_memory, CLI reset, update_core_memory validation, and prompt assembly.
 pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     ("user_summary", "New user. No information yet."),
     ("persona", "Mika -- personal AI executive assistant."),
@@ -43,2387 +34,76 @@ pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     ("key_people", "No one tracked yet."),
 ];
 
-/// Returns just the section names from CORE_MEMORY_SECTIONS.
 pub fn core_memory_section_names() -> Vec<&'static str> {
     CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect()
 }
 
-/// Per-customer SQLite database.
-pub struct Database {
-    conn: Connection,
+// ===== Public Types =====
+
+#[derive(Debug, Clone)]
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    pub home_dir: String,
+    pub active: bool,
+    pub last_seen: Option<i64>,
+    pub created_at: i64,
 }
 
-impl Database {
-    /// Open (or create) a per-customer SQLite database at `path`.
-    /// Runs migrations automatically. Registers sqlite-vec if not already done.
-    pub fn open(path: &Path) -> Result<Self> {
-        init_sqlite_vec();
-        let conn = Connection::open(path)
-            .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
-
-        // Performance pragmas
-        // auto_vacuum = INCREMENTAL must be set before first table creation for new DBs.
-        // For existing DBs it requires a full VACUUM to take effect (handled by migration).
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA auto_vacuum = INCREMENTAL;",
-        )
-        .context("failed to set SQLite pragmas")?;
-
-        let db = Self { conn };
-        db.migrate()?;
-        Ok(db)
-    }
-
-    /// Open an in-memory database (for tests).
-    /// Registers sqlite-vec if not already done.
-    pub fn open_in_memory() -> Result<Self> {
-        init_sqlite_vec();
-        let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .context("failed to set pragmas")?;
-        let db = Self { conn };
-        db.migrate()?;
-        Ok(db)
-    }
-
-    // -- Schema migrations --
-
-    fn current_version(&self) -> Result<i64> {
-        // schema_version table may not exist yet
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .context("failed to check schema_version existence")?;
-
-        if !exists {
-            return Ok(0);
-        }
-
-        let version: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                [],
-                |row| row.get(0),
-            )
-            .context("failed to read schema version")?;
-        Ok(version)
-    }
-
-    fn migrate(&self) -> Result<()> {
-        let version = self.current_version()?;
-        debug!(
-            current_version = version,
-            target_version = CURRENT_SCHEMA_VERSION,
-            "checking migrations"
-        );
-
-        if version >= CURRENT_SCHEMA_VERSION {
-            return Ok(());
-        }
-
-        if version < 4 {
-            self.migrate_v4()?;
-        }
-        if version < 5 {
-            self.migrate_v5()?;
-        }
-        if version < 6 {
-            self.migrate_v6()?;
-        }
-        if version < 7 {
-            self.migrate_v7()?;
-        }
-        if version < 8 {
-            self.migrate_v8()?;
-        }
-        if version < 9 {
-            self.migrate_v9()?;
-        }
-        if version < 10 {
-            self.migrate_v10()?;
-        }
-        if version < 11 {
-            self.migrate_v11()?;
-        }
-
-        info!(version = CURRENT_SCHEMA_VERSION, "database migrated");
-        Ok(())
-    }
-
-    fn migrate_v4(&self) -> Result<()> {
-        info!("applying migration v4: plaintext schema (encryption removed)");
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            -- Drop all existing tables if they exist (pre-production, no data to preserve)
-            DROP TABLE IF EXISTS memory_events;
-            DROP TABLE IF EXISTS events;
-            DROP TABLE IF EXISTS preferences;
-            DROP TABLE IF EXISTS commitments;
-            DROP TABLE IF EXISTS people;
-            DROP TABLE IF EXISTS core_memory;
-            DROP TABLE IF EXISTS conversations;
-            DROP TABLE IF EXISTS schema_version;
-
-            -- Schema version tracking
-            CREATE TABLE schema_version (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- Conversations (message history)
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                channel_type TEXT NOT NULL,
-                metadata TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- Core memory (Layer 1)
-            CREATE TABLE core_memory (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                token_count INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- People (Layer 2)
-            CREATE TABLE people (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                canonical_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                relationship TEXT,
-                notes TEXT,
-                first_mentioned TEXT NOT NULL DEFAULT (datetime('now')),
-                last_mentioned TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- Commitments (Layer 2)
-            CREATE TABLE commitments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                description TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                status TEXT NOT NULL DEFAULT 'pending',
-                due_date TEXT,
-                person_id INTEGER REFERENCES people(id),
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                completed_at TEXT
-            );
-            CREATE INDEX idx_commit_status ON commitments(status);
-            CREATE INDEX idx_commit_due ON commitments(due_date);
-
-            -- Preferences (Layer 2)
-            CREATE TABLE preferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- Events (Layer 2)
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                description TEXT NOT NULL,
-                event_date TEXT,
-                context TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX idx_events_date ON events(event_date);
-
-            -- Memory events (audit log)
-            CREATE TABLE memory_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                target_key TEXT NOT NULL,
-                before_value TEXT,
-                after_value TEXT,
-                reasoning TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX idx_memory_events_session ON memory_events(session_id);
-
-            -- Record version
-            INSERT INTO schema_version (version) VALUES (4);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v4")?;
-
-        Ok(())
-    }
-
-    fn migrate_v5(&self) -> Result<()> {
-        info!("applying migration v5: compaction, reminders, heartbeat, customer_config");
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            -- Compaction support: track which messages a summary covers
-            ALTER TABLE conversations ADD COLUMN compacted_through_id INTEGER;
-
-            -- Reminders (persisted Tokio timer state)
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fire_at TEXT NOT NULL,
-                message TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                delivered_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_reminders_status_fire_at ON reminders(status, fire_at);
-
-            -- Heartbeat send rate limiting
-            CREATE TABLE IF NOT EXISTS heartbeat_sends (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sent_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_heartbeat_sends_sent_at ON heartbeat_sends(sent_at);
-
-            -- Indexes on conversations for hot-path queries
-            CREATE INDEX IF NOT EXISTS idx_conversations_role ON conversations(role, id);
-            CREATE INDEX IF NOT EXISTS idx_conversations_channel_type ON conversations(channel_type, id);
-
-            -- Customer config (timezone, chat_id for outbound)
-            CREATE TABLE IF NOT EXISTS customer_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            -- Failed outbound sends (retry queue for /send failures)
-            CREATE TABLE IF NOT EXISTS failed_sends (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                request_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                retry_count INTEGER NOT NULL DEFAULT 0
-            );
-
-            INSERT INTO schema_version (version) VALUES (5);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v5")?;
-
-        Ok(())
-    }
-
-    fn migrate_v6(&self) -> Result<()> {
-        info!("applying migration v6: memory_event_summaries for tiered retention");
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            CREATE TABLE IF NOT EXISTS memory_event_summaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                year INTEGER NOT NULL,
-                month INTEGER NOT NULL,
-                tool_counts TEXT NOT NULL,
-                category_counts TEXT NOT NULL,
-                total_mutations INTEGER NOT NULL,
-                top_targets TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(year, month)
-            );
-
-            INSERT INTO schema_version (version) VALUES (6);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v6")?;
-
-        Ok(())
-    }
-
-    fn migrate_v7(&self) -> Result<()> {
-        info!("applying migration v7: index on memory_events.created_at");
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            CREATE INDEX IF NOT EXISTS idx_memory_events_created_at ON memory_events(created_at);
-
-            INSERT INTO schema_version (version) VALUES (7);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v7")?;
-
-        Ok(())
-    }
-
-    fn migrate_v8(&self) -> Result<()> {
-        info!(
-            "applying migration v8: Layer 3 search tables (search_content, vec_search, fts_search)"
-        );
-
-        // search_content and fts_search in one transaction
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            -- Unified content table for all searchable text
-            CREATE TABLE search_content (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_type TEXT NOT NULL,
-                source_id INTEGER,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX idx_search_content_source ON search_content(source_type, source_id);
-
-            -- FTS5 keyword index (BM25 ranking)
-            CREATE VIRTUAL TABLE fts_search USING fts5(
-                content,
-                content_id UNINDEXED,
-                source_type UNINDEXED,
-                tokenize='porter unicode61'
-            );
-
-            INSERT INTO schema_version (version) VALUES (8);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v8 (search_content + fts_search)")?;
-
-        // vec0 virtual table must be created outside the transaction
-        // (sqlite-vec limitation with virtual tables)
-        self.conn
-            .execute_batch(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_search USING vec0(
-                    content_id INTEGER PRIMARY KEY,
-                    embedding float[512]
-                );",
-            )
-            .context("failed to create vec_search table")?;
-
-        Ok(())
-    }
-
-    fn migrate_v9(&self) -> Result<()> {
-        info!(
-            "applying migration v9: convert reminders.fire_at from TEXT to INTEGER (unix timestamp)"
-        );
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            -- Add new integer column
-            ALTER TABLE reminders ADD COLUMN fire_at_unix INTEGER;
-
-            -- Backfill: unixepoch() handles both 'T' and space separators
-            UPDATE reminders SET fire_at_unix = unixepoch(fire_at);
-
-            -- Guard: mark any reminders with unparseable fire_at as failed
-            -- (unixepoch returns NULL for invalid input)
-            UPDATE reminders SET status = 'failed'
-                WHERE fire_at_unix IS NULL AND status = 'pending';
-            -- Set a safe default for non-pending rows with NULL (delivered/cancelled/failed)
-            UPDATE reminders SET fire_at_unix = 0 WHERE fire_at_unix IS NULL;
-
-            -- Must drop index before dropping the column (SQLite constraint)
-            DROP INDEX IF EXISTS idx_reminders_status_fire_at;
-
-            -- Drop old text column (requires SQLite 3.35+)
-            ALTER TABLE reminders DROP COLUMN fire_at;
-
-            -- Rename new column to fire_at
-            ALTER TABLE reminders RENAME COLUMN fire_at_unix TO fire_at;
-
-            -- Recreate index on the new integer column
-            CREATE INDEX idx_reminders_status_fire_at ON reminders(status, fire_at);
-
-            INSERT INTO schema_version (version) VALUES (9);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v9")?;
-
-        Ok(())
-    }
-
-    fn migrate_v10(&self) -> Result<()> {
-        info!("applying migration v10: reflection_runs table for periodic memory reflection");
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            CREATE TABLE IF NOT EXISTS reflection_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ran_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'completed',
-                changes_made INTEGER DEFAULT 0,
-                summary TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_reflection_runs_ran_at ON reflection_runs(ran_at);
-
-            CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
-
-            INSERT INTO schema_version (version) VALUES (10);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v10")?;
-
-        Ok(())
-    }
-
-    fn migrate_v11(&self) -> Result<()> {
-        info!(
-            "applying migration v11: team_runs and team_messages tables for graph-structured team persistence"
-        );
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            CREATE TABLE IF NOT EXISTS team_runs (
-                id TEXT PRIMARY KEY,
-                team_name TEXT NOT NULL,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'running',
-                failure_reason TEXT,
-                iteration INTEGER NOT NULL DEFAULT 0,
-                max_iterations INTEGER NOT NULL DEFAULT 3,
-                deliverable TEXT,
-                started_at INTEGER NOT NULL,
-                ended_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_team_runs_team_started ON team_runs(team_name, started_at);
-
-            CREATE TABLE IF NOT EXISTS team_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES team_runs(id),
-                parent_id INTEGER REFERENCES team_messages(id),
-                agent_name TEXT,
-                message_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                iteration INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
-            );
-            CREATE INDEX IF NOT EXISTS idx_team_messages_run ON team_messages(run_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_team_messages_parent ON team_messages(parent_id);
-
-            INSERT INTO schema_version (version) VALUES (11);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply migration v11")?;
-
-        Ok(())
-    }
-
-    // -- Team Runs --
-
-    /// Insert a new team run record. Returns the run_id.
-    pub fn insert_team_run(
-        &self,
-        run_id: &str,
-        team_name: &str,
-        goal: &str,
-        max_iterations: u32,
-        started_at: i64,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO team_runs (id, team_name, goal, status, max_iterations, started_at)
-                 VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
-                rusqlite::params![run_id, team_name, goal, max_iterations, started_at],
-            )
-            .context("failed to insert team run")?;
-        Ok(())
-    }
-
-    /// Update a team run's status, iteration, deliverable, and end time.
-    pub fn update_team_run(
-        &self,
-        run_id: &str,
-        status: &str,
-        failure_reason: Option<&str>,
-        iteration: u32,
-        deliverable: Option<&str>,
-        ended_at: Option<i64>,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
-                 deliverable = ?4, ended_at = ?5 WHERE id = ?6",
-                rusqlite::params![
-                    status,
-                    failure_reason,
-                    iteration,
-                    deliverable,
-                    ended_at,
-                    run_id
-                ],
-            )
-            .context("failed to update team run")?;
-        Ok(())
-    }
-
-    /// Load recent team runs, most recent first.
-    pub fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
-                    deliverable, started_at, ended_at
-             FROM team_runs WHERE team_name = ?1
-             ORDER BY started_at DESC LIMIT ?2",
-        )?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![team_name, limit], |row| {
-                Ok(TeamRunRow {
-                    id: row.get(0)?,
-                    team_name: row.get(1)?,
-                    goal: row.get(2)?,
-                    status: row.get(3)?,
-                    failure_reason: row.get(4)?,
-                    iteration: row.get(5)?,
-                    max_iterations: row.get(6)?,
-                    deliverable: row.get(7)?,
-                    started_at: row.get(8)?,
-                    ended_at: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to load team runs")?;
-
-        Ok(rows)
-    }
-
-    /// Load recent team runs with goal and deliverable truncated in SQL.
-    ///
-    /// Used for prompt injection where full text is unnecessary.
-    /// `max_text_len` controls the `SUBSTR` limit for both fields.
-    pub fn load_team_runs_for_prompt(
-        &self,
-        team_name: &str,
-        limit: usize,
-        max_text_len: usize,
-    ) -> Result<Vec<TeamRunRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, team_name, SUBSTR(goal, 1, ?3), status, failure_reason,
-                    iteration, max_iterations, SUBSTR(deliverable, 1, ?3),
-                    started_at, ended_at
-             FROM team_runs WHERE team_name = ?1
-             ORDER BY started_at DESC LIMIT ?2",
-        )?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![team_name, limit, max_text_len], |row| {
-                Ok(TeamRunRow {
-                    id: row.get(0)?,
-                    team_name: row.get(1)?,
-                    goal: row.get(2)?,
-                    status: row.get(3)?,
-                    failure_reason: row.get(4)?,
-                    iteration: row.get(5)?,
-                    max_iterations: row.get(6)?,
-                    deliverable: row.get(7)?,
-                    started_at: row.get(8)?,
-                    ended_at: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to load team runs for prompt")?;
-
-        Ok(rows)
-    }
-
-    /// Load the latest team run for a team.
-    pub fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
-        let mut runs = self.load_team_runs(team_name, 1)?;
-        Ok(runs.pop())
-    }
-
-    /// Load a specific team run by its ID.
-    pub fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, team_name, goal, status, failure_reason, iteration, max_iterations,
-                    deliverable, started_at, ended_at
-             FROM team_runs WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map([run_id], |row| {
-            Ok(TeamRunRow {
-                id: row.get(0)?,
-                team_name: row.get(1)?,
-                goal: row.get(2)?,
-                status: row.get(3)?,
-                failure_reason: row.get(4)?,
-                iteration: row.get(5)?,
-                max_iterations: row.get(6)?,
-                deliverable: row.get(7)?,
-                started_at: row.get(8)?,
-                ended_at: row.get(9)?,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(row)) => Ok(Some(row)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
-    }
-
-    // -- Team Messages --
-
-    /// Insert a team message and return its id.
-    pub fn insert_team_message(
-        &self,
-        run_id: &str,
-        parent_id: Option<i64>,
-        agent_name: Option<&str>,
-        message_type: &str,
-        content: &str,
-        iteration: u32,
-    ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO team_messages (run_id, parent_id, agent_name, message_type, content, iteration)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![run_id, parent_id, agent_name, message_type, content, iteration],
-            )
-            .context("failed to insert team message")?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Load all messages for a team run, ordered by creation time.
-    pub fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, parent_id, agent_name, message_type, content, iteration, created_at
-             FROM team_messages WHERE run_id = ?1 ORDER BY created_at, id",
-        )?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![run_id], |row| {
-                Ok(TeamMessageRow {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    parent_id: row.get(2)?,
-                    agent_name: row.get(3)?,
-                    message_type: row.get(4)?,
-                    content: row.get(5)?,
-                    iteration: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to load team messages")?;
-
-        Ok(rows)
-    }
-
-    /// Load assignment message IDs for a specific run and iteration.
-    ///
-    /// Returns a map of agent_name -> message_id for assignment messages,
-    /// used for parent-linking agent responses to their assignments.
-    pub fn load_assignment_msg_ids(
-        &self,
-        run_id: &str,
-        iteration: u32,
-    ) -> Result<std::collections::HashMap<String, i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, agent_name FROM team_messages
-             WHERE run_id = ?1 AND message_type = 'assignment' AND iteration = ?2
-             ORDER BY id",
-        )?;
-        let map = stmt
-            .query_map(rusqlite::params![run_id, iteration], |row| {
-                let id: i64 = row.get(0)?;
-                let agent: Option<String> = row.get(1)?;
-                Ok((agent, id))
-            })?
-            .filter_map(|r| r.ok())
-            .filter_map(|(agent, id)| agent.map(|name| (name, id)))
-            .collect();
-        Ok(map)
-    }
-
-    // -- Conversations --
-
-    /// Save a conversation message.
-    pub fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
-        self.save_message_with_metadata(role, content, channel_type, None)
-    }
-
-    /// Save a conversation message with optional JSON metadata (e.g., tool call summaries).
-    pub fn save_message_with_metadata(
-        &self,
-        role: &str,
-        content: &str,
-        channel_type: &str,
-        metadata: Option<&str>,
-    ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO conversations (role, content, channel_type, metadata) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![role, content, channel_type, metadata],
-            )
-            .context("failed to insert conversation with metadata")?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Load the N most recent messages, oldest first.
-    /// If `channel_types` is Some, only messages with matching channel_type are returned.
-    /// If None, all messages are returned (used by compaction).
-    /// Summary rows (role = 'summary') are always excluded — use `load_conversation_summary()`.
-    pub fn load_recent_messages(
-        &self,
-        limit: usize,
-        channel_types: Option<&[&str]>,
-    ) -> Result<Vec<ConversationMessage>> {
-        let (sql, params) = match channel_types {
-            Some(types) if !types.is_empty() => {
-                let placeholders: Vec<String> =
-                    (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
-                let sql = format!(
-                    "SELECT id, role, content, channel_type, metadata, created_at
-                     FROM conversations
-                     WHERE role != 'summary' AND channel_type IN ({})
-                     ORDER BY id DESC LIMIT ?1",
-                    placeholders.join(", ")
-                );
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(limit as i64)];
-                for t in types {
-                    params.push(Box::new(t.to_string()));
-                }
-                (sql, params)
-            }
-            _ => {
-                let sql = "SELECT id, role, content, channel_type, metadata, created_at
-                     FROM conversations
-                     WHERE role != 'summary'
-                     ORDER BY id DESC LIMIT ?1"
-                    .to_string();
-                let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(limit as i64)];
-                (sql, params)
-            }
-        };
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let mut messages: Vec<ConversationMessage> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(ConversationMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    channel_type: row.get(3)?,
-                    metadata: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        // Reverse to oldest-first order
-        messages.reverse();
-        Ok(messages)
-    }
-
-    // -- Core Memory --
-
-    /// Get a core memory value by key.
-    pub fn get_core_memory(&self, key: &str) -> Result<Option<CoreMemoryEntry>> {
-        let entry = self
-            .conn
-            .query_row(
-                "SELECT key, value, token_count, updated_at FROM core_memory WHERE key = ?1",
-                [key],
-                |row| {
-                    Ok(CoreMemoryEntry {
-                        key: row.get(0)?,
-                        value: row.get(1)?,
-                        token_count: row.get(2)?,
-                        updated_at: row.get(3)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(entry)
-    }
-
-    /// Get all core memory entries.
-    pub fn get_all_core_memory(&self) -> Result<Vec<CoreMemoryEntry>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value, token_count, updated_at FROM core_memory ORDER BY key")?;
-
-        let entries: Vec<CoreMemoryEntry> = stmt
-            .query_map([], |row| {
-                Ok(CoreMemoryEntry {
-                    key: row.get(0)?,
-                    value: row.get(1)?,
-                    token_count: row.get(2)?,
-                    updated_at: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(entries)
-    }
-
-    /// Upsert a core memory entry.
-    /// Returns token count. Approximate: chars / 4.
-    pub fn set_core_memory(&self, key: &str, value: &str) -> Result<i32> {
-        let token_count = (value.len() / 4) as i32;
-
-        self.conn
-            .execute(
-                "INSERT INTO core_memory (key, value, token_count, updated_at)
-                 VALUES (?1, ?2, ?3, datetime('now'))
-                 ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    token_count = excluded.token_count,
-                    updated_at = excluded.updated_at",
-                rusqlite::params![key, value, token_count],
-            )
-            .context("failed to upsert core memory")?;
-
-        Ok(token_count)
-    }
-
-    /// Total token count across all core memory entries.
-    pub fn total_core_memory_tokens(&self) -> Result<i32> {
-        let total: i32 = self.conn.query_row(
-            "SELECT COALESCE(SUM(token_count), 0) FROM core_memory",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(total)
-    }
-
-    /// Seed default core memory for a new customer.
-    /// If user_md_content is provided, use it for user_summary instead of the default.
-    pub fn seed_core_memory(&self, user_md_content: Option<&str>) -> Result<()> {
-        for &(key, default_value) in CORE_MEMORY_SECTIONS {
-            let value = if key == "user_summary" {
-                user_md_content.unwrap_or(default_value)
-            } else {
-                default_value
-            };
-            self.set_core_memory(key, value)?;
-        }
-        Ok(())
-    }
-
-    // -- People (Layer 2) --
-
-    /// Insert or update a person. Returns their ID.
-    pub fn upsert_person(
-        &self,
-        name: &str,
-        relationship: Option<&str>,
-        notes: Option<&str>,
-    ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO people (canonical_name, relationship, notes, last_mentioned)
-                 VALUES (?1, ?2, ?3, datetime('now'))
-                 ON CONFLICT(canonical_name) DO UPDATE SET
-                    relationship = COALESCE(excluded.relationship, people.relationship),
-                    notes = COALESCE(excluded.notes, people.notes),
-                    last_mentioned = excluded.last_mentioned",
-                rusqlite::params![name, relationship, notes],
-            )
-            .context("failed to upsert person")?;
-
-        let id = self.conn.query_row(
-            "SELECT id FROM people WHERE canonical_name = ?1",
-            [name],
-            |row| row.get(0),
-        )?;
-        Ok(id)
-    }
-
-    /// Get a person by name (case-insensitive).
-    pub fn get_person(&self, name: &str) -> Result<Option<Person>> {
-        let person = self
-            .conn
-            .query_row(
-                "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
-                 FROM people WHERE canonical_name = ?1",
-                [name],
-                |row| {
-                    Ok(Person {
-                        id: row.get(0)?,
-                        canonical_name: row.get(1)?,
-                        relationship: row.get(2)?,
-                        notes: row.get(3)?,
-                        first_mentioned: row.get(4)?,
-                        last_mentioned: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(person)
-    }
-
-    /// List all people.
-    pub fn list_people(&self) -> Result<Vec<Person>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
-             FROM people ORDER BY last_mentioned DESC",
-        )?;
-
-        let people: Vec<Person> = stmt
-            .query_map([], |row| {
-                Ok(Person {
-                    id: row.get(0)?,
-                    canonical_name: row.get(1)?,
-                    relationship: row.get(2)?,
-                    notes: row.get(3)?,
-                    first_mentioned: row.get(4)?,
-                    last_mentioned: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(people)
-    }
-
-    // -- Commitments (Layer 2) --
-
-    /// Add a commitment. Uses case-insensitive UNIQUE for dedup.
-    pub fn add_commitment(
-        &self,
-        description: &str,
-        due_date: Option<&str>,
-        person_id: Option<i64>,
-    ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO commitments (description, due_date, person_id)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![description, due_date, person_id],
-            )
-            .context("failed to insert commitment")?;
-
-        let id = self.conn.query_row(
-            "SELECT id FROM commitments WHERE description = ?1",
-            [description],
-            |row| row.get(0),
-        )?;
-        Ok(id)
-    }
-
-    /// List commitments by status.
-    pub fn list_commitments(&self, status: &str) -> Result<Vec<Commitment>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, description, status, due_date, person_id, created_at, completed_at
-             FROM commitments WHERE status = ?1 ORDER BY due_date ASC NULLS LAST",
-        )?;
-
-        let commitments: Vec<Commitment> = stmt
-            .query_map([status], |row| {
-                Ok(Commitment {
-                    id: row.get(0)?,
-                    description: row.get(1)?,
-                    status: row.get(2)?,
-                    due_date: row.get(3)?,
-                    person_id: row.get(4)?,
-                    created_at: row.get(5)?,
-                    completed_at: row.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(commitments)
-    }
-
-    /// Update commitment status. Returns `true` if a row was updated, `false` if the id was not found.
-    pub fn update_commitment_status(&self, id: i64, status: &str) -> Result<bool> {
-        if !COMMITMENT_STATUSES.contains(&status) {
-            anyhow::bail!("invalid commitment status: {status}");
-        }
-
-        let rows = if status == "completed" {
-            self.conn.execute(
-                "UPDATE commitments SET status = ?1, completed_at = datetime('now') WHERE id = ?2",
-                rusqlite::params![status, id],
-            )?
-        } else {
-            self.conn.execute(
-                "UPDATE commitments SET status = ?1, completed_at = NULL WHERE id = ?2",
-                rusqlite::params![status, id],
-            )?
-        };
-        Ok(rows > 0)
-    }
-
-    /// Get the current status of a commitment by id.
-    pub fn get_commitment_status(&self, id: i64) -> Result<Option<String>> {
-        let status = self
-            .conn
-            .query_row(
-                "SELECT status FROM commitments WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(status)
-    }
-
-    /// Get the description and due_date of a commitment by id.
-    pub fn get_commitment_details(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT description, due_date FROM commitments WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(result)
-    }
-
-    // -- Preferences (Layer 2) --
-
-    /// Upsert a preference (case-insensitive category). Returns the preference ID.
-    pub fn set_preference(&self, category: &str, value: &str) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO preferences (category, value, updated_at)
-                 VALUES (?1, ?2, datetime('now'))
-                 ON CONFLICT(category) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at",
-                rusqlite::params![category, value],
-            )
-            .context("failed to upsert preference")?;
-        let id = self
-            .conn
-            .query_row(
-                "SELECT id FROM preferences WHERE category = ?1",
-                [category],
-                |row| row.get(0),
-            )
-            .context("failed to get preference id")?;
-        Ok(id)
-    }
-
-    /// Get a preference by category (case-insensitive).
-    pub fn get_preference(&self, category: &str) -> Result<Option<String>> {
-        let value: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM preferences WHERE category = ?1",
-                [category],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(value)
-    }
-
-    /// List all preferences (for substring search).
-    pub fn list_preferences(&self) -> Result<Vec<Preference>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT category, value, updated_at FROM preferences ORDER BY category")?;
-        let prefs = stmt
-            .query_map([], |row| {
-                Ok(Preference {
-                    category: row.get(0)?,
-                    value: row.get(1)?,
-                    updated_at: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(prefs)
-    }
-
-    // -- Events (Layer 2) --
-
-    /// Add an event.
-    pub fn add_event(
-        &self,
-        description: &str,
-        event_date: Option<&str>,
-        context: Option<&str>,
-    ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO events (description, event_date, context) VALUES (?1, ?2, ?3)",
-                rusqlite::params![description, event_date, context],
-            )
-            .context("failed to insert event")?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// List all events.
-    pub fn list_events(&self) -> Result<Vec<Event>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, description, event_date, context, created_at
-             FROM events ORDER BY event_date ASC NULLS LAST",
-        )?;
-
-        let events = stmt
-            .query_map([], |row| {
-                Ok(Event {
-                    id: row.get(0)?,
-                    description: row.get(1)?,
-                    event_date: row.get(2)?,
-                    context: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(events)
-    }
-
-    // -- Reminders --
-
-    /// Add a new reminder. `fire_at` is a Unix timestamp (seconds since epoch).
-    /// Returns the reminder ID.
-    pub fn add_reminder(&self, fire_at: i64, message: &str) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO reminders (fire_at, message) VALUES (?1, ?2)",
-                rusqlite::params![fire_at, message],
-            )
-            .context("failed to insert reminder")?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Query reminders using a type-safe filter enum.
-    fn query_reminders(&self, filter: ReminderFilter) -> Result<Vec<Reminder>> {
-        let sql = match filter {
-            ReminderFilter::All => {
-                "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' ORDER BY fire_at ASC"
-            }
-            ReminderFilter::Future => {
-                "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' AND fire_at > unixepoch('now') ORDER BY fire_at ASC"
-            }
-            ReminderFilter::PastDue => {
-                "SELECT id, fire_at, message, status, created_at, delivered_at \
-                 FROM reminders WHERE status = 'pending' AND fire_at <= unixepoch('now') ORDER BY fire_at ASC"
-            }
-        };
-        let mut stmt = self.conn.prepare_cached(sql)?;
-        let reminders = stmt
-            .query_map([], |row| {
-                Ok(Reminder {
-                    id: row.get(0)?,
-                    fire_at: row.get(1)?,
-                    message: row.get(2)?,
-                    status: row.get(3)?,
-                    created_at: row.get(4)?,
-                    delivered_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(reminders)
-    }
-
-    /// Get all pending reminders (any fire_at).
-    pub fn get_pending_reminders(&self) -> Result<Vec<Reminder>> {
-        self.query_reminders(ReminderFilter::All)
-    }
-
-    /// Get pending reminders whose fire_at is in the future.
-    pub fn get_future_reminders(&self) -> Result<Vec<Reminder>> {
-        self.query_reminders(ReminderFilter::Future)
-    }
-
-    /// Get pending reminders whose fire_at is at or past now (ready to deliver).
-    pub fn get_past_due_reminders(&self) -> Result<Vec<Reminder>> {
-        self.query_reminders(ReminderFilter::PastDue)
-    }
-
-    /// Mark a reminder as delivered.
-    pub fn mark_reminder_delivered(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE reminders SET status = 'delivered', delivered_at = datetime('now') WHERE id = ?1",
-            [id],
-        )?;
-        Ok(())
-    }
-
-    /// Mark a reminder as failed.
-    pub fn mark_reminder_failed(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("UPDATE reminders SET status = 'failed' WHERE id = ?1", [id])?;
-        Ok(())
-    }
-
-    /// Cancel a pending reminder. Returns true if a reminder was actually cancelled.
-    pub fn cancel_reminder(&self, id: i64) -> Result<bool> {
-        let rows = self.conn.execute(
-            "UPDATE reminders SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'",
-            [id],
-        )?;
-        Ok(rows > 0)
-    }
-
-    // -- Heartbeat Pruning --
-
-    /// Delete heartbeat sends older than `days` days.
-    pub fn prune_old_heartbeat_sends(&self, days: u32) -> Result<()> {
-        let modifier = format!("-{days} days");
-        self.conn.execute(
-            "DELETE FROM heartbeat_sends WHERE sent_at < datetime('now', ?1)",
-            [&modifier],
-        )?;
-        Ok(())
-    }
-
-    /// Record a heartbeat send (for rate limiting).
-    pub fn record_heartbeat_send(&self) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO heartbeat_sends (sent_at) VALUES (datetime('now'))",
-            [],
-        )?;
-        Ok(())
-    }
-
-    /// Count heartbeat sends in the last hour.
-    pub fn count_heartbeat_sends_last_hour(&self) -> Result<u32> {
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= datetime('now', '-1 hour')",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
-    /// Count heartbeat sends today in the customer's timezone.
-    /// Computes the local start-of-day boundary using chrono-tz, then counts
-    /// sends with `sent_at >= local_midnight_utc`.
-    pub fn count_heartbeat_sends_today(&self, timezone: &str) -> Result<u32> {
-        let boundary = today_midnight_utc(timezone)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM heartbeat_sends WHERE sent_at >= ?1",
-            [&boundary],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
-    /// Most recent user message timestamp (for heartbeat pre-filter).
-    pub fn last_user_message_time(&self) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT created_at FROM conversations \
-                 WHERE role = 'user' \
-                 ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
+#[derive(Debug, Clone)]
+pub struct TeamRow {
+    pub id: String,
+    pub name: String,
+    pub config_path: String,
+    pub created_at: i64,
 }
 
-/// Compute today's midnight in the given timezone, converted to UTC.
-///
-/// Falls back to UTC if the timezone string is invalid. Handles DST
-/// ambiguity by choosing the earliest possible time.
-pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
-    use chrono::{Datelike, NaiveDate, Utc};
-    use chrono_tz::Tz;
-
-    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-    let now_local = Utc::now().with_timezone(&tz);
-    let local_midnight =
-        NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), now_local.day())
-            .unwrap_or_else(|| Utc::now().date_naive())
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid");
-
-    local_midnight
-        .and_local_timezone(tz)
-        .earliest()
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now)
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub agent_id: String,
+    pub team_run_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: i64,
+    pub label: String,
+    pub trigger_type: String,
+    pub cron_expr: Option<String>,
+    pub event_source: Option<String>,
+    pub event_offset_secs: Option<i64>,
+    pub condition_expr: Option<String>,
+    pub next_fire_at: Option<i64>,
+    pub timeout_at: Option<i64>,
+    pub action_type: String,
+    pub action_config: String,
+    pub status: String,
+    pub process_id: Option<i64>,
+    pub input_context: Option<String>,
+    pub result: Option<String>,
+    pub created_by_session: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub fired_at: Option<i64>,
+    pub completed_at: Option<i64>,
 }
 
-impl Database {
-    // -- Reflection --
-
-    /// Get conversation messages since a given UTC boundary timestamp.
-    /// Excludes reflection channel messages to avoid self-referential loops.
-    pub fn get_conversations_since(&self, since_utc: &str) -> Result<Vec<ConversationMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, metadata, created_at
-             FROM conversations
-             WHERE created_at >= ?1
-               AND channel_type != 'reflection'
-             ORDER BY id
-             LIMIT 500",
-        )?;
-
-        let messages: Vec<ConversationMessage> = stmt
-            .query_map([since_utc], |row| {
-                Ok(ConversationMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    channel_type: row.get(3)?,
-                    metadata: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(messages)
-    }
-
-    /// Get memory events since a given UTC boundary timestamp.
-    pub fn get_memory_events_since(&self, since_utc: &str) -> Result<Vec<MemoryEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning, created_at
-             FROM memory_events
-             WHERE created_at >= ?1
-             ORDER BY id",
-        )?;
-
-        let events: Vec<MemoryEvent> = stmt
-            .query_map([since_utc], |row| {
-                Ok(MemoryEvent {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    tool_name: row.get(2)?,
-                    target_key: row.get(3)?,
-                    before_value: row.get(4)?,
-                    after_value: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(events)
-    }
-
-    /// Delete reflection runs older than `days` days.
-    pub fn prune_old_reflection_runs(&self, days: u32) -> Result<usize> {
-        let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86_400);
-        let deleted = self
-            .conn
-            .execute("DELETE FROM reflection_runs WHERE ran_at < ?1", [cutoff])?;
-        Ok(deleted)
-    }
-
-    /// Record a reflection run for rate limiting and audit.
-    pub fn record_reflection_run(
-        &self,
-        status: &str,
-        changes_made: i64,
-        summary: Option<&str>,
-    ) -> Result<()> {
-        let now_unix = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO reflection_runs (ran_at, status, changes_made, summary) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![now_unix, status, changes_made, summary],
-        )?;
-        Ok(())
-    }
-
-    /// Check if a reflection has already run today (any status) in the user's timezone.
-    pub fn last_reflection_run_today(&self, timezone: &str) -> Result<bool> {
-        let midnight_unix = today_midnight_utc(timezone).timestamp();
-
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM reflection_runs WHERE ran_at >= ?1",
-            [midnight_unix],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    /// Count memory events for a given session (used to count reflection changes).
-    pub fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memory_events WHERE session_id = ?1",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
-    // -- Failed Sends --
-
-    /// Save a failed outbound send for later retry.
-    pub fn save_failed_send(&self, text: &str, request_id: Option<&str>) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO failed_sends (text, request_id) VALUES (?1, ?2)",
-            rusqlite::params![text, request_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Get oldest failed sends for flushing (max retry_count 3, max age 24h).
-    pub fn get_pending_failed_sends(&self, limit: usize) -> Result<Vec<FailedSend>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, text, request_id, created_at, retry_count \
-             FROM failed_sends \
-             WHERE retry_count < 3 AND created_at > datetime('now', '-24 hours') \
-             ORDER BY created_at ASC LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map([limit as i64], |row| {
-                Ok(FailedSend {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    request_id: row.get(2)?,
-                    created_at: row.get(3)?,
-                    retry_count: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Delete a successfully flushed send.
-    pub fn delete_failed_send(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM failed_sends WHERE id = ?1", [id])?;
-        Ok(())
-    }
-
-    /// Increment retry count on a failed flush.
-    pub fn increment_failed_send_retry(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE failed_sends SET retry_count = retry_count + 1 WHERE id = ?1",
-            [id],
-        )?;
-        Ok(())
-    }
-
-    // -- Conversation Compaction --
-
-    /// Save a conversation summary row. Returns the new row ID.
-    /// Only used directly by tests; production code uses `replace_with_summary`.
-    #[cfg(test)]
-    fn save_conversation_summary(&self, summary: &str, compacted_through_id: i64) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO conversations (role, content, channel_type, compacted_through_id)
-             VALUES ('summary', ?1, 'system', ?2)",
-            rusqlite::params![summary, compacted_through_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Delete messages up to and including `through_id`, excluding summary rows.
-    /// Returns the number of deleted rows.
-    /// Only used directly by tests; production code uses `replace_with_summary`.
-    #[cfg(test)]
-    fn delete_compacted_messages(&self, through_id: i64) -> Result<u32> {
-        let rows = self.conn.execute(
-            "DELETE FROM conversations WHERE id <= ?1 AND role != 'summary'",
-            [through_id],
-        )?;
-        Ok(rows as u32)
-    }
-
-    /// Load the most recent conversation summary (if any).
-    pub fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
-        let msg = self
-            .conn
-            .query_row(
-                "SELECT id, role, content, channel_type, metadata, created_at
-                 FROM conversations WHERE role = 'summary'
-                 ORDER BY id DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok(ConversationMessage {
-                        id: row.get(0)?,
-                        role: row.get(1)?,
-                        content: row.get(2)?,
-                        channel_type: row.get(3)?,
-                        metadata: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(msg)
-    }
-
-    /// Count total non-summary messages.
-    pub fn count_messages(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conversations WHERE role != 'summary'",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
-    /// Load messages older than the most recent `window_size` messages.
-    /// Used by compaction to identify messages to summarize.
-    pub fn load_messages_before_window(
-        &self,
-        window_size: usize,
-    ) -> Result<Vec<ConversationMessage>> {
-        // Get the ID threshold: the oldest message in the "keep" window
-        let threshold_id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT MIN(id) FROM (
-                    SELECT id FROM conversations
-                    WHERE role != 'summary'
-                    ORDER BY id DESC LIMIT ?1
-                )",
-                [window_size as i64],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        let Some(threshold_id) = threshold_id else {
-            return Ok(Vec::new());
-        };
-
-        let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, metadata, created_at
-             FROM conversations
-             WHERE role != 'summary' AND id < ?1
-             ORDER BY id ASC",
-        )?;
-        let messages = stmt
-            .query_map([threshold_id], |row| {
-                Ok(ConversationMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    channel_type: row.get(3)?,
-                    metadata: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(messages)
-    }
-
-    /// Atomically replace old messages with a summary.
-    /// Deletes messages up to the highest ID in the batch and saves a summary row.
-    pub fn replace_with_summary(&self, summary: &str, compacted_through_id: i64) -> Result<i64> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM conversations WHERE role = 'summary'", [])?;
-        tx.execute(
-            "DELETE FROM conversations WHERE id <= ?1 AND role != 'summary'",
-            [compacted_through_id],
-        )?;
-        tx.execute(
-            "INSERT INTO conversations (role, content, channel_type, compacted_through_id) VALUES ('summary', ?1, 'system', ?2)",
-            rusqlite::params![summary, compacted_through_id],
-        )?;
-        let id = tx.query_row("SELECT last_insert_rowid()", [], |row| row.get(0))?;
-        tx.commit()?;
-        Ok(id)
-    }
-
-    // -- Search methods (SQL LIKE filter) --
-
-    /// Search commitments by description substring (case-insensitive via LIKE).
-    pub fn search_commitments(&self, query: &str) -> Result<Vec<Commitment>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, description, status, due_date, person_id, created_at, completed_at
-             FROM commitments WHERE description LIKE '%' || ?1 || '%'
-             ORDER BY due_date ASC NULLS LAST",
-        )?;
-        let commitments = stmt
-            .query_map([query], |row| {
-                Ok(Commitment {
-                    id: row.get(0)?,
-                    description: row.get(1)?,
-                    status: row.get(2)?,
-                    due_date: row.get(3)?,
-                    person_id: row.get(4)?,
-                    created_at: row.get(5)?,
-                    completed_at: row.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(commitments)
-    }
-
-    /// Search people by name, relationship, or notes substring (case-insensitive via LIKE).
-    pub fn search_people(&self, query: &str) -> Result<Vec<Person>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, canonical_name, relationship, notes, first_mentioned, last_mentioned
-             FROM people
-             WHERE canonical_name LIKE '%' || ?1 || '%'
-                OR relationship LIKE '%' || ?1 || '%'
-                OR notes LIKE '%' || ?1 || '%'
-             ORDER BY last_mentioned DESC",
-        )?;
-        let people = stmt
-            .query_map([query], |row| {
-                Ok(Person {
-                    id: row.get(0)?,
-                    canonical_name: row.get(1)?,
-                    relationship: row.get(2)?,
-                    notes: row.get(3)?,
-                    first_mentioned: row.get(4)?,
-                    last_mentioned: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(people)
-    }
-
-    /// Search preferences by category or value substring (case-insensitive via LIKE).
-    pub fn search_preferences(&self, query: &str) -> Result<Vec<Preference>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT category, value, updated_at FROM preferences
-             WHERE category LIKE '%' || ?1 || '%'
-                OR value LIKE '%' || ?1 || '%'
-             ORDER BY category",
-        )?;
-        let prefs = stmt
-            .query_map([query], |row| {
-                Ok(Preference {
-                    category: row.get(0)?,
-                    value: row.get(1)?,
-                    updated_at: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(prefs)
-    }
-
-    /// Search events by description, date, or context substring (case-insensitive via LIKE).
-    pub fn search_events(&self, query: &str) -> Result<Vec<Event>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, description, event_date, context, created_at
-             FROM events
-             WHERE description LIKE '%' || ?1 || '%'
-                OR event_date LIKE '%' || ?1 || '%'
-                OR context LIKE '%' || ?1 || '%'
-             ORDER BY event_date ASC NULLS LAST",
-        )?;
-        let events = stmt
-            .query_map([query], |row| {
-                Ok(Event {
-                    id: row.get(0)?,
-                    description: row.get(1)?,
-                    event_date: row.get(2)?,
-                    context: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(events)
-    }
-
-    /// Search pending reminders by message substring (case-insensitive via LIKE).
-    pub fn search_reminders(&self, query: &str) -> Result<Vec<Reminder>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, fire_at, message, status, created_at, delivered_at
-             FROM reminders
-             WHERE status = 'pending' AND message LIKE '%' || ?1 || '%'
-             ORDER BY fire_at ASC",
-        )?;
-        let reminders = stmt
-            .query_map([query], |row| {
-                Ok(Reminder {
-                    id: row.get(0)?,
-                    fire_at: row.get(1)?,
-                    message: row.get(2)?,
-                    status: row.get(3)?,
-                    created_at: row.get(4)?,
-                    delivered_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(reminders)
-    }
-
-    // -- Layer 3: Search Indexing --
-
-    /// Index content for search: inserts into search_content and fts_search.
-    /// Returns the search_content.id for subsequent vector embedding storage.
-    pub fn index_content(
-        &self,
-        source_type: &str,
-        source_id: Option<i64>,
-        content: &str,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO search_content (source_type, source_id, content) VALUES (?1, ?2, ?3)",
-            rusqlite::params![source_type, source_id, content],
-        )?;
-        let content_id = self.conn.last_insert_rowid();
-
-        self.conn.execute(
-            "INSERT INTO fts_search (content, content_id, source_type) VALUES (?1, ?2, ?3)",
-            rusqlite::params![content, content_id, source_type],
-        )?;
-
-        Ok(content_id)
-    }
-
-    /// Store a vector embedding for a search_content row.
-    pub fn index_embedding(&self, content_id: i64, embedding: &[f32]) -> Result<()> {
-        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(embedding);
-        self.conn.execute(
-            "INSERT INTO vec_search (content_id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![content_id, bytes],
-        )?;
-        Ok(())
-    }
-
-    /// Delete search index entries for a specific source (for re-indexing on update).
-    pub fn delete_search_content(&self, source_type: &str, source_id: i64) -> Result<()> {
-        let subquery = "SELECT id FROM search_content WHERE source_type = ?1 AND source_id = ?2";
-
-        self.conn.execute(
-            &format!("DELETE FROM vec_search WHERE content_id IN ({subquery})"),
-            rusqlite::params![source_type, source_id],
-        )?;
-        self.conn.execute(
-            &format!("DELETE FROM fts_search WHERE content_id IN ({subquery})"),
-            rusqlite::params![source_type, source_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM search_content WHERE source_type = ?1 AND source_id = ?2",
-            rusqlite::params![source_type, source_id],
-        )?;
-
-        Ok(())
-    }
-
-    /// Count total rows in search_content (used for backfill detection).
-    pub fn count_search_content(&self) -> Result<i64> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM search_content", [], |row| row.get(0))?;
-        Ok(count)
-    }
-
-    // -- Layer 3: Search Queries --
-
-    /// Sanitize a query for FTS5 MATCH by wrapping in double quotes.
-    /// Escapes any embedded double quotes to prevent FTS5 syntax errors
-    /// from special characters (AND, OR, NOT, parentheses, etc.).
-    fn sanitize_fts5_query(query: &str) -> String {
-        let escaped = query.replace('"', "\"\"");
-        format!("\"{escaped}\"")
-    }
-
-    /// FTS5-only search (BM25 keyword ranking). Used when no embedding client.
-    pub fn fts_search(
-        &self,
-        query: &str,
-        limit: usize,
-        source_type_filter: Option<&str>,
-    ) -> Result<Vec<SearchResult>> {
-        let safe_query = Self::sanitize_fts5_query(query);
-
-        let base_sql = "SELECT sc.id, sc.source_type, sc.source_id, sc.content, fts.rank
-                 FROM fts_search fts
-                 JOIN search_content sc ON sc.id = CAST(fts.content_id AS INTEGER)
-                 WHERE fts_search MATCH ?1";
-
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match source_type_filter
-        {
-            Some(st) => (
-                format!("{base_sql} AND sc.source_type = ?3 ORDER BY fts.rank LIMIT ?2"),
-                vec![
-                    Box::new(safe_query),
-                    Box::new(limit as i64),
-                    Box::new(st.to_string()),
-                ],
-            ),
-            None => (
-                format!("{base_sql} ORDER BY fts.rank LIMIT ?2"),
-                vec![Box::new(safe_query), Box::new(limit as i64)],
-            ),
-        };
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let results = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(SearchResult {
-                    id: row.get(0)?,
-                    source_type: row.get(1)?,
-                    source_id: row.get(2)?,
-                    content: row.get(3)?,
-                    score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative, negate
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(results)
-    }
-
-    /// Vector-only search. Returns content_ids ranked by cosine distance.
-    pub fn vec_search(&self, embedding: &[f32], limit: usize) -> Result<Vec<(i64, f64)>> {
-        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(embedding);
-        let mut stmt = self.conn.prepare(
-            "SELECT content_id, distance
-             FROM vec_search
-             WHERE embedding MATCH ?1 AND k = ?2
-             ORDER BY distance",
-        )?;
-        let results = stmt
-            .query_map(rusqlite::params![bytes, limit as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(results)
-    }
-
-    /// Hybrid search using Reciprocal Rank Fusion (RRF) of FTS5 + vector results.
-    pub fn hybrid_search(
-        &self,
-        fts_query: &str,
-        embedding: Option<&[f32]>,
-        limit: usize,
-        source_type_filter: Option<&str>,
-    ) -> Result<Vec<SearchResult>> {
-        // Get FTS5 results with rank positions
-        let fts_results = self.fts_search(fts_query, limit * 2, source_type_filter)?;
-
-        // If no embedding provided, return FTS5-only results
-        let vec_results = match embedding {
-            Some(emb) => self.vec_search(emb, limit * 2)?,
-            None => Vec::new(),
-        };
-
-        if vec_results.is_empty() {
-            // FTS5-only: just truncate to limit
-            let mut results = fts_results;
-            results.truncate(limit);
-            return Ok(results);
-        }
-
-        // RRF merge with k=60
-        const RRF_K: f64 = 60.0;
-        let mut scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-
-        for (rank, result) in fts_results.iter().enumerate() {
-            *scores.entry(result.id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-        }
-
-        for (rank, (content_id, _distance)) in vec_results.iter().enumerate() {
-            *scores.entry(*content_id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-        }
-
-        // Sort by RRF score descending
-        let mut scored: Vec<(i64, f64)> = scores.into_iter().collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-
-        // Fetch full content for top results, applying source_type filter for vec results
-        let mut results = Vec::with_capacity(scored.len());
-        for (content_id, score) in scored {
-            if let Ok(result) = self.conn.query_row(
-                "SELECT id, source_type, source_id, content FROM search_content WHERE id = ?1",
-                [content_id],
-                |row| {
-                    Ok(SearchResult {
-                        id: row.get(0)?,
-                        source_type: row.get(1)?,
-                        source_id: row.get(2)?,
-                        content: row.get(3)?,
-                        score,
-                    })
-                },
-            ) {
-                // Filter by source_type if specified (vec results weren't pre-filtered)
-                if let Some(st) = source_type_filter
-                    && result.source_type != st
-                {
-                    continue;
-                }
-                results.push(result);
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// List all facts for backfill indexing (returns source_type, source_id, content text).
-    pub fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
-        let mut facts = Vec::new();
-
-        // People
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, canonical_name, relationship, notes FROM people")?;
-        let people = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let rel: Option<String> = row.get(2)?;
-            let notes: Option<String> = row.get(3)?;
-            let mut content = name.clone();
-            if let Some(r) = rel {
-                content.push_str(&format!(" — {r}"));
-            }
-            if let Some(n) = notes {
-                content.push_str(&format!(". {n}"));
-            }
-            Ok((id, content))
-        })?;
-        for row in people {
-            let (id, content) = row?;
-            facts.push(("person".to_string(), id, content));
-        }
-
-        // Commitments
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, description, due_date, status FROM commitments")?;
-        let commits = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let desc: String = row.get(1)?;
-            let due: Option<String> = row.get(2)?;
-            let status: String = row.get(3)?;
-            let mut content = desc;
-            if let Some(d) = due {
-                content.push_str(&format!(" (due: {d})"));
-            }
-            content.push_str(&format!(", status: {status}"));
-            Ok((id, content))
-        })?;
-        for row in commits {
-            let (id, content) = row?;
-            facts.push(("commitment".to_string(), id, content));
-        }
-
-        // Preferences
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, category, value FROM preferences")?;
-        let prefs = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let cat: String = row.get(1)?;
-            let val: String = row.get(2)?;
-            Ok((id, format!("{cat}: {val}")))
-        })?;
-        for row in prefs {
-            let (id, content) = row?;
-            facts.push(("preference".to_string(), id, content));
-        }
-
-        // Events
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, description, event_date, context FROM events")?;
-        let events = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let desc: String = row.get(1)?;
-            let date: Option<String> = row.get(2)?;
-            let ctx: Option<String> = row.get(3)?;
-            let mut content = desc;
-            if let Some(d) = date {
-                content.push_str(&format!(" on {d}"));
-            }
-            if let Some(c) = ctx {
-                content.push_str(&format!(". {c}"));
-            }
-            Ok((id, content))
-        })?;
-        for row in events {
-            let (id, content) = row?;
-            facts.push(("event".to_string(), id, content));
-        }
-
-        Ok(facts)
-    }
-
-    // -- Customer Config --
-
-    /// Get a customer config value by key.
-    pub fn get_customer_config(&self, key: &str) -> Result<Option<String>> {
-        let value = self
-            .conn
-            .query_row(
-                "SELECT value FROM customer_config WHERE key = ?1",
-                [key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(value)
-    }
-
-    /// Set a customer config value.
-    pub fn set_customer_config(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO customer_config (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, value],
-        )?;
-        Ok(())
-    }
-
-    /// List all customer config entries.
-    pub fn list_customer_config(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value FROM customer_config ORDER BY key")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    // -- Cross-Channel Queries --
-
-    /// Load messages with id > after_id, optionally filtered by channel type.
-    /// Returns messages in ascending id order.
-    pub fn load_messages_after(
-        &self,
-        after_id: i64,
-        channel_types: Option<&[&str]>,
-    ) -> Result<Vec<ConversationMessage>> {
-        let (sql, params) = match channel_types {
-            Some(types) if !types.is_empty() => {
-                let placeholders: Vec<String> =
-                    (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
-                let sql = format!(
-                    "SELECT id, role, content, channel_type, metadata, created_at
-                     FROM conversations
-                     WHERE id > ?1 AND role != 'summary' AND channel_type IN ({})
-                     ORDER BY id ASC
-                     LIMIT 100",
-                    placeholders.join(", ")
-                );
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
-                for t in types {
-                    params.push(Box::new(t.to_string()));
-                }
-                (sql, params)
-            }
-            _ => {
-                let sql = "SELECT id, role, content, channel_type, metadata, created_at
-                     FROM conversations
-                     WHERE id > ?1 AND role != 'summary'
-                     ORDER BY id ASC
-                     LIMIT 100"
-                    .to_string();
-                let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(after_id)];
-                (sql, params)
-            }
-        };
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let messages: Vec<ConversationMessage> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(ConversationMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    channel_type: row.get(3)?,
-                    metadata: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(messages)
-    }
-
-    /// Get the maximum message id in the conversations table.
-    /// Returns 0 if the table is empty.
-    pub fn max_message_id(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM conversations",
-            [],
-            |row| row.get(0),
-        )?)
-    }
-
-    // -- Memory Events (Audit Log) --
-
-    /// Log a memory mutation event for auditability.
-    pub fn log_memory_event(
-        &self,
-        session_id: &str,
-        tool_name: &str,
-        target_key: &str,
-        before_value: Option<&str>,
-        after_value: &str,
-        reasoning: Option<&str>,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO memory_events (session_id, tool_name, target_key, before_value, after_value, reasoning)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![session_id, tool_name, target_key, before_value, after_value, reasoning],
-            )
-            .context("failed to log memory event")?;
-        Ok(())
-    }
-
-    /// Get memory events for a session.
-    pub fn get_memory_events(&self, session_id: &str) -> Result<Vec<MemoryEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning, created_at
-             FROM memory_events WHERE session_id = ?1 ORDER BY id",
-        )?;
-
-        let events: Vec<MemoryEvent> = stmt
-            .query_map([session_id], |row| {
-                Ok(MemoryEvent {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    tool_name: row.get(2)?,
-                    target_key: row.get(3)?,
-                    before_value: row.get(4)?,
-                    after_value: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(events)
-    }
-
-    // -- Tiered Retention --
-
-    /// Compact memory events older than `days` days into monthly summaries.
-    /// Uses SQL GROUP BY for aggregation (memory is O(months), not O(events)).
-    /// All operations run within a single transaction for atomicity.
-    /// Returns the number of raw events deleted (0 if nothing to compact).
-    pub fn compact_old_memory_events(&self, days: u32) -> Result<usize> {
-        use std::collections::HashMap;
-
-        let modifier = format!("-{days} days");
-
-        // Wrap everything in one transaction for atomicity
-        let tx = self.conn.unchecked_transaction()?;
-
-        let cutoff: String =
-            tx.query_row("SELECT datetime('now', ?1)", [&modifier], |row| row.get(0))?;
-
-        // Check if there are any events to compact (early exit avoids unnecessary work)
-        let event_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM memory_events WHERE created_at < ?1",
-            [&cutoff],
-            |row| row.get(0),
-        )?;
-
-        if event_count == 0 {
-            tx.commit()?;
-            return Ok(0);
-        }
-
-        // Aggregate tool counts per month using SQL GROUP BY — O(months * tools)
-        {
-            let mut tool_stmt = tx.prepare(
-                "SELECT CAST(strftime('%Y', created_at) AS INTEGER),
-                        CAST(strftime('%m', created_at) AS INTEGER),
-                        tool_name,
-                        COUNT(*)
-                 FROM memory_events
-                 WHERE created_at < ?1
-                 GROUP BY strftime('%Y', created_at), strftime('%m', created_at), tool_name",
-            )?;
-
-            let mut month_tools: HashMap<(i64, i64), HashMap<String, u32>> = HashMap::new();
-            let mut rows = tool_stmt.query([&cutoff])?;
-            while let Some(row) = rows.next()? {
-                let year: i64 = row.get(0)?;
-                let month: i64 = row.get(1)?;
-                let tool_name: String = row.get(2)?;
-                let count: u32 = row.get(3)?;
-                month_tools
-                    .entry((year, month))
-                    .or_default()
-                    .insert(tool_name, count);
-            }
-            drop(rows);
-            drop(tool_stmt);
-
-            // Aggregate category counts (category = part before ':' in target_key)
-            // and target counts per month
-            let mut detail_stmt = tx.prepare(
-                "SELECT CAST(strftime('%Y', created_at) AS INTEGER),
-                        CAST(strftime('%m', created_at) AS INTEGER),
-                        target_key,
-                        COUNT(*)
-                 FROM memory_events
-                 WHERE created_at < ?1
-                 GROUP BY strftime('%Y', created_at), strftime('%m', created_at), target_key",
-            )?;
-
-            struct MonthAgg {
-                category_counts: HashMap<String, u32>,
-                target_counts: HashMap<String, u32>,
-            }
-
-            let mut month_details: HashMap<(i64, i64), MonthAgg> = HashMap::new();
-            let mut rows = detail_stmt.query([&cutoff])?;
-            while let Some(row) = rows.next()? {
-                let year: i64 = row.get(0)?;
-                let month: i64 = row.get(1)?;
-                let target_key: String = row.get(2)?;
-                let count: u32 = row.get(3)?;
-
-                let category = target_key
-                    .split(':')
-                    .next()
-                    .unwrap_or(&target_key)
-                    .to_string();
-
-                let agg = month_details
-                    .entry((year, month))
-                    .or_insert_with(|| MonthAgg {
-                        category_counts: HashMap::new(),
-                        target_counts: HashMap::new(),
-                    });
-                *agg.category_counts.entry(category).or_insert(0) += count;
-                agg.target_counts.insert(target_key, count);
-            }
-            drop(rows);
-            drop(detail_stmt);
-
-            // Aggregate total mutations per month
-            let mut total_stmt = tx.prepare(
-                "SELECT CAST(strftime('%Y', created_at) AS INTEGER),
-                        CAST(strftime('%m', created_at) AS INTEGER),
-                        COUNT(*)
-                 FROM memory_events
-                 WHERE created_at < ?1
-                 GROUP BY strftime('%Y', created_at), strftime('%m', created_at)",
-            )?;
-
-            let mut month_totals: HashMap<(i64, i64), u32> = HashMap::new();
-            let mut rows = total_stmt.query([&cutoff])?;
-            while let Some(row) = rows.next()? {
-                let year: i64 = row.get(0)?;
-                let month: i64 = row.get(1)?;
-                let total: u32 = row.get(2)?;
-                month_totals.insert((year, month), total);
-            }
-            drop(rows);
-            drop(total_stmt);
-
-            // Write summaries with ON CONFLICT upsert
-            for (&(year, month), total) in &month_totals {
-                let tool_counts = month_tools.get(&(year, month));
-                let details = month_details.get(&(year, month));
-
-                let tool_counts_json =
-                    serde_json::to_string(&tool_counts.unwrap_or(&HashMap::new()))?;
-                let category_counts_json = serde_json::to_string(
-                    &details
-                        .map(|d| &d.category_counts)
-                        .unwrap_or(&HashMap::new()),
-                )?;
-
-                // Build top targets (top 10 by count)
-                let top_targets_json = if let Some(d) = details {
-                    let mut targets: Vec<(&String, &u32)> = d.target_counts.iter().collect();
-                    targets.sort_by(|a, b| b.1.cmp(a.1));
-                    targets.truncate(10);
-                    let top: Vec<String> = targets
-                        .iter()
-                        .map(|(k, v)| format!("{}:{}", k, v))
-                        .collect();
-                    serde_json::to_string(&top)?
-                } else {
-                    "[]".to_string()
-                };
-
-                tx.execute(
-                    "INSERT INTO memory_event_summaries (year, month, tool_counts, category_counts, total_mutations, top_targets)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(year, month) DO UPDATE SET
-                        tool_counts = excluded.tool_counts,
-                        category_counts = excluded.category_counts,
-                        total_mutations = excluded.total_mutations,
-                        top_targets = excluded.top_targets",
-                    rusqlite::params![
-                        year,
-                        month,
-                        tool_counts_json,
-                        category_counts_json,
-                        total,
-                        top_targets_json
-                    ],
-                )?;
-            }
-        }
-
-        // Batch delete all compacted raw events in one statement
-        let deleted = tx.execute("DELETE FROM memory_events WHERE created_at < ?1", [&cutoff])?;
-
-        tx.commit()?;
-        Ok(deleted)
-    }
-
-    /// Get database file size using PRAGMA page_count * PRAGMA page_size.
-    pub fn db_size_bytes(&self) -> Result<u64> {
-        let page_count: u64 = self
-            .conn
-            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        let page_size: u64 = self
-            .conn
-            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
-        Ok(page_count * page_size)
-    }
-
-    /// Reclaim space after deletions using incremental auto-vacuum.
-    /// Frees up to 100 pages per call, avoiding the full-db rewrite of VACUUM.
-    pub fn vacuum(&self) -> Result<()> {
-        self.conn.execute_batch("PRAGMA incremental_vacuum(100)")?;
-        Ok(())
-    }
-
-    /// Return the current schema version of the database.
-    pub fn schema_version(&self) -> Result<i64> {
-        self.current_version()
-    }
-}
-
-// -- Public types --
-
-/// Type-safe filter for reminder queries, replacing raw SQL string interpolation.
-pub enum ReminderFilter {
-    /// All pending reminders regardless of fire_at.
-    All,
-    /// Pending reminders with fire_at in the future.
-    Future,
-    /// Pending reminders with fire_at at or past now.
-    PastDue,
+#[derive(Debug, Clone)]
+pub struct NewTask {
+    pub agent_id: String,
+    pub team_run_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: i64,
+    pub label: String,
+    pub trigger_type: String,
+    pub cron_expr: Option<String>,
+    pub event_source: Option<String>,
+    pub event_offset_secs: Option<i64>,
+    pub condition_expr: Option<String>,
+    pub next_fire_at: Option<i64>,
+    pub timeout_at: Option<i64>,
+    pub action_type: String,
+    pub action_config: String,
+    pub input_context: Option<String>,
+    pub created_by_session: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2434,41 +114,6 @@ pub struct ConversationMessage {
     pub channel_type: String,
     pub metadata: Option<String>,
     pub created_at: String,
-}
-
-/// Format a Unix timestamp as an ISO 8601 UTC string.
-pub fn format_unix_ts(ts: i64) -> String {
-    DateTime::<chrono::Utc>::from_timestamp(ts, 0)
-        .map(|dt: DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| ts.to_string())
-}
-
-/// A row from the `team_runs` table.
-#[derive(Debug, Clone)]
-pub struct TeamRunRow {
-    pub id: String,
-    pub team_name: String,
-    pub goal: String,
-    pub status: String,
-    pub failure_reason: Option<String>,
-    pub iteration: u32,
-    pub max_iterations: u32,
-    pub deliverable: Option<String>,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-}
-
-/// A row from the `team_messages` table.
-#[derive(Debug, Clone)]
-pub struct TeamMessageRow {
-    pub id: i64,
-    pub run_id: String,
-    pub parent_id: Option<i64>,
-    pub agent_name: Option<String>,
-    pub message_type: String,
-    pub content: String,
-    pub iteration: u32,
-    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2517,25 +162,6 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone)]
-pub struct Reminder {
-    pub id: i64,
-    pub fire_at: i64,
-    pub message: String,
-    pub status: String,
-    pub created_at: String,
-    pub delivered_at: Option<String>,
-}
-
-impl Reminder {
-    /// Format `fire_at` unix timestamp as a human-readable UTC string.
-    pub fn display_fire_at(&self) -> String {
-        DateTime::from_timestamp(self.fire_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| self.fire_at.to_string())
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct MemoryEvent {
     pub id: i64,
     pub session_id: String,
@@ -2547,6 +173,7 @@ pub struct MemoryEvent {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct FailedSend {
     pub id: i64,
     pub text: String,
@@ -2564,1408 +191,2719 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-// Bring in rusqlite optional extension
-use rusqlite::OptionalExtension;
+#[derive(Debug, Clone)]
+pub struct TeamRunRow {
+    pub id: String,
+    pub team_name: String,
+    pub goal: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub deliverable: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TeamMessageRow {
+    pub id: i64,
+    pub run_id: String,
+    pub parent_id: Option<i64>,
+    pub agent_name: Option<String>,
+    pub message_type: String,
+    pub content: String,
+    pub iteration: u32,
+    pub created_at: i64,
+}
+
+// ===== Database =====
+
+pub struct Database {
+    conn: Connection,
+}
+
+impl Database {
+    pub fn open(path: &Path) -> Result<Self> {
+        init_sqlite_vec();
+        let conn = Connection::open(path)
+            .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA auto_vacuum = INCREMENTAL;",
+        )
+        .context("failed to set SQLite pragmas")?;
+        let db = Self { conn };
+        // Auto-backup DB file before any destructive schema migration
+        let current_ver = db.current_version().unwrap_or(0);
+        if current_ver > 0 && current_ver < CURRENT_SCHEMA_VERSION {
+            let backup_path = path.with_extension(format!("db.v{current_ver}-backup"));
+            match std::fs::copy(path, &backup_path) {
+                Ok(_) => info!(
+                    from_version = current_ver,
+                    backup = %backup_path.display(),
+                    "auto-backed up DB before schema migration"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not auto-backup DB before migration — proceeding anyway"
+                ),
+            }
+        }
+        db.migrate()?;
+        Ok(db)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .context("failed to set pragmas")?;
+        let db = Self { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn current_version(&self) -> Result<i64> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to check schema_version existence")?;
+        if !exists {
+            return Ok(0);
+        }
+        let version: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to read schema version")?;
+        Ok(version)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let version = self.current_version()?;
+        debug!(current_version = version, target_version = CURRENT_SCHEMA_VERSION, "checking migrations");
+        if version < CURRENT_SCHEMA_VERSION {
+            if version > 0 {
+                info!(from = version, to = CURRENT_SCHEMA_VERSION, "applying clean-slate migration");
+            }
+            self.migrate_v1()?;
+            info!(version = CURRENT_SCHEMA_VERSION, "database migrated to v1");
+        }
+        Ok(())
+    }
+
+    fn migrate_v1(&self) -> Result<()> {
+        info!("applying migration v1: unified task engine schema (clean slate)");
+
+        // Drop all existing tables (clean slate — no backward compat constraint)
+        let drops = [
+            "DROP TABLE IF EXISTS fts_search",
+            "DROP TABLE IF EXISTS vec_search",
+            "DROP TABLE IF EXISTS reminders",
+            "DROP TABLE IF EXISTS heartbeat_sends",
+            "DROP TABLE IF EXISTS reflection_runs",
+            "DROP TABLE IF EXISTS failed_sends",
+            "DROP TABLE IF EXISTS customer_config",
+            "DROP TABLE IF EXISTS memory_event_summaries",
+            "DROP TABLE IF EXISTS memory_events",
+            "DROP TABLE IF EXISTS search_content",
+            "DROP TABLE IF EXISTS events",
+            "DROP TABLE IF EXISTS preferences",
+            "DROP TABLE IF EXISTS commitments",
+            "DROP TABLE IF EXISTS people",
+            "DROP TABLE IF EXISTS core_memory",
+            "DROP TABLE IF EXISTS team_messages",
+            "DROP TABLE IF EXISTS team_runs",
+            "DROP TABLE IF EXISTS conversations",
+            "DROP TABLE IF EXISTS tasks",
+            "DROP TABLE IF EXISTS teams",
+            "DROP TABLE IF EXISTS agents",
+            "DROP TABLE IF EXISTS schema_version",
+        ];
+        for drop in &drops {
+            self.conn.execute_batch(drop)?;
+        }
+
+        self.conn.execute_batch(
+            "
+            BEGIN;
+
+            CREATE TABLE schema_version (
+                version INTEGER NOT NULL,
+                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            INSERT INTO schema_version (version) VALUES (1);
+
+            CREATE TABLE agents (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE,
+                home_dir TEXT NOT NULL DEFAULT '',
+                active BOOLEAN NOT NULL DEFAULT 1,
+                last_seen INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE teams (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE,
+                config_path TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE team_runs (
+                id TEXT PRIMARY KEY,
+                team_id TEXT NOT NULL REFERENCES teams(id),
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running'
+                    CHECK (status IN ('running','completed','failed','cancelled')),
+                failure_reason TEXT,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                max_iterations INTEGER NOT NULL DEFAULT 3,
+                deliverable TEXT,
+                started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                ended_at INTEGER
+            );
+            CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
+
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                label TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK (
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition')
+                ),
+                cron_expr TEXT,
+                event_source TEXT,
+                event_offset_secs INTEGER,
+                condition_expr TEXT,
+                next_fire_at INTEGER,
+                timeout_at INTEGER,
+                action_type TEXT NOT NULL CHECK (
+                    action_type IN (
+                        'send_message','resume_agent','inject_context',
+                        'run_skill','invoke_orchestrator'
+                    )
+                ),
+                action_config TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    status IN ('pending','in_progress','completed','failed',
+                               'cancelled','expired','recurring_active')
+                ),
+                process_id INTEGER,
+                input_context TEXT,
+                result TEXT,
+                created_by_session TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                fired_at INTEGER,
+                completed_at INTEGER
+            );
+            CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+            CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
+                WHERE status IN ('pending','recurring_active');
+
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary')),
+                content TEXT NOT NULL,
+                channel_type TEXT NOT NULL DEFAULT 'telegram',
+                metadata TEXT,
+                compacted_through_id INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_conv_agent_created ON conversations(agent_id, created_at DESC);
+
+            CREATE TABLE core_memory (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                key TEXT NOT NULL COLLATE NOCASE,
+                value TEXT NOT NULL,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (agent_id, key)
+            );
+
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                canonical_name TEXT NOT NULL COLLATE NOCASE,
+                relationship TEXT,
+                notes TEXT,
+                first_mentioned INTEGER NOT NULL DEFAULT (unixepoch()),
+                last_mentioned INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE (agent_id, canonical_name)
+            );
+
+            CREATE TABLE commitments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                description TEXT NOT NULL COLLATE NOCASE,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','completed','cancelled')),
+                due_date TEXT,
+                person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                completed_at INTEGER,
+                UNIQUE (agent_id, description)
+            );
+            CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+
+            CREATE TABLE preferences (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                category TEXT NOT NULL COLLATE NOCASE,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (agent_id, category)
+            );
+
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                description TEXT NOT NULL,
+                event_date TEXT,
+                context TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE memory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                before_value TEXT,
+                after_value TEXT NOT NULL,
+                reasoning TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_memev_agent_created ON memory_events(agent_id, created_at DESC);
+            CREATE INDEX idx_memev_session ON memory_events(session_id);
+
+            CREATE TABLE memory_event_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE (agent_id, year, month)
+            );
+
+            CREATE TABLE search_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL,
+                source_id INTEGER,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_search_agent ON search_content(agent_id, source_type);
+
+            CREATE TABLE team_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+                parent_id INTEGER REFERENCES team_messages(id),
+                agent_id TEXT REFERENCES agents(id),
+                message_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_team_msg_run ON team_messages(run_id, created_at);
+
+            CREATE TABLE heartbeat_sends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                sent_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_heartbeat_agent ON heartbeat_sends(agent_id, sent_at DESC);
+
+            CREATE TABLE reflection_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                changes_made INTEGER NOT NULL DEFAULT 0,
+                summary TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX idx_reflect_agent ON reflection_runs(agent_id, created_at DESC);
+
+            CREATE TABLE customer_config (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                key TEXT NOT NULL COLLATE NOCASE,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (agent_id, key)
+            );
+
+            CREATE TABLE failed_sends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                request_id TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            -- Pre-register the default 'main' agent
+            INSERT INTO agents (id, name, home_dir) VALUES ('main', 'main', '');
+
+            COMMIT;
+            ",
+        )
+        .context("failed to create v1 schema")?;
+
+        // Virtual tables must be outside transactions
+        let _ = self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_search
+                 USING fts5(content, content='search_content', content_rowid='id');
+             CREATE VIRTUAL TABLE IF NOT EXISTS vec_search
+                 USING vec0(embedding float[512]);",
+        );
+
+        Ok(())
+    }
+
+    // ===== Agent CRUD =====
+
+    pub fn register_agent(&self, id: &str, name: &str, home_dir: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES (?1, ?2, ?3)",
+            params![id, name, home_dir],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_agent_last_seen(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agents SET last_seen = unixepoch() WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_agents_db(&self) -> Result<Vec<AgentRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, home_dir, active, last_seen, created_at FROM agents ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AgentRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    home_dir: r.get(2)?,
+                    active: r.get(3)?,
+                    last_seen: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Team CRUD =====
+
+    pub fn register_team(&self, id: &str, name: &str, config_path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO teams (id, name, config_path) VALUES (?1, ?2, ?3)",
+            params![id, name, config_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_teams_db(&self) -> Result<Vec<TeamRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, config_path, created_at FROM teams ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TeamRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    config_path: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Task CRUD =====
+
+    pub fn create_task(&self, task: &NewTask) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO tasks (
+                id, agent_id, team_run_id, parent_task_id, depth, label,
+                trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
+                next_fire_at, timeout_at, action_type, action_config,
+                input_context, created_by_session
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15,
+                ?16, ?17
+             )",
+            params![
+                id,
+                task.agent_id,
+                task.team_run_id,
+                task.parent_task_id,
+                task.depth,
+                task.label,
+                task.trigger_type,
+                task.cron_expr,
+                task.event_source,
+                task.event_offset_secs,
+                task.condition_expr,
+                task.next_fire_at,
+                task.timeout_at,
+                task.action_type,
+                task.action_config,
+                task.input_context,
+                task.created_by_session,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+        Ok(Task {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            team_run_id: r.get(2)?,
+            parent_task_id: r.get(3)?,
+            depth: r.get(4)?,
+            label: r.get(5)?,
+            trigger_type: r.get(6)?,
+            cron_expr: r.get(7)?,
+            event_source: r.get(8)?,
+            event_offset_secs: r.get(9)?,
+            condition_expr: r.get(10)?,
+            next_fire_at: r.get(11)?,
+            timeout_at: r.get(12)?,
+            action_type: r.get(13)?,
+            action_config: r.get(14)?,
+            status: r.get(15)?,
+            process_id: r.get(16)?,
+            input_context: r.get(17)?,
+            result: r.get(18)?,
+            created_by_session: r.get(19)?,
+            created_at: r.get(20)?,
+            updated_at: r.get(21)?,
+            fired_at: r.get(22)?,
+            completed_at: r.get(23)?,
+        })
+    }
+
+    const TASK_COLUMNS: &'static str =
+        "id, agent_id, team_run_id, parent_task_id, depth, label,
+         trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
+         next_fire_at, timeout_at, action_type, action_config,
+         status, process_id, input_context, result, created_by_session,
+         created_at, updated_at, fired_at, completed_at";
+
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
+        let sql = format!("SELECT {} FROM tasks WHERE id = ?1", Self::TASK_COLUMNS);
+        self.conn
+            .query_row(&sql, params![id], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_due_tasks(&self, now_unix: i64, limit: usize) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE next_fire_at <= ?1
+               AND status IN ('pending','recurring_active')
+             ORDER BY next_fire_at ASC
+             LIMIT ?2",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![now_unix, limit as i64], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_schedulable_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1 AND status IN ('pending','recurring_active')
+             ORDER BY next_fire_at ASC NULLS LAST",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET status = ?1, updated_at = unixepoch() WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET status = 'completed', result = ?1,
+             completed_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ?2",
+            params![result, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_next_fire_at(&self, id: &str, next_fire_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET next_fire_at = ?1, updated_at = unixepoch() WHERE id = ?2",
+            params![next_fire_at, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_task_fired(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET fired_at = unixepoch(), updated_at = unixepoch() WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_task(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
+             WHERE id = ?1 AND status NOT IN ('completed','failed','cancelled','expired')",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET status = 'expired', updated_at = unixepoch()
+             WHERE timeout_at IS NOT NULL AND timeout_at < ?1
+               AND status NOT IN ('completed','failed','cancelled','expired')",
+            params![now_unix],
+        )?;
+        Ok(n)
+    }
+
+    pub fn count_pending_tasks(&self, agent_id: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1 AND status IN ('pending','in_progress','recurring_active')",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    pub fn get_pending_user_reply_task(&self, agent_id: &str) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1 AND trigger_type = 'user_reply' AND status = 'pending'
+             ORDER BY created_at ASC LIMIT 1",
+            Self::TASK_COLUMNS
+        );
+        self.conn
+            .query_row(&sql, params![agent_id], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_pending_reminder_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type IN ('time', 'recurring')
+               AND action_type = 'send_message'
+               AND status IN ('pending', 'recurring_active')
+             ORDER BY next_fire_at ASC",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_inject_context_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1 AND action_type = 'inject_context'
+               AND status = 'pending'
+             ORDER BY next_fire_at ASC",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET process_id = ?1, updated_at = unixepoch() WHERE id = ?2",
+            params![process_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
+        let cutoff = Utc::now().timestamp() - older_than_secs;
+        let n = self.conn.execute(
+            "DELETE FROM tasks WHERE status IN ('completed','cancelled','expired','failed')
+             AND completed_at IS NOT NULL AND completed_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    pub fn get_tasks_by_status(&self, agent_id: &str, statuses: &[&str]) -> Result<Vec<Task>> {
+        if statuses.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders: String = (1..=statuses.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE agent_id = ?1 AND status IN ({}) ORDER BY created_at DESC",
+            Self::TASK_COLUMNS,
+            placeholders
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(agent_id.to_string())];
+        for s in statuses {
+            bind.push(Box::new(s.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Conversation =====
+
+    pub fn save_message(
+        &self,
+        agent_id: &str,
+        role: &str,
+        content: &str,
+        channel_type: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO conversations (agent_id, role, content, channel_type)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![agent_id, role, content, channel_type],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn save_message_with_metadata(
+        &self,
+        agent_id: &str,
+        role: &str,
+        content: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO conversations (agent_id, role, content, channel_type, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![agent_id, role, content, channel_type, metadata],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn row_to_conversation_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationMessage> {
+        Ok(ConversationMessage {
+            id: r.get(0)?,
+            role: r.get(1)?,
+            content: r.get(2)?,
+            channel_type: r.get(3)?,
+            metadata: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    }
+
+    pub fn load_recent_messages(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        channel_types: Option<&[&str]>,
+    ) -> Result<Vec<ConversationMessage>> {
+        let mut messages = if let Some(types) = channel_types {
+            let placeholders: String = (1..=types.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, role, content, channel_type, metadata,
+                         datetime(created_at, 'unixepoch')
+                  FROM conversations
+                  WHERE agent_id = ?1 AND channel_type IN ({})
+                  ORDER BY created_at DESC, id DESC LIMIT ?2",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(agent_id.to_string()), Box::new(limit as i64)];
+            for t in types {
+                bind.push(Box::new(t.to_string()));
+            }
+            let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+            stmt.query_map(refs.as_slice(), Self::row_to_conversation_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, role, content, channel_type, metadata,
+                         datetime(created_at, 'unixepoch')
+                  FROM conversations WHERE agent_id = ?1 AND role != 'summary'
+                  ORDER BY created_at DESC, id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(
+                params![agent_id, limit as i64],
+                Self::row_to_conversation_message,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub fn load_conversation_summary(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<ConversationMessage>> {
+        self.conn
+            .query_row(
+                "SELECT id, role, content, channel_type, metadata,
+                         datetime(created_at, 'unixepoch')
+                  FROM conversations WHERE agent_id = ?1 AND role = 'summary'
+                  ORDER BY created_at DESC LIMIT 1",
+                params![agent_id],
+                Self::row_to_conversation_message,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn count_messages(&self, agent_id: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1 AND role != 'summary'",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    pub fn load_messages_before_window(
+        &self,
+        agent_id: &str,
+        window_size: usize,
+    ) -> Result<Vec<ConversationMessage>> {
+        let cutoff_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM conversations WHERE agent_id = ?1 AND role != 'summary'
+                  ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET ?2",
+                params![agent_id, window_size as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let cutoff_id = match cutoff_id {
+            Some(id) => id,
+            None => return Ok(vec![]),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, channel_type, metadata,
+                     datetime(created_at, 'unixepoch')
+              FROM conversations
+              WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2
+              ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, cutoff_id], Self::row_to_conversation_message)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn replace_with_summary(
+        &self,
+        agent_id: &str,
+        summary: &str,
+        compacted_through_id: i64,
+    ) -> Result<i64> {
+        // Delete old non-summary messages up to compacted_through_id
+        self.conn.execute(
+            "DELETE FROM conversations
+             WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2",
+            params![agent_id, compacted_through_id],
+        )?;
+        // Remove old summary
+        self.conn.execute(
+            "DELETE FROM conversations WHERE agent_id = ?1 AND role = 'summary'",
+            params![agent_id],
+        )?;
+        // Insert new summary
+        self.conn.execute(
+            "INSERT INTO conversations (agent_id, role, content, channel_type, compacted_through_id)
+             VALUES (?1, 'summary', ?2, 'cli', ?3)",
+            params![agent_id, summary, compacted_through_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn load_messages_after(
+        &self,
+        agent_id: &str,
+        after_id: i64,
+        channel_types: Option<&[&str]>,
+    ) -> Result<Vec<ConversationMessage>> {
+        if let Some(types) = channel_types {
+            let placeholders: String = (1..=types.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, role, content, channel_type, metadata,
+                         datetime(created_at, 'unixepoch')
+                  FROM conversations
+                  WHERE agent_id = ?1 AND id > ?2 AND channel_type IN ({})
+                  ORDER BY created_at ASC",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(agent_id.to_string()), Box::new(after_id)];
+            for t in types {
+                bind.push(Box::new(t.to_string()));
+            }
+            let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt
+                .query_map(refs.as_slice(), Self::row_to_conversation_message)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, role, content, channel_type, metadata,
+                         datetime(created_at, 'unixepoch')
+                  FROM conversations WHERE agent_id = ?1 AND id > ?2
+                  ORDER BY created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![agent_id, after_id], Self::row_to_conversation_message)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        }
+    }
+
+    pub fn max_message_id(&self, agent_id: &str) -> Result<i64> {
+        let id: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM conversations WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_conversations_since(
+        &self,
+        agent_id: &str,
+        since_unix: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, channel_type, metadata,
+                     datetime(created_at, 'unixepoch')
+              FROM conversations
+              WHERE agent_id = ?1 AND created_at >= ?2 AND role != 'summary'
+              ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, since_unix], Self::row_to_conversation_message)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn last_user_message_time(&self, agent_id: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MAX(created_at) FROM conversations
+                  WHERE agent_id = ?1 AND role = 'user'",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(Into::into)
+    }
+
+    // ===== Core Memory =====
+
+    pub fn get_core_memory(&self, agent_id: &str, key: &str) -> Result<Option<CoreMemoryEntry>> {
+        self.conn
+            .query_row(
+                "SELECT key, value, token_count, datetime(updated_at, 'unixepoch')
+                  FROM core_memory WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id, key],
+                |r| {
+                    Ok(CoreMemoryEntry {
+                        key: r.get(0)?,
+                        value: r.get(1)?,
+                        token_count: r.get(2)?,
+                        updated_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_all_core_memory(&self, agent_id: &str) -> Result<Vec<CoreMemoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value, token_count, datetime(updated_at, 'unixepoch')
+              FROM core_memory WHERE agent_id = ?1 ORDER BY key",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| {
+                Ok(CoreMemoryEntry {
+                    key: r.get(0)?,
+                    value: r.get(1)?,
+                    token_count: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or update a core memory entry. Returns the new token count.
+    pub fn set_core_memory(&self, agent_id: &str, key: &str, value: &str) -> Result<i32> {
+        let token_count = (value.len() / 4).max(1) as i32;
+        self.conn.execute(
+            "INSERT INTO core_memory (agent_id, key, value, token_count)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, key) DO UPDATE SET
+                value = excluded.value,
+                token_count = excluded.token_count,
+                updated_at = unixepoch()",
+            params![agent_id, key, value, token_count],
+        )?;
+        Ok(token_count)
+    }
+
+    pub fn seed_core_memory(&self, agent_id: &str, user_md_content: Option<&str>) -> Result<()> {
+        for (key, default) in CORE_MEMORY_SECTIONS {
+            let existing = self.get_core_memory(agent_id, key)?;
+            if existing.is_none() {
+                self.set_core_memory(agent_id, key, default)?;
+            }
+        }
+        if let Some(md) = user_md_content {
+            if !md.trim().is_empty() {
+                self.set_core_memory(agent_id, "user_summary", md.trim())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn total_core_memory_tokens(&self, agent_id: &str) -> Result<i32> {
+        let n: i32 = self.conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM core_memory WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    // ===== People =====
+
+    pub fn upsert_person(
+        &self,
+        agent_id: &str,
+        name: &str,
+        relationship: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM people WHERE agent_id = ?1 AND canonical_name = ?2",
+                params![agent_id, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE people SET relationship = COALESCE(?1, relationship),
+                  notes = COALESCE(?2, notes),
+                  last_mentioned = unixepoch()
+                  WHERE id = ?3",
+                params![relationship, notes, id],
+            )?;
+            Ok(id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO people (agent_id, canonical_name, relationship, notes)
+                  VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id, name, relationship, notes],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        }
+    }
+
+    pub fn get_person(&self, agent_id: &str, name: &str) -> Result<Option<Person>> {
+        self.conn
+            .query_row(
+                "SELECT id, canonical_name, relationship, notes,
+                         datetime(first_mentioned, 'unixepoch'),
+                         datetime(last_mentioned, 'unixepoch')
+                  FROM people WHERE agent_id = ?1 AND canonical_name = ?2",
+                params![agent_id, name],
+                |r| {
+                    Ok(Person {
+                        id: r.get(0)?,
+                        canonical_name: r.get(1)?,
+                        relationship: r.get(2)?,
+                        notes: r.get(3)?,
+                        first_mentioned: r.get(4)?,
+                        last_mentioned: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_people(&self, agent_id: &str) -> Result<Vec<Person>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, canonical_name, relationship, notes,
+                     datetime(first_mentioned, 'unixepoch'),
+                     datetime(last_mentioned, 'unixepoch')
+              FROM people WHERE agent_id = ?1 ORDER BY canonical_name",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| {
+                Ok(Person {
+                    id: r.get(0)?,
+                    canonical_name: r.get(1)?,
+                    relationship: r.get(2)?,
+                    notes: r.get(3)?,
+                    first_mentioned: r.get(4)?,
+                    last_mentioned: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn search_people(&self, agent_id: &str, query: &str) -> Result<Vec<Person>> {
+        let pattern = format!("%{}%", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, canonical_name, relationship, notes,
+                     datetime(first_mentioned, 'unixepoch'),
+                     datetime(last_mentioned, 'unixepoch')
+              FROM people
+              WHERE agent_id = ?1 AND (
+                  canonical_name LIKE ?2 OR relationship LIKE ?2 OR notes LIKE ?2
+              )
+              ORDER BY canonical_name",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, pattern], |r| {
+                Ok(Person {
+                    id: r.get(0)?,
+                    canonical_name: r.get(1)?,
+                    relationship: r.get(2)?,
+                    notes: r.get(3)?,
+                    first_mentioned: r.get(4)?,
+                    last_mentioned: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Commitments =====
+
+    pub fn add_commitment(
+        &self,
+        agent_id: &str,
+        description: &str,
+        due_date: Option<&str>,
+        person_id: Option<i64>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO commitments (agent_id, description, due_date, person_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, description) DO UPDATE SET
+                 due_date = COALESCE(?3, due_date),
+                 person_id = COALESCE(?4, person_id)",
+            params![agent_id, description, due_date, person_id],
+        )?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM commitments WHERE agent_id = ?1 AND description = ?2",
+            params![agent_id, description],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    fn row_to_commitment(r: &rusqlite::Row<'_>) -> rusqlite::Result<Commitment> {
+        Ok(Commitment {
+            id: r.get(0)?,
+            description: r.get(1)?,
+            status: r.get(2)?,
+            due_date: r.get(3)?,
+            person_id: r.get(4)?,
+            created_at: r.get(5)?,
+            completed_at: r.get(6)?,
+        })
+    }
+
+    pub fn list_commitments(&self, agent_id: &str, status: &str) -> Result<Vec<Commitment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, status, due_date, person_id,
+                     datetime(created_at, 'unixepoch'),
+                     datetime(completed_at, 'unixepoch')
+              FROM commitments WHERE agent_id = ?1 AND status = ?2
+              ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, status], Self::row_to_commitment)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_commitment_status(&self, agent_id: &str, id: i64, status: &str) -> Result<bool> {
+        let completed_at = if status == "completed" {
+            Some(Utc::now().timestamp())
+        } else {
+            None
+        };
+        let n = self.conn.execute(
+            "UPDATE commitments SET status = ?1, completed_at = ?2
+             WHERE agent_id = ?3 AND id = ?4",
+            params![status, completed_at, agent_id, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn get_commitment_status(&self, agent_id: &str, id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT status FROM commitments WHERE agent_id = ?1 AND id = ?2",
+                params![agent_id, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_commitment_details(
+        &self,
+        agent_id: &str,
+        id: i64,
+    ) -> Result<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT description, due_date FROM commitments WHERE agent_id = ?1 AND id = ?2",
+                params![agent_id, id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn search_commitments(&self, agent_id: &str, query: &str) -> Result<Vec<Commitment>> {
+        let pattern = format!("%{}%", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, status, due_date, person_id,
+                     datetime(created_at, 'unixepoch'),
+                     datetime(completed_at, 'unixepoch')
+              FROM commitments WHERE agent_id = ?1 AND description LIKE ?2
+              ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, pattern], Self::row_to_commitment)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Preferences =====
+
+    pub fn set_preference(&self, agent_id: &str, category: &str, value: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO preferences (agent_id, category, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id, category) DO UPDATE SET
+                 value = excluded.value, updated_at = unixepoch()",
+            params![agent_id, category, value],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_preference(&self, agent_id: &str, category: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM preferences WHERE agent_id = ?1 AND category = ?2",
+                params![agent_id, category],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_preferences(&self, agent_id: &str) -> Result<Vec<Preference>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT category, value, datetime(updated_at, 'unixepoch')
+              FROM preferences WHERE agent_id = ?1 ORDER BY category",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| {
+                Ok(Preference {
+                    category: r.get(0)?,
+                    value: r.get(1)?,
+                    updated_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn search_preferences(&self, agent_id: &str, query: &str) -> Result<Vec<Preference>> {
+        let pattern = format!("%{}%", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT category, value, datetime(updated_at, 'unixepoch')
+              FROM preferences WHERE agent_id = ?1 AND (category LIKE ?2 OR value LIKE ?2)
+              ORDER BY category",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, pattern], |r| {
+                Ok(Preference {
+                    category: r.get(0)?,
+                    value: r.get(1)?,
+                    updated_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Events =====
+
+    pub fn add_event(
+        &self,
+        agent_id: &str,
+        description: &str,
+        event_date: Option<&str>,
+        context: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO events (agent_id, description, event_date, context) VALUES (?1, ?2, ?3, ?4)",
+            params![agent_id, description, event_date, context],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_events(&self, agent_id: &str) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, event_date, context, datetime(created_at, 'unixepoch')
+              FROM events WHERE agent_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| {
+                Ok(Event {
+                    id: r.get(0)?,
+                    description: r.get(1)?,
+                    event_date: r.get(2)?,
+                    context: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn search_events(&self, agent_id: &str, query: &str) -> Result<Vec<Event>> {
+        let pattern = format!("%{}%", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description, event_date, context, datetime(created_at, 'unixepoch')
+              FROM events WHERE agent_id = ?1 AND (description LIKE ?2 OR context LIKE ?2)
+              ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, pattern], |r| {
+                Ok(Event {
+                    id: r.get(0)?,
+                    description: r.get(1)?,
+                    event_date: r.get(2)?,
+                    context: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Memory Events (Audit Log) =====
+
+    pub fn log_memory_event(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        target_key: &str,
+        before_value: Option<&str>,
+        after_value: &str,
+        reasoning: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO memory_events
+             (agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_memory_events(&self, agent_id: &str, session_id: &str) -> Result<Vec<MemoryEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
+                     datetime(created_at, 'unixepoch')
+              FROM memory_events WHERE agent_id = ?1 AND session_id = ?2
+              ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, session_id], |r| {
+                Ok(MemoryEvent {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    tool_name: r.get(2)?,
+                    target_key: r.get(3)?,
+                    before_value: r.get(4)?,
+                    after_value: r.get(5)?,
+                    reasoning: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_memory_events_since(
+        &self,
+        agent_id: &str,
+        since_unix: i64,
+    ) -> Result<Vec<MemoryEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
+                     datetime(created_at, 'unixepoch')
+              FROM memory_events WHERE agent_id = ?1 AND created_at >= ?2
+              ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, since_unix], |r| {
+                Ok(MemoryEvent {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    tool_name: r.get(2)?,
+                    target_key: r.get(3)?,
+                    before_value: r.get(4)?,
+                    after_value: r.get(5)?,
+                    reasoning: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_memory_events_for_session(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE agent_id = ?1 AND session_id = ?2",
+            params![agent_id, session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    pub fn compact_old_memory_events(&self, agent_id: &str, days: u32) -> Result<usize> {
+        let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                 CAST(strftime('%Y', datetime(created_at, 'unixepoch')) AS INTEGER) AS year,
+                 CAST(strftime('%m', datetime(created_at, 'unixepoch')) AS INTEGER) AS month,
+                 COUNT(*) AS cnt,
+                 GROUP_CONCAT(
+                     tool_name || ': ' || target_key || ' = ' || substr(after_value, 1, 100),
+                     '; '
+                 ) AS summary
+             FROM memory_events
+             WHERE agent_id = ?1 AND created_at < ?2
+             GROUP BY year, month",
+        )?;
+        let groups: Vec<(i64, i64, i64, String)> = stmt
+            .query_map(params![agent_id, cutoff], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if groups.is_empty() {
+            return Ok(0);
+        }
+        let count = groups.len();
+        for (year, month, event_count, summary) in groups {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO memory_event_summaries
+                 (agent_id, year, month, summary, event_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![agent_id, year, month, summary, event_count],
+            )?;
+        }
+        self.conn.execute(
+            "DELETE FROM memory_events WHERE agent_id = ?1 AND created_at < ?2",
+            params![agent_id, cutoff],
+        )?;
+        Ok(count)
+    }
+
+    // ===== Heartbeat =====
+
+    pub fn record_heartbeat_send(&self, agent_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO heartbeat_sends (agent_id) VALUES (?1)",
+            params![agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_heartbeat_sends_last_hour(&self, agent_id: &str) -> Result<u32> {
+        let n: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM heartbeat_sends
+             WHERE agent_id = ?1 AND sent_at >= unixepoch('now') - 3600",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    pub fn count_heartbeat_sends_today(&self, agent_id: &str, timezone: &str) -> Result<u32> {
+        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+        let now_local = Utc::now().with_timezone(&tz);
+        let midnight_local = now_local
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default();
+        let since_ts = tz
+            .from_local_datetime(&midnight_local)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc).timestamp())
+            .unwrap_or_else(|| Utc::now().timestamp());
+        let n: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM heartbeat_sends WHERE agent_id = ?1 AND sent_at >= ?2",
+            params![agent_id, since_ts],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    pub fn prune_old_heartbeat_sends(&self, agent_id: &str, days: u32) -> Result<()> {
+        let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
+        self.conn.execute(
+            "DELETE FROM heartbeat_sends WHERE agent_id = ?1 AND sent_at < ?2",
+            params![agent_id, cutoff],
+        )?;
+        Ok(())
+    }
+
+    // ===== Reflection =====
+
+    pub fn record_reflection_run(
+        &self,
+        agent_id: &str,
+        status: &str,
+        changes_made: i64,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO reflection_runs (agent_id, status, changes_made, summary)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![agent_id, status, changes_made, summary],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_reflection_run_today(&self, agent_id: &str, timezone: &str) -> Result<bool> {
+        let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+        let now_local = Utc::now().with_timezone(&tz);
+        let midnight_local = now_local
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default();
+        let since_ts = tz
+            .from_local_datetime(&midnight_local)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc).timestamp())
+            .unwrap_or_else(|| Utc::now().timestamp());
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reflection_runs
+             WHERE agent_id = ?1 AND status = 'completed' AND created_at >= ?2",
+            params![agent_id, since_ts],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn prune_old_reflection_runs(&self, agent_id: &str, days: u32) -> Result<usize> {
+        let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
+        let n = self.conn.execute(
+            "DELETE FROM reflection_runs WHERE agent_id = ?1 AND created_at < ?2",
+            params![agent_id, cutoff],
+        )?;
+        Ok(n)
+    }
+
+    // ===== Failed Sends =====
+
+    pub fn save_failed_send(
+        &self,
+        agent_id: &str,
+        text: &str,
+        request_id: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO failed_sends (agent_id, text, request_id) VALUES (?1, ?2, ?3)",
+            params![agent_id, text, request_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_pending_failed_sends(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FailedSend>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, request_id, datetime(created_at, 'unixepoch'), retry_count
+              FROM failed_sends WHERE agent_id = ?1
+              ORDER BY created_at ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, limit as i64], |r| {
+                Ok(FailedSend {
+                    id: r.get(0)?,
+                    text: r.get(1)?,
+                    request_id: r.get(2)?,
+                    created_at: r.get(3)?,
+                    retry_count: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_failed_send(&self, agent_id: &str, id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM failed_sends WHERE agent_id = ?1 AND id = ?2",
+            params![agent_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn increment_failed_send_retry(&self, agent_id: &str, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE failed_sends SET retry_count = retry_count + 1 WHERE agent_id = ?1 AND id = ?2",
+            params![agent_id, id],
+        )?;
+        Ok(())
+    }
+
+    // ===== Customer Config =====
+
+    pub fn get_customer_config(&self, agent_id: &str, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM customer_config WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id, key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_customer_config(&self, agent_id: &str, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO customer_config (agent_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id, key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+            params![agent_id, key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_customer_config(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value FROM customer_config WHERE agent_id = ?1 ORDER BY key",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Team Runs =====
+
+    pub fn insert_team_run(
+        &self,
+        run_id: &str,
+        team_name: &str,
+        goal: &str,
+        max_iterations: u32,
+        started_at: i64,
+    ) -> Result<()> {
+        // Auto-register team (team_id = team_name)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO teams (id, name) VALUES (?1, ?1)",
+            params![team_name],
+        )?;
+        self.conn.execute(
+            "INSERT INTO team_runs (id, team_id, goal, max_iterations, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id, team_name, goal, max_iterations, started_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_team_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        failure_reason: Option<&str>,
+        iteration: u32,
+        deliverable: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
+             deliverable = ?4, ended_at = ?5
+             WHERE id = ?6",
+            params![status, failure_reason, iteration, deliverable, ended_at, run_id],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_team_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRunRow> {
+        Ok(TeamRunRow {
+            id: r.get(0)?,
+            team_name: r.get(1)?,
+            goal: r.get(2)?,
+            status: r.get(3)?,
+            failure_reason: r.get(4)?,
+            iteration: r.get::<_, u32>(5)?,
+            max_iterations: r.get::<_, u32>(6)?,
+            deliverable: r.get(7)?,
+            started_at: r.get(8)?,
+            ended_at: r.get(9)?,
+        })
+    }
+
+    pub fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
+                     r.max_iterations, r.deliverable, r.started_at, r.ended_at
+              FROM team_runs r JOIN teams t ON r.team_id = t.id
+              WHERE t.name = ?1
+              ORDER BY r.started_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![team_name, limit as i64], Self::row_to_team_run)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn load_team_runs_for_prompt(
+        &self,
+        team_name: &str,
+        limit: usize,
+        max_text_len: usize,
+    ) -> Result<Vec<TeamRunRow>> {
+        let mut runs = self.load_team_runs(team_name, limit)?;
+        for run in &mut runs {
+            if let Some(ref d) = run.deliverable {
+                if d.len() > max_text_len {
+                    run.deliverable = Some(format!("{}...", &d[..max_text_len]));
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    pub fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        self.conn
+            .query_row(
+                "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
+                         r.max_iterations, r.deliverable, r.started_at, r.ended_at
+                  FROM team_runs r JOIN teams t ON r.team_id = t.id
+                  WHERE t.name = ?1
+                  ORDER BY r.started_at DESC LIMIT 1",
+                params![team_name],
+                Self::row_to_team_run,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        self.conn
+            .query_row(
+                "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
+                         r.max_iterations, r.deliverable, r.started_at, r.ended_at
+                  FROM team_runs r JOIN teams t ON r.team_id = t.id
+                  WHERE r.id = ?1",
+                params![run_id],
+                Self::row_to_team_run,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    // ===== Team Messages =====
+
+    pub fn insert_team_message(
+        &self,
+        run_id: &str,
+        parent_id: Option<i64>,
+        agent_name: Option<&str>,
+        message_type: &str,
+        content: &str,
+        iteration: u32,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO team_messages (run_id, parent_id, agent_id, message_type, content, iteration)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run_id, parent_id, agent_name, message_type, content, iteration],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn load_assignment_msg_ids(
+        &self,
+        run_id: &str,
+        iteration: u32,
+    ) -> Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id, id FROM team_messages
+             WHERE run_id = ?1 AND iteration = ?2 AND message_type = 'assignment'
+             AND agent_id IS NOT NULL",
+        )?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![run_id, iteration], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    pub fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, parent_id, agent_id AS agent_name,
+                     message_type, content, iteration, created_at
+              FROM team_messages WHERE run_id = ?1
+              ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                Ok(TeamMessageRow {
+                    id: r.get(0)?,
+                    run_id: r.get(1)?,
+                    parent_id: r.get(2)?,
+                    agent_name: r.get(3)?,
+                    message_type: r.get(4)?,
+                    content: r.get(5)?,
+                    iteration: r.get::<_, u32>(6)?,
+                    created_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ===== Search / Layer 3 =====
+
+    pub fn index_content(
+        &self,
+        agent_id: &str,
+        source_type: &str,
+        source_id: Option<i64>,
+        content: &str,
+    ) -> Result<i64> {
+        let existing: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, content FROM search_content
+                  WHERE agent_id = ?1 AND source_type = ?2 AND source_id IS ?3",
+                params![agent_id, source_type, source_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_id, old_content)) = existing {
+            self.conn.execute(
+                "UPDATE search_content SET content = ?1, updated_at = unixepoch() WHERE id = ?2",
+                params![content, existing_id],
+            )?;
+            // Update FTS index
+            let _ = self.conn.execute(
+                "INSERT INTO fts_search(fts_search, rowid, content) VALUES ('delete', ?1, ?2)",
+                params![existing_id, old_content],
+            );
+            let _ = self.conn.execute(
+                "INSERT INTO fts_search(rowid, content) VALUES (?1, ?2)",
+                params![existing_id, content],
+            );
+            Ok(existing_id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO search_content (agent_id, source_type, source_id, content)
+                  VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id, source_type, source_id, content],
+            )?;
+            let new_id = self.conn.last_insert_rowid();
+            let _ = self.conn.execute(
+                "INSERT INTO fts_search(rowid, content) VALUES (?1, ?2)",
+                params![new_id, content],
+            );
+            Ok(new_id)
+        }
+    }
+
+    pub fn index_embedding(&self, content_id: i64, embedding: &[f32]) -> Result<()> {
+        let emb_json = serde_json::to_string(embedding)?;
+        self.conn.execute(
+            "UPDATE search_content SET embedding_json = ?1, updated_at = unixepoch()
+             WHERE id = ?2",
+            params![emb_json, content_id],
+        )?;
+        // Upsert into vec0 table
+        let _ = self.conn.execute(
+            "INSERT INTO vec_search(rowid, embedding) VALUES (?1, ?2)
+             ON CONFLICT(rowid) DO UPDATE SET embedding = excluded.embedding",
+            params![content_id, emb_json],
+        );
+        Ok(())
+    }
+
+    pub fn delete_search_content(&self, agent_id: &str, source_type: &str, source_id: i64) -> Result<()> {
+        let existing: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, content FROM search_content
+                  WHERE agent_id = ?1 AND source_type = ?2 AND source_id = ?3",
+                params![agent_id, source_type, source_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, content)) = existing {
+            let _ = self.conn.execute(
+                "INSERT INTO fts_search(fts_search, rowid, content) VALUES ('delete', ?1, ?2)",
+                params![id, content],
+            );
+            let _ = self.conn.execute(
+                "DELETE FROM vec_search WHERE rowid = ?1",
+                params![id],
+            );
+            self.conn.execute(
+                "DELETE FROM search_content WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn count_search_content(&self, agent_id: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM search_content WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    pub fn fts_search(
+        &self,
+        agent_id: &str,
+        query: &str,
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sc.id, sc.source_type, sc.source_id, sc.content, -rank AS score
+              FROM fts_search
+              JOIN search_content sc ON fts_search.rowid = sc.id
+              WHERE fts_search MATCH ?1 AND sc.agent_id = ?2
+                AND (?3 IS NULL OR sc.source_type = ?3)
+              ORDER BY rank LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![query, agent_id, source_type_filter, limit as i64], |r| {
+                Ok(SearchResult {
+                    id: r.get(0)?,
+                    source_type: r.get(1)?,
+                    source_id: r.get(2)?,
+                    content: r.get(3)?,
+                    score: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn vec_search_internal(
+        &self,
+        agent_id: &str,
+        embedding: &[f32],
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let emb_json = serde_json::to_string(embedding)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT sc.id, sc.source_type, sc.source_id, sc.content, knn.distance
+              FROM (
+                  SELECT rowid, distance FROM vec_search
+                  WHERE embedding MATCH ?1
+                  ORDER BY distance LIMIT ?4
+              ) knn
+              JOIN search_content sc ON knn.rowid = sc.id
+              WHERE sc.agent_id = ?2 AND (?3 IS NULL OR sc.source_type = ?3)
+              ORDER BY knn.distance",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![emb_json, agent_id, source_type_filter, (limit * 3) as i64],
+                |r| {
+                    let dist: f64 = r.get(4)?;
+                    Ok(SearchResult {
+                        id: r.get(0)?,
+                        source_type: r.get(1)?,
+                        source_id: r.get(2)?,
+                        content: r.get(3)?,
+                        score: 1.0 / (1.0 + dist),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn hybrid_search(
+        &self,
+        agent_id: &str,
+        fts_query: &str,
+        embedding: Option<&[f32]>,
+        limit: usize,
+        source_type_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let fts = self
+            .fts_search(agent_id, fts_query, limit * 2, source_type_filter)
+            .unwrap_or_default();
+        let vec_results = embedding
+            .and_then(|e| {
+                self.vec_search_internal(agent_id, e, limit * 2, source_type_filter)
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        if vec_results.is_empty() {
+            return Ok(fts.into_iter().take(limit).collect());
+        }
+
+        const K: f64 = 60.0;
+        let mut scores: HashMap<i64, f64> = HashMap::new();
+        for (rank, r) in fts.iter().enumerate() {
+            *scores.entry(r.id).or_default() += 1.0 / (K + rank as f64 + 1.0);
+        }
+        for (rank, r) in vec_results.iter().enumerate() {
+            *scores.entry(r.id).or_default() += 1.0 / (K + rank as f64 + 1.0);
+        }
+        let mut all: HashMap<i64, SearchResult> = HashMap::new();
+        for r in fts.into_iter().chain(vec_results.into_iter()) {
+            all.entry(r.id).or_insert(r);
+        }
+        let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .filter_map(|(id, score)| {
+                all.remove(&id).map(|mut r| {
+                    r.score = score;
+                    r
+                })
+            })
+            .collect())
+    }
+
+    pub fn get_all_facts_for_indexing(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<(String, i64, String)>> {
+        let mut results = Vec::new();
+        // People
+        let mut stmt = self.conn.prepare(
+            "SELECT id, canonical_name || COALESCE(' - ' || relationship, '')
+                        || COALESCE(': ' || notes, '')
+              FROM people WHERE agent_id = ?1",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, content) in rows {
+            results.push(("person".to_string(), id, content));
+        }
+        // Commitments
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description || ' [' || status || ']'
+              FROM commitments WHERE agent_id = ?1",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, content) in rows {
+            results.push(("commitment".to_string(), id, content));
+        }
+        // Preferences
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, category || ': ' || value FROM preferences WHERE agent_id = ?1",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, content) in rows {
+            results.push(("preference".to_string(), id, content));
+        }
+        // Events
+        let mut stmt = self.conn.prepare(
+            "SELECT id, description || COALESCE(': ' || context, '')
+              FROM events WHERE agent_id = ?1",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, content) in rows {
+            results.push(("event".to_string(), id, content));
+        }
+        Ok(results)
+    }
+
+    // ===== Utilities =====
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.current_version()
+    }
+
+    pub fn db_size_bytes(&self) -> Result<u64> {
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        Ok((page_size * page_count) as u64)
+    }
+
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+}
+
+// ===== Utility Functions =====
+
+/// Format a unix timestamp as a human-readable UTC string: "YYYY-MM-DD HH:MM:SS".
+pub fn format_unix_ts(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// Return today's midnight UTC time for the given IANA timezone string.
+/// Falls back to UTC if the timezone string is unrecognised.
+pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    let now_local = chrono::Utc::now().with_timezone(&tz);
+    let midnight_local = now_local
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_default();
+    tz.from_local_datetime(&midnight_local)
+        .earliest()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+// ===== Tests =====
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::test_helpers::test_db;
+    use super::*;
 
-    #[test]
-    fn test_migration_creates_tables() {
-        let db = test_db();
-        let version: i64 = db
-            .conn
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 11);
+    fn db() -> Database {
+        Database::open_in_memory().unwrap()
     }
 
     #[test]
-    fn test_migration_idempotent() {
-        let db = test_db();
-        db.migrate().unwrap();
-        let version: i64 = db
-            .conn
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 11);
+    fn test_open_in_memory_creates_schema() {
+        let db = db();
+        let version = db.schema_version().unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
-    fn test_conversation_roundtrip() {
-        let db = test_db();
-        db.save_message("user", "Hello Mika!", "telegram").unwrap();
-        db.save_message("assistant", "Hi! How can I help?", "telegram")
-            .unwrap();
-
-        let messages = db.load_recent_messages(10, None).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "Hello Mika!");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "Hi! How can I help?");
+    fn test_default_agent_registered() {
+        let db = db();
+        let agents = db.list_agents_db().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "main");
     }
 
     #[test]
-    fn test_conversation_limit() {
-        let db = test_db();
-        for i in 0..20 {
-            db.save_message("user", &format!("Message {i}"), "telegram")
-                .unwrap();
-        }
-        let messages = db.load_recent_messages(5, None).unwrap();
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[0].content, "Message 15");
-        assert_eq!(messages[4].content, "Message 19");
-    }
-
-    #[test]
-    fn test_core_memory_crud() {
-        let db = test_db();
-
-        let tokens = db.set_core_memory("user_summary", "Loves coffee.").unwrap();
-        assert!(tokens > 0);
-
-        let entry = db.get_core_memory("user_summary").unwrap().unwrap();
-        assert_eq!(entry.value, "Loves coffee.");
-        assert_eq!(entry.key, "user_summary");
-
-        db.set_core_memory("user_summary", "Loves coffee and tea.")
-            .unwrap();
-        let entry = db.get_core_memory("user_summary").unwrap().unwrap();
-        assert_eq!(entry.value, "Loves coffee and tea.");
-
-        assert!(db.get_core_memory("nonexistent").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_core_memory_seed() {
-        let db = test_db();
-        db.seed_core_memory(None).unwrap();
-
-        let all = db.get_all_core_memory().unwrap();
-        assert_eq!(all.len(), 4);
-
-        let summary = db.get_core_memory("user_summary").unwrap().unwrap();
-        assert_eq!(summary.value, "New user. No information yet.");
-    }
-
-    #[test]
-    fn test_core_memory_seed_with_user_md() {
-        let db = test_db();
-        db.seed_core_memory(Some("I'm a CEO who loves hiking"))
-            .unwrap();
-
-        let summary = db.get_core_memory("user_summary").unwrap().unwrap();
-        assert_eq!(summary.value, "I'm a CEO who loves hiking");
-    }
-
-    #[test]
-    fn test_total_token_count() {
-        let db = test_db();
-        db.set_core_memory("a", &"x".repeat(100)).unwrap();
-        db.set_core_memory("b", &"y".repeat(200)).unwrap();
-        let total = db.total_core_memory_tokens().unwrap();
-        assert_eq!(total, 75);
-    }
-
-    #[test]
-    fn test_people_crud() {
-        let db = test_db();
-
-        let id = db
-            .upsert_person("Sarah Chen", Some("colleague"), Some("VP of Engineering"))
-            .unwrap();
-        assert!(id > 0);
-
-        let person = db.get_person("Sarah Chen").unwrap().unwrap();
-        assert_eq!(person.canonical_name, "Sarah Chen");
-        assert_eq!(person.relationship, Some("colleague".to_string()));
-        assert_eq!(person.notes, Some("VP of Engineering".to_string()));
-
-        db.upsert_person("Sarah Chen", Some("manager"), None)
-            .unwrap();
-        let person = db.get_person("Sarah Chen").unwrap().unwrap();
-        assert_eq!(person.relationship, Some("manager".to_string()));
-
-        assert!(db.get_person("Unknown").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_people_list() {
-        let db = test_db();
-        db.upsert_person("Alice", None, None).unwrap();
-        db.upsert_person("Bob", None, None).unwrap();
-
-        let people = db.list_people().unwrap();
-        assert_eq!(people.len(), 2);
-    }
-
-    #[test]
-    fn test_person_lookup_case_insensitive() {
-        let db = test_db();
-        db.upsert_person("Sarah Chen", Some("colleague"), None)
-            .unwrap();
-
-        // Lookup with different casing should find the same person
-        let person = db.get_person("sarah chen").unwrap().unwrap();
-        assert_eq!(person.canonical_name, "Sarah Chen");
-        assert_eq!(person.relationship, Some("colleague".to_string()));
-
-        let person = db.get_person("SARAH CHEN").unwrap().unwrap();
-        assert_eq!(person.canonical_name, "Sarah Chen");
-    }
-
-    #[test]
-    fn test_commitments() {
-        let db = test_db();
-
-        let id = db
-            .add_commitment("Review Q4 budget", Some("2026-03-01"), None)
-            .unwrap();
-        assert!(id > 0);
-
-        // Duplicate should be ignored (same description, case-insensitive)
-        db.add_commitment("Review Q4 budget", Some("2026-03-01"), None)
-            .unwrap();
-
-        let pending = db.list_commitments("pending").unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].description, "Review Q4 budget");
-
-        db.update_commitment_status(id, "completed").unwrap();
-        let pending = db.list_commitments("pending").unwrap();
-        assert_eq!(pending.len(), 0);
-        let completed = db.list_commitments("completed").unwrap();
-        assert_eq!(completed.len(), 1);
-    }
-
-    #[test]
-    fn test_commitment_dedup_case_insensitive() {
-        let db = test_db();
-        db.add_commitment("Review Q4 budget", Some("2026-03-01"), None)
-            .unwrap();
-        db.add_commitment("review q4 budget", Some("2026-03-01"), None)
-            .unwrap();
-
-        let pending = db.list_commitments("pending").unwrap();
-        assert_eq!(pending.len(), 1);
-    }
-
-    #[test]
-    fn test_preferences() {
-        let db = test_db();
-
-        db.set_preference("communication_style", "Direct and concise")
-            .unwrap();
-        let pref = db.get_preference("communication_style").unwrap().unwrap();
-        assert_eq!(pref, "Direct and concise");
-
-        db.set_preference("communication_style", "Friendly and warm")
-            .unwrap();
-        let pref = db.get_preference("communication_style").unwrap().unwrap();
-        assert_eq!(pref, "Friendly and warm");
-
-        assert!(db.get_preference("nonexistent").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_preference_case_insensitive() {
-        let db = test_db();
-        db.set_preference("Food", "No shellfish").unwrap();
-
-        let pref = db.get_preference("food").unwrap().unwrap();
-        assert_eq!(pref, "No shellfish");
-
-        let pref = db.get_preference("FOOD").unwrap().unwrap();
-        assert_eq!(pref, "No shellfish");
-    }
-
-    #[test]
-    fn test_events() {
-        let db = test_db();
-
-        let id = db
-            .add_event("Board meeting", Some("2026-03-15"), Some("business"))
-            .unwrap();
-        assert!(id > 0);
-    }
-
-    #[test]
-    fn test_memory_events() {
-        let db = test_db();
-        db.log_memory_event(
-            "sess-1",
-            "store_fact",
-            "person:Alice",
-            None,
-            "Alice — colleague",
-            None,
-        )
-        .unwrap();
-        db.log_memory_event(
-            "sess-1",
-            "update_core_memory",
-            "persona",
-            Some("old"),
-            "new",
-            Some("user asked"),
-        )
-        .unwrap();
-
-        let events = db.get_memory_events("sess-1").unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].tool_name, "store_fact");
-        assert_eq!(events[0].target_key, "person:Alice");
-        assert_eq!(events[1].reasoning, Some("user asked".to_string()));
-
-        // Different session returns empty
-        let events = db.get_memory_events("other").unwrap();
-        assert!(events.is_empty());
-    }
-
-    // -- Migration tests --
-
-    #[test]
-    fn test_v5_tables_exist() {
-        let db = test_db();
-        // Verify all v5+ tables exist by querying sqlite_master
-        let tables: Vec<String> = {
-            let mut stmt = db
-                .conn
-                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                .unwrap();
-            stmt.query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert!(tables.contains(&"reminders".to_string()));
-        assert!(tables.contains(&"heartbeat_sends".to_string()));
-        assert!(tables.contains(&"customer_config".to_string()));
-        assert!(tables.contains(&"failed_sends".to_string()));
-        assert!(tables.contains(&"memory_event_summaries".to_string()));
-    }
-
-    #[test]
-    fn test_conversations_has_compacted_through_id() {
-        let db = test_db();
-        // Verify the column exists by inserting a row with it
-        db.conn
-            .execute(
-                "INSERT INTO conversations (role, content, channel_type, compacted_through_id)
-                 VALUES ('summary', 'test', 'system', 42)",
-                [],
-            )
-            .unwrap();
-        let val: i64 = db
+    fn test_v1_tables_exist() {
+        let db = db();
+        let count: i64 = db
             .conn
             .query_row(
-                "SELECT compacted_through_id FROM conversations WHERE role = 'summary'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+                  AND name IN ('agents','teams','tasks','conversations','core_memory',
+                               'people','commitments','preferences','events',
+                               'memory_events','memory_event_summaries','search_content',
+                               'team_runs','team_messages','heartbeat_sends',
+                               'reflection_runs','customer_config','failed_sends')",
                 [],
-                |row| row.get(0),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(val, 42);
+        assert_eq!(count, 18);
     }
 
-    // -- Channel type filter tests --
+    #[test]
+    fn test_no_reminders_table() {
+        let db = db();
+        let exists: bool = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='reminders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
 
     #[test]
-    fn test_load_messages_channel_filter() {
-        let db = test_db();
-        db.save_message("user", "cli msg", "cli").unwrap();
-        db.save_message("user", "telegram msg", "telegram").unwrap();
-        db.save_message("user", "heartbeat msg", "heartbeat")
-            .unwrap();
-
-        // Filter to only cli + telegram
-        let msgs = db
-            .load_recent_messages(10, Some(&["cli", "telegram"]))
-            .unwrap();
+    fn test_save_and_load_messages() {
+        let db = db();
+        db.save_message("main", "user", "Hello!", "cli").unwrap();
+        db.save_message("main", "assistant", "Hi!", "cli").unwrap();
+        let msgs = db.load_recent_messages("main", 10, None).unwrap();
         assert_eq!(msgs.len(), 2);
-        assert!(msgs.iter().all(|m| m.channel_type != "heartbeat"));
-
-        // No filter returns all
-        let all = db.load_recent_messages(10, None).unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
     }
 
     #[test]
-    fn test_load_messages_excludes_summary() {
-        let db = test_db();
-        db.save_message("user", "real msg", "cli").unwrap();
-        db.save_conversation_summary("old summary", 0).unwrap();
-
-        let msgs = db.load_recent_messages(10, None).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "real msg");
-    }
-
-    // -- Reminder tests --
-
-    #[test]
-    fn test_reminder_lifecycle() {
-        let db = test_db();
-
-        // Create two reminders: one in the past, one in the future
-        // 2020-01-01T00:00:00Z
-        let past_id = db.add_reminder(1_577_836_800, "past reminder").unwrap();
-        // 2099-12-31T23:59:59Z
-        let future_id = db.add_reminder(4_102_444_799, "future reminder").unwrap();
-        assert!(past_id > 0);
-        assert!(future_id > past_id);
-
-        // All pending
-        let pending = db.get_pending_reminders().unwrap();
-        assert_eq!(pending.len(), 2);
-
-        // Future only
-        let future = db.get_future_reminders().unwrap();
-        assert_eq!(future.len(), 1);
-        assert_eq!(future[0].message, "future reminder");
-
-        // Past due only
-        let past_due = db.get_past_due_reminders().unwrap();
-        assert_eq!(past_due.len(), 1);
-        assert_eq!(past_due[0].message, "past reminder");
-
-        // Mark past as delivered
-        db.mark_reminder_delivered(past_id).unwrap();
-        let pending = db.get_pending_reminders().unwrap();
-        assert_eq!(pending.len(), 1);
-
-        // Cancel future
-        let cancelled = db.cancel_reminder(future_id).unwrap();
-        assert!(cancelled);
-        let pending = db.get_pending_reminders().unwrap();
-        assert_eq!(pending.len(), 0);
-    }
-
-    #[test]
-    fn test_cancel_nonpending_reminder() {
-        let db = test_db();
-        let id = db.add_reminder(1_577_836_800, "already delivered").unwrap();
-        db.mark_reminder_delivered(id).unwrap();
-
-        // Cancelling a delivered reminder returns false
-        let cancelled = db.cancel_reminder(id).unwrap();
-        assert!(!cancelled);
-    }
-
-    #[test]
-    fn test_mark_reminder_failed() {
-        let db = test_db();
-        let id = db.add_reminder(1_577_836_800, "will fail").unwrap();
-        db.mark_reminder_failed(id).unwrap();
-
-        let pending = db.get_pending_reminders().unwrap();
-        assert_eq!(pending.len(), 0);
-    }
-
-    #[test]
-    fn test_get_pending_reminders_excludes_cancelled() {
-        let db = test_db();
-        // 2099-01-01T00:00:00Z
-        db.add_reminder(4_070_908_800, "active one").unwrap();
-        // 2099-02-01T00:00:00Z
-        let id2 = db.add_reminder(4_073_587_200, "will cancel").unwrap();
-        db.cancel_reminder(id2).unwrap();
-
-        let active = db.get_pending_reminders().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].message, "active one");
-    }
-
-    // -- Heartbeat pruning tests --
-
-    #[test]
-    fn test_prune_heartbeat_sends() {
-        let db = test_db();
-        // Insert a send with an old timestamp manually
-        db.conn
-            .execute(
-                "INSERT INTO heartbeat_sends (sent_at) VALUES (datetime('now', '-10 days'))",
-                [],
-            )
-            .unwrap();
-        // Insert a recent one directly
-        db.conn
-            .execute("INSERT INTO heartbeat_sends DEFAULT VALUES", [])
-            .unwrap();
-
-        let total_before: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM heartbeat_sends", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(total_before, 2);
-
-        // Prune sends older than 7 days
-        db.prune_old_heartbeat_sends(7).unwrap();
-
-        // The old one should be gone, recent one remains
-        let total: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM heartbeat_sends", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(total, 1);
-    }
-
-    #[test]
-    fn test_record_and_count_heartbeat_sends() {
-        let db = test_db();
-
-        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 0);
-        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 0);
-
-        db.record_heartbeat_send().unwrap();
-        db.record_heartbeat_send().unwrap();
-
-        assert_eq!(db.count_heartbeat_sends_last_hour().unwrap(), 2);
-        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 2);
-    }
-
-    #[test]
-    fn test_last_user_message_time() {
-        let db = test_db();
-
-        // No messages yet
-        assert!(db.last_user_message_time().unwrap().is_none());
-
-        // Add a user message
-        db.save_message("user", "hello", "cli").unwrap();
-        let ts = db.last_user_message_time().unwrap();
-        assert!(ts.is_some());
-
-        // Heartbeat messages should not count
-        db.save_message("assistant", "hi", "heartbeat").unwrap();
-        let ts2 = db.last_user_message_time().unwrap();
-        assert_eq!(ts, ts2); // same as before
-
-        // WhatsApp and API user messages should count (no hardcoded channel filter)
-        db.save_message("user", "hi from whatsapp", "whatsapp")
-            .unwrap();
-        assert!(db.last_user_message_time().unwrap().is_some());
-        db.save_message("user", "hi from api", "api").unwrap();
-        assert!(db.last_user_message_time().unwrap().is_some());
-    }
-
-    #[test]
-    fn test_failed_send_lifecycle() {
-        let db = test_db();
-
-        // No sends initially
-        let sends = db.get_pending_failed_sends(10).unwrap();
-        assert!(sends.is_empty());
-
-        // Save a failed send
-        let id = db.save_failed_send("hello user", Some("req-123")).unwrap();
-        assert!(id > 0);
-
-        // Retrieve it
-        let sends = db.get_pending_failed_sends(10).unwrap();
-        assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].text, "hello user");
-        assert_eq!(sends[0].request_id.as_deref(), Some("req-123"));
-        assert_eq!(sends[0].retry_count, 0);
-
-        // Increment retry
-        db.increment_failed_send_retry(id).unwrap();
-        let sends = db.get_pending_failed_sends(10).unwrap();
-        assert_eq!(sends[0].retry_count, 1);
-
-        // Delete after successful flush
-        db.delete_failed_send(id).unwrap();
-        let sends = db.get_pending_failed_sends(10).unwrap();
-        assert!(sends.is_empty());
-    }
-
-    #[test]
-    fn test_failed_sends_respects_retry_limit() {
-        let db = test_db();
-
-        let id = db.save_failed_send("doomed msg", None).unwrap();
-        db.increment_failed_send_retry(id).unwrap();
-        db.increment_failed_send_retry(id).unwrap();
-        db.increment_failed_send_retry(id).unwrap();
-
-        // retry_count = 3 → should not appear in pending
-        let sends = db.get_pending_failed_sends(10).unwrap();
-        assert!(sends.is_empty());
-    }
-
-    // -- Compaction tests --
-
-    #[test]
-    fn test_save_and_load_summary() {
-        let db = test_db();
-
-        // Initially no summary
-        assert!(db.load_conversation_summary().unwrap().is_none());
-
-        let id = db
-            .save_conversation_summary("Summary of messages 1-10", 10)
-            .unwrap();
-        assert!(id > 0);
-
-        let summary = db.load_conversation_summary().unwrap().unwrap();
-        assert_eq!(summary.role, "summary");
-        assert_eq!(summary.content, "Summary of messages 1-10");
-    }
-
-    #[test]
-    fn test_delete_compacted_messages() {
-        let db = test_db();
-
-        // Insert 5 messages
+    fn test_load_recent_messages_limit() {
+        let db = db();
         for i in 0..5 {
-            db.save_message("user", &format!("msg {i}"), "cli").unwrap();
+            db.save_message("main", "user", &format!("msg {i}"), "cli")
+                .unwrap();
         }
-        let all = db.load_recent_messages(10, None).unwrap();
-        assert_eq!(all.len(), 5);
-        let third_id = all[2].id;
-
-        // Delete messages up to and including the third
-        let deleted = db.delete_compacted_messages(third_id).unwrap();
-        assert_eq!(deleted, 3);
-
-        let remaining = db.load_recent_messages(10, None).unwrap();
-        assert_eq!(remaining.len(), 2);
-    }
-
-    #[test]
-    fn test_count_messages() {
-        let db = test_db();
-        assert_eq!(db.count_messages().unwrap(), 0);
-
-        db.save_message("user", "one", "cli").unwrap();
-        db.save_message("assistant", "two", "cli").unwrap();
-        assert_eq!(db.count_messages().unwrap(), 2);
-
-        // Summary rows don't count
-        db.save_conversation_summary("summary", 0).unwrap();
-        assert_eq!(db.count_messages().unwrap(), 2);
-    }
-
-    #[test]
-    fn test_load_messages_before_window() {
-        let db = test_db();
-
-        // Insert 10 messages
-        for i in 0..10 {
-            db.save_message("user", &format!("msg {i}"), "cli").unwrap();
-        }
-
-        // Window of 3 keeps the last 3, so 7 should be "before window"
-        let old = db.load_messages_before_window(3).unwrap();
-        assert_eq!(old.len(), 7);
-        assert_eq!(old[0].content, "msg 0");
-        assert_eq!(old[6].content, "msg 6");
-    }
-
-    #[test]
-    fn test_load_messages_before_window_empty() {
-        let db = test_db();
-
-        // Fewer messages than window size
-        db.save_message("user", "only one", "cli").unwrap();
-        let old = db.load_messages_before_window(5).unwrap();
-        assert_eq!(old.len(), 0);
-    }
-
-    #[test]
-    fn test_replace_with_summary() {
-        let db = test_db();
-
-        // Insert 10 messages
-        for i in 0..10 {
-            db.save_message("user", &format!("msg {i}"), "cli").unwrap();
-        }
-        let all = db.load_recent_messages(20, None).unwrap();
-        let seventh_id = all[6].id; // msg 6's id
-
-        // Replace messages 0-6 with a summary
-        let summary_id = db
-            .replace_with_summary("Summary of messages 0-6", seventh_id)
-            .unwrap();
-        assert!(summary_id > 0);
-
-        // Should have 3 real messages remaining
-        let remaining = db.load_recent_messages(20, None).unwrap();
-        assert_eq!(remaining.len(), 3);
-        assert_eq!(remaining[0].content, "msg 7");
-
-        // Summary should be loadable
-        let summary = db.load_conversation_summary().unwrap().unwrap();
-        assert_eq!(summary.content, "Summary of messages 0-6");
-    }
-
-    // -- Customer config tests --
-
-    #[test]
-    fn test_customer_config_crud() {
-        let db = test_db();
-
-        // Initially empty
-        assert!(db.get_customer_config("timezone").unwrap().is_none());
-
-        // Set and get
-        db.set_customer_config("timezone", "+08:00").unwrap();
-        let tz = db.get_customer_config("timezone").unwrap().unwrap();
-        assert_eq!(tz, "+08:00");
-
-        // Upsert
-        db.set_customer_config("timezone", "-05:00").unwrap();
-        let tz = db.get_customer_config("timezone").unwrap().unwrap();
-        assert_eq!(tz, "-05:00");
-    }
-
-    // -- Compaction tests --
-
-    /// Helper to insert a memory event with a specific created_at timestamp.
-    fn insert_event_at(db: &super::Database, tool: &str, target: &str, created_at: &str) {
-        db.conn
-            .execute(
-                "INSERT INTO memory_events (session_id, tool_name, target_key, after_value, created_at)
-                 VALUES ('test', ?1, ?2, 'v', ?3)",
-                rusqlite::params![tool, target, created_at],
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn test_compact_no_old_events() {
-        let db = test_db();
-        // No events at all — should return 0
-        let deleted = db.compact_old_memory_events(90).unwrap();
-        assert_eq!(deleted, 0);
-    }
-
-    #[test]
-    fn test_compact_groups_by_month() {
-        let db = test_db();
-        // Insert events across 3 different months, all old enough to compact
-        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
-        insert_event_at(&db, "store_fact", "person:Bob", "2020-01-20 10:00:00");
-        insert_event_at(&db, "update_fact", "commitment:1", "2020-02-10 10:00:00");
-        insert_event_at(&db, "store_fact", "event:meeting", "2020-03-05 10:00:00");
-
-        let deleted = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted, 4);
-
-        // Should have 3 summary rows (one per month)
-        let count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM memory_event_summaries", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 3);
-
-        // Raw events should be gone
-        let remaining: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(remaining, 0);
-    }
-
-    #[test]
-    fn test_compact_preserves_recent_events() {
-        let db = test_db();
-        // Insert old event
-        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
-        // Insert recent event (use a far-future date so it's always "recent")
-        insert_event_at(&db, "store_fact", "person:Bob", "2099-12-31 10:00:00");
-
-        let deleted = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted, 1);
-
-        // Recent event should still exist
-        let remaining: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(remaining, 1);
-    }
-
-    #[test]
-    fn test_compact_returns_deletion_count() {
-        let db = test_db();
-        insert_event_at(&db, "store_fact", "person:A", "2020-01-01 10:00:00");
-        insert_event_at(&db, "store_fact", "person:B", "2020-01-02 10:00:00");
-        insert_event_at(&db, "store_fact", "person:C", "2020-01-03 10:00:00");
-
-        let deleted = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted, 3);
-    }
-
-    #[test]
-    fn test_compact_idempotent() {
-        let db = test_db();
-        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
-        insert_event_at(&db, "update_fact", "person:Alice", "2020-01-20 10:00:00");
-
-        // First compaction
-        let deleted1 = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted1, 2);
-
-        // Second compaction — nothing left to compact
-        let deleted2 = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted2, 0);
-
-        // Summary should still be there and unchanged
-        let count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM memory_event_summaries", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_compact_summary_content() {
-        let db = test_db();
-        insert_event_at(&db, "store_fact", "person:Alice", "2020-03-10 10:00:00");
-        insert_event_at(&db, "store_fact", "person:Bob", "2020-03-15 10:00:00");
-        insert_event_at(&db, "update_fact", "commitment:1", "2020-03-20 10:00:00");
-
-        db.compact_old_memory_events(1).unwrap();
-
-        // Verify the summary row content
-        let (tool_counts, category_counts, total, year, month): (
-            String,
-            String,
-            i64,
-            i64,
-            i64,
-        ) = db
-            .conn
-            .query_row(
-                "SELECT tool_counts, category_counts, total_mutations, year, month FROM memory_event_summaries",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .unwrap();
-
-        assert_eq!(year, 2020);
-        assert_eq!(month, 3);
-        assert_eq!(total, 3);
-
-        let tc: serde_json::Value = serde_json::from_str(&tool_counts).unwrap();
-        assert_eq!(tc["store_fact"], 2);
-        assert_eq!(tc["update_fact"], 1);
-
-        let cc: serde_json::Value = serde_json::from_str(&category_counts).unwrap();
-        assert_eq!(cc["person"], 2);
-        assert_eq!(cc["commitment"], 1);
-    }
-
-    #[test]
-    fn test_compact_boundary_date_excludes_recent() {
-        let db = test_db();
-        // Insert an event right at "now" — it should NOT be compacted even with days=0
-        // because the cutoff is datetime('now', '-0 days') which equals now, and we use < not <=
-        db.log_memory_event("sess-1", "store_fact", "person:Alice", None, "v", None)
-            .unwrap();
-
-        // With days=0, cutoff is essentially "now"; event created at "now" should
-        // not be strictly less than cutoff
-        let deleted = db.compact_old_memory_events(0).unwrap();
-        assert_eq!(deleted, 0);
-    }
-
-    #[test]
-    fn test_compact_multiple_months_separate_summaries() {
-        let db = test_db();
-        // Events spanning 5 months
-        insert_event_at(&db, "store_fact", "person:A", "2019-06-01 10:00:00");
-        insert_event_at(&db, "store_fact", "person:B", "2019-07-15 10:00:00");
-        insert_event_at(&db, "update_fact", "person:C", "2019-08-20 10:00:00");
-        insert_event_at(&db, "store_fact", "event:meeting", "2019-09-10 10:00:00");
-        insert_event_at(&db, "store_fact", "person:D", "2019-10-05 10:00:00");
-
-        let deleted = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted, 5);
-
-        let count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM memory_event_summaries", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 5); // one summary per month
-
-        // Verify each month has total_mutations = 1
-        let mut stmt = db
-            .conn
-            .prepare("SELECT year, month, total_mutations FROM memory_event_summaries ORDER BY year, month")
-            .unwrap();
-        let rows: Vec<(i64, i64, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(rows.len(), 5);
-        for (_, _, total) in &rows {
-            assert_eq!(*total, 1);
-        }
-    }
-
-    #[test]
-    fn test_compact_upserts_existing_summary() {
-        let db = test_db();
-        // Insert events for January 2020
-        insert_event_at(&db, "store_fact", "person:Alice", "2020-01-15 10:00:00");
-        insert_event_at(&db, "store_fact", "person:Bob", "2020-01-20 10:00:00");
-
-        // First compaction
-        let deleted1 = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted1, 2);
-
-        // Manually insert more events for the same month (simulates edge case)
-        insert_event_at(&db, "update_fact", "person:Alice", "2020-01-25 10:00:00");
-
-        // Second compaction should upsert (ON CONFLICT) the existing summary
-        let deleted2 = db.compact_old_memory_events(1).unwrap();
-        assert_eq!(deleted2, 1);
-
-        // Should still have exactly 1 summary row for Jan 2020
-        let count: i64 = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memory_event_summaries WHERE year = 2020 AND month = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_heartbeat_sends_today_with_utc_timezone() {
-        let db = test_db();
-
-        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 0);
-
-        db.record_heartbeat_send().unwrap();
-        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 1);
-
-        // Old send should not count for today
-        db.conn
-            .execute(
-                "INSERT INTO heartbeat_sends (sent_at) VALUES (datetime('now', '-2 days'))",
-                [],
-            )
-            .unwrap();
-        assert_eq!(db.count_heartbeat_sends_today("UTC").unwrap(), 1);
-    }
-
-    #[test]
-    fn test_heartbeat_sends_today_invalid_timezone_falls_back_to_utc() {
-        let db = test_db();
-        db.record_heartbeat_send().unwrap();
-        // Invalid timezone should fall back to UTC and still work
-        let count = db.count_heartbeat_sends_today("Invalid/Timezone").unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_v7_index_exists() {
-        let db = test_db();
-        // Verify the v7 index exists
-        let index_exists: bool = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_memory_events_created_at'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            index_exists,
-            "idx_memory_events_created_at should exist after v7 migration"
-        );
-    }
-
-    #[test]
-    fn test_v8_search_tables_exist() {
-        let db = test_db();
-
-        // search_content table exists
-        let sc_exists: bool = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='search_content'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            sc_exists,
-            "search_content table should exist after v8 migration"
-        );
-
-        // fts_search virtual table exists
-        let fts_exists: bool = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='fts_search'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            fts_exists,
-            "fts_search table should exist after v8 migration"
-        );
-
-        // vec_search virtual table exists
-        let vec_exists: bool = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_search'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            vec_exists,
-            "vec_search table should exist after v8 migration"
-        );
-
-        // Verify vec_search works with a simple insert + query
-        db.conn
-            .execute(
-                "INSERT INTO search_content (source_type, content) VALUES ('test', 'hello world')",
-                [],
-            )
-            .unwrap();
-        let content_id: i64 = db.conn.last_insert_rowid();
-
-        // Insert a dummy 512-dim vector
-        let zeros = vec![0.0f32; 512];
-        let bytes: &[u8] = zerocopy::AsBytes::as_bytes(zeros.as_slice());
-        db.conn
-            .execute(
-                "INSERT INTO vec_search (content_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![content_id, bytes],
-            )
-            .unwrap();
-
-        // FTS5 insert
-        db.conn
-            .execute(
-                "INSERT INTO fts_search (content, content_id, source_type) VALUES ('hello world', ?1, 'test')",
-                rusqlite::params![content_id],
-            )
-            .unwrap();
-
-        // FTS5 query
-        let fts_count: i64 = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM fts_search WHERE fts_search MATCH 'hello'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(fts_count, 1);
-    }
-
-    #[test]
-    fn test_index_content_and_fts_search() {
-        let db = test_db();
-
-        db.index_content("person", Some(1), "Alice is a software engineer")
-            .unwrap();
-        db.index_content("commitment", Some(2), "Review quarterly budget report")
-            .unwrap();
-        db.index_content("event", Some(3), "Team dinner at Italian restaurant")
-            .unwrap();
-
-        // FTS5 search for "engineer"
-        let results = db.fts_search("engineer", 10, None).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].source_type, "person");
-        assert!(results[0].content.contains("Alice"));
-
-        // FTS5 search for "budget" (stemmed via porter)
-        let results = db.fts_search("budget", 10, None).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].source_type, "commitment");
-    }
-
-    #[test]
-    fn test_index_content_with_embedding_and_vec_search() {
-        let db = test_db();
-
-        let cid = db
-            .index_content("person", Some(1), "Alice is a software engineer")
-            .unwrap();
-
-        // Create a simple embedding (512 dims)
-        let embedding: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
-        db.index_embedding(cid, &embedding).unwrap();
-
-        // Vector search with similar embedding
-        let query_emb: Vec<f32> = (0..512).map(|i| (i as f32 + 0.5) / 512.0).collect();
-        let results = db.vec_search(&query_emb, 10).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, cid);
-    }
-
-    #[test]
-    fn test_hybrid_search_fts_only() {
-        let db = test_db();
-
-        db.index_content("person", Some(1), "Alice is a software engineer")
-            .unwrap();
-        db.index_content("commitment", Some(2), "Review quarterly budget report")
-            .unwrap();
-
-        // Hybrid search without embedding (FTS5-only path)
-        let results = db.hybrid_search("engineer", None, 10, None).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].content.contains("Alice"));
-    }
-
-    #[test]
-    fn test_hybrid_search_with_vectors() {
-        let db = test_db();
-
-        // Index two items with embeddings
-        let cid1 = db
-            .index_content("person", Some(1), "Alice is a software engineer")
-            .unwrap();
-        let emb1: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
-        db.index_embedding(cid1, &emb1).unwrap();
-
-        let cid2 = db
-            .index_content("commitment", Some(2), "budget report review")
-            .unwrap();
-        let emb2: Vec<f32> = (0..512).map(|i| (512 - i) as f32 / 512.0).collect();
-        db.index_embedding(cid2, &emb2).unwrap();
-
-        // Hybrid search: "engineer" should rank cid1 highest via FTS5 + vector
-        let query_emb: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
-        let results = db
-            .hybrid_search("engineer", Some(&query_emb), 10, None)
-            .unwrap();
-        assert!(!results.is_empty());
-        assert_eq!(results[0].source_type, "person");
-    }
-
-    #[test]
-    fn test_delete_search_content() {
-        let db = test_db();
-
-        let cid = db
-            .index_content("person", Some(1), "Alice is a software engineer")
-            .unwrap();
-        let emb: Vec<f32> = vec![0.0; 512];
-        db.index_embedding(cid, &emb).unwrap();
-
-        // Verify content exists
-        assert_eq!(db.count_search_content().unwrap(), 1);
-        assert_eq!(db.fts_search("engineer", 10, None).unwrap().len(), 1);
-
-        // Delete
-        db.delete_search_content("person", 1).unwrap();
-
-        // Verify everything is gone
-        assert_eq!(db.count_search_content().unwrap(), 0);
-        assert_eq!(db.fts_search("engineer", 10, None).unwrap().len(), 0);
-        assert_eq!(db.vec_search(&emb, 10).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_get_all_facts_for_indexing() {
-        let db = test_db();
-
-        // Add a person, commitment, preference, event
-        db.conn.execute(
-            "INSERT INTO people (canonical_name, relationship, notes) VALUES ('Alice', 'colleague', 'works in engineering')",
-            [],
-        ).unwrap();
-        db.conn.execute(
-            "INSERT INTO commitments (description, due_date, status) VALUES ('Review budget', '2026-03-01', 'pending')",
-            [],
-        ).unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO preferences (category, value) VALUES ('coffee', 'oat milk latte')",
-                [],
-            )
-            .unwrap();
-        db.conn.execute(
-            "INSERT INTO events (description, event_date, context) VALUES ('Team dinner', '2026-02-20', 'Italian restaurant')",
-            [],
-        ).unwrap();
-
-        let facts = db.get_all_facts_for_indexing().unwrap();
-        assert_eq!(facts.len(), 4);
-
-        // Check person content
-        let person = facts.iter().find(|(t, _, _)| t == "person").unwrap();
-        assert!(person.2.contains("Alice"));
-        assert!(person.2.contains("colleague"));
-        assert!(person.2.contains("engineering"));
-
-        // Check commitment content
-        let commit = facts.iter().find(|(t, _, _)| t == "commitment").unwrap();
-        assert!(commit.2.contains("Review budget"));
-
-        // Check preference content
-        let pref = facts.iter().find(|(t, _, _)| t == "preference").unwrap();
-        assert!(pref.2.contains("coffee"));
-        assert!(pref.2.contains("oat milk latte"));
-
-        // Check event content
-        let event = facts.iter().find(|(t, _, _)| t == "event").unwrap();
-        assert!(event.2.contains("Team dinner"));
-        assert!(event.2.contains("Italian restaurant"));
-    }
-
-    // -- Cross-channel query tests --
-
-    #[test]
-    fn test_load_messages_after_basic() {
-        let db = test_db();
-        let id1 = db.save_message("user", "msg1", "telegram").unwrap();
-        let id2 = db.save_message("assistant", "msg2", "telegram").unwrap();
-        let _id3 = db.save_message("user", "msg3", "cli").unwrap();
-
-        // Load after id1 — should get msg2 and msg3
-        let msgs = db.load_messages_after(id1, None).unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].id, id2);
-        assert_eq!(msgs[0].content, "msg2");
-
-        // Load after id1 with telegram filter — should get only msg2
-        let msgs = db.load_messages_after(id1, Some(&["telegram"])).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "msg2");
-
-        // Load after id2 with telegram filter — should be empty
-        let msgs = db.load_messages_after(id2, Some(&["telegram"])).unwrap();
-        assert!(msgs.is_empty());
-    }
-
-    #[test]
-    fn test_load_messages_after_excludes_summary() {
-        let db = test_db();
-        db.save_message("user", "msg1", "cli").unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO conversations (role, content, channel_type) VALUES ('summary', 'sum', 'system')",
-                [],
-            )
-            .unwrap();
-        db.save_message("user", "msg2", "telegram").unwrap();
-
-        let msgs = db.load_messages_after(0, None).unwrap();
-        assert!(msgs.iter().all(|m| m.role != "summary"));
-    }
-
-    #[test]
-    fn test_load_messages_after_ascending_order() {
-        let db = test_db();
-        let id1 = db.save_message("user", "first", "telegram").unwrap();
-        let id2 = db.save_message("user", "second", "telegram").unwrap();
-        let id3 = db.save_message("user", "third", "telegram").unwrap();
-
-        let msgs = db.load_messages_after(0, None).unwrap();
+        let msgs = db.load_recent_messages("main", 3, None).unwrap();
         assert_eq!(msgs.len(), 3);
-        assert!(msgs[0].id < msgs[1].id);
-        assert!(msgs[1].id < msgs[2].id);
-        assert_eq!(msgs[0].id, id1);
-        assert_eq!(msgs[1].id, id2);
-        assert_eq!(msgs[2].id, id3);
+        assert_eq!(msgs[2].content, "msg 4");
     }
 
     #[test]
-    fn test_max_message_id_empty() {
-        let db = test_db();
-        assert_eq!(db.max_message_id().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_max_message_id_populated() {
-        let db = test_db();
-        db.save_message("user", "msg1", "cli").unwrap();
-        let id2 = db.save_message("user", "msg2", "telegram").unwrap();
-        assert_eq!(db.max_message_id().unwrap(), id2);
-    }
-
-    #[test]
-    fn test_list_customer_config_empty() {
-        let db = test_db();
-        let configs = db.list_customer_config().unwrap();
-        assert!(configs.is_empty());
-    }
-
-    #[test]
-    fn test_list_customer_config_populated() {
-        let db = test_db();
-        db.set_customer_config("timezone", "Asia/Singapore")
+    fn test_load_recent_messages_channel_filter() {
+        let db = db();
+        db.save_message("main", "user", "telegram msg", "telegram").unwrap();
+        db.save_message("main", "user", "cli msg", "cli").unwrap();
+        let tg = db
+            .load_recent_messages("main", 10, Some(&["telegram"]))
             .unwrap();
-        db.set_customer_config("chat_id", "12345").unwrap();
-
-        let configs = db.list_customer_config().unwrap();
-        assert_eq!(configs.len(), 2);
-        // Ordered by key
-        assert_eq!(configs[0], ("chat_id".to_string(), "12345".to_string()));
-        assert_eq!(
-            configs[1],
-            ("timezone".to_string(), "Asia/Singapore".to_string())
-        );
-    }
-
-    // -- Reflection --
-
-    #[test]
-    fn test_v10_reflection_runs_table_exists() {
-        let db = test_db();
-        // Table should exist after migration
-        let count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM reflection_runs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_record_and_check_reflection_run() {
-        let db = test_db();
-        db.record_reflection_run("completed", 3, Some("Promoted 2 facts, pruned 1"))
-            .unwrap();
-
-        let ran = db.last_reflection_run_today("UTC").unwrap();
-        assert!(ran, "should detect today's reflection run");
-    }
-
-    #[test]
-    fn test_last_reflection_run_today_none() {
-        let db = test_db();
-        let ran = db.last_reflection_run_today("UTC").unwrap();
-        assert!(!ran, "should return false when no reflection has run");
-    }
-
-    #[test]
-    fn test_last_reflection_run_today_with_timezone() {
-        let db = test_db();
-        db.record_reflection_run("completed", 1, None).unwrap();
-
-        // Should still be "today" regardless of timezone (just ran)
-        let ran = db.last_reflection_run_today("America/New_York").unwrap();
-        assert!(ran);
-
-        let ran = db.last_reflection_run_today("Asia/Tokyo").unwrap();
-        assert!(ran);
-    }
-
-    #[test]
-    fn test_last_reflection_run_today_invalid_tz_fallback() {
-        let db = test_db();
-        db.record_reflection_run("completed", 0, None).unwrap();
-
-        // Invalid timezone should fall back to UTC
-        let ran = db.last_reflection_run_today("Invalid/Zone").unwrap();
-        assert!(ran);
+        assert_eq!(tg.len(), 1);
+        assert_eq!(tg[0].content, "telegram msg");
     }
 
     #[test]
     fn test_get_conversations_since() {
-        let db = test_db();
-        db.save_message("user", "Hello", "cli").unwrap();
-        db.save_message("assistant", "Hi!", "cli").unwrap();
-        db.save_message("user", "Reflection msg", "reflection")
+        let db = db();
+        // Insert directly with a known timestamp
+        db.conn
+            .execute(
+                "INSERT INTO conversations (agent_id, role, content, channel_type, created_at)
+                  VALUES ('main', 'user', 'old', 'cli', 1000)",
+                [],
+            )
             .unwrap();
-
-        // Use a past timestamp to get all messages
-        let msgs = db.get_conversations_since("2020-01-01 00:00:00").unwrap();
-        assert_eq!(msgs.len(), 2, "should exclude reflection channel_type");
-        assert_eq!(msgs[0].content, "Hello");
-        assert_eq!(msgs[1].content, "Hi!");
+        db.conn
+            .execute(
+                "INSERT INTO conversations (agent_id, role, content, channel_type, created_at)
+                  VALUES ('main', 'user', 'new', 'cli', 2000)",
+                [],
+            )
+            .unwrap();
+        let msgs = db.get_conversations_since("main", 1500).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "new");
     }
 
     #[test]
-    fn test_get_conversations_since_future_returns_empty() {
-        let db = test_db();
-        db.save_message("user", "Hello", "cli").unwrap();
+    fn test_last_user_message_time() {
+        let db = db();
+        assert!(db.last_user_message_time("main").unwrap().is_none());
+        db.save_message("main", "user", "hello", "cli").unwrap();
+        let ts = db.last_user_message_time("main").unwrap();
+        assert!(ts.is_some());
+        assert!(ts.unwrap() > 0);
+    }
 
-        let msgs = db.get_conversations_since("2099-01-01 00:00:00").unwrap();
-        assert!(msgs.is_empty());
+    #[test]
+    fn test_replace_with_summary() {
+        let db = db();
+        let id1 = db.save_message("main", "user", "msg1", "cli").unwrap();
+        db.save_message("main", "assistant", "reply1", "cli").unwrap();
+        db.replace_with_summary("main", "Summary text", id1).unwrap();
+        let summary = db.load_conversation_summary("main").unwrap().unwrap();
+        assert_eq!(summary.role, "summary");
+        assert_eq!(summary.content, "Summary text");
+        let count = db.count_messages("main").unwrap();
+        assert_eq!(count, 1); // only the second message remains + summary excluded
+    }
+
+    #[test]
+    fn test_count_messages_excludes_summary() {
+        let db = db();
+        db.save_message("main", "user", "a", "cli").unwrap();
+        db.save_message("main", "assistant", "b", "cli").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO conversations (agent_id, role, content, channel_type)
+                  VALUES ('main', 'summary', 'S', 'cli')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.count_messages("main").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_core_memory_set_and_get() {
+        let db = db();
+        db.set_core_memory("main", "user_summary", "Alice").unwrap();
+        let entry = db.get_core_memory("main", "user_summary").unwrap().unwrap();
+        assert_eq!(entry.value, "Alice");
+    }
+
+    #[test]
+    fn test_seed_core_memory() {
+        let db = db();
+        db.seed_core_memory("main", None).unwrap();
+        let entries = db.get_all_core_memory("main").unwrap();
+        assert_eq!(entries.len(), CORE_MEMORY_SECTIONS.len());
+    }
+
+    #[test]
+    fn test_seed_core_memory_custom_user_summary() {
+        let db = db();
+        db.seed_core_memory("main", Some("Bob")).unwrap();
+        let entry = db.get_core_memory("main", "user_summary").unwrap().unwrap();
+        assert_eq!(entry.value, "Bob");
+    }
+
+    #[test]
+    fn test_upsert_and_get_person() {
+        let db = db();
+        db.upsert_person("main", "Alice", Some("colleague"), Some("Works at Acme"))
+            .unwrap();
+        let p = db.get_person("main", "Alice").unwrap().unwrap();
+        assert_eq!(p.canonical_name, "Alice");
+        assert_eq!(p.relationship.unwrap(), "colleague");
+    }
+
+    #[test]
+    fn test_add_commitment_and_list() {
+        let db = db();
+        db.add_commitment("main", "Write report", Some("2026-04-01"), None)
+            .unwrap();
+        let items = db.list_commitments("main", "pending").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].description, "Write report");
+    }
+
+    #[test]
+    fn test_update_commitment_status() {
+        let db = db();
+        let id = db
+            .add_commitment("main", "Task A", None, None)
+            .unwrap();
+        assert!(db.update_commitment_status("main", id, "completed").unwrap());
+        let status = db.get_commitment_status("main", id).unwrap().unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn test_set_and_get_preference() {
+        let db = db();
+        db.set_preference("main", "timezone", "UTC").unwrap();
+        let v = db.get_preference("main", "timezone").unwrap().unwrap();
+        assert_eq!(v, "UTC");
+    }
+
+    #[test]
+    fn test_add_and_list_events() {
+        let db = db();
+        db.add_event("main", "Team meeting", Some("2026-04-15"), None)
+            .unwrap();
+        let evts = db.list_events("main").unwrap();
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0].description, "Team meeting");
+    }
+
+    #[test]
+    fn test_log_and_get_memory_events() {
+        let db = db();
+        db.log_memory_event(
+            "main", "sess1", "update_core_memory", "user_summary",
+            None, "New summary", Some("reason"),
+        )
+        .unwrap();
+        let events = db.get_memory_events("main", "sess1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "update_core_memory");
     }
 
     #[test]
     fn test_get_memory_events_since() {
-        let db = test_db();
-        db.log_memory_event(
-            "s1",
-            "update_core_memory",
-            "user_summary",
-            None,
-            "Updated",
-            None,
-        )
-        .unwrap();
-        db.log_memory_event(
-            "s1",
-            "store_fact",
-            "pref:coffee",
-            None,
-            "Likes coffee",
-            None,
-        )
-        .unwrap();
-
-        let events = db.get_memory_events_since("2020-01-01 00:00:00").unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].tool_name, "update_core_memory");
-        assert_eq!(events[1].tool_name, "store_fact");
+        let db = db();
+        db.conn
+            .execute(
+                "INSERT INTO memory_events
+                  (agent_id, session_id, tool_name, target_key, after_value, created_at)
+                  VALUES ('main', 's1', 'tool', 'key', 'val', 1000)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO memory_events
+                  (agent_id, session_id, tool_name, target_key, after_value, created_at)
+                  VALUES ('main', 's2', 'tool', 'key', 'val', 2000)",
+                [],
+            )
+            .unwrap();
+        let evs = db.get_memory_events_since("main", 1500).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].session_id, "s2");
     }
 
     #[test]
-    fn test_count_memory_events_for_session() {
-        let db = test_db();
-        db.log_memory_event(
-            "reflection-2026-03-03",
-            "update_core_memory",
-            "user_summary",
-            None,
-            "v1",
-            None,
-        )
-        .unwrap();
-        db.log_memory_event(
-            "reflection-2026-03-03",
-            "store_fact",
-            "pref:x",
-            None,
-            "v2",
-            None,
-        )
-        .unwrap();
-        db.log_memory_event("other-session", "store_fact", "pref:y", None, "v3", None)
-            .unwrap();
-
-        let count = db
-            .count_memory_events_for_session("reflection-2026-03-03")
-            .unwrap();
+    fn test_record_and_count_heartbeat_sends() {
+        let db = db();
+        db.record_heartbeat_send("main").unwrap();
+        db.record_heartbeat_send("main").unwrap();
+        let count = db.count_heartbeat_sends_last_hour("main").unwrap();
         assert_eq!(count, 2);
+    }
 
-        let count = db.count_memory_events_for_session("other-session").unwrap();
-        assert_eq!(count, 1);
+    #[test]
+    fn test_prune_old_heartbeat_sends() {
+        let db = db();
+        // Insert old record manually
+        db.conn
+            .execute(
+                "INSERT INTO heartbeat_sends (agent_id, sent_at) VALUES ('main', 1000)",
+                [],
+            )
+            .unwrap();
+        db.record_heartbeat_send("main").unwrap();
+        db.prune_old_heartbeat_sends("main", 30).unwrap();
+        let count = db.count_heartbeat_sends_last_hour("main").unwrap();
+        // Old entry gone, recent one stays
+        assert!(count <= 1);
+    }
 
-        let count = db.count_memory_events_for_session("nonexistent").unwrap();
-        assert_eq!(count, 0);
+    #[test]
+    fn test_record_reflection_run() {
+        let db = db();
+        db.record_reflection_run("main", "completed", 3, Some("Updated 3 keys"))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_save_and_get_failed_send() {
+        let db = db();
+        let id = db
+            .save_failed_send("main", "Failed message", Some("req-1"))
+            .unwrap();
+        let pending = db.get_pending_failed_sends("main", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "Failed message");
+        db.delete_failed_send("main", id).unwrap();
+        let pending = db.get_pending_failed_sends("main", 10).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_customer_config() {
+        let db = db();
+        db.set_customer_config("main", "timezone", "America/New_York")
+            .unwrap();
+        let v = db.get_customer_config("main", "timezone").unwrap().unwrap();
+        assert_eq!(v, "America/New_York");
+        let all = db.list_customer_config("main").unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_team_runs_insert_and_load() {
+        let db = db();
+        db.insert_team_run("run-001", "engineering", "Build feature X", 3, 1_700_000_000)
+            .unwrap();
+        db.update_team_run("run-001", "completed", None, 1, Some("Done!"), Some(1_700_001_000))
+            .unwrap();
+        let runs = db.load_team_runs("engineering", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].goal, "Build feature X");
+        assert_eq!(runs[0].status, "completed");
+    }
+
+    #[test]
+    fn test_team_messages_insert_and_load() {
+        let db = db();
+        db.insert_team_run("run-001", "eng", "Goal", 3, 0).unwrap();
+        let id = db
+            .insert_team_message("run-001", None, Some("main"), "plan", "Do this", 1)
+            .unwrap();
+        let msgs = db.load_team_messages("run-001").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, id);
+        assert_eq!(msgs[0].message_type, "plan");
+    }
+
+    #[test]
+    fn test_create_and_get_task() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Send reminder".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: r#"{"message":"hello"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(&task).unwrap();
+        let t = db.get_task(&id).unwrap().unwrap();
+        assert_eq!(t.label, "Send reminder");
+        assert_eq!(t.trigger_type, "time");
+        assert_eq!(t.status, "pending");
+    }
+
+    #[test]
+    fn test_get_due_tasks() {
+        let db = db();
+        let past_task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Past reminder".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(1_000),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        db.create_task(&past_task).unwrap();
+        let due = db.get_due_tasks(Utc::now().timestamp(), 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].label, "Past reminder");
+    }
+
+    #[test]
+    fn test_cancel_task() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Cancelable".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(&task).unwrap();
+        assert!(db.cancel_task(&id).unwrap());
+        let t = db.get_task(&id).unwrap().unwrap();
+        assert_eq!(t.status, "cancelled");
+        // Cancelling again returns false
+        assert!(!db.cancel_task(&id).unwrap());
+    }
+
+    #[test]
+    fn test_register_agent() {
+        let db = db();
+        db.register_agent("agent2", "Secondary Agent", "/home/agent2")
+            .unwrap();
+        let agents = db.list_agents_db().unwrap();
+        assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn test_register_team() {
+        let db = db();
+        db.register_team("eng", "Engineering", "/teams/eng.toml")
+            .unwrap();
+        let teams = db.list_teams_db().unwrap();
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0].id, "eng");
+    }
+
+    #[test]
+    fn test_fts_search_agent_isolation() {
+        let db = db();
+        db.register_agent("other", "Other", "").unwrap();
+        db.index_content("main", "person", Some(1), "Alice in Wonderland")
+            .unwrap();
+        db.index_content("other", "person", Some(1), "Bob the Builder")
+            .unwrap();
+        let results = db.fts_search("main", "Alice", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Alice"));
+    }
+
+    #[test]
+    fn test_get_all_facts_for_indexing() {
+        let db = db();
+        db.upsert_person("main", "Alice", Some("friend"), None)
+            .unwrap();
+        db.add_commitment("main", "Write docs", None, None).unwrap();
+        db.set_preference("main", "theme", "dark").unwrap();
+        let facts = db.get_all_facts_for_indexing("main").unwrap();
+        assert_eq!(facts.len(), 3);
+        let types: Vec<&str> = facts.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert!(types.contains(&"person"));
+        assert!(types.contains(&"commitment"));
+        assert!(types.contains(&"preference"));
+    }
+
+    #[test]
+    fn test_compact_old_memory_events() {
+        let db = db();
+        // Insert old events
+        db.conn
+            .execute_batch(
+                "INSERT INTO memory_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
+                  VALUES ('main', 's1', 'tool', 'k1', 'v1', 1580000000);
+                 INSERT INTO memory_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
+                  VALUES ('main', 's1', 'tool', 'k2', 'v2', 1580000001);",
+            )
+            .unwrap();
+        // Insert recent event
+        db.log_memory_event("main", "s2", "tool", "k3", None, "v3", None)
+            .unwrap();
+        let compacted = db.compact_old_memory_events("main", 30).unwrap();
+        assert!(compacted > 0);
+        // Old events gone, recent one stays
+        let recent = db.get_memory_events("main", "s2").unwrap();
+        assert_eq!(recent.len(), 1);
+    }
+
+    #[test]
+    fn test_load_messages_before_window() {
+        let db = db();
+        for i in 0..5 {
+            db.save_message("main", "user", &format!("msg {i}"), "cli")
+                .unwrap();
+        }
+        let before = db.load_messages_before_window("main", 2).unwrap();
+        // Window is last 2, so before window is first 3
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[0].content, "msg 0");
+    }
+
+    #[test]
+    fn test_count_pending_tasks() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "T1".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        db.create_task(&task).unwrap();
+        assert_eq!(db.count_pending_tasks("main").unwrap(), 1);
     }
 }
