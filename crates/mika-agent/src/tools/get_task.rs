@@ -4,28 +4,26 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
+use crate::db::format_unix_ts;
 
-pub struct CancelTaskTool;
+pub struct GetTaskTool;
 
 #[async_trait]
-impl Tool for CancelTaskTool {
+impl Tool for GetTaskTool {
     fn name(&self) -> &str {
-        "cancel_task"
+        "get_task"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "cancel_task".to_string(),
-            description:
-                "Cancel any pending task by its full UUID (from list_tasks or create_task). \
-                Works for any task type: reminders, callback tasks, recurring tasks, etc."
-                    .to_string(),
+            name: "get_task".to_string(),
+            description: "Look up a task by its full UUID and return all task fields including status, trigger type, action type, schedule, and result.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "The full UUID of the task to cancel"
+                        "description": "The full UUID of the task to look up."
                     }
                 },
                 "required": ["id"]
@@ -44,26 +42,36 @@ impl Tool for CancelTaskTool {
             ));
         }
 
-        let cancelled = ctx.db.cancel_task(id).await?;
-        if cancelled {
-            ctx.db
-                .log_memory_event(
-                    ctx.session_id,
-                    "cancel_task",
-                    &format!("task:{id}"),
-                    None,
-                    "cancelled",
-                    None,
-                )
-                .await?;
-            Ok(ToolOutput::success(format!(
-                "Task {id} has been cancelled."
-            )))
-        } else {
-            Ok(ToolOutput::error(format!(
-                "Task {id} not found or not in cancellable status."
-            )))
-        }
+        let task = match ctx.db.get_task(id).await? {
+            Some(t) => t,
+            None => return Ok(ToolOutput::error(format!("Task '{}' not found.", id))),
+        };
+
+        let next_fire = task
+            .next_fire_at
+            .map(format_unix_ts)
+            .unwrap_or_else(|| "N/A".to_string());
+        let timeout = task
+            .timeout_at
+            .map(format_unix_ts)
+            .unwrap_or_else(|| "none".to_string());
+        let result = task.result.as_deref().unwrap_or("none");
+        let created = format_unix_ts(task.created_at);
+
+        let output = format!(
+            "Task: {}\nLabel: {}\nStatus: {}\nTrigger: {}\nAction: {}\nCreated: {}\nNext fire: {}\nTimeout: {}\nResult: {}",
+            task.id,
+            task.label,
+            task.status,
+            task.trigger_type,
+            task.action_type,
+            created,
+            next_fire,
+            timeout,
+            result,
+        );
+
+        Ok(ToolOutput::success(output))
     }
 }
 
@@ -99,26 +107,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_task_success() {
+    async fn test_get_task_success() {
         let harness = TestHarness::new();
-        let id = add_callback_task(&harness, "Analyze codebase").await;
-
+        let id = add_callback_task(&harness, "My callback task").await;
         let ctx = harness.ctx();
-        let tool = CancelTaskTool;
+        let tool = GetTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"id": id}), &ctx)
             .await
             .unwrap();
-        assert!(!result.is_error);
-        assert!(result.content.contains("cancelled"));
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains(&id));
+        assert!(result.content.contains("My callback task"));
+        assert!(result.content.contains("callback"));
+        assert!(result.content.contains("resume_agent"));
+        assert!(result.content.contains("pending"));
     }
 
     #[tokio::test]
-    async fn test_cancel_task_not_found() {
+    async fn test_get_task_not_found() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = CancelTaskTool;
+        let tool = GetTaskTool;
 
         let result = tool
             .execute(
@@ -132,13 +143,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_task_missing_id() {
+    async fn test_get_task_empty_id() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = CancelTaskTool;
+        let tool = GetTaskTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("'id' is required"));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_id_too_long() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = GetTaskTool;
+
+        let long_id = "x".repeat(37);
+        let result = tool
+            .execute(serde_json::json!({"id": long_id}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("UUID"));
     }
 }

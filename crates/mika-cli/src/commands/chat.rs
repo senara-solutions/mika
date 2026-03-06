@@ -112,6 +112,8 @@ async fn spawn_agent_worker(
             tracing::warn!(error = %e, "task engine startup recovery failed");
         }
     }
+    // Prune completed tasks older than 30 days to prevent unbounded DB growth
+    task_engine::prune_old_tasks(&ctx.async_db).await;
     let poller_handle = TaskEngine::spawn_tick_loop(task_engine);
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();

@@ -763,10 +763,13 @@ impl Database {
          status, process_id, input_context, result, created_by_session,
          created_at, updated_at, fired_at, completed_at";
 
-    pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
-        let sql = format!("SELECT {} FROM tasks WHERE id = ?1", Self::TASK_COLUMNS);
+    pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE id = ?1 AND agent_id = ?2",
+            Self::TASK_COLUMNS
+        );
         self.conn
-            .query_row(&sql, params![id], Self::row_to_task)
+            .query_row(&sql, params![id, agent_id], Self::row_to_task)
             .optional()
             .map_err(Into::into)
     }
@@ -796,33 +799,38 @@ impl Database {
     /// Atomically claim a task and record its fired_at in a single UPDATE.
     /// Returns true if the task was claimed (was in 'pending' or 'recurring_active' state).
     /// Returns false if the task was already claimed, cancelled, or completed.
-    pub fn claim_and_fire_task(&self, id: &str) -> Result<bool> {
+    pub fn claim_and_fire_task(&self, id: &str, agent_id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'in_progress',
                               fired_at = unixepoch(),
                               updated_at = unixepoch()
-             WHERE id = ?1 AND status IN ('pending', 'recurring_active')",
-            params![id],
+             WHERE id = ?1 AND agent_id = ?2 AND status IN ('pending', 'recurring_active')",
+            params![id, agent_id],
         )?;
         Ok(n > 0)
     }
 
-    pub fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
-        self.conn.execute(
+    pub fn update_task_completed(
+        &self,
+        id: &str,
+        agent_id: &str,
+        result: Option<&str>,
+    ) -> Result<bool> {
+        let rows = self.conn.execute(
             "UPDATE tasks SET status = 'completed', result = ?1,
              completed_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ?2",
-            params![result, id],
+             WHERE id = ?2 AND agent_id = ?3 AND status IN ('pending', 'in_progress')",
+            params![result, id, agent_id],
         )?;
-        Ok(())
+        Ok(rows > 0)
     }
 
-    pub fn update_task_failed(&self, id: &str, error: &str) -> Result<()> {
+    pub fn update_task_failed(&self, id: &str, agent_id: &str, error: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET status = 'failed', result = ?1,
              completed_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ?2",
-            params![error, id],
+             WHERE id = ?2 AND agent_id = ?3",
+            params![error, id, agent_id],
         )?;
         Ok(())
     }
@@ -835,11 +843,21 @@ impl Database {
         Ok(())
     }
 
-    pub fn cancel_task(&self, id: &str) -> Result<bool> {
+    /// Atomically reschedule a recurring task: set next_fire_at and status = 'recurring_active'
+    /// in a single UPDATE, replacing two sequential writes.
+    pub fn update_task_rescheduled(&self, id: &str, next_fire_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET next_fire_at = ?1, status = 'recurring_active', updated_at = unixepoch() WHERE id = ?2",
+            params![next_fire_at, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_task(&self, id: &str, agent_id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
-             WHERE id = ?1 AND status NOT IN ('completed','failed','cancelled','expired')",
-            params![id],
+             WHERE id = ?1 AND agent_id = ?2 AND status NOT IN ('completed','failed','cancelled','expired')",
+            params![id, agent_id],
         )?;
         Ok(n > 0)
     }
@@ -2802,7 +2820,7 @@ mod tests {
             created_by_session: None,
         };
         let id = db.create_task(&task).unwrap();
-        let t = db.get_task(&id).unwrap().unwrap();
+        let t = db.get_task(&id, "main").unwrap().unwrap();
         assert_eq!(t.label, "Send reminder");
         assert_eq!(t.trigger_type, "time");
         assert_eq!(t.status, "pending");
@@ -2830,11 +2848,11 @@ mod tests {
             created_by_session: None,
         };
         let id = db.create_task(&task).unwrap();
-        assert!(db.cancel_task(&id).unwrap());
-        let t = db.get_task(&id).unwrap().unwrap();
+        assert!(db.cancel_task(&id, "main").unwrap());
+        let t = db.get_task(&id, "main").unwrap().unwrap();
         assert_eq!(t.status, "cancelled");
         // Cancelling again returns false
-        assert!(!db.cancel_task(&id).unwrap());
+        assert!(!db.cancel_task(&id, "main").unwrap());
     }
 
     #[test]

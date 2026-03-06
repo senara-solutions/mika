@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
+use super::cancel_task::CancelTaskTool;
 use super::{Tool, ToolContext, ToolOutput};
 
 pub struct CancelReminderTool;
@@ -16,13 +17,13 @@ impl Tool for CancelReminderTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "cancel_reminder".to_string(),
-            description: "Cancel a pending reminder by its full UUID (from list_reminders or create_reminder).".to_string(),
+            description: "Cancel a pending reminder by UUID. Works for any task type.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "The full UUID of the reminder to cancel (as returned by list_reminders or create_reminder)"
+                        "description": "The full UUID of the reminder to cancel."
                     }
                 },
                 "required": ["id"]
@@ -31,31 +32,7 @@ impl Tool for CancelReminderTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        let id = input["id"].as_str().unwrap_or("").trim();
-        if id.is_empty() {
-            return Ok(ToolOutput::error("'id' is required."));
-        }
-
-        let cancelled = ctx.db.cancel_task(id).await?;
-        if cancelled {
-            ctx.db
-                .log_memory_event(
-                    ctx.session_id,
-                    "cancel_reminder",
-                    &format!("task:{id}"),
-                    None,
-                    "cancelled",
-                    None,
-                )
-                .await?;
-            Ok(ToolOutput::success(format!(
-                "Reminder {id} has been cancelled."
-            )))
-        } else {
-            Ok(ToolOutput::error(format!(
-                "Reminder {id} not found or not in pending status."
-            )))
-        }
+        CancelTaskTool.execute(input, ctx).await
     }
 }
 

@@ -7,6 +7,7 @@ use serde_json::Value;
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::db::NewTask;
 use crate::task_engine::types::action_type;
+use crate::task_engine::types::trigger_type as tt;
 
 pub struct CreateTaskTool;
 
@@ -71,7 +72,7 @@ impl Tool for CreateTaskTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let label = input["label"].as_str().unwrap_or("").trim();
-        let trigger_type = input["trigger_type"].as_str().unwrap_or("").trim();
+        let trigger_type_str = input["trigger_type"].as_str().unwrap_or("").trim();
         let action_type_val = input["action_type"].as_str().unwrap_or("").trim();
 
         if label.is_empty() {
@@ -83,15 +84,15 @@ impl Tool for CreateTaskTool {
                 label.len()
             )));
         }
-        if trigger_type.is_empty() {
+        if trigger_type_str.is_empty() {
             return Ok(ToolOutput::error("'trigger_type' is required."));
         }
         if action_type_val.is_empty() {
             return Ok(ToolOutput::error("'action_type' is required."));
         }
 
-        match trigger_type {
-            "time" | "recurring" | "callback" => {}
+        match trigger_type_str {
+            tt::TIME | tt::RECURRING | tt::CALLBACK => {}
             other => {
                 return Ok(ToolOutput::error(format!(
                     "Invalid trigger_type '{other}'. Must be one of: time, recurring, callback"
@@ -124,8 +125,8 @@ impl Tool for CreateTaskTool {
             ));
         }
 
-        let (next_fire_at, cron_expr) = match trigger_type {
-            "time" => {
+        let (next_fire_at, cron_expr) = match trigger_type_str {
+            tt::TIME => {
                 let fire_at_str = input["fire_at"].as_str().unwrap_or("");
                 if fire_at_str.is_empty() {
                     return Ok(ToolOutput::error(
@@ -148,7 +149,7 @@ impl Tool for CreateTaskTool {
                 }
                 (Some(parsed.timestamp()), None)
             }
-            "recurring" => {
+            tt::RECURRING => {
                 let cron = input["cron_expr"].as_str().unwrap_or("").trim();
                 if cron.is_empty() {
                     return Ok(ToolOutput::error(
@@ -170,14 +171,21 @@ impl Tool for CreateTaskTool {
             _ => (None, None), // callback: no next_fire_at
         };
 
+        const MAX_TIMEOUT_SECS: i64 = 7_776_000; // 90 days
+
         let timeout_at = if let Some(secs) = input["timeout_secs"].as_i64() {
-            if secs > 0 {
-                Some(Utc::now().timestamp() + secs)
-            } else {
+            if secs <= 0 {
                 return Ok(ToolOutput::error(
                     "'timeout_secs' must be a positive integer.",
                 ));
             }
+            if secs > MAX_TIMEOUT_SECS {
+                return Ok(ToolOutput::error(format!(
+                    "'timeout_secs' cannot exceed {} seconds (90 days).",
+                    MAX_TIMEOUT_SECS
+                )));
+            }
+            Some(Utc::now().timestamp() + secs)
         } else {
             None
         };
@@ -188,7 +196,7 @@ impl Tool for CreateTaskTool {
             parent_task_id: None,
             depth: 0,
             label: label.to_string(),
-            trigger_type: trigger_type.to_string(),
+            trigger_type: trigger_type_str.to_string(),
             cron_expr,
             event_source: None,
             event_offset_secs: None,
@@ -209,13 +217,13 @@ impl Tool for CreateTaskTool {
                 "create_task",
                 &format!("task:{id}"),
                 None,
-                &format!("{trigger_type}/{action_type_val} — {label}"),
+                &format!("{trigger_type_str}/{action_type_val} — {label}"),
                 None,
             )
             .await?;
 
         Ok(ToolOutput::success(format!(
-            "Task {id} created ({trigger_type}/{action_type_val})."
+            "Task {id} created ({trigger_type_str}/{action_type_val})."
         )))
     }
 }
@@ -383,6 +391,28 @@ mod tests {
             .unwrap();
         let task = tasks.iter().find(|t| t.label == "Timed callback").unwrap();
         assert!(task.timeout_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_task_timeout_exceeds_max() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Too long timeout",
+                    "trigger_type": "callback",
+                    "action_type": "resume_agent",
+                    "timeout_secs": 99_999_999
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("90 days"));
     }
 
     #[tokio::test]

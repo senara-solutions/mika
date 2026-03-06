@@ -1,11 +1,13 @@
 mod cancel_reminder;
 mod cancel_task;
+mod complete_task;
 mod create_reminder;
 pub(crate) mod create_skill;
 mod create_task;
 mod delegate_task;
 mod delete_skill;
 mod get_config;
+mod get_task;
 mod get_team_history;
 mod get_team_status;
 mod list_agents;
@@ -361,6 +363,8 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
     registry.register(Box::new(create_task::CreateTaskTool));
     registry.register(Box::new(cancel_task::CancelTaskTool));
+    registry.register(Box::new(complete_task::CompleteTaskTool));
+    registry.register(Box::new(get_task::GetTaskTool));
     registry.register(Box::new(send_message::SendMessageTool));
     registry.register(Box::new(create_skill::CreateSkillTool));
     registry.register(Box::new(delete_skill::DeleteSkillTool));

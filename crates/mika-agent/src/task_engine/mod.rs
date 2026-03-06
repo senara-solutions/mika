@@ -13,6 +13,16 @@ use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 use tracing::{debug, info, warn};
 
+/// Prune completed/failed/cancelled/expired tasks older than 30 days at startup
+/// to prevent unbounded DB growth.
+pub async fn prune_old_tasks(db: &AsyncDatabase) {
+    // 30 days in seconds
+    const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
+    if let Err(e) = db.prune_completed_tasks(THIRTY_DAYS_SECS).await {
+        warn!("Failed to prune completed tasks: {}", e);
+    }
+}
+
 /// Register a recurring task in the DB if one with the same label doesn't already exist.
 ///
 /// Idempotent: no-op if a recurring task with `label` is already scheduled.

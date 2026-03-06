@@ -304,7 +304,7 @@ pub async fn handle_task_complete(
     if req.result.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "result must not be empty"})),
+            Json(serde_json::json!({"error": "result must not be empty", "task_id": task_id})),
         )
             .into_response();
     }
@@ -312,7 +312,7 @@ pub async fn handle_task_complete(
     if req.result.len() > 100_000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "result must be at most 100000 characters"})),
+            Json(serde_json::json!({"error": "result must be at most 100000 characters", "task_id": task_id})),
         )
             .into_response();
     }
@@ -322,7 +322,7 @@ pub async fn handle_task_complete(
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("agent '{}' not found", req.agent)})),
+                Json(serde_json::json!({"error": format!("agent '{}' not found", req.agent), "task_id": task_id})),
             )
                 .into_response();
         }
@@ -334,7 +334,7 @@ pub async fn handle_task_complete(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("task '{}' not found", task_id)})),
+                Json(serde_json::json!({"error": format!("task '{}' not found", task_id), "task_id": task_id})),
             )
                 .into_response();
         }
@@ -342,7 +342,7 @@ pub async fn handle_task_complete(
             error!(error = %e, task_id, "failed to load task");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to load task"})),
+                Json(serde_json::json!({"error": "failed to load task", "task_id": task_id})),
             )
                 .into_response();
         }
@@ -353,46 +353,69 @@ pub async fn handle_task_complete(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("task '{}' has trigger_type '{}', not 'callback'", task_id, task.trigger_type)
+                "error": format!("task '{}' has trigger_type '{}', not 'callback'", task_id, task.trigger_type),
+                "task_id": task_id
             })),
         )
             .into_response();
     }
 
-    // Validate status
+    // Validate status — only pending or in_progress tasks can be completed
     if !matches!(task.status.as_str(), "pending" | "in_progress") {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": format!("task '{}' has status '{}' and cannot be completed", task_id, task.status)
+                "error": format!("task '{}' has status '{}' and cannot be completed", task_id, task.status),
+                "task_id": task_id
             })),
         )
             .into_response();
     }
 
-    // Mark task completed with the result
+    // Transition to in_progress before spawning dispatch so startup_recovery can detect stuck tasks
     if let Err(e) = agent_state
         .db
-        .update_task_completed(&task_id, Some(&req.result))
+        .update_task_status(&task_id, "in_progress")
         .await
     {
-        error!(error = %e, task_id, "failed to mark task completed");
+        error!(error = %e, task_id, "failed to transition task to in_progress");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "failed to complete task"})),
+            Json(serde_json::json!({"error": "failed to complete task", "task_id": task_id})),
         )
             .into_response();
     }
 
-    // If action_type is resume_agent, spawn the dispatch in background
+    // If action_type is resume_agent, spawn the dispatch in background;
+    // otherwise mark completed immediately.
     if task.action_type == crate::task_engine::types::action_type::RESUME_AGENT {
-        // Build the task with the result set (update_task_completed stores it but doesn't return it)
+        // Build the task struct with result set for dispatch
         let mut completed_task = task;
-        completed_task.result = Some(req.result);
-        completed_task.status = "completed".to_string();
+        completed_task.result = Some(req.result.clone());
+        completed_task.status = "in_progress".to_string();
 
+        let db = agent_state.db.clone();
         let engine = agent_state.task_engine.clone();
+        let task_id_clone = task_id.clone();
+        let result_clone = req.result.clone();
         tokio::spawn(async move {
+            // Persist result and mark completed in DB before dispatch
+            match db
+                .update_task_completed(&task_id_clone, Some(&result_clone))
+                .await
+            {
+                Ok(false) => {
+                    warn!(task_id = %task_id_clone, "task already in terminal state, skipping dispatch");
+                    return;
+                }
+                Err(e) => {
+                    warn!(task_id = %task_id_clone, error = %e, "failed to mark task completed before dispatch");
+                    let _ = db.update_task_status(&task_id_clone, "failed").await;
+                    return;
+                }
+                Ok(true) => {}
+            }
+
             let dispatcher = {
                 let eng = engine.lock().await;
                 eng.dispatcher()
@@ -404,6 +427,35 @@ pub async fn handle_task_complete(
                 warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
             }
         });
+    } else {
+        // Non-resume_agent callback: persist result and mark completed directly
+        match agent_state
+            .db
+            .update_task_completed(&task_id, Some(&req.result))
+            .await
+        {
+            Ok(false) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "task already completed or not in completable state",
+                        "task_id": task_id
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                error!(error = %e, task_id, "failed to mark task completed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({"error": "failed to complete task", "task_id": task_id}),
+                    ),
+                )
+                    .into_response();
+            }
+            Ok(true) => {}
+        }
     }
 
     (

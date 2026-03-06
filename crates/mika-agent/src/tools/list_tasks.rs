@@ -47,14 +47,17 @@ impl Tool for ListTasksTool {
 
         let mut output = String::from("Active tasks:\n");
         for t in &tasks {
-            let short_id = &t.id[..8.min(t.id.len())];
             let fire_at = t
                 .next_fire_at
                 .map(format_unix_ts)
                 .unwrap_or_else(|| "no schedule".to_string());
+            let timeout = t
+                .timeout_at
+                .map(format_unix_ts)
+                .unwrap_or_else(|| "none".to_string());
             output.push_str(&format!(
-                "- {} [{}] {} ({}) — next: {}\n",
-                short_id, t.status, t.label, t.action_type, fire_at
+                "- {} [{}/{}] {} ({}) — next: {} | timeout: {}\n",
+                t.id, t.status, t.trigger_type, t.label, t.action_type, fire_at, timeout
             ));
         }
 
@@ -147,17 +150,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tasks_shows_short_id_and_schedule() {
+    async fn test_list_tasks_shows_full_id_and_schedule() {
         let harness = TestHarness::new();
-        add_task(&harness, "Check-in", "send_message").await;
+        let id = add_task(&harness, "Check-in", "send_message").await;
 
         let ctx = harness.ctx();
         let tool = ListTasksTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
-        // Short ID (8 chars) and scheduling info should be present
+        // Full UUID and scheduling info should be present
         assert!(result.content.contains("Check-in"));
         assert!(result.content.contains("pending"));
+        // Full UUID should appear in output (not just 8 chars)
+        assert!(result.content.contains(&id));
+        // trigger_type should appear
+        assert!(result.content.contains("time"));
+        // timeout should appear as "none" when not set
+        assert!(result.content.contains("timeout: none"));
     }
 }

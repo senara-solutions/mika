@@ -12,7 +12,7 @@ use crate::db::NewTask;
 use super::cron::next_fire_from_cron;
 use super::dispatcher::TaskDispatcher;
 use super::queue::QueuedTask;
-use super::types::task_status;
+use super::types::{action_type, task_status, trigger_type};
 
 /// Maximum tasks fired per tick to prevent overrun when many tasks are overdue.
 const MAX_PER_TICK: usize = 10;
@@ -128,8 +128,8 @@ impl TaskEngine {
     /// Returns the new task's UUID string ID.
     pub async fn enqueue(&mut self, task: NewTask) -> Result<String> {
         let next_fire_at = task.next_fire_at;
-        let trigger_type = task.trigger_type.clone();
-        let action_type = task.action_type.clone();
+        let trigger_type_val = task.trigger_type.clone();
+        let action_type_val = task.action_type.clone();
         let cron_expr = task.cron_expr.as_deref().map(str::to_owned);
 
         let id = self.db.create_task(task).await?;
@@ -138,8 +138,8 @@ impl TaskEngine {
             self.push_to_heap(QueuedTask {
                 task_id: id.clone(),
                 next_fire_at: fire_at,
-                trigger_type,
-                action_type,
+                trigger_type: trigger_type_val,
+                action_type: action_type_val,
                 cron_expr,
             });
         }
@@ -242,8 +242,8 @@ impl TaskEngine {
     fn enqueue_queued_task(
         &mut self,
         task_id: &str,
-        trigger_type: &str,
-        action_type: &str,
+        trigger_type_str: &str,
+        action_type_str: &str,
         cron_expr: Option<&str>,
         next_fire_at: Option<i64>,
         now: i64,
@@ -251,7 +251,7 @@ impl TaskEngine {
         if self.queued_ids.contains(task_id) {
             return;
         }
-        let fire_at = if trigger_type == "recurring" {
+        let fire_at = if trigger_type_str == trigger_type::RECURRING {
             match cron_expr {
                 Some(expr) => match next_fire_from_cron(expr, now) {
                     Ok(ts) => ts,
@@ -278,8 +278,8 @@ impl TaskEngine {
         self.push_to_heap(QueuedTask {
             task_id: task_id.to_owned(),
             next_fire_at: fire_at,
-            trigger_type: trigger_type.to_owned(),
-            action_type: action_type.to_owned(),
+            trigger_type: trigger_type_str.to_owned(),
+            action_type: action_type_str.to_owned(),
             cron_expr: cron_expr.map(str::to_owned),
         });
     }
@@ -319,15 +319,15 @@ impl TaskEngine {
         let dispatcher = self.dispatcher.clone();
         let db = self.db.clone();
         let reenqueue_tx = self.reenqueue_tx.clone();
-        let trigger_type = queued.trigger_type.clone();
-        let action_type = queued.action_type.clone();
+        let trigger_type_val = queued.trigger_type.clone();
+        let action_type_val = queued.action_type.clone();
         let cron_expr = queued.cron_expr.clone();
 
         tokio::spawn(async move {
             let result = dispatcher.dispatch(&task_id).await;
             match result {
                 Ok(()) => {
-                    if trigger_type == "recurring" {
+                    if trigger_type_val == trigger_type::RECURRING {
                         // Recompute next fire time and re-enqueue
                         let next = match cron_expr
                             .as_deref()
@@ -342,14 +342,8 @@ impl TaskEngine {
                             }
                         };
 
-                        if let Err(e) = db.update_task_next_fire_at(&task_id, next).await {
-                            warn!(task_id = %task_id, error = %e, "failed to update next_fire_at after recurring fire");
-                        }
-                        if let Err(e) = db
-                            .update_task_status(&task_id, task_status::RECURRING_ACTIVE)
-                            .await
-                        {
-                            warn!(task_id = %task_id, error = %e, "failed to set recurring_active status");
+                        if let Err(e) = db.update_task_rescheduled(&task_id, next).await {
+                            warn!(task_id = %task_id, error = %e, "failed to reschedule recurring task after fire");
                         }
 
                         // Send back to engine for re-enqueue on next tick
@@ -357,16 +351,22 @@ impl TaskEngine {
                             .send(QueuedTask {
                                 task_id,
                                 next_fire_at: next,
-                                trigger_type,
-                                action_type: action_type.clone(),
+                                trigger_type: trigger_type_val,
+                                action_type: action_type_val.clone(),
                                 cron_expr,
                             })
                             .await;
-                    } else if action_type != super::types::action_type::INJECT_CONTEXT {
+                    } else if action_type_val != action_type::INJECT_CONTEXT {
                         // inject_context stays in_progress until the agent loop consumes it.
                         // All other one-shot actions are marked completed here.
-                        if let Err(e) = db.update_task_completed(&task_id, None).await {
-                            warn!(task_id = %task_id, error = %e, "failed to mark task completed");
+                        match db.update_task_completed(&task_id, None).await {
+                            Ok(false) => {
+                                warn!(task_id = %task_id, "task already in terminal state, skipping complete");
+                            }
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "failed to mark task completed");
+                            }
+                            Ok(true) => {}
                         }
                     }
                 }

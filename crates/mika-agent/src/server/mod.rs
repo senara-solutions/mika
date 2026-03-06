@@ -362,6 +362,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             }
         }
 
+        // Prune completed tasks older than 30 days to prevent unbounded DB growth
+        task_engine::prune_old_tasks(&db).await;
+
         // Spawn tick loop and retain the handle so we can abort it on shutdown
         let handle = TaskEngine::spawn_tick_loop(engine);
         tick_handles.push(handle);
@@ -1136,6 +1139,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_task_complete_already_completed_returns_conflict() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("main").unwrap().db.clone();
+        let task_id = create_callback_task(&db).await;
+
+        // Mark the task completed before the HTTP request
+        let transitioned = db
+            .update_task_completed(&task_id, Some("first result"))
+            .await
+            .unwrap();
+        assert!(transitioned, "task should have transitioned to completed");
+
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/complete"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"result":"second attempt"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task_id"], task_id);
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be completed")
+        );
     }
 
     #[tokio::test]

@@ -58,9 +58,19 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
                         task.status
                     );
                 }
-                ctx.async_db
+                match ctx
+                    .async_db
                     .update_task_completed(tid, Some(&user_message))
-                    .await?;
+                    .await?
+                {
+                    true => {}
+                    false => {
+                        anyhow::bail!(
+                            "Task '{}' could not be completed: already in a terminal state.",
+                            tid
+                        );
+                    }
+                }
             }
             Ok(None) => {
                 anyhow::bail!("Task '{}' not found.", tid);

@@ -163,7 +163,8 @@ impl AsyncDatabase {
 
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>> {
         let i = id.to_owned();
-        self.with_db(move |db| db.get_task(&i)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_task(&i, &a)).await
     }
 
     pub async fn get_schedulable_tasks(&self) -> Result<Vec<Task>> {
@@ -173,7 +174,9 @@ impl AsyncDatabase {
 
     pub async fn claim_and_fire_task(&self, id: &str) -> Result<bool> {
         let id = id.to_string();
-        self.with_db(move |db| db.claim_and_fire_task(&id)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.claim_and_fire_task(&id, &a))
+            .await
     }
 
     pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
@@ -181,16 +184,18 @@ impl AsyncDatabase {
         self.with_db(move |db| db.update_task_status(&i, &s)).await
     }
 
-    pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
+    pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<bool> {
         let (i, r) = (id.to_owned(), result.map(|s| s.to_owned()));
-        self.with_db(move |db| db.update_task_completed(&i, r.as_deref()))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.update_task_completed(&i, &a, r.as_deref()))
             .await
     }
 
     pub async fn update_task_failed(&self, id: &str, error: &str) -> Result<()> {
         let id = id.to_string();
         let error = error.to_string();
-        self.with_db(move |db| db.update_task_failed(&id, &error))
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.update_task_failed(&id, &a, &error))
             .await
     }
 
@@ -200,9 +205,16 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn update_task_rescheduled(&self, id: &str, next_fire_at: i64) -> Result<()> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.update_task_rescheduled(&i, next_fire_at))
+            .await
+    }
+
     pub async fn cancel_task(&self, id: &str) -> Result<bool> {
         let i = id.to_owned();
-        self.with_db(move |db| db.cancel_task(&i)).await
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.cancel_task(&i, &a)).await
     }
 
     pub async fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
