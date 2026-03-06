@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "499"
 tags: [code-review, security, prompt-injection]

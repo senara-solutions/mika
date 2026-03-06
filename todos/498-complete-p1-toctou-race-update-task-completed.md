@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "498"
 tags: [code-review, architecture, correctness, database]

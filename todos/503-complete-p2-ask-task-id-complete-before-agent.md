@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "503"
 tags: [code-review, architecture, reliability, cli]

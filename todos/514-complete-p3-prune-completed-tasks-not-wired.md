@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "514"
 tags: [code-review, performance, database, maintenance]
