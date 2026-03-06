@@ -312,7 +312,12 @@ mod tests {
 
         let result = tool
             .execute(
-                make_input("self_model", "append", &"y".repeat(200), "Extending persona"),
+                make_input(
+                    "self_model",
+                    "append",
+                    &"y".repeat(200),
+                    "Extending persona",
+                ),
                 &ctx,
             )
             .await
@@ -393,7 +398,10 @@ mod tests {
 
         // 4th edit should be rate limited
         let result = tool
-            .execute(make_input("self_model", "replace", "Edit 3", "One more"), &ctx)
+            .execute(
+                make_input("self_model", "replace", "Edit 3", "One more"),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -487,7 +495,12 @@ mod tests {
         // Without evidence field → rejected
         let result = tool
             .execute(
-                make_input("self_model", "replace", "Updated persona", "Reflection update"),
+                make_input(
+                    "self_model",
+                    "replace",
+                    "Updated persona",
+                    "Reflection update",
+                ),
                 &ctx,
             )
             .await

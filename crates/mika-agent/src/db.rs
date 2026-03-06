@@ -599,7 +599,9 @@ impl Database {
 
     pub fn register_agent(&self, id: &str, name: &str, home_dir: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES (?1, ?2, ?3)",
+            "INSERT INTO agents (id, name, home_dir) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET home_dir = excluded.home_dir
+             WHERE excluded.home_dir != ''",
             params![id, name, home_dir],
         )?;
         Ok(())
@@ -3081,6 +3083,28 @@ mod tests {
             .unwrap();
         let agents = db.list_agents_db().unwrap();
         assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn test_register_agent_upserts_home_dir() {
+        let db = db();
+        // "main" was pre-registered with empty home_dir by schema init
+        let agents = db.list_agents_db().unwrap();
+        let main = agents.iter().find(|a| a.id == "main").unwrap();
+        assert_eq!(main.home_dir, "");
+
+        // Re-register with a real path — should update
+        db.register_agent("main", "main", "/home/mika/agents/main")
+            .unwrap();
+        let agents = db.list_agents_db().unwrap();
+        let main = agents.iter().find(|a| a.id == "main").unwrap();
+        assert_eq!(main.home_dir, "/home/mika/agents/main");
+
+        // Re-register with empty string — should NOT overwrite
+        db.register_agent("main", "main", "").unwrap();
+        let agents = db.list_agents_db().unwrap();
+        let main = agents.iter().find(|a| a.id == "main").unwrap();
+        assert_eq!(main.home_dir, "/home/mika/agents/main");
     }
 
     #[test]
