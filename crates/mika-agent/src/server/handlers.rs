@@ -416,10 +416,7 @@ pub async fn handle_task_complete(
                 Ok(true) => {}
             }
 
-            if let Err(e) = dispatcher
-                .dispatch_resume_agent(&completed_task)
-                .await
-            {
+            if let Err(e) = dispatcher.dispatch_resume_agent(&completed_task).await {
                 warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
             }
         });

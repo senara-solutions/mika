@@ -136,5 +136,4 @@ pub mod test_helpers {
             otlp_auth_header: None,
         }
     }
-
 }
