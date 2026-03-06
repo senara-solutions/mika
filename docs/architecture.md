@@ -421,7 +421,7 @@ sends in a background task (does not block message processing).
 ## 13. Multi-Agent Support
 
 - Global home directory: `~/.mika/`
-- Agent homes: `~/.mika/agents/{name}/` (each with data/, skills/, logs/)
+- Agent homes: `~/.mika/agents/{name}/` (each with skills/, logs/)
 - Active agent tracked in `~/.mika/active_agent`
 - CLI `--agent` flag overrides active agent
 - CLI `--team` flag launches TUI in team mode (mutually exclusive with `--agent`)
@@ -440,8 +440,8 @@ section listing available agents with their identities (emoji + name).
 ### Team Workflows
 
 Teams are defined in `~/.mika/teams/{name}/team.toml` and orchestrated by the
-`run_team` tool. Team runs and message graphs are persisted to a per-team SQLite
-database (`{team_dir}/data/mika.db`) with graph-structured messages linked via
+`run_team` tool. Team runs and message graphs are persisted to the shared container
+database (`~/.mika/data/mika.db`) with graph-structured messages linked via
 `parent_id`. Queryable via `get_team_status` and `get_team_history` tools.
 
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
