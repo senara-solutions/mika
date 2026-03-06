@@ -115,7 +115,9 @@ fn onboarding_prompt() -> String {
          This is your first conversation with the user. Introduce yourself briefly and warmly. \
          Ask who they are and what they're working on. Use update_core_memory to seed all \
          {} blocks ({}) from their \
-         responses. Keep it to 2-3 natural exchanges, then transition to being helpful \
+         responses. Also use store_fact(category=\"person\") to create a record for the user \
+         with their name and relationship \"The user\". \
+         Keep it to 2-3 natural exchanges, then transition to being helpful \
          with whatever they need.",
         section_names.len(),
         section_names.join(", ")
@@ -276,7 +278,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str("\n## Tool Usage\n");
     prompt.push_str("- Update your core memory when you learn important things about the user.\n");
     prompt.push_str(
-        "- Track people, commitments, preferences, and events using the appropriate tools.\n",
+        "- When the user mentions a person by name for the first time, store them using \
+store_fact(category=\"person\") with their name, relationship, and any context. \
+Core memory tracks key people briefly — the people table is the full record.\n",
     );
     prompt.push_str(
         "- Use search_memory to find stored facts before asking the user to repeat information.\n",
@@ -1337,5 +1341,32 @@ notify = true
         let prompt = build_silent_prompt(&ctx);
         assert!(!prompt.contains("## Today's Conversations"));
         assert!(!prompt.contains("## Recent Memory Changes"));
+    }
+
+    #[test]
+    fn test_onboarding_prompt_mentions_store_fact() {
+        let prompt = onboarding_prompt();
+        assert!(prompt.contains("store_fact"));
+        assert!(prompt.contains("person"));
+        assert!(prompt.contains("The user"));
+    }
+
+    #[test]
+    fn test_tool_usage_prompt_mentions_store_fact_person() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: chrono::Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("store_fact(category=\"person\")"));
     }
 }

@@ -491,6 +491,47 @@ pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
         .unwrap_or(true)
 }
 
+/// After onboarding, extract the user's name from user_summary and create
+/// a people record. This guarantees the user exists in the people table
+/// regardless of whether the agent called store_fact.
+async fn seed_user_person(db: &AsyncDatabase) -> Result<()> {
+    let default_summary = crate::db::CORE_MEMORY_SECTIONS
+        .iter()
+        .find(|(k, _)| *k == "user_summary")
+        .map(|(_, v)| *v)
+        .unwrap_or("");
+
+    let entry = db.get_core_memory("user_summary").await?;
+    let summary = match entry {
+        Some(e) if e.value != default_summary => e.value,
+        _ => return Ok(()), // Still default — agent didn't update it
+    };
+
+    // Extract name: take text before first comma, period, dash, or newline.
+    // Typical user_summary: "Sam, software engineer at Senara Solutions"
+    let name = summary
+        .split(&[',', '.', '\u{2014}', '-', '\n'][..])
+        .next()
+        .unwrap_or(&summary)
+        .trim();
+
+    if name.is_empty() || name.len() > 100 {
+        return Ok(());
+    }
+
+    // Check if person already exists (agent might have stored them via store_fact)
+    if db.get_person(name).await?.is_some() {
+        return Ok(());
+    }
+
+    db.upsert_person(name, Some("The user"), None).await?;
+    info!(
+        name = name,
+        "auto-seeded user in people table after onboarding"
+    );
+    Ok(())
+}
+
 /// Parameters for running the agent loop.
 pub struct AgentParams<'a> {
     pub db: &'a AsyncDatabase,
@@ -567,6 +608,12 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 && let Err(e) = compaction::maybe_compact(params.db, params.claude).await
             {
                 warn!(error = %e, "post-turn compaction failed");
+            }
+            // Auto-seed user in people table after onboarding
+            if params.is_onboarding
+                && let Err(e) = seed_user_person(params.db).await
+            {
+                warn!(error = %e, "failed to auto-seed user person record");
             }
             Ok(output)
         }
@@ -1689,6 +1736,67 @@ mod tests {
             .await
             .unwrap();
         assert!(check_onboarding(&db).await);
+    }
+
+    // -- seed_user_person tests --
+
+    #[tokio::test]
+    async fn test_seed_user_person_after_onboarding() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        db.set_core_memory("user_summary", "Sam, software engineer at Senara Solutions")
+            .await
+            .unwrap();
+
+        seed_user_person(&db).await.unwrap();
+
+        let person = db.get_person("Sam").await.unwrap();
+        assert!(person.is_some());
+        let person = person.unwrap();
+        assert_eq!(person.relationship.as_deref(), Some("The user"));
+    }
+
+    #[tokio::test]
+    async fn test_seed_user_person_skips_when_default() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        // user_summary is still at default
+
+        seed_user_person(&db).await.unwrap();
+
+        let people = db.list_people().await.unwrap();
+        assert!(people.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_seed_user_person_skips_when_already_exists() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        db.set_core_memory("user_summary", "Sam, software engineer")
+            .await
+            .unwrap();
+        // Pre-create the person
+        db.upsert_person("Sam", Some("Friend"), None).await.unwrap();
+
+        seed_user_person(&db).await.unwrap();
+
+        // Relationship should NOT be overwritten
+        let person = db.get_person("Sam").await.unwrap().unwrap();
+        assert_eq!(person.relationship.as_deref(), Some("Friend"));
+    }
+
+    #[tokio::test]
+    async fn test_seed_user_person_extracts_name_before_comma() {
+        let db = test_async_db();
+        db.seed_core_memory(None).await.unwrap();
+        db.set_core_memory("user_summary", "Alice Johnson, product manager")
+            .await
+            .unwrap();
+
+        seed_user_person(&db).await.unwrap();
+
+        let person = db.get_person("Alice Johnson").await.unwrap();
+        assert!(person.is_some());
     }
 
     // -- Skill helper tests --
