@@ -478,9 +478,9 @@ mod tests {
                 updated_at: "2026-01-01".to_string(),
             },
             CoreMemoryEntry {
-                key: "persona".to_string(),
-                value: "Mika — assistant.".to_string(),
-                token_count: 4,
+                key: "self_model".to_string(),
+                value: "I am main. No interaction history yet.".to_string(),
+                token_count: 8,
                 updated_at: "2026-01-01".to_string(),
             },
         ]
@@ -527,8 +527,8 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("### user_summary"));
         assert!(prompt.contains("Loves coffee."));
-        assert!(prompt.contains("### persona"));
-        assert!(prompt.contains("Mika — assistant."));
+        assert!(prompt.contains("### self_model"));
+        assert!(prompt.contains("I am main. No interaction history yet."));
     }
 
     #[test]

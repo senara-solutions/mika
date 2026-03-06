@@ -23,13 +23,10 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
 pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
-    ("user_summary", "New user. No information yet."),
-    ("persona", "Mika -- personal AI executive assistant."),
-    (
-        "current_priorities",
-        "Get to know the user and understand their needs.",
-    ),
-    ("key_people", "No one tracked yet."),
+    ("user_summary", "No information about the user yet."),
+    ("self_model", "No interaction history yet."),
+    ("current_priorities", "No priorities set yet."),
+    ("key_people", "No people tracked yet."),
 ];
 
 pub fn core_memory_section_names() -> Vec<&'static str> {
@@ -1408,11 +1405,30 @@ impl Database {
                 self.set_core_memory(agent_id, key, default)?;
             }
         }
+        // Override self_model with agent-aware default (only if still at static default)
+        if let Some(entry) = self.get_core_memory(agent_id, "self_model")?
+            && entry.value == "No interaction history yet."
+        {
+            self.set_core_memory(
+                agent_id,
+                "self_model",
+                &format!("I am {agent_id}. No interaction history yet."),
+            )?;
+        }
         if let Some(md) = user_md_content
             && !md.trim().is_empty()
         {
             self.set_core_memory(agent_id, "user_summary", md.trim())?;
         }
+        Ok(())
+    }
+
+    /// Migrate legacy `persona` key to `self_model` for an agent.
+    pub fn migrate_persona_to_self_model(&self, agent_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE core_memory SET key = 'self_model' WHERE agent_id = ?1 AND key = 'persona'",
+            params![agent_id],
+        )?;
         Ok(())
     }
 

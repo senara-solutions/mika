@@ -142,10 +142,10 @@ Always present in the system prompt. The agent can edit these blocks via the
 
 | Block | Default Value |
 |-------|--------------|
-| `user_summary` | "New user. No information yet." |
-| `persona` | "Mika -- personal AI executive assistant." |
-| `current_priorities` | "Get to know the user and understand their needs." |
-| `key_people` | "No one tracked yet." |
+| `user_summary` | "No information about the user yet." |
+| `self_model` | "I am {agent_id}. No interaction history yet." |
+| `current_priorities` | "No priorities set yet." |
+| `key_people` | "No people tracked yet." |
 
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)

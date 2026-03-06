@@ -482,7 +482,7 @@ pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
         .iter()
         .find(|(k, _)| *k == "user_summary")
         .map(|(_, v)| *v)
-        .unwrap_or("New user. No information yet.");
+        .unwrap_or("No information about the user yet.");
     db.get_core_memory("user_summary")
         .await
         .ok()
@@ -1732,7 +1732,7 @@ mod tests {
     async fn test_check_onboarding_true_even_when_other_sections_customized() {
         let db = test_async_db();
         db.seed_core_memory(None).await.unwrap();
-        db.set_core_memory("persona", "Custom persona")
+        db.set_core_memory("self_model", "Custom self model")
             .await
             .unwrap();
         assert!(check_onboarding(&db).await);

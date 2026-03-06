@@ -83,6 +83,11 @@ impl AsyncDatabase {
         }
     }
 
+    /// Return the agent_id for this handle.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
     /// Gracefully shut down the database thread.
     pub fn shutdown(&self) {
         {
@@ -398,6 +403,12 @@ impl AsyncDatabase {
     pub async fn seed_core_memory(&self, user_md_content: Option<String>) -> Result<()> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.seed_core_memory(&a, user_md_content.as_deref()))
+            .await
+    }
+
+    pub async fn migrate_persona_to_self_model(&self) -> Result<()> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.migrate_persona_to_self_model(&a))
             .await
     }
 
@@ -1005,7 +1016,7 @@ mod tests {
         let entries = db.get_all_core_memory().await.unwrap();
         assert!(!entries.is_empty());
         let entry = db.get_core_memory("user_summary").await.unwrap().unwrap();
-        assert_eq!(entry.value, "New user. No information yet.");
+        assert_eq!(entry.value, "No information about the user yet.");
     }
 
     #[tokio::test]
