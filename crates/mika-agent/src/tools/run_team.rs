@@ -6,8 +6,11 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use mika_common::home;
+
+use crate::async_db::AsyncDatabase;
+use crate::db::Database;
 use crate::messaging::MessageSender;
-use crate::teams::open_or_create_team_db;
 use crate::teams::types::{TeamEvent, TeamEventCallback};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
@@ -74,10 +77,11 @@ impl Tool for RunTeamTool {
             )));
         }
 
-        // Open team DB for persistence
-        let team_db = match open_or_create_team_db(&self.home_dir, team_name) {
-            Ok(db) => db,
-            Err(msg) => return Ok(ToolOutput::error(msg)),
+        // Open the shared container DB for team persistence
+        let db_path = home::container_db_path(&self.home_dir);
+        let team_db = match Database::open(&db_path) {
+            Ok(db) => AsyncDatabase::new(db),
+            Err(e) => return Ok(ToolOutput::error(format!("Failed to open database: {e}"))),
         };
 
         let callback: Option<TeamEventCallback> = ctx.message_sender.as_ref().map(|sender| {

@@ -19,6 +19,7 @@ use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::tools;
 use crate::tools::ToolRegistry;
+use mika_common::home;
 
 use super::prompt;
 use super::types::*;
@@ -72,13 +73,16 @@ impl TeamEngine {
         let mut agents = HashMap::new();
         let embedding_client = settings.make_embedding_client();
 
+        // Use the single shared container database
+        let db_path = home::container_db_path(global_home);
+
         for ta in &team.agents {
             let home_dir = agent::agent_dir(global_home, &ta.name);
-            let db_path = home_dir.join("data").join("mika.db");
             let db = Database::open(&db_path)
-                .with_context(|| format!("failed to open DB for agent '{}'", ta.name))?;
+                .with_context(|| format!("failed to open container DB for agent '{}'", ta.name))?;
+            db.register_agent(&ta.name, &ta.name, home_dir.to_str().unwrap_or(""))?;
             startup::seed_core_memory_if_empty(&db, &home_dir, &ta.name)?;
-            let async_db = AsyncDatabase::new(db);
+            let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
             let skills = SkillRegistry::from_dir(&home_dir.join("skills"));
 
             agents.insert(

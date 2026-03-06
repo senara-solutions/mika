@@ -474,10 +474,10 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
     let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamEvent>();
 
-    // Open on-disk DB for team conversation persistence
-    let data_dir = team_dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-    let team_db = mika_agent::async_db::AsyncDatabase::open(&data_dir.join("mika.db"))?;
+    // Use the shared container DB for team conversation persistence
+    let db_path = mika_common::home::container_db_path(global_home);
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let team_db = mika_agent::async_db::AsyncDatabase::open(&db_path)?;
 
     // Spawn team worker
     let worker_home = global_home.to_path_buf();

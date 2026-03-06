@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use mika_common::agent;
 use mika_common::claude::{ClaudeClient, ToolDefinition};
 use mika_common::config::Settings;
+use mika_common::home;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -10,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct DelegateTaskTool {
+    /// The global Mika home directory (e.g. `~/.mika/`).
     pub home_dir: PathBuf,
     pub settings: Settings,
 }
@@ -78,7 +80,7 @@ impl Tool for DelegateTaskTool {
         }
 
         let agent_home = agent::agent_dir(&self.home_dir, agent_name);
-        let db_path = agent_home.join("data").join("mika.db");
+        let db_path = home::container_db_path(&self.home_dir);
 
         let db = match crate::db::Database::open(&db_path) {
             Ok(db) => db,
@@ -88,7 +90,7 @@ impl Tool for DelegateTaskTool {
                 )));
             }
         };
-        let async_db = crate::async_db::AsyncDatabase::new(db);
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, agent_name);
 
         // Load delegate agent's skills
         let skills = crate::skills::SkillRegistry::from_dir(&agent_home.join("skills"));

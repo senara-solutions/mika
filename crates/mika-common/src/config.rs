@@ -135,7 +135,7 @@ impl Settings {
     ///   4. MIKA_* env vars      (highest priority)
     ///
     /// The `home_dir` argument is the resolved Mika home directory.
-    /// If `db_path` is not explicitly set, it defaults to `{home_dir}/data/mika.db`.
+    /// If `db_path` is not explicitly set, it defaults to `{home_dir}/data/mika.db` (container DB).
     /// Load settings from config files + environment variables.
     ///
     /// Backward-compatible wrapper: uses `home_dir` as both global and agent home.
@@ -153,7 +153,7 @@ impl Settings {
     ///   5. MIKA_* env vars              (highest priority)
     ///
     /// `agent_home` is the resolved directory for the specific agent.
-    /// `db_path` defaults to `{agent_home}/data/mika.db` if not explicitly set.
+    /// `db_path` defaults to `{global_home}/data/mika.db` (single container DB).
     pub fn load_for_agent(global_home: &Path, agent_home: &Path) -> anyhow::Result<Self> {
         let global_config = global_home.join("config.toml");
         let agent_config = agent_home.join("config.toml");
@@ -179,9 +179,10 @@ impl Settings {
 
         settings.home_dir = agent_home.to_path_buf();
 
-        // If db_path is still the default "mika.db", resolve it to {agent_home}/data/mika.db
+        // If db_path is still the default "mika.db", resolve it to {global_home}/data/mika.db
+        // (single unified database per container — see brainstorm)
         if settings.db_path == Path::new("mika.db") {
-            settings.db_path = agent_home.join("data").join("mika.db");
+            settings.db_path = global_home.join("data").join("mika.db");
         }
 
         // Validate internal_token format if present (fixed-length eliminates timing leak)
@@ -356,8 +357,8 @@ mod tests {
         assert_eq!(settings.log_level, "debug");
         // home_dir should be agent_home
         assert_eq!(settings.home_dir, agent_home);
-        // db_path should resolve to agent_home/data/mika.db
-        assert_eq!(settings.db_path, agent_home.join("data").join("mika.db"));
+        // db_path should resolve to global_home/data/mika.db (single container DB)
+        assert_eq!(settings.db_path, global_home.join("data").join("mika.db"));
     }
 
     #[test]

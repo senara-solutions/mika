@@ -417,11 +417,7 @@ pub fn management_tools(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Too
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
         }),
-        Box::new(get_team_status::GetTeamStatusTool {
-            home_dir: home_dir.to_path_buf(),
-        }),
-        Box::new(get_team_history::GetTeamHistoryTool {
-            home_dir: home_dir.to_path_buf(),
-        }),
+        Box::new(get_team_status::GetTeamStatusTool),
+        Box::new(get_team_history::GetTeamHistoryTool),
     ]
 }

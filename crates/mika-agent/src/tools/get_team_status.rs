@@ -4,16 +4,12 @@ use mika_common::claude::ToolDefinition;
 use mika_common::team;
 use serde_json::Value;
 use std::fmt::Write;
-use std::path::PathBuf;
 
 use crate::db::{TeamRunRow, format_unix_ts};
-use crate::teams::{TeamDbError, open_team_db};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
-pub struct GetTeamStatusTool {
-    pub home_dir: PathBuf,
-}
+pub struct GetTeamStatusTool;
 
 #[async_trait]
 impl Tool for GetTeamStatusTool {
@@ -42,7 +38,7 @@ impl Tool for GetTeamStatusTool {
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let team_name = input["team_name"].as_str().unwrap_or("");
         if team_name.is_empty() {
             return Ok(ToolOutput::error("'team_name' is required."));
@@ -67,28 +63,22 @@ impl Tool for GetTeamStatusTool {
             )));
         }
 
-        // Open team DB
-        let team_db = match open_team_db(&self.home_dir, team_name) {
-            Ok(db) => db,
-            Err(TeamDbError::NoRuns(msg)) => return Ok(ToolOutput::success(msg)),
-            Err(TeamDbError::OpenFailed(msg)) => return Ok(ToolOutput::error(msg)),
-        };
+        // Use the shared container DB from ToolContext
+        let db = ctx.db;
 
         let run: Option<TeamRunRow> = if let Some(target_id) = run_id_filter {
-            match team_db.load_team_run_by_id(target_id).await {
+            match db.load_team_run_by_id(target_id).await {
                 Ok(run) => run,
                 Err(e) => {
-                    team_db.shutdown();
                     return Ok(ToolOutput::error(format!(
                         "Failed to load run '{target_id}' for team '{team_name}': {e}"
                     )));
                 }
             }
         } else {
-            match team_db.load_latest_team_run(team_name).await {
+            match db.load_latest_team_run(team_name).await {
                 Ok(run) => run,
                 Err(e) => {
-                    team_db.shutdown();
                     return Ok(ToolOutput::error(format!(
                         "Failed to load status for team '{team_name}': {e}"
                     )));
@@ -97,7 +87,6 @@ impl Tool for GetTeamStatusTool {
         };
 
         let Some(run) = run else {
-            team_db.shutdown();
             return Ok(ToolOutput::success(format!(
                 "No runs found for team '{team_name}'."
             )));
@@ -119,7 +108,7 @@ impl Tool for GetTeamStatusTool {
         }
 
         // Load messages for this run
-        if let Ok(messages) = team_db.load_team_messages(&run.id).await
+        if let Ok(messages) = db.load_team_messages(&run.id).await
             && !messages.is_empty()
         {
             writeln!(out, "\nMessages ({}):", messages.len()).unwrap();
@@ -154,7 +143,6 @@ impl Tool for GetTeamStatusTool {
             writeln!(out, "\nDeliverable:\n{preview}").unwrap();
         }
 
-        team_db.shutdown();
         Ok(ToolOutput::success(out))
     }
 }
@@ -162,16 +150,13 @@ impl Tool for GetTeamStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{TestHarness, setup_team_db};
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_get_team_status_no_runs() {
-        let tmp = tempfile::tempdir().unwrap();
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamStatusTool {
-            home_dir: tmp.path().to_path_buf(),
-        };
+        let tool = GetTeamStatusTool;
 
         let result = tool
             .execute(serde_json::json!({"team_name": "dev-team"}), &ctx)
@@ -183,11 +168,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_team_status_latest() {
-        let (_tmp, home) = setup_team_db("dev-team", 1);
-
         let harness = TestHarness::new();
+        // Seed team run data in the shared DB
+        harness
+            .db
+            .insert_team_run("run-0000", "dev-team", "Goal 0", 3, 1_740_000_000)
+            .await
+            .unwrap();
+        harness
+            .db
+            .update_team_run(
+                "run-0000",
+                "completed",
+                None,
+                1,
+                Some("Done"),
+                Some(1_740_000_060),
+            )
+            .await
+            .unwrap();
+
         let ctx = harness.ctx();
-        let tool = GetTeamStatusTool { home_dir: home };
+        let tool = GetTeamStatusTool;
 
         let result = tool
             .execute(serde_json::json!({"team_name": "dev-team"}), &ctx)
@@ -203,9 +205,7 @@ mod tests {
     async fn test_get_team_status_missing_name() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamStatusTool {
-            home_dir: PathBuf::from("/tmp"),
-        };
+        let tool = GetTeamStatusTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(result.is_error);
@@ -216,9 +216,7 @@ mod tests {
     async fn test_get_team_status_invalid_name() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamStatusTool {
-            home_dir: PathBuf::from("/tmp"),
-        };
+        let tool = GetTeamStatusTool;
 
         let result = tool
             .execute(serde_json::json!({"team_name": "INVALID"}), &ctx)

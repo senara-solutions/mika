@@ -62,10 +62,13 @@ fn build_router(state: AppState) -> Router {
 }
 
 /// Initialize a single agent and return its AgentState with a running TaskEngine.
+///
+/// Uses the shared container database at `{global_home}/data/mika.db`.
 #[allow(clippy::too_many_arguments)]
 async fn init_agent(
     agent_name: &str,
     agent_home: &std::path::Path,
+    global_home: &std::path::Path,
     claude: &ClaudeClient,
     tool_registry: &Arc<crate::tools::ToolRegistry>,
     gateway_url: &str,
@@ -75,10 +78,13 @@ async fn init_agent(
     brave_api_key: Option<String>,
     disable_bundled_skills: bool,
 ) -> Result<AgentState> {
-    let db = Database::open(&agent_home.join("data").join("mika.db"))?;
+    let db_path = home::container_db_path(global_home);
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let db = Database::open(&db_path)?;
+    db.register_agent(agent_name, agent_name, agent_home.to_str().unwrap_or(""))?;
     startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
-    let async_db = AsyncDatabase::new(db);
+    let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
     let skill_registry = Arc::new(SkillRegistry::from_dir(&agent_home.join("skills")));
 
@@ -249,11 +255,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let agent_names = agent::list_agents(global_home);
 
     if agent_names.is_empty() {
-        // No agents found — initialize default agent via legacy path
-        let agent_home = home::resolve_agent_home(global_home, agent::DEFAULT_AGENT);
-        if !agent_home.join("data").join("mika.db").exists() {
+        // No agents found — initialize default agent
+        if !home::container_db_path(global_home).exists() {
+            let default_home = home::resolve_agent_home(global_home, agent::DEFAULT_AGENT);
             let agent_state = init_agent(
                 agent::DEFAULT_AGENT,
+                &default_home,
                 global_home,
                 &claude,
                 &tool_registry,
@@ -273,6 +280,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             match init_agent(
                 name,
                 &agent_home,
+                global_home,
                 &claude,
                 &tool_registry,
                 &gateway_url,
