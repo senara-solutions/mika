@@ -736,6 +736,44 @@ impl Database {
         }
     }
 
+    /// Get the cron expression for an existing recurring task by label.
+    pub fn get_recurring_task_cron(&self, agent_id: &str, label: &str) -> Result<Option<String>> {
+        let cron: Option<Option<String>> = self.conn.query_row(
+            "SELECT cron_expr FROM tasks WHERE agent_id = ?1 AND label = ?2 AND trigger_type = 'recurring' AND status IN ('recurring_active', 'pending', 'in_progress') LIMIT 1",
+            params![agent_id, label],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(cron.flatten())
+    }
+
+    /// Update the cron expression and next_fire_at for an existing recurring task.
+    pub fn update_recurring_task_cron(
+        &self,
+        agent_id: &str,
+        label: &str,
+        new_cron: &str,
+        next_fire_at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET cron_expr = ?1, next_fire_at = ?2
+             WHERE agent_id = ?3 AND label = ?4 AND trigger_type = 'recurring'
+               AND status IN ('recurring_active', 'pending', 'in_progress')",
+            params![new_cron, next_fire_at, agent_id, label],
+        )?;
+        Ok(())
+    }
+
+    /// Cancel a recurring task by label (e.g. when reflection is disabled in identity.toml).
+    pub fn cancel_recurring_task_by_label(&self, agent_id: &str, label: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
+             WHERE agent_id = ?1 AND label = ?2 AND trigger_type = 'recurring'
+               AND status NOT IN ('completed','failed','cancelled','expired')",
+            params![agent_id, label],
+        )?;
+        Ok(())
+    }
+
     fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         Ok(Task {
             id: r.get(0)?,

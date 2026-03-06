@@ -14,6 +14,8 @@ pub struct ReflectionConfig {
     pub time: String,
     #[serde(default)]
     pub notify: bool,
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 fn default_reflection_time() -> String {
@@ -26,6 +28,7 @@ impl Default for ReflectionConfig {
             enabled: false,
             time: default_reflection_time(),
             notify: false,
+            timezone: None,
         }
     }
 }
@@ -1228,6 +1231,7 @@ max_iterations = 3
             enabled: true,
             time: "20:00".to_string(),
             notify: false,
+            timezone: None,
         };
         let time = config.parse_time().unwrap();
         assert_eq!(time.hour(), 20);
@@ -1240,6 +1244,7 @@ max_iterations = 3
             enabled: true,
             time: "25:00".to_string(),
             notify: false,
+            timezone: None,
         };
         assert!(config.parse_time().is_none());
 
@@ -1247,6 +1252,7 @@ max_iterations = 3
             enabled: true,
             time: "8pm".to_string(),
             notify: false,
+            timezone: None,
         };
         assert!(config2.parse_time().is_none());
     }

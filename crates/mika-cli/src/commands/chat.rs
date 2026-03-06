@@ -99,13 +99,21 @@ async fn spawn_agent_worker(
         r#"{"trigger":"heartbeat"}"#,
     )
     .await;
-    task_engine::ensure_recurring_task(
-        &ctx.async_db,
-        "reflection",
-        "0 0 2 * * *",
-        r#"{"trigger":"reflection"}"#,
-    )
-    .await;
+    if let Some(cron) = task_engine::reflection_cron_for_agent(&ctx.home_dir, &ctx.async_db).await {
+        task_engine::ensure_recurring_task(
+            &ctx.async_db,
+            "reflection",
+            &cron,
+            r#"{"trigger":"reflection"}"#,
+        )
+        .await;
+    } else if let Err(e) = ctx
+        .async_db
+        .cancel_recurring_task_by_label("reflection")
+        .await
+    {
+        tracing::warn!(error = %e, "failed to cancel stale reflection task");
+    }
     {
         let mut eng = task_engine.lock().await;
         if let Err(e) = eng.startup_recovery().await {

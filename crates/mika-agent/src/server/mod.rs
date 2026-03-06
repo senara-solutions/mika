@@ -38,9 +38,6 @@ use state::{AgentState, AppState};
 /// Pre-filters (active hours, rate limits, recent activity) are applied at dispatch time.
 const HEARTBEAT_CRON: &str = "0 0 * * * *";
 
-/// Cron schedule for the nightly reflection task: 2am UTC every day.
-const REFLECTION_CRON: &str = "0 0 2 * * *";
-
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -82,7 +79,11 @@ async fn init_agent(
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let db = Database::open(&db_path)?;
     let identity = crate::prompt::load_identity(agent_home);
-    db.register_agent(agent_name, &identity.name, agent_home.to_str().unwrap_or(""))?;
+    db.register_agent(
+        agent_name,
+        &identity.name,
+        agent_home.to_str().unwrap_or(""),
+    )?;
     startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
@@ -356,13 +357,18 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             r#"{"trigger":"heartbeat"}"#,
         )
         .await;
-        task_engine::ensure_recurring_task(
-            &db,
-            "reflection",
-            REFLECTION_CRON,
-            r#"{"trigger":"reflection"}"#,
-        )
-        .await;
+        if let Some(cron) = task_engine::reflection_cron_for_agent(&agent_state.home_dir, &db).await
+        {
+            task_engine::ensure_recurring_task(
+                &db,
+                "reflection",
+                &cron,
+                r#"{"trigger":"reflection"}"#,
+            )
+            .await;
+        } else if let Err(e) = db.cancel_recurring_task_by_label("reflection").await {
+            warn!(agent = %agent_name, error = %e, "failed to cancel stale reflection task");
+        }
 
         // Startup recovery (expire timed-out tasks, mark orphaned in_progress as failed, load heap)
         {

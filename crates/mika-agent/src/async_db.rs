@@ -166,6 +166,33 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_recurring_task_cron(&self, label: &str) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.get_recurring_task_cron(&a, &l))
+            .await
+    }
+
+    pub async fn update_recurring_task_cron(
+        &self,
+        label: &str,
+        new_cron: &str,
+        next_fire_at: i64,
+    ) -> Result<()> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        let c = new_cron.to_owned();
+        self.with_db(move |db| db.update_recurring_task_cron(&a, &l, &c, next_fire_at))
+            .await
+    }
+
+    pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.cancel_recurring_task_by_label(&a, &l))
+            .await
+    }
+
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>> {
         let i = id.to_owned();
         let a = self.agent_id.clone();

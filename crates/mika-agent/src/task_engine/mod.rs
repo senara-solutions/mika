@@ -11,6 +11,8 @@ pub use types::{action_type, task_status, trigger_type};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
+use chrono::Timelike;
+use std::path::Path;
 use tracing::{debug, info, warn};
 
 /// Prune completed/failed/cancelled/expired tasks older than 30 days at startup
@@ -24,8 +26,9 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
 }
 
 /// Register a recurring task in the DB if one with the same label doesn't already exist.
+/// If it already exists but the cron expression differs, update the cron and recompute
+/// the next fire time.
 ///
-/// Idempotent: no-op if a recurring task with `label` is already scheduled.
 /// Used at startup to ensure built-in tasks (heartbeat, reflection) are always registered.
 pub async fn ensure_recurring_task(
     db: &AsyncDatabase,
@@ -55,7 +58,68 @@ pub async fn ensure_recurring_task(
 
     match db.create_recurring_task_if_absent(task).await {
         Ok(Some(id)) => info!(label, task_id = %id, cron = cron_expr, "registered recurring task"),
-        Ok(None) => debug!(label, "recurring task already registered, skipping"),
+        Ok(None) => {
+            // Task already exists — check if the cron expression changed.
+            if let Ok(Some(existing_cron)) = db.get_recurring_task_cron(label).await {
+                if existing_cron != cron_expr {
+                    let now = chrono::Utc::now().timestamp();
+                    match cron::next_fire_from_cron(cron_expr, now) {
+                        Ok(next_fire) => {
+                            match db
+                                .update_recurring_task_cron(label, cron_expr, next_fire)
+                                .await
+                            {
+                                Ok(_) => {
+                                    info!(label, old_cron = %existing_cron, new_cron = cron_expr, "updated recurring task cron")
+                                }
+                                Err(e) => {
+                                    warn!(label, error = %e, "failed to update recurring task cron")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(label, cron = cron_expr, error = %e, "failed to compute next fire time for updated cron")
+                        }
+                    }
+                } else {
+                    debug!(label, "recurring task already registered, skipping");
+                }
+            }
+        }
         Err(e) => warn!(label, error = %e, "failed to register recurring task"),
     }
+}
+
+/// Build a UTC cron expression for reflection from identity.toml config + customer timezone.
+/// Returns `None` if reflection is disabled or not configured.
+pub async fn reflection_cron_for_agent(home_dir: &Path, db: &AsyncDatabase) -> Option<String> {
+    let identity = crate::prompt::load_identity_async(home_dir).await;
+    let config = identity.reflection.as_ref().filter(|c| c.enabled)?;
+    let local_time = config.parse_time()?;
+
+    let tz_str = if let Some(ref tz) = config.timezone {
+        tz.clone()
+    } else {
+        db.get_customer_config("timezone")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "UTC".to_string())
+    };
+    let tz: chrono_tz::Tz = match tz_str.parse() {
+        Ok(tz) => tz,
+        Err(_) => {
+            warn!(timezone = %tz_str, "invalid timezone in customer config, skipping reflection registration");
+            return None;
+        }
+    };
+
+    // Convert local time to UTC: pick today's date, attach the local time,
+    // convert to UTC, extract hour/minute.
+    let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+    let local_dt = today.and_time(local_time);
+    let utc_dt = local_dt.and_local_timezone(tz).earliest()?;
+    let utc_time = utc_dt.with_timezone(&chrono::Utc).time();
+
+    Some(format!("0 {} {} * * *", utc_time.minute(), utc_time.hour()))
 }
