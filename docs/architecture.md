@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 19 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -179,7 +179,7 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ### Builtin Tools
 
-All 19 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
+All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
 | Tool | Description | Category |
@@ -190,8 +190,12 @@ All 19 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
 | `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. Outputs full UUID. | Reminders |
 | `list_reminders` | List pending and future reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
-| `cancel_reminder` | Cancel a pending reminder by full UUID. | Reminders |
-| `list_tasks` | List scheduled tasks with optional status filter. Shows all action types (send_message, run_skill, inject_context). | Tasks |
+| `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
+| `list_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
+| `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against `trigger_type::*` / `action_type::*` constants. timeout_secs capped at 90 days. | Tasks |
+| `cancel_task` | Cancel a pending task by full UUID (36-char validation). | Tasks |
+| `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. | Tasks |
+| `get_task` | Inspect a task by full UUID. Returns all fields including status, trigger_type, action_type, result, timeout_at. | Tasks |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
 | `create_skill` | Create a new custom skill with prompt snippets and tool definitions. | Skills |
 | `delete_skill` | Delete a custom or marketplace skill. Built-in skills cannot be deleted. | Skills |
@@ -301,8 +305,10 @@ Source: `crates/mika-agent/src/task_engine/`
 | Action | Description |
 |--------|-------------|
 | `send_message` | Deliver a message to the user (capped at 50,000 chars) |
-| `run_skill` | Invoke a named skill |
-| `inject_context` | Inject a context block into the next agent turn |
+| `run_skill` | Invoke a named skill by `skill_name`; dispatches via `SilentTrigger::SkillRun` for correct framing |
+| `inject_context` | Inject a context block into the next agent turn (stays `in_progress`) |
+| `resume_agent` | Re-invoke the agent with a callback result injected as `SilentTrigger::Callback` |
+| `invoke_orchestrator` | Re-invoke the team orchestrator when all sibling tasks complete |
 
 ### Recurring Tasks (registered at startup)
 
@@ -318,6 +324,33 @@ Source: `crates/mika-agent/src/task_engine/`
 - `startup_recovery()` on init: expires timed-out tasks, marks orphaned `in_progress` tasks as failed, loads heap
 - CLI aborts the tick loop `JoinHandle` on agent switch
 - Server stores `tick_handles: Vec<JoinHandle<()>>` and aborts them on graceful shutdown
+
+### Callback/Resume Lifecycle
+
+Agent-created callback tasks follow this end-to-end pattern:
+
+1. Agent calls `create_task` with `trigger_type="callback"` and `action_type="resume_agent"`. Receives full UUID.
+2. Agent or background script does long-running work.
+3. External process completes the task via one of:
+   - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — agent runs first with result injected, then task marked complete
+   - **HTTP:** `POST /tasks/{id}/complete` with Bearer auth and `{"result": "..."}` body
+4. `update_task_completed` validates status (`AND status IN ('pending','in_progress')`) before writing — returns `false` if already completed (TOCTOU guard).
+5. `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }`. The result is wrapped in `<callback_result trust="untrusted">` delimiters before LLM injection to mitigate prompt injection.
+
+### SilentTrigger Variants
+
+`SilentTrigger` controls the system-prompt framing for background agent runs:
+
+| Variant | Used by | Prompt framing |
+|---------|---------|---------------|
+| `Heartbeat` | Hourly heartbeat recurring task | Scheduled check-in, review commitments |
+| `Reflection` | Daily reflection recurring task | Memory reflection and consolidation |
+| `Callback { label, result }` | `resume_agent` dispatcher | Background task completed, inject result |
+| `SkillRun { skill_name }` | `run_skill` dispatcher | Run the named skill |
+
+### Startup Maintenance
+
+`prune_old_tasks()` runs at startup and deletes completed, failed, and cancelled tasks older than 30 days to prevent unbounded table growth.
 
 ### Composite Partial Index
 
@@ -344,6 +377,11 @@ Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handle
 skills for security — only builtin-handler skills are available in autonomous
 background runs.
 
+Each background run is framed by a `SilentTrigger` variant (see Section 9 §
+SilentTrigger Variants). Callback results are wrapped in
+`<callback_result trust="untrusted">` XML-like delimiters before LLM injection
+to mitigate prompt injection from external result payloads.
+
 
 ## 11. HTTP Server (mika-server)
 
@@ -353,6 +391,7 @@ The per-customer agent container runs an Axum HTTP server:
 |----------|--------|------|---------|
 | `/health` | GET | None | Liveness/readiness probe |
 | `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
+| `/tasks/{id}/complete` | POST | Bearer | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
 
 `AppState` is Clone via Arc-wrapped dependencies. Agent lock
 (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock`

@@ -214,6 +214,8 @@ The most commonly used commands:
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
 | `mika ask "<message>"`       | Send a message non-interactively                  |
+| `mika ask --task-id <uuid> "<result>"` | Complete a callback task and resume the agent with the result |
+| `mika tasks`                 | List scheduled tasks for the active agent         |
 | `mika skills`                | List, install, update, and manage skills           |
 
 Run `mika --help` for the complete list of commands and options.
@@ -254,6 +256,20 @@ echo "Mika says: $response"
 Each `mika ask` invocation creates a fresh session. Mika still has access to all
 stored memory (people, commitments, preferences, events) but does not carry over
 conversation context from previous `ask` calls.
+
+**Completing a callback task:**
+
+Pass `--task-id <uuid>` to resume the agent with the result of a background task
+and mark the task complete. The agent runs first (receiving the message as the
+callback result), then the task is marked complete in the database on success.
+
+```sh
+mika ask --agent main --task-id "550e8400-e29b-41d4-a716-446655440000" "Analysis complete: found 3 issues"
+```
+
+This is the entry point for background scripts that perform long-running work
+and need to resume an agent with their findings. The referenced task must have
+`trigger_type=callback` and be in `pending` or `in_progress` status.
 
 ---
 
