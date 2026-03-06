@@ -7,7 +7,7 @@ Slash commands are client-side actions executed directly in the Mika TUI. They a
 database and renders output in-place, while typing a regular message (no `/` prefix)
 sends it to the Claude-backed agent loop as usual.
 
-All 20 commands are defined in a single `COMMANDS` array
+All 21 commands are defined in a single `COMMANDS` array
 (`crates/mika-cli/src/tui/commands/mod.rs`), dispatched through pattern matching in
 `handlers.rs`, and surfaced via an autocomplete popup driven by `autocomplete.rs`.
 
@@ -291,6 +291,21 @@ List all available team workflows (subdirectories of `~/.mika/teams/`).
 
 ---
 
+### /tasks
+
+List scheduled tasks from the unified task engine. Shows task ID (8-char prefix),
+label, action type, status, and next fire time.
+
+**Aliases:** None | **Arguments:** None
+
+```
+Scheduled tasks:
+  a1b2c3d4  heartbeat          send_message    recurring_active  next: 2026-03-06T01:00:00Z
+  e5f6a7b8  follow-up-alice    send_message    pending           next: 2026-03-07T09:00:00Z
+```
+
+---
+
 ### /team
 
 Run a team workflow with a specified goal. Dispatches to the team engine for
@@ -382,7 +397,7 @@ to a safe subset. Agent-specific commands are disabled:
 |-----------|----------|
 | `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
-| `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach` |
+| `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
 
 In team mode, `/status` and `/team` both show team info (name, orchestrator,
 agents). `/export` writes to the team directory instead of the agent home.

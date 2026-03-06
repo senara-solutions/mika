@@ -59,8 +59,8 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 16 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
-| `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 19 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, HTTP server binary (`mika-server`) |
+| `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
 
@@ -179,7 +179,7 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ### Builtin Tools
 
-All 16 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
+All 19 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
 | Tool | Description | Category |
@@ -188,9 +188,10 @@ All 16 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `store_fact` | Store a new structured fact (person, commitment, preference, or event) into Layer 2 tables. | Memory |
 | `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events). | Memory |
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
-| `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. | Reminders |
-| `list_reminders` | List pending and future reminders. | Reminders |
-| `cancel_reminder` | Cancel a pending reminder by ID. | Reminders |
+| `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. Outputs full UUID. | Reminders |
+| `list_reminders` | List pending and future reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
+| `cancel_reminder` | Cancel a pending reminder by full UUID. | Reminders |
+| `list_tasks` | List scheduled tasks with optional status filter. Shows all action types (send_message, run_skill, inject_context). | Tasks |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
 | `create_skill` | Create a new custom skill with prompt snippets and tool definitions. | Skills |
 | `delete_skill` | Delete a custom or marketplace skill. Built-in skills cannot be deleted. | Skills |
@@ -200,6 +201,8 @@ All 16 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `get_config` | Read customer config values (timezone, chat_id, thinking_level). | Config |
 | `set_config` | Update customer config values. | Config |
 | `write_file` | Write content to a file in the agent's home directory. Requires `confirm: true` to overwrite existing files — returns current content first. | Files |
+| `read_home_file` | Read a file from the agent's home directory. Uses `validate_and_resolve_path` with `create_parents: false`. Reports resolved absolute path. | Files |
+| `list_home_files` | List files in a directory within the agent's home directory. Includes sizes and modification ages. Uses `spawn_blocking` for I/O. | Files |
 
 ### Management Tools
 
@@ -276,19 +279,52 @@ Properties:
 - **Graceful shutdown:** `shutdown()` drops the sender, joins the background thread.
 
 
-## 9. Heartbeat System
+## 9. Unified Task Engine
 
-The heartbeat system enables proactive check-ins without user initiation. An
-external scheduler periodically POSTs to the container's `/heartbeat` endpoint.
+The task engine is a single SQLite-backed scheduler that handles all proactive
+behaviors (heartbeat, reflection, reminders) via a unified `tasks` table.
 
-### Pre-Filter Checks (before acquiring Mutex)
+Source: `crates/mika-agent/src/task_engine/`
 
-1. Active hours: 08:00-21:00 in customer's local timezone
-2. Max 1 heartbeat per hour
-3. Max 3 heartbeats per day
-4. Skip if user messaged within 2 hours
+### Components
 
-If any check fails, the handler returns `204 No Content` immediately.
+| Module | Responsibility |
+|--------|---------------|
+| `engine.rs` | `TaskEngine` — min-heap `BinaryHeap<QueuedTask>` + 1-second tick loop |
+| `dispatcher.rs` | `TaskDispatcher` — matches `action_type` and executes tasks |
+| `queue.rs` | `QueuedTask` — heap entry with `next_fire_at` for ordering |
+| `types.rs` | Constants: `task_status::*` and `action_type::*` (no magic strings) |
+| `mod.rs` | `ensure_recurring_task()` — idempotently registers built-in tasks at startup |
+
+### Action Types
+
+| Action | Description |
+|--------|-------------|
+| `send_message` | Deliver a message to the user (capped at 50,000 chars) |
+| `run_skill` | Invoke a named skill |
+| `inject_context` | Inject a context block into the next agent turn |
+
+### Recurring Tasks (registered at startup)
+
+| Label | Cron | Purpose |
+|-------|------|---------|
+| `heartbeat` | `0 0 * * * *` | Hourly proactive check-in |
+| `reflection` | `0 0 2 * * *` | Daily memory reflection at 02:00 |
+
+### Tick Loop
+
+- 1-second tick: fires tasks where `next_fire_at <= now` via `claim_and_fire_task` (single atomic UPDATE)
+- Every 60 ticks: DB scan picks up tasks created by tools during agent runs
+- `startup_recovery()` on init: expires timed-out tasks, marks orphaned `in_progress` tasks as failed, loads heap
+- CLI aborts the tick loop `JoinHandle` on agent switch
+- Server stores `tick_handles: Vec<JoinHandle<()>>` and aborts them on graceful shutdown
+
+### Composite Partial Index
+
+```sql
+CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC)
+WHERE status IN ('pending', 'recurring_active');
+```
 
 
 ## 10. Silent Mode
@@ -317,7 +353,6 @@ The per-customer agent container runs an Axum HTTP server:
 |----------|--------|------|---------|
 | `/health` | GET | None | Liveness/readiness probe |
 | `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
-| `/heartbeat` | POST | Bearer | Scheduled job trigger for proactive check-ins |
 
 `AppState` is Clone via Arc-wrapped dependencies. Agent lock
 (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock`
@@ -375,33 +410,33 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 
 ## Appendix: Database Schema
 
-**Schema version:** 11
+**Schema version:** 1 (consolidated clean-slate baseline)
 
 ### Tables
 
-| Table | Purpose | Schema Version |
-|-------|---------|----------------|
-| `schema_version` | Migration tracking | v4 |
-| `conversations` | Message history (user, assistant, summary rows) | v4 (+`compacted_through_id` in v5) |
-| `core_memory` | Layer 1 persistent memory blocks | v4 |
-| `people` | Layer 2 people/contacts | v4 |
-| `commitments` | Layer 2 tasks/promises with status tracking | v4 |
-| `preferences` | Layer 2 user preferences | v4 |
-| `events` | Layer 2 notable events | v4 |
-| `memory_events` | Audit log for all memory mutations | v4 (+`created_at` index in v7) |
-| `reminders` | Scheduled future reminders (`fire_at` INTEGER unix timestamp since v9) | v5 (+`fire_at` TEXT→INTEGER in v9) |
-| `heartbeat_sends` | Rate limiting for heartbeat sends | v5 |
-| `customer_config` | Key-value store (timezone, chat_id) | v5 |
-| `failed_sends` | Durable outbox for failed outbound messages | v5 |
-| `memory_event_summaries` | Tiered retention summaries (monthly) | v6 |
-| `skills` | Skill metadata (name, description, builtin flag, enabled) | v7 |
-| `skill_tools` | Tool definitions per skill | v7 |
-| `search_content` | Unified search content for Layer 3 hybrid search | v8 |
-| `fts_search` | FTS5 virtual table for full-text search | v8 |
-| `vec_search` | sqlite-vec virtual table (vec0) for vector similarity | v8 |
-| `reflection_runs` | Periodic memory reflection tracking | v10 |
-| `team_runs` | Team run metadata (goal, status, iterations, deliverable) | v11 |
-| `team_messages` | Graph-structured team messages with `parent_id` links | v11 |
+| Table | Purpose |
+|-------|---------|
+| `schema_version` | Migration tracking |
+| `agents` | Agent registry (name, display_name, model, active flag) |
+| `teams` | Team registry (name, display_name, orchestrator) |
+| `conversations` | Message history (user, assistant, summary rows; `channel_type`, `agent_id` FK) |
+| `core_memory` | Layer 1 persistent memory blocks (`agent_id` FK) |
+| `people` | Layer 2 people/contacts (`agent_id` FK) |
+| `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
+| `preferences` | Layer 2 user preferences (`agent_id` FK) |
+| `events` | Layer 2 notable events (`agent_id` FK) |
+| `memory_events` | Audit log for all memory mutations (`agent_id` FK) |
+| `customer_config` | Key-value store (timezone, chat_id) |
+| `failed_sends` | Durable outbox for failed outbound messages |
+| `memory_event_summaries` | Tiered retention summaries (monthly) |
+| `skills` | Skill metadata (name, description, builtin flag, enabled) |
+| `skill_tools` | Tool definitions per skill |
+| `search_content` | Unified search content for Layer 3 hybrid search |
+| `fts_search` | FTS5 virtual table for full-text search |
+| `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
+| `tasks` | Unified task scheduler — replaces `reminders`; all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`) |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable) |
+| `team_messages` | Graph-structured team messages with `parent_id` links; `agent_name` column (not FK) |
 
 ### SQLite Pragmas
 
