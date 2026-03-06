@@ -11,7 +11,8 @@ pub fn next_fire_from_cron(expr: &str, after_unix: i64) -> Result<i64> {
     let schedule = Schedule::from_str(expr)
         .map_err(|e| anyhow!("invalid cron expression '{}': {}", expr, e))?;
 
-    let after_dt = chrono::DateTime::from_timestamp(after_unix, 0)
+    let after_dt = chrono::TimeZone::timestamp_opt(&chrono::Utc, after_unix, 0)
+        .single()
         .ok_or_else(|| anyhow!("invalid unix timestamp: {}", after_unix))?;
 
     let next = schedule

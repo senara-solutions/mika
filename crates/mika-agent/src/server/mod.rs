@@ -75,7 +75,7 @@ async fn init_agent(
     disable_bundled_skills: bool,
 ) -> Result<AgentState> {
     let db = Database::open(&agent_home.join("data").join("mika.db"))?;
-    startup::seed_core_memory_if_empty(&db, agent_home)?;
+    startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     let async_db = AsyncDatabase::new(db);
 

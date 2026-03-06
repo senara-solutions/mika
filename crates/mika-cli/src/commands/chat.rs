@@ -87,7 +87,14 @@ async fn spawn_agent_worker(
         dispatcher,
     )));
 
-    // Register recurring reflection task and run startup recovery
+    // Register recurring built-in tasks and run startup recovery
+    task_engine::ensure_recurring_task(
+        &ctx.async_db,
+        "heartbeat",
+        "0 0 * * * *",
+        r#"{"trigger":"heartbeat"}"#,
+    )
+    .await;
     task_engine::ensure_recurring_task(
         &ctx.async_db,
         "reflection",

@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc::{self, SyncSender}};
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
@@ -28,7 +28,7 @@ pub struct AsyncDatabase {
 }
 
 struct AsyncDatabaseInner {
-    sender: Mutex<Option<mpsc::Sender<DbClosure>>>,
+    sender: Mutex<Option<SyncSender<DbClosure>>>,
     thread_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -40,7 +40,8 @@ impl AsyncDatabase {
 
     /// Spawn with a specific agent_id.
     pub fn new_with_agent(db: Database, agent_id: &str) -> Self {
-        let (tx, rx) = mpsc::channel::<DbClosure>();
+        // Bounded channel: backpressure when DB thread falls behind
+        let (tx, rx) = mpsc::sync_channel::<DbClosure>(512);
         let handle = std::thread::Builder::new()
             .name("mika-db".to_string())
             .spawn(move || {
@@ -148,6 +149,10 @@ impl AsyncDatabase {
         self.with_db(move |db| db.create_task(&task)).await
     }
 
+    pub async fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
+        self.with_db(move |db| db.create_recurring_task_if_absent(task)).await
+    }
+
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>> {
         let i = id.to_owned();
         self.with_db(move |db| db.get_task(&i)).await
@@ -162,6 +167,11 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_schedulable_tasks(&id)).await
     }
 
+    pub async fn try_claim_task(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        self.with_db(move |db| db.try_claim_task(&id)).await
+    }
+
     pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
         let (i, s) = (id.to_owned(), status.to_owned());
         self.with_db(move |db| db.update_task_status(&i, &s)).await
@@ -170,6 +180,12 @@ impl AsyncDatabase {
     pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
         let (i, r) = (id.to_owned(), result.map(|s| s.to_owned()));
         self.with_db(move |db| db.update_task_completed(&i, r.as_deref())).await
+    }
+
+    pub async fn update_task_failed(&self, id: &str, error: &str) -> Result<()> {
+        let id = id.to_string();
+        let error = error.to_string();
+        self.with_db(move |db| db.update_task_failed(&id, &error)).await
     }
 
     pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: i64) -> Result<()> {
@@ -188,7 +204,8 @@ impl AsyncDatabase {
     }
 
     pub async fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
-        self.with_db(move |db| db.mark_tasks_expired(now_unix)).await
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.mark_tasks_expired(now_unix, &id)).await
     }
 
     pub async fn count_pending_tasks(&self) -> Result<i64> {

@@ -113,7 +113,7 @@ pub struct ConversationMessage {
     pub content: String,
     pub channel_type: String,
     pub metadata: Option<String>,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +562,10 @@ impl Database {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
 
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
+                ON tasks(agent_id, label)
+                WHERE trigger_type = 'recurring';
+
             -- Pre-register the default 'main' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('main', 'main', '');
 
@@ -684,6 +688,32 @@ impl Database {
         Ok(id)
     }
 
+    /// Insert a recurring task only if no task with the same (agent_id, label) and
+    /// trigger_type='recurring' exists. Returns the task ID if created, None if already existed.
+    pub fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO tasks
+             (id, agent_id, team_run_id, parent_task_id, depth, label,
+              trigger_type, cron_expr, event_source, event_offset_secs,
+              condition_expr, next_fire_at, timeout_at, action_type,
+              action_config, status, input_context, created_by_session)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17)",
+            params![
+                id, task.agent_id, task.team_run_id, task.parent_task_id,
+                task.depth, task.label, task.trigger_type, task.cron_expr,
+                task.event_source, task.event_offset_secs, task.condition_expr,
+                task.next_fire_at, task.timeout_at, task.action_type,
+                task.action_config, task.input_context, task.created_by_session
+            ],
+        )?;
+        if n > 0 {
+            Ok(Some(id))
+        } else {
+            Ok(None) // already existed
+        }
+    }
+
     fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         Ok(Task {
             id: r.get(0)?,
@@ -766,12 +796,34 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically claim a task by setting status to 'in_progress'.
+    /// Returns true if the task was claimed (was in 'pending' or 'recurring_active' state).
+    /// Returns false if the task was already claimed, cancelled, or completed.
+    pub fn try_claim_task(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET status = 'in_progress', updated_at = unixepoch()
+             WHERE id = ?1 AND status IN ('pending', 'recurring_active')",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET status = 'completed', result = ?1,
              completed_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ?2",
             params![result, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_failed(&self, id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET status = 'failed', result = ?1,
+             completed_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ?2",
+            params![error, id],
         )?;
         Ok(())
     }
@@ -801,12 +853,13 @@ impl Database {
         Ok(n > 0)
     }
 
-    pub fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
+    pub fn mark_tasks_expired(&self, now_unix: i64, agent_id: &str) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'expired', updated_at = unixepoch()
-             WHERE timeout_at IS NOT NULL AND timeout_at < ?1
+             WHERE agent_id = ?2
+               AND timeout_at IS NOT NULL AND timeout_at < ?1
                AND status NOT IN ('completed','failed','cancelled','expired')",
-            params![now_unix],
+            params![now_unix, agent_id],
         )?;
         Ok(n)
     }
@@ -855,7 +908,7 @@ impl Database {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1 AND action_type = 'inject_context'
-               AND status = 'pending'
+               AND status IN ('pending', 'in_progress')
              ORDER BY next_fire_at ASC",
             Self::TASK_COLUMNS
         );
@@ -950,7 +1003,7 @@ impl Database {
             content: r.get(2)?,
             channel_type: r.get(3)?,
             metadata: r.get(4)?,
-            created_at: r.get(5)?,
+            created_at: r.get::<_, i64>(5)?,
         })
     }
 
@@ -966,8 +1019,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, role, content, channel_type, metadata,
-                         datetime(created_at, 'unixepoch')
+                "SELECT id, role, content, channel_type, metadata, created_at
                   FROM conversations
                   WHERE agent_id = ?1 AND channel_type IN ({})
                   ORDER BY created_at DESC, id DESC LIMIT ?2",
@@ -984,8 +1036,7 @@ impl Database {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT id, role, content, channel_type, metadata,
-                         datetime(created_at, 'unixepoch')
+                "SELECT id, role, content, channel_type, metadata, created_at
                   FROM conversations WHERE agent_id = ?1 AND role != 'summary'
                   ORDER BY created_at DESC, id DESC LIMIT ?2",
             )?;
@@ -1005,8 +1056,7 @@ impl Database {
     ) -> Result<Option<ConversationMessage>> {
         self.conn
             .query_row(
-                "SELECT id, role, content, channel_type, metadata,
-                         datetime(created_at, 'unixepoch')
+                "SELECT id, role, content, channel_type, metadata, created_at
                   FROM conversations WHERE agent_id = ?1 AND role = 'summary'
                   ORDER BY created_at DESC LIMIT 1",
                 params![agent_id],
@@ -1044,8 +1094,7 @@ impl Database {
             None => return Ok(vec![]),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, metadata,
-                     datetime(created_at, 'unixepoch')
+            "SELECT id, role, content, channel_type, metadata, created_at
               FROM conversations
               WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2
               ORDER BY created_at ASC, id ASC",
@@ -1062,6 +1111,7 @@ impl Database {
         summary: &str,
         compacted_through_id: i64,
     ) -> Result<i64> {
+        self.conn.execute_batch("BEGIN")?;
         // Delete old non-summary messages up to compacted_through_id
         self.conn.execute(
             "DELETE FROM conversations
@@ -1079,7 +1129,9 @@ impl Database {
              VALUES (?1, 'summary', ?2, 'cli', ?3)",
             params![agent_id, summary, compacted_through_id],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let row_id = self.conn.last_insert_rowid();
+        self.conn.execute_batch("COMMIT")?;
+        Ok(row_id)
     }
 
     pub fn load_messages_after(
@@ -1094,8 +1146,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, role, content, channel_type, metadata,
-                         datetime(created_at, 'unixepoch')
+                "SELECT id, role, content, channel_type, metadata, created_at
                   FROM conversations
                   WHERE agent_id = ?1 AND id > ?2 AND channel_type IN ({})
                   ORDER BY created_at ASC",
@@ -1114,8 +1165,7 @@ impl Database {
             Ok(rows)
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT id, role, content, channel_type, metadata,
-                         datetime(created_at, 'unixepoch')
+                "SELECT id, role, content, channel_type, metadata, created_at
                   FROM conversations WHERE agent_id = ?1 AND id > ?2
                   ORDER BY created_at ASC",
             )?;
@@ -1141,8 +1191,7 @@ impl Database {
         since_unix: i64,
     ) -> Result<Vec<ConversationMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, metadata,
-                     datetime(created_at, 'unixepoch')
+            "SELECT id, role, content, channel_type, metadata, created_at
               FROM conversations
               WHERE agent_id = ?1 AND created_at >= ?2 AND role != 'summary'
               ORDER BY created_at ASC",

@@ -10,25 +10,27 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
 
     match args.command {
         None => {
-            let tasks = db.get_schedulable_tasks().await?;
-            let pending: Vec<_> = tasks
-                .iter()
-                .filter(|t| t.status == "pending" || t.status == "in_progress")
-                .collect();
+            let tasks = db
+                .get_tasks_by_status(vec![
+                    "pending".to_string(),
+                    "in_progress".to_string(),
+                    "recurring_active".to_string(),
+                ])
+                .await?;
 
-            if pending.is_empty() {
-                println!("\n  No pending tasks.\n");
+            if tasks.is_empty() {
+                println!("\n  No active tasks.\n");
             } else {
-                println!("\n  Pending Tasks ({}):", pending.len());
-                for t in &pending {
+                println!("\n  Active Tasks ({}):", tasks.len());
+                for t in &tasks {
                     let short_id = &t.id[..12.min(t.id.len())];
                     let when = t
                         .next_fire_at
                         .map(format_unix_ts)
                         .unwrap_or_else(|| t.trigger_type.clone());
                     println!(
-                        "    {}: [{}] \"{}\" ({})",
-                        short_id, t.action_type, t.label, when
+                        "    {}: [{}] [{}] \"{}\" ({})",
+                        short_id, t.status, t.action_type, t.label, when
                     );
                 }
                 println!();

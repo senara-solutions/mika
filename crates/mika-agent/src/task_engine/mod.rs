@@ -9,7 +9,7 @@ pub use queue::QueuedTask;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Register a recurring task in the DB if one with the same label doesn't already exist.
 ///
@@ -21,15 +21,6 @@ pub async fn ensure_recurring_task(
     cron_expr: &str,
     action_config: &str,
 ) {
-    let existing = db.get_schedulable_tasks().await.unwrap_or_default();
-
-    if existing
-        .iter()
-        .any(|t| t.label == label && t.trigger_type == "recurring")
-    {
-        return;
-    }
-
     let agent_id = db.agent_id.clone();
     let task = NewTask {
         agent_id,
@@ -50,8 +41,9 @@ pub async fn ensure_recurring_task(
         created_by_session: None,
     };
 
-    match db.create_task(task).await {
-        Ok(id) => info!(label, task_id = %id, cron = cron_expr, "registered recurring task"),
+    match db.create_recurring_task_if_absent(task).await {
+        Ok(Some(id)) => info!(label, task_id = %id, cron = cron_expr, "registered recurring task"),
+        Ok(None) => debug!(label, "recurring task already registered, skipping"),
         Err(e) => warn!(label, error = %e, "failed to register recurring task"),
     }
 }

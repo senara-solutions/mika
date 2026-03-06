@@ -25,6 +25,7 @@ struct ReEnqueue {
     task_id: String,
     next_fire_at: i64,
     trigger_type: String,
+    action_type: String,
     cron_expr: Option<String>,
 }
 
@@ -90,11 +91,7 @@ impl TaskEngine {
             .unwrap_or_default();
 
         for task in in_progress {
-            if task.process_id.is_some_and(process_is_alive) {
-                debug!(task_id = %task.id, "in_progress task process still alive, skipping recovery");
-                continue;
-            }
-            debug!(task_id = %task.id, "marking orphaned in_progress task as failed");
+            debug!(task_id = %task.id, "marking orphaned in_progress task as failed on startup");
             if let Err(e) = self.db.update_task_status(&task.id, "failed").await {
                 warn!(task_id = %task.id, error = %e, "failed to mark task as failed during recovery");
             }
@@ -105,7 +102,7 @@ impl TaskEngine {
         let count = schedulable.len();
 
         for task in schedulable {
-            self.enqueue_queued_task(&task.id, &task.trigger_type, task.cron_expr.as_deref(), task.next_fire_at, now);
+            self.enqueue_queued_task(&task.id, &task.trigger_type, &task.action_type, task.cron_expr.as_deref(), task.next_fire_at, now);
         }
 
         info!(
@@ -122,6 +119,7 @@ impl TaskEngine {
     pub async fn enqueue(&mut self, task: NewTask) -> Result<String> {
         let next_fire_at = task.next_fire_at;
         let trigger_type = task.trigger_type.clone();
+        let action_type = task.action_type.clone();
         let cron_expr = task.cron_expr.as_deref().map(str::to_owned);
 
         let id = self.db.create_task(task).await?;
@@ -131,6 +129,7 @@ impl TaskEngine {
                 task_id: id.clone(),
                 next_fire_at: fire_at,
                 trigger_type,
+                action_type,
                 cron_expr,
             });
         }
@@ -173,6 +172,7 @@ impl TaskEngine {
                 task_id: re.task_id,
                 next_fire_at: re.next_fire_at,
                 trigger_type: re.trigger_type,
+                action_type: re.action_type,
                 cron_expr: re.cron_expr,
             });
         }
@@ -218,7 +218,7 @@ impl TaskEngine {
             if self.queued_ids.contains(&task.id) {
                 continue;
             }
-            self.enqueue_queued_task(&task.id, &task.trigger_type, task.cron_expr.as_deref(), task.next_fire_at, now);
+            self.enqueue_queued_task(&task.id, &task.trigger_type, &task.action_type, task.cron_expr.as_deref(), task.next_fire_at, now);
             added += 1;
         }
         if added > 0 {
@@ -232,6 +232,7 @@ impl TaskEngine {
         &mut self,
         task_id: &str,
         trigger_type: &str,
+        action_type: &str,
         cron_expr: Option<&str>,
         next_fire_at: Option<i64>,
         now: i64,
@@ -267,6 +268,7 @@ impl TaskEngine {
             task_id: task_id.to_owned(),
             next_fire_at: fire_at,
             trigger_type: trigger_type.to_owned(),
+            action_type: action_type.to_owned(),
             cron_expr: cron_expr.map(str::to_owned),
         });
     }
@@ -290,22 +292,17 @@ impl TaskEngine {
     async fn fire_task(&mut self, queued: QueuedTask) {
         let task_id = queued.task_id.clone();
 
-        // Pre-check: skip if task was cancelled or already completed while queued
-        match self.db.get_task(&task_id).await {
-            Ok(Some(ref t)) if t.status == "cancelled" || t.status == "completed" => {
-                debug!(task_id = %task_id, status = %t.status, "skipping non-pending task");
+        // Atomically claim the task (only succeeds if status is pending/recurring_active)
+        match self.db.try_claim_task(&task_id).await {
+            Ok(true) => {} // claimed successfully
+            Ok(false) => {
+                debug!(task_id = %task_id, "task no longer claimable (cancelled/completed/expired), skipping");
                 return;
             }
-            Ok(None) => {
-                debug!(task_id = %task_id, "task not found, skipping");
+            Err(e) => {
+                warn!(task_id = %task_id, error = %e, "failed to claim task");
                 return;
             }
-            _ => {}
-        }
-
-        if let Err(e) = self.db.update_task_status(&task_id, "in_progress").await {
-            warn!(task_id = %task_id, error = %e, "failed to mark task in_progress");
-            return;
         }
         if let Err(e) = self.db.set_task_fired(&task_id).await {
             warn!(task_id = %task_id, error = %e, "failed to set task fired_at");
@@ -315,6 +312,7 @@ impl TaskEngine {
         let db = self.db.clone();
         let reenqueue_tx = self.reenqueue_tx.clone();
         let trigger_type = queued.trigger_type.clone();
+        let action_type = queued.action_type.clone();
         let cron_expr = queued.cron_expr.clone();
 
         tokio::spawn(async move {
@@ -323,12 +321,18 @@ impl TaskEngine {
                 Ok(()) => {
                     if trigger_type == "recurring" {
                         // Recompute next fire time and re-enqueue
-                        let next = cron_expr
+                        let next = match cron_expr
                             .as_deref()
-                            .and_then(|e| {
-                                next_fire_from_cron(e, chrono::Utc::now().timestamp()).ok()
-                            })
-                            .unwrap_or(i64::MAX);
+                            .ok_or_else(|| anyhow::anyhow!("recurring task missing cron_expr"))
+                            .and_then(|e| next_fire_from_cron(e, chrono::Utc::now().timestamp()))
+                        {
+                            Ok(ts) => ts,
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "cannot reschedule recurring task, marking failed");
+                                let _ = db.update_task_failed(&task_id, &e.to_string()).await;
+                                return;
+                            }
+                        };
 
                         if let Err(e) = db.update_task_next_fire_at(&task_id, next).await {
                             warn!(task_id = %task_id, error = %e, "failed to update next_fire_at after recurring fire");
@@ -343,10 +347,11 @@ impl TaskEngine {
                                 task_id,
                                 next_fire_at: next,
                                 trigger_type,
+                                action_type: action_type.clone(),
                                 cron_expr,
                             })
                             .await;
-                    } else if trigger_type != "inject_context" {
+                    } else if action_type != "inject_context" {
                         // inject_context stays in_progress until the agent loop consumes it.
                         // All other one-shot actions are marked completed here.
                         if let Err(e) = db.update_task_completed(&task_id, None).await {
@@ -356,8 +361,8 @@ impl TaskEngine {
                 }
                 Err(e) => {
                     warn!(task_id = %task_id, error = %e, "task dispatch failed");
-                    if let Err(db_err) = db.update_task_completed(&task_id, Some(&e.to_string())).await {
-                        warn!(task_id = %task_id, error = %db_err, "failed to mark task failed");
+                    if let Err(db_err) = db.update_task_failed(&task_id, &e.to_string()).await {
+                        warn!(task_id = %task_id, error = %db_err, "failed to mark task as failed in DB");
                     }
                 }
             }
@@ -366,20 +371,6 @@ impl TaskEngine {
     }
 }
 
-/// Check if a process is still alive by probing `/proc/{pid}` on Linux.
-///
-/// Returns `false` on any OS or permission error (safe default: treat as dead).
-fn process_is_alive(pid: i64) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -483,15 +474,18 @@ mod tests {
         assert_eq!(engine.queue.len(), 0);
         assert!(!engine.queued_ids.contains(&id));
 
-        // Give spawned task time to complete
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let t = db.get_task(&id).await.unwrap().unwrap();
-        assert!(
-            matches!(t.status.as_str(), "in_progress" | "completed"),
-            "expected in_progress or completed, got {}",
-            t.status
-        );
+        // Poll until completed (up to 5 seconds)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let t = db.get_task(&id).await.unwrap().unwrap();
+            if t.status == "completed" {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for task to complete; status={}", t.status);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -566,17 +560,4 @@ mod tests {
         assert_eq!(task.status, "failed");
     }
 
-    #[test]
-    fn test_process_is_alive_current_process() {
-        #[cfg(target_os = "linux")]
-        {
-            let pid = std::process::id() as i64;
-            assert!(process_is_alive(pid));
-        }
-    }
-
-    #[test]
-    fn test_process_is_alive_invalid_pid() {
-        assert!(!process_is_alive(i64::MAX));
-    }
 }

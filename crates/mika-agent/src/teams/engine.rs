@@ -77,7 +77,7 @@ impl TeamEngine {
             let db_path = home_dir.join("data").join("mika.db");
             let db = Database::open(&db_path)
                 .with_context(|| format!("failed to open DB for agent '{}'", ta.name))?;
-            startup::seed_core_memory_if_empty(&db, &home_dir)?;
+            startup::seed_core_memory_if_empty(&db, &home_dir, &ta.name)?;
             let async_db = AsyncDatabase::new(db);
             let skills = SkillRegistry::from_dir(&home_dir.join("skills"));
 

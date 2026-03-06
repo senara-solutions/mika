@@ -77,7 +77,7 @@ impl TaskDispatcher {
     /// Phase 4 implementation.
     async fn dispatch_resume_agent(&self, task: &Task, _config: &serde_json::Value) -> Result<()> {
         warn!(task_id = %task.id, "dispatch_resume_agent not yet implemented (Phase 4)");
-        Ok(())
+        Err(anyhow!("resume_agent action type not yet implemented"))
     }
 
     /// Inject-context tasks have a two-phase lifecycle.
@@ -259,12 +259,19 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
         };
 
-        if let Err(e) = run_silent_agent(&params).await {
-            warn!(task_id = %task.id, error = %e, "reflection run failed");
-            let _ = self
-                .db
-                .record_reflection_run("failed", 0, Some(&e.to_string()))
-                .await;
+        match run_silent_agent(&params).await {
+            Ok(()) => {
+                if let Err(e) = self.db.record_reflection_run("completed", 0, None).await {
+                    warn!(task_id = %task.id, error = %e, "failed to record reflection run");
+                }
+            }
+            Err(e) => {
+                warn!(task_id = %task.id, error = %e, "reflection run failed");
+                let _ = self
+                    .db
+                    .record_reflection_run("failed", 0, Some(&e.to_string()))
+                    .await;
+            }
         }
 
         Ok(())
@@ -321,6 +328,164 @@ impl TaskDispatcher {
         _config: &serde_json::Value,
     ) -> Result<()> {
         warn!(task_id = %task.id, "dispatch_invoke_orchestrator not yet implemented (Phase 4)");
-        Ok(())
+        Err(anyhow!("invoke_orchestrator action type not yet implemented"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_db::AsyncDatabase;
+    use crate::db::{Database, NewTask};
+    use crate::messaging::MessageSender;
+    use mika_common::claude::ClaudeClient;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    struct NoopSender;
+    #[async_trait::async_trait]
+    impl MessageSender for NoopSender {
+        async fn send(&self, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_db() -> AsyncDatabase {
+        let db = Database::open_in_memory().unwrap();
+        AsyncDatabase::new_with_agent(db, "main")
+    }
+
+    fn test_dispatcher(db: AsyncDatabase) -> TaskDispatcher {
+        let claude = ClaudeClient::new(
+            Some("sk-test".to_string()),
+            "claude-sonnet-4-6".to_string(),
+            8192,
+        )
+        .unwrap();
+        TaskDispatcher {
+            db,
+            claude,
+            tools: Arc::new(crate::tools::default_tools()),
+            skills: Arc::new(crate::skills::SkillRegistry::empty()),
+            message_sender: Some(Arc::new(NoopSender)),
+            home_dir: PathBuf::from("/tmp"),
+            embedding_client: None,
+            brave_api_key: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_send_message_missing_text_returns_error() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(), // missing "text" key
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        let result = dispatcher.dispatch(&id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing 'text'"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_send_message_succeeds() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: r#"{"text": "hello"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        let result = dispatcher.dispatch(&id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_inject_context_is_noop() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            timeout_at: None,
+            action_type: "inject_context".to_string(),
+            action_config: r#"{"context": "some context"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        let result = dispatcher.dispatch(&id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_resume_agent_returns_error() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let task = NewTask {
+            agent_id: "main".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        let result = dispatcher.dispatch(&id).await;
+        assert!(result.is_err());
     }
 }

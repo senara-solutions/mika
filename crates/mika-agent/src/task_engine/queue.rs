@@ -11,6 +11,7 @@ pub struct QueuedTask {
     pub next_fire_at: i64,
     /// "time", "recurring", "callback", "user_reply", "inject_context"
     pub trigger_type: String,
+    pub action_type: String,
     /// For recurring tasks: the cron expression to compute the next fire time.
     pub cron_expr: Option<String>,
 }
@@ -38,6 +39,7 @@ impl QueuedTask {
             task_id: task.id.clone(),
             next_fire_at,
             trigger_type: task.trigger_type.clone(),
+            action_type: task.action_type.clone(),
             cron_expr: task.cron_expr.clone(),
         })
     }
@@ -53,6 +55,7 @@ mod tests {
             task_id: id.to_string(),
             next_fire_at: fire_at,
             trigger_type: "time".to_string(),
+            action_type: "send_message".to_string(),
             cron_expr: None,
         }
     }
