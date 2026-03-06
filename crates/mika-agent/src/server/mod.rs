@@ -81,7 +81,8 @@ async fn init_agent(
     let db_path = home::container_db_path(global_home);
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let db = Database::open(&db_path)?;
-    db.register_agent(agent_name, agent_name, agent_home.to_str().unwrap_or(""))?;
+    let identity = crate::prompt::load_identity(agent_home);
+    db.register_agent(agent_name, &identity.name, agent_home.to_str().unwrap_or(""))?;
     startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);

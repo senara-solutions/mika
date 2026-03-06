@@ -600,8 +600,9 @@ impl Database {
     pub fn register_agent(&self, id: &str, name: &str, home_dir: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO agents (id, name, home_dir) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET home_dir = excluded.home_dir
-             WHERE excluded.home_dir != ''",
+             ON CONFLICT(id) DO UPDATE SET
+               home_dir = CASE WHEN excluded.home_dir != '' THEN excluded.home_dir ELSE agents.home_dir END,
+               name = excluded.name",
             params![id, name, home_dir],
         )?;
         Ok(())
@@ -3110,11 +3111,30 @@ mod tests {
         let mika = agents.iter().find(|a| a.id == "mika").unwrap();
         assert_eq!(mika.home_dir, "/home/user/.mika/agents/mika");
 
-        // Re-register with empty string — should NOT overwrite
+        // Re-register with empty string — should NOT overwrite home_dir
         db.register_agent("mika", "Mika", "").unwrap();
         let agents = db.list_agents_db().unwrap();
         let mika = agents.iter().find(|a| a.id == "mika").unwrap();
         assert_eq!(mika.home_dir, "/home/user/.mika/agents/mika");
+    }
+
+    #[test]
+    fn test_register_agent_upserts_name() {
+        let db = db();
+        // "mika" was pre-registered by schema init with name = "Mika"
+        let name = db.get_agent_display_name("mika");
+        assert_eq!(name, "Mika");
+
+        // Re-register with a proper display name — should update
+        db.register_agent("mika", "Mika ✨", "/home/user/.mika/agents/mika")
+            .unwrap();
+        let name = db.get_agent_display_name("mika");
+        assert_eq!(name, "Mika ✨");
+
+        // Re-register with a different name — should update again
+        db.register_agent("mika", "My Assistant", "").unwrap();
+        let name = db.get_agent_display_name("mika");
+        assert_eq!(name, "My Assistant");
     }
 
     #[test]
