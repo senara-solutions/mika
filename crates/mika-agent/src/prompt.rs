@@ -319,12 +319,27 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
             home.display()
         )
         .unwrap();
+        writeln!(
+            prompt,
+            "- You can read files from your home directory with read_file (path relative to {}). \
+             Files larger than 100 KB are rejected.",
+            home.display()
+        )
+        .unwrap();
     } else {
         prompt.push_str(
             "- You can write files to your home directory with write_file. Paths are relative to your home. \
              If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
         );
+        prompt.push_str(
+            "- You can read files from your home directory with read_file (relative paths only). \
+             Files larger than 100 KB are rejected.\n",
+        );
     }
+    prompt.push_str(
+        "- You can list files in your home directory with list_files. \
+         Omit path or pass an empty string to list the root. Pass a relative subdirectory path to list that directory.\n",
+    );
 
     prompt
 }

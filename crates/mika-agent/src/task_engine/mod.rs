@@ -2,10 +2,12 @@ pub mod cron;
 pub mod dispatcher;
 pub mod engine;
 pub mod queue;
+pub mod types;
 
 pub use dispatcher::TaskDispatcher;
 pub use engine::TaskEngine;
 pub use queue::QueuedTask;
+pub use types::{action_type, task_status};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
@@ -35,7 +37,7 @@ pub async fn ensure_recurring_task(
         condition_expr: None,
         next_fire_at: None,
         timeout_at: None,
-        action_type: "run_skill".to_string(),
+        action_type: action_type::RUN_SKILL.to_string(),
         action_config: action_config.to_string(),
         input_context: None,
         created_by_session: None,

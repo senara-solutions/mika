@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "477"
 tags: [code-review, quality, dependencies]

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "476"
 tags: [code-review, quality, task-engine]
@@ -53,10 +53,11 @@ Option A initially. Enums are a good follow-up.
 
 ## Acceptance Criteria
 
-- [ ] Constants defined for all status values and action types
-- [ ] All string literals in task_engine/ replaced with constants
-- [ ] `cargo clippy` passes with no new warnings
+- [x] Constants defined for all status values and action types
+- [x] All string literals in task_engine/ replaced with constants
+- [x] `cargo clippy` passes with no new warnings
 
 ## Work Log
 
 - 2026-03-06: Identified by code quality review agent (QUAL-7)
+- 2026-03-06: Implemented Option A — created `types.rs` with `task_status` and `action_type` constant modules; replaced magic strings in `engine.rs`, `dispatcher.rs`, and `mod.rs`; all 840 tests pass, no new clippy warnings

@@ -7,10 +7,12 @@ mod get_config;
 mod get_team_history;
 mod get_team_status;
 mod list_agents;
+mod list_files;
 mod list_reminders;
 mod list_skills;
 mod list_teams;
 mod list_workspace;
+mod read_file;
 mod read_workspace;
 mod run_team;
 mod search_memory;
@@ -356,6 +358,8 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(get_config::GetConfigTool));
     registry.register(Box::new(set_config::SetConfigTool));
     registry.register(Box::new(write_file::WriteFileTool));
+    registry.register(Box::new(read_file::ReadFileTool));
+    registry.register(Box::new(list_files::ListFilesTool));
     registry
 }
 

@@ -12,6 +12,7 @@ use crate::db::NewTask;
 use super::cron::next_fire_from_cron;
 use super::dispatcher::TaskDispatcher;
 use super::queue::QueuedTask;
+use super::types::task_status;
 
 /// Maximum tasks fired per tick to prevent overrun when many tasks are overdue.
 const MAX_PER_TICK: usize = 10;
@@ -86,13 +87,13 @@ impl TaskEngine {
         // 2. Recover in_progress tasks (process couldn't have survived container restart)
         let in_progress = self
             .db
-            .get_tasks_by_status(vec!["in_progress".to_string()])
+            .get_tasks_by_status(vec![task_status::IN_PROGRESS.to_string()])
             .await
             .unwrap_or_default();
 
         for task in in_progress {
             debug!(task_id = %task.id, "marking orphaned in_progress task as failed on startup");
-            if let Err(e) = self.db.update_task_status(&task.id, "failed").await {
+            if let Err(e) = self.db.update_task_status(&task.id, task_status::FAILED).await {
                 warn!(task_id = %task.id, error = %e, "failed to mark task as failed during recovery");
             }
         }
@@ -337,7 +338,7 @@ impl TaskEngine {
                         if let Err(e) = db.update_task_next_fire_at(&task_id, next).await {
                             warn!(task_id = %task_id, error = %e, "failed to update next_fire_at after recurring fire");
                         }
-                        if let Err(e) = db.update_task_status(&task_id, "recurring_active").await {
+                        if let Err(e) = db.update_task_status(&task_id, task_status::RECURRING_ACTIVE).await {
                             warn!(task_id = %task_id, error = %e, "failed to set recurring_active status");
                         }
 
@@ -351,7 +352,7 @@ impl TaskEngine {
                                 cron_expr,
                             })
                             .await;
-                    } else if action_type != "inject_context" {
+                    } else if action_type != super::types::action_type::INJECT_CONTEXT {
                         // inject_context stays in_progress until the agent loop consumes it.
                         // All other one-shot actions are marked completed here.
                         if let Err(e) = db.update_task_completed(&task_id, None).await {

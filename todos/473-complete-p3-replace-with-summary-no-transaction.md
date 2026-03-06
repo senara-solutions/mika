@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: "473"
 tags: [code-review, correctness, database, compaction]

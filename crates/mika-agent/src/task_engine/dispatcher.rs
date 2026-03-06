@@ -14,6 +14,8 @@ use crate::messaging::MessageSender;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 
+use super::types::action_type;
+
 /// Executes a task's action by matching on `action_type`.
 ///
 /// `send_message` and `inject_context` are fully implemented.
@@ -47,11 +49,11 @@ impl TaskDispatcher {
             .unwrap_or(serde_json::Value::Null);
 
         match task.action_type.as_str() {
-            "send_message" => self.dispatch_send_message(&task, &config).await,
-            "resume_agent" => self.dispatch_resume_agent(&task, &config).await,
-            "inject_context" => self.dispatch_inject_context(&task, &config).await,
-            "run_skill" => self.dispatch_run_skill(&task, &config).await,
-            "invoke_orchestrator" => self.dispatch_invoke_orchestrator(&task, &config).await,
+            action_type::SEND_MESSAGE => self.dispatch_send_message(&task, &config).await,
+            action_type::RESUME_AGENT => self.dispatch_resume_agent(&task, &config).await,
+            action_type::INJECT_CONTEXT => self.dispatch_inject_context(&task, &config).await,
+            action_type::RUN_SKILL => self.dispatch_run_skill(&task, &config).await,
+            action_type::INVOKE_ORCHESTRATOR => self.dispatch_invoke_orchestrator(&task, &config).await,
             other => Err(anyhow!("unknown action_type: {}", other)),
         }
     }
