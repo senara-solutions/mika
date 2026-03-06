@@ -65,6 +65,8 @@ If the `[triggers]` section is omitted entirely, it defaults to an empty keyword
 | `tools`   | Array<String>            | Yes      | Tool names this handler owns (all handler types).        |
 | `command` | String                   | Exec only | Path to the executable to run.                          |
 | `args`    | Array<String>            | No       | Static arguments passed before the tool name (exec only). Default: `[]`. |
+| `long_running` | bool                | No       | If true, exec handler spawns in background and returns a callback task ID immediately (exec only). Default: `false`. |
+| `estimated_duration_secs` | u64     | No       | Expected runtime in seconds; used to compute timeout as `estimated * 3` clamped to 600..7,776,000 (exec only, requires `long_running = true`). |
 | `url`     | String                   | Http only | URL to POST tool calls to.                              |
 | `headers` | Map<String, String>      | No       | HTTP headers added to every request (http only). Default: `{}`. |
 
