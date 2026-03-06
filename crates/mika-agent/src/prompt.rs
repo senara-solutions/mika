@@ -116,7 +116,7 @@ fn onboarding_prompt() -> String {
          Ask who they are and what they're working on. Use update_core_memory to seed all \
          {} blocks ({}) from their \
          responses. Also use store_fact(category=\"person\") to create a record for the user \
-         with their name and relationship \"The user\". \
+         with just their first name (e.g. name=\"Vincent\") and relationship \"The user\". \
          Keep it to 2-3 natural exchanges, then transition to being helpful \
          with whatever they need.",
         section_names.len(),
@@ -280,6 +280,8 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str(
         "- When the user mentions a person by name for the first time, store them using \
 store_fact(category=\"person\") with their name, relationship, and any context. \
+Use only their first name (or first + last if ambiguous). Never prefix with \"User:\", \
+\"Mr.\", \"Dr.\", etc. — the relationship field captures the role. \
 Core memory tracks key people briefly — the people table is the full record.\n",
     );
     prompt.push_str(
