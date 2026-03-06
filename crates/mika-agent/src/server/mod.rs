@@ -184,7 +184,10 @@ async fn startup_cleanup(db: AsyncDatabase) {
         info!(count = facts.len(), "backfilling search index");
         let mut content_ids: Vec<(i64, usize)> = Vec::new();
         for (i, (source_type, source_id, content)) in facts.iter().enumerate() {
-            if let Ok(cid) = db.index_content(source_type, Some(*source_id), content).await {
+            if let Ok(cid) = db
+                .index_content(source_type, Some(*source_id), content)
+                .await
+            {
                 content_ids.push((cid, i));
             }
         }
@@ -715,7 +718,8 @@ mod tests {
 
         // Route no longer exists — expect 404 or 405
         assert!(
-            resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
+            resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
             "expected 404/405, got {}",
             resp.status()
         );
@@ -856,8 +860,14 @@ mod tests {
         use mika_common::claude::ImageSource;
 
         let payloads = vec![
-            ImagePayload { media_type: "image/jpeg".to_string(), data: "dGVzdC1qcGVn".to_string() },
-            ImagePayload { media_type: "image/png".to_string(), data: "dGVzdC1wbmc=".to_string() },
+            ImagePayload {
+                media_type: "image/jpeg".to_string(),
+                data: "dGVzdC1qcGVn".to_string(),
+            },
+            ImagePayload {
+                media_type: "image/png".to_string(),
+                data: "dGVzdC1wbmc=".to_string(),
+            },
         ];
         let user_images: Vec<ImageSource> = payloads
             .into_iter()

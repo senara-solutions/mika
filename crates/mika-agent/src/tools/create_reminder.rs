@@ -4,8 +4,8 @@ use chrono::Utc;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use crate::db::NewTask;
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use crate::db::NewTask;
 
 pub struct CreateReminderTool;
 

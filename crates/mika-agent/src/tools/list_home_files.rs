@@ -397,7 +397,11 @@ mod tests {
         collect_entries(&home, &home, &mut entries, 0);
 
         assert!(entries.iter().any(|(p, _, _, _)| p == "shallow.md"));
-        assert!(!entries.iter().any(|(p, _, _, _)| p.contains("deep_file.md")));
+        assert!(
+            !entries
+                .iter()
+                .any(|(p, _, _, _)| p.contains("deep_file.md"))
+        );
     }
 
     #[test]

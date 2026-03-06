@@ -83,7 +83,11 @@ impl TaskEngine {
 
         for task in in_progress {
             debug!(task_id = %task.id, "marking orphaned in_progress task as failed on startup");
-            if let Err(e) = self.db.update_task_status(&task.id, task_status::FAILED).await {
+            if let Err(e) = self
+                .db
+                .update_task_status(&task.id, task_status::FAILED)
+                .await
+            {
                 warn!(task_id = %task.id, error = %e, "failed to mark task as failed during recovery");
             }
         }
@@ -93,7 +97,14 @@ impl TaskEngine {
         let count = schedulable.len();
 
         for task in schedulable {
-            self.enqueue_queued_task(&task.id, &task.trigger_type, &task.action_type, task.cron_expr.as_deref(), task.next_fire_at, now);
+            self.enqueue_queued_task(
+                &task.id,
+                &task.trigger_type,
+                &task.action_type,
+                task.cron_expr.as_deref(),
+                task.next_fire_at,
+                now,
+            );
         }
 
         info!(
@@ -203,7 +214,14 @@ impl TaskEngine {
             if self.queued_ids.contains(&task.id) {
                 continue;
             }
-            self.enqueue_queued_task(&task.id, &task.trigger_type, &task.action_type, task.cron_expr.as_deref(), task.next_fire_at, now);
+            self.enqueue_queued_task(
+                &task.id,
+                &task.trigger_type,
+                &task.action_type,
+                task.cron_expr.as_deref(),
+                task.next_fire_at,
+                now,
+            );
             added += 1;
         }
         if added > 0 {
@@ -319,7 +337,10 @@ impl TaskEngine {
                         if let Err(e) = db.update_task_next_fire_at(&task_id, next).await {
                             warn!(task_id = %task_id, error = %e, "failed to update next_fire_at after recurring fire");
                         }
-                        if let Err(e) = db.update_task_status(&task_id, task_status::RECURRING_ACTIVE).await {
+                        if let Err(e) = db
+                            .update_task_status(&task_id, task_status::RECURRING_ACTIVE)
+                            .await
+                        {
                             warn!(task_id = %task_id, error = %e, "failed to set recurring_active status");
                         }
 
@@ -352,7 +373,6 @@ impl TaskEngine {
         // Engine lock released when fire_task() returns (immediately after spawn)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -434,7 +454,10 @@ mod tests {
         let mut engine = TaskEngine::new(db, dispatcher);
 
         let future_ts = chrono::Utc::now().timestamp() + 3600;
-        let id = engine.enqueue(make_task("test reminder", future_ts)).await.unwrap();
+        let id = engine
+            .enqueue(make_task("test reminder", future_ts))
+            .await
+            .unwrap();
 
         assert!(!id.is_empty());
         assert_eq!(engine.queue.len(), 1);
@@ -449,7 +472,10 @@ mod tests {
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let past_ts = chrono::Utc::now().timestamp() - 10;
-        let id = engine.enqueue(make_task("past reminder", past_ts)).await.unwrap();
+        let id = engine
+            .enqueue(make_task("past reminder", past_ts))
+            .await
+            .unwrap();
         assert_eq!(engine.queue.len(), 1);
 
         engine.tick().await;
@@ -464,7 +490,10 @@ mod tests {
                 break;
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("timed out waiting for task to complete; status={}", t.status);
+                panic!(
+                    "timed out waiting for task to complete; status={}",
+                    t.status
+                );
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -477,7 +506,10 @@ mod tests {
         let mut engine = TaskEngine::new(db, dispatcher);
 
         let future_ts = chrono::Utc::now().timestamp() + 3600;
-        engine.enqueue(make_task("future reminder", future_ts)).await.unwrap();
+        engine
+            .enqueue(make_task("future reminder", future_ts))
+            .await
+            .unwrap();
         engine.tick().await;
 
         assert_eq!(engine.queue.len(), 1);
@@ -490,7 +522,10 @@ mod tests {
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let past_ts = chrono::Utc::now().timestamp() - 10;
-        let id = engine.enqueue(make_task("cancelled reminder", past_ts)).await.unwrap();
+        let id = engine
+            .enqueue(make_task("cancelled reminder", past_ts))
+            .await
+            .unwrap();
 
         // Cancel in DB before tick fires it
         db.cancel_task(&id).await.unwrap();
@@ -510,7 +545,10 @@ mod tests {
 
         // Create task directly in DB (bypassing engine.enqueue)
         let past_ts = chrono::Utc::now().timestamp() - 10;
-        let id = db.create_task(make_task("direct db task", past_ts)).await.unwrap();
+        let id = db
+            .create_task(make_task("direct db task", past_ts))
+            .await
+            .unwrap();
 
         assert!(!engine.queued_ids.contains(&id));
 
@@ -532,7 +570,9 @@ mod tests {
             .await
             .unwrap();
 
-        db.update_task_status(&task_id, "in_progress").await.unwrap();
+        db.update_task_status(&task_id, "in_progress")
+            .await
+            .unwrap();
 
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
@@ -541,5 +581,4 @@ mod tests {
         let task = db.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "failed");
     }
-
 }

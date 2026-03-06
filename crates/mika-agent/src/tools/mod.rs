@@ -236,13 +236,12 @@ pub(crate) async fn validate_and_resolve_path(
 
     if let Some(parent) = full_path.parent() {
         // Create parent directories only for write operations
-        if create_parents {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        if create_parents
+            && let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return Err(ToolOutput::error(format!(
                     "Failed to create parent directories: {e}"
                 )));
             }
-        }
 
         // Check for symlinks in the parent chain (only when parent exists)
         match tokio::fs::symlink_metadata(parent).await {
@@ -279,9 +278,7 @@ pub(crate) async fn validate_and_resolve_path(
                 // have already failed above). For read operations, the file-not-found error will
                 // be returned by the caller when it tries to open the file.
                 if create_parents {
-                    return Err(ToolOutput::error(
-                        "Failed to verify parent directory.",
-                    ));
+                    return Err(ToolOutput::error("Failed to verify parent directory."));
                 }
             }
         }

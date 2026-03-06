@@ -297,4 +297,3 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         }
     }
 }
-

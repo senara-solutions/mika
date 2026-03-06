@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use crate::db::format_unix_ts;
 use super::{Tool, ToolContext, ToolOutput};
+use crate::db::format_unix_ts;
 
 pub struct ListRemindersTool;
 

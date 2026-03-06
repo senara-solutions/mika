@@ -32,7 +32,6 @@ impl PartialOrd for QueuedTask {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,9 +8,9 @@ pub mod mcp;
 pub mod messaging;
 pub mod prompt;
 pub mod server;
-pub mod task_engine;
 pub mod skills;
 pub mod startup;
+pub mod task_engine;
 pub mod teams;
 #[cfg(test)]
 pub mod test_utils;

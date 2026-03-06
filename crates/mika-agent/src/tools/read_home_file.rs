@@ -45,9 +45,7 @@ impl Tool for ReadHomeFileTool {
         match tokio::fs::symlink_metadata(&full_path).await {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
-                    return Ok(ToolOutput::error(
-                        "Symbolic links are not allowed.",
-                    ));
+                    return Ok(ToolOutput::error("Symbolic links are not allowed."));
                 }
             }
             Err(_) => {

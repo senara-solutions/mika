@@ -1,13 +1,16 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc::{self, SyncSender}};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, SyncSender},
+};
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend,
-    MemoryEvent, NewTask, Person, Preference, SearchResult, Task, TeamMessageRow, TeamRunRow,
-    TeamRow,
+    MemoryEvent, NewTask, Person, Preference, SearchResult, Task, TeamMessageRow, TeamRow,
+    TeamRunRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -154,7 +157,8 @@ impl AsyncDatabase {
     }
 
     pub async fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
-        self.with_db(move |db| db.create_recurring_task_if_absent(task)).await
+        self.with_db(move |db| db.create_recurring_task_if_absent(task))
+            .await
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>> {
@@ -179,18 +183,21 @@ impl AsyncDatabase {
 
     pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<()> {
         let (i, r) = (id.to_owned(), result.map(|s| s.to_owned()));
-        self.with_db(move |db| db.update_task_completed(&i, r.as_deref())).await
+        self.with_db(move |db| db.update_task_completed(&i, r.as_deref()))
+            .await
     }
 
     pub async fn update_task_failed(&self, id: &str, error: &str) -> Result<()> {
         let id = id.to_string();
         let error = error.to_string();
-        self.with_db(move |db| db.update_task_failed(&id, &error)).await
+        self.with_db(move |db| db.update_task_failed(&id, &error))
+            .await
     }
 
     pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: i64) -> Result<()> {
         let i = id.to_owned();
-        self.with_db(move |db| db.update_task_next_fire_at(&i, next_fire_at)).await
+        self.with_db(move |db| db.update_task_next_fire_at(&i, next_fire_at))
+            .await
     }
 
     pub async fn cancel_task(&self, id: &str) -> Result<bool> {
@@ -200,7 +207,8 @@ impl AsyncDatabase {
 
     pub async fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.mark_tasks_expired(now_unix, &id)).await
+        self.with_db(move |db| db.mark_tasks_expired(now_unix, &id))
+            .await
     }
 
     pub async fn count_pending_tasks(&self) -> Result<i64> {
@@ -210,21 +218,25 @@ impl AsyncDatabase {
 
     pub async fn get_pending_reminder_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.get_pending_reminder_tasks(&id)).await
+        self.with_db(move |db| db.get_pending_reminder_tasks(&id))
+            .await
     }
 
     pub async fn get_inject_context_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.get_inject_context_tasks(&id)).await
+        self.with_db(move |db| db.get_inject_context_tasks(&id))
+            .await
     }
 
     pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         let i = id.to_owned();
-        self.with_db(move |db| db.set_task_process_id(&i, process_id)).await
+        self.with_db(move |db| db.set_task_process_id(&i, process_id))
+            .await
     }
 
     pub async fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
-        self.with_db(move |db| db.prune_completed_tasks(older_than_secs)).await
+        self.with_db(move |db| db.prune_completed_tasks(older_than_secs))
+            .await
     }
 
     pub async fn get_tasks_by_status(&self, statuses: Vec<String>) -> Result<Vec<Task>> {
@@ -245,7 +257,8 @@ impl AsyncDatabase {
             content.to_owned(),
             channel_type.to_owned(),
         );
-        self.with_db(move |db| db.save_message(&a, &r, &c, &ct)).await
+        self.with_db(move |db| db.save_message(&a, &r, &c, &ct))
+            .await
     }
 
     pub async fn save_message_with_metadata(
@@ -283,7 +296,8 @@ impl AsyncDatabase {
 
     pub async fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.load_conversation_summary(&a)).await
+        self.with_db(move |db| db.load_conversation_summary(&a))
+            .await
     }
 
     pub async fn count_messages(&self) -> Result<usize> {
@@ -335,7 +349,8 @@ impl AsyncDatabase {
 
     pub async fn total_core_memory_tokens(&self) -> Result<i32> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.total_core_memory_tokens(&a)).await
+        self.with_db(move |db| db.total_core_memory_tokens(&a))
+            .await
     }
 
     // -- People --
@@ -401,7 +416,8 @@ impl AsyncDatabase {
 
     pub async fn get_commitment_status(&self, id: i64) -> Result<Option<String>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_commitment_status(&a, id)).await
+        self.with_db(move |db| db.get_commitment_status(&a, id))
+            .await
     }
 
     pub async fn get_commitment_details(
@@ -409,7 +425,8 @@ impl AsyncDatabase {
         id: i64,
     ) -> Result<Option<(String, Option<String>)>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_commitment_details(&a, id)).await
+        self.with_db(move |db| db.get_commitment_details(&a, id))
+            .await
     }
 
     pub async fn search_commitments(&self, query: &str) -> Result<Vec<Commitment>> {
@@ -553,7 +570,8 @@ impl AsyncDatabase {
 
     pub async fn set_customer_config(&self, key: &str, value: &str) -> Result<()> {
         let (a, k, v) = (self.agent_id.clone(), key.to_owned(), value.to_owned());
-        self.with_db(move |db| db.set_customer_config(&a, &k, &v)).await
+        self.with_db(move |db| db.set_customer_config(&a, &k, &v))
+            .await
     }
 
     pub async fn list_customer_config(&self) -> Result<Vec<(String, String)>> {
@@ -730,7 +748,8 @@ impl AsyncDatabase {
 
     pub async fn get_all_facts_for_indexing(&self) -> Result<Vec<(String, i64, String)>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_all_facts_for_indexing(&a)).await
+        self.with_db(move |db| db.get_all_facts_for_indexing(&a))
+            .await
     }
 
     // -- Team Runs --
@@ -965,7 +984,9 @@ mod tests {
         db.register_agent("agent2", "Agent 2", "").await.unwrap();
         let db2 = db.with_agent("agent2");
         db.save_message("user", "from main", "cli").await.unwrap();
-        db2.save_message("user", "from agent2", "cli").await.unwrap();
+        db2.save_message("user", "from agent2", "cli")
+            .await
+            .unwrap();
         let main_msgs = db.load_recent_messages(10, None).await.unwrap();
         let agent2_msgs = db2.load_recent_messages(10, None).await.unwrap();
         assert_eq!(main_msgs.len(), 1);

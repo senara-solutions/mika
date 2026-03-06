@@ -44,8 +44,8 @@ impl TaskDispatcher {
             .await?
             .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
 
-        let config: serde_json::Value = serde_json::from_str(&task.action_config)
-            .unwrap_or(serde_json::Value::Null);
+        let config: serde_json::Value =
+            serde_json::from_str(&task.action_config).unwrap_or(serde_json::Value::Null);
 
         match task.action_type.as_str() {
             action_type::SEND_MESSAGE => self.dispatch_send_message(&task, &config).await,
@@ -59,15 +59,20 @@ impl TaskDispatcher {
     ///
     /// Expects `action_config`: `{"text": "<message>"}`
     async fn dispatch_send_message(&self, task: &Task, config: &serde_json::Value) -> Result<()> {
-        let text = config["text"]
-            .as_str()
-            .ok_or_else(|| anyhow!("send_message task {} missing 'text' in action_config", task.id))?;
+        let text = config["text"].as_str().ok_or_else(|| {
+            anyhow!(
+                "send_message task {} missing 'text' in action_config",
+                task.id
+            )
+        })?;
 
         const MAX_MESSAGE_LEN: usize = 50_000;
         if text.len() > MAX_MESSAGE_LEN {
             return Err(anyhow!(
                 "send_message task {} text exceeds {} chars (got {})",
-                task.id, MAX_MESSAGE_LEN, text.len()
+                task.id,
+                MAX_MESSAGE_LEN,
+                text.len()
             ));
         }
 
@@ -102,9 +107,12 @@ impl TaskDispatcher {
     ///
     /// Pre-filters are applied for each trigger type before running the agent loop.
     async fn dispatch_run_skill(&self, task: &Task, config: &serde_json::Value) -> Result<()> {
-        let trigger_name = config["trigger"]
-            .as_str()
-            .ok_or_else(|| anyhow!("run_skill task {} missing 'trigger' in action_config", task.id))?;
+        let trigger_name = config["trigger"].as_str().ok_or_else(|| {
+            anyhow!(
+                "run_skill task {} missing 'trigger' in action_config",
+                task.id
+            )
+        })?;
 
         match trigger_name {
             "heartbeat" => self.dispatch_heartbeat(task).await,
@@ -220,7 +228,11 @@ impl TaskDispatcher {
 
         // Skip if no conversations today
         let midnight_unix = crate::db::today_midnight_utc(&tz_str).timestamp();
-        let conversations = self.db.get_conversations_since(midnight_unix).await.unwrap_or_default();
+        let conversations = self
+            .db
+            .get_conversations_since(midnight_unix)
+            .await
+            .unwrap_or_default();
         if conversations.is_empty() {
             debug!(task_id = %task.id, "no conversations today, skipping reflection");
             return Ok(());
@@ -240,7 +252,10 @@ impl TaskDispatcher {
         };
 
         let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
-        let today_str = chrono::Utc::now().with_timezone(&tz).format("%Y-%m-%d").to_string();
+        let today_str = chrono::Utc::now()
+            .with_timezone(&tz)
+            .format("%Y-%m-%d")
+            .to_string();
         let session_id = format!("reflection-{today_str}");
         info!(task_id = %task.id, session_id = %session_id, "running daily reflection");
 
@@ -302,7 +317,13 @@ impl TaskDispatcher {
         }
 
         // 3. Rate limit: max 3 per day
-        if self.db.count_heartbeat_sends_today(&tz_str).await.unwrap_or(0) >= 3 {
+        if self
+            .db
+            .count_heartbeat_sends_today(&tz_str)
+            .await
+            .unwrap_or(0)
+            >= 3
+        {
             return false;
         }
 
@@ -316,7 +337,6 @@ impl TaskDispatcher {
 
         true
     }
-
 }
 
 #[cfg(test)]
@@ -447,5 +467,4 @@ mod tests {
         let result = dispatcher.dispatch(&id).await;
         assert!(result.is_ok());
     }
-
 }

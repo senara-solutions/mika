@@ -643,15 +643,14 @@ impl<'a> App<'a> {
         }
 
         // Task count polling: refresh every ~5s for footer badge.
-        if !self.is_team_mode() && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) {
-            if let Ok(tasks) = self.db.get_pending_reminder_tasks().await {
+        if !self.is_team_mode() && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
+            && let Ok(tasks) = self.db.get_pending_reminder_tasks().await {
                 let new_count = tasks.len();
                 if new_count != self.pending_task_count {
                     self.pending_task_count = new_count;
                     self.needs_redraw = true;
                 }
             }
-        }
 
         // Thinking animation needs redraw every tick while active
         if self.status == AgentStatus::Thinking {

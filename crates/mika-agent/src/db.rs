@@ -10,13 +10,11 @@ use tracing::{debug, info};
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
 pub fn init_sqlite_vec() {
     static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(
-                #[allow(clippy::missing_transmute_annotations)]
-                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
-            ));
-        }
+    INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(
+            #[allow(clippy::missing_transmute_annotations)]
+            std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
+        ));
     });
 }
 
@@ -296,10 +294,18 @@ impl Database {
 
     fn migrate(&self) -> Result<()> {
         let version = self.current_version()?;
-        debug!(current_version = version, target_version = CURRENT_SCHEMA_VERSION, "checking migrations");
+        debug!(
+            current_version = version,
+            target_version = CURRENT_SCHEMA_VERSION,
+            "checking migrations"
+        );
         if version < CURRENT_SCHEMA_VERSION {
             if version > 0 {
-                info!(from = version, to = CURRENT_SCHEMA_VERSION, "applying clean-slate migration");
+                info!(
+                    from = version,
+                    to = CURRENT_SCHEMA_VERSION,
+                    "applying clean-slate migration"
+                );
             }
             self.migrate_v1()?;
             info!(version = CURRENT_SCHEMA_VERSION, "database migrated to v1");
@@ -339,8 +345,9 @@ impl Database {
             self.conn.execute_batch(drop)?;
         }
 
-        self.conn.execute_batch(
-            "
+        self.conn
+            .execute_batch(
+                "
             BEGIN;
 
             CREATE TABLE schema_version (
@@ -578,8 +585,8 @@ impl Database {
 
             COMMIT;
             ",
-        )
-        .context("failed to create v1 schema")?;
+            )
+            .context("failed to create v1 schema")?;
 
         // Virtual tables must be outside transactions
         let _ = self.conn.execute_batch(
@@ -640,9 +647,9 @@ impl Database {
     }
 
     pub fn list_teams_db(&self) -> Result<Vec<TeamRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, config_path, created_at FROM teams ORDER BY name",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, config_path, created_at FROM teams ORDER BY name")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(TeamRow {
@@ -750,8 +757,7 @@ impl Database {
         })
     }
 
-    const TASK_COLUMNS: &'static str =
-        "id, agent_id, team_run_id, parent_task_id, depth, label,
+    const TASK_COLUMNS: &'static str = "id, agent_id, team_run_id, parent_task_id, depth, label,
          trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
@@ -923,8 +929,7 @@ impl Database {
             placeholders
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(agent_id.to_string())];
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id.to_string())];
         for s in statuses {
             bind.push(Box::new(s.to_string()));
         }
@@ -1022,10 +1027,7 @@ impl Database {
         Ok(messages)
     }
 
-    pub fn load_conversation_summary(
-        &self,
-        agent_id: &str,
-    ) -> Result<Option<ConversationMessage>> {
+    pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<ConversationMessage>> {
         self.conn
             .query_row(
                 "SELECT id, role, content, channel_type, metadata, created_at
@@ -1072,7 +1074,10 @@ impl Database {
               ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt
-            .query_map(params![agent_id, cutoff_id], Self::row_to_conversation_message)?
+            .query_map(
+                params![agent_id, cutoff_id],
+                Self::row_to_conversation_message,
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1142,7 +1147,10 @@ impl Database {
                   ORDER BY created_at ASC",
             )?;
             let rows = stmt
-                .query_map(params![agent_id, after_id], Self::row_to_conversation_message)?
+                .query_map(
+                    params![agent_id, after_id],
+                    Self::row_to_conversation_message,
+                )?
                 .collect::<rusqlite::Result<_>>()?;
             Ok(rows)
         }
@@ -1169,7 +1177,10 @@ impl Database {
               ORDER BY created_at ASC",
         )?;
         let rows = stmt
-            .query_map(params![agent_id, since_unix], Self::row_to_conversation_message)?
+            .query_map(
+                params![agent_id, since_unix],
+                Self::row_to_conversation_message,
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1248,11 +1259,10 @@ impl Database {
                 self.set_core_memory(agent_id, key, default)?;
             }
         }
-        if let Some(md) = user_md_content {
-            if !md.trim().is_empty() {
+        if let Some(md) = user_md_content
+            && !md.trim().is_empty() {
                 self.set_core_memory(agent_id, "user_summary", md.trim())?;
             }
-        }
         Ok(())
     }
 
@@ -1596,6 +1606,7 @@ impl Database {
 
     // ===== Memory Events (Audit Log) =====
 
+    #[allow(clippy::too_many_arguments)]
     pub fn log_memory_event(
         &self,
         agent_id: &str,
@@ -1610,7 +1621,15 @@ impl Database {
             "INSERT INTO memory_events
              (agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning],
+            params![
+                agent_id,
+                session_id,
+                tool_name,
+                target_key,
+                before_value,
+                after_value,
+                reasoning
+            ],
         )?;
         Ok(())
     }
@@ -1667,11 +1686,7 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn count_memory_events_for_session(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-    ) -> Result<i64> {
+    pub fn count_memory_events_for_session(&self, agent_id: &str, session_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM memory_events WHERE agent_id = ?1 AND session_id = ?2",
             params![agent_id, session_id],
@@ -1893,9 +1908,9 @@ impl Database {
     }
 
     pub fn list_customer_config(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT key, value FROM customer_config WHERE agent_id = ?1 ORDER BY key",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM customer_config WHERE agent_id = ?1 ORDER BY key")?;
         let rows = stmt
             .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -1938,7 +1953,14 @@ impl Database {
             "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
              deliverable = ?4, ended_at = ?5
              WHERE id = ?6",
-            params![status, failure_reason, iteration, deliverable, ended_at, run_id],
+            params![
+                status,
+                failure_reason,
+                iteration,
+                deliverable,
+                ended_at,
+                run_id
+            ],
         )?;
         Ok(())
     }
@@ -1980,11 +2002,10 @@ impl Database {
     ) -> Result<Vec<TeamRunRow>> {
         let mut runs = self.load_team_runs(team_name, limit)?;
         for run in &mut runs {
-            if let Some(ref d) = run.deliverable {
-                if d.len() > max_text_len {
+            if let Some(ref d) = run.deliverable
+                && d.len() > max_text_len {
                     run.deliverable = Some(format!("{}...", &d[..max_text_len]));
                 }
-            }
         }
         Ok(runs)
     }
@@ -2141,7 +2162,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn delete_search_content(&self, agent_id: &str, source_type: &str, source_id: i64) -> Result<()> {
+    pub fn delete_search_content(
+        &self,
+        agent_id: &str,
+        source_type: &str,
+        source_id: i64,
+    ) -> Result<()> {
         let existing: Option<(i64, String)> = self
             .conn
             .query_row(
@@ -2156,14 +2182,11 @@ impl Database {
                 "INSERT INTO fts_search(fts_search, rowid, content) VALUES ('delete', ?1, ?2)",
                 params![id, content],
             );
-            let _ = self.conn.execute(
-                "DELETE FROM vec_search WHERE rowid = ?1",
-                params![id],
-            );
-            self.conn.execute(
-                "DELETE FROM search_content WHERE id = ?1",
-                params![id],
-            )?;
+            let _ = self
+                .conn
+                .execute("DELETE FROM vec_search WHERE rowid = ?1", params![id]);
+            self.conn
+                .execute("DELETE FROM search_content WHERE id = ?1", params![id])?;
         }
         Ok(())
     }
@@ -2193,15 +2216,18 @@ impl Database {
               ORDER BY rank LIMIT ?4",
         )?;
         let rows = stmt
-            .query_map(params![query, agent_id, source_type_filter, limit as i64], |r| {
-                Ok(SearchResult {
-                    id: r.get(0)?,
-                    source_type: r.get(1)?,
-                    source_id: r.get(2)?,
-                    content: r.get(3)?,
-                    score: r.get(4)?,
-                })
-            })?
+            .query_map(
+                params![query, agent_id, source_type_filter, limit as i64],
+                |r| {
+                    Ok(SearchResult {
+                        id: r.get(0)?,
+                        source_type: r.get(1)?,
+                        source_id: r.get(2)?,
+                        content: r.get(3)?,
+                        score: r.get(4)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -2291,10 +2317,7 @@ impl Database {
             .collect())
     }
 
-    pub fn get_all_facts_for_indexing(
-        &self,
-        agent_id: &str,
-    ) -> Result<Vec<(String, i64, String)>> {
+    pub fn get_all_facts_for_indexing(&self, agent_id: &str) -> Result<Vec<(String, i64, String)>> {
         let mut results = Vec::new();
         // People
         let mut stmt = self.conn.prepare(
@@ -2350,12 +2373,8 @@ impl Database {
     }
 
     pub fn db_size_bytes(&self) -> Result<u64> {
-        let page_size: i64 = self
-            .conn
-            .query_row("PRAGMA page_size", [], |r| r.get(0))?;
-        let page_count: i64 = self
-            .conn
-            .query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         Ok((page_size * page_count) as u64)
     }
 
@@ -2473,7 +2492,8 @@ mod tests {
     #[test]
     fn test_load_recent_messages_channel_filter() {
         let db = db();
-        db.save_message("main", "user", "telegram msg", "telegram").unwrap();
+        db.save_message("main", "user", "telegram msg", "telegram")
+            .unwrap();
         db.save_message("main", "user", "cli msg", "cli").unwrap();
         let tg = db
             .load_recent_messages("main", 10, Some(&["telegram"]))
@@ -2519,8 +2539,10 @@ mod tests {
     fn test_replace_with_summary() {
         let db = db();
         let id1 = db.save_message("main", "user", "msg1", "cli").unwrap();
-        db.save_message("main", "assistant", "reply1", "cli").unwrap();
-        db.replace_with_summary("main", "Summary text", id1).unwrap();
+        db.save_message("main", "assistant", "reply1", "cli")
+            .unwrap();
+        db.replace_with_summary("main", "Summary text", id1)
+            .unwrap();
         let summary = db.load_conversation_summary("main").unwrap().unwrap();
         assert_eq!(summary.role, "summary");
         assert_eq!(summary.content, "Summary text");
@@ -2590,10 +2612,11 @@ mod tests {
     #[test]
     fn test_update_commitment_status() {
         let db = db();
-        let id = db
-            .add_commitment("main", "Task A", None, None)
-            .unwrap();
-        assert!(db.update_commitment_status("main", id, "completed").unwrap());
+        let id = db.add_commitment("main", "Task A", None, None).unwrap();
+        assert!(
+            db.update_commitment_status("main", id, "completed")
+                .unwrap()
+        );
         let status = db.get_commitment_status("main", id).unwrap().unwrap();
         assert_eq!(status, "completed");
     }
@@ -2620,8 +2643,13 @@ mod tests {
     fn test_log_and_get_memory_events() {
         let db = db();
         db.log_memory_event(
-            "main", "sess1", "update_core_memory", "user_summary",
-            None, "New summary", Some("reason"),
+            "main",
+            "sess1",
+            "update_core_memory",
+            "user_summary",
+            None,
+            "New summary",
+            Some("reason"),
         )
         .unwrap();
         let events = db.get_memory_events("main", "sess1").unwrap();
@@ -2714,10 +2742,23 @@ mod tests {
     #[test]
     fn test_team_runs_insert_and_load() {
         let db = db();
-        db.insert_team_run("run-001", "engineering", "Build feature X", 3, 1_700_000_000)
-            .unwrap();
-        db.update_team_run("run-001", "completed", None, 1, Some("Done!"), Some(1_700_001_000))
-            .unwrap();
+        db.insert_team_run(
+            "run-001",
+            "engineering",
+            "Build feature X",
+            3,
+            1_700_000_000,
+        )
+        .unwrap();
+        db.update_team_run(
+            "run-001",
+            "completed",
+            None,
+            1,
+            Some("Done!"),
+            Some(1_700_001_000),
+        )
+        .unwrap();
         let runs = db.load_team_runs("engineering", 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].goal, "Build feature X");

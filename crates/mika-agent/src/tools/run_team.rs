@@ -80,41 +80,36 @@ impl Tool for RunTeamTool {
             Err(msg) => return Ok(ToolOutput::error(msg)),
         };
 
-        let callback: Option<TeamEventCallback> =
-            ctx.message_sender.as_ref().map(|sender| {
-                let sender: Arc<dyn MessageSender> = Arc::clone(sender);
-                let cb: TeamEventCallback = Box::new(move |event: TeamEvent| {
-                    let text = match &event {
-                        TeamEvent::PhaseChanged { phase, iteration } => {
-                            Some(format!("[Team] Phase: {} (iteration {})", phase, iteration))
-                        }
-                        TeamEvent::AgentCompleted { agent, .. } => {
-                            Some(format!("[Team] Agent '{}' completed", agent))
-                        }
-                        TeamEvent::AgentFailed { agent, error } => {
-                            Some(format!("[Team] Agent '{}' failed: {}", agent, error))
-                        }
-                        TeamEvent::Deliverable(_) => {
-                            Some("[Team] Deliverable ready".to_string())
-                        }
-                        TeamEvent::RunFailed(msg) => {
-                            Some(format!("[Team] Run failed: {}", msg))
-                        }
-                        // Skip noisy/intermediate events
-                        TeamEvent::Progress(_)
-                        | TeamEvent::AgentStarted { .. }
-                        | TeamEvent::TasksAssigned { .. }
-                        | TeamEvent::CriticReview { .. } => None,
-                    };
-                    if let Some(text) = text {
-                        let sender = Arc::clone(&sender);
-                        tokio::spawn(async move {
-                            let _ = sender.send(&text).await;
-                        });
+        let callback: Option<TeamEventCallback> = ctx.message_sender.as_ref().map(|sender| {
+            let sender: Arc<dyn MessageSender> = Arc::clone(sender);
+            let cb: TeamEventCallback = Box::new(move |event: TeamEvent| {
+                let text = match &event {
+                    TeamEvent::PhaseChanged { phase, iteration } => {
+                        Some(format!("[Team] Phase: {} (iteration {})", phase, iteration))
                     }
-                });
-                cb
+                    TeamEvent::AgentCompleted { agent, .. } => {
+                        Some(format!("[Team] Agent '{}' completed", agent))
+                    }
+                    TeamEvent::AgentFailed { agent, error } => {
+                        Some(format!("[Team] Agent '{}' failed: {}", agent, error))
+                    }
+                    TeamEvent::Deliverable(_) => Some("[Team] Deliverable ready".to_string()),
+                    TeamEvent::RunFailed(msg) => Some(format!("[Team] Run failed: {}", msg)),
+                    // Skip noisy/intermediate events
+                    TeamEvent::Progress(_)
+                    | TeamEvent::AgentStarted { .. }
+                    | TeamEvent::TasksAssigned { .. }
+                    | TeamEvent::CriticReview { .. } => None,
+                };
+                if let Some(text) = text {
+                    let sender = Arc::clone(&sender);
+                    tokio::spawn(async move {
+                        let _ = sender.send(&text).await;
+                    });
+                }
             });
+            cb
+        });
 
         let result = crate::teams::run_team(
             team_name,

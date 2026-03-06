@@ -200,7 +200,9 @@ mod tests {
         let total = db.count_messages("main").unwrap();
         assert!(total > COMPACTION_THRESHOLD);
 
-        let old = db.load_messages_before_window("main", CONTEXT_WINDOW).unwrap();
+        let old = db
+            .load_messages_before_window("main", CONTEXT_WINDOW)
+            .unwrap();
         // Should have (total - CONTEXT_WINDOW) messages to compact
         assert_eq!(old.len(), total - CONTEXT_WINDOW);
     }
@@ -213,7 +215,9 @@ mod tests {
                 .unwrap();
         }
 
-        let old = db.load_messages_before_window("main", CONTEXT_WINDOW).unwrap();
+        let old = db
+            .load_messages_before_window("main", CONTEXT_WINDOW)
+            .unwrap();
         let highest_id = old.last().unwrap().id;
 
         db.replace_with_summary("main", "Compacted summary", highest_id)
@@ -239,7 +243,9 @@ mod tests {
                 .unwrap();
         }
 
-        let old = db.load_messages_before_window("main", CONTEXT_WINDOW).unwrap();
+        let old = db
+            .load_messages_before_window("main", CONTEXT_WINDOW)
+            .unwrap();
         let highest_id = old.last().unwrap().id;
         db.replace_with_summary("main", "First summary", highest_id)
             .unwrap();
@@ -255,7 +261,9 @@ mod tests {
         assert_eq!(total, 60);
 
         // Second compaction
-        let old = db.load_messages_before_window("main", CONTEXT_WINDOW).unwrap();
+        let old = db
+            .load_messages_before_window("main", CONTEXT_WINDOW)
+            .unwrap();
         assert_eq!(old.len(), 40);
         let highest_id = old.last().unwrap().id;
         db.replace_with_summary("main", "Merged summary", highest_id)
