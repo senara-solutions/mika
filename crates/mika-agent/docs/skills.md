@@ -119,7 +119,7 @@ When Claude calls a builtin tool, it is dispatched through the standard `ToolReg
 
 ### Exec
 
-Runs a shell command for each tool call. The command receives the tool name as an additional trailing argument and the tool input JSON via the `MIKA_TOOL_INPUT` environment variable. Stdout is returned as the tool result; a non-zero exit code is reported as an error.
+Runs a shell command for each tool call. The command receives the tool name as an additional trailing argument and the tool input JSON via **stdin**. Stdout is returned as the tool result; a non-zero exit code is reported as an error.
 
 ```toml
 name = "calendar"
@@ -142,7 +142,7 @@ Execution details:
 
 - The command is spawned as: `<command> <args...> <tool_name>`
 - For the example above, calling `get_events` runs: `/usr/local/bin/cal-tool --format json get_events`
-- The tool input JSON is available in the `MIKA_TOOL_INPUT` environment variable.
+- The tool input JSON is piped to the process via **stdin** (read with `cat`, `jq`, etc.).
 - The process must complete within `timeout_secs` or it is killed and an error is returned.
 - Stdout is captured as the successful tool result.
 - Stderr is included in the error message on non-zero exit.
@@ -506,8 +506,8 @@ set -euo pipefail
 # Tool name is passed as the last argument
 TOOL="$1"
 
-# Tool input is in MIKA_TOOL_INPUT (JSON string)
-INPUT="${MIKA_TOOL_INPUT:-{}}"
+# Tool input JSON is piped via stdin
+INPUT=$(cat)
 
 case "$TOOL" in
   convert_timezone)
