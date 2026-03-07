@@ -712,7 +712,7 @@ impl TeamEngine {
         // Child tasks: one per agent delegation.
         let team_state = serialize_checkpoint(&self.run);
         let parent_task = crate::db::NewTask {
-            agent_id: self.team_db.agent_id.clone(),
+            agent_id: self.team.team.orchestrator.clone(),
             team_run_id: Some(self.run.run_id.clone()),
             parent_task_id: None,
             depth: 0,
