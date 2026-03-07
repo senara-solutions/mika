@@ -3,7 +3,7 @@ use mika_common::claude::{ClaudeClient, Message, MessageContent, MessagesRequest
 use tracing::{debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
-use crate::db::ConversationMessage;
+use crate::db::SessionMessage;
 
 const COMPACTION_THRESHOLD: usize = 50;
 const CONTEXT_WINDOW: usize = 20;
@@ -79,8 +79,8 @@ pub async fn maybe_compact(db: &AsyncDatabase, claude: &ClaudeClient) -> Result<
 /// an existing summary.
 async fn summarize_messages(
     claude: &ClaudeClient,
-    messages: &[ConversationMessage],
-    existing_summary: Option<&ConversationMessage>,
+    messages: &[SessionMessage],
+    existing_summary: Option<&SessionMessage>,
 ) -> Result<String> {
     let mut user_prompt = String::with_capacity(2048);
 
@@ -174,26 +174,28 @@ mod tests {
     use super::*;
     use crate::test_utils::test_helpers::test_db;
 
+    fn test_db_with_session() -> (crate::db::Database, String) {
+        let db = test_db();
+        let sid = "test-session".to_string();
+        db.create_session(&sid, "mika", "cli").unwrap();
+        (db, sid)
+    }
+
     #[test]
     fn test_compaction_skips_below_threshold() {
-        let db = test_db();
-        // Insert fewer than COMPACTION_THRESHOLD messages
+        let (db, sid) = test_db_with_session();
         for i in 0..10 {
-            db.save_message("mika", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("msg {i}"))
                 .unwrap();
         }
-
-        // We can't call maybe_compact in a sync test without a ClaudeClient,
-        // but we can verify the threshold check logic
         assert!(db.count_messages("mika").unwrap() <= COMPACTION_THRESHOLD);
     }
 
     #[test]
     fn test_compaction_identifies_old_messages() {
-        let db = test_db();
-        // Insert COMPACTION_THRESHOLD + 10 messages
+        let (db, sid) = test_db_with_session();
         for i in 0..(COMPACTION_THRESHOLD + 10) {
-            db.save_message("mika", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("msg {i}"))
                 .unwrap();
         }
 
@@ -203,15 +205,14 @@ mod tests {
         let old = db
             .load_messages_before_window("mika", CONTEXT_WINDOW)
             .unwrap();
-        // Should have (total - CONTEXT_WINDOW) messages to compact
         assert_eq!(old.len(), total - CONTEXT_WINDOW);
     }
 
     #[test]
     fn test_replace_with_summary_preserves_recent() {
-        let db = test_db();
+        let (db, sid) = test_db_with_session();
         for i in 0..60 {
-            db.save_message("mika", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("msg {i}"))
                 .unwrap();
         }
 
@@ -223,23 +224,20 @@ mod tests {
         db.replace_with_summary("mika", "Compacted summary", highest_id)
             .unwrap();
 
-        // Recent messages should still be there
-        let recent = db.load_recent_messages("mika", 30, None).unwrap();
+        let recent = db.load_recent_messages("mika", 30).unwrap();
         assert_eq!(recent.len(), CONTEXT_WINDOW);
         assert_eq!(recent[0].content, "msg 40");
 
-        // Summary should exist
         let summary = db.load_conversation_summary("mika").unwrap().unwrap();
         assert_eq!(summary.content, "Compacted summary");
     }
 
     #[test]
     fn test_incremental_compaction() {
-        let db = test_db();
+        let (db, sid) = test_db_with_session();
 
-        // First round: 60 messages
         for i in 0..60 {
-            db.save_message("mika", "user", &format!("batch1 msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("batch1 msg {i}"))
                 .unwrap();
         }
 
@@ -250,17 +248,14 @@ mod tests {
         db.replace_with_summary("mika", "First summary", highest_id)
             .unwrap();
 
-        // Add more messages to trigger second compaction
         for i in 0..40 {
-            db.save_message("mika", "user", &format!("batch2 msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("batch2 msg {i}"))
                 .unwrap();
         }
 
-        // Should now have 60 messages (20 kept + 40 new)
         let total = db.count_messages("mika").unwrap();
         assert_eq!(total, 60);
 
-        // Second compaction
         let old = db
             .load_messages_before_window("mika", CONTEXT_WINDOW)
             .unwrap();
@@ -269,11 +264,9 @@ mod tests {
         db.replace_with_summary("mika", "Merged summary", highest_id)
             .unwrap();
 
-        // After second compaction, only CONTEXT_WINDOW messages remain
-        let remaining = db.load_recent_messages("mika", 100, None).unwrap();
+        let remaining = db.load_recent_messages("mika", 100).unwrap();
         assert_eq!(remaining.len(), CONTEXT_WINDOW);
 
-        // Summary is the latest one
         let summary = db.load_conversation_summary("mika").unwrap().unwrap();
         assert_eq!(summary.content, "Merged summary");
     }

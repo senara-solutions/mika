@@ -195,6 +195,19 @@ impl TaskDispatcher {
         let session_id = format!("skill-{}-{}", skill_name, uuid::Uuid::new_v4());
         info!(task_id = %task.id, skill = skill_name, session_id = %session_id, "running skill task");
 
+        if let Err(e) = self
+            .db
+            .create_session_with_metadata(
+                &session_id,
+                &task.agent_id,
+                "system",
+                Some(r#"{"trigger": "skill_run"}"#),
+            )
+            .await
+        {
+            warn!(session_id = %session_id, error = %e, "failed to create session for skill run");
+        }
+
         let params = SilentAgentParams {
             db: &self.db,
             claude: &self.claude,
@@ -250,6 +263,19 @@ impl TaskDispatcher {
 
         let session_id = format!("callback-{}", uuid::Uuid::new_v4());
         info!(task_id = %task.id, session_id = %session_id, label = %task.label, "resuming agent for callback task");
+
+        if let Err(e) = self
+            .db
+            .create_session_with_metadata(
+                &session_id,
+                &task.agent_id,
+                "system",
+                Some(r#"{"trigger": "callback"}"#),
+            )
+            .await
+        {
+            warn!(session_id = %session_id, error = %e, "failed to create session for callback");
+        }
 
         let params = SilentAgentParams {
             db: &self.db,
@@ -410,6 +436,19 @@ impl TaskDispatcher {
         let session_id = format!("heartbeat-{}", uuid::Uuid::new_v4());
         info!(task_id = %task.id, session_id = %session_id, "running heartbeat");
 
+        if let Err(e) = self
+            .db
+            .create_session_with_metadata(
+                &session_id,
+                &task.agent_id,
+                "system",
+                Some(r#"{"trigger": "heartbeat"}"#),
+            )
+            .await
+        {
+            warn!(session_id = %session_id, error = %e, "failed to create session for heartbeat");
+        }
+
         let params = SilentAgentParams {
             db: &self.db,
             claude: &self.claude,
@@ -489,7 +528,7 @@ impl TaskDispatcher {
         let midnight_unix = crate::db::today_midnight_utc(&tz_str).timestamp();
         let conversations = self
             .db
-            .get_conversations_since(midnight_unix)
+            .get_messages_since(midnight_unix)
             .await
             .unwrap_or_default();
         if conversations.is_empty() {
@@ -517,6 +556,19 @@ impl TaskDispatcher {
             .to_string();
         let session_id = format!("reflection-{today_str}");
         info!(task_id = %task.id, session_id = %session_id, "running daily reflection");
+
+        if let Err(e) = self
+            .db
+            .create_session_with_metadata(
+                &session_id,
+                &task.agent_id,
+                "system",
+                Some(r#"{"trigger": "reflection"}"#),
+            )
+            .await
+        {
+            warn!(session_id = %session_id, error = %e, "failed to create session for reflection");
+        }
 
         let params = SilentAgentParams {
             db: &self.db,

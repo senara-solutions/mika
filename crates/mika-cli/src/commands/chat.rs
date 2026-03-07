@@ -53,6 +53,13 @@ async fn spawn_agent_worker(
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
     let session_id = Uuid::new_v4().to_string();
+    if let Err(e) = ctx
+        .async_db
+        .create_session(&session_id, ctx.async_db.agent_id(), "cli")
+        .await
+    {
+        tracing::warn!(error = %e, "failed to create session");
+    }
     let mut tool_registry = tools::default_tools();
     for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
         tool_registry.register(tool);
@@ -242,9 +249,9 @@ async fn spawn_agent_worker(
                     .to_string();
                     let _ = worker_db
                         .save_message_with_metadata(
+                            &worker_session,
                             "tool_result",
                             &result,
-                            "callback",
                             Some(&metadata),
                         )
                         .await;
@@ -364,20 +371,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     );
 
     // Load recent conversation history so the user sees prior messages on restart
-    if let Ok(history) = worker
-        ._ctx
-        .async_db
-        .load_recent_messages(
-            20,
-            Some(
-                crate::tui::app::POLLED_CHANNELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
-        )
-        .await
-    {
+    if let Ok(history) = worker._ctx.async_db.load_recent_messages(20).await {
         for msg in history {
             let role = match msg.role.as_str() {
                 "user" => ChatRole::User,
@@ -630,32 +624,9 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         team_db,
     );
 
-    // Insert session boundary marker so different TUI sessions are visually separated
-    app.db
-        .save_message("system", "--- New team session ---", "team")
-        .await
-        .ok();
-
-    // Load recent conversations from DB
-    if let Ok(history) = app
-        .db
-        .load_recent_messages(20, Some(vec!["team".into()]))
-        .await
-    {
-        for msg in history {
-            let role = match msg.role.as_str() {
-                "user" => ChatRole::User,
-                "assistant" => ChatRole::Assistant,
-                _ => ChatRole::System,
-            };
-            app.messages.push(ChatMessage {
-                role,
-                content: msg.content,
-                rendered: None,
-                channel: None,
-            });
-        }
-    }
+    // Team mode: skip history loading. Team conversations are goal-driven —
+    // each goal triggers a full team run. The shared container DB contains
+    // regular agent messages that should not appear in the team TUI.
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

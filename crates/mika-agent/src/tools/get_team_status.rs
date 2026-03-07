@@ -108,7 +108,7 @@ impl Tool for GetTeamStatusTool {
         }
 
         // Load messages for this run
-        if let Ok(messages) = db.load_team_messages(&run.id).await
+        if let Ok(messages) = db.load_team_workspace(&run.id).await
             && !messages.is_empty()
         {
             writeln!(out, "\nMessages ({}):", messages.len()).unwrap();
@@ -125,7 +125,7 @@ impl Tool for GetTeamStatusTool {
                 writeln!(
                     out,
                     "  - [{}] {agent} (iter {}): {}",
-                    msg.message_type, msg.iteration, preview
+                    msg.entry_type, msg.iteration, preview
                 )
                 .unwrap();
             }

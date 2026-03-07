@@ -13,8 +13,10 @@ pub mod test_helpers {
     }
 
     /// Create an async database for tool/agent tests.
+    /// Pre-creates a "test-session" session for agent "mika" so FK constraints are satisfied.
     pub fn test_async_db() -> AsyncDatabase {
         let db = Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
         AsyncDatabase::new(db)
     }
 
@@ -70,6 +72,11 @@ pub mod test_helpers {
         /// Create a harness with a specific agent ID.
         pub fn with_agent(agent_id: &str) -> Self {
             let db = Database::open_in_memory().unwrap();
+            // Ensure the agent exists (default "mika" is seeded by migrate)
+            if agent_id != "mika" {
+                db.register_agent(agent_id, agent_id, "").unwrap();
+            }
+            db.create_session("test-session", agent_id, "cli").unwrap();
             Self {
                 db: AsyncDatabase::new_with_agent(db, agent_id),
                 counter: AtomicU32::new(0),

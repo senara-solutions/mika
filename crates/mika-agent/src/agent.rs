@@ -94,31 +94,26 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
 }
 
 /// Parameterizes behavioral differences between the three agent loop variants.
-enum LoopMode<'a> {
+enum LoopMode {
     /// Standard conversation: captures thinking, tracks usage, saves to DB, follows up on empty.
-    Conversation { channel_type: &'a str },
+    Conversation,
     /// Silent background task: saves to DB but no thinking/usage/follow-up.
-    Silent { channel_type: &'a str },
+    Silent,
     /// Team sub-agent: follows up on empty but no thinking/usage/DB saves.
     Team,
 }
 
-impl LoopMode<'_> {
+impl LoopMode {
     fn is_conversation(&self) -> bool {
-        matches!(self, Self::Conversation { .. })
+        matches!(self, Self::Conversation)
     }
 
     fn follow_up_on_empty(&self) -> bool {
-        matches!(self, Self::Conversation { .. } | Self::Team)
+        matches!(self, Self::Conversation | Self::Team)
     }
 
-    fn channel_type(&self) -> Option<&str> {
-        match self {
-            Self::Conversation { channel_type } | Self::Silent { channel_type } => {
-                Some(channel_type)
-            }
-            Self::Team => None,
-        }
+    fn saves_to_db(&self) -> bool {
+        matches!(self, Self::Conversation | Self::Silent)
     }
 
     fn max_steps(&self) -> usize {
@@ -130,8 +125,8 @@ impl LoopMode<'_> {
 
     fn label(&self) -> &'static str {
         match self {
-            Self::Conversation { .. } => "agent",
-            Self::Silent { .. } => "silent agent",
+            Self::Conversation => "agent",
+            Self::Silent => "silent agent",
             Self::Team => "team agent",
         }
     }
@@ -332,7 +327,8 @@ async fn run_loop(
     skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
     request: &mut MessagesRequest,
-    mode: &LoopMode<'_>,
+    mode: &LoopMode,
+    session_id: &str,
     db: &AsyncDatabase,
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
@@ -342,7 +338,6 @@ async fn run_loop(
     let mut last_usage = None;
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
-    let channel_type = mode.channel_type();
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -351,7 +346,6 @@ async fn run_loop(
         debug!(
             step,
             label = mode.label(),
-            channel_type,
             messages_len = request.messages.len(),
             "agent_step"
         );
@@ -362,7 +356,7 @@ async fn run_loop(
         }
 
         // Nudge the model to wrap up when approaching the step limit
-        if matches!(mode, LoopMode::Conversation { .. } | LoopMode::Team)
+        if matches!(mode, LoopMode::Conversation | LoopMode::Team)
             && step == max_steps - 2
             && let Some(ref mut system) = request.system
         {
@@ -387,12 +381,17 @@ async fn run_loop(
                 let text = response.text();
 
                 if !text.is_empty() {
-                    if let Some(ct) = channel_type {
+                    if mode.saves_to_db() {
                         let metadata = tool_calls_metadata_json(&all_tool_summaries);
-                        db.save_message_with_metadata("assistant", &text, ct, metadata.as_deref())
-                            .await?;
+                        db.save_message_with_metadata(
+                            session_id,
+                            "assistant",
+                            &text,
+                            metadata.as_deref(),
+                        )
+                        .await?;
                     }
-                    info!(step, stop_reason = ?response.stop_reason, label = mode.label(), channel_type, "agent done");
+                    info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult {
                         text: Some(text),
                         thinking: thinking_text,
@@ -404,7 +403,7 @@ async fn run_loop(
                 }
 
                 if !mode.follow_up_on_empty() {
-                    info!(step, label = mode.label(), channel_type, "agent done");
+                    info!(step, label = mode.label(), "agent done");
                     return Ok(LoopResult {
                         text: None,
                         thinking: None,
@@ -422,7 +421,6 @@ async fn run_loop(
                         step,
                         stop_reason = ?response.stop_reason,
                         label = mode.label(),
-                        channel_type,
                         "injecting follow-up after empty tool response"
                     );
                     request.messages.push(Message {
@@ -442,11 +440,10 @@ async fn run_loop(
                     warn!(
                         step,
                         label = mode.label(),
-                        channel_type,
                         "agent returned empty text after follow-up"
                     );
                 }
-                info!(step, stop_reason = ?response.stop_reason, label = mode.label(), channel_type, "agent done");
+                info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                 return Ok(LoopResult {
                     text: None,
                     thinking: thinking_text,
@@ -477,7 +474,7 @@ async fn run_loop(
 
     warn!(
         label = mode.label(),
-        max_steps, channel_type, "agent exceeded max tool steps"
+        max_steps, "agent exceeded max tool steps"
     );
     Ok(LoopResult {
         text: None,
@@ -596,7 +593,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
     };
     params
         .db
-        .save_message("user", &save_text, params.channel_type)
+        .save_message(params.session_id, "user", &save_text)
         .await?;
 
     let agent_name = params
@@ -645,7 +642,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
             params
                 .db
-                .save_message("assistant", fallback, params.channel_type)
+                .save_message(params.session_id, "assistant", fallback)
                 .await?;
             Ok(AgentOutput {
                 text: Some(fallback.to_string()),
@@ -661,7 +658,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let db = params.db;
     let claude = params.claude;
     let tools = params.tools;
-    let channel_type = params.channel_type;
+    let session_id = params.session_id;
 
     let ctx = load_agent_context(db, params.home_dir).await?;
 
@@ -704,7 +701,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
 
-    let history = db.load_recent_messages(20, None).await?;
+    let history = db.load_recent_messages(20).await?;
 
     // Build initial message list from history.
     // The last message in history is the user message we just saved.
@@ -796,7 +793,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         thinking: params.thinking.clone(),
     };
 
-    let mode = LoopMode::Conversation { channel_type };
+    let mode = LoopMode::Conversation;
     let lr_ctx = if params.is_callback_turn {
         None
     } else {
@@ -814,6 +811,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         &tool_ctx,
         &mut request,
         &mode,
+        session_id,
         db,
         params.mcp_manager,
         lr_ctx.as_ref(),
@@ -876,7 +874,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         };
 
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata("assistant", &text, channel_type, metadata.as_deref())
+        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref())
             .await?;
         return Ok(AgentOutput {
             text: Some(text),
@@ -1142,7 +1140,7 @@ pub struct SilentAgentParams<'a> {
 /// The agent must use `send_message` tool to contact the user.
 /// If no `send_message` call is made, the run is a silent no-op.
 pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
-    let channel_type = match &params.trigger {
+    let trigger_label = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
         SilentTrigger::Callback { .. } => "callback",
@@ -1153,12 +1151,12 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         "agent_turn",
         agent = %params.home_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
         mode = "silent",
-        trigger = %channel_type,
+        trigger = %trigger_label,
     );
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_silent_inner(params, channel_type).instrument(silent_span),
+        run_silent_inner(params).instrument(silent_span),
     )
     .await;
 
@@ -1167,7 +1165,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         Err(_elapsed) => {
             warn!(
                 timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
-                channel_type, "silent agent timeout exceeded"
+                trigger_label, "silent agent timeout exceeded"
             );
             // Record failed reflection run on timeout
             if matches!(&params.trigger, SilentTrigger::Reflection) {
@@ -1181,7 +1179,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     }
 }
 
-async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) -> Result<()> {
+async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let db = params.db;
     let claude = params.claude;
     let tools = params.tools;
@@ -1199,7 +1197,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
             let midnight_unix = crate::db::today_midnight_utc(&tz_str).timestamp();
 
             // Load today's conversations (capped at 50,000 chars)
-            let conversations = db.get_conversations_since(midnight_unix).await?;
+            let conversations = db.get_messages_since(midnight_unix).await?;
             let conv_digest = if conversations.is_empty() {
                 None
             } else {
@@ -1370,7 +1368,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         thinking: None,
     };
 
-    let mode = LoopMode::Silent { channel_type };
+    let mode = LoopMode::Silent;
     run_loop(
         claude,
         tools,
@@ -1379,6 +1377,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, channel_type: &str) ->
         &tool_ctx,
         &mut request,
         &mode,
+        params.session_id,
         db,
         None, // MCP tools excluded from silent mode
         None, // long_running not supported in silent mode
@@ -1569,6 +1568,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         &tool_ctx,
         &mut request,
         &mode,
+        params.session_id,
         params.db,
         params.mcp_manager,
         None, // long_running: team agents will be wired in Phase 4
@@ -1621,7 +1621,10 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         // Auto-complete child task if this agent was spawned as part of a team task tree
         if let Some(task_id) = params.child_task_id {
             match params.db.update_task_completed(task_id, Some(&text)).await {
-                Ok(false) => warn!(task_id, "child task completion had no effect (already completed or agent_id mismatch)"),
+                Ok(false) => warn!(
+                    task_id,
+                    "child task completion had no effect (already completed or agent_id mismatch)"
+                ),
                 Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
                 Ok(true) => {}
             }
@@ -1633,8 +1636,15 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     // Auto-complete child task if this agent was spawned as part of a team task tree
     if let Some(task_id) = params.child_task_id {
         let result_text = result.text.as_deref().unwrap_or("");
-        match params.db.update_task_completed(task_id, Some(result_text)).await {
-            Ok(false) => warn!(task_id, "child task completion had no effect (already completed or agent_id mismatch)"),
+        match params
+            .db
+            .update_task_completed(task_id, Some(result_text))
+            .await
+        {
+            Ok(false) => warn!(
+                task_id,
+                "child task completion had no effect (already completed or agent_id mismatch)"
+            ),
             Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
             Ok(true) => {}
         }
@@ -1709,23 +1719,19 @@ mod tests {
 
     #[test]
     fn test_loop_mode_conversation_properties() {
-        let mode = LoopMode::Conversation {
-            channel_type: "cli",
-        };
+        let mode = LoopMode::Conversation;
         assert!(mode.is_conversation());
         assert!(mode.follow_up_on_empty());
-        assert_eq!(mode.channel_type(), Some("cli"));
+        assert!(mode.saves_to_db());
         assert_eq!(mode.label(), "agent");
     }
 
     #[test]
     fn test_loop_mode_silent_properties() {
-        let mode = LoopMode::Silent {
-            channel_type: "heartbeat",
-        };
+        let mode = LoopMode::Silent;
         assert!(!mode.is_conversation());
         assert!(!mode.follow_up_on_empty());
-        assert_eq!(mode.channel_type(), Some("heartbeat"));
+        assert!(mode.saves_to_db());
         assert_eq!(mode.label(), "silent agent");
     }
 
@@ -1734,7 +1740,7 @@ mod tests {
         let mode = LoopMode::Team;
         assert!(!mode.is_conversation());
         assert!(mode.follow_up_on_empty());
-        assert_eq!(mode.channel_type(), None);
+        assert!(!mode.saves_to_db());
         assert_eq!(mode.label(), "team agent");
     }
 
@@ -2119,15 +2125,15 @@ mod tests {
         let db = test_async_db();
         let metadata = r#"{"tool_calls":[{"step":0,"name":"search_memory","input_summary":"q","output_summary":"found","success":true}]}"#;
         db.save_message_with_metadata(
+            "test-session",
             "assistant",
             "I searched your memory.",
-            "cli",
             Some(metadata),
         )
         .await
         .unwrap();
 
-        let messages = db.load_recent_messages(10, None).await.unwrap();
+        let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "I searched your memory.");
@@ -2137,9 +2143,11 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_without_metadata_loads_as_none() {
         let db = test_async_db();
-        db.save_message("user", "Hello", "cli").await.unwrap();
+        db.save_message("test-session", "user", "Hello")
+            .await
+            .unwrap();
 
-        let messages = db.load_recent_messages(10, None).await.unwrap();
+        let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].metadata.is_none());
     }
@@ -2147,11 +2155,11 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_with_null_metadata() {
         let db = test_async_db();
-        db.save_message_with_metadata("assistant", "No tools used.", "cli", None)
+        db.save_message_with_metadata("test-session", "assistant", "No tools used.", None)
             .await
             .unwrap();
 
-        let messages = db.load_recent_messages(10, None).await.unwrap();
+        let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].metadata.is_none());
     }
