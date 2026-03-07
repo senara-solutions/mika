@@ -1620,7 +1620,11 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
         // Auto-complete child task if this agent was spawned as part of a team task tree
         if let Some(task_id) = params.child_task_id {
-            let _ = params.db.update_task_completed(task_id, Some(&text)).await;
+            match params.db.update_task_completed(task_id, Some(&text)).await {
+                Ok(false) => warn!(task_id, "child task completion had no effect (already completed or agent_id mismatch)"),
+                Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
+                Ok(true) => {}
+            }
         }
 
         return Ok(Some(text));
@@ -1629,10 +1633,11 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     // Auto-complete child task if this agent was spawned as part of a team task tree
     if let Some(task_id) = params.child_task_id {
         let result_text = result.text.as_deref().unwrap_or("");
-        let _ = params
-            .db
-            .update_task_completed(task_id, Some(result_text))
-            .await;
+        match params.db.update_task_completed(task_id, Some(result_text)).await {
+            Ok(false) => warn!(task_id, "child task completion had no effect (already completed or agent_id mismatch)"),
+            Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
+            Ok(true) => {}
+        }
     }
 
     Ok(result.text)

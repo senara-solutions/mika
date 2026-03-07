@@ -553,16 +553,21 @@ fn spawn_long_running_exec(
             Ok(child) => child,
             Err(e) => {
                 warn!(task_id = %task_id, error = %e, "failed to spawn long-running exec");
-                let _ = db
+                if let Err(db_err) = db
                     .update_task_failed(&task_id, &format!("spawn failed: {e}"))
-                    .await;
+                    .await
+                {
+                    warn!(task_id = %task_id, error = %db_err, "failed to mark spawn-failed task in DB");
+                }
                 return;
             }
         };
 
         // Record PID
-        if let Some(pid) = child.id() {
-            let _ = db.set_task_process_id(&task_id, Some(pid as i64)).await;
+        if let Some(pid) = child.id()
+            && let Err(e) = db.set_task_process_id(&task_id, Some(pid as i64)).await
+        {
+            warn!(task_id = %task_id, error = %e, "failed to record process ID for long-running task");
         }
 
         // Write input JSON to stdin
@@ -587,9 +592,12 @@ fn spawn_long_running_exec(
             Ok(s) => s,
             Err(e) => {
                 warn!(task_id = %task_id, error = %e, "failed to wait on long-running exec");
-                let _ = db
+                if let Err(db_err) = db
                     .update_task_failed(&task_id, &format!("wait failed: {e}"))
-                    .await;
+                    .await
+                {
+                    warn!(task_id = %task_id, error = %db_err, "failed to mark wait-failed task in DB");
+                }
                 return;
             }
         };
@@ -611,7 +619,9 @@ fn spawn_long_running_exec(
                 truncate_output(&stderr_text)
             );
             warn!(task_id = %task_id, exit_code, "long-running exec failed");
-            let _ = db.update_task_failed(&task_id, &err_msg).await;
+            if let Err(db_err) = db.update_task_failed(&task_id, &err_msg).await {
+                warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB");
+            }
         }
         // If success, the script called `mika ask --task-id` which completes the task.
         // If the script didn't call it, the task will eventually expire via timeout_at.

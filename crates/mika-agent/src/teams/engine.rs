@@ -740,7 +740,7 @@ impl TeamEngine {
 
         for input in &mut inputs {
             let child_task = crate::db::NewTask {
-                agent_id: self.team_db.agent_id.clone(),
+                agent_id: input.agent_name.clone(),
                 team_run_id: Some(self.run.run_id.clone()),
                 parent_task_id: Some(parent_task_id.clone()),
                 depth: 1,
