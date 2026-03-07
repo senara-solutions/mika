@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-use mika_agent::agent::{self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent};
+use mika_agent::agent::{
+    self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent,
+};
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 

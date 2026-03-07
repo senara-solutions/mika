@@ -1467,11 +1467,7 @@ impl Database {
             && entry.value == "No interaction history yet."
         {
             let display_name = self.get_agent_display_name(agent_id);
-            self.set_core_memory(
-                agent_id,
-                "self_model",
-                &default_self_model(&display_name),
-            )?;
+            self.set_core_memory(agent_id, "self_model", &default_self_model(&display_name))?;
         }
         if let Some(md) = user_md_content
             && !md.trim().is_empty()
