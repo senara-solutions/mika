@@ -228,6 +228,7 @@ pub async fn handle_message(
                 skills_dirty: &a.skills_dirty,
                 mcp_manager: a.mcp_manager.as_ref(),
                 global_home_dir: Some(&s.global_home_dir),
+                is_callback_turn: false,
             };
 
             match agent::run_agent(&params).await {

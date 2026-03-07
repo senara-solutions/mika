@@ -122,6 +122,7 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
         skills_dirty: &skills_dirty,
         mcp_manager: mcp_manager.as_ref(),
         global_home_dir: Some(&ctx.global_home),
+        is_callback_turn: false,
     })
     .await?;
 
