@@ -4,9 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-use mika_agent::agent::{
-    self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent,
-};
+use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 
@@ -41,9 +39,8 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
         );
     }
 
-    // If --task-id is provided, mark the task as completed and run silent agent
-    // with the callback trigger. This prevents the agent from spawning new
-    // long-running tasks (silent mode filters out exec/http handlers).
+    // If --task-id is provided, mark the task as completed and exit.
+    // The TUI tick loop (or server dispatcher) handles delivery to the user.
     if let Some(tid) = task_id {
         let task = match ctx.async_db.get_task(tid).await {
             Ok(Some(task)) => task,
@@ -80,29 +77,6 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
                 tid
             );
         }
-
-        let tool_registry = Arc::new(tools::default_tools());
-        let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
-        let skills_dirty = AtomicBool::new(false);
-
-        run_silent_agent(&SilentAgentParams {
-            db: &ctx.async_db,
-            claude: &ctx.claude,
-            tools: &tool_registry,
-            skills: &skill_registry,
-            trigger: SilentTrigger::Callback {
-                task_id: tid.to_string(),
-                label: task.label,
-                result: user_message,
-            },
-            home_dir: &ctx.home_dir,
-            session_id: &session_id,
-            message_sender,
-            embedding_client: embedding_client.as_ref(),
-            brave_api_key: ctx.settings.brave_api_key.as_deref(),
-            skills_dirty: &skills_dirty,
-        })
-        .await?;
 
         // Check if all siblings are done and parent task should be dispatched.
         // In CLI one-shot mode we can't run the dispatcher, but we mark the
