@@ -18,14 +18,12 @@ static ARCHITECTURE_OVERVIEW: &str =
     include_str!(concat!(env!("OUT_DIR"), "/docs/architecture.md"));
 
 /// Embedded documentation files (topic → content).
-static DOC_CONFIGURATION: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/docs/configuration.md"));
+static DOC_CONFIGURATION: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/configuration.md"));
 static DOC_DEPLOYMENT: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/deployment.md"));
 static DOC_GETTING_STARTED: &str =
     include_str!(concat!(env!("OUT_DIR"), "/docs/getting-started.md"));
 static DOC_SKILLS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/skills.md"));
-static DOC_SLASH_COMMANDS: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/docs/slash-commands.md"));
+static DOC_SLASH_COMMANDS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/slash-commands.md"));
 
 /// Known builtin function names, used for startup validation.
 pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "web_search"];
@@ -238,7 +236,10 @@ mod tests {
             let input = serde_json::json!({"topic": topic});
             let output = get_documentation(&input, &ctx).await;
             assert!(!output.is_error, "topic {topic} should succeed");
-            assert!(!output.content.is_empty(), "topic {topic} should have content");
+            assert!(
+                !output.content.is_empty(),
+                "topic {topic} should have content"
+            );
         }
     }
 
