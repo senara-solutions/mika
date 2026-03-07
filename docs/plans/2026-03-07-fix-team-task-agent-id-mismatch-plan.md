@@ -1,7 +1,7 @@
 ---
 title: "Fix team task agent_id mismatch causing orphaned pending tasks"
 type: fix
-status: active
+status: completed
 date: 2026-03-07
 ---
 
