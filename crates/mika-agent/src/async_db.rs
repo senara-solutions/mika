@@ -312,15 +312,13 @@ impl AsyncDatabase {
         task_id: &str,
     ) -> Result<Option<String>> {
         let i = task_id.to_owned();
-        let a = self.agent_id.clone();
-        self.with_db(move |db| db.try_complete_parent_on_sibling_done(&i, &a))
+        self.with_db(move |db| db.try_complete_parent_on_sibling_done(&i))
             .await
     }
 
     pub async fn get_child_tasks(&self, parent_task_id: &str) -> Result<Vec<Task>> {
         let p = parent_task_id.to_owned();
-        let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_child_tasks(&p, &a)).await
+        self.with_db(move |db| db.get_child_tasks(&p)).await
     }
 
     pub async fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {

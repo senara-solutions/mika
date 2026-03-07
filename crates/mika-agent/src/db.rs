@@ -1033,7 +1033,7 @@ impl Database {
     pub fn get_expired_child_task_ids(&self, agent_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id FROM tasks t
-             JOIN tasks p ON t.parent_task_id = p.id AND p.agent_id = t.agent_id
+             JOIN tasks p ON t.parent_task_id = p.id
              WHERE t.agent_id = ?1
                AND t.status = 'expired'
                AND t.parent_task_id IS NOT NULL
@@ -1164,15 +1164,15 @@ impl Database {
     pub fn try_complete_parent_on_sibling_done(
         &self,
         task_id: &str,
-        agent_id: &str,
     ) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
 
-        // 1. Get parent_task_id for this task
+        // 1. Get parent_task_id for this task (no agent_id filter — parent-child
+        //    relationships are structural, and team task trees have mixed agent_ids)
         let parent_id: Option<String> = tx
             .query_row(
-                "SELECT parent_task_id FROM tasks WHERE id = ?1 AND agent_id = ?2",
-                params![task_id, agent_id],
+                "SELECT parent_task_id FROM tasks WHERE id = ?1",
+                params![task_id],
                 |row| row.get(0),
             )
             .optional()?
@@ -1183,12 +1183,13 @@ impl Database {
             None => return Ok(None),
         };
 
-        // 2. Count incomplete siblings (same parent, not in terminal state)
+        // 2. Count incomplete siblings (same parent, not in terminal state).
+        // No agent_id filter — siblings in a team task tree have different agent_ids.
         let incomplete: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE parent_task_id = ?1 AND agent_id = ?2
+             WHERE parent_task_id = ?1
              AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
-            params![&parent_id, agent_id],
+            params![&parent_id],
             |row| row.get(0),
         )?;
 
@@ -1197,11 +1198,12 @@ impl Database {
             return Ok(None);
         }
 
-        // 3. Atomically claim parent task (only if still pending)
+        // 3. Atomically claim parent task (only if still pending).
+        // No agent_id filter — the parent may have a different agent_id than children.
         let changed = tx.execute(
             "UPDATE tasks SET status = 'in_progress', fired_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ?1 AND agent_id = ?2 AND status = 'pending'",
-            params![&parent_id, agent_id],
+             WHERE id = ?1 AND status = 'pending'",
+            params![&parent_id],
         )?;
 
         tx.commit()?;
@@ -1214,16 +1216,17 @@ impl Database {
     }
 
     /// Get all child tasks for a given parent task.
-    pub fn get_child_tasks(&self, parent_task_id: &str, agent_id: &str) -> Result<Vec<Task>> {
+    /// No agent_id filter — team task trees have children with different agent_ids.
+    pub fn get_child_tasks(&self, parent_task_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
-             WHERE parent_task_id = ?1 AND agent_id = ?2
+             WHERE parent_task_id = ?1
              ORDER BY created_at ASC",
             Self::TASK_COLUMNS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![parent_task_id, agent_id], Self::row_to_task)?
+            .query_map(params![parent_task_id], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -3461,7 +3464,7 @@ mod tests {
         db.update_task_completed(&c2_id, "mika", Some("done"))
             .unwrap();
         assert_eq!(
-            db.try_complete_parent_on_sibling_done(&c2_id, "mika")
+            db.try_complete_parent_on_sibling_done(&c2_id)
                 .unwrap(),
             None
         );
@@ -3470,7 +3473,7 @@ mod tests {
         db.update_task_completed(&c3_id, "mika", Some("done"))
             .unwrap();
         let result = db
-            .try_complete_parent_on_sibling_done(&c3_id, "mika")
+            .try_complete_parent_on_sibling_done(&c3_id)
             .unwrap();
         assert_eq!(result, Some(parent_id));
     }
@@ -3480,7 +3483,7 @@ mod tests {
         let db = db();
         let task_id = db.create_task(&make_task("orphan")).unwrap();
         assert_eq!(
-            db.try_complete_parent_on_sibling_done(&task_id, "mika")
+            db.try_complete_parent_on_sibling_done(&task_id)
                 .unwrap(),
             None
         );
@@ -3504,7 +3507,7 @@ mod tests {
             .unwrap();
         db.update_task_failed(&c2_id, "mika", "error").unwrap();
         let result = db
-            .try_complete_parent_on_sibling_done(&c2_id, "mika")
+            .try_complete_parent_on_sibling_done(&c2_id)
             .unwrap();
         assert_eq!(result, Some(parent_id));
     }
@@ -3522,7 +3525,7 @@ mod tests {
         c2.parent_task_id = Some(parent_id.clone());
         db.create_task(&c2).unwrap();
 
-        let children = db.get_child_tasks(&parent_id, "mika").unwrap();
+        let children = db.get_child_tasks(&parent_id).unwrap();
         assert_eq!(children.len(), 2);
     }
 
