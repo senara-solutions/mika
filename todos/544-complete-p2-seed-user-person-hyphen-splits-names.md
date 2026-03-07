@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "544"
 tags: [code-review, bugfix, agent]

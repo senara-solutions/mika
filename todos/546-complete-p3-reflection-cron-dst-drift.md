@@ -1,6 +1,6 @@
 ---
-status: pending
-priority: p2
+status: complete
+priority: p3
 issue_id: "546"
 tags: [code-review, correctness, task-engine]
 dependencies: []
@@ -50,9 +50,13 @@ Example: User wants reflection at 20:00 America/New_York.
 
 - **Affected files:** `crates/mika-agent/src/task_engine/mod.rs`, potentially `cron.rs`
 
+## Recommended Action
+
+Option B: Accept 1-hour drift, add a code comment documenting the known limitation. Daily reflections have no hard timing requirement and containers restart frequently.
+
 ## Acceptance Criteria
 
-- [ ] Reflection fires at the configured local time regardless of DST state
+- [ ] Code comment added to `reflection_cron_for_agent` documenting DST drift limitation
 
 ## Work Log
 
