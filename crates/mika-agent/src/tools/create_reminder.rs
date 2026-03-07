@@ -62,9 +62,8 @@ impl Tool for CreateReminderTool {
             )));
         }
 
-        let action_config = serde_json::json!({"text": message}).to_string();
-
-        if !cron_expr_input.is_empty() {
+        // Determine scheduling mode: periodic (cron) or one-shot (fire_at)
+        let (trigger_type, cron_expr, next_fire_at, display) = if !cron_expr_input.is_empty() {
             // Periodic reminder
             if cron_expr_input.len() > 128 {
                 return Ok(ToolOutput::error("'cron_expr' is too long."));
@@ -81,41 +80,25 @@ impl Tool for CreateReminderTool {
                 }
             };
 
-            let task = NewTask {
-                agent_id: ctx.db.agent_id.clone(),
-                team_run_id: None,
-                parent_task_id: None,
-                depth: 0,
-                label: message.to_string(),
-                trigger_type: "recurring".to_string(),
-                cron_expr: Some(cron_expr_input.to_string()),
-                event_source: None,
-                event_offset_secs: None,
-                condition_expr: None,
-                next_fire_at: Some(next_fire),
-                timeout_at: None,
-                action_type: "send_message".to_string(),
-                action_config,
-                input_context: None,
-                created_by_session: Some(ctx.session_id.to_string()),
-            };
+            // Reject cron expressions that fire more frequently than once per minute
+            const MIN_INTERVAL_SECS: i64 = 60;
+            if next_fire - now < MIN_INTERVAL_SECS {
+                // Check second interval to confirm (the first might be short due to alignment)
+                if let Ok(second_fire) = next_fire_from_cron(cron_expr_input, next_fire) {
+                    if second_fire - next_fire < MIN_INTERVAL_SECS {
+                        return Ok(ToolOutput::error(
+                            "Cron expression fires too frequently. Minimum interval is 1 minute.",
+                        ));
+                    }
+                }
+            }
 
-            let id = ctx.db.create_task(task).await?;
-
-            ctx.db
-                .log_memory_event(
-                    ctx.session_id,
-                    "create_reminder",
-                    &format!("task:{id}"),
-                    None,
-                    &format!("periodic ({cron_expr_input}) — {message}"),
-                    None,
-                )
-                .await?;
-
-            Ok(ToolOutput::success(format!(
-                "Periodic reminder {id} created (cron: {cron_expr_input})."
-            )))
+            (
+                "recurring",
+                Some(cron_expr_input.to_string()),
+                next_fire,
+                format!("periodic ({cron_expr_input})"),
+            )
         } else {
             // One-shot reminder
             if fire_at.is_empty() {
@@ -141,43 +124,50 @@ impl Tool for CreateReminderTool {
             }
 
             let timestamp = parsed.timestamp();
-            let task = NewTask {
-                agent_id: ctx.db.agent_id.clone(),
-                team_run_id: None,
-                parent_task_id: None,
-                depth: 0,
-                label: message.to_string(),
-                trigger_type: "time".to_string(),
-                cron_expr: None,
-                event_source: None,
-                event_offset_secs: None,
-                condition_expr: None,
-                next_fire_at: Some(timestamp),
-                timeout_at: None,
-                action_type: "send_message".to_string(),
-                action_config,
-                input_context: None,
-                created_by_session: Some(ctx.session_id.to_string()),
-            };
+            let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            ("time", None, timestamp, display_time)
+        };
 
-            let id = ctx.db.create_task(task).await?;
+        let action_config = serde_json::json!({"text": message}).to_string();
+        let task = NewTask {
+            agent_id: ctx.db.agent_id.clone(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: message.to_string(),
+            trigger_type: trigger_type.to_string(),
+            cron_expr,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(next_fire_at),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config,
+            input_context: None,
+            created_by_session: Some(ctx.session_id.to_string()),
+        };
 
-            let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC");
-            ctx.db
-                .log_memory_event(
-                    ctx.session_id,
-                    "create_reminder",
-                    &format!("task:{id}"),
-                    None,
-                    &format!("{display_time} — {message}"),
-                    None,
-                )
-                .await?;
+        let id = ctx.db.create_task(task).await?;
 
-            Ok(ToolOutput::success(format!(
-                "Reminder {id} scheduled for {display_time}."
-            )))
-        }
+        ctx.db
+            .log_memory_event(
+                ctx.session_id,
+                "create_reminder",
+                &format!("task:{id}"),
+                None,
+                &format!("{display} — {message}"),
+                None,
+            )
+            .await?;
+
+        let response = if trigger_type == "recurring" {
+            format!("Periodic reminder {id} created (cron: {display}).")
+        } else {
+            format!("Reminder {id} scheduled for {display}.")
+        };
+
+        Ok(ToolOutput::success(response))
     }
 }
 
@@ -317,6 +307,27 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid cron expression"));
+    }
+
+    #[tokio::test]
+    async fn test_create_recurring_reminder_too_frequent() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // Every second — should be rejected
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "cron_expr": "* * * * * *",
+                    "message": "Too frequent"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("too frequently"));
     }
 
     #[tokio::test]
