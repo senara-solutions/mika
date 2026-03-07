@@ -325,8 +325,7 @@ impl AsyncDatabase {
 
     pub async fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
         let r = team_run_id.to_owned();
-        let a = self.agent_id.clone();
-        self.with_db(move |db| db.count_pending_callback_tasks_by_team_run(&r, &a))
+        self.with_db(move |db| db.count_pending_callback_tasks_by_team_run(&r))
             .await
     }
 

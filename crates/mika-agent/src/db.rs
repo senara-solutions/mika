@@ -933,6 +933,7 @@ impl Database {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1 AND status IN ('pending','recurring_active')
+               AND trigger_type != 'callback'
              ORDER BY next_fire_at ASC NULLS LAST",
             Self::TASK_COLUMNS
         );
@@ -1232,16 +1233,14 @@ impl Database {
     pub fn count_pending_callback_tasks_by_team_run(
         &self,
         team_run_id: &str,
-        agent_id: &str,
     ) -> Result<i64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1
-               AND team_run_id = ?2
+             WHERE team_run_id = ?1
                AND trigger_type = 'callback'
                AND status = 'pending'
                AND depth > 1",
-            params![agent_id, team_run_id],
+            params![team_run_id],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -3589,7 +3588,7 @@ mod tests {
         db.create_task(&t4).unwrap();
 
         let count = db
-            .count_pending_callback_tasks_by_team_run("run123", "mika")
+            .count_pending_callback_tasks_by_team_run("run123")
             .unwrap();
         assert_eq!(count, 1); // only the pending depth=2 grandchild for run123
     }
