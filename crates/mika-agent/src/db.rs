@@ -1310,7 +1310,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
-              WHERE m.agent_id = ?1 AND m.role != 'summary'
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
         )?;
         let mut messages = stmt
@@ -2843,6 +2843,67 @@ mod tests {
         // Channel type comes from session JOIN
         assert!(msgs.iter().any(|m| m.channel_type == "telegram"));
         assert!(msgs.iter().any(|m| m.channel_type == "cli"));
+    }
+
+    #[test]
+    fn test_load_recent_messages_excludes_team() {
+        let db = db();
+        db.create_session("team-session", "mika", "team").unwrap();
+        db.create_session("cli-session", "mika", "cli").unwrap();
+        db.save_message("mika", "team-session", "assistant", "team msg")
+            .unwrap();
+        db.save_message("mika", "cli-session", "user", "cli msg")
+            .unwrap();
+
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "cli msg");
+        assert_eq!(msgs[0].channel_type, "cli");
+    }
+
+    #[test]
+    fn test_load_recent_messages_includes_telegram() {
+        let db = db();
+        db.create_session("tg-session", "mika", "telegram")
+            .unwrap();
+        db.save_message("mika", "tg-session", "user", "hello from telegram")
+            .unwrap();
+
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "hello from telegram");
+        assert_eq!(msgs[0].channel_type, "telegram");
+    }
+
+    #[test]
+    fn test_load_recent_messages_mixed_channels() {
+        let db = db();
+        db.create_session("cli-session", "mika", "cli").unwrap();
+        db.create_session("tg-session", "mika", "telegram")
+            .unwrap();
+        db.create_session("team-session", "mika", "team").unwrap();
+
+        db.save_message("mika", "cli-session", "user", "cli 1")
+            .unwrap();
+        db.save_message("mika", "team-session", "assistant", "team 1")
+            .unwrap();
+        db.save_message("mika", "tg-session", "user", "tg 1")
+            .unwrap();
+        db.save_message("mika", "team-session", "assistant", "team 2")
+            .unwrap();
+        db.save_message("mika", "cli-session", "user", "cli 2")
+            .unwrap();
+
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 3);
+        // Team messages excluded, cli and telegram present in chronological order
+        assert!(msgs.iter().all(|m| m.channel_type != "team"));
+        assert!(msgs.iter().any(|m| m.channel_type == "cli"));
+        assert!(msgs.iter().any(|m| m.channel_type == "telegram"));
+        // Chronological order (reversed from DESC query)
+        assert_eq!(msgs[0].content, "cli 1");
+        assert_eq!(msgs[1].content, "tg 1");
+        assert_eq!(msgs[2].content, "cli 2");
     }
 
     #[test]
