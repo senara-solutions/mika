@@ -490,10 +490,14 @@ Agent-created callback tasks follow this end-to-end pattern:
 1. Agent calls `create_task` with `trigger_type="callback"` and `action_type="resume_agent"`. Receives full UUID.
 2. Agent or background script does long-running work.
 3. External process completes the task via one of:
-   - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — agent runs first with result injected, then task marked complete
+   - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — marks task complete and exits (no silent agent run). TUI handles delivery.
    - **HTTP:** `POST /tasks/{id}/complete` with Bearer auth and `{"result": "..."}` body
 4. `update_task_completed` validates status (`AND status IN ('pending','in_progress')`) before writing — returns `false` if already completed (TOCTOU guard).
-5. `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }`. The result is wrapped in `<callback_result trust="untrusted">` delimiters before LLM injection to mitigate prompt injection.
+5. **Delivery** depends on the path:
+   - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }` → marks task `delivered` on success.
+   - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry.
+
+The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered`.
 
 ### SilentTrigger Variants
 
@@ -510,11 +514,16 @@ Agent-created callback tasks follow this end-to-end pattern:
 
 `prune_old_tasks()` runs at startup and deletes completed, failed, and cancelled tasks older than 30 days to prevent unbounded table growth.
 
-### Composite Partial Index
+### Key Indexes
 
 ```sql
+-- Scheduling efficiency
 CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC)
 WHERE status IN ('pending', 'recurring_active');
+
+-- TUI callback polling efficiency
+CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at)
+WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status = 'completed';
 ```
 
 
@@ -699,7 +708,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 1 (consolidated clean-slate baseline)
+**Schema version:** 2 (v1: consolidated clean-slate baseline; v2: adds `delivered` task status and `tool_result` conversation role)
 
 ### Tables
 
