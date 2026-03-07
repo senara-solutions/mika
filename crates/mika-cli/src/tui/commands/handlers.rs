@@ -201,7 +201,7 @@ async fn handle_memory_search(app: &mut App<'_>, query: &str) -> String {
 }
 
 async fn handle_reminders(app: &mut App<'_>) -> String {
-    let tasks = match app.db.get_pending_reminder_tasks().await {
+    let tasks = match app.db.get_user_visible_tasks().await {
         Ok(t) => t,
         Err(_) => return "Failed to load reminders.".to_string(),
     };

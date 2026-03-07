@@ -10,6 +10,7 @@ pub mod task_status {
     pub const CANCELLED: &str = "cancelled";
     pub const EXPIRED: &str = "expired";
     pub const RECURRING_ACTIVE: &str = "recurring_active";
+    pub const DELIVERED: &str = "delivered";
 }
 
 /// String constants for task action type values stored in the `tasks.action_type` column.

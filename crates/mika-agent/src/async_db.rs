@@ -266,16 +266,26 @@ impl AsyncDatabase {
         self.with_db(move |db| db.count_pending_tasks(&id)).await
     }
 
-    pub async fn get_pending_reminder_tasks(&self) -> Result<Vec<Task>> {
+    pub async fn get_user_visible_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.get_pending_reminder_tasks(&id))
-            .await
+        self.with_db(move |db| db.get_user_visible_tasks(&id)).await
     }
 
     pub async fn get_inject_context_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_inject_context_tasks(&id))
             .await
+    }
+
+    pub async fn get_undelivered_callback_tasks(&self, since_unix: i64) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_undelivered_callback_tasks(&id, since_unix))
+            .await
+    }
+
+    pub async fn mark_task_delivered(&self, task_id: &str) -> Result<bool> {
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.mark_task_delivered(&i)).await
     }
 
     pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {

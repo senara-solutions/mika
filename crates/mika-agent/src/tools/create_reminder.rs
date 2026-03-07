@@ -139,7 +139,7 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("scheduled"));
 
-        let reminders = harness.db.get_pending_reminder_tasks().await.unwrap();
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
         assert_eq!(reminders.len(), 1);
         assert_eq!(reminders[0].label, "Year-end review");
     }

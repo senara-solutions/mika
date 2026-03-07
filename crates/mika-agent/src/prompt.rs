@@ -109,6 +109,9 @@ pub struct PromptContext<'a> {
     /// Per-agent home directory (e.g. `~/.mika/agents/mika/`).
     /// Surfaced in the Tool Usage section so the agent knows write_file's base path.
     pub home_dir: Option<&'a Path>,
+    /// When set, this is a callback result turn. Injects a guard section telling the agent
+    /// to process the results directly and not spawn new long-running tasks.
+    pub callback_context: Option<&'a str>,
 }
 
 fn onboarding_prompt() -> String {
@@ -212,6 +215,18 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
             "These are your persistent memory blocks. Update them using the update_core_memory tool.",
         ),
     );
+
+    // Callback turn guard
+    if let Some(context) = ctx.callback_context {
+        prompt.push_str("## Callback Result Turn\n");
+        prompt.push_str(
+            "A background task has completed and the results are provided in the user message below.\n\
+             IMPORTANT: You MUST NOT submit new long-running tasks during this turn.\n\
+             Process the results and respond directly to the user with your analysis.\n\n",
+        );
+        prompt.push_str(context);
+        prompt.push_str("\n\n");
+    }
 
     // Instructions
     prompt.push_str("## Instructions\n");
@@ -506,6 +521,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -527,6 +543,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -554,6 +571,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -574,6 +592,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -595,6 +614,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -637,6 +657,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -740,6 +761,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -762,6 +784,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -783,6 +806,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -816,6 +840,7 @@ mod tests {
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -921,6 +946,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -964,6 +990,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -994,6 +1021,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1015,6 +1043,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1035,6 +1064,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1055,6 +1085,7 @@ max_iterations = 3
             channel_type: Some("telegram"),
             telegram_configured: true,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1077,6 +1108,7 @@ max_iterations = 3
             channel_type: Some("cli"),
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1099,6 +1131,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1119,6 +1152,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: Some(std::path::Path::new("/home/user/.mika/agents/mika")),
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1146,6 +1180,7 @@ max_iterations = 3
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1373,8 +1408,50 @@ notify = true
             channel_type: None,
             telegram_configured: false,
             home_dir: None,
+            callback_context: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
+    }
+
+    #[test]
+    fn test_callback_context_injects_prompt_guard() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: chrono::Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: Some("Processing callback results from a long-running task."),
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Callback Result Turn"));
+        assert!(prompt.contains("MUST NOT submit new long-running tasks"));
+    }
+
+    #[test]
+    fn test_no_callback_context_omits_prompt_guard() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: chrono::Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Callback Result Turn"));
     }
 }

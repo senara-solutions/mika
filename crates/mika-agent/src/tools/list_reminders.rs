@@ -27,7 +27,7 @@ impl Tool for ListRemindersTool {
     }
 
     async fn execute(&self, _input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        let tasks = ctx.db.get_pending_reminder_tasks().await?;
+        let tasks = ctx.db.get_user_visible_tasks().await?;
 
         if tasks.is_empty() {
             return Ok(ToolOutput::success("No active reminders."));

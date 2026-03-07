@@ -271,6 +271,9 @@ impl TaskDispatcher {
 
         if let Err(e) = run_silent_agent(&params).await {
             warn!(task_id = %task.id, error = %e, "resume_agent run failed");
+        } else {
+            // Mark delivered so TUI polling doesn't re-process this callback
+            let _ = self.db.mark_task_delivered(&task.id).await;
         }
 
         Ok(())

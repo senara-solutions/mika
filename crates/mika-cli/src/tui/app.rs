@@ -57,6 +57,12 @@ pub enum AgentRequest {
         images: Vec<ImageAttachment>,
         thinking_budget: Option<u32>,
     },
+    /// A background callback task has completed — inject into the conversation.
+    CallbackResult {
+        task_id: String,
+        label: String,
+        result: String,
+    },
     SetModel {
         model: String,
     },
@@ -645,13 +651,22 @@ impl<'a> App<'a> {
         // Task count polling: refresh every ~5s for footer badge.
         if !self.is_team_mode()
             && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
-            && let Ok(tasks) = self.db.get_pending_reminder_tasks().await
+            && let Ok(tasks) = self.db.get_user_visible_tasks().await
         {
             let new_count = tasks.len();
             if new_count != self.pending_task_count {
                 self.pending_task_count = new_count;
                 self.needs_redraw = true;
             }
+        }
+
+        // Callback delivery polling: check for completed-but-undelivered callback tasks.
+        // Only poll when idle (agent not processing) and not in team mode.
+        if !self.is_team_mode()
+            && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
+            && self.status == AgentStatus::Idle
+        {
+            self.poll_callback_tasks().await;
         }
 
         // Thinking animation needs redraw every tick while active
@@ -1054,6 +1069,56 @@ impl<'a> App<'a> {
         }
         // Auto-scroll: stays at bottom if scroll_offset == 0; preserves position otherwise.
         self.needs_redraw = true;
+    }
+
+    /// Poll for completed-but-undelivered callback tasks and inject them into the conversation.
+    async fn poll_callback_tasks(&mut self) {
+        // Look back 7 days for undelivered callbacks
+        let since = chrono::Utc::now().timestamp() - 7 * 24 * 3600;
+        let tasks = match self.db.get_undelivered_callback_tasks(since).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("callback poll failed: {e}");
+                return;
+            }
+        };
+
+        for task in tasks {
+            // Atomically claim this task — prevents double-processing by multiple TUI instances
+            match self.db.mark_task_delivered(&task.id).await {
+                Ok(true) => {}
+                Ok(false) => continue, // already claimed by another instance
+                Err(e) => {
+                    tracing::warn!(task_id = %task.id, "failed to mark task delivered: {e}");
+                    continue;
+                }
+            }
+
+            let result = task.result.unwrap_or_default();
+            if result.is_empty() {
+                continue;
+            }
+
+            // Show a system message that a callback arrived
+            self.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: format!("[{}] completed", task.label),
+                rendered: None,
+                channel: None,
+            });
+
+            // Send to agent worker for processing
+            let _ = self.agent_tx.send(AgentRequest::CallbackResult {
+                task_id: task.id,
+                label: task.label,
+                result,
+            });
+
+            self.status = AgentStatus::Thinking;
+            self.needs_redraw = true;
+            // Only inject one callback per tick to keep the agent responsive
+            break;
+        }
     }
 
     fn reset_textarea(&mut self) {
