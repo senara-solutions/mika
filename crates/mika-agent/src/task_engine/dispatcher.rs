@@ -273,7 +273,9 @@ impl TaskDispatcher {
             warn!(task_id = %task.id, error = %e, "resume_agent run failed");
         } else {
             // Mark delivered so TUI polling doesn't re-process this callback
-            let _ = self.db.mark_task_delivered(&task.id).await;
+            if let Err(e) = self.db.mark_task_delivered(&task.id).await {
+                warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
+            }
         }
 
         Ok(())
@@ -319,7 +321,9 @@ impl TaskDispatcher {
                     "invoke_orchestrator fired but team run is not suspended, skipping"
                 );
                 // Mark as completed so it doesn't re-fire.
-                self.db.update_task_status(&task.id, "completed").await.ok();
+                if let Err(e) = self.db.update_task_status(&task.id, "completed").await {
+                    warn!(task_id = %task.id, error = %e, "failed to mark stale orchestrator task as completed");
+                }
                 return Ok(());
             }
             None => {
@@ -328,7 +332,9 @@ impl TaskDispatcher {
                     team_run_id,
                     "invoke_orchestrator fired but team run not found, skipping"
                 );
-                self.db.update_task_status(&task.id, "completed").await.ok();
+                if let Err(e) = self.db.update_task_status(&task.id, "completed").await {
+                    warn!(task_id = %task.id, error = %e, "failed to mark orphaned orchestrator task as completed");
+                }
                 return Ok(());
             }
         }
@@ -534,10 +540,13 @@ impl TaskDispatcher {
             }
             Err(e) => {
                 warn!(task_id = %task.id, error = %e, "reflection run failed");
-                let _ = self
+                if let Err(db_err) = self
                     .db
                     .record_reflection_run("failed", 0, Some(&e.to_string()))
-                    .await;
+                    .await
+                {
+                    warn!(task_id = %task.id, error = %db_err, "failed to record reflection run failure in DB");
+                }
             }
         }
 

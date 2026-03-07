@@ -415,9 +415,12 @@ pub async fn handle_task_complete(
                 }
                 Err(e) => {
                     warn!(task_id = %task_id_clone, error = %e, "failed to mark task completed before dispatch");
-                    let _ = db
+                    if let Err(db_err) = db
                         .update_task_status(&task_id_clone, task_status::FAILED)
-                        .await;
+                        .await
+                    {
+                        warn!(task_id = %task_id_clone, error = %db_err, "failed to mark task as failed in DB after completion error");
+                    }
                     return;
                 }
                 Ok(true) => {}
@@ -431,22 +434,31 @@ pub async fn handle_task_complete(
 
                     if is_expired {
                         warn!(task_id = %completed_task.id, "task timed out while waiting for agent, marking failed");
-                        let _ = db
+                        if let Err(db_err) = db
                             .update_task_failed(
                                 &completed_task.id,
                                 "task timed out while waiting for agent",
                             )
-                            .await;
+                            .await
+                        {
+                            warn!(task_id = %completed_task.id, error = %db_err, "failed to mark timed-out task as failed in DB");
+                        }
                     } else {
                         // Agent is busy — reset task to pending for the tick loop to retry
                         debug!(task_id = %completed_task.id, "agent busy, deferring resume_agent to tick loop in 30s");
                         let retry_at = now + 30;
-                        let _ = db
+                        if let Err(e) = db
                             .update_task_status(&completed_task.id, task_status::PENDING)
-                            .await;
-                        let _ = db
+                            .await
+                        {
+                            warn!(task_id = %completed_task.id, error = %e, "failed to reset task status to pending for retry");
+                        }
+                        if let Err(e) = db
                             .update_task_next_fire_at(&completed_task.id, retry_at)
-                            .await;
+                            .await
+                        {
+                            warn!(task_id = %completed_task.id, error = %e, "failed to update next_fire_at for retry");
+                        }
                     }
                 }
                 Err(e) => {
