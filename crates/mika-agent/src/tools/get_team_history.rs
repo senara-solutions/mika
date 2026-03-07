@@ -4,16 +4,12 @@ use mika_common::claude::ToolDefinition;
 use mika_common::team;
 use serde_json::Value;
 use std::fmt::Write;
-use std::path::PathBuf;
 
 use crate::db::format_unix_ts;
-use crate::teams::{TeamDbError, open_team_db};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
-pub struct GetTeamHistoryTool {
-    pub home_dir: PathBuf,
-}
+pub struct GetTeamHistoryTool;
 
 #[async_trait]
 impl Tool for GetTeamHistoryTool {
@@ -44,7 +40,7 @@ impl Tool for GetTeamHistoryTool {
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let team_name = input["team_name"].as_str().unwrap_or("");
         if team_name.is_empty() {
             return Ok(ToolOutput::error("'team_name' is required."));
@@ -61,23 +57,17 @@ impl Tool for GetTeamHistoryTool {
 
         let limit = input["limit"].as_u64().unwrap_or(5).min(20) as usize;
 
-        // Open team DB
-        let team_db = match open_team_db(&self.home_dir, team_name) {
-            Ok(db) => db,
-            Err(TeamDbError::NoRuns(msg)) => return Ok(ToolOutput::success(msg)),
-            Err(TeamDbError::OpenFailed(msg)) => return Ok(ToolOutput::error(msg)),
-        };
+        // Use the shared container DB from ToolContext
+        let db = ctx.db;
 
-        let runs = match team_db.load_team_runs(team_name, limit).await {
+        let runs = match db.load_team_runs(team_name, limit).await {
             Ok(r) => r,
             Err(e) => {
-                team_db.shutdown();
                 return Ok(ToolOutput::error(format!(
                     "Failed to load history for team '{team_name}': {e}"
                 )));
             }
         };
-        team_db.shutdown();
 
         if runs.is_empty() {
             return Ok(ToolOutput::success(format!(
@@ -118,16 +108,13 @@ impl Tool for GetTeamHistoryTool {
 mod tests {
     use super::*;
 
-    use crate::test_utils::test_helpers::{TestHarness, setup_team_db};
+    use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
     async fn test_get_team_history_empty() {
-        let tmp = tempfile::tempdir().unwrap();
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamHistoryTool {
-            home_dir: tmp.path().to_path_buf(),
-        };
+        let tool = GetTeamHistoryTool;
 
         let result = tool
             .execute(serde_json::json!({"team_name": "dev-team"}), &ctx)
@@ -139,11 +126,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_team_history_multiple_runs() {
-        let (_tmp, home) = setup_team_db("dev-team", 2);
-
         let harness = TestHarness::new();
+        // Seed team runs in shared DB
+        for i in 0..2 {
+            let run_id = format!("run-{i:04}");
+            let ts = 1_740_000_000 + (i as i64 * 300);
+            harness
+                .db
+                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts)
+                .await
+                .unwrap();
+            harness
+                .db
+                .update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
+                .await
+                .unwrap();
+        }
+
         let ctx = harness.ctx();
-        let tool = GetTeamHistoryTool { home_dir: home };
+        let tool = GetTeamHistoryTool;
 
         let result = tool
             .execute(serde_json::json!({"team_name": "dev-team"}), &ctx)
@@ -157,11 +158,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_team_history_respects_limit() {
-        let (_tmp, home) = setup_team_db("dev-team", 5);
-
         let harness = TestHarness::new();
+        for i in 0..5 {
+            let run_id = format!("run-{i:04}");
+            let ts = 1_740_000_000 + (i as i64 * 300);
+            harness
+                .db
+                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts)
+                .await
+                .unwrap();
+            harness
+                .db
+                .update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
+                .await
+                .unwrap();
+        }
+
         let ctx = harness.ctx();
-        let tool = GetTeamHistoryTool { home_dir: home };
+        let tool = GetTeamHistoryTool;
 
         let result = tool
             .execute(
@@ -178,9 +192,7 @@ mod tests {
     async fn test_get_team_history_missing_name() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = GetTeamHistoryTool {
-            home_dir: PathBuf::from("/tmp"),
-        };
+        let tool = GetTeamHistoryTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(result.is_error);

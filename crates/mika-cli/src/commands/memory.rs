@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mika_agent::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
+use mika_agent::db::{CORE_MEMORY_SECTIONS, core_memory_section_names, default_self_model};
 
 use crate::cli::{MemoryArgs, MemoryCommand};
 use crate::init;
@@ -179,6 +179,9 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
                         .as_deref()
                         .filter(|s| !s.starts_with("# Tell Mika about yourself"));
                     from_file.unwrap_or(default_value).to_string()
+                } else if block == "self_model" {
+                    let display_name = db.get_agent_display_name().await;
+                    default_self_model(&display_name)
                 } else {
                     default_value.to_string()
                 };

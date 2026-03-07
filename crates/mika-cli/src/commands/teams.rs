@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 use std::io::{self, Write};
 
-use mika_agent::db::format_unix_ts;
+use mika_agent::async_db::AsyncDatabase;
+use mika_agent::db::{Database, format_unix_ts};
 use mika_agent::teams::types::TeamEvent;
-use mika_agent::teams::{TeamDbError, open_or_create_team_db, open_team_db_sync};
 use mika_common::config::Settings;
 use mika_common::home;
 use mika_common::team;
@@ -22,6 +22,23 @@ pub async fn run(args: TeamsArgs) -> Result<()> {
         TeamsCommand::Log { name } => log(&global_home, &name),
         TeamsCommand::Delete { name, force } => delete(&global_home, &name, force),
     }
+}
+
+/// Open the shared container database (sync, for read-only CLI commands).
+fn open_container_db(global_home: &std::path::Path) -> Result<Database> {
+    let db_path = home::container_db_path(global_home);
+    if !db_path.exists() {
+        bail!("No database found. Run `mika` first to initialize.");
+    }
+    Database::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {e}"))
+}
+
+/// Open the shared container database (async, for team run command).
+fn open_container_db_async(global_home: &std::path::Path) -> Result<AsyncDatabase> {
+    let db_path = home::container_db_path(global_home);
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let db = Database::open(&db_path)?;
+    Ok(AsyncDatabase::new(db))
 }
 
 fn list(global_home: &std::path::Path) -> Result<()> {
@@ -195,8 +212,8 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
         TeamEvent::RunFailed(_) => {}   // handled by run result
     };
 
-    // Open team DB for persistence
-    let team_db = open_or_create_team_db(global_home, &name).map_err(|e| anyhow::anyhow!(e))?;
+    // Use the shared container DB
+    let team_db = open_container_db_async(global_home)?;
 
     let run = mika_agent::teams::run_team(
         &name,
@@ -216,6 +233,9 @@ async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> 
         }
         mika_agent::teams::types::RunStatus::Failed(msg) => {
             println!("  Status: failed - {msg}");
+        }
+        mika_agent::teams::types::RunStatus::Suspended => {
+            println!("  Status: suspended (waiting for background tasks)");
         }
         mika_agent::teams::types::RunStatus::Running => {
             println!("  Status: running (unexpected)");
@@ -252,8 +272,8 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
     }
     println!("  Max iterations: {}", def.flow.max_iterations);
 
-    // Show latest run if available from team DB
-    if let Ok(db) = open_team_db_sync(global_home, &name)
+    // Show latest run if available from shared container DB
+    if let Ok(db) = open_container_db(global_home)
         && let Ok(Some(latest)) = db.load_latest_team_run(&name)
     {
         println!("\n  Latest run:");
@@ -277,13 +297,12 @@ fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
         bail!("Team '{name}' not found.");
     }
 
-    let db = match open_team_db_sync(global_home, &name) {
+    let db = match open_container_db(global_home) {
         Ok(db) => db,
-        Err(TeamDbError::NoRuns(_)) => {
+        Err(_) => {
             println!("\n  No runs found for team '{name}'.\n");
             return Ok(());
         }
-        Err(TeamDbError::OpenFailed(msg)) => bail!(msg),
     };
     let runs = db.load_team_runs(&name, 50)?;
 

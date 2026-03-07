@@ -308,6 +308,8 @@ pub struct App<'a> {
     // Cross-channel polling
     /// Watermark: highest message id seen (used to avoid re-fetching).
     pub last_seen_msg_id: i64,
+    /// Cached count of pending/active tasks (polled periodically for footer badge).
+    pub pending_task_count: usize,
 
     // Team mode fields (None when in agent mode)
     /// Team worker channel for sending goals.
@@ -384,6 +386,7 @@ impl<'a> App<'a> {
             thinking_level: None,
             context_tokens: None,
             last_seen_msg_id: 0,
+            pending_task_count: 0,
             team_tx: None,
             team_rx: None,
             team_name: None,
@@ -443,6 +446,7 @@ impl<'a> App<'a> {
             thinking_level: None,
             context_tokens: None,
             last_seen_msg_id: 0,
+            pending_task_count: 0,
             team_tx: Some(team_tx),
             team_rx: Some(team_rx),
             team_name: Some(team_name.to_string()),
@@ -636,6 +640,18 @@ impl<'a> App<'a> {
             && self.status == AgentStatus::Idle
         {
             self.poll_cross_channel_messages().await;
+        }
+
+        // Task count polling: refresh every ~5s for footer badge.
+        if !self.is_team_mode()
+            && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
+            && let Ok(tasks) = self.db.get_pending_reminder_tasks().await
+        {
+            let new_count = tasks.len();
+            if new_count != self.pending_task_count {
+                self.pending_task_count = new_count;
+                self.needs_redraw = true;
+            }
         }
 
         // Thinking animation needs redraw every tick while active

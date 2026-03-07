@@ -55,9 +55,15 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
         .context("Failed to load config (run `mika setup` first).")?;
 
     let db = open_db(&settings)?;
-    startup::seed_core_memory_if_empty(&db, &agent_home)?;
+    let identity = mika_agent::prompt::load_identity(&agent_home);
+    db.register_agent(
+        agent_name,
+        &identity.name,
+        agent_home.to_str().unwrap_or(""),
+    )?;
+    startup::seed_core_memory_if_empty(&db, &agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(&agent_home, settings.disable_bundled_skills);
-    let async_db = AsyncDatabase::new(db);
+    let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
     Ok((settings, async_db, agent_home, global_home))
 }

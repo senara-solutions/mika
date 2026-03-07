@@ -27,7 +27,7 @@ impl Tool for StoreFactTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "Person's full name (required for person category)"
+                        "description": "Person's first name, or first + last if ambiguous. No prefixes (User:, Mr., Dr.). The relationship field captures the role."
                     },
                     "relationship": {
                         "type": "string",

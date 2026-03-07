@@ -16,12 +16,10 @@ use super::types;
     paths(
         handlers::handle_health,
         handlers::handle_message,
-        handlers::handle_heartbeat,
     ),
     components(schemas(
         types::MessageRequest,
         types::AcceptedResponse,
-        types::HeartbeatRequest,
         types::HealthResponse,
     )),
     modifiers(&SecurityAddon),
@@ -64,7 +62,6 @@ mod tests {
         let yaml = agent_openapi_yaml();
         assert!(yaml.contains("/health"), "missing /health endpoint");
         assert!(yaml.contains("/message"), "missing /message endpoint");
-        assert!(yaml.contains("/heartbeat"), "missing /heartbeat endpoint");
     }
 
     #[test]

@@ -173,7 +173,7 @@ mod tests {
         safe_entry.skill_tools = vec![ResolvedSkillTool {
             definition: dummy_def.clone(),
             handler: ToolHandler::Builtin {
-                function: "get_api_spec".to_string(),
+                function: "get_documentation".to_string(),
             },
             skill_dir: PathBuf::from("/skills/memory"),
         }];
@@ -184,6 +184,8 @@ mod tests {
             definition: dummy_def.clone(),
             handler: ToolHandler::Exec {
                 command: "./run.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
             },
             skill_dir: PathBuf::from("/skills/tmux"),
         }];

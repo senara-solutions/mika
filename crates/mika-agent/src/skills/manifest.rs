@@ -50,6 +50,10 @@ fn default_timeout() -> u64 {
 pub enum ToolHandler {
     Exec {
         command: String,
+        #[serde(default)]
+        long_running: bool,
+        #[serde(default)]
+        estimated_duration_secs: Option<u64>,
     },
     Http {
         url: String,
@@ -168,7 +172,7 @@ mod tests {
     fn test_tool_handler_exec_deserialize() {
         let json = r#"{"type": "exec", "command": "./handler.sh"}"#;
         let handler: ToolHandler = serde_json::from_str(json).unwrap();
-        assert!(matches!(handler, ToolHandler::Exec { command } if command == "./handler.sh"));
+        assert!(matches!(handler, ToolHandler::Exec { command, .. } if command == "./handler.sh"));
     }
 
     #[test]
@@ -218,5 +222,42 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "web_search");
         assert!(matches!(&tools[0].handler, ToolHandler::Exec { .. }));
+    }
+
+    #[test]
+    fn test_tool_handler_exec_long_running() {
+        let json = r#"{"type": "exec", "command": "./analyze.sh", "long_running": true, "estimated_duration_secs": 300}"#;
+        let handler: ToolHandler = serde_json::from_str(json).unwrap();
+        match handler {
+            ToolHandler::Exec {
+                command,
+                long_running,
+                estimated_duration_secs,
+            } => {
+                assert_eq!(command, "./analyze.sh");
+                assert!(long_running);
+                assert_eq!(estimated_duration_secs, Some(300));
+            }
+            _ => panic!("expected Exec handler"),
+        }
+    }
+
+    #[test]
+    fn test_tool_handler_exec_backward_compat() {
+        // Missing long_running field should default to false
+        let json = r#"{"type": "exec", "command": "./handler.sh"}"#;
+        let handler: ToolHandler = serde_json::from_str(json).unwrap();
+        match handler {
+            ToolHandler::Exec {
+                command,
+                long_running,
+                estimated_duration_secs,
+            } => {
+                assert_eq!(command, "./handler.sh");
+                assert!(!long_running);
+                assert_eq!(estimated_duration_secs, None);
+            }
+            _ => panic!("expected Exec handler"),
+        }
     }
 }

@@ -122,7 +122,7 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
                 println!("    Tools:");
                 for st in &entry.skill_tools {
                     let handler_type = match &st.handler {
-                        mika_agent::skills::manifest::ToolHandler::Exec { command } => {
+                        mika_agent::skills::manifest::ToolHandler::Exec { command, .. } => {
                             format!("exec: {command}")
                         }
                         mika_agent::skills::manifest::ToolHandler::Http { url, method } => {
@@ -289,7 +289,8 @@ async fn test_skill_tool(
     println!("\n  Testing {skill_name}/{tool_name}...\n");
 
     let output =
-        executor::execute_skill_tool(skill_tool, input, entry.manifest.skill.timeout_secs).await;
+        executor::execute_skill_tool(skill_tool, input, entry.manifest.skill.timeout_secs, None)
+            .await;
 
     if output.is_error {
         println!("  [ERROR] {}", output.content);

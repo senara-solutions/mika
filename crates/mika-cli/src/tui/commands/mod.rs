@@ -62,6 +62,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         completer: None,
     },
     SlashCommand {
+        name: "tasks",
+        aliases: &[],
+        description: "List or cancel pending tasks",
+        args_hint: Some("[cancel <id>]"),
+        completer: None,
+    },
+    SlashCommand {
         name: "status",
         aliases: &["stat"],
         description: "Show system health info",

@@ -4,8 +4,14 @@ use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::teams::open_or_create_team_db;
+use mika_common::home;
+
+use crate::async_db::AsyncDatabase;
+use crate::db::Database;
+use crate::messaging::MessageSender;
+use crate::teams::types::{TeamEvent, TeamEventCallback};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -45,7 +51,7 @@ impl Tool for RunTeamTool {
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let team_name = input["team_name"].as_str().unwrap_or("");
         if team_name.is_empty() {
             return Ok(ToolOutput::error("'team_name' is required."));
@@ -60,6 +66,14 @@ impl Tool for RunTeamTool {
             return Ok(ToolOutput::error(format!("Invalid team name: {e}")));
         }
 
+        // Only orchestrators can run teams
+        let current_agent_id = ctx.db.agent_id();
+        if !super::is_orchestrator(&self.home_dir, current_agent_id) {
+            return Ok(ToolOutput::error(
+                "Only orchestrator agents can run teams. You are a specialist — call tools directly.",
+            ));
+        }
+
         let goal = input["goal"].as_str().unwrap_or("");
         if goal.is_empty() {
             return Ok(ToolOutput::error("'goal' is required."));
@@ -71,18 +85,50 @@ impl Tool for RunTeamTool {
             )));
         }
 
-        // Open team DB for persistence
-        let team_db = match open_or_create_team_db(&self.home_dir, team_name) {
-            Ok(db) => db,
-            Err(msg) => return Ok(ToolOutput::error(msg)),
+        // Open the shared container DB for team persistence
+        let db_path = home::container_db_path(&self.home_dir);
+        let team_db = match Database::open(&db_path) {
+            Ok(db) => AsyncDatabase::new(db),
+            Err(e) => return Ok(ToolOutput::error(format!("Failed to open database: {e}"))),
         };
+
+        let callback: Option<TeamEventCallback> = ctx.message_sender.as_ref().map(|sender| {
+            let sender: Arc<dyn MessageSender> = Arc::clone(sender);
+            let cb: TeamEventCallback = Box::new(move |event: TeamEvent| {
+                let text = match &event {
+                    TeamEvent::PhaseChanged { phase, iteration } => {
+                        Some(format!("[Team] Phase: {} (iteration {})", phase, iteration))
+                    }
+                    TeamEvent::AgentCompleted { agent, .. } => {
+                        Some(format!("[Team] Agent '{}' completed", agent))
+                    }
+                    TeamEvent::AgentFailed { agent, error } => {
+                        Some(format!("[Team] Agent '{}' failed: {}", agent, error))
+                    }
+                    TeamEvent::Deliverable(_) => Some("[Team] Deliverable ready".to_string()),
+                    TeamEvent::RunFailed(msg) => Some(format!("[Team] Run failed: {}", msg)),
+                    // Skip noisy/intermediate events
+                    TeamEvent::Progress(_)
+                    | TeamEvent::AgentStarted { .. }
+                    | TeamEvent::TasksAssigned { .. }
+                    | TeamEvent::CriticReview { .. } => None,
+                };
+                if let Some(text) = text {
+                    let sender = Arc::clone(&sender);
+                    tokio::spawn(async move {
+                        let _ = sender.send(&text).await;
+                    });
+                }
+            });
+            cb
+        });
 
         let result = crate::teams::run_team(
             team_name,
             goal,
             &self.home_dir,
             &self.settings,
-            None,
+            callback,
             team_db.clone(),
         )
         .await;
@@ -188,5 +234,26 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid team name"));
+    }
+
+    #[tokio::test]
+    async fn test_run_team_non_orchestrator_blocked() {
+        let harness = TestHarness::with_agent("specialist-agent");
+        let ctx = harness.ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = RunTeamTool {
+            home_dir: tmp.path().to_path_buf(),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"team_name": "dev-team", "goal": "test"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Only orchestrator agents"));
     }
 }

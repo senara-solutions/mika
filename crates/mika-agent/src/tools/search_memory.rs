@@ -148,21 +148,26 @@ async fn search_core_memory(
     Ok(())
 }
 
-/// Search reminders via SQL LIKE.
+/// Search pending reminder tasks by label.
 async fn search_reminders(
     ctx: &ToolContext<'_>,
     query: &str,
     results: &mut Vec<String>,
 ) -> Result<()> {
-    let reminders = ctx.db.search_reminders(query).await?;
-    for r in reminders {
-        results.push(format!(
-            "[reminder] #{}: \"{}\" at {} (created: {})",
-            r.id,
-            r.message,
-            r.display_fire_at(),
-            r.created_at
-        ));
+    let query_lower = query.to_lowercase();
+    let tasks = ctx.db.get_pending_reminder_tasks().await?;
+    for t in tasks {
+        if t.label.to_lowercase().contains(&query_lower) {
+            let short_id = &t.id[..8.min(t.id.len())];
+            let fire_at = t
+                .next_fire_at
+                .map(crate::db::format_unix_ts)
+                .unwrap_or_else(|| "unknown".to_string());
+            results.push(format!(
+                "[reminder] {}: \"{}\" at {}",
+                short_id, t.label, fire_at
+            ));
+        }
     }
     Ok(())
 }

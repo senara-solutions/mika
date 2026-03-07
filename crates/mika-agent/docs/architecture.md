@@ -58,9 +58,9 @@ from the `mika-agent` crate.
 
 | Crate | Path | Responsibility |
 |-------|------|---------------|
-| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel/OTLP export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 8 builtin tools, prompt assembly, conversation compaction, reminder scheduler, HTTP server binary (`mika-server`) |
-| `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`) |
+| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
 
@@ -125,7 +125,7 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `MAX_TOOL_STEPS` | 10 | Maximum tool-use iterations per agent turn |
-| `TOOL_TIMEOUT_SECS` | 30 | Per-tool execution timeout (seconds) |
+| `TOOL_TIMEOUT_SECS` | 30 | Default per-tool execution timeout (overridable via `Tool::timeout_secs()`) |
 | `AGENT_TOTAL_TIMEOUT_SECS` | 300 | Total agent loop timeout (5 minutes) |
 | `CONTINUATION_TIMEOUT_SECS` | 60 | Continuation turn timeout after max steps |
 
@@ -142,10 +142,10 @@ Always present in the system prompt. The agent can edit these blocks via the
 
 | Block | Default Value |
 |-------|--------------|
-| `user_summary` | "New user. No information yet." |
-| `persona` | "Mika -- personal AI executive assistant." |
-| `current_priorities` | "Get to know the user and understand their needs." |
-| `key_people` | "No one tracked yet." |
+| `user_summary` | "No information about the user yet." |
+| `self_model` | "I am {agent_id}. No interaction history yet." |
+| `current_priorities` | "No priorities set yet." |
+| `key_people` | "No people tracked yet." |
 
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
@@ -177,7 +177,9 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ## 6. Tools
 
-All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
+### Builtin Tools
+
+All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
 | Tool | Description | Category |
@@ -186,17 +188,360 @@ All 8 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `store_fact` | Store a new structured fact (person, commitment, preference, or event) into Layer 2 tables. | Memory |
 | `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events). | Memory |
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
-| `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. | Reminders |
-| `list_reminders` | List pending and future reminders. | Reminders |
-| `cancel_reminder` | Cancel a pending reminder by ID. | Reminders |
+| `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. Outputs full UUID. | Reminders |
+| `list_reminders` | List pending and future reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
+| `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
+| `list_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
+| `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
+| `cancel_task` | Cancel a pending task by full UUID (36-char validation). | Tasks |
+| `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. | Tasks |
+| `get_task` | Inspect a task by full UUID. Returns all fields including status, trigger_type, action_type, result, timeout_at. | Tasks |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
+| `create_skill` | Create a new custom skill with prompt snippets and tool definitions. | Skills |
+| `delete_skill` | Delete a custom or marketplace skill. Built-in skills cannot be deleted. | Skills |
+| `list_skills` | List all skills with their origin, status, and keywords. | Skills |
+| `toggle_skill` | Enable or disable a skill. | Skills |
+| `update_skill` | Update an existing skill's description, keywords, prompts, or always_on setting. | Skills |
+| `get_config` | Read customer config values (timezone, chat_id, thinking_level). | Config |
+| `set_config` | Update customer config values. | Config |
+| `write_file` | Write content to a file in the agent's home directory. Requires `confirm: true` to overwrite existing files — returns current content first. | Files |
+| `read_home_file` | Read a file from the agent's home directory. Uses `validate_and_resolve_path` with `create_parents: false`. Reports resolved absolute path. | Files |
+| `list_home_files` | List files in a directory within the agent's home directory. Includes sizes and modification ages. Uses `spawn_blocking` for I/O. | Files |
+
+### Management Tools
+
+6 tools for multi-agent and team workflows, registered conditionally via
+`management_tools_if_needed()` only when `agents.len() > 1 || !teams.is_empty()`:
+
+| Tool | Description | Timeout |
+|------|-------------|---------|
+| `list_agents` | List all configured agents with their identities and role hints. | default (30s) |
+| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s |
+| `list_teams` | List all configured teams with agent counts. | default (30s) |
+| `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s |
+| `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) |
+| `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) |
+
+Management tools are NOT registered for team sub-agents or delegated agents,
+preventing infinite delegation chains.
 
 **Tool trait:** `#[async_trait]` with `Send + Sync` bounds (required for `tokio::spawn`
 in server handlers). Each tool validates inputs: empty string check + 10,000 character
-maximum (`MAX_INPUT_LEN`).
+maximum (`MAX_INPUT_LEN`). Per-tool timeout override via `timeout_secs()` default method
+(returns `None` to use the 30s default).
 
 
-## 7. Conversation Compaction
+## 7. Skills System
+
+Source: `crates/mika-agent/src/skills/`
+
+Skills extend Mika's capabilities with prompt snippets, tool definitions, and handler
+scripts. Each skill lives in its own directory under `{agent_home}/skills/{name}/`.
+
+### Skill Directory Structure
+
+```
+{agent_home}/skills/{skill_name}/
+  skill.toml              # Manifest (required, max 64KB)
+  tools.json              # Tool definitions for exec/http handlers (optional, max 256KB)
+  system_prompt.md        # Prompt snippet injected on match (optional, max 8KB)
+  .disabled               # Marker file to disable skill (presence = disabled)
+  handlers/
+    run.sh                # Exec handler scripts (executable)
+```
+
+### Manifest (`skill.toml`)
+
+```toml
+[skill]
+name = "web-search"
+description = "Search the web for current information"
+version = "0.1.0"
+always_on = false
+timeout_secs = 60
+
+[triggers]
+keywords = ["search", "look up", "find online"]
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `skill.name` | yes | — | Unique skill identifier |
+| `skill.description` | yes | — | Human-readable description |
+| `skill.version` | no | `""` | Semantic version |
+| `skill.always_on` | no | `false` | Active every turn regardless of keywords |
+| `skill.timeout_secs` | no | `30` | Per-tool execution timeout (seconds) |
+| `triggers.keywords` | no | `[]` | Case-insensitive substring-matched keywords |
+
+### Handler Types
+
+Defined in `tools.json` via `#[serde(tag = "type")]`:
+
+**Builtin** — Dispatches to compiled Rust functions in `ToolRegistry` (e.g.,
+`get_documentation`, `web_search`). Full `ToolContext` access.
+
+**Exec** — Spawns a subprocess, passes tool input as JSON via stdin, captures stdout.
+MIKA_* environment variables are scrubbed from child processes. Supports the
+`__mika_v1` image protocol (see below) and long-running mode.
+
+**HTTP** — POST/GET/PUT to a URL with tool input as JSON body (or query params for GET).
+Optional static headers.
+
+### Exec Handler Image Protocol (`__mika_v1`)
+
+Exec handler scripts can return images by outputting a JSON envelope:
+
+```json
+{"__mika_v1": {"text": "Screenshot captured.", "images": ["/tmp/screenshot.png"]}}
+```
+
+The executor detects the sentinel key via prefix check, reads and validates image files
+(canonicalize, regular file check, 5MB limit, magic-byte validation for JPEG/PNG/GIF/WebP),
+base64-encodes them, and returns them as `ImageData` on `ToolOutput`. Max 5 images per
+result. If detection fails, stdout is treated as plain text (backward compatible).
+
+### Long-Running Exec Handlers
+
+When `long_running: true` is set on an exec handler (conversation mode only, not
+silent/team), the executor creates a callback task and returns immediately instead
+of waiting for the subprocess to complete.
+
+**Mechanism:**
+1. Executor creates a callback task (`trigger_type=callback`, `action_type=resume_agent`)
+   with label `long_running:{tool_name}`.
+2. `__mika_task_id` (UUID) and `__mika_agent` (agent name) are injected into the
+   tool input JSON passed to the subprocess via stdin.
+3. Subprocess spawned with `kill_on_drop(false)` and `stdout(Stdio::null())`.
+4. PID recorded to database via `set_task_process_id()`.
+5. Tool returns immediately with "task created" message.
+
+**Timeout:** `(estimated_duration_secs.unwrap_or(3600) * 3).clamp(600, 7_776_000)` —
+minimum 10 minutes, maximum 90 days.
+
+**Completion:** The subprocess calls `mika ask --task-id <uuid>` (CLI) or the external
+system POSTs to `/tasks/{id}/complete` (server) to deliver results back. On success,
+the task engine fires `dispatch_resume_agent` with `SilentTrigger::Callback`.
+
+**Failure:** A background monitor (`spawn_long_running_exec`) awaits the child process.
+On non-zero exit, stderr is captured (capped) and the task is marked failed. Expired
+tasks get SIGTERM via `kill_orphan_processes()` in the tick loop.
+
+### Skill Matching
+
+`match_skills()` in `matcher.rs`:
+
+1. **Always-on skills** included unconditionally (if enabled).
+2. **Keyword-matched skills** included if any keyword is a case-insensitive substring
+   of the user message. Keywords are pre-lowercased at scan time.
+3. **Disabled skills** (`.disabled` marker file) excluded entirely.
+
+Silent mode uses `safe_always_on_skills()` which filters out exec/http-handler skills
+for security — only builtin-handler skills are available in autonomous background runs.
+
+### Three-Tier Origin
+
+| Origin | Description |
+|--------|-------------|
+| `[built-in]` | Bundled with Mika binary, re-seeded on startup |
+| `[marketplace]` | Installed from Git repos via `mika skills install`, tracked in `marketplace.lock` |
+| `[custom]` | Created locally via `create_skill` tool or manually |
+
+### Marketplace
+
+Git-based skill distribution. See [ADR-006](adr/006-git-based-skills-marketplace.md).
+
+- **Install:** `mika skills install user/repo` (GitHub shorthand) or full Git URL.
+  Shallow clones to temp dir, scans for `skill.toml` (depth <= 2), copies skill dir
+  (excluding `.git/`, symlink escape checks). Multi-skill repos show interactive picker.
+- **Update:** `mika skills update [name]` — re-clones, compares HEAD commit to pinned
+  commit, replaces if changed.
+- **Uninstall:** `mika skills uninstall <name>` — removes skill dir and lock entry.
+
+Lock file (`marketplace.lock` at agent home root) tracks URL, path, commit hash, and
+timestamps per installed skill.
+
+
+## 8. MCP Client (Model Context Protocol)
+
+Source: `crates/mika-agent/src/mcp/`
+
+Mika connects to external MCP servers at startup via `McpManager`, using the `rmcp`
+crate (v0.17) for both stdio and Streamable HTTP transports.
+
+### Configuration
+
+MCP servers are configured in `{agent_home}/mcp.json` (Claude Desktop convention,
+written with `0600` permissions to protect secrets):
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"],
+      "env": {},
+      "enabled": true
+    },
+    "remote-api": {
+      "transport": "http",
+      "url": "https://mcp.example.com/v1",
+      "headers": {
+        "Authorization": "Bearer sk-test-123"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Server names must be lowercase alphanumeric with single hyphens/underscores (no `__`,
+which is reserved for tool namespacing).
+
+### Transports
+
+**Stdio:** Spawns a child process via `tokio::process::Command`. Environment isolation:
+`env_clear()` + allowlist (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`,
+`XDG_RUNTIME_DIR`) + server-specific env from config. `MIKA_*` overrides are rejected
+with a warning. `kill_on_drop(true)` ensures cleanup.
+
+**Streamable HTTP:** Connects to a URL via `StreamableHttpClientTransport` from rmcp.
+`Authorization` header routed through rmcp's `auth_header()` (case-insensitive match);
+other headers via `custom_headers()`.
+
+Both transports use a 30-second handshake timeout. Connections happen in parallel via
+`JoinSet` for fast startup. Failures are logged as warnings and never block startup.
+
+### Tool Namespacing
+
+MCP tools are namespaced as `mcp__{server}__{tool}` to prevent collisions with
+builtin tools and skills. Example: `mcp__filesystem__read_file`.
+
+Dispatch chain: builtins → skills → MCP → unknown error.
+
+### Security
+
+- **Environment isolation:** Child processes cannot access `MIKA_ANTHROPIC_API_KEY`,
+  `MIKA_INTERNAL_TOKEN`, or any other Mika secrets.
+- **Header redaction:** Custom `Debug` impl on `McpServerConfig` redacts both header
+  and env variable values in logs.
+- **Result limits:** 5 images max per result, 5MB per image, 10,000 chars text.
+
+### Availability
+
+| Context | MCP Available |
+|---------|--------------|
+| CLI ask mode (`mika ask`) | Yes (per-invocation connections, graceful shutdown) |
+| CLI chat mode (`mika`) | Yes (session-persistent connections) |
+| Server mode (`mika-server`) | Yes (per-agent manager, startup connections) |
+| Silent mode (heartbeat, reflection, callbacks) | No |
+| Team agent runs | No (Phase 4 future) |
+
+CLI commands: `mika mcp add/remove/list/enable/disable`, `--header KEY=VALUE` for
+HTTP headers.
+
+
+## 9. Unified Task Engine
+
+The task engine is a single SQLite-backed scheduler that handles all proactive
+behaviors (heartbeat, reflection, reminders) via a unified `tasks` table.
+
+Source: `crates/mika-agent/src/task_engine/`
+
+### Components
+
+| Module | Responsibility |
+|--------|---------------|
+| `engine.rs` | `TaskEngine` — min-heap `BinaryHeap<QueuedTask>` + 1-second tick loop |
+| `dispatcher.rs` | `TaskDispatcher` — matches `action_type` and executes tasks |
+| `queue.rs` | `QueuedTask` — heap entry with `next_fire_at` for ordering |
+| `types.rs` | Constants: `task_status::*`, `action_type::*`, `trigger_type::*` (no magic strings) |
+| `mod.rs` | `ensure_recurring_task()` — idempotently registers built-in tasks at startup |
+
+### Action Types
+
+| Action | Description |
+|--------|-------------|
+| `send_message` | Deliver a message to the user (capped at 50,000 chars) |
+| `run_skill` | Invoke a named skill by `skill_name`; dispatches via `SilentTrigger::SkillRun` for correct framing |
+| `inject_context` | Inject a context block into the next agent turn (stays `in_progress`) |
+| `resume_agent` | Re-invoke the agent with a callback result injected as `SilentTrigger::Callback` |
+| `invoke_orchestrator` | Re-invoke the team orchestrator when all sibling tasks complete |
+
+### Recurring Tasks (registered at startup)
+
+| Label | Cron | Purpose |
+|-------|------|---------|
+| `heartbeat` | `0 0 * * * *` | Hourly proactive check-in |
+| `reflection` | `0 0 2 * * *` | Daily memory reflection at 02:00 |
+
+### Tick Loop
+
+- 1-second tick: fires tasks where `next_fire_at <= now` via `claim_and_fire_task` (single atomic UPDATE)
+- Every 60 ticks: DB scan picks up tasks created by tools during agent runs
+- `startup_recovery()` on init: expires timed-out tasks, marks orphaned `in_progress` tasks as failed, loads heap
+- CLI aborts the tick loop `JoinHandle` on agent switch
+- Server stores `tick_handles: Vec<JoinHandle<()>>` and aborts them on graceful shutdown
+
+### Callback/Resume Lifecycle
+
+Agent-created callback tasks follow this end-to-end pattern:
+
+1. Agent calls `create_task` with `trigger_type="callback"` and `action_type="resume_agent"`. Receives full UUID.
+2. Agent or background script does long-running work.
+3. External process completes the task via one of:
+   - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — agent runs first with result injected, then task marked complete
+   - **HTTP:** `POST /tasks/{id}/complete` with Bearer auth and `{"result": "..."}` body
+4. `update_task_completed` validates status (`AND status IN ('pending','in_progress')`) before writing — returns `false` if already completed (TOCTOU guard).
+5. `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }`. The result is wrapped in `<callback_result trust="untrusted">` delimiters before LLM injection to mitigate prompt injection.
+
+### SilentTrigger Variants
+
+`SilentTrigger` controls the system-prompt framing for background agent runs:
+
+| Variant | Used by | Prompt framing |
+|---------|---------|---------------|
+| `Heartbeat` | Hourly heartbeat recurring task | Scheduled check-in, review commitments |
+| `Reflection` | Daily reflection recurring task | Memory reflection and consolidation |
+| `Callback { label, result }` | `resume_agent` dispatcher | Background task completed, inject result |
+| `SkillRun { skill_name }` | `run_skill` dispatcher | Run the named skill |
+
+### Startup Maintenance
+
+`prune_old_tasks()` runs at startup and deletes completed, failed, and cancelled tasks older than 30 days to prevent unbounded table growth.
+
+### Composite Partial Index
+
+```sql
+CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC)
+WHERE status IN ('pending', 'recurring_active');
+```
+
+
+## 10. Silent Mode
+
+Silent mode is used for background tasks (heartbeat check-ins and reminders) where
+the agent's text output is NOT automatically delivered to the user.
+
+| Aspect | Normal Mode | Silent Mode |
+|--------|-------------|-------------|
+| User message | Actual user input | Synthetic trigger |
+| Text output | Returned to caller | NOT delivered (saved to DB for audit) |
+| How to reach user | Automatic | Must use `send_message` tool |
+| Message history | Last 20 messages | Single trigger message only |
+| Compaction | Runs post-turn | Does not run |
+
+Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handler
+skills for security — only builtin-handler skills are available in autonomous
+background runs.
+
+Each background run is framed by a `SilentTrigger` variant (see Section 9 §
+SilentTrigger Variants). Callback results are wrapped in
+`<callback_result trust="untrusted">` XML-like delimiters before LLM injection
+to mitigate prompt injection from external result payloads.
+
+
+## 11. Conversation Compaction
 
 When conversation history grows beyond a threshold, older messages are summarized via
 a Claude API call and replaced with a summary row. The summary is injected into the
@@ -227,7 +572,7 @@ Compaction is incremental -- subsequent rounds merge the existing summary with
 newly compacted messages.
 
 
-## 8. AsyncDatabase
+## 12. AsyncDatabase
 
 Source: `crates/mika-agent/src/async_db.rs`
 
@@ -248,40 +593,7 @@ Properties:
 - **Graceful shutdown:** `shutdown()` drops the sender, joins the background thread.
 
 
-## 9. Heartbeat System
-
-The heartbeat system enables proactive check-ins without user initiation. An
-external scheduler periodically POSTs to the container's `/heartbeat` endpoint.
-
-### Pre-Filter Checks (before acquiring Mutex)
-
-1. Active hours: 08:00-21:00 in customer's local timezone
-2. Max 1 heartbeat per hour
-3. Max 3 heartbeats per day
-4. Skip if user messaged within 2 hours
-
-If any check fails, the handler returns `204 No Content` immediately.
-
-
-## 10. Silent Mode
-
-Silent mode is used for background tasks (heartbeat check-ins and reminders) where
-the agent's text output is NOT automatically delivered to the user.
-
-| Aspect | Normal Mode | Silent Mode |
-|--------|-------------|-------------|
-| User message | Actual user input | Synthetic trigger |
-| Text output | Returned to caller | NOT delivered (saved to DB for audit) |
-| How to reach user | Automatic | Must use `send_message` tool |
-| Message history | Last 20 messages | Single trigger message only |
-| Compaction | Runs post-turn | Does not run |
-
-Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handler
-skills for security — only builtin-handler skills are available in autonomous
-background runs.
-
-
-## 11. HTTP Server (mika-server)
+## 13. HTTP Server (mika-server)
 
 The per-customer agent container runs an Axum HTTP server:
 
@@ -289,7 +601,7 @@ The per-customer agent container runs an Axum HTTP server:
 |----------|--------|------|---------|
 | `/health` | GET | None | Liveness/readiness probe |
 | `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
-| `/heartbeat` | POST | Bearer | Scheduled job trigger for proactive check-ins |
+| `/tasks/{id}/complete` | POST | Bearer | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
 
 `AppState` is Clone via Arc-wrapped dependencies. Agent lock
 (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock`
@@ -298,7 +610,7 @@ The per-customer agent container runs an Axum HTTP server:
 See [ADR-001](adr/001-axum-http-server-architecture.md) for design decisions.
 
 
-## 12. Failed Sends (Durable Outbox Pattern)
+## 14. Failed Sends (Durable Outbox Pattern)
 
 When the outbound routing endpoint is unreachable, messages are not lost.
 
@@ -316,18 +628,36 @@ At the start of each `/message` handler, the server flushes up to 5 pending fail
 sends in a background task (does not block message processing).
 
 
-## 13. Multi-Agent Support
+## 15. Multi-Agent Support
 
 - Global home directory: `~/.mika/`
-- Agent homes: `~/.mika/agents/{name}/` (each with data/, skills/, logs/)
+- Agent homes: `~/.mika/agents/{name}/` (each with skills/, logs/)
 - Active agent tracked in `~/.mika/active_agent`
 - CLI `--agent` flag overrides active agent
+- CLI `--team` flag launches TUI in team mode (mutually exclusive with `--agent`)
 - Server discovers all agents on startup
+- `AgentParams` carries `global_home_dir: Option<&Path>` (global `~/.mika/`) distinct from
+  per-agent `home_dir` (e.g. `~/.mika/agents/main/`) for agent/team discovery
+
+### Agent Delegation
+
+When multiple agents are configured, the primary agent can delegate tasks to other
+agents via the `delegate_task` tool. The delegate runs with its own personality,
+memory, and skills but receives only `default_tools()` (no management tools, no MCP)
+to prevent infinite delegation chains. The system prompt includes an "Agents & Teams"
+section listing available agents with their identities (emoji + name).
+
+### Team Workflows
+
+Teams are defined in `~/.mika/teams/{name}/team.toml` and orchestrated by the
+`run_team` tool. Team runs and message graphs are persisted to the shared container
+database (`~/.mika/data/mika.db`) with graph-structured messages linked via
+`parent_id`. Queryable via `get_team_status` and `get_team_history` tools.
 
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
 
-## 14. Observability & Telemetry
+## 16. Observability & Telemetry
 
 Mika follows an "always instrument, optionally export" pattern. Tracing spans are
 compiled unconditionally into the binary — no feature flags needed. Spans cover the
@@ -369,33 +699,33 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 11
+**Schema version:** 1 (consolidated clean-slate baseline)
 
 ### Tables
 
-| Table | Purpose | Schema Version |
-|-------|---------|----------------|
-| `schema_version` | Migration tracking | v4 |
-| `conversations` | Message history (user, assistant, summary rows) | v4 (+`compacted_through_id` in v5) |
-| `core_memory` | Layer 1 persistent memory blocks | v4 |
-| `people` | Layer 2 people/contacts | v4 |
-| `commitments` | Layer 2 tasks/promises with status tracking | v4 |
-| `preferences` | Layer 2 user preferences | v4 |
-| `events` | Layer 2 notable events | v4 |
-| `memory_events` | Audit log for all memory mutations | v4 (+`created_at` index in v7) |
-| `reminders` | Scheduled future reminders | v5 |
-| `heartbeat_sends` | Rate limiting for heartbeat sends | v5 |
-| `customer_config` | Key-value store (timezone, chat_id) | v5 |
-| `failed_sends` | Durable outbox for failed outbound messages | v5 |
-| `memory_event_summaries` | Tiered retention summaries (monthly) | v6 |
-| `skills` | Skill metadata (name, description, builtin flag, enabled) | v7 |
-| `skill_tools` | Tool definitions per skill | v7 |
-| `search_content` | Unified search content for Layer 3 hybrid search | v8 |
-| `fts_search` | FTS5 virtual table for full-text search | v8 |
-| `vec_search` | sqlite-vec virtual table (vec0) for vector similarity | v8 |
-| `reflection_runs` | Periodic memory reflection tracking | v10 |
-| `team_runs` | Team execution run metadata | v11 |
-| `team_messages` | Graph-structured team messages with parent_id links | v11 |
+| Table | Purpose |
+|-------|---------|
+| `schema_version` | Migration tracking |
+| `agents` | Agent registry (name, display_name, model, active flag) |
+| `teams` | Team registry (name, display_name, orchestrator) |
+| `conversations` | Message history (user, assistant, summary rows; `channel_type`, `agent_id` FK) |
+| `core_memory` | Layer 1 persistent memory blocks (`agent_id` FK) |
+| `people` | Layer 2 people/contacts (`agent_id` FK) |
+| `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
+| `preferences` | Layer 2 user preferences (`agent_id` FK) |
+| `events` | Layer 2 notable events (`agent_id` FK) |
+| `memory_events` | Audit log for all memory mutations (`agent_id` FK) |
+| `customer_config` | Key-value store (timezone, chat_id) |
+| `failed_sends` | Durable outbox for failed outbound messages |
+| `memory_event_summaries` | Tiered retention summaries (monthly) |
+| `skills` | Skill metadata (name, description, builtin flag, enabled) |
+| `skill_tools` | Tool definitions per skill |
+| `search_content` | Unified search content for Layer 3 hybrid search |
+| `fts_search` | FTS5 virtual table for full-text search |
+| `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
+| `tasks` | Unified task scheduler — replaces `reminders`; all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`) |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable) |
+| `team_messages` | Graph-structured team messages with `parent_id` links; `agent_name` column (not FK) |
 
 ### SQLite Pragmas
 

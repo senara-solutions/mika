@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
+use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names, default_self_model};
 
 const MAX_TOKENS_PER_BLOCK: i32 = 500;
 const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
@@ -159,12 +159,17 @@ impl Tool for UpdateCoreMemoryTool {
                 lines.join("\n")
             }
             "reset" => {
-                let default_value = CORE_MEMORY_SECTIONS
+                let static_default = CORE_MEMORY_SECTIONS
                     .iter()
                     .find(|(k, _)| *k == section)
                     .map(|(_, v)| *v)
                     .expect("section already validated above");
-                default_value.to_string()
+                if section == "self_model" {
+                    let display_name = ctx.db.get_agent_display_name().await;
+                    default_self_model(&display_name)
+                } else {
+                    static_default.to_string()
+                }
             }
             _ => unreachable!(), // Already validated above
         };
@@ -245,7 +250,7 @@ mod tests {
         let result = tool
             .execute(
                 make_input(
-                    "persona",
+                    "self_model",
                     "replace",
                     "Mika — sharp, proactive EA.",
                     "Updated persona",
@@ -258,7 +263,7 @@ mod tests {
 
         let entry = harness
             .db
-            .get_core_memory("persona")
+            .get_core_memory("self_model")
             .await
             .unwrap()
             .unwrap();
@@ -300,7 +305,7 @@ mod tests {
         // Set a block near the limit (~500 tokens = ~2000 chars)
         harness
             .db
-            .set_core_memory("persona", &"x".repeat(1900))
+            .set_core_memory("self_model", &"x".repeat(1900))
             .await
             .unwrap();
         let ctx = harness.ctx();
@@ -308,7 +313,12 @@ mod tests {
 
         let result = tool
             .execute(
-                make_input("persona", "append", &"y".repeat(200), "Extending persona"),
+                make_input(
+                    "self_model",
+                    "append",
+                    &"y".repeat(200),
+                    "Extending persona",
+                ),
                 &ctx,
             )
             .await
@@ -379,7 +389,7 @@ mod tests {
         for i in 0..3 {
             let result = tool
                 .execute(
-                    make_input("persona", "replace", &format!("Edit {i}"), "Testing"),
+                    make_input("self_model", "replace", &format!("Edit {i}"), "Testing"),
                     &ctx,
                 )
                 .await
@@ -389,7 +399,10 @@ mod tests {
 
         // 4th edit should be rate limited
         let result = tool
-            .execute(make_input("persona", "replace", "Edit 3", "One more"), &ctx)
+            .execute(
+                make_input("self_model", "replace", "Edit 3", "One more"),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -408,7 +421,7 @@ mod tests {
             let result = tool
                 .execute(
                     make_input(
-                        "persona",
+                        "self_model",
                         "replace",
                         &format!("Onboarding edit {i}"),
                         "Seeding",
@@ -446,7 +459,7 @@ mod tests {
         assert_eq!(events[0].target_key, "user_summary");
         assert_eq!(
             events[0].before_value,
-            Some("New user. No information yet.".to_string())
+            Some("No information about the user yet.".to_string())
         );
         assert_eq!(events[0].after_value, "Alice, CEO of Acme.");
         assert_eq!(
@@ -464,7 +477,7 @@ mod tests {
         // 500 tokens * 4 chars/token = 2000 chars. Slightly over should fail.
         let result = tool
             .execute(
-                make_input("persona", "replace", &"x".repeat(2004), "Testing limit"),
+                make_input("self_model", "replace", &"x".repeat(2004), "Testing limit"),
                 &ctx,
             )
             .await
@@ -483,7 +496,12 @@ mod tests {
         // Without evidence field → rejected
         let result = tool
             .execute(
-                make_input("persona", "replace", "Updated persona", "Reflection update"),
+                make_input(
+                    "self_model",
+                    "replace",
+                    "Updated persona",
+                    "Reflection update",
+                ),
                 &ctx,
             )
             .await
@@ -502,7 +520,7 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "section": "persona",
+                    "section": "self_model",
                     "action": "replace",
                     "content": "Updated persona",
                     "reasoning": "Reflection update",
@@ -524,7 +542,7 @@ mod tests {
 
         let make_reflection_input = |i: u32| {
             serde_json::json!({
-                "section": "persona",
+                "section": "self_model",
                 "action": "replace",
                 "content": format!("Edit {i}"),
                 "reasoning": "Reflection",
@@ -623,6 +641,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.value, "New user. No information yet.");
+        assert_eq!(entry.value, "No information about the user yet.");
     }
 }

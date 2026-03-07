@@ -97,16 +97,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // Create two agents
-        let main_dir = agent::agent_dir(tmp.path(), "main");
-        fs::create_dir_all(&main_dir).unwrap();
-        fs::write(main_dir.join("config.toml"), "# config").unwrap();
+        let mika_dir = agent::agent_dir(tmp.path(), "mika");
+        fs::create_dir_all(&mika_dir).unwrap();
+        fs::write(mika_dir.join("config.toml"), "# config").unwrap();
         fs::write(
-            main_dir.join("identity.toml"),
+            mika_dir.join("identity.toml"),
             "name = \"Mika\"\nemoji = \"✦\"\n",
         )
         .unwrap();
         fs::write(
-            main_dir.join("soul.md"),
+            mika_dir.join("soul.md"),
             "You are a sharp executive assistant.\n",
         )
         .unwrap();
@@ -129,7 +129,7 @@ mod tests {
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Found 2 agents"));
-        assert!(result.content.contains("main (✦ Mika)"));
+        assert!(result.content.contains("mika (✦ Mika)"));
         assert!(result.content.contains("researcher (🔬 Rex)"));
         assert!(result.content.contains("sharp executive assistant"));
     }

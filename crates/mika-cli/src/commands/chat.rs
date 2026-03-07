@@ -21,8 +21,8 @@ use crate::tui::input;
 use crate::tui::ui;
 use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::prompt;
-use mika_agent::scheduler::ReminderScheduler;
 use mika_agent::skills::SkillRegistry;
+use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::tools;
 use mika_common::claude::{ImageSource, ThinkingConfig};
@@ -69,8 +69,8 @@ async fn spawn_agent_worker(
     // Connect to MCP servers
     let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
 
-    // Recover reminders on startup and start background poller
-    let scheduler = Arc::new(ReminderScheduler {
+    // Set up task engine for background tasks (reminders, reflection)
+    let dispatcher = Arc::new(TaskDispatcher {
         db: ctx.async_db.clone(),
         claude: ctx.claude.clone(),
         tools: tool_registry.clone(),
@@ -80,13 +80,49 @@ async fn spawn_agent_worker(
         embedding_client: embedding_client.clone(),
         brave_api_key: brave_api_key.clone(),
         skills_dirty: skills_dirty.clone(),
-        agent_lock: None, // CLI serializes via channel, no lock needed
-        reflection_config: identity.reflection.clone(),
+        // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
+        // concurrently with user message processing (both use the same AsyncDatabase,
+        // which serializes at the DB thread level). Concurrent Claude API calls are
+        // accepted in CLI mode; rate-limit errors are handled by the Claude client.
+        agent_lock: None,
     });
-    if let Err(e) = scheduler.recover().await {
-        tracing::warn!(error = %e, "reminder recovery failed");
+    let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
+        ctx.async_db.clone(),
+        dispatcher,
+    )));
+
+    // Register recurring built-in tasks and run startup recovery
+    task_engine::ensure_recurring_task(
+        &ctx.async_db,
+        "heartbeat",
+        "0 0 * * * *",
+        r#"{"trigger":"heartbeat"}"#,
+    )
+    .await;
+    if let Some(cron) = task_engine::reflection_cron_for_agent(&ctx.home_dir, &ctx.async_db).await {
+        task_engine::ensure_recurring_task(
+            &ctx.async_db,
+            "reflection",
+            &cron,
+            r#"{"trigger":"reflection"}"#,
+        )
+        .await;
+    } else if let Err(e) = ctx
+        .async_db
+        .cancel_recurring_task_by_label("reflection")
+        .await
+    {
+        tracing::warn!(error = %e, "failed to cancel stale reflection task");
     }
-    let poller_handle = scheduler.spawn_poller();
+    {
+        let mut eng = task_engine.lock().await;
+        if let Err(e) = eng.startup_recovery().await {
+            tracing::warn!(error = %e, "task engine startup recovery failed");
+        }
+    }
+    // Prune completed tasks older than 30 days to prevent unbounded DB growth
+    task_engine::prune_old_tasks(&ctx.async_db).await;
+    let poller_handle = TaskEngine::spawn_tick_loop(task_engine);
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
@@ -446,10 +482,10 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
     let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamEvent>();
 
-    // Open on-disk DB for team conversation persistence
-    let data_dir = team_dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-    let team_db = mika_agent::async_db::AsyncDatabase::open(&data_dir.join("mika.db"))?;
+    // Use the shared container DB for team conversation persistence
+    let db_path = mika_common::home::container_db_path(global_home);
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let team_db = mika_agent::async_db::AsyncDatabase::open(&db_path)?;
 
     // Spawn team worker
     let worker_home = global_home.to_path_buf();

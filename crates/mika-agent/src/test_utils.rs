@@ -67,6 +67,15 @@ pub mod test_helpers {
             }
         }
 
+        /// Create a harness with a specific agent ID.
+        pub fn with_agent(agent_id: &str) -> Self {
+            let db = Database::open_in_memory().unwrap();
+            Self {
+                db: AsyncDatabase::new_with_agent(db, agent_id),
+                counter: AtomicU32::new(0),
+            }
+        }
+
         /// Create a non-onboarding ToolContext borrowing from this harness.
         pub fn ctx(&self) -> ToolContext<'_> {
             test_ctx(&self.db, &self.counter)
@@ -135,27 +144,5 @@ pub mod test_helpers {
             otlp_endpoint: None,
             otlp_auth_header: None,
         }
-    }
-
-    /// Create a team DB on disk with `run_count` completed runs.
-    ///
-    /// Returns `(TempDir, home_dir)`. The `TempDir` must be kept alive
-    /// for the duration of the test to prevent cleanup. Each run is
-    /// spaced 5 minutes apart with IDs `run-0000`, `run-0001`, etc.
-    pub fn setup_team_db(team_name: &str, run_count: usize) -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        let data_dir = mika_common::team::team_dir(&home, team_name).join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let db = Database::open(&data_dir.join("mika.db")).unwrap();
-        for i in 0..run_count {
-            let run_id = format!("run-{i:04}");
-            let ts = 1_740_000_000 + (i as i64 * 300); // spaced 5 min apart
-            db.insert_team_run(&run_id, team_name, &format!("Goal {i}"), 3, ts)
-                .unwrap();
-            db.update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
-                .unwrap();
-        }
-        (tmp, home)
     }
 }

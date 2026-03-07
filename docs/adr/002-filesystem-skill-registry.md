@@ -29,7 +29,7 @@ Matched skills contribute tools and prompt snippets to that turn's agent loop.
 ### Handler Types
 
 - **Builtin** — dispatches to Rust `ToolRegistry` (full DB/context access)
-- **Exec** — spawns subprocess with `MIKA_TOOL_INPUT` env var
+- **Exec** — spawns subprocess, pipes tool input JSON via stdin
 - **Http** — POSTs `{tool_name, input}` to configured URL
 
 ### Key Design Choices
@@ -49,7 +49,7 @@ Matched skills contribute tools and prompt snippets to that turn's agent loop.
 - Prompt size scales with matched skills, not total skills
 - Exec handlers run unsandboxed — the skills directory is the trust boundary
 - Skill manifests are scanned once at startup; new skill directories require restart
-- `MIKA_TOOL_INPUT` env var is the only data channel to exec handlers
+- Stdin is the data channel to exec handlers (tool input JSON piped via stdin)
 
 ### Security Considerations
 

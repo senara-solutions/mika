@@ -12,11 +12,16 @@ pub fn resolve_home_dir() -> Result<PathBuf> {
     Ok(home.join(".mika"))
 }
 
-/// Check if Mika has been initialized (database exists).
-/// Supports both legacy layout (data/mika.db at root) and multi-agent layout.
+/// Path to the single shared container database: `{home_dir}/data/mika.db`.
+/// This is the unified schema v1 database that replaces per-agent databases.
+pub fn container_db_path(home_dir: &Path) -> PathBuf {
+    home_dir.join("data").join("mika.db")
+}
+
+/// Check if Mika has been initialized (container DB or agents exist).
 pub fn is_initialized(home_dir: &Path) -> bool {
-    // Legacy layout
-    if home_dir.join("data").join("mika.db").exists() {
+    // Container DB exists (normal + legacy layout)
+    if container_db_path(home_dir).exists() {
         return true;
     }
     // Multi-agent layout: at least one bootstrapped agent
@@ -29,8 +34,10 @@ pub fn is_multi_agent_layout(home_dir: &Path) -> bool {
 }
 
 /// Check if the home directory uses the legacy layout (has `data/mika.db` at root, no `agents/` dir).
+/// In the unified model, `data/mika.db` at root is the normal container DB.
+/// Legacy means it exists but there's no `agents/` directory yet.
 pub fn is_legacy_layout(home_dir: &Path) -> bool {
-    home_dir.join("data").join("mika.db").exists() && !is_multi_agent_layout(home_dir)
+    container_db_path(home_dir).exists() && !is_multi_agent_layout(home_dir)
 }
 
 /// Bootstrap a fresh installation with multi-agent layout.
@@ -40,6 +47,9 @@ pub fn is_legacy_layout(home_dir: &Path) -> bool {
 pub fn bootstrap_fresh_install(home_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(home_dir.join("agents"))
         .with_context(|| format!("failed to create {}/agents/", home_dir.display()))?;
+    // Create the container-level data directory for the shared database
+    std::fs::create_dir_all(home_dir.join("data"))
+        .with_context(|| format!("failed to create {}/data/", home_dir.display()))?;
     bootstrap_agent(home_dir, crate::agent::DEFAULT_AGENT)
         .with_context(|| "failed to initialize default agent".to_string())?;
     write_active_agent(home_dir, crate::agent::DEFAULT_AGENT)?;
@@ -69,9 +79,9 @@ pub fn resolve_agent_home(home_dir: &Path, agent_name: &str) -> PathBuf {
 /// Migrate a legacy layout to multi-agent layout (idempotent).
 ///
 /// If already multi-agent layout → no-op.
-/// If legacy layout: creates `agents/main/`, moves data/, logs/, skills/, exports/,
+/// If legacy layout: creates `agents/mika/`, moves data/, logs/, skills/, exports/,
 /// config.toml, identity.toml, soul.md, heartbeat.md, user.md into it.
-/// Writes `active_agent` file with "main".
+/// Writes `active_agent` file with "mika".
 /// Creates a root-level config.toml with shared settings.
 pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
     if is_multi_agent_layout(home_dir) {
@@ -86,7 +96,8 @@ pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", agent.display()))?;
 
     // Move directories (fault-tolerant: NotFound means another process already moved it)
-    for dir_name in &["data", "logs", "skills", "exports"] {
+    // NOTE: "data" stays at root (it's the container DB), only logs/skills/exports move
+    for dir_name in &["logs", "skills", "exports"] {
         let src = home_dir.join(dir_name);
         if src.is_dir() {
             let dst = agent.join(dir_name);
@@ -135,7 +146,7 @@ pub fn migrate_to_multi_agent(home_dir: &Path) -> Result<()> {
 }
 
 /// Read the active agent name from `{home_dir}/active_agent`.
-/// Returns DEFAULT_AGENT ("main") if file doesn't exist or is empty.
+/// Returns DEFAULT_AGENT ("mika") if file doesn't exist or is empty.
 pub fn read_active_agent(home_dir: &Path) -> String {
     let path = home_dir.join("active_agent");
     std::fs::read_to_string(&path)
@@ -166,8 +177,6 @@ log_level = "info"
 /// Create the ~/.mika/ directory structure with default files.
 /// Sets permissions to 0700 for directories, 0600 for files on Unix.
 pub fn bootstrap(home_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(home_dir.join("data"))
-        .with_context(|| format!("failed to create {}/data/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("logs"))
         .with_context(|| format!("failed to create {}/logs/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("skills"))
@@ -325,7 +334,6 @@ mod tests {
 
         bootstrap(&home).unwrap();
 
-        assert!(home.join("data").is_dir());
         assert!(home.join("logs").is_dir());
         assert!(home.join("config.toml").is_file());
         assert!(home.join("identity.toml").is_file());
@@ -411,7 +419,6 @@ mod tests {
         bootstrap_agent(tmp.path(), "work").unwrap();
 
         let agent = tmp.path().join("agents").join("work");
-        assert!(agent.join("data").is_dir());
         assert!(agent.join("logs").is_dir());
         assert!(agent.join("skills").is_dir());
         assert!(agent.join("config.toml").is_file());
@@ -431,7 +438,7 @@ mod tests {
     fn test_resolve_agent_home_legacy() {
         let tmp = tempfile::tempdir().unwrap();
         // No agents/ dir → legacy layout → returns home_dir
-        let resolved = resolve_agent_home(tmp.path(), "main");
+        let resolved = resolve_agent_home(tmp.path(), "mika");
         assert_eq!(resolved, tmp.path());
     }
 
@@ -449,7 +456,7 @@ mod tests {
         assert!(!is_initialized(tmp.path()));
 
         // Create a multi-agent layout with one bootstrapped agent
-        let agent = tmp.path().join("agents").join("main");
+        let agent = tmp.path().join("agents").join("mika");
         fs::create_dir_all(&agent).unwrap();
         fs::write(agent.join("config.toml"), "# config").unwrap();
         assert!(is_initialized(tmp.path()));
@@ -460,9 +467,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        // Set up legacy layout
+        // Set up legacy layout (bootstrap no longer creates data/, so create it
+        // manually to simulate the legacy layout that had a per-root data/ dir)
         bootstrap(home).unwrap();
-        // Write a marker into the DB so we can verify it moved
+        fs::create_dir_all(home.join("data")).unwrap();
+        // Write a marker into the DB so we can verify it stays at root
         fs::write(home.join("data").join("mika.db"), "test-db-content").unwrap();
         fs::write(home.join("soul.md"), "custom soul").unwrap();
 
@@ -473,27 +482,26 @@ mod tests {
 
         // Verify multi-agent layout
         assert!(is_multi_agent_layout(home));
-        assert!(!is_legacy_layout(home));
 
-        // Data moved to agents/main/
-        let main_agent = home.join("agents").join("main");
+        // data/ stays at root (container DB)
+        assert!(home.join("data").is_dir());
         assert_eq!(
-            fs::read_to_string(main_agent.join("data").join("mika.db")).unwrap(),
+            fs::read_to_string(home.join("data").join("mika.db")).unwrap(),
             "test-db-content"
         );
+
+        // Agent files moved to agents/mika/
+        let mika_agent = home.join("agents").join("mika");
         assert_eq!(
-            fs::read_to_string(main_agent.join("soul.md")).unwrap(),
+            fs::read_to_string(mika_agent.join("soul.md")).unwrap(),
             "custom soul"
         );
-        assert!(main_agent.join("identity.toml").is_file());
-        assert!(main_agent.join("config.toml").is_file());
-        assert!(main_agent.join("skills").is_dir());
-
-        // Root-level data/ should no longer exist
-        assert!(!home.join("data").is_dir());
+        assert!(mika_agent.join("identity.toml").is_file());
+        assert!(mika_agent.join("config.toml").is_file());
+        assert!(mika_agent.join("skills").is_dir());
 
         // active_agent file should exist
-        assert_eq!(read_active_agent(home), "main");
+        assert_eq!(read_active_agent(home), "mika");
 
         // Root config.toml should be the global one
         let root_config = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -505,19 +513,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        // Set up legacy layout and migrate
+        // Set up legacy layout and migrate (bootstrap no longer creates data/,
+        // so create it manually to simulate the legacy layout)
         bootstrap(home).unwrap();
+        fs::create_dir_all(home.join("data")).unwrap();
         fs::write(home.join("data").join("mika.db"), "test-db").unwrap();
         migrate_to_multi_agent(home).unwrap();
 
         // Migrate again — should be no-op
         migrate_to_multi_agent(home).unwrap();
 
-        // Still works
+        // Still works — container DB at root
         assert!(is_multi_agent_layout(home));
-        let main_agent = home.join("agents").join("main");
         assert_eq!(
-            fs::read_to_string(main_agent.join("data").join("mika.db")).unwrap(),
+            fs::read_to_string(home.join("data").join("mika.db")).unwrap(),
             "test-db"
         );
     }
@@ -536,7 +545,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // Default when no file
-        assert_eq!(read_active_agent(tmp.path()), "main");
+        assert_eq!(read_active_agent(tmp.path()), "mika");
 
         // Write and read back
         write_active_agent(tmp.path(), "work").unwrap();
@@ -551,7 +560,7 @@ mod tests {
     fn test_read_active_agent_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("active_agent"), "  \n").unwrap();
-        assert_eq!(read_active_agent(tmp.path()), "main");
+        assert_eq!(read_active_agent(tmp.path()), "mika");
     }
 
     #[test]
@@ -564,16 +573,18 @@ mod tests {
         // Multi-agent layout created
         assert!(is_multi_agent_layout(home));
 
-        // Default agent bootstrapped
-        let main_agent = home.join("agents").join("main");
-        assert!(main_agent.join("data").is_dir());
-        assert!(main_agent.join("logs").is_dir());
-        assert!(main_agent.join("skills").is_dir());
-        assert!(main_agent.join("config.toml").is_file());
-        assert!(main_agent.join("soul.md").is_file());
+        // Container-level data dir created
+        assert!(home.join("data").is_dir());
 
-        // Active agent set to "main"
-        assert_eq!(read_active_agent(home), "main");
+        // Default agent bootstrapped
+        let mika_agent = home.join("agents").join("mika");
+        assert!(mika_agent.join("logs").is_dir());
+        assert!(mika_agent.join("skills").is_dir());
+        assert!(mika_agent.join("config.toml").is_file());
+        assert!(mika_agent.join("soul.md").is_file());
+
+        // Active agent set to "mika"
+        assert_eq!(read_active_agent(home), "mika");
 
         // Root-level global config written
         let root_config = fs::read_to_string(home.join("config.toml")).unwrap();

@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     }
 
     // Resolve agent name first — needed for correct log directory.
-    // Priority: --agent flag > active_agent file > "main"
+    // Priority: --agent flag > active_agent file > "mika"
     let agent_name = match cli.agent {
         Some(name) => {
             let name = agent::normalize_agent_name(&name);
@@ -136,16 +136,19 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => commands::status::run(&agent_name).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
-        Some(Commands::Ask { message }) => match commands::ask::run(&message, &agent_name).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
+        Some(Commands::Ask { message, task_id }) => {
+            match commands::ask::run(&message, &agent_name, task_id.as_deref()).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Some(Commands::Agents(args)) => commands::agents::run(args).await,
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
+        Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
     }
 }
 
@@ -240,7 +243,7 @@ mod tests {
         let home = tmp.path();
         // No agents/ dir → legacy layout → resolve_agent_home returns home
 
-        let log_dir = home::resolve_agent_home(home, "main").join("logs");
+        let log_dir = home::resolve_agent_home(home, "mika").join("logs");
         assert_eq!(log_dir, home.join("logs"));
     }
 

@@ -1,5 +1,5 @@
 ---
-status: wont_fix
+status: complete
 priority: p3
 issue_id: 425
 tags: [code-review, feature, agent-native]

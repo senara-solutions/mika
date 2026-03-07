@@ -14,6 +14,8 @@ pub struct ReflectionConfig {
     pub time: String,
     #[serde(default)]
     pub notify: bool,
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 fn default_reflection_time() -> String {
@@ -26,6 +28,7 @@ impl Default for ReflectionConfig {
             enabled: false,
             time: default_reflection_time(),
             notify: false,
+            timezone: None,
         }
     }
 }
@@ -103,7 +106,7 @@ pub struct PromptContext<'a> {
     pub channel_type: Option<&'a str>,
     /// Whether Telegram integration is configured (chat_id exists in customer_config).
     pub telegram_configured: bool,
-    /// Per-agent home directory (e.g. `~/.mika/agents/main/`).
+    /// Per-agent home directory (e.g. `~/.mika/agents/mika/`).
     /// Surfaced in the Tool Usage section so the agent knows write_file's base path.
     pub home_dir: Option<&'a Path>,
 }
@@ -115,7 +118,9 @@ fn onboarding_prompt() -> String {
          This is your first conversation with the user. Introduce yourself briefly and warmly. \
          Ask who they are and what they're working on. Use update_core_memory to seed all \
          {} blocks ({}) from their \
-         responses. Keep it to 2-3 natural exchanges, then transition to being helpful \
+         responses. Also use store_fact(category=\"person\") to create a record for the user \
+         with just their first name (e.g. name=\"Vincent\") and relationship \"The user\". \
+         Keep it to 2-3 natural exchanges, then transition to being helpful \
          with whatever they need.",
         section_names.len(),
         section_names.join(", ")
@@ -276,7 +281,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str("\n## Tool Usage\n");
     prompt.push_str("- Update your core memory when you learn important things about the user.\n");
     prompt.push_str(
-        "- Track people, commitments, preferences, and events using the appropriate tools.\n",
+        "- When the user mentions a person by name for the first time, store them using \
+store_fact(category=\"person\") with their name, relationship, and any context. \
+Use only their first name (or first + last if ambiguous). Never prefix with \"User:\", \
+\"Mr.\", \"Dr.\", etc. — the relationship field captures the role. \
+Core memory tracks key people briefly — the people table is the full record.\n",
     );
     prompt.push_str(
         "- Use search_memory to find stored facts before asking the user to repeat information.\n",
@@ -304,10 +313,15 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- Tools may return images (screenshots, image files); you will see and can describe their contents.\n",
     );
     prompt.push_str(
-        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_file on that path to view the image contents.\n",
+        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_home_file on that path to view the image contents.\n",
     );
     prompt.push_str(
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
+    );
+    prompt.push_str(
+        "- Some tools are long-running and return a task ID instead of immediate results. \
+         When this happens, inform the user that a background task is running and you'll follow up \
+         when results arrive. Do not retry the tool.\n",
     );
     if let Some(home) = ctx.home_dir {
         writeln!(
@@ -319,12 +333,27 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
             home.display()
         )
         .unwrap();
+        writeln!(
+            prompt,
+            "- You can read files from your home directory with read_home_file (path relative to {}). \
+             Files larger than 100 KB are rejected.",
+            home.display()
+        )
+        .unwrap();
     } else {
         prompt.push_str(
             "- You can write files to your home directory with write_file. Paths are relative to your home. \
              If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
         );
+        prompt.push_str(
+            "- You can read files from your home directory with read_home_file (relative paths only). \
+             Files larger than 100 KB are rejected.\n",
+        );
     }
+    prompt.push_str(
+        "- You can list files in your home directory with list_home_files. \
+         Omit path or pass an empty string to list the root. Pass a relative subdirectory path to list that directory.\n",
+    );
 
     prompt
 }
@@ -347,6 +376,8 @@ pub struct SilentPromptContext<'a> {
     pub recent_conversations: Option<&'a str>,
     /// Pre-formatted digest of today's memory events (reflection mode only).
     pub recent_memory_events: Option<&'a str>,
+    /// Agent home directory. When set, file tool instructions include the absolute path.
+    pub home_dir: Option<&'a std::path::Path>,
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -401,6 +432,24 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         prompt.push_str("\n</memory-events>\n\n");
     }
 
+    // File tools — mention home-scoped file tools so heartbeat agents can discover them
+    prompt.push_str("## File Tools\n");
+    if let Some(home) = ctx.home_dir {
+        writeln!(
+            prompt,
+            "- read_home_file: Read a file from your home directory ({}). Paths are relative to that directory.\n\
+             - list_home_files: List files and directories in your home directory. Omit path to list the root.",
+            home.display()
+        )
+        .unwrap();
+    } else {
+        prompt.push_str(
+            "- read_home_file: Read a file from your home directory. Paths are relative to your home.\n\
+             - list_home_files: List files and directories in your home directory. Omit path to list the root.\n",
+        );
+    }
+    prompt.push('\n');
+
     // Trigger-specific context
     prompt.push_str("## Trigger\n");
     prompt.push_str(ctx.trigger_context);
@@ -434,9 +483,9 @@ mod tests {
                 updated_at: "2026-01-01".to_string(),
             },
             CoreMemoryEntry {
-                key: "persona".to_string(),
-                value: "Mika — assistant.".to_string(),
-                token_count: 4,
+                key: "self_model".to_string(),
+                value: "I am Mika. No interaction history yet.".to_string(),
+                token_count: 8,
                 updated_at: "2026-01-01".to_string(),
             },
         ]
@@ -483,8 +532,8 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("### user_summary"));
         assert!(prompt.contains("Loves coffee."));
-        assert!(prompt.contains("### persona"));
-        assert!(prompt.contains("Mika — assistant."));
+        assert!(prompt.contains("### self_model"));
+        assert!(prompt.contains("I am Mika. No interaction history yet."));
     }
 
     #[test]
@@ -611,6 +660,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -635,6 +685,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -667,6 +718,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -796,6 +848,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -819,6 +872,7 @@ mod tests {
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -880,11 +934,11 @@ max_iterations = 3
         let tmp = tempfile::tempdir().unwrap();
 
         // Create two agents
-        let main_dir = tmp.path().join("agents").join("main");
-        std::fs::create_dir_all(&main_dir).unwrap();
-        std::fs::write(main_dir.join("config.toml"), "# config").unwrap();
+        let mika_dir = tmp.path().join("agents").join("mika");
+        std::fs::create_dir_all(&mika_dir).unwrap();
+        std::fs::write(mika_dir.join("config.toml"), "# config").unwrap();
         std::fs::write(
-            main_dir.join("identity.toml"),
+            mika_dir.join("identity.toml"),
             "name = \"Mika\"\nemoji = \"✦\"\n",
         )
         .unwrap();
@@ -915,7 +969,7 @@ max_iterations = 3
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Agents & Teams"));
         assert!(prompt.contains("delegate_task"));
-        assert!(prompt.contains("main (✦ Mika)"));
+        assert!(prompt.contains("mika (✦ Mika)"));
         assert!(prompt.contains("researcher (🔬 Rex)"));
     }
 
@@ -924,9 +978,9 @@ max_iterations = 3
         let tmp = tempfile::tempdir().unwrap();
 
         // Single agent only
-        let main_dir = tmp.path().join("agents").join("main");
-        std::fs::create_dir_all(&main_dir).unwrap();
-        std::fs::write(main_dir.join("config.toml"), "# config").unwrap();
+        let mika_dir = tmp.path().join("agents").join("mika");
+        std::fs::create_dir_all(&mika_dir).unwrap();
+        std::fs::write(mika_dir.join("config.toml"), "# config").unwrap();
 
         let identity = test_identity();
         let ctx = PromptContext {
@@ -1064,16 +1118,16 @@ max_iterations = 3
             global_home_dir: None,
             channel_type: None,
             telegram_configured: false,
-            home_dir: Some(std::path::Path::new("/home/user/.mika/agents/main")),
+            home_dir: Some(std::path::Path::new("/home/user/.mika/agents/mika")),
         };
 
         let prompt = build_system_prompt(&ctx);
         assert!(
-            prompt.contains("/home/user/.mika/agents/main"),
+            prompt.contains("/home/user/.mika/agents/mika"),
             "prompt should include the home directory path"
         );
         assert!(
-            prompt.contains("Your home directory is /home/user/.mika/agents/main"),
+            prompt.contains("Your home directory is /home/user/.mika/agents/mika"),
             "prompt should include the home directory in write_file instruction"
         );
     }
@@ -1116,6 +1170,7 @@ max_iterations = 3
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1137,6 +1192,7 @@ max_iterations = 3
             has_message_sender: true,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1158,6 +1214,7 @@ max_iterations = 3
             has_message_sender: false,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1174,6 +1231,7 @@ max_iterations = 3
             enabled: true,
             time: "20:00".to_string(),
             notify: false,
+            timezone: None,
         };
         let time = config.parse_time().unwrap();
         assert_eq!(time.hour(), 20);
@@ -1186,6 +1244,7 @@ max_iterations = 3
             enabled: true,
             time: "25:00".to_string(),
             notify: false,
+            timezone: None,
         };
         assert!(config.parse_time().is_none());
 
@@ -1193,6 +1252,7 @@ max_iterations = 3
             enabled: true,
             time: "8pm".to_string(),
             notify: false,
+            timezone: None,
         };
         assert!(config2.parse_time().is_none());
     }
@@ -1258,6 +1318,7 @@ notify = true
             has_message_sender: false,
             recent_conversations: Some("User discussed Series A fundraise with Alice."),
             recent_memory_events: Some("update_core_memory: current_priorities -> fundraise"),
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1282,10 +1343,38 @@ notify = true
             has_message_sender: false,
             recent_conversations: None,
             recent_memory_events: None,
+            home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
         assert!(!prompt.contains("## Today's Conversations"));
         assert!(!prompt.contains("## Recent Memory Changes"));
+    }
+
+    #[test]
+    fn test_onboarding_prompt_mentions_store_fact() {
+        let prompt = onboarding_prompt();
+        assert!(prompt.contains("store_fact"));
+        assert!(prompt.contains("person"));
+        assert!(prompt.contains("The user"));
+    }
+
+    #[test]
+    fn test_tool_usage_prompt_mentions_store_fact_person() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: chrono::Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("store_fact(category=\"person\")"));
     }
 }

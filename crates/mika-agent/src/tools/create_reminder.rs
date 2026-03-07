@@ -5,6 +5,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use crate::db::NewTask;
 
 pub struct CreateReminderTool;
 
@@ -74,14 +75,34 @@ impl Tool for CreateReminderTool {
         }
 
         let timestamp = parsed.timestamp();
-        let id = ctx.db.add_reminder(timestamp, message).await?;
+        let action_config = serde_json::json!({"text": message}).to_string();
+        let task = NewTask {
+            agent_id: ctx.db.agent_id.clone(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: message.to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(timestamp),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config,
+            input_context: None,
+            created_by_session: Some(ctx.session_id.to_string()),
+        };
+
+        let id = ctx.db.create_task(task).await?;
 
         let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC");
         ctx.db
             .log_memory_event(
                 ctx.session_id,
                 "create_reminder",
-                &format!("reminder:{id}"),
+                &format!("task:{id}"),
                 None,
                 &format!("{display_time} — {message}"),
                 None,
@@ -89,7 +110,7 @@ impl Tool for CreateReminderTool {
             .await?;
 
         Ok(ToolOutput::success(format!(
-            "Reminder #{id} scheduled for {display_time}."
+            "Reminder {id} scheduled for {display_time}."
         )))
     }
 }
@@ -118,9 +139,9 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("scheduled"));
 
-        let reminders = harness.db.get_pending_reminders().await.unwrap();
+        let reminders = harness.db.get_pending_reminder_tasks().await.unwrap();
         assert_eq!(reminders.len(), 1);
-        assert_eq!(reminders[0].message, "Year-end review");
+        assert_eq!(reminders[0].label, "Year-end review");
     }
 
     #[tokio::test]

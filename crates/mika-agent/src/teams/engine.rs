@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use mika_common::agent;
 use mika_common::claude::ClaudeClient;
@@ -19,6 +19,7 @@ use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::tools;
 use crate::tools::ToolRegistry;
+use mika_common::home;
 
 use super::prompt;
 use super::types::*;
@@ -32,6 +33,14 @@ struct AgentResources {
     skills: SkillRegistry,
     home_dir: PathBuf,
     embedding_client: Option<EmbeddingClient>,
+}
+
+/// Shared initialization resources produced by [`TeamEngine::init_resources`].
+struct EngineResources {
+    agents: HashMap<String, AgentResources>,
+    claude: ClaudeClient,
+    tool_registry: ToolRegistry,
+    workspace_dir: PathBuf,
 }
 
 /// The team orchestration engine.
@@ -51,34 +60,35 @@ pub struct TeamEngine {
 }
 
 impl TeamEngine {
-    /// Create a new engine for a team run.
-    pub fn new(
-        team: TeamDefinition,
-        goal: &str,
+    /// Initialize the shared resources (agents, Claude client, tool registry, workspace)
+    /// used by both [`Self::new`] and [`Self::new_for_resume`].
+    fn init_resources(
+        team: &TeamDefinition,
         global_home: &Path,
         settings: &Settings,
-        callback: Option<TeamEventCallback>,
-        team_db: AsyncDatabase,
-    ) -> Result<Self> {
-        let run_id = uuid::Uuid::new_v4().to_string();
+    ) -> Result<EngineResources> {
         let team_name = &team.team.name;
         let workspace_dir = mika_common::team::workspace_dir(global_home, team_name);
-
-        // Ensure workspace exists
-        std::fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("failed to create workspace {}", workspace_dir.display()))?;
 
         // Initialize agent resources
         let mut agents = HashMap::new();
         let embedding_client = settings.make_embedding_client();
 
+        // Use the single shared container database
+        let db_path = home::container_db_path(global_home);
+
+        // N+1 DB connections: each agent gets its own SQLite connection (+ 1 for team_db).
+        // This is intentional — AsyncDatabase::shutdown() kills the inner OS thread, so we
+        // cannot share a single connection across agent shutdown boundaries. WAL mode handles
+        // concurrent readers correctly, and busy_timeout covers write contention.
         for ta in &team.agents {
             let home_dir = agent::agent_dir(global_home, &ta.name);
-            let db_path = home_dir.join("data").join("mika.db");
             let db = Database::open(&db_path)
-                .with_context(|| format!("failed to open DB for agent '{}'", ta.name))?;
-            startup::seed_core_memory_if_empty(&db, &home_dir)?;
-            let async_db = AsyncDatabase::new(db);
+                .with_context(|| format!("failed to open container DB for agent '{}'", ta.name))?;
+            let identity = crate::prompt::load_identity(&home_dir);
+            db.register_agent(&ta.name, &identity.name, home_dir.to_str().unwrap_or(""))?;
+            startup::seed_core_memory_if_empty(&db, &home_dir, &ta.name)?;
+            let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
             let skills = SkillRegistry::from_dir(&home_dir.join("skills"));
 
             agents.insert(
@@ -104,9 +114,33 @@ impl TeamEngine {
             tool_registry.register(tool);
         }
 
+        Ok(EngineResources {
+            agents,
+            claude,
+            tool_registry,
+            workspace_dir,
+        })
+    }
+
+    /// Create a new engine for a team run.
+    pub fn new(
+        team: TeamDefinition,
+        goal: &str,
+        global_home: &Path,
+        settings: &Settings,
+        callback: Option<TeamEventCallback>,
+        team_db: AsyncDatabase,
+    ) -> Result<Self> {
+        let res = Self::init_resources(&team, global_home, settings)?;
+
+        // Ensure workspace exists
+        std::fs::create_dir_all(&res.workspace_dir).with_context(|| {
+            format!("failed to create workspace {}", res.workspace_dir.display())
+        })?;
+
         let run = TeamRun {
-            run_id,
-            team_name: team_name.clone(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            team_name: team.team.name.clone(),
             goal: goal.to_string(),
             status: RunStatus::Running,
             iteration: 0,
@@ -120,15 +154,155 @@ impl TeamEngine {
         Ok(Self {
             team,
             run,
-            workspace_dir,
-            agents: Arc::new(agents),
-            claude,
-            tool_registry: Arc::new(tool_registry),
+            workspace_dir: res.workspace_dir,
+            agents: Arc::new(res.agents),
+            claude: res.claude,
+            tool_registry: Arc::new(res.tool_registry),
             callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
             team_db,
             goal_msg_id: None,
         })
+    }
+
+    /// Create an engine for resuming a suspended team run.
+    pub fn new_for_resume(
+        team: TeamDefinition,
+        run: TeamRun,
+        global_home: &Path,
+        settings: &Settings,
+        team_db: AsyncDatabase,
+    ) -> Result<Self> {
+        let res = Self::init_resources(&team, global_home, settings)?;
+
+        Ok(Self {
+            team,
+            run,
+            workspace_dir: res.workspace_dir,
+            agents: Arc::new(res.agents),
+            claude: res.claude,
+            tool_registry: Arc::new(res.tool_registry),
+            callback: None, // No callback on resume — events go through task system
+            brave_api_key: settings.brave_api_key.clone(),
+            team_db,
+            goal_msg_id: None,
+        })
+    }
+
+    /// Resume execution from a specific phase with child results injected.
+    ///
+    /// Called after a suspended team run's child tasks all complete.
+    /// The child results are injected as if agents completed synchronously.
+    pub async fn execute_from_phase(
+        mut self,
+        next_phase: &str,
+        child_results: &str,
+    ) -> Result<TeamRun> {
+        info!(
+            team = %self.run.team_name,
+            run_id = %self.run.run_id,
+            phase = next_phase,
+            "resuming team run from phase"
+        );
+
+        // Mark run as running again
+        self.run.status = RunStatus::Running;
+        if let Err(e) = self.team_db.resume_team_run_status(&self.run.run_id).await {
+            warn!(error = %e, "failed to resume team run status");
+        }
+
+        // Inject child results into the task assignments
+        if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(child_results) {
+            for result in &results {
+                let agent = result["agent"].as_str().unwrap_or("");
+                let status = result["status"].as_str().unwrap_or("");
+                let output = result["result"].as_str().unwrap_or("");
+
+                // Update the task assignment status based on child task status
+                if let Some(task) = self.run.tasks.iter_mut().find(|t| t.agent == agent) {
+                    if status == "completed" {
+                        task.status = TaskStatus::Completed;
+                    } else {
+                        task.status = TaskStatus::Failed(format!("child task {status}: {output}"));
+                    }
+                }
+
+                // Write agent output to the workspace output file
+                if !output.is_empty()
+                    && let Some(task) = self.run.tasks.iter().find(|t| t.agent == agent)
+                {
+                    let output_path = self.workspace_dir.join(&task.output_file);
+                    if let Err(e) = tokio::fs::write(&output_path, output).await {
+                        warn!(error = %e, agent, "failed to write resumed agent output");
+                    }
+                }
+            }
+        }
+
+        // Determine starting phase based on next_phase parameter
+        match next_phase {
+            "execute" => {
+                // Re-execute tasks, then review, then deliver
+                self.transition_phase(TeamPhase::Execute);
+                let suspended = self.execute_tasks().await?;
+                if suspended {
+                    // Team run suspended again, will resume via invoke_orchestrator
+                    self.finalize_and_shutdown().await;
+                    return Ok(self.run);
+                }
+
+                // Fall through to review
+                self.transition_phase(TeamPhase::Review);
+                let (approved, feedback) = self.review().await?;
+                if approved {
+                    info!(
+                        iteration = self.run.iteration,
+                        "critic approved (resumed from execute)"
+                    );
+                } else {
+                    info!(
+                        iteration = self.run.iteration,
+                        feedback = %feedback,
+                        "critic rejected on resume from execute, proceeding anyway"
+                    );
+                }
+            }
+            "deliver" => {
+                // Skip review, go straight to deliver
+                info!(
+                    iteration = self.run.iteration,
+                    "resuming directly to deliver phase"
+                );
+            }
+            other => {
+                if other != "review" {
+                    warn!(
+                        phase = other,
+                        "unknown next_phase value, defaulting to review"
+                    );
+                }
+                // Default: Review -> Deliver
+                self.transition_phase(TeamPhase::Review);
+                let (approved, feedback) = self.review().await?;
+                if approved {
+                    info!(iteration = self.run.iteration, "critic approved (resumed)");
+                } else {
+                    info!(
+                        iteration = self.run.iteration,
+                        feedback = %feedback,
+                        "critic rejected on resume, proceeding anyway"
+                    );
+                }
+            }
+        }
+
+        // Deliver
+        self.deliver_phase().await?;
+
+        self.run.status = RunStatus::Completed;
+        self.finalize_and_shutdown().await;
+
+        Ok(self.run)
     }
 
     /// Execute the full team orchestration flow.
@@ -187,7 +361,10 @@ impl TeamEngine {
 
         match &result {
             Ok(_) => {
-                self.run.status = RunStatus::Completed;
+                // Don't override Suspended status set by execute_tasks
+                if self.run.status == RunStatus::Running {
+                    self.run.status = RunStatus::Completed;
+                }
             }
             Err(e) => {
                 self.run.status = RunStatus::Failed(e.to_string());
@@ -212,13 +389,51 @@ impl TeamEngine {
             }
         }
 
-        let ended_at = chrono::Utc::now().timestamp();
-        self.run.ended_at = Some(ended_at);
+        self.finalize_and_shutdown().await;
+
+        match result {
+            Ok(_) => Ok(self.run),
+            Err(e) => {
+                // Return the run even on failure (it has status info)
+                warn!(error = %e, "team execution failed");
+                Ok(self.run)
+            }
+        }
+    }
+
+    /// Run the deliver phase: transition, emit progress, produce deliverable, emit result.
+    ///
+    /// Shared by `execute_inner` (normal flow) and `execute_from_phase` (resumed flow).
+    async fn deliver_phase(&mut self) -> Result<()> {
+        self.transition_phase(TeamPhase::Deliver);
+        self.emit_event(TeamEvent::Progress(
+            "Producing final deliverable...".to_string(),
+        ));
+        let deliverable = self.deliver().await?;
+        self.run.deliverable = Some(deliverable.clone());
+        self.emit_event(TeamEvent::Deliverable(deliverable));
+        Ok(())
+    }
+
+    /// Persist final run status to DB and shutdown all AsyncDatabase instances.
+    ///
+    /// Shared by `execute` (normal flow) and `execute_from_phase` (resumed flow).
+    async fn finalize_and_shutdown(&mut self) {
+        let is_suspended = self.run.status == RunStatus::Suspended;
+
+        let ended_at = if is_suspended {
+            None // Suspended runs haven't ended yet
+        } else {
+            let ts = chrono::Utc::now().timestamp();
+            self.run.ended_at = Some(ts);
+            Some(ts)
+        };
 
         // Update run status in DB
         let (status_str, failure_reason) = match &self.run.status {
             RunStatus::Running => ("running", None),
             RunStatus::Completed => ("completed", None),
+            RunStatus::Suspended => ("suspended", None),
             RunStatus::Failed(reason) => ("failed", Some(reason.as_str())),
         };
         if let Err(e) = self
@@ -229,7 +444,7 @@ impl TeamEngine {
                 failure_reason,
                 self.run.iteration,
                 self.run.deliverable.as_deref(),
-                Some(ended_at),
+                ended_at,
             )
             .await
         {
@@ -241,15 +456,6 @@ impl TeamEngine {
             resources.db.shutdown();
         }
         self.team_db.shutdown();
-
-        match result {
-            Ok(_) => Ok(self.run),
-            Err(e) => {
-                // Return the run even on failure (it has status info)
-                warn!(error = %e, "team execution failed");
-                Ok(self.run)
-            }
-        }
     }
 
     async fn execute_inner(&mut self) -> Result<()> {
@@ -285,7 +491,10 @@ impl TeamEngine {
         loop {
             // Step 2: Execute -- run each specialist
             self.transition_phase(TeamPhase::Execute);
-            self.execute_tasks().await?;
+            let suspended = self.execute_tasks().await?;
+            if suspended {
+                return Ok(()); // Team run suspended, will resume via invoke_orchestrator
+            }
 
             // Step 3: Review -- critic evaluates outputs
             self.transition_phase(TeamPhase::Review);
@@ -330,14 +539,7 @@ impl TeamEngine {
         }
 
         // Step 4: Deliver -- produce final output
-        self.transition_phase(TeamPhase::Deliver);
-        self.emit_event(TeamEvent::Progress(
-            "Producing final deliverable...".to_string(),
-        ));
-        let deliverable = self.deliver().await?;
-        self.run.deliverable = Some(deliverable.clone());
-
-        self.emit_event(TeamEvent::Deliverable(deliverable));
+        self.deliver_phase().await?;
 
         Ok(())
     }
@@ -444,7 +646,7 @@ impl TeamEngine {
     /// Uses `tokio::task::JoinSet` to run all specialist agents in parallel.
     /// Each agent has its own AsyncDatabase and the workspace is shared via
     /// the filesystem, so there are no shared mutable state concerns.
-    async fn execute_tasks(&mut self) -> Result<()> {
+    async fn execute_tasks(&mut self) -> Result<bool> {
         // Prepare shared resources that will be moved into spawned tasks.
         let agents = Arc::clone(&self.agents);
         let claude = self.claude.clone();
@@ -471,6 +673,7 @@ impl TeamEngine {
             role: String,
             task_desc: String,
             context: String,
+            child_task_id: Option<String>,
         }
 
         let mut inputs = Vec::with_capacity(self.run.tasks.len());
@@ -498,7 +701,74 @@ impl TeamEngine {
                 role: task.role.clone(),
                 task_desc: task.task.clone(),
                 context,
+                child_task_id: None, // Populated below after task tree creation
             });
+        }
+
+        // Phase 4.2: Create parent/child task tree for sibling completion detection.
+        // Parent task: invoke_orchestrator (fires when all children complete).
+        // Child tasks: one per agent delegation.
+        let team_state = serialize_checkpoint(&self.run);
+        let parent_task = crate::db::NewTask {
+            agent_id: self.team_db.agent_id.clone(),
+            team_run_id: Some(self.run.run_id.clone()),
+            parent_task_id: None,
+            depth: 0,
+            label: format!("team-{}-orchestrator", self.run.team_name),
+            trigger_type: crate::task_engine::types::trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(chrono::Utc::now().timestamp() + TEAM_RUN_TIMEOUT_SECS as i64),
+            action_type: crate::task_engine::types::action_type::INVOKE_ORCHESTRATOR.to_string(),
+            action_config: serde_json::json!({
+                "team_name": self.run.team_name,
+                "next_phase": "review",
+            })
+            .to_string(),
+            input_context: Some(team_state),
+            created_by_session: Some(format!("team-{}", self.run.run_id)),
+        };
+
+        let parent_task_id = self
+            .team_db
+            .create_task(parent_task)
+            .await
+            .context("failed to create parent invoke_orchestrator task")?;
+
+        for input in &mut inputs {
+            let child_task = crate::db::NewTask {
+                agent_id: self.team_db.agent_id.clone(),
+                team_run_id: Some(self.run.run_id.clone()),
+                parent_task_id: Some(parent_task_id.clone()),
+                depth: 1,
+                label: format!("team-agent-{}", input.agent_name),
+                trigger_type: crate::task_engine::types::trigger_type::CALLBACK.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: Some(chrono::Utc::now().timestamp() + TEAM_RUN_TIMEOUT_SECS as i64),
+                action_type: crate::task_engine::types::action_type::RESUME_AGENT.to_string(),
+                action_config: serde_json::json!({
+                    "agent": input.agent_name,
+                })
+                .to_string(),
+                input_context: None,
+                created_by_session: Some(format!("team-{}-{}", self.run.run_id, input.agent_name)),
+            };
+
+            match self.team_db.create_task(child_task).await {
+                Ok(child_id) => {
+                    input.child_task_id = Some(child_id);
+                }
+                Err(e) => {
+                    warn!(agent = %input.agent_name, error = %e, "failed to create child task");
+                }
+            }
         }
 
         self.emit_event(TeamEvent::Progress(format!(
@@ -544,6 +814,7 @@ impl TeamEngine {
                         Ok(resources) => {
                             let session_id = format!("team-{}-{}", run_id, agent_name);
                             let skills_dirty = AtomicBool::new(false);
+                            let child_task_id_ref = input.child_task_id.as_deref();
                             let params = TeamAgentParams {
                                 db: &resources.db,
                                 claude: &claude,
@@ -558,6 +829,7 @@ impl TeamEngine {
                                 skills_dirty: &skills_dirty,
                                 mcp_manager: None,
                                 agent_name,
+                                child_task_id: child_task_id_ref,
                             };
                             crate::agent::run_team_agent(&params)
                                 .await
@@ -686,7 +958,58 @@ impl TeamEngine {
             }
         }
 
-        Ok(())
+        // Phase 4.4: Check for pending grandchild callback tasks (long_running tools).
+        // If any exist, the team run should suspend and wait for them to complete.
+        let pending_grandchildren = self
+            .team_db
+            .count_pending_callback_tasks_by_team_run(&self.run.run_id)
+            .await
+            .unwrap_or(0);
+
+        if pending_grandchildren > 0 {
+            info!(
+                count = pending_grandchildren,
+                "pending grandchild callback tasks detected, suspending team run"
+            );
+
+            // Update checkpoint on parent task with current state
+            let checkpoint = serialize_checkpoint(&self.run);
+            if let Err(e) = self
+                .team_db
+                .suspend_team_run(&self.run.run_id, &checkpoint)
+                .await
+            {
+                warn!(error = %e, "failed to suspend team run");
+            }
+
+            self.run.status = RunStatus::Suspended;
+            self.emit_event(TeamEvent::Progress(format!(
+                "Team run suspended — waiting for {pending_grandchildren} background task(s)"
+            )));
+            return Ok(true); // suspended
+        }
+
+        // Not suspending — cancel the parent invoke_orchestrator task to prevent it
+        // from firing via sibling-completion detection. The synchronous flow will
+        // continue directly to review/deliver, so the async resume path must not race.
+        if let Err(e) = self
+            .team_db
+            .update_task_status(&parent_task_id, "cancelled")
+            .await
+        {
+            warn!(
+                parent_task_id = %parent_task_id,
+                error = %e,
+                "failed to cancel parent invoke_orchestrator task"
+            );
+        } else {
+            debug!(
+                parent_task_id = %parent_task_id,
+                "cancelled parent invoke_orchestrator task (sync completion)"
+            );
+        }
+
+        Ok(false) // not suspended
     }
 
     /// Ask the critic agent to review the outputs.
@@ -814,6 +1137,7 @@ impl TeamEngine {
             skills_dirty: &skills_dirty,
             mcp_manager: None,
             agent_name,
+            child_task_id: None,
         };
 
         Ok(crate::agent::run_team_agent(&params)

@@ -35,6 +35,10 @@ pub enum Commands {
     Ask {
         /// The message to send (use "-" to read from stdin)
         message: String,
+        /// Mark a callback task complete with this message as the result before running the agent.
+        /// Used by background processes: mika ask --task-id <uuid> "findings..."
+        #[arg(long)]
+        task_id: Option<String>,
     },
     /// Manage agents
     Agents(AgentsArgs),
@@ -42,6 +46,8 @@ pub enum Commands {
     Teams(TeamsArgs),
     /// Manage MCP (Model Context Protocol) servers
     Mcp(McpArgs),
+    /// List or cancel pending tasks
+    Tasks(TaskArgs),
 }
 
 #[derive(clap::Args)]
@@ -59,7 +65,7 @@ pub enum AgentsCommand {
         /// Name for the new agent (lowercase, alphanumeric, hyphens)
         name: String,
     },
-    /// Delete an agent (cannot delete "main")
+    /// Delete an agent (cannot delete "mika")
     Delete {
         /// Name of the agent to delete
         name: String,
@@ -217,8 +223,20 @@ pub struct ReminderArgs {
 
 #[derive(Subcommand)]
 pub enum ReminderCommand {
-    /// Cancel a reminder by ID
-    Cancel { id: i64 },
+    /// Cancel a reminder by ID (from `mika reminders`)
+    Cancel { id: String },
+}
+
+#[derive(clap::Args)]
+pub struct TaskArgs {
+    #[command(subcommand)]
+    pub command: Option<TaskCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum TaskCommand {
+    /// Cancel a task by ID (from `mika tasks`)
+    Cancel { id: String },
 }
 
 #[derive(clap::Args)]

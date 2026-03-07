@@ -8,4 +8,5 @@ pub mod reminders;
 pub mod setup;
 pub mod skills;
 pub mod status;
+pub mod tasks;
 pub mod teams;

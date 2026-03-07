@@ -40,7 +40,7 @@ Added `MIKA_*` env var scrubbing directly in the executor's `execute_exec` funct
 
 ```rust
 let mut cmd = Command::new(&handler.command);
-// ... set args, MIKA_TOOL_INPUT env var, etc.
+// ... set args, pipe tool input via stdin, etc.
 
 // Scrub MIKA_* env vars from child process (defense-in-depth)
 for (key, _) in std::env::vars() {

@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(entries[0].skill_tools[0].skill_dir, skill_dir);
         assert!(matches!(
             &entries[0].skill_tools[0].handler,
-            super::super::manifest::ToolHandler::Exec { command } if command == "./handlers/search.sh"
+            super::super::manifest::ToolHandler::Exec { command, .. } if command == "./handlers/search.sh"
         ));
     }
 
@@ -555,7 +555,7 @@ mod tests {
                     "name": "valid_tool",
                     "description": "Valid builtin",
                     "input_schema": {"type": "object", "properties": {}},
-                    "handler": {"type": "builtin", "function": "get_api_spec"}
+                    "handler": {"type": "builtin", "function": "get_documentation"}
                 },
                 {
                     "name": "bad_tool",

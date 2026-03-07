@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use mika_common::agent;
 use mika_common::claude::{ClaudeClient, ToolDefinition};
 use mika_common::config::Settings;
+use mika_common::home;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -10,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
 pub struct DelegateTaskTool {
+    /// The global Mika home directory (e.g. `~/.mika/`).
     pub home_dir: PathBuf,
     pub settings: Settings,
 }
@@ -45,7 +47,7 @@ impl Tool for DelegateTaskTool {
         Some(120)
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let agent_name = input["agent_name"].as_str().unwrap_or("");
         if agent_name.is_empty() {
             return Ok(ToolOutput::error("'agent_name' is required."));
@@ -58,6 +60,21 @@ impl Tool for DelegateTaskTool {
         }
         if let Err(e) = agent::validate_agent_name(agent_name) {
             return Ok(ToolOutput::error(format!("Invalid agent name: {e}")));
+        }
+
+        // Block self-delegation
+        let current_agent_id = ctx.db.agent_id();
+        if agent_name == current_agent_id {
+            return Ok(ToolOutput::error(
+                "Cannot delegate to yourself. Call the tool directly instead.",
+            ));
+        }
+
+        // Only orchestrators can delegate
+        if !super::is_orchestrator(&self.home_dir, current_agent_id) {
+            return Ok(ToolOutput::error(
+                "Only orchestrator agents can delegate tasks. You are a specialist — call tools directly.",
+            ));
         }
 
         let task = input["task"].as_str().unwrap_or("");
@@ -78,7 +95,7 @@ impl Tool for DelegateTaskTool {
         }
 
         let agent_home = agent::agent_dir(&self.home_dir, agent_name);
-        let db_path = agent_home.join("data").join("mika.db");
+        let db_path = home::container_db_path(&self.home_dir);
 
         let db = match crate::db::Database::open(&db_path) {
             Ok(db) => db,
@@ -88,7 +105,7 @@ impl Tool for DelegateTaskTool {
                 )));
             }
         };
-        let async_db = crate::async_db::AsyncDatabase::new(db);
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, agent_name);
 
         // Load delegate agent's skills
         let skills = crate::skills::SkillRegistry::from_dir(&agent_home.join("skills"));
@@ -129,6 +146,7 @@ impl Tool for DelegateTaskTool {
             skills_dirty: &skills_dirty,
             mcp_manager: None,
             agent_name,
+            child_task_id: None,
         };
 
         let result = crate::agent::run_team_agent(&params).await;
@@ -228,5 +246,48 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid agent name"));
+    }
+
+    #[tokio::test]
+    async fn test_delegate_task_self_delegation_blocked() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let agent_id = ctx.db.agent_id().to_string();
+        let tool = DelegateTaskTool {
+            home_dir: PathBuf::from("/tmp"),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"agent_name": agent_id, "task": "test"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Cannot delegate to yourself"));
+    }
+
+    #[tokio::test]
+    async fn test_delegate_task_non_orchestrator_blocked() {
+        // Create a harness with a non-default agent name
+        let harness = TestHarness::with_agent("specialist-agent");
+        let ctx = harness.ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = DelegateTaskTool {
+            home_dir: tmp.path().to_path_buf(),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"agent_name": "other-agent", "task": "test"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Only orchestrator agents"));
     }
 }
