@@ -42,7 +42,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use mika_common::agent::DEFAULT_AGENT;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::team;
 
 /// Maximum length (in characters) allowed for any single string input to a tool.
 pub const MAX_INPUT_LEN: usize = 10_000;
@@ -186,6 +188,21 @@ pub(crate) fn check_reflection_evidence(
         }
     }
     None
+}
+
+/// Check if the given agent is an orchestrator (default agent or listed as orchestrator in any team).
+pub(crate) fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
+    if agent_id == DEFAULT_AGENT {
+        return true;
+    }
+    for team_name in team::list_teams(home_dir) {
+        if let Ok(def) = team::load_team(home_dir, &team_name)
+            && def.team.orchestrator == agent_id
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Validate a relative path and resolve it to a full path within `base_dir`.

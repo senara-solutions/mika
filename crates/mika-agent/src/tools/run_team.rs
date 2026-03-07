@@ -1,11 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use mika_common::agent::DEFAULT_AGENT;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
-use mika_common::team;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mika_common::home;
@@ -16,21 +14,6 @@ use crate::messaging::MessageSender;
 use crate::teams::types::{TeamEvent, TeamEventCallback};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-
-/// Check if the given agent is an orchestrator (default agent or listed as orchestrator in any team).
-fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
-    if agent_id == DEFAULT_AGENT {
-        return true;
-    }
-    for team_name in team::list_teams(home_dir) {
-        if let Ok(def) = team::load_team(home_dir, &team_name)
-            && def.team.orchestrator == agent_id
-        {
-            return true;
-        }
-    }
-    false
-}
 
 pub struct RunTeamTool {
     pub home_dir: PathBuf,
@@ -85,7 +68,7 @@ impl Tool for RunTeamTool {
 
         // Only orchestrators can run teams
         let current_agent_id = ctx.db.agent_id();
-        if !is_orchestrator(&self.home_dir, current_agent_id) {
+        if !super::is_orchestrator(&self.home_dir, current_agent_id) {
             return Ok(ToolOutput::error(
                 "Only orchestrator agents can run teams. You are a specialist — call tools directly.",
             ));

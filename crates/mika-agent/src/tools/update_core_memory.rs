@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names};
+use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names, default_self_model};
 
 const MAX_TOKENS_PER_BLOCK: i32 = 500;
 const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
@@ -166,7 +166,7 @@ impl Tool for UpdateCoreMemoryTool {
                     .expect("section already validated above");
                 if section == "self_model" {
                     let display_name = ctx.db.get_agent_display_name().await;
-                    format!("I am {display_name}. No interaction history yet.")
+                    default_self_model(&display_name)
                 } else {
                     static_default.to_string()
                 }

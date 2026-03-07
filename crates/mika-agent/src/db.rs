@@ -33,6 +33,12 @@ pub fn core_memory_section_names() -> Vec<&'static str> {
     CORE_MEMORY_SECTIONS.iter().map(|(k, _)| *k).collect()
 }
 
+/// Returns the default self_model string for a given agent display name.
+/// Centralises the format so callers don't duplicate the template.
+pub fn default_self_model(display_name: &str) -> String {
+    format!("I am {display_name}. No interaction history yet.")
+}
+
 // ===== Public Types =====
 
 #[derive(Debug, Clone)]
@@ -574,7 +580,8 @@ impl Database {
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
                 ON tasks(agent_id, label)
-                WHERE trigger_type = 'recurring';
+                WHERE trigger_type = 'recurring'
+                AND status NOT IN ('cancelled', 'failed', 'expired');
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -1463,7 +1470,7 @@ impl Database {
             self.set_core_memory(
                 agent_id,
                 "self_model",
-                &format!("I am {display_name}. No interaction history yet."),
+                &default_self_model(&display_name),
             )?;
         }
         if let Some(md) = user_md_content
@@ -3505,5 +3512,65 @@ mod tests {
             "should only return expired children whose parent is still pending"
         );
         assert_eq!(ids[0], c_id);
+    }
+
+    #[test]
+    fn test_cancelled_recurring_task_allows_re_creation() {
+        let db = db();
+
+        // Step 1: Create a recurring task
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "heartbeat".to_string(),
+            trigger_type: "recurring".to_string(),
+            cron_expr: Some("0 0 * * * *".to_string()),
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "inject_context".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id1 = db.create_task(&task).unwrap();
+        assert!(!id1.is_empty());
+
+        // Step 2: Cancel it
+        assert!(db.cancel_task(&id1, "mika").unwrap());
+        let t = db.get_task(&id1, "mika").unwrap().unwrap();
+        assert_eq!(t.status, "cancelled");
+
+        // Step 3: Create another recurring task with the same label — should succeed
+        let task2 = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "heartbeat".to_string(),
+            trigger_type: "recurring".to_string(),
+            cron_expr: Some("0 0 * * * *".to_string()),
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "inject_context".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        };
+        let id2 = db.create_task(&task2).unwrap();
+        assert!(!id2.is_empty());
+        assert_ne!(id1, id2, "should be a new task, not the old cancelled one");
+
+        // Verify the new task is pending
+        let t2 = db.get_task(&id2, "mika").unwrap().unwrap();
+        assert_eq!(t2.status, "pending");
+        assert_eq!(t2.label, "heartbeat");
     }
 }

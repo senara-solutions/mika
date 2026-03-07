@@ -1,30 +1,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use mika_common::agent::{self, DEFAULT_AGENT};
+use mika_common::agent;
 use mika_common::claude::{ClaudeClient, ToolDefinition};
 use mika_common::config::Settings;
 use mika_common::home;
-use mika_common::team;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-
-/// Check if the given agent is an orchestrator (default agent or listed as orchestrator in any team).
-fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
-    if agent_id == DEFAULT_AGENT {
-        return true;
-    }
-    for team_name in team::list_teams(home_dir) {
-        if let Ok(def) = team::load_team(home_dir, &team_name)
-            && def.team.orchestrator == agent_id
-        {
-            return true;
-        }
-    }
-    false
-}
 
 pub struct DelegateTaskTool {
     /// The global Mika home directory (e.g. `~/.mika/`).
@@ -87,7 +71,7 @@ impl Tool for DelegateTaskTool {
         }
 
         // Only orchestrators can delegate
-        if !is_orchestrator(&self.home_dir, current_agent_id) {
+        if !super::is_orchestrator(&self.home_dir, current_agent_id) {
             return Ok(ToolOutput::error(
                 "Only orchestrator agents can delegate tasks. You are a specialist — call tools directly.",
             ));

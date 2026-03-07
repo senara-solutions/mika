@@ -31,6 +31,14 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
         anyhow::bail!("Empty message. Provide a message argument or pipe via stdin with \"-\".");
     }
 
+    const MAX_CALLBACK_RESULT: usize = 100_000; // 100KB, matches server limit
+    if task_id.is_some() && user_message.len() > MAX_CALLBACK_RESULT {
+        anyhow::bail!(
+            "Callback result too large: {} bytes (max: {MAX_CALLBACK_RESULT})",
+            user_message.len()
+        );
+    }
+
     // If --task-id is provided, mark the task as completed and run silent agent
     // with the callback trigger. This prevents the agent from spawning new
     // long-running tasks (silent mode filters out exec/http handlers).
@@ -93,6 +101,17 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
             skills_dirty: &skills_dirty,
         })
         .await?;
+
+        // Check if all siblings are done and parent task should be dispatched.
+        // In CLI one-shot mode we can't run the dispatcher, but we mark the
+        // parent ready so the next TaskEngine tick (in TUI or server) picks it up.
+        if let Ok(Some(parent_id)) = ctx.async_db.try_complete_parent_on_sibling_done(tid).await {
+            tracing::info!(
+                task_id = tid,
+                parent_id = %parent_id,
+                "All sibling tasks complete; parent task ready for dispatch"
+            );
+        }
 
         return Ok(());
     }

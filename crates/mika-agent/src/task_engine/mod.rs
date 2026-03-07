@@ -116,6 +116,9 @@ pub async fn reflection_cron_for_agent(home_dir: &Path, db: &AsyncDatabase) -> O
 
     // Convert local time to UTC: pick today's date, attach the local time,
     // convert to UTC, extract hour/minute.
+    // NOTE: DST drift — the UTC offset is computed from today's date. For timezones with
+    // daylight saving time, the reflection may fire ~1 hour early or late after a DST
+    // transition until the next restart. This is acceptable for daily reflections.
     let today = chrono::Utc::now().with_timezone(&tz).date_naive();
     let local_dt = today.and_time(local_time);
     let utc_dt = local_dt.and_local_timezone(tz).earliest()?;
