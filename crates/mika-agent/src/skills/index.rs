@@ -555,7 +555,7 @@ mod tests {
                     "name": "valid_tool",
                     "description": "Valid builtin",
                     "input_schema": {"type": "object", "properties": {}},
-                    "handler": {"type": "builtin", "function": "get_api_spec"}
+                    "handler": {"type": "builtin", "function": "get_documentation"}
                 },
                 {
                     "name": "bad_tool",

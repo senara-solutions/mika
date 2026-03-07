@@ -43,7 +43,7 @@ MCP servers extend Mika with external tools. They are configured in `~/.mika/mcp
 - `mika mcp enable <name>` — Enable a disabled server
 - `mika mcp disable <name>` — Disable a server without removing it
 
-**Important:** If you need to verify what CLI commands exist, use the `get_cli_reference` self-knowledge tool. Do NOT guess or suggest commands that aren't listed here or in the CLI reference.
+**Important:** If you need to verify what CLI commands exist, use the `get_documentation` tool with topic `cli-reference`. Do NOT guess or suggest commands that aren't listed here or in the CLI reference.
 
 **Troubleshooting:**
 - Headers not working? Run `mika mcp list` to verify header keys are shown. Check the log file for connection errors.

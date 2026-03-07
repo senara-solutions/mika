@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -192,7 +192,7 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `list_reminders` | List pending and future reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
 | `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
 | `list_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
-| `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against `trigger_type::*` / `action_type::*` constants. timeout_secs capped at 90 days. | Tasks |
+| `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
 | `cancel_task` | Cancel a pending task by full UUID (36-char validation). | Tasks |
 | `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. | Tasks |
 | `get_task` | Inspect a task by full UUID. Returns all fields including status, trigger_type, action_type, result, timeout_at. | Tasks |
@@ -231,56 +231,214 @@ maximum (`MAX_INPUT_LEN`). Per-tool timeout override via `timeout_secs()` defaul
 (returns `None` to use the 30s default).
 
 
-## 7. Conversation Compaction
+## 7. Skills System
 
-When conversation history grows beyond a threshold, older messages are summarized via
-a Claude API call and replaced with a summary row. The summary is injected into the
-system prompt (not into message history).
+Source: `crates/mika-agent/src/skills/`
 
-### Constants
+Skills extend Mika's capabilities with prompt snippets, tool definitions, and handler
+scripts. Each skill lives in its own directory under `{agent_home}/skills/{name}/`.
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `COMPACTION_THRESHOLD` | 50 | Minimum message count before compaction triggers |
-| `CONTEXT_WINDOW` | 20 | Number of recent messages to keep (not compacted) |
-| `MAX_COMPACTION_BATCH` | 100 | Maximum messages per summarization call |
-| `MAX_SUMMARY_CHARS` | 4000 | Truncation limit for generated summaries |
-| `MAX_COMPACTION_INPUT_CHARS` | 50,000 | Character budget for messages sent to summarizer |
-
-### Flow
-
-1. After each agent turn, `maybe_compact()` checks `count_messages()`.
-2. If total messages <= 50, skip.
-3. Load all messages outside the context window.
-4. Cap the batch at 100 messages.
-5. Call Claude API with a summarization system prompt and the message batch.
-6. Truncate the generated summary to 4000 characters if needed.
-7. Delete old messages up to `compacted_through_id`, insert or update the summary row.
-8. Recent 20 messages remain untouched.
-
-Compaction is incremental -- subsequent rounds merge the existing summary with
-newly compacted messages.
-
-
-## 8. AsyncDatabase
-
-Source: `crates/mika-agent/src/async_db.rs`
-
-`AsyncDatabase` wraps the synchronous `Database` (rusqlite) with a dedicated OS
-thread and an `mpsc` channel, making it Send+Sync and compatible with `tokio::spawn`.
+### Skill Directory Structure
 
 ```
-Caller (any tokio task)                  Dedicated OS thread ("mika-db")
-        |                                        |
-        |-- mpsc::send(closure) ----------------->|
-        |                                        |-- closure(&Database)
-        |<-- oneshot::send(Result<T>) ------------|
+{agent_home}/skills/{skill_name}/
+  skill.toml              # Manifest (required, max 64KB)
+  tools.json              # Tool definitions for exec/http handlers (optional, max 256KB)
+  system_prompt.md        # Prompt snippet injected on match (optional, max 8KB)
+  .disabled               # Marker file to disable skill (presence = disabled)
+  handlers/
+    run.sh                # Exec handler scripts (executable)
 ```
 
-Properties:
-- **Clone-able:** Wraps `Arc<AsyncDatabaseInner>` — clones share the same connection.
-- **Panic-resilient:** Each closure wrapped in `catch_unwind()`.
-- **Graceful shutdown:** `shutdown()` drops the sender, joins the background thread.
+### Manifest (`skill.toml`)
+
+```toml
+[skill]
+name = "web-search"
+description = "Search the web for current information"
+version = "0.1.0"
+always_on = false
+timeout_secs = 60
+
+[triggers]
+keywords = ["search", "look up", "find online"]
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `skill.name` | yes | — | Unique skill identifier |
+| `skill.description` | yes | — | Human-readable description |
+| `skill.version` | no | `""` | Semantic version |
+| `skill.always_on` | no | `false` | Active every turn regardless of keywords |
+| `skill.timeout_secs` | no | `30` | Per-tool execution timeout (seconds) |
+| `triggers.keywords` | no | `[]` | Case-insensitive substring-matched keywords |
+
+### Handler Types
+
+Defined in `tools.json` via `#[serde(tag = "type")]`:
+
+**Builtin** — Dispatches to compiled Rust functions in `ToolRegistry` (e.g.,
+`get_documentation`, `web_search`). Full `ToolContext` access.
+
+**Exec** — Spawns a subprocess, passes tool input as JSON via stdin, captures stdout.
+MIKA_* environment variables are scrubbed from child processes. Supports the
+`__mika_v1` image protocol (see below) and long-running mode.
+
+**HTTP** — POST/GET/PUT to a URL with tool input as JSON body (or query params for GET).
+Optional static headers.
+
+### Exec Handler Image Protocol (`__mika_v1`)
+
+Exec handler scripts can return images by outputting a JSON envelope:
+
+```json
+{"__mika_v1": {"text": "Screenshot captured.", "images": ["/tmp/screenshot.png"]}}
+```
+
+The executor detects the sentinel key via prefix check, reads and validates image files
+(canonicalize, regular file check, 5MB limit, magic-byte validation for JPEG/PNG/GIF/WebP),
+base64-encodes them, and returns them as `ImageData` on `ToolOutput`. Max 5 images per
+result. If detection fails, stdout is treated as plain text (backward compatible).
+
+### Long-Running Exec Handlers
+
+When `long_running: true` is set on an exec handler (conversation mode only, not
+silent/team), the executor creates a callback task and returns immediately instead
+of waiting for the subprocess to complete.
+
+**Mechanism:**
+1. Executor creates a callback task (`trigger_type=callback`, `action_type=resume_agent`)
+   with label `long_running:{tool_name}`.
+2. `__mika_task_id` (UUID) and `__mika_agent` (agent name) are injected into the
+   tool input JSON passed to the subprocess via stdin.
+3. Subprocess spawned with `kill_on_drop(false)` and `stdout(Stdio::null())`.
+4. PID recorded to database via `set_task_process_id()`.
+5. Tool returns immediately with "task created" message.
+
+**Timeout:** `(estimated_duration_secs.unwrap_or(3600) * 3).clamp(600, 7_776_000)` —
+minimum 10 minutes, maximum 90 days.
+
+**Completion:** The subprocess calls `mika ask --task-id <uuid>` (CLI) or the external
+system POSTs to `/tasks/{id}/complete` (server) to deliver results back. On success,
+the task engine fires `dispatch_resume_agent` with `SilentTrigger::Callback`.
+
+**Failure:** A background monitor (`spawn_long_running_exec`) awaits the child process.
+On non-zero exit, stderr is captured (capped) and the task is marked failed. Expired
+tasks get SIGTERM via `kill_orphan_processes()` in the tick loop.
+
+### Skill Matching
+
+`match_skills()` in `matcher.rs`:
+
+1. **Always-on skills** included unconditionally (if enabled).
+2. **Keyword-matched skills** included if any keyword is a case-insensitive substring
+   of the user message. Keywords are pre-lowercased at scan time.
+3. **Disabled skills** (`.disabled` marker file) excluded entirely.
+
+Silent mode uses `safe_always_on_skills()` which filters out exec/http-handler skills
+for security — only builtin-handler skills are available in autonomous background runs.
+
+### Three-Tier Origin
+
+| Origin | Description |
+|--------|-------------|
+| `[built-in]` | Bundled with Mika binary, re-seeded on startup |
+| `[marketplace]` | Installed from Git repos via `mika skills install`, tracked in `marketplace.lock` |
+| `[custom]` | Created locally via `create_skill` tool or manually |
+
+### Marketplace
+
+Git-based skill distribution. See [ADR-006](adr/006-git-based-skills-marketplace.md).
+
+- **Install:** `mika skills install user/repo` (GitHub shorthand) or full Git URL.
+  Shallow clones to temp dir, scans for `skill.toml` (depth <= 2), copies skill dir
+  (excluding `.git/`, symlink escape checks). Multi-skill repos show interactive picker.
+- **Update:** `mika skills update [name]` — re-clones, compares HEAD commit to pinned
+  commit, replaces if changed.
+- **Uninstall:** `mika skills uninstall <name>` — removes skill dir and lock entry.
+
+Lock file (`marketplace.lock` at agent home root) tracks URL, path, commit hash, and
+timestamps per installed skill.
+
+
+## 8. MCP Client (Model Context Protocol)
+
+Source: `crates/mika-agent/src/mcp/`
+
+Mika connects to external MCP servers at startup via `McpManager`, using the `rmcp`
+crate (v0.17) for both stdio and Streamable HTTP transports.
+
+### Configuration
+
+MCP servers are configured in `{agent_home}/mcp.json` (Claude Desktop convention,
+written with `0600` permissions to protect secrets):
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"],
+      "env": {},
+      "enabled": true
+    },
+    "remote-api": {
+      "transport": "http",
+      "url": "https://mcp.example.com/v1",
+      "headers": {
+        "Authorization": "Bearer sk-test-123"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Server names must be lowercase alphanumeric with single hyphens/underscores (no `__`,
+which is reserved for tool namespacing).
+
+### Transports
+
+**Stdio:** Spawns a child process via `tokio::process::Command`. Environment isolation:
+`env_clear()` + allowlist (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`,
+`XDG_RUNTIME_DIR`) + server-specific env from config. `MIKA_*` overrides are rejected
+with a warning. `kill_on_drop(true)` ensures cleanup.
+
+**Streamable HTTP:** Connects to a URL via `StreamableHttpClientTransport` from rmcp.
+`Authorization` header routed through rmcp's `auth_header()` (case-insensitive match);
+other headers via `custom_headers()`.
+
+Both transports use a 30-second handshake timeout. Connections happen in parallel via
+`JoinSet` for fast startup. Failures are logged as warnings and never block startup.
+
+### Tool Namespacing
+
+MCP tools are namespaced as `mcp__{server}__{tool}` to prevent collisions with
+builtin tools and skills. Example: `mcp__filesystem__read_file`.
+
+Dispatch chain: builtins → skills → MCP → unknown error.
+
+### Security
+
+- **Environment isolation:** Child processes cannot access `MIKA_ANTHROPIC_API_KEY`,
+  `MIKA_INTERNAL_TOKEN`, or any other Mika secrets.
+- **Header redaction:** Custom `Debug` impl on `McpServerConfig` redacts both header
+  and env variable values in logs.
+- **Result limits:** 5 images max per result, 5MB per image, 10,000 chars text.
+
+### Availability
+
+| Context | MCP Available |
+|---------|--------------|
+| CLI ask mode (`mika ask`) | Yes (per-invocation connections, graceful shutdown) |
+| CLI chat mode (`mika`) | Yes (session-persistent connections) |
+| Server mode (`mika-server`) | Yes (per-agent manager, startup connections) |
+| Silent mode (heartbeat, reflection, callbacks) | No |
+| Team agent runs | No (Phase 4 future) |
+
+CLI commands: `mika mcp add/remove/list/enable/disable`, `--header KEY=VALUE` for
+HTTP headers.
 
 
 ## 9. Unified Task Engine
@@ -297,7 +455,7 @@ Source: `crates/mika-agent/src/task_engine/`
 | `engine.rs` | `TaskEngine` — min-heap `BinaryHeap<QueuedTask>` + 1-second tick loop |
 | `dispatcher.rs` | `TaskDispatcher` — matches `action_type` and executes tasks |
 | `queue.rs` | `QueuedTask` — heap entry with `next_fire_at` for ordering |
-| `types.rs` | Constants: `task_status::*` and `action_type::*` (no magic strings) |
+| `types.rs` | Constants: `task_status::*`, `action_type::*`, `trigger_type::*` (no magic strings) |
 | `mod.rs` | `ensure_recurring_task()` — idempotently registers built-in tasks at startup |
 
 ### Action Types
@@ -383,7 +541,59 @@ SilentTrigger Variants). Callback results are wrapped in
 to mitigate prompt injection from external result payloads.
 
 
-## 11. HTTP Server (mika-server)
+## 11. Conversation Compaction
+
+When conversation history grows beyond a threshold, older messages are summarized via
+a Claude API call and replaced with a summary row. The summary is injected into the
+system prompt (not into message history).
+
+### Constants
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `COMPACTION_THRESHOLD` | 50 | Minimum message count before compaction triggers |
+| `CONTEXT_WINDOW` | 20 | Number of recent messages to keep (not compacted) |
+| `MAX_COMPACTION_BATCH` | 100 | Maximum messages per summarization call |
+| `MAX_SUMMARY_CHARS` | 4000 | Truncation limit for generated summaries |
+| `MAX_COMPACTION_INPUT_CHARS` | 50,000 | Character budget for messages sent to summarizer |
+
+### Flow
+
+1. After each agent turn, `maybe_compact()` checks `count_messages()`.
+2. If total messages <= 50, skip.
+3. Load all messages outside the context window.
+4. Cap the batch at 100 messages.
+5. Call Claude API with a summarization system prompt and the message batch.
+6. Truncate the generated summary to 4000 characters if needed.
+7. Delete old messages up to `compacted_through_id`, insert or update the summary row.
+8. Recent 20 messages remain untouched.
+
+Compaction is incremental -- subsequent rounds merge the existing summary with
+newly compacted messages.
+
+
+## 12. AsyncDatabase
+
+Source: `crates/mika-agent/src/async_db.rs`
+
+`AsyncDatabase` wraps the synchronous `Database` (rusqlite) with a dedicated OS
+thread and an `mpsc` channel, making it Send+Sync and compatible with `tokio::spawn`.
+
+```
+Caller (any tokio task)                  Dedicated OS thread ("mika-db")
+        |                                        |
+        |-- mpsc::send(closure) ----------------->|
+        |                                        |-- closure(&Database)
+        |<-- oneshot::send(Result<T>) ------------|
+```
+
+Properties:
+- **Clone-able:** Wraps `Arc<AsyncDatabaseInner>` — clones share the same connection.
+- **Panic-resilient:** Each closure wrapped in `catch_unwind()`.
+- **Graceful shutdown:** `shutdown()` drops the sender, joins the background thread.
+
+
+## 13. HTTP Server (mika-server)
 
 The per-customer agent container runs an Axum HTTP server:
 
@@ -400,7 +610,7 @@ The per-customer agent container runs an Axum HTTP server:
 See [ADR-001](adr/001-axum-http-server-architecture.md) for design decisions.
 
 
-## 12. Failed Sends (Durable Outbox Pattern)
+## 14. Failed Sends (Durable Outbox Pattern)
 
 When the outbound routing endpoint is unreachable, messages are not lost.
 
@@ -418,7 +628,7 @@ At the start of each `/message` handler, the server flushes up to 5 pending fail
 sends in a background task (does not block message processing).
 
 
-## 13. Multi-Agent Support
+## 15. Multi-Agent Support
 
 - Global home directory: `~/.mika/`
 - Agent homes: `~/.mika/agents/{name}/` (each with skills/, logs/)
@@ -445,6 +655,46 @@ database (`~/.mika/data/mika.db`) with graph-structured messages linked via
 `parent_id`. Queryable via `get_team_status` and `get_team_history` tools.
 
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
+
+
+## 16. Observability & Telemetry
+
+Mika follows an "always instrument, optionally export" pattern. Tracing spans are
+compiled unconditionally into the binary — no feature flags needed. Spans cover the
+agent loop (`agent_turn`), Claude API calls, per-tool execution, team engine
+(`team_run`, `team_agent_task`), and server HTTP handlers (`tower_http::TraceLayer`).
+
+### Optional OTLP Export
+
+Export is feature-gated behind `--features telemetry`. When enabled,
+`mika_common::telemetry::build_otel_layer()` builds an OpenTelemetry tracing layer
+that exports spans via OTLP/HTTP. The layer composes into the tracing subscriber
+alongside the normal log layer.
+
+Three environment variables control export:
+
+| Variable | Purpose |
+|----------|---------|
+| `MIKA_TELEMETRY_ENABLED` | Enable trace export (`true`/`false`, default: false) |
+| `MIKA_OTLP_ENDPOINT` | OTLP HTTP endpoint URL (must include `/v1/traces` path) |
+| `MIKA_OTLP_AUTH_HEADER` | Authorization header value (e.g., Base64 credentials) |
+
+`build_otel_layer()` returns a `TelemetryGuard` that flushes pending spans on drop,
+ensuring no traces are lost at shutdown. Both `mika-server` and `mika` CLI hold
+the guard alive until process exit.
+
+### Langfuse Compatibility
+
+The OTLP export is compatible with Langfuse's OpenTelemetry ingestion endpoint.
+Set `MIKA_OTLP_ENDPOINT` to `https://cloud.langfuse.com/api/public/otel/v1/traces`
+and `MIKA_OTLP_AUTH_HEADER` to `publicKey:secretKey` (auto-encoded to Base64) for
+authentication. For Jaeger, use `http://localhost:4318/v1/traces` (no auth needed).
+
+### Graceful Degradation
+
+When the `telemetry` feature is not compiled in, `build_otel_layer()` is a no-op
+that returns `None`. When compiled but `MIKA_TELEMETRY_ENABLED` is false or unset,
+no exporter is created. Spans still flow to the normal log subscriber either way.
 
 
 ## Appendix: Database Schema

@@ -173,7 +173,7 @@ mod tests {
         safe_entry.skill_tools = vec![ResolvedSkillTool {
             definition: dummy_def.clone(),
             handler: ToolHandler::Builtin {
-                function: "get_api_spec".to_string(),
+                function: "get_documentation".to_string(),
             },
             skill_dir: PathBuf::from("/skills/memory"),
         }];

@@ -28,7 +28,13 @@ Process:
 - **If new slash commands**: Update `docs/slash-commands.md`
 
 4. Show a summary of what was updated and why
-5. Commit the doc changes with message: "docs: update documentation for recent changes"
+5. After updating docs, run `cargo build -p mika-agent` to verify the build.rs picks them up
+6. Commit the doc changes with message: "docs: update documentation for recent changes"
 
-Do NOT invent information. Only document what exists in the code. If unsure about 
+**Important:** `docs/` is the single source of truth. The `build.rs` in `crates/mika-agent/`
+automatically copies docs into `OUT_DIR` at build time — no manual sync step needed during
+development. Crate-local fallback copies in `crates/mika-agent/docs/` are only for crates.io
+publishing; run `scripts/sync-agent-docs.sh` before `cargo publish`.
+
+Do NOT invent information. Only document what exists in the code. If unsure about
 a detail, check the source file before writing.
