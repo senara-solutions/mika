@@ -1055,11 +1055,12 @@ impl Database {
     }
 
     /// Get all pending user-visible tasks (reminders and callbacks, excludes heartbeat/reflection).
-    pub fn get_pending_reminder_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
+    pub fn get_user_visible_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
-               AND action_type != 'run_skill'
+               AND (action_type = 'send_message'
+                 OR (trigger_type = 'callback' AND action_type = 'resume_agent'))
                AND status IN ('pending', 'in_progress', 'recurring_active')
              ORDER BY next_fire_at ASC",
             Self::TASK_COLUMNS
@@ -3706,5 +3707,121 @@ mod tests {
         let t2 = db.get_task(&id2, "mika").unwrap().unwrap();
         assert_eq!(t2.status, "pending");
         assert_eq!(t2.label, "heartbeat");
+    }
+
+    fn callback_task(agent_id: &str) -> NewTask {
+        NewTask {
+            agent_id: agent_id.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "analyze_codebase".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+        }
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_returns_completed_only() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+
+        // Pending task should not appear
+        let results = db.get_undelivered_callback_tasks("mika", 0).unwrap();
+        assert!(results.is_empty());
+
+        // Complete it
+        assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
+
+        // Now it should appear
+        let results = db.get_undelivered_callback_tasks("mika", 0).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_since_boundary() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
+
+        // Get the completed_at value
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        let completed_at = task.completed_at.unwrap();
+
+        // since_unix = completed_at means "after this time", so the task at exactly
+        // that time should still be included (query uses >)
+        // But since completed_at == since_unix, and query is >, it should NOT appear
+        let results = db
+            .get_undelivered_callback_tasks("mika", completed_at)
+            .unwrap();
+        assert!(results.is_empty());
+
+        // since_unix before completed_at should include it
+        let results = db
+            .get_undelivered_callback_tasks("mika", completed_at - 1)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+        let id = db.create_task(&callback_task("agent_a")).unwrap();
+        assert!(db.update_task_completed(&id, "agent_a", Some("x")).unwrap());
+
+        let results = db.get_undelivered_callback_tasks("agent_b", 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_mark_task_delivered_claims_completed_task() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        assert!(
+            db.update_task_completed(&id, "mika", Some("result"))
+                .unwrap()
+        );
+
+        // First claim succeeds
+        assert!(db.mark_task_delivered(&id).unwrap());
+
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "delivered");
+    }
+
+    #[test]
+    fn test_mark_task_delivered_double_claim_rejected() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        assert!(
+            db.update_task_completed(&id, "mika", Some("result"))
+                .unwrap()
+        );
+
+        // First claim
+        assert!(db.mark_task_delivered(&id).unwrap());
+        // Second claim returns false (already delivered)
+        assert!(!db.mark_task_delivered(&id).unwrap());
+    }
+
+    #[test]
+    fn test_mark_task_delivered_rejects_non_completed_task() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+
+        // Task is still pending, should not be claimable
+        assert!(!db.mark_task_delivered(&id).unwrap());
     }
 }

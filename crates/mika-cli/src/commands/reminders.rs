@@ -10,7 +10,7 @@ pub async fn run(args: ReminderArgs, agent_name: &str) -> Result<()> {
 
     match args.command {
         None => {
-            let reminders = db.get_pending_reminder_tasks().await?;
+            let reminders = db.get_user_visible_tasks().await?;
             if reminders.is_empty() {
                 println!("\n  No pending reminders.\n");
             } else {

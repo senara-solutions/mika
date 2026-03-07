@@ -266,10 +266,9 @@ impl AsyncDatabase {
         self.with_db(move |db| db.count_pending_tasks(&id)).await
     }
 
-    pub async fn get_pending_reminder_tasks(&self) -> Result<Vec<Task>> {
+    pub async fn get_user_visible_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.get_pending_reminder_tasks(&id))
-            .await
+        self.with_db(move |db| db.get_user_visible_tasks(&id)).await
     }
 
     pub async fn get_inject_context_tasks(&self) -> Result<Vec<Task>> {

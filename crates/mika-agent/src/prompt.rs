@@ -1413,4 +1413,45 @@ notify = true
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
     }
+
+    #[test]
+    fn test_callback_context_injects_prompt_guard() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: chrono::Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: Some("Processing callback results from a long-running task."),
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Callback Result Turn"));
+        assert!(prompt.contains("MUST NOT submit new long-running tasks"));
+    }
+
+    #[test]
+    fn test_no_callback_context_omits_prompt_guard() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: chrono::Utc::now(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Callback Result Turn"));
+    }
 }

@@ -155,7 +155,7 @@ async fn search_reminders(
     results: &mut Vec<String>,
 ) -> Result<()> {
     let query_lower = query.to_lowercase();
-    let tasks = ctx.db.get_pending_reminder_tasks().await?;
+    let tasks = ctx.db.get_user_visible_tasks().await?;
     for t in tasks {
         if t.label.to_lowercase().contains(&query_lower) {
             let short_id = &t.id[..8.min(t.id.len())];

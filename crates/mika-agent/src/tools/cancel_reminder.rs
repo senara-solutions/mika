@@ -82,7 +82,7 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("cancelled"));
 
-        let pending = harness.db.get_pending_reminder_tasks().await.unwrap();
+        let pending = harness.db.get_user_visible_tasks().await.unwrap();
         assert_eq!(pending.len(), 0);
     }
 
