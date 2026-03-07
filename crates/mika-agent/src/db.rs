@@ -18,7 +18,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
@@ -108,8 +108,19 @@ pub struct NewTask {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConversationMessage {
+pub struct Session {
+    pub id: String,
+    pub agent_id: String,
+    pub channel_type: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMessage {
     pub id: i64,
+    pub session_id: String,
     pub role: String,
     pub content: String,
     pub channel_type: String,
@@ -207,12 +218,12 @@ pub struct TeamRunRow {
 }
 
 #[derive(Debug, Clone)]
-pub struct TeamMessageRow {
+pub struct TeamWorkspaceEntry {
     pub id: i64,
     pub run_id: String,
     pub parent_id: Option<i64>,
     pub agent_name: Option<String>,
-    pub message_type: String,
+    pub entry_type: String,
     pub content: String,
     pub iteration: u32,
     pub created_at: i64,
@@ -307,11 +318,11 @@ impl Database {
                 info!(from = version, to = 1, "applying clean-slate migration");
             }
             self.migrate_v1()?;
-            info!(version = 1, "database migrated to v1");
+            info!(version = CURRENT_SCHEMA_VERSION, "database migrated to v{CURRENT_SCHEMA_VERSION}");
         }
-        if version < 2 {
-            self.migrate_v2()?;
-            info!(version = 2, "database migrated to v2");
+        if (1..3).contains(&version) {
+            self.migrate_v3()?;
+            info!(version = 3, "database migrated to v3");
         }
         Ok(())
     }
@@ -336,8 +347,11 @@ impl Database {
             "DROP TABLE IF EXISTS commitments",
             "DROP TABLE IF EXISTS people",
             "DROP TABLE IF EXISTS core_memory",
+            "DROP TABLE IF EXISTS team_workspace",
             "DROP TABLE IF EXISTS team_messages",
             "DROP TABLE IF EXISTS team_runs",
+            "DROP TABLE IF EXISTS messages",
+            "DROP TABLE IF EXISTS sessions",
             "DROP TABLE IF EXISTS conversations",
             "DROP TABLE IF EXISTS tasks",
             "DROP TABLE IF EXISTS teams",
@@ -357,7 +371,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (1);
+            INSERT INTO schema_version (version) VALUES (3);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -436,17 +450,28 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
 
-            CREATE TABLE conversations (
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                channel_type TEXT NOT NULL DEFAULT 'cli',
+                started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                ended_at INTEGER,
+                metadata TEXT
+            );
+            CREATE INDEX idx_sessions_agent ON sessions(agent_id, started_at DESC);
+
+            CREATE TABLE messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
                 content TEXT NOT NULL,
-                channel_type TEXT NOT NULL DEFAULT 'telegram',
                 metadata TEXT,
                 compacted_through_id INTEGER,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            CREATE INDEX idx_conv_agent_created ON conversations(agent_id, created_at DESC);
+            CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
+            CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
 
             CREATE TABLE core_memory (
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -536,17 +561,17 @@ impl Database {
             );
             CREATE INDEX idx_search_agent ON search_content(agent_id, source_type);
 
-            CREATE TABLE team_messages (
+            CREATE TABLE team_workspace (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
-                parent_id INTEGER REFERENCES team_messages(id),
+                parent_id INTEGER REFERENCES team_workspace(id),
                 agent_name TEXT,
-                message_type TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            CREATE INDEX idx_team_msg_run ON team_messages(run_id, created_at);
+            CREATE INDEX idx_team_ws_run ON team_workspace(run_id, created_at);
 
             CREATE TABLE heartbeat_sends (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -606,102 +631,12 @@ impl Database {
         Ok(())
     }
 
-    /// Migration v2: Add 'delivered' status to tasks, 'tool_result' role to conversations.
+    /// Migration v3: Sessions + Messages schema redesign (clean-slate).
     ///
-    /// SQLite does not support ALTER COLUMN, so we recreate both tables with
-    /// updated CHECK constraints and copy data over.
-    fn migrate_v2(&self) -> Result<()> {
-        info!("applying migration v2: add delivered status and tool_result role");
-
-        self.conn
-            .execute_batch(
-                "
-            BEGIN;
-
-            -- Recreate tasks table with 'delivered' in status CHECK
-            CREATE TABLE tasks_v2 (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
-                parent_task_id TEXT REFERENCES tasks_v2(id) ON DELETE SET NULL,
-                depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
-                label TEXT NOT NULL,
-                trigger_type TEXT NOT NULL CHECK (
-                    trigger_type IN ('time','recurring','callback','user_reply','event','condition')
-                ),
-                cron_expr TEXT,
-                event_source TEXT,
-                event_offset_secs INTEGER,
-                condition_expr TEXT,
-                next_fire_at INTEGER,
-                timeout_at INTEGER,
-                action_type TEXT NOT NULL CHECK (
-                    action_type IN (
-                        'send_message','resume_agent','inject_context',
-                        'run_skill','invoke_orchestrator'
-                    )
-                ),
-                action_config TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                    status IN ('pending','in_progress','completed','failed',
-                               'cancelled','expired','recurring_active','delivered')
-                ),
-                process_id INTEGER,
-                input_context TEXT,
-                result TEXT,
-                created_by_session TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                fired_at INTEGER,
-                completed_at INTEGER
-            );
-
-            INSERT INTO tasks_v2 SELECT * FROM tasks;
-            DROP TABLE tasks;
-            ALTER TABLE tasks_v2 RENAME TO tasks;
-
-            -- Recreate all task indexes
-            CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
-            CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
-                WHERE status IN ('pending','recurring_active');
-            CREATE INDEX idx_tasks_schedulable
-                ON tasks(agent_id, next_fire_at ASC)
-                WHERE status IN ('pending','recurring_active');
-            CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id)
-                WHERE parent_task_id IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session)
-                WHERE created_by_session IS NOT NULL;
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
-                ON tasks(agent_id, label)
-                WHERE trigger_type = 'recurring'
-                AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
-
-            -- Recreate conversations table with 'tool_result' in role CHECK
-            CREATE TABLE conversations_v2 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
-                content TEXT NOT NULL,
-                channel_type TEXT NOT NULL DEFAULT 'telegram',
-                metadata TEXT,
-                compacted_through_id INTEGER,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
-            );
-
-            INSERT INTO conversations_v2 SELECT * FROM conversations;
-            DROP TABLE conversations;
-            ALTER TABLE conversations_v2 RENAME TO conversations;
-
-            CREATE INDEX idx_conv_agent_created ON conversations(agent_id, created_at DESC);
-
-            INSERT INTO schema_version (version) VALUES (2);
-
-            COMMIT;
-            ",
-            )
-            .context("failed to apply v2 migration")?;
-
-        Ok(())
+    /// Single user, no data to preserve. Drop and recreate via migrate_v1.
+    fn migrate_v3(&self) -> Result<()> {
+        info!("applying migration v3: sessions + messages schema redesign (clean slate)");
+        self.migrate_v1()
     }
 
     // ===== Agent CRUD =====
@@ -1284,19 +1219,60 @@ impl Database {
         Ok(rows)
     }
 
-    // ===== Conversation =====
+    // ===== Sessions =====
+
+    pub fn create_session(&self, id: &str, agent_id: &str, channel_type: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (id, agent_id, channel_type) VALUES (?1, ?2, ?3)",
+            params![id, agent_id, channel_type],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_session_with_metadata(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (id, agent_id, channel_type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![id, agent_id, channel_type, metadata],
+        )?;
+        Ok(())
+    }
+
+    pub fn end_session(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET ended_at = unixepoch() WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_or_create_system_session(&self, agent_id: &str) -> Result<String> {
+        let id = format!("system-{agent_id}");
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent_id, channel_type) VALUES (?1, ?2, 'system')",
+            params![&id, agent_id],
+        )?;
+        Ok(id)
+    }
+
+    // ===== Messages =====
 
     pub fn save_message(
         &self,
         agent_id: &str,
+        session_id: &str,
         role: &str,
         content: &str,
-        channel_type: &str,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO conversations (agent_id, role, content, channel_type)
+            "INSERT INTO messages (session_id, agent_id, role, content)
              VALUES (?1, ?2, ?3, ?4)",
-            params![agent_id, role, content, channel_type],
+            params![session_id, agent_id, role, content],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1304,27 +1280,28 @@ impl Database {
     pub fn save_message_with_metadata(
         &self,
         agent_id: &str,
+        session_id: &str,
         role: &str,
         content: &str,
-        channel_type: &str,
         metadata: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO conversations (agent_id, role, content, channel_type, metadata)
+            "INSERT INTO messages (session_id, agent_id, role, content, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![agent_id, role, content, channel_type, metadata],
+            params![session_id, agent_id, role, content, metadata],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    fn row_to_conversation_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationMessage> {
-        Ok(ConversationMessage {
+    fn row_to_session_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
+        Ok(SessionMessage {
             id: r.get(0)?,
-            role: r.get(1)?,
-            content: r.get(2)?,
-            channel_type: r.get(3)?,
-            metadata: r.get(4)?,
-            created_at: r.get::<_, i64>(5)?,
+            session_id: r.get(1)?,
+            role: r.get(2)?,
+            content: r.get(3)?,
+            channel_type: r.get(4)?,
+            metadata: r.get(5)?,
+            created_at: r.get::<_, i64>(6)?,
         })
     }
 
@@ -1332,53 +1309,29 @@ impl Database {
         &self,
         agent_id: &str,
         limit: usize,
-        channel_types: Option<&[&str]>,
-    ) -> Result<Vec<ConversationMessage>> {
-        let mut messages = if let Some(types) = channel_types {
-            let placeholders: String = (1..=types.len())
-                .map(|i| format!("?{}", i + 2))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT id, role, content, channel_type, metadata, created_at
-                  FROM conversations
-                  WHERE agent_id = ?1 AND channel_type IN ({})
-                  ORDER BY created_at DESC, id DESC LIMIT ?2",
-                placeholders
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
-                vec![Box::new(agent_id.to_string()), Box::new(limit as i64)];
-            for t in types {
-                bind.push(Box::new(t.to_string()));
-            }
-            let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
-            stmt.query_map(refs.as_slice(), Self::row_to_conversation_message)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, role, content, channel_type, metadata, created_at
-                  FROM conversations WHERE agent_id = ?1 AND role != 'summary'
-                  ORDER BY created_at DESC, id DESC LIMIT ?2",
-            )?;
-            stmt.query_map(
-                params![agent_id, limit as i64],
-                Self::row_to_conversation_message,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+    ) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.role != 'summary'
+              ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
+        )?;
+        let mut messages = stmt
+            .query_map(params![agent_id, limit as i64], Self::row_to_session_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         messages.reverse();
         Ok(messages)
     }
 
-    pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<ConversationMessage>> {
+    pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<SessionMessage>> {
         self.conn
             .query_row(
-                "SELECT id, role, content, channel_type, metadata, created_at
-                  FROM conversations WHERE agent_id = ?1 AND role = 'summary'
-                  ORDER BY created_at DESC LIMIT 1",
+                "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+                  FROM messages m JOIN sessions s ON m.session_id = s.id
+                  WHERE m.agent_id = ?1 AND m.role = 'summary'
+                  ORDER BY m.created_at DESC LIMIT 1",
                 params![agent_id],
-                Self::row_to_conversation_message,
+                Self::row_to_session_message,
             )
             .optional()
             .map_err(Into::into)
@@ -1386,7 +1339,7 @@ impl Database {
 
     pub fn count_messages(&self, agent_id: &str) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1 AND role != 'summary'",
+            "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND role != 'summary'",
             params![agent_id],
             |r| r.get(0),
         )?;
@@ -1397,11 +1350,11 @@ impl Database {
         &self,
         agent_id: &str,
         window_size: usize,
-    ) -> Result<Vec<ConversationMessage>> {
+    ) -> Result<Vec<SessionMessage>> {
         let cutoff_id: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM conversations WHERE agent_id = ?1 AND role != 'summary'
+                "SELECT id FROM messages WHERE agent_id = ?1 AND role != 'summary'
                   ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET ?2",
                 params![agent_id, window_size as i64],
                 |r| r.get(0),
@@ -1412,16 +1365,13 @@ impl Database {
             None => return Ok(vec![]),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, metadata, created_at
-              FROM conversations
-              WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2
-              ORDER BY created_at ASC, id ASC",
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND m.id <= ?2
+              ORDER BY m.created_at ASC, m.id ASC",
         )?;
         let rows = stmt
-            .query_map(
-                params![agent_id, cutoff_id],
-                Self::row_to_conversation_message,
-            )?
+            .query_map(params![agent_id, cutoff_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1432,23 +1382,24 @@ impl Database {
         summary: &str,
         compacted_through_id: i64,
     ) -> Result<i64> {
+        let system_session = self.get_or_create_system_session(agent_id)?;
         self.conn.execute_batch("BEGIN")?;
         // Delete old non-summary messages up to compacted_through_id
         self.conn.execute(
-            "DELETE FROM conversations
+            "DELETE FROM messages
              WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2",
             params![agent_id, compacted_through_id],
         )?;
         // Remove old summary
         self.conn.execute(
-            "DELETE FROM conversations WHERE agent_id = ?1 AND role = 'summary'",
+            "DELETE FROM messages WHERE agent_id = ?1 AND role = 'summary'",
             params![agent_id],
         )?;
         // Insert new summary
         self.conn.execute(
-            "INSERT INTO conversations (agent_id, role, content, channel_type, compacted_through_id)
-             VALUES (?1, 'summary', ?2, 'cli', ?3)",
-            params![agent_id, summary, compacted_through_id],
+            "INSERT INTO messages (session_id, agent_id, role, content, compacted_through_id)
+             VALUES (?1, ?2, 'summary', ?3, ?4)",
+            params![system_session, agent_id, summary, compacted_through_id],
         )?;
         let row_id = self.conn.last_insert_rowid();
         self.conn.execute_batch("COMMIT")?;
@@ -1459,72 +1410,41 @@ impl Database {
         &self,
         agent_id: &str,
         after_id: i64,
-        channel_types: Option<&[&str]>,
-    ) -> Result<Vec<ConversationMessage>> {
-        if let Some(types) = channel_types {
-            let placeholders: String = (0..types.len())
-                .map(|i| format!("?{}", i + 3))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT id, role, content, channel_type, metadata, created_at
-                  FROM conversations
-                  WHERE agent_id = ?1 AND id > ?2 AND channel_type IN ({})
-                  ORDER BY created_at ASC",
-                placeholders
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
-                vec![Box::new(agent_id.to_string()), Box::new(after_id)];
-            for t in types {
-                bind.push(Box::new(t.to_string()));
-            }
-            let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
-            let rows = stmt
-                .query_map(refs.as_slice(), Self::row_to_conversation_message)?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(rows)
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, role, content, channel_type, metadata, created_at
-                  FROM conversations WHERE agent_id = ?1 AND id > ?2
-                  ORDER BY created_at ASC",
-            )?;
-            let rows = stmt
-                .query_map(
-                    params![agent_id, after_id],
-                    Self::row_to_conversation_message,
-                )?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(rows)
-        }
+    ) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.id > ?2
+              ORDER BY m.created_at ASC, m.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, after_id], Self::row_to_session_message)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn max_message_id(&self, agent_id: &str) -> Result<i64> {
         let id: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM conversations WHERE agent_id = ?1",
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE agent_id = ?1",
             params![agent_id],
             |r| r.get(0),
         )?;
         Ok(id)
     }
 
-    pub fn get_conversations_since(
+    pub fn get_messages_since(
         &self,
         agent_id: &str,
         since_unix: i64,
-    ) -> Result<Vec<ConversationMessage>> {
+    ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, channel_type, metadata, created_at
-              FROM conversations
-              WHERE agent_id = ?1 AND created_at >= ?2 AND role != 'summary'
-              ORDER BY created_at ASC",
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.created_at >= ?2 AND m.role != 'summary'
+              ORDER BY m.created_at ASC",
         )?;
         let rows = stmt
-            .query_map(
-                params![agent_id, since_unix],
-                Self::row_to_conversation_message,
-            )?
+            .query_map(params![agent_id, since_unix], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1532,7 +1452,7 @@ impl Database {
     pub fn last_user_message_time(&self, agent_id: &str) -> Result<Option<i64>> {
         self.conn
             .query_row(
-                "SELECT MAX(created_at) FROM conversations
+                "SELECT MAX(created_at) FROM messages
                   WHERE agent_id = ?1 AND role = 'user'",
                 params![agent_id],
                 |r| r.get(0),
@@ -2432,33 +2352,33 @@ impl Database {
             .map_err(Into::into)
     }
 
-    // ===== Team Messages =====
+    // ===== Team Workspace =====
 
-    pub fn insert_team_message(
+    pub fn insert_team_workspace_entry(
         &self,
         run_id: &str,
         parent_id: Option<i64>,
         agent_name: Option<&str>,
-        message_type: &str,
+        entry_type: &str,
         content: &str,
         iteration: u32,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO team_messages (run_id, parent_id, agent_name, message_type, content, iteration)
+            "INSERT INTO team_workspace (run_id, parent_id, agent_name, entry_type, content, iteration)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run_id, parent_id, agent_name, message_type, content, iteration],
+            params![run_id, parent_id, agent_name, entry_type, content, iteration],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn load_assignment_msg_ids(
+    pub fn load_assignment_entry_ids(
         &self,
         run_id: &str,
         iteration: u32,
     ) -> Result<HashMap<String, i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT agent_name, id FROM team_messages
-             WHERE run_id = ?1 AND iteration = ?2 AND message_type = 'assignment'
+            "SELECT agent_name, id FROM team_workspace
+             WHERE run_id = ?1 AND iteration = ?2 AND entry_type = 'assignment'
              AND agent_name IS NOT NULL",
         )?;
         let rows: Vec<(String, i64)> = stmt
@@ -2467,21 +2387,21 @@ impl Database {
         Ok(rows.into_iter().collect())
     }
 
-    pub fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+    pub fn load_team_workspace(&self, run_id: &str) -> Result<Vec<TeamWorkspaceEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, parent_id, agent_name,
-                     message_type, content, iteration, created_at
-              FROM team_messages WHERE run_id = ?1
+                     entry_type, content, iteration, created_at
+              FROM team_workspace WHERE run_id = ?1
               ORDER BY created_at ASC",
         )?;
         let rows = stmt
             .query_map(params![run_id], |r| {
-                Ok(TeamMessageRow {
+                Ok(TeamWorkspaceEntry {
                     id: r.get(0)?,
                     run_id: r.get(1)?,
                     parent_id: r.get(2)?,
                     agent_name: r.get(3)?,
-                    message_type: r.get(4)?,
+                    entry_type: r.get(4)?,
                     content: r.get(5)?,
                     iteration: r.get::<_, u32>(6)?,
                     created_at: r.get(7)?,
@@ -2811,6 +2731,13 @@ mod tests {
         Database::open_in_memory().unwrap()
     }
 
+    fn db_with_session() -> (Database, String) {
+        let db = db();
+        let session_id = "test-session".to_string();
+        db.create_session(&session_id, "mika", "cli").unwrap();
+        (db, session_id)
+    }
+
     #[test]
     fn test_open_in_memory_creates_schema() {
         let db = db();
@@ -2827,22 +2754,22 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_tables_exist() {
+    fn test_v3_tables_exist() {
         let db = db();
         let count: i64 = db
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
-                  AND name IN ('agents','teams','tasks','conversations','core_memory',
+                  AND name IN ('agents','teams','tasks','sessions','messages','core_memory',
                                'people','commitments','preferences','events',
                                'memory_events','memory_event_summaries','search_content',
-                               'team_runs','team_messages','heartbeat_sends',
+                               'team_runs','team_workspace','heartbeat_sends',
                                'reflection_runs','customer_config','failed_sends')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
     }
 
     #[test]
@@ -2861,109 +2788,88 @@ mod tests {
 
     #[test]
     fn test_save_and_load_messages() {
-        let db = db();
-        db.save_message("mika", "user", "Hello!", "cli").unwrap();
-        db.save_message("mika", "assistant", "Hi!", "cli").unwrap();
-        let msgs = db.load_recent_messages("mika", 10, None).unwrap();
+        let (db, sid) = db_with_session();
+        db.save_message("mika", &sid, "user", "Hello!").unwrap();
+        db.save_message("mika", &sid, "assistant", "Hi!").unwrap();
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[0].session_id, sid);
     }
 
     #[test]
     fn test_load_recent_messages_limit() {
-        let db = db();
+        let (db, sid) = db_with_session();
         for i in 0..5 {
-            db.save_message("mika", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("msg {i}"))
                 .unwrap();
         }
-        let msgs = db.load_recent_messages("mika", 3, None).unwrap();
+        let msgs = db.load_recent_messages("mika", 3).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[2].content, "msg 4");
     }
 
     #[test]
-    fn test_load_recent_messages_channel_filter() {
-        let db = db();
-        db.save_message("mika", "user", "telegram msg", "telegram")
-            .unwrap();
-        db.save_message("mika", "user", "cli msg", "cli").unwrap();
-        let tg = db
-            .load_recent_messages("mika", 10, Some(&["telegram"]))
-            .unwrap();
-        assert_eq!(tg.len(), 1);
-        assert_eq!(tg[0].content, "telegram msg");
-    }
+    fn test_load_messages_after() {
+        let (db, sid) = db_with_session();
+        db.save_message("mika", &sid, "user", "msg 1").unwrap();
+        db.save_message("mika", &sid, "user", "msg 2").unwrap();
+        db.save_message("mika", &sid, "user", "msg 3").unwrap();
 
-    #[test]
-    fn test_load_messages_after_with_channel_filter() {
-        let db = db();
-        // Insert messages across different channels
-        db.save_message("mika", "user", "telegram msg 1", "telegram")
-            .unwrap();
-        db.save_message("mika", "user", "cli msg 1", "cli").unwrap();
-        db.save_message("mika", "user", "api msg 1", "api").unwrap();
-        db.save_message("mika", "user", "telegram msg 2", "telegram")
-            .unwrap();
-        db.save_message("mika", "user", "cli msg 2", "cli").unwrap();
+        let all = db.load_messages_after("mika", 0).unwrap();
+        assert_eq!(all.len(), 3);
 
-        // Filter to telegram + cli only (should exclude api)
-        let msgs = db
-            .load_messages_after("mika", 0, Some(&["telegram", "cli"]))
-            .unwrap();
-        assert_eq!(msgs.len(), 4);
-        for msg in &msgs {
-            assert!(
-                msg.channel_type == "telegram" || msg.channel_type == "cli",
-                "unexpected channel_type: {}",
-                msg.channel_type
-            );
-        }
-
-        // No filter returns all messages
-        let all = db.load_messages_after("mika", 0, None).unwrap();
-        assert_eq!(all.len(), 5);
-
-        // after_id filtering works with channel filter
-        let first_id = msgs[0].id;
-        let after = db
-            .load_messages_after("mika", first_id, Some(&["cli"]))
-            .unwrap();
-        // Should get only cli messages after first_id
+        let first_id = all[0].id;
+        let after = db.load_messages_after("mika", first_id).unwrap();
+        assert_eq!(after.len(), 2);
         for msg in &after {
-            assert_eq!(msg.channel_type, "cli");
             assert!(msg.id > first_id);
         }
     }
 
     #[test]
-    fn test_get_conversations_since() {
+    fn test_session_channel_type_via_join() {
         let db = db();
-        // Insert directly with a known timestamp
+        db.create_session("tg-session", "mika", "telegram").unwrap();
+        db.create_session("cli-session", "mika", "cli").unwrap();
+        db.save_message("mika", "tg-session", "user", "telegram msg").unwrap();
+        db.save_message("mika", "cli-session", "user", "cli msg").unwrap();
+
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 2);
+        // Channel type comes from session JOIN
+        assert!(msgs.iter().any(|m| m.channel_type == "telegram"));
+        assert!(msgs.iter().any(|m| m.channel_type == "cli"));
+    }
+
+    #[test]
+    fn test_get_messages_since() {
+        let (db, sid) = db_with_session();
         db.conn
             .execute(
-                "INSERT INTO conversations (agent_id, role, content, channel_type, created_at)
-                  VALUES ('mika', 'user', 'old', 'cli', 1000)",
-                [],
+                "INSERT INTO messages (session_id, agent_id, role, content, created_at)
+                  VALUES (?1, 'mika', 'user', 'old', 1000)",
+                params![sid],
             )
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO conversations (agent_id, role, content, channel_type, created_at)
-                  VALUES ('mika', 'user', 'new', 'cli', 2000)",
-                [],
+                "INSERT INTO messages (session_id, agent_id, role, content, created_at)
+                  VALUES (?1, 'mika', 'user', 'new', 2000)",
+                params![sid],
             )
             .unwrap();
-        let msgs = db.get_conversations_since("mika", 1500).unwrap();
+        let msgs = db.get_messages_since("mika", 1500).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "new");
     }
 
     #[test]
     fn test_last_user_message_time() {
-        let db = db();
+        let (db, sid) = db_with_session();
         assert!(db.last_user_message_time("mika").unwrap().is_none());
-        db.save_message("mika", "user", "hello", "cli").unwrap();
+        db.save_message("mika", &sid, "user", "hello").unwrap();
         let ts = db.last_user_message_time("mika").unwrap();
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
@@ -2971,12 +2877,10 @@ mod tests {
 
     #[test]
     fn test_replace_with_summary() {
-        let db = db();
-        let id1 = db.save_message("mika", "user", "msg1", "cli").unwrap();
-        db.save_message("mika", "assistant", "reply1", "cli")
-            .unwrap();
-        db.replace_with_summary("mika", "Summary text", id1)
-            .unwrap();
+        let (db, sid) = db_with_session();
+        let id1 = db.save_message("mika", &sid, "user", "msg1").unwrap();
+        db.save_message("mika", &sid, "assistant", "reply1").unwrap();
+        db.replace_with_summary("mika", "Summary text", id1).unwrap();
         let summary = db.load_conversation_summary("mika").unwrap().unwrap();
         assert_eq!(summary.role, "summary");
         assert_eq!(summary.content, "Summary text");
@@ -2986,14 +2890,15 @@ mod tests {
 
     #[test]
     fn test_count_messages_excludes_summary() {
-        let db = db();
-        db.save_message("mika", "user", "a", "cli").unwrap();
-        db.save_message("mika", "assistant", "b", "cli").unwrap();
+        let (db, sid) = db_with_session();
+        db.save_message("mika", &sid, "user", "a").unwrap();
+        db.save_message("mika", &sid, "assistant", "b").unwrap();
+        let sys_session = db.get_or_create_system_session("mika").unwrap();
         db.conn
             .execute(
-                "INSERT INTO conversations (agent_id, role, content, channel_type)
-                  VALUES ('mika', 'summary', 'S', 'cli')",
-                [],
+                "INSERT INTO messages (session_id, agent_id, role, content)
+                  VALUES (?1, 'mika', 'summary', 'S')",
+                params![sys_session],
             )
             .unwrap();
         assert_eq!(db.count_messages("mika").unwrap(), 2);
@@ -3200,16 +3105,16 @@ mod tests {
     }
 
     #[test]
-    fn test_team_messages_insert_and_load() {
+    fn test_team_workspace_insert_and_load() {
         let db = db();
         db.insert_team_run("run-001", "eng", "Goal", 3, 0).unwrap();
         let id = db
-            .insert_team_message("run-001", None, Some("mika"), "plan", "Do this", 1)
+            .insert_team_workspace_entry("run-001", None, Some("mika"), "plan", "Do this", 1)
             .unwrap();
-        let msgs = db.load_team_messages("run-001").unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].id, id);
-        assert_eq!(msgs[0].message_type, "plan");
+        let entries = db.load_team_workspace("run-001").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].entry_type, "plan");
     }
 
     #[test]
@@ -3381,9 +3286,9 @@ mod tests {
 
     #[test]
     fn test_load_messages_before_window() {
-        let db = db();
+        let (db, sid) = db_with_session();
         for i in 0..5 {
-            db.save_message("mika", "user", &format!("msg {i}"), "cli")
+            db.save_message("mika", &sid, "user", &format!("msg {i}"))
                 .unwrap();
         }
         let before = db.load_messages_before_window("mika", 2).unwrap();

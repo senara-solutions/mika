@@ -46,7 +46,7 @@ impl Tool for SendMessageTool {
         }
 
         // Persist the outbound message for conversation history
-        ctx.db.save_message("assistant", text, "outbound").await?;
+        ctx.db.save_message(ctx.session_id, "assistant", text).await?;
 
         match &ctx.message_sender {
             Some(sender) => {
@@ -124,7 +124,7 @@ mod tests {
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
-            session_id: "test",
+            session_id: "test-session",
             home_dir: std::path::Path::new("/tmp"),
             core_memory_edit_count: &harness.counter,
             is_onboarding: false,

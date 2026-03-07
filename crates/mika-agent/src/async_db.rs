@@ -8,9 +8,9 @@ use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
-    AgentRow, Commitment, ConversationMessage, CoreMemoryEntry, Database, Event, FailedSend,
-    MemoryEvent, NewTask, Person, Preference, SearchResult, Task, TeamMessageRow, TeamRow,
-    TeamRunRow,
+    AgentRow, Commitment, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent, NewTask,
+    Person, Preference, SearchResult, SessionMessage, Task, TeamRow, TeamRunRow,
+    TeamWorkspaceEntry,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -341,53 +341,85 @@ impl AsyncDatabase {
         .await
     }
 
-    // -- Conversation --
+    // -- Sessions --
 
-    pub async fn save_message(&self, role: &str, content: &str, channel_type: &str) -> Result<i64> {
-        let (a, r, c, ct) = (
+    pub async fn create_session(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+    ) -> Result<()> {
+        let (i, a, ct) = (id.to_owned(), agent_id.to_owned(), channel_type.to_owned());
+        self.with_db(move |db| db.create_session(&i, &a, &ct))
+            .await
+    }
+
+    pub async fn create_session_with_metadata(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        let (i, a, ct, m) = (
+            id.to_owned(),
+            agent_id.to_owned(),
+            channel_type.to_owned(),
+            metadata.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.create_session_with_metadata(&i, &a, &ct, m.as_deref()))
+            .await
+    }
+
+    pub async fn end_session(&self, id: &str) -> Result<()> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.end_session(&i)).await
+    }
+
+    pub async fn get_or_create_system_session(&self) -> Result<String> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_or_create_system_session(&a))
+            .await
+    }
+
+    // -- Messages --
+
+    pub async fn save_message(&self, session_id: &str, role: &str, content: &str) -> Result<i64> {
+        let (a, sid, r, c) = (
             self.agent_id.clone(),
+            session_id.to_owned(),
             role.to_owned(),
             content.to_owned(),
-            channel_type.to_owned(),
         );
-        self.with_db(move |db| db.save_message(&a, &r, &c, &ct))
+        self.with_db(move |db| db.save_message(&a, &sid, &r, &c))
             .await
     }
 
     pub async fn save_message_with_metadata(
         &self,
+        session_id: &str,
         role: &str,
         content: &str,
-        channel_type: &str,
         metadata: Option<&str>,
     ) -> Result<i64> {
-        let (a, r, c, ct, m) = (
+        let (a, sid, r, c, m) = (
             self.agent_id.clone(),
+            session_id.to_owned(),
             role.to_owned(),
             content.to_owned(),
-            channel_type.to_owned(),
             metadata.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.save_message_with_metadata(&a, &r, &c, &ct, m.as_deref()))
+        self.with_db(move |db| db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref()))
             .await
     }
 
-    pub async fn load_recent_messages(
-        &self,
-        limit: usize,
-        channel_filter: Option<Vec<String>>,
-    ) -> Result<Vec<ConversationMessage>> {
+    pub async fn load_recent_messages(&self, limit: usize) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| {
-            let refs: Option<Vec<&str>> = channel_filter
-                .as_ref()
-                .map(|v| v.iter().map(|s| s.as_str()).collect());
-            db.load_recent_messages(&a, limit, refs.as_deref())
-        })
-        .await
+        self.with_db(move |db| db.load_recent_messages(&a, limit))
+            .await
     }
 
-    pub async fn load_conversation_summary(&self) -> Result<Option<ConversationMessage>> {
+    pub async fn load_conversation_summary(&self) -> Result<Option<SessionMessage>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.load_conversation_summary(&a))
             .await
@@ -401,7 +433,7 @@ impl AsyncDatabase {
     pub async fn load_messages_before_window(
         &self,
         window_size: usize,
-    ) -> Result<Vec<ConversationMessage>> {
+    ) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.load_messages_before_window(&a, window_size))
             .await
@@ -685,21 +717,12 @@ impl AsyncDatabase {
         self.with_db(move |db| db.list_customer_config(&a)).await
     }
 
-    // -- Cross-Channel Queries --
+    // -- Cross-Session Queries --
 
-    pub async fn load_messages_after(
-        &self,
-        after_id: i64,
-        channel_types: Option<Vec<String>>,
-    ) -> Result<Vec<ConversationMessage>> {
+    pub async fn load_messages_after(&self, after_id: i64) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| {
-            let refs: Option<Vec<&str>> = channel_types
-                .as_ref()
-                .map(|v| v.iter().map(|s| s.as_str()).collect());
-            db.load_messages_after(&a, after_id, refs.as_deref())
-        })
-        .await
+        self.with_db(move |db| db.load_messages_after(&a, after_id))
+            .await
     }
 
     pub async fn max_message_id(&self) -> Result<i64> {
@@ -740,12 +763,9 @@ impl AsyncDatabase {
 
     // -- Reflection --
 
-    pub async fn get_conversations_since(
-        &self,
-        since_unix: i64,
-    ) -> Result<Vec<ConversationMessage>> {
+    pub async fn get_messages_since(&self, since_unix: i64) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_conversations_since(&a, since_unix))
+        self.with_db(move |db| db.get_messages_since(&a, since_unix))
             .await
     }
 
@@ -936,42 +956,42 @@ impl AsyncDatabase {
         self.with_db(move |db| db.load_team_run_by_id(&ri)).await
     }
 
-    // -- Team Messages --
+    // -- Team Workspace --
 
-    pub async fn insert_team_message(
+    pub async fn insert_team_workspace_entry(
         &self,
         run_id: &str,
         parent_id: Option<i64>,
         agent_name: Option<&str>,
-        message_type: &str,
+        entry_type: &str,
         content: &str,
         iteration: u32,
     ) -> Result<i64> {
-        let (ri, an, mt, c) = (
+        let (ri, an, et, c) = (
             run_id.to_owned(),
             agent_name.map(|s| s.to_owned()),
-            message_type.to_owned(),
+            entry_type.to_owned(),
             content.to_owned(),
         );
         self.with_db(move |db| {
-            db.insert_team_message(&ri, parent_id, an.as_deref(), &mt, &c, iteration)
+            db.insert_team_workspace_entry(&ri, parent_id, an.as_deref(), &et, &c, iteration)
         })
         .await
     }
 
-    pub async fn load_assignment_msg_ids(
+    pub async fn load_assignment_entry_ids(
         &self,
         run_id: &str,
         iteration: u32,
     ) -> Result<std::collections::HashMap<String, i64>> {
         let ri = run_id.to_owned();
-        self.with_db(move |db| db.load_assignment_msg_ids(&ri, iteration))
+        self.with_db(move |db| db.load_assignment_entry_ids(&ri, iteration))
             .await
     }
 
-    pub async fn load_team_messages(&self, run_id: &str) -> Result<Vec<TeamMessageRow>> {
+    pub async fn load_team_workspace(&self, run_id: &str) -> Result<Vec<TeamWorkspaceEntry>> {
         let ri = run_id.to_owned();
-        self.with_db(move |db| db.load_team_messages(&ri)).await
+        self.with_db(move |db| db.load_team_workspace(&ri)).await
     }
 }
 
@@ -985,14 +1005,21 @@ mod tests {
         AsyncDatabase::new(db)
     }
 
+    async fn test_async_db_with_session() -> (AsyncDatabase, String) {
+        let db = test_async_db();
+        let sid = "test-session".to_string();
+        db.create_session(&sid, "mika", "cli").await.unwrap();
+        (db, sid)
+    }
+
     #[tokio::test]
     async fn test_async_save_and_load() {
-        let db = test_async_db();
-        db.save_message("user", "Hello!", "cli").await.unwrap();
-        db.save_message("assistant", "Hi there!", "cli")
+        let (db, sid) = test_async_db_with_session().await;
+        db.save_message(&sid, "user", "Hello!").await.unwrap();
+        db.save_message(&sid, "assistant", "Hi there!")
             .await
             .unwrap();
-        let messages = db.load_recent_messages(10, None).await.unwrap();
+        let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -1000,14 +1027,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_concurrent_reads() {
-        let db = test_async_db();
-        db.save_message("user", "Message 1", "cli").await.unwrap();
-        db.save_message("user", "Message 2", "cli").await.unwrap();
+        let (db, sid) = test_async_db_with_session().await;
+        db.save_message(&sid, "user", "Message 1").await.unwrap();
+        db.save_message(&sid, "user", "Message 2").await.unwrap();
         let mut handles = Vec::new();
         for _ in 0..5 {
             let db_clone = db.clone();
             handles.push(tokio::spawn(async move {
-                db_clone.load_recent_messages(10, None).await.unwrap()
+                db_clone.load_recent_messages(10).await.unwrap()
             }));
         }
         for handle in handles {
@@ -1018,19 +1045,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_clone_shares_connection() {
-        let db = test_async_db();
+        let (db, sid) = test_async_db_with_session().await;
         let db2 = db.clone();
-        db.save_message("user", "From clone 1", "cli")
+        db.save_message(&sid, "user", "From clone 1")
             .await
             .unwrap();
-        let messages = db2.load_recent_messages(10, None).await.unwrap();
+        let messages = db2.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
     }
 
     #[tokio::test]
     async fn test_async_db_survives_panic() {
-        let db = test_async_db();
-        db.save_message("user", "before panic", "cli")
+        let (db, sid) = test_async_db_with_session().await;
+        db.save_message(&sid, "user", "before panic")
             .await
             .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -1046,7 +1073,7 @@ mod tests {
             }))
             .unwrap();
         rx.await.unwrap();
-        let messages = db.load_recent_messages(10, None).await.unwrap();
+        let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
     }
 
@@ -1062,38 +1089,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_joins_thread() {
-        let db = test_async_db();
-        db.save_message("user", "before shutdown", "cli")
+        let (db, sid) = test_async_db_with_session().await;
+        db.save_message(&sid, "user", "before shutdown")
             .await
             .unwrap();
-        let messages = db.load_recent_messages(10, None).await.unwrap();
+        let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
         db.shutdown();
     }
 
     #[tokio::test]
     async fn test_shutdown_rejects_subsequent_operations() {
-        let db = test_async_db();
-        db.save_message("user", "msg", "cli").await.unwrap();
+        let (db, sid) = test_async_db_with_session().await;
+        db.save_message(&sid, "user", "msg").await.unwrap();
         db.shutdown();
-        let result = db.load_recent_messages(10, None).await;
+        let result = db.load_recent_messages(10).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("shut down"));
     }
 
     #[tokio::test]
     async fn test_shutdown_idempotent() {
-        let db = test_async_db();
-        db.save_message("user", "msg", "cli").await.unwrap();
+        let (db, sid) = test_async_db_with_session().await;
+        db.save_message(&sid, "user", "msg").await.unwrap();
         db.shutdown();
         db.shutdown();
     }
 
     #[tokio::test]
     async fn test_last_user_message_time_returns_i64() {
-        let db = test_async_db();
+        let (db, sid) = test_async_db_with_session().await;
         assert!(db.last_user_message_time().await.unwrap().is_none());
-        db.save_message("user", "hello", "cli").await.unwrap();
+        db.save_message(&sid, "user", "hello").await.unwrap();
         let ts = db.last_user_message_time().await.unwrap();
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
@@ -1101,16 +1128,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_agent_scoping() {
-        let db = test_async_db();
-        // Register a second agent
+        let (db, sid) = test_async_db_with_session().await;
+        // Register a second agent and create a session for it
         db.register_agent("agent2", "Agent 2", "").await.unwrap();
         let db2 = db.with_agent("agent2");
-        db.save_message("user", "from main", "cli").await.unwrap();
-        db2.save_message("user", "from agent2", "cli")
+        db2.create_session("agent2-session", "agent2", "cli")
             .await
             .unwrap();
-        let main_msgs = db.load_recent_messages(10, None).await.unwrap();
-        let agent2_msgs = db2.load_recent_messages(10, None).await.unwrap();
+        db.save_message(&sid, "user", "from main").await.unwrap();
+        db2.save_message("agent2-session", "user", "from agent2")
+            .await
+            .unwrap();
+        let main_msgs = db.load_recent_messages(10).await.unwrap();
+        let agent2_msgs = db2.load_recent_messages(10).await.unwrap();
         assert_eq!(main_msgs.len(), 1);
         assert_eq!(agent2_msgs.len(), 1);
         assert_eq!(main_msgs[0].content, "from main");

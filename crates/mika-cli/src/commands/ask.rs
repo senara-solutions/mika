@@ -13,6 +13,13 @@ use crate::init;
 pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
     let session_id = Uuid::new_v4().to_string();
+    if let Err(e) = ctx
+        .async_db
+        .create_session(&session_id, ctx.async_db.agent_id(), "cli")
+        .await
+    {
+        tracing::warn!(error = %e, "failed to create session");
+    }
     let http_client = reqwest::Client::new();
     let message_sender =
         crate::init::make_message_sender(&ctx.settings, &ctx.async_db, &http_client);

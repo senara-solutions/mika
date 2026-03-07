@@ -333,10 +333,21 @@ impl TeamEngine {
             warn!(error = %e, "failed to persist team run to DB");
         }
 
-        // Insert the goal as the root message
+        // Create a team session for storing agent messages
+        let orchestrator_agent_id = self.team.team.orchestrator.clone();
+        let team_session_id = format!("team-{}", self.run.run_id);
+        if let Err(e) = self
+            .team_db
+            .create_session(&team_session_id, &orchestrator_agent_id, "team")
+            .await
+        {
+            warn!(error = %e, "failed to create team session");
+        }
+
+        // Insert the goal as the root workspace entry
         match self
             .team_db
-            .insert_team_message(&self.run.run_id, None, None, "goal", &self.run.goal, 0)
+            .insert_team_workspace_entry(&self.run.run_id, None, None, "goal", &self.run.goal, 0)
             .await
         {
             Ok(id) => self.goal_msg_id = Some(id),
@@ -370,11 +381,11 @@ impl TeamEngine {
                 self.run.status = RunStatus::Failed(e.to_string());
                 self.emit_event(TeamEvent::RunFailed(e.to_string()));
 
-                // Persist error message to DB
+                // Persist error entry to DB (generic error, no agent)
                 if let Some(goal_id) = self.goal_msg_id
                     && let Err(e) = self
                         .team_db
-                        .insert_team_message(
+                        .insert_team_workspace_entry(
                             &self.run.run_id,
                             Some(goal_id),
                             None,
@@ -384,7 +395,7 @@ impl TeamEngine {
                         )
                         .await
                 {
-                    warn!(error = %e, "failed to persist team message");
+                    warn!(error = %e, "failed to persist team workspace entry");
                 }
             }
         }
@@ -585,7 +596,7 @@ impl TeamEngine {
                 if let Some(goal_id) = self.goal_msg_id
                     && let Err(e) = self
                         .team_db
-                        .insert_team_message(
+                        .insert_team_workspace_entry(
                             &self.run.run_id,
                             Some(goal_id),
                             Some(orchestrator_name),
@@ -595,7 +606,7 @@ impl TeamEngine {
                         )
                         .await
                 {
-                    warn!(error = %e, "failed to persist team message");
+                    warn!(error = %e, "failed to persist team workspace entry");
                 }
                 return Ok(DecomposeResult::Conversational(reply));
             }
@@ -604,9 +615,9 @@ impl TeamEngine {
 
         // Persist orchestrator decomposition to DB
         if let Some(goal_id) = self.goal_msg_id {
-            let orchestrator_msg_id = self
+            let orchestrator_entry_id = self
                 .team_db
-                .insert_team_message(
+                .insert_team_workspace_entry(
                     &self.run.run_id,
                     Some(goal_id),
                     Some(orchestrator_name),
@@ -617,12 +628,12 @@ impl TeamEngine {
                 .await
                 .ok();
 
-            // Insert assignment messages as children of orchestrator
-            if let Some(orch_id) = orchestrator_msg_id {
+            // Insert assignment entries as children of orchestrator
+            if let Some(orch_id) = orchestrator_entry_id {
                 for task in &tasks {
                     if let Err(e) = self
                         .team_db
-                        .insert_team_message(
+                        .insert_team_workspace_entry(
                             &self.run.run_id,
                             Some(orch_id),
                             Some(&task.agent),
@@ -632,7 +643,7 @@ impl TeamEngine {
                         )
                         .await
                     {
-                        warn!(error = %e, "failed to persist team message");
+                        warn!(error = %e, "failed to persist team workspace entry");
                     }
                 }
             }
@@ -656,15 +667,6 @@ impl TeamEngine {
         let team_name = self.run.team_name.clone();
         let brave_api_key = self.brave_api_key.clone();
         let team_db = self.team_db.clone();
-        let iteration = self.run.iteration;
-
-        // Look up assignment message IDs from DB for parent linking.
-        let assignment_msg_ids: HashMap<String, i64> = self
-            .team_db
-            .load_assignment_msg_ids(&self.run.run_id, iteration)
-            .await
-            .unwrap_or_default();
-        let assignment_msg_ids = Arc::new(assignment_msg_ids);
 
         // Build per-task parameters upfront from self (avoids borrowing self in spawned tasks).
         struct TaskInput {
@@ -793,7 +795,6 @@ impl TeamEngine {
             let team_name = team_name.clone();
             let brave_api_key = brave_api_key.clone();
             let team_db = team_db.clone();
-            let assignment_msg_ids = Arc::clone(&assignment_msg_ids);
 
             let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
             join_set.spawn(
@@ -839,8 +840,6 @@ impl TeamEngine {
                     };
 
                     // Persist and report completion/failure for this agent.
-                    let parent_id = assignment_msg_ids.get(agent_name.as_str()).copied();
-
                     match &result {
                         Ok(response) => {
                             info!(agent = %agent_name, "task completed");
@@ -850,19 +849,22 @@ impl TeamEngine {
                                     response: response.clone(),
                                 });
                             }
-                            // Persist agent response
+                            // Persist agent response to messages table
+                            let team_session_id = format!("team-{}", run_id);
+                            let metadata = serde_json::json!({
+                                "team_run_id": run_id,
+                                "agent_name": agent_name,
+                            }).to_string();
                             if let Err(e) = team_db
-                                .insert_team_message(
-                                    &run_id,
-                                    parent_id,
-                                    Some(agent_name),
-                                    "agent_response",
+                                .save_message_with_metadata(
+                                    &team_session_id,
+                                    "assistant",
                                     response,
-                                    iteration,
+                                    Some(&metadata),
                                 )
                                 .await
                             {
-                                warn!(error = %e, "failed to persist team message");
+                                warn!(error = %e, "failed to persist agent response message");
                             }
                         }
                         Err(e) => {
@@ -874,19 +876,22 @@ impl TeamEngine {
                                     error: error_str.clone(),
                                 });
                             }
-                            // Persist agent error
+                            // Persist agent error to messages table
+                            let team_session_id = format!("team-{}", run_id);
+                            let metadata = serde_json::json!({
+                                "team_run_id": run_id,
+                                "agent_name": agent_name,
+                            }).to_string();
                             if let Err(e) = team_db
-                                .insert_team_message(
-                                    &run_id,
-                                    parent_id,
-                                    Some(agent_name),
-                                    "error",
+                                .save_message_with_metadata(
+                                    &team_session_id,
+                                    "system",
                                     &error_str,
-                                    iteration,
+                                    Some(&metadata),
                                 )
                                 .await
                             {
-                                warn!(error = %e, "failed to persist team message");
+                                warn!(error = %e, "failed to persist agent error message");
                             }
                         }
                     }
@@ -1045,7 +1050,7 @@ impl TeamEngine {
         if let Some(goal_id) = self.goal_msg_id
             && let Err(e) = self
                 .team_db
-                .insert_team_message(
+                .insert_team_workspace_entry(
                     &self.run.run_id,
                     Some(goal_id),
                     Some(&critic_name),
@@ -1055,7 +1060,7 @@ impl TeamEngine {
                 )
                 .await
         {
-            warn!(error = %e, "failed to persist team message");
+            warn!(error = %e, "failed to persist team workspace entry");
         }
 
         self.emit_event(TeamEvent::CriticReview {
@@ -1086,21 +1091,23 @@ impl TeamEngine {
             .run_agent(&agent_name, "Produce the final deliverable.", &context)
             .await?;
 
-        // Persist deliverable to DB
-        if let Some(goal_id) = self.goal_msg_id
-            && let Err(e) = self
-                .team_db
-                .insert_team_message(
-                    &self.run.run_id,
-                    Some(goal_id),
-                    Some(&agent_name),
-                    "deliverable",
-                    &response,
-                    self.run.iteration,
-                )
-                .await
+        // Persist deliverable to messages table
+        let team_session_id = format!("team-{}", self.run.run_id);
+        let metadata = serde_json::json!({
+            "team_run_id": self.run.run_id,
+            "agent_name": agent_name,
+        }).to_string();
+        if let Err(e) = self
+            .team_db
+            .save_message_with_metadata(
+                &team_session_id,
+                "assistant",
+                &response,
+                Some(&metadata),
+            )
+            .await
         {
-            warn!(error = %e, "failed to persist team message");
+            warn!(error = %e, "failed to persist deliverable message");
         }
 
         Ok(response)

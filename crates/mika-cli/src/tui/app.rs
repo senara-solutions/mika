@@ -335,10 +335,8 @@ pub struct App<'a> {
 /// Context window limit for the model (Claude's 200K context).
 pub const MODEL_CONTEXT_LIMIT: u32 = 200_000;
 
-/// Channels to poll for cross-channel messages (includes "cli" for messages
-/// from other CLI processes like `mika ask`; the TUI's own messages are
-/// excluded via the watermark which is bumped after each send).
-pub const POLLED_CHANNELS: &[&str] = &["telegram", "cli"];
+// Channel filtering removed: sessions table replaces channel_type column.
+// Cross-channel messages are now discovered via load_messages_after (watermark-based).
 
 /// Poll interval for cross-channel messages in ticks (~5 seconds at 30ms tick rate).
 const POLL_INTERVAL_TICKS: u64 = 167;
@@ -516,7 +514,7 @@ impl<'a> App<'a> {
             // Persist user message to DB (fire-and-forget)
             let db = self.db.clone();
             tokio::spawn(async move {
-                if let Err(e) = db.save_message("user", &text, "team").await {
+                if let Err(e) = db.save_message("", "user", &text).await {
                     tracing::warn!(error = %e, "failed to save team user message");
                 }
             });
@@ -805,7 +803,7 @@ impl<'a> App<'a> {
                     self.status = AgentStatus::Idle;
                 } else {
                     // Persist deliverable to DB
-                    if let Err(e) = self.db.save_message("assistant", &text, "team").await {
+                    if let Err(e) = self.db.save_message("", "assistant", &text).await {
                         tracing::warn!(error = %e, "failed to save team deliverable");
                     }
                     self.pending_response = Some(text);
@@ -1025,10 +1023,9 @@ impl<'a> App<'a> {
 
     /// Poll for new messages from other channels/processes (e.g. Telegram, `mika ask`).
     async fn poll_cross_channel_messages(&mut self) {
-        let channels: Vec<String> = POLLED_CHANNELS.iter().map(|s| s.to_string()).collect();
         let new_msgs = match self
             .db
-            .load_messages_after(self.last_seen_msg_id, Some(channels))
+            .load_messages_after(self.last_seen_msg_id)
             .await
         {
             Ok(msgs) => msgs,
