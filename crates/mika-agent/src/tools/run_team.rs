@@ -1,9 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use mika_common::agent::DEFAULT_AGENT;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
+use mika_common::team;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mika_common::home;
@@ -14,6 +16,21 @@ use crate::messaging::MessageSender;
 use crate::teams::types::{TeamEvent, TeamEventCallback};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+
+/// Check if the given agent is an orchestrator (default agent or listed as orchestrator in any team).
+fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
+    if agent_id == DEFAULT_AGENT {
+        return true;
+    }
+    for team_name in team::list_teams(home_dir) {
+        if let Ok(def) = team::load_team(home_dir, &team_name)
+            && def.team.orchestrator == agent_id
+        {
+            return true;
+        }
+    }
+    false
+}
 
 pub struct RunTeamTool {
     pub home_dir: PathBuf,
@@ -64,6 +81,14 @@ impl Tool for RunTeamTool {
         }
         if let Err(e) = mika_common::team::validate_team_name(team_name) {
             return Ok(ToolOutput::error(format!("Invalid team name: {e}")));
+        }
+
+        // Only orchestrators can run teams
+        let current_agent_id = ctx.db.agent_id();
+        if !is_orchestrator(&self.home_dir, current_agent_id) {
+            return Ok(ToolOutput::error(
+                "Only orchestrator agents can run teams. You are a specialist — call tools directly.",
+            ));
         }
 
         let goal = input["goal"].as_str().unwrap_or("");
@@ -226,5 +251,26 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid team name"));
+    }
+
+    #[tokio::test]
+    async fn test_run_team_non_orchestrator_blocked() {
+        let harness = TestHarness::with_agent("specialist-agent");
+        let ctx = harness.ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = RunTeamTool {
+            home_dir: tmp.path().to_path_buf(),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"team_name": "dev-team", "goal": "test"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Only orchestrator agents"));
     }
 }

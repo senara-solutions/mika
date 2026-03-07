@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-use mika_agent::agent::{self, AgentParams, check_onboarding};
+use mika_agent::agent::{self, AgentParams, SilentAgentParams, SilentTrigger, check_onboarding, run_silent_agent};
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 
@@ -13,12 +13,6 @@ use crate::init;
 pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
     let session_id = Uuid::new_v4().to_string();
-    let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
-        tool_registry.register(tool);
-    }
-    let tool_registry = Arc::new(tool_registry);
-    let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
     let http_client = reqwest::Client::new();
     let message_sender =
         crate::init::make_message_sender(&ctx.settings, &ctx.async_db, &http_client);
@@ -37,50 +31,79 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
         anyhow::bail!("Empty message. Provide a message argument or pipe via stdin with \"-\".");
     }
 
-    // If --task-id is provided, mark the task as completed with the message as result.
-    // This is used by background processes to deliver callback results:
-    //   mika ask --agent <agent> --task-id <uuid> "Analysis complete: ..."
+    // If --task-id is provided, mark the task as completed and run silent agent
+    // with the callback trigger. This prevents the agent from spawning new
+    // long-running tasks (silent mode filters out exec/http handlers).
     if let Some(tid) = task_id {
-        match ctx.async_db.get_task(tid).await {
-            Ok(Some(task)) => {
-                if task.trigger_type != "callback" {
-                    anyhow::bail!(
-                        "Task '{}' has trigger_type '{}', not 'callback'. \
-                         --task-id is only for callback tasks.",
-                        tid,
-                        task.trigger_type
-                    );
-                }
-                if !matches!(task.status.as_str(), "pending" | "in_progress") {
-                    anyhow::bail!(
-                        "Task '{}' has status '{}' and cannot be completed.",
-                        tid,
-                        task.status
-                    );
-                }
-                match ctx
-                    .async_db
-                    .update_task_completed(tid, Some(&user_message))
-                    .await?
-                {
-                    true => {}
-                    false => {
-                        anyhow::bail!(
-                            "Task '{}' could not be completed: already in a terminal state.",
-                            tid
-                        );
-                    }
-                }
-            }
+        let task = match ctx.async_db.get_task(tid).await {
+            Ok(Some(task)) => task,
             Ok(None) => {
                 anyhow::bail!("Task '{}' not found.", tid);
             }
             Err(e) => {
                 anyhow::bail!("Failed to load task '{}': {}", tid, e);
             }
+        };
+
+        if task.trigger_type != "callback" {
+            anyhow::bail!(
+                "Task '{}' has trigger_type '{}', not 'callback'. \
+                 --task-id is only for callback tasks.",
+                tid,
+                task.trigger_type
+            );
         }
+        if !matches!(task.status.as_str(), "pending" | "in_progress") {
+            anyhow::bail!(
+                "Task '{}' has status '{}' and cannot be completed.",
+                tid,
+                task.status
+            );
+        }
+        if !ctx
+            .async_db
+            .update_task_completed(tid, Some(&user_message))
+            .await?
+        {
+            anyhow::bail!(
+                "Task '{}' could not be completed: already in a terminal state.",
+                tid
+            );
+        }
+
+        let tool_registry = Arc::new(tools::default_tools());
+        let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
+        let skills_dirty = AtomicBool::new(false);
+
+        run_silent_agent(&SilentAgentParams {
+            db: &ctx.async_db,
+            claude: &ctx.claude,
+            tools: &tool_registry,
+            skills: &skill_registry,
+            trigger: SilentTrigger::Callback {
+                task_id: tid.to_string(),
+                label: task.label,
+                result: user_message,
+            },
+            home_dir: &ctx.home_dir,
+            session_id: &session_id,
+            message_sender,
+            embedding_client: embedding_client.as_ref(),
+            brave_api_key: ctx.settings.brave_api_key.as_deref(),
+            skills_dirty: &skills_dirty,
+        })
+        .await?;
+
+        return Ok(());
     }
 
+    // Normal ask mode — full conversation agent
+    let mut tool_registry = tools::default_tools();
+    for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
+        tool_registry.register(tool);
+    }
+    let tool_registry = Arc::new(tool_registry);
+    let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
     let is_onboarding = check_onboarding(&ctx.async_db).await;
     let skills_dirty = AtomicBool::new(false);
     let mcp_manager = init::connect_mcp(&ctx.home_dir).await;

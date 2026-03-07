@@ -67,6 +67,15 @@ pub mod test_helpers {
             }
         }
 
+        /// Create a harness with a specific agent ID.
+        pub fn with_agent(agent_id: &str) -> Self {
+            let db = Database::open_in_memory().unwrap();
+            Self {
+                db: AsyncDatabase::new_with_agent(db, agent_id),
+                counter: AtomicU32::new(0),
+            }
+        }
+
         /// Create a non-onboarding ToolContext borrowing from this harness.
         pub fn ctx(&self) -> ToolContext<'_> {
             test_ctx(&self.db, &self.counter)
