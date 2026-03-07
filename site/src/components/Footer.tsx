@@ -38,8 +38,13 @@ export function Footer() {
         </div>
 
         <p className="text-sm text-muted/30">
-          Built with Rust{" "}
-          <span className="text-red-400">&hearts;</span>
+          Backed by Senara Solutions &{" "}
+          <a
+            href="https://superuserhq.com/"
+            className="text-muted/50 transition-colors hover:text-white"
+          >
+            Superuser HQ
+          </a>
         </p>
       </div>
     </footer>
