@@ -32,7 +32,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
 - `todos/` — Code review findings (tracked as markdown files)
-- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit)
+- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues)
 
 ## Conventions
 

@@ -31,6 +31,17 @@ The command uses a `/ralph-loop` wrapper internally to ensure all steps run to c
 
 For documentation-only changes, you can run `/mika-doc-audit` directly instead of the full `/mika` workflow.
 
+### Issue Management
+
+Two slash commands streamline GitHub issue creation using the repo's label taxonomy:
+
+```
+/mika-issue <description>       # Create a single issue
+/mika-issues <list of issues>   # Batch-create multiple issues
+```
+
+Both commands classify issues by type (`bug`, `enhancement`, `documentation`, `question`), assign priority (`p0-critical` through `p3-nice-to-have`) and component labels (`agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`), format the body using the repo's issue templates, and present the `gh issue create` command for approval before executing.
+
 ### Setup
 
 1. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
