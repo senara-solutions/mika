@@ -278,6 +278,17 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_undelivered_callback_tasks(&self, since_unix: i64) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_undelivered_callback_tasks(&id, since_unix))
+            .await
+    }
+
+    pub async fn mark_task_delivered(&self, task_id: &str) -> Result<bool> {
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.mark_task_delivered(&i)).await
+    }
+
     pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         let i = id.to_owned();
         self.with_db(move |db| db.set_task_process_id(&i, process_id))

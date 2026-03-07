@@ -18,7 +18,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
@@ -309,6 +309,10 @@ impl Database {
             self.migrate_v1()?;
             info!(version = 1, "database migrated to v1");
         }
+        if version < 2 {
+            self.migrate_v2()?;
+            info!(version = 2, "database migrated to v2");
+        }
         Ok(())
     }
 
@@ -412,7 +416,7 @@ impl Database {
                 action_config TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'pending' CHECK (
                     status IN ('pending','in_progress','completed','failed',
-                               'cancelled','expired','recurring_active')
+                               'cancelled','expired','recurring_active','delivered')
                 ),
                 process_id INTEGER,
                 input_context TEXT,
@@ -435,7 +439,7 @@ impl Database {
             CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary')),
+                role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
                 content TEXT NOT NULL,
                 channel_type TEXT NOT NULL DEFAULT 'telegram',
                 metadata TEXT,
@@ -581,7 +585,7 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
                 ON tasks(agent_id, label)
                 WHERE trigger_type = 'recurring'
-                AND status NOT IN ('cancelled', 'failed', 'expired');
+                AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -598,6 +602,104 @@ impl Database {
              CREATE VIRTUAL TABLE IF NOT EXISTS vec_search
                  USING vec0(embedding float[512]);",
         );
+
+        Ok(())
+    }
+
+    /// Migration v2: Add 'delivered' status to tasks, 'tool_result' role to conversations.
+    ///
+    /// SQLite does not support ALTER COLUMN, so we recreate both tables with
+    /// updated CHECK constraints and copy data over.
+    fn migrate_v2(&self) -> Result<()> {
+        info!("applying migration v2: add delivered status and tool_result role");
+
+        self.conn
+            .execute_batch(
+                "
+            BEGIN;
+
+            -- Recreate tasks table with 'delivered' in status CHECK
+            CREATE TABLE tasks_v2 (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                parent_task_id TEXT REFERENCES tasks_v2(id) ON DELETE SET NULL,
+                depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                label TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK (
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition')
+                ),
+                cron_expr TEXT,
+                event_source TEXT,
+                event_offset_secs INTEGER,
+                condition_expr TEXT,
+                next_fire_at INTEGER,
+                timeout_at INTEGER,
+                action_type TEXT NOT NULL CHECK (
+                    action_type IN (
+                        'send_message','resume_agent','inject_context',
+                        'run_skill','invoke_orchestrator'
+                    )
+                ),
+                action_config TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    status IN ('pending','in_progress','completed','failed',
+                               'cancelled','expired','recurring_active','delivered')
+                ),
+                process_id INTEGER,
+                input_context TEXT,
+                result TEXT,
+                created_by_session TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                fired_at INTEGER,
+                completed_at INTEGER
+            );
+
+            INSERT INTO tasks_v2 SELECT * FROM tasks;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_v2 RENAME TO tasks;
+
+            -- Recreate all task indexes
+            CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+            CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
+                WHERE status IN ('pending','recurring_active');
+            CREATE INDEX idx_tasks_schedulable
+                ON tasks(agent_id, next_fire_at ASC)
+                WHERE status IN ('pending','recurring_active');
+            CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id)
+                WHERE parent_task_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session)
+                WHERE created_by_session IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
+                ON tasks(agent_id, label)
+                WHERE trigger_type = 'recurring'
+                AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+
+            -- Recreate conversations table with 'tool_result' in role CHECK
+            CREATE TABLE conversations_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
+                content TEXT NOT NULL,
+                channel_type TEXT NOT NULL DEFAULT 'telegram',
+                metadata TEXT,
+                compacted_through_id INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            INSERT INTO conversations_v2 SELECT * FROM conversations;
+            DROP TABLE conversations;
+            ALTER TABLE conversations_v2 RENAME TO conversations;
+
+            CREATE INDEX idx_conv_agent_created ON conversations(agent_id, created_at DESC);
+
+            INSERT INTO schema_version (version) VALUES (2);
+
+            COMMIT;
+            ",
+            )
+            .context("failed to apply v2 migration")?;
 
         Ok(())
     }
@@ -909,7 +1011,7 @@ impl Database {
     pub fn cancel_task(&self, id: &str, agent_id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
-             WHERE id = ?1 AND agent_id = ?2 AND status NOT IN ('completed','failed','cancelled','expired')",
+             WHERE id = ?1 AND agent_id = ?2 AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
             params![id, agent_id],
         )?;
         Ok(n > 0)
@@ -920,7 +1022,7 @@ impl Database {
             "UPDATE tasks SET status = 'expired', updated_at = unixepoch()
              WHERE agent_id = ?2
                AND timeout_at IS NOT NULL AND timeout_at < ?1
-               AND status NOT IN ('completed','failed','cancelled','expired')",
+               AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
             params![now_unix, agent_id],
         )?;
         Ok(n)
@@ -952,13 +1054,13 @@ impl Database {
         Ok(n)
     }
 
+    /// Get all pending user-visible tasks (reminders and callbacks, excludes heartbeat/reflection).
     pub fn get_pending_reminder_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
-               AND trigger_type IN ('time', 'recurring')
-               AND action_type = 'send_message'
-               AND status IN ('pending', 'recurring_active')
+               AND action_type != 'run_skill'
+               AND status IN ('pending', 'in_progress', 'recurring_active')
              ORDER BY next_fire_at ASC",
             Self::TASK_COLUMNS
         );
@@ -982,6 +1084,42 @@ impl Database {
             .query_map(params![agent_id], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Get callback tasks that completed but have not yet been delivered to the user.
+    /// Bounded by `since_unix` to avoid processing stale callbacks.
+    pub fn get_undelivered_callback_tasks(
+        &self,
+        agent_id: &str,
+        since_unix: i64,
+    ) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND action_type = 'resume_agent'
+               AND status = 'completed'
+               AND completed_at IS NOT NULL
+               AND completed_at > ?2
+             ORDER BY completed_at ASC",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id, since_unix], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Atomically mark a completed callback task as delivered.
+    /// Returns `false` if the task was already claimed (not in 'completed' status).
+    pub fn mark_task_delivered(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET status = 'delivered', updated_at = unixepoch()
+             WHERE id = ?1 AND status = 'completed'",
+            params![id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
@@ -1047,7 +1185,7 @@ impl Database {
         let incomplete: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE parent_task_id = ?1 AND agent_id = ?2
-             AND status NOT IN ('completed','failed','cancelled','expired')",
+             AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
             params![&parent_id, agent_id],
             |row| row.get(0),
         )?;
@@ -1111,7 +1249,7 @@ impl Database {
     pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
         let cutoff = Utc::now().timestamp() - older_than_secs;
         let n = self.conn.execute(
-            "DELETE FROM tasks WHERE status IN ('completed','cancelled','expired','failed')
+            "DELETE FROM tasks WHERE status IN ('completed','cancelled','expired','failed','delivered')
              AND completed_at IS NOT NULL AND completed_at < ?1",
             params![cutoff],
         )?;
