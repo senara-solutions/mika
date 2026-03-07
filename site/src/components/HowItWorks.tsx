@@ -16,7 +16,7 @@ const steps: Step[] = [
     icon: Download,
     title: "Install",
     code: "cargo install mika-cli",
-    description: "or pull the Docker image.",
+    description: "or download a pre-built binary from GitHub Releases.",
   },
   {
     num: 2,

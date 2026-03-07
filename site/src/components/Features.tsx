@@ -3,10 +3,9 @@ import {
   Bell,
   Wrench,
   Link,
-  MessageCircle,
-  ArrowLeftRight,
-  Zap,
-  TerminalSquare,
+  Globe,
+  ListChecks,
+  Activity,
 } from "lucide-react";
 import { FadeIn } from "./FadeIn";
 import type { LucideIcon } from "lucide-react";
@@ -20,21 +19,21 @@ interface Feature {
 const features: Feature[] = [
   {
     icon: Brain,
-    title: "Persistent Memory",
+    title: "Three-Layer Memory",
     description:
-      "Remembers people, commitments, and preferences across every conversation.",
+      "Core context always in mind. Structured facts for people and commitments. Hybrid search with vector embeddings.",
   },
   {
     icon: Bell,
-    title: "Proactive Reminders",
+    title: "Proactive Agent",
     description:
-      "Schedules reminders, flags conflicts, and surfaces patterns you'd miss.",
+      "Unified task engine with reminders, hourly check-ins, and daily reflection. Mika acts between conversations.",
   },
   {
     icon: Wrench,
-    title: "Skills System",
+    title: "Skills Marketplace",
     description:
-      "Extend with custom skills — inject context, keywords, and behaviors.",
+      "Install community skills with mika skills install user/repo. Or build your own with a TOML manifest.",
   },
   {
     icon: Link,
@@ -43,27 +42,22 @@ const features: Feature[] = [
       "Connect any Model Context Protocol server. Tools appear natively.",
   },
   {
-    icon: MessageCircle,
-    title: "Telegram Integration",
+    icon: Globe,
+    title: "Works Everywhere",
     description:
-      "Approval flows, nudges, and escalations wherever you are.",
+      "Terminal, Telegram, WhatsApp. Your assistant meets you where you are.",
   },
   {
-    icon: ArrowLeftRight,
-    title: "Gateway Router",
+    icon: ListChecks,
+    title: "Long-Running Tasks",
     description:
-      "Stateless router enables community adapters. Zero business logic.",
+      "Delegate heavy work and get results when ready. Mika tracks progress, handles callbacks, and resumes where it left off.",
   },
   {
-    icon: Zap,
-    title: "Built in Rust",
-    description: "Fast, reliable, minimal footprint. Runs on a $5 VPS.",
-  },
-  {
-    icon: TerminalSquare,
-    title: "CLI-First",
+    icon: Activity,
+    title: "Observability",
     description:
-      "Full terminal interface. Works over SSH. No browser required.",
+      "OpenTelemetry traces on every agent step. Langfuse compatible. Debug with confidence.",
   },
 ];
 
@@ -79,7 +73,7 @@ export function Features() {
         </p>
       </FadeIn>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="flex flex-wrap justify-center gap-4 [&>*]:w-full [&>*]:sm:w-[calc(50%-0.5rem)] [&>*]:lg:w-[calc(25%-0.75rem)]">
         {features.map((feature, i) => (
           <FadeIn key={feature.title} delay={i * 80}>
             <FeatureCard {...feature} />
