@@ -371,12 +371,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     );
 
     // Load recent conversation history so the user sees prior messages on restart
-    if let Ok(history) = worker
-        ._ctx
-        .async_db
-        .load_recent_messages(20)
-        .await
-    {
+    if let Ok(history) = worker._ctx.async_db.load_recent_messages(20).await {
         for msg in history {
             let role = match msg.role.as_str() {
                 "user" => ChatRole::User,
@@ -637,11 +632,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
         .ok();
 
     // Load recent conversations from DB
-    if let Ok(history) = app
-        .db
-        .load_recent_messages(20)
-        .await
-    {
+    if let Ok(history) = app.db.load_recent_messages(20).await {
         for msg in history {
             let role = match msg.role.as_str() {
                 "user" => ChatRole::User,

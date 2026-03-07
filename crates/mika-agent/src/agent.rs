@@ -383,8 +383,13 @@ async fn run_loop(
                 if !text.is_empty() {
                     if mode.saves_to_db() {
                         let metadata = tool_calls_metadata_json(&all_tool_summaries);
-                        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref())
-                            .await?;
+                        db.save_message_with_metadata(
+                            session_id,
+                            "assistant",
+                            &text,
+                            metadata.as_deref(),
+                        )
+                        .await?;
                     }
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult {
@@ -1616,7 +1621,10 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         // Auto-complete child task if this agent was spawned as part of a team task tree
         if let Some(task_id) = params.child_task_id {
             match params.db.update_task_completed(task_id, Some(&text)).await {
-                Ok(false) => warn!(task_id, "child task completion had no effect (already completed or agent_id mismatch)"),
+                Ok(false) => warn!(
+                    task_id,
+                    "child task completion had no effect (already completed or agent_id mismatch)"
+                ),
                 Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
                 Ok(true) => {}
             }
@@ -1628,8 +1636,15 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     // Auto-complete child task if this agent was spawned as part of a team task tree
     if let Some(task_id) = params.child_task_id {
         let result_text = result.text.as_deref().unwrap_or("");
-        match params.db.update_task_completed(task_id, Some(result_text)).await {
-            Ok(false) => warn!(task_id, "child task completion had no effect (already completed or agent_id mismatch)"),
+        match params
+            .db
+            .update_task_completed(task_id, Some(result_text))
+            .await
+        {
+            Ok(false) => warn!(
+                task_id,
+                "child task completion had no effect (already completed or agent_id mismatch)"
+            ),
             Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
             Ok(true) => {}
         }
@@ -2128,7 +2143,9 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_without_metadata_loads_as_none() {
         let db = test_async_db();
-        db.save_message("test-session", "user", "Hello").await.unwrap();
+        db.save_message("test-session", "user", "Hello")
+            .await
+            .unwrap();
 
         let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);

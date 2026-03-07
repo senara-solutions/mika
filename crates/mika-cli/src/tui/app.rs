@@ -1023,11 +1023,7 @@ impl<'a> App<'a> {
 
     /// Poll for new messages from other channels/processes (e.g. Telegram, `mika ask`).
     async fn poll_cross_channel_messages(&mut self) {
-        let new_msgs = match self
-            .db
-            .load_messages_after(self.last_seen_msg_id)
-            .await
-        {
+        let new_msgs = match self.db.load_messages_after(self.last_seen_msg_id).await {
             Ok(msgs) => msgs,
             Err(e) => {
                 tracing::warn!("cross-channel poll failed: {e}");

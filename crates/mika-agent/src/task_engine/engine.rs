@@ -395,7 +395,9 @@ impl TaskEngine {
                             Ok(ts) => ts,
                             Err(e) => {
                                 warn!(task_id = %task_id, error = %e, "cannot reschedule recurring task, marking failed");
-                                if let Err(db_err) = db.update_task_failed(&task_id, &e.to_string()).await {
+                                if let Err(db_err) =
+                                    db.update_task_failed(&task_id, &e.to_string()).await
+                                {
                                     warn!(task_id = %task_id, error = %db_err, "failed to mark recurring task as failed in DB");
                                 }
                                 return;
@@ -456,7 +458,9 @@ impl TaskEngine {
                             // Agent is busy — reset task to pending and re-enqueue for retry
                             debug!(task_id = %task_id, "agent busy, re-queuing task for retry in 30s");
                             let retry_at = now + 30;
-                            if let Err(e) = db.update_task_status(&task_id, task_status::PENDING).await {
+                            if let Err(e) =
+                                db.update_task_status(&task_id, task_status::PENDING).await
+                            {
                                 warn!(task_id = %task_id, error = %e, "failed to reset task status to pending for retry");
                             }
                             if let Err(e) = db.update_task_next_fire_at(&task_id, retry_at).await {

@@ -198,10 +198,9 @@ pub async fn handle_message(
             };
 
             let session_id = uuid::Uuid::new_v4().to_string();
-            if let Err(e) = a
-                .db
-                .create_session(&session_id, a.db.agent_id(), &req.channel)
-                .await
+            if let Err(e) =
+                a.db.create_session(&session_id, a.db.agent_id(), &req.channel)
+                    .await
             {
                 warn!(error = %e, "failed to create session");
             }

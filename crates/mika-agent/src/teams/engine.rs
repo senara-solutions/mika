@@ -854,7 +854,8 @@ impl TeamEngine {
                             let metadata = serde_json::json!({
                                 "team_run_id": run_id,
                                 "agent_name": agent_name,
-                            }).to_string();
+                            })
+                            .to_string();
                             if let Err(e) = team_db
                                 .save_message_with_metadata(
                                     &team_session_id,
@@ -881,7 +882,8 @@ impl TeamEngine {
                             let metadata = serde_json::json!({
                                 "team_run_id": run_id,
                                 "agent_name": agent_name,
-                            }).to_string();
+                            })
+                            .to_string();
                             if let Err(e) = team_db
                                 .save_message_with_metadata(
                                     &team_session_id,
@@ -1096,15 +1098,11 @@ impl TeamEngine {
         let metadata = serde_json::json!({
             "team_run_id": self.run.run_id,
             "agent_name": agent_name,
-        }).to_string();
+        })
+        .to_string();
         if let Err(e) = self
             .team_db
-            .save_message_with_metadata(
-                &team_session_id,
-                "assistant",
-                &response,
-                Some(&metadata),
-            )
+            .save_message_with_metadata(&team_session_id, "assistant", &response, Some(&metadata))
             .await
         {
             warn!(error = %e, "failed to persist deliverable message");

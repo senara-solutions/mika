@@ -343,15 +343,9 @@ impl AsyncDatabase {
 
     // -- Sessions --
 
-    pub async fn create_session(
-        &self,
-        id: &str,
-        agent_id: &str,
-        channel_type: &str,
-    ) -> Result<()> {
+    pub async fn create_session(&self, id: &str, agent_id: &str, channel_type: &str) -> Result<()> {
         let (i, a, ct) = (id.to_owned(), agent_id.to_owned(), channel_type.to_owned());
-        self.with_db(move |db| db.create_session(&i, &a, &ct))
-            .await
+        self.with_db(move |db| db.create_session(&i, &a, &ct)).await
     }
 
     pub async fn create_session_with_metadata(
@@ -1047,9 +1041,7 @@ mod tests {
     async fn test_async_clone_shares_connection() {
         let (db, sid) = test_async_db_with_session().await;
         let db2 = db.clone();
-        db.save_message(&sid, "user", "From clone 1")
-            .await
-            .unwrap();
+        db.save_message(&sid, "user", "From clone 1").await.unwrap();
         let messages = db2.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
     }
@@ -1057,9 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_survives_panic() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "before panic")
-            .await
-            .unwrap();
+        db.save_message(&sid, "user", "before panic").await.unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         db.inner
             .sender

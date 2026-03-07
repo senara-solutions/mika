@@ -318,7 +318,10 @@ impl Database {
                 info!(from = version, to = 1, "applying clean-slate migration");
             }
             self.migrate_v1()?;
-            info!(version = CURRENT_SCHEMA_VERSION, "database migrated to v{CURRENT_SCHEMA_VERSION}");
+            info!(
+                version = CURRENT_SCHEMA_VERSION,
+                "database migrated to v{CURRENT_SCHEMA_VERSION}"
+            );
         }
         if (1..3).contains(&version) {
             self.migrate_v3()?;
@@ -1096,10 +1099,7 @@ impl Database {
     ///
     /// Returns `Some(parent_id)` when the parent was claimed, `None` otherwise.
     /// Uses a single SQLite transaction to prevent races.
-    pub fn try_complete_parent_on_sibling_done(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn try_complete_parent_on_sibling_done(&self, task_id: &str) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
 
         // 1. Get parent_task_id for this task (no agent_id filter — parent-child
@@ -1168,10 +1168,7 @@ impl Database {
 
     /// Count pending callback tasks for a given team run with depth > 1.
     /// Used to detect grandchild long-running tasks spawned during a team run.
-    pub fn count_pending_callback_tasks_by_team_run(
-        &self,
-        team_run_id: &str,
-    ) -> Result<i64> {
+    pub fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE team_run_id = ?1
@@ -1317,7 +1314,10 @@ impl Database {
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
         )?;
         let mut messages = stmt
-            .query_map(params![agent_id, limit as i64], Self::row_to_session_message)?
+            .query_map(
+                params![agent_id, limit as i64],
+                Self::row_to_session_message,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         messages.reverse();
         Ok(messages)
@@ -2833,8 +2833,10 @@ mod tests {
         let db = db();
         db.create_session("tg-session", "mika", "telegram").unwrap();
         db.create_session("cli-session", "mika", "cli").unwrap();
-        db.save_message("mika", "tg-session", "user", "telegram msg").unwrap();
-        db.save_message("mika", "cli-session", "user", "cli msg").unwrap();
+        db.save_message("mika", "tg-session", "user", "telegram msg")
+            .unwrap();
+        db.save_message("mika", "cli-session", "user", "cli msg")
+            .unwrap();
 
         let msgs = db.load_recent_messages("mika", 10).unwrap();
         assert_eq!(msgs.len(), 2);
@@ -2879,8 +2881,10 @@ mod tests {
     fn test_replace_with_summary() {
         let (db, sid) = db_with_session();
         let id1 = db.save_message("mika", &sid, "user", "msg1").unwrap();
-        db.save_message("mika", &sid, "assistant", "reply1").unwrap();
-        db.replace_with_summary("mika", "Summary text", id1).unwrap();
+        db.save_message("mika", &sid, "assistant", "reply1")
+            .unwrap();
+        db.replace_with_summary("mika", "Summary text", id1)
+            .unwrap();
         let summary = db.load_conversation_summary("mika").unwrap().unwrap();
         assert_eq!(summary.role, "summary");
         assert_eq!(summary.content, "Summary text");
@@ -3369,17 +3373,14 @@ mod tests {
         db.update_task_completed(&c2_id, "mika", Some("done"))
             .unwrap();
         assert_eq!(
-            db.try_complete_parent_on_sibling_done(&c2_id)
-                .unwrap(),
+            db.try_complete_parent_on_sibling_done(&c2_id).unwrap(),
             None
         );
 
         // Complete the 3rd — parent should fire
         db.update_task_completed(&c3_id, "mika", Some("done"))
             .unwrap();
-        let result = db
-            .try_complete_parent_on_sibling_done(&c3_id)
-            .unwrap();
+        let result = db.try_complete_parent_on_sibling_done(&c3_id).unwrap();
         assert_eq!(result, Some(parent_id));
     }
 
@@ -3388,8 +3389,7 @@ mod tests {
         let db = db();
         let task_id = db.create_task(&make_task("orphan")).unwrap();
         assert_eq!(
-            db.try_complete_parent_on_sibling_done(&task_id)
-                .unwrap(),
+            db.try_complete_parent_on_sibling_done(&task_id).unwrap(),
             None
         );
     }
@@ -3411,9 +3411,7 @@ mod tests {
         db.update_task_completed(&c1_id, "mika", Some("ok"))
             .unwrap();
         db.update_task_failed(&c2_id, "mika", "error").unwrap();
-        let result = db
-            .try_complete_parent_on_sibling_done(&c2_id)
-            .unwrap();
+        let result = db.try_complete_parent_on_sibling_done(&c2_id).unwrap();
         assert_eq!(result, Some(parent_id));
     }
 
