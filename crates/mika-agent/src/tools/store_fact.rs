@@ -176,10 +176,40 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
         None
     };
 
-    let commitment_id = ctx
+    let commitment_id = match ctx
         .db
         .add_commitment(description, due_date, person_id)
-        .await?;
+        .await
+    {
+        Ok(id) => id,
+        Err(e) if crate::db::is_unique_violation(&e) => {
+            let detail = if let Ok(commitments) = ctx.db.list_commitments("pending").await {
+                commitments
+                    .iter()
+                    .find(|c| {
+                        c.description.eq_ignore_ascii_case(description)
+                            && c.due_date.as_deref() == due_date
+                    })
+                    .map(|c| {
+                        let due_info = c
+                            .due_date
+                            .as_deref()
+                            .map(|d| format!(" (due: {d})"))
+                            .unwrap_or_default();
+                        format!(
+                            "A commitment '{}'{} already exists (id: {}). No duplicate created.",
+                            c.description, due_info, c.id
+                        )
+                    })
+            } else {
+                None
+            };
+            return Ok(ToolOutput::success(detail.unwrap_or_else(|| {
+                "A similar commitment already exists. No duplicate created.".to_string()
+            })));
+        }
+        Err(e) => return Err(e),
+    };
 
     let target = format!("commitment:{description}");
     let reasoning = reflection_reasoning(ctx, input);
@@ -262,7 +292,37 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
     let event_date = input["event_date"].as_str();
     let notes = input["notes"].as_str();
 
-    let event_id = ctx.db.add_event(description, event_date, notes).await?;
+    let event_id = match ctx.db.add_event(description, event_date, notes).await {
+        Ok(id) => id,
+        Err(e) if crate::db::is_unique_violation(&e) => {
+            // Query for existing event to provide details
+            let detail = if let Ok(events) = ctx.db.list_events().await {
+                events
+                    .iter()
+                    .find(|ev| {
+                        ev.description.eq_ignore_ascii_case(description)
+                            && ev.event_date.as_deref() == event_date
+                    })
+                    .map(|ev| {
+                        let date_info = ev
+                            .event_date
+                            .as_deref()
+                            .map(|d| format!(" on {d}"))
+                            .unwrap_or_default();
+                        format!(
+                            "An event '{}'{} already exists (id: {}). No duplicate created.",
+                            ev.description, date_info, ev.id
+                        )
+                    })
+            } else {
+                None
+            };
+            return Ok(ToolOutput::success(detail.unwrap_or_else(|| {
+                "A similar event already exists. No duplicate created.".to_string()
+            })));
+        }
+        Err(e) => return Err(e),
+    };
 
     let target = format!("event:{description}");
     let reasoning = reflection_reasoning(ctx, input);
@@ -396,6 +456,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_event_blocks_duplicate() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+        let input = serde_json::json!({
+            "category": "event",
+            "description": "Board meeting",
+            "event_date": "2026-04-15"
+        });
+
+        // First creation succeeds
+        let result = tool.execute(input.clone(), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Board meeting"));
+
+        // Second creation with same description is blocked — with details
+        let result = tool.execute(input, &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("already exists"));
+        assert!(
+            result.content.contains("Board meeting"),
+            "should contain event description"
+        );
+        assert!(
+            result.content.contains("on 2026-04-15"),
+            "should contain event date"
+        );
+        assert!(result.content.contains("id:"), "should contain event id");
+
+        let events = harness.db.list_events().await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_store_event_allows_different_description() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+
+        tool.execute(
+            serde_json::json!({
+                "category": "event",
+                "description": "Board meeting",
+                "event_date": "2026-04-15"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "category": "event",
+                    "description": "Team offsite",
+                    "event_date": "2026-05-01"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Team offsite"));
+
+        let events = harness.db.list_events().await.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_store_event_allows_duplicate_without_date() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+        let input = serde_json::json!({
+            "category": "event",
+            "description": "Interesting observation"
+        });
+
+        // First creation succeeds
+        let result = tool.execute(input.clone(), &ctx).await.unwrap();
+        assert!(!result.is_error);
+
+        // Second creation with same description but no date also succeeds
+        // (partial index only covers dated events)
+        let result = tool.execute(input, &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Interesting observation"));
+
+        let events = harness.db.list_events().await.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_store_fact_logs_audit() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -457,6 +610,126 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_store_commitment_blocks_duplicate() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+        let input = serde_json::json!({
+            "category": "commitment",
+            "description": "Call Sarah",
+            "due_date": "2026-03-15"
+        });
+
+        // First creation succeeds
+        let result = tool.execute(input.clone(), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Call Sarah"));
+
+        // Second creation with same description + due_date is blocked
+        let result = tool.execute(input, &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("already exists"));
+        assert!(result.content.contains("Call Sarah"));
+        assert!(result.content.contains("due: 2026-03-15"));
+        assert!(
+            result.content.contains("id:"),
+            "should contain commitment id"
+        );
+
+        let commitments = harness.db.list_commitments("pending").await.unwrap();
+        assert_eq!(commitments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_store_commitment_allows_different_due_date() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+
+        tool.execute(
+            serde_json::json!({
+                "category": "commitment",
+                "description": "Call Sarah",
+                "due_date": "2026-03-15"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "category": "commitment",
+                    "description": "Call Sarah",
+                    "due_date": "2026-04-01"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let commitments = harness.db.list_commitments("pending").await.unwrap();
+        assert_eq!(commitments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_store_commitment_allows_after_completed() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+        let input = serde_json::json!({
+            "category": "commitment",
+            "description": "Call Sarah",
+            "due_date": "2026-03-15"
+        });
+
+        // Create and complete
+        let result = tool.execute(input.clone(), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        let commitments = harness.db.list_commitments("pending").await.unwrap();
+        assert_eq!(commitments.len(), 1);
+        let id = commitments[0].id;
+        harness
+            .db
+            .update_commitment_status(id, "completed")
+            .await
+            .unwrap();
+
+        // Create same again — succeeds because the first is completed
+        let result = tool.execute(input, &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Call Sarah"));
+
+        let commitments = harness.db.list_commitments("pending").await.unwrap();
+        assert_eq!(commitments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_store_commitment_allows_duplicate_without_due_date() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = StoreFactTool;
+        let input = serde_json::json!({
+            "category": "commitment",
+            "description": "Call Sarah"
+        });
+
+        // First creation
+        let result = tool.execute(input.clone(), &ctx).await.unwrap();
+        assert!(!result.is_error);
+
+        // Second creation with no due_date also succeeds (NULL != NULL in SQLite UNIQUE)
+        let result = tool.execute(input, &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Call Sarah"));
+
+        let commitments = harness.db.list_commitments("pending").await.unwrap();
+        assert_eq!(commitments.len(), 2);
     }
 
     #[tokio::test]

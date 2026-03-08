@@ -18,7 +18,16 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+
+/// Check if an anyhow error is a SQLite UNIQUE constraint violation.
+pub fn is_unique_violation(err: &anyhow::Error) -> bool {
+    if let Some(rusqlite::Error::SqliteFailure(e, _)) = err.downcast_ref::<rusqlite::Error>() {
+        e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    } else {
+        false
+    }
+}
 
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
@@ -327,6 +336,10 @@ impl Database {
             self.migrate_v3()?;
             info!(version = 3, "database migrated to v3");
         }
+        if version == 3 {
+            self.migrate_v3_to_v4()?;
+            info!(version = 4, "database migrated to v4");
+        }
         Ok(())
     }
 
@@ -374,7 +387,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (3);
+            INSERT INTO schema_version (version) VALUES (4);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -505,10 +518,13 @@ impl Database {
                 due_date TEXT,
                 person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                completed_at INTEGER,
-                UNIQUE (agent_id, description)
+                completed_at INTEGER
             );
             CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_commitments_unique_pending
+                ON commitments(agent_id, description COLLATE NOCASE, due_date)
+                WHERE status = 'pending';
 
             CREATE TABLE preferences (
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -611,9 +627,18 @@ impl Database {
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
-                ON tasks(agent_id, label)
+                ON tasks(agent_id, label COLLATE NOCASE)
                 WHERE trigger_type = 'recurring'
                 AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_reminder
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE status IN ('pending', 'in_progress', 'recurring_active')
+                AND action_type = 'send_message';
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_description
+                ON events(agent_id, description COLLATE NOCASE, event_date)
+                WHERE event_date IS NOT NULL;
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -640,6 +665,57 @@ impl Database {
     fn migrate_v3(&self) -> Result<()> {
         info!("applying migration v3: sessions + messages schema redesign (clean slate)");
         self.migrate_v1()
+    }
+
+    /// Migration v3 → v4: Add duplicate-prevention indexes to existing v3 databases.
+    ///
+    /// New databases already get these indexes via `migrate_v1`, but databases
+    /// created at v3 before these indexes were added need them applied retroactively.
+    fn migrate_v3_to_v4(&self) -> Result<()> {
+        info!("migrating database schema v3 → v4 (duplicate-prevention indexes)");
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_tasks_unique_recurring;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE trigger_type = 'recurring'
+                AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_reminder
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE status IN ('pending', 'in_progress', 'recurring_active')
+                AND action_type = 'send_message';
+
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_description
+                ON events(agent_id, description COLLATE NOCASE, event_date)
+                WHERE event_date IS NOT NULL;
+
+             -- Rebuild commitments table: replace inline UNIQUE(agent_id, description)
+             -- with partial unique index scoped to pending status
+             CREATE TABLE commitments_new (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 description TEXT NOT NULL COLLATE NOCASE,
+                 status TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','completed','cancelled')),
+                 due_date TEXT,
+                 person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 completed_at INTEGER
+             );
+             INSERT INTO commitments_new SELECT * FROM commitments;
+             DROP TABLE commitments;
+             ALTER TABLE commitments_new RENAME TO commitments;
+             CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_commitments_unique_pending
+                 ON commitments(agent_id, description COLLATE NOCASE, due_date)
+                 WHERE status = 'pending';
+
+             PRAGMA user_version = 4;",
+        )?;
+        // Update the schema_version table to reflect v4
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (4)", [])?;
+        Ok(())
     }
 
     // ===== Agent CRUD =====
@@ -1675,18 +1751,10 @@ impl Database {
     ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO commitments (agent_id, description, due_date, person_id)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(agent_id, description) DO UPDATE SET
-                 due_date = COALESCE(?3, due_date),
-                 person_id = COALESCE(?4, person_id)",
+             VALUES (?1, ?2, ?3, ?4)",
             params![agent_id, description, due_date, person_id],
         )?;
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM commitments WHERE agent_id = ?1 AND description = ?2",
-            params![agent_id, description],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+        Ok(self.conn.last_insert_rowid())
     }
 
     fn row_to_commitment(r: &rusqlite::Row<'_>) -> rusqlite::Result<Commitment> {
@@ -2864,8 +2932,7 @@ mod tests {
     #[test]
     fn test_load_recent_messages_includes_telegram() {
         let db = db();
-        db.create_session("tg-session", "mika", "telegram")
-            .unwrap();
+        db.create_session("tg-session", "mika", "telegram").unwrap();
         db.save_message("mika", "tg-session", "user", "hello from telegram")
             .unwrap();
 
@@ -2879,8 +2946,7 @@ mod tests {
     fn test_load_recent_messages_mixed_channels() {
         let db = db();
         db.create_session("cli-session", "mika", "cli").unwrap();
-        db.create_session("tg-session", "mika", "telegram")
-            .unwrap();
+        db.create_session("tg-session", "mika", "telegram").unwrap();
         db.create_session("team-session", "mika", "team").unwrap();
 
         db.save_message("mika", "cli-session", "user", "cli 1")
@@ -3789,5 +3855,24 @@ mod tests {
 
         // Task is still pending, should not be claimable
         assert!(!db.mark_task_delivered(&id).unwrap());
+    }
+
+    #[test]
+    fn test_is_unique_violation_only_catches_unique() {
+        use rusqlite::ffi;
+
+        // UNIQUE violation should match
+        let unique_err = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT_UNIQUE),
+            Some("UNIQUE constraint failed".to_string()),
+        );
+        assert!(is_unique_violation(&anyhow::Error::from(unique_err)));
+
+        // NOT NULL violation should NOT match
+        let notnull_err = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT_NOTNULL),
+            Some("NOT NULL constraint failed".to_string()),
+        );
+        assert!(!is_unique_violation(&anyhow::Error::from(notnull_err)));
     }
 }
