@@ -1054,8 +1054,12 @@ mod tests {
     #[tokio::test]
     async fn test_async_concurrent_reads() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "Message 1", None).await.unwrap();
-        db.save_message(&sid, "user", "Message 2", None).await.unwrap();
+        db.save_message(&sid, "user", "Message 1", None)
+            .await
+            .unwrap();
+        db.save_message(&sid, "user", "Message 2", None)
+            .await
+            .unwrap();
         let mut handles = Vec::new();
         for _ in 0..5 {
             let db_clone = db.clone();
@@ -1073,7 +1077,9 @@ mod tests {
     async fn test_async_clone_shares_connection() {
         let (db, sid) = test_async_db_with_session().await;
         let db2 = db.clone();
-        db.save_message(&sid, "user", "From clone 1", None).await.unwrap();
+        db.save_message(&sid, "user", "From clone 1", None)
+            .await
+            .unwrap();
         let messages = db2.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
     }
@@ -1081,7 +1087,9 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_survives_panic() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "before panic", None).await.unwrap();
+        db.save_message(&sid, "user", "before panic", None)
+            .await
+            .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         db.inner
             .sender
@@ -1157,7 +1165,9 @@ mod tests {
         db2.create_session("agent2-session", "agent2", "cli")
             .await
             .unwrap();
-        db.save_message(&sid, "user", "from main", None).await.unwrap();
+        db.save_message(&sid, "user", "from main", None)
+            .await
+            .unwrap();
         db2.save_message("agent2-session", "user", "from agent2", None)
             .await
             .unwrap();

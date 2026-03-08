@@ -2995,8 +2995,10 @@ mod tests {
     #[test]
     fn test_save_and_load_messages() {
         let (db, sid) = db_with_session();
-        db.save_message("mika", &sid, "user", "Hello!", None).unwrap();
-        db.save_message("mika", &sid, "assistant", "Hi!", None).unwrap();
+        db.save_message("mika", &sid, "user", "Hello!", None)
+            .unwrap();
+        db.save_message("mika", &sid, "assistant", "Hi!", None)
+            .unwrap();
         let msgs = db.load_recent_messages("mika", 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
@@ -3019,9 +3021,12 @@ mod tests {
     #[test]
     fn test_load_messages_after() {
         let (db, sid) = db_with_session();
-        db.save_message("mika", &sid, "user", "msg 1", None).unwrap();
-        db.save_message("mika", &sid, "user", "msg 2", None).unwrap();
-        db.save_message("mika", &sid, "user", "msg 3", None).unwrap();
+        db.save_message("mika", &sid, "user", "msg 1", None)
+            .unwrap();
+        db.save_message("mika", &sid, "user", "msg 2", None)
+            .unwrap();
+        db.save_message("mika", &sid, "user", "msg 3", None)
+            .unwrap();
 
         let all = db.load_messages_after("mika", 0).unwrap();
         assert_eq!(all.len(), 3);
@@ -3136,7 +3141,8 @@ mod tests {
     fn test_last_user_message_time() {
         let (db, sid) = db_with_session();
         assert!(db.last_user_message_time("mika").unwrap().is_none());
-        db.save_message("mika", &sid, "user", "hello", None).unwrap();
+        db.save_message("mika", &sid, "user", "hello", None)
+            .unwrap();
         let ts = db.last_user_message_time("mika").unwrap();
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
@@ -3161,7 +3167,8 @@ mod tests {
     fn test_count_messages_excludes_summary() {
         let (db, sid) = db_with_session();
         db.save_message("mika", &sid, "user", "a", None).unwrap();
-        db.save_message("mika", &sid, "assistant", "b", None).unwrap();
+        db.save_message("mika", &sid, "assistant", "b", None)
+            .unwrap();
         let sys_session = db.get_or_create_system_session("mika").unwrap();
         db.conn
             .execute(
@@ -4032,8 +4039,17 @@ mod tests {
             .unwrap();
 
         // Log audit event with trace_id
-        db.log_audit_event("mika", &sid, "store_fact", "person:Alice", None, "new", None, Some(trace))
-            .unwrap();
+        db.log_audit_event(
+            "mika",
+            &sid,
+            "store_fact",
+            "person:Alice",
+            None,
+            "new",
+            None,
+            Some(trace),
+        )
+        .unwrap();
 
         // Create task with trace_id
         let task = NewTask {
@@ -4067,7 +4083,11 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(rows.len(), 3, "expected message + audit + task in unified_timeline");
+        assert_eq!(
+            rows.len(),
+            3,
+            "expected message + audit + task in unified_timeline"
+        );
         let types: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
         assert!(types.contains(&"audit"), "missing audit event");
         assert!(types.contains(&"message"), "missing message");
@@ -4092,6 +4112,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(count >= 1, "legacy rows with NULL trace_id should appear in unified_timeline");
+        assert!(
+            count >= 1,
+            "legacy rows with NULL trace_id should appear in unified_timeline"
+        );
     }
 }

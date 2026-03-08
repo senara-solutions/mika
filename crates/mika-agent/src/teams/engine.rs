@@ -351,7 +351,15 @@ impl TeamEngine {
         // Insert the goal as the root workspace entry
         match self
             .team_db
-            .insert_team_workspace_entry(&self.run.run_id, None, None, "goal", &self.run.goal, 0, Some(&self.trace_id))
+            .insert_team_workspace_entry(
+                &self.run.run_id,
+                None,
+                None,
+                "goal",
+                &self.run.goal,
+                0,
+                Some(&self.trace_id),
+            )
             .await
         {
             Ok(id) => self.goal_msg_id = Some(id),
@@ -1116,7 +1124,13 @@ impl TeamEngine {
         .to_string();
         if let Err(e) = self
             .team_db
-            .save_message_with_metadata(&team_session_id, "assistant", &response, Some(&metadata), Some(&self.trace_id))
+            .save_message_with_metadata(
+                &team_session_id,
+                "assistant",
+                &response,
+                Some(&metadata),
+                Some(&self.trace_id),
+            )
             .await
         {
             warn!(error = %e, "failed to persist deliverable message");

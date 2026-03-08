@@ -880,8 +880,14 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         };
 
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref(), Some(trace_id))
-            .await?;
+        db.save_message_with_metadata(
+            session_id,
+            "assistant",
+            &text,
+            metadata.as_deref(),
+            Some(trace_id),
+        )
+        .await?;
         return Ok(AgentOutput {
             text: Some(text),
             thinking: result.thinking,
