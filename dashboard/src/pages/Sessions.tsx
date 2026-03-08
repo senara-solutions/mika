@@ -2,9 +2,25 @@ import { Link, useSearchParams } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
-import { formatTimestamp } from '../hooks/useFormatTime.ts'
+import { formatRelativeTime } from '../hooks/useFormatTime.ts'
+import { Search, Terminal, MessageSquare, Users, Settings, Download } from 'lucide-react'
 
 const CHANNEL_TYPES = ['', 'cli', 'telegram', 'team', 'system']
+
+function channelIcon(type: string) {
+  switch (type) {
+    case 'cli':
+      return <Terminal size={12} />
+    case 'telegram':
+      return <MessageSquare size={12} />
+    case 'team':
+      return <Users size={12} />
+    case 'system':
+      return <Settings size={12} />
+    default:
+      return <MessageSquare size={12} />
+  }
+}
 
 export default function Sessions() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -37,29 +53,52 @@ export default function Sessions() {
 
   return (
     <div>
-      <h2 className="text-heading text-xl font-semibold mb-4">Sessions</h2>
+      <div className="flex items-center justify-between mb-5">
+        <div>
+          <h2 className="text-heading text-xl font-semibold">Sessions</h2>
+          <p className="text-sm text-muted/60 mt-1">
+            {data ? `${data.total} session${data.total !== 1 ? 's' : ''} found` : 'Loading sessions...'}
+          </p>
+        </div>
+        <button className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.06] text-xs text-muted hover:text-heading hover:border-white/[0.1] transition-colors">
+          <Download size={13} />
+          Export
+        </button>
+      </div>
 
       {/* Filters */}
-      <div className="flex flex-wrap gap-3 mb-4">
-        <select
-          value={filters.channel_type ?? ''}
-          onChange={(e) => updateFilter('channel_type', e.target.value)}
-          className="bg-bg-card border border-white/[0.06] rounded-lg px-3 py-1.5 text-sm text-muted focus:outline-none focus:border-accent/40"
-        >
-          {CHANNEL_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t || 'All channels'}
-            </option>
-          ))}
-        </select>
-
-        <input
-          type="text"
-          placeholder="Filter by agent..."
-          value={filters.agent_id ?? ''}
-          onChange={(e) => updateFilter('agent_id', e.target.value)}
-          className="bg-bg-card border border-white/[0.06] rounded-lg px-3 py-1.5 text-sm text-muted placeholder:text-muted/40 focus:outline-none focus:border-accent/40 w-40"
-        />
+      <div className="bg-bg-card border border-white/[0.05] rounded-xl p-3 mb-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative flex-1 min-w-[180px]">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" />
+            <input
+              type="text"
+              placeholder="Search agent..."
+              value={filters.agent_id ?? ''}
+              onChange={(e) => updateFilter('agent_id', e.target.value)}
+              className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40"
+            />
+          </div>
+          <select
+            value={filters.channel_type ?? ''}
+            onChange={(e) => updateFilter('channel_type', e.target.value)}
+            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
+          >
+            {CHANNEL_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t ? t.charAt(0).toUpperCase() + t.slice(1) : 'All Channels'}
+              </option>
+            ))}
+          </select>
+          {(filters.agent_id || filters.channel_type) && (
+            <button
+              onClick={() => setSearchParams(new URLSearchParams())}
+              className="text-xs text-muted/60 hover:text-muted transition-colors"
+            >
+              Clear
+            </button>
+          )}
+        </div>
       </div>
 
       {isLoading ? (
@@ -86,24 +125,25 @@ export default function Sessions() {
               <tbody className="divide-y divide-white/[0.03]">
                 {data.data.map((s) => (
                   <tr key={s.id} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="px-4 py-2.5">
+                    <td className="px-4 py-3">
                       <Link
                         to={`/sessions/${s.id}`}
                         className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
                       >
-                        {s.id.slice(0, 16)}...
+                        sess_{s.id.slice(0, 10)}...
                       </Link>
                     </td>
-                    <td className="px-4 py-2.5 text-xs text-heading">{s.agent_id}</td>
-                    <td className="px-4 py-2.5">
-                      <span className="text-xs text-muted bg-white/[0.04] px-1.5 py-0.5 rounded">
+                    <td className="px-4 py-3 text-xs text-heading font-medium">{s.agent_id}</td>
+                    <td className="px-4 py-3">
+                      <span className="inline-flex items-center gap-1.5 text-xs text-muted bg-white/[0.04] px-2 py-0.5 rounded-full">
+                        {channelIcon(s.channel_type)}
                         {s.channel_type}
                       </span>
                     </td>
-                    <td className="px-4 py-2.5 text-xs text-muted/80">
-                      {formatTimestamp(s.started_at)}
+                    <td className="px-4 py-3 text-xs text-muted/70 font-mono">
+                      {formatRelativeTime(s.started_at)}
                     </td>
-                    <td className="px-4 py-2.5 text-xs text-muted">{s.message_count}</td>
+                    <td className="px-4 py-3 text-xs text-heading font-medium">{s.message_count}</td>
                   </tr>
                 ))}
               </tbody>

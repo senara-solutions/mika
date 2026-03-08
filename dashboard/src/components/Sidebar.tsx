@@ -1,20 +1,29 @@
 import { NavLink } from 'react-router'
-import { Activity, Bot, MessageSquare } from 'lucide-react'
+import { Activity, Bot, MessageSquare, Search, Settings } from 'lucide-react'
 
 const navItems = [
-  { to: '/', label: 'Timeline', icon: Activity },
+  { to: '/', label: 'Event Timeline', icon: Activity },
   { to: '/agents', label: 'Agents', icon: Bot },
   { to: '/sessions', label: 'Sessions', icon: MessageSquare },
+  { to: '/traces', label: 'Traces', icon: Search },
+  { to: '/settings', label: 'Settings', icon: Settings },
 ]
 
 export default function Sidebar() {
   return (
     <aside className="w-56 shrink-0 border-r border-white/[0.05] bg-bg-card flex flex-col">
       <div className="p-5 border-b border-white/[0.05]">
-        <h1 className="text-heading font-bold text-lg tracking-tight">Mika</h1>
-        <p className="text-xs text-muted/60 mt-0.5">Dashboard</p>
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-accent/20 flex items-center justify-center">
+            <span className="text-accent font-bold text-sm">M</span>
+          </div>
+          <div>
+            <h1 className="text-heading font-bold text-sm tracking-tight">MikaPlatform</h1>
+            <p className="text-[10px] text-muted/50 uppercase tracking-widest">Observability</p>
+          </div>
+        </div>
       </div>
-      <nav className="flex-1 p-3 space-y-1">
+      <nav className="flex-1 p-3 space-y-0.5">
         {navItems.map((item) => (
           <NavLink
             key={item.to}
