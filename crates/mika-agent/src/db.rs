@@ -518,10 +518,13 @@ impl Database {
                 due_date TEXT,
                 person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                completed_at INTEGER,
-                UNIQUE (agent_id, description)
+                completed_at INTEGER
             );
             CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_commitments_unique_pending
+                ON commitments(agent_id, description COLLATE NOCASE, due_date)
+                WHERE status = 'pending';
 
             CREATE TABLE preferences (
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -686,13 +689,32 @@ impl Database {
                 ON events(agent_id, description COLLATE NOCASE, event_date)
                 WHERE event_date IS NOT NULL;
 
+             -- Rebuild commitments table: replace inline UNIQUE(agent_id, description)
+             -- with partial unique index scoped to pending status
+             CREATE TABLE commitments_new (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 description TEXT NOT NULL COLLATE NOCASE,
+                 status TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','completed','cancelled')),
+                 due_date TEXT,
+                 person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 completed_at INTEGER
+             );
+             INSERT INTO commitments_new SELECT * FROM commitments;
+             DROP TABLE commitments;
+             ALTER TABLE commitments_new RENAME TO commitments;
+             CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_commitments_unique_pending
+                 ON commitments(agent_id, description COLLATE NOCASE, due_date)
+                 WHERE status = 'pending';
+
              PRAGMA user_version = 4;",
         )?;
         // Update the schema_version table to reflect v4
-        self.conn.execute(
-            "INSERT INTO schema_version (version) VALUES (4)",
-            [],
-        )?;
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (4)", [])?;
         Ok(())
     }
 
@@ -1729,18 +1751,10 @@ impl Database {
     ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO commitments (agent_id, description, due_date, person_id)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(agent_id, description) DO UPDATE SET
-                 due_date = COALESCE(?3, due_date),
-                 person_id = COALESCE(?4, person_id)",
+             VALUES (?1, ?2, ?3, ?4)",
             params![agent_id, description, due_date, person_id],
         )?;
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM commitments WHERE agent_id = ?1 AND description = ?2",
-            params![agent_id, description],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+        Ok(self.conn.last_insert_rowid())
     }
 
     fn row_to_commitment(r: &rusqlite::Row<'_>) -> rusqlite::Result<Commitment> {

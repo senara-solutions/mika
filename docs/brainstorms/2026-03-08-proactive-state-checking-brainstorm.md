@@ -64,7 +64,7 @@ tools rather than relying on memory of past actions.
 | create_reminder (one-shot) | UNIQUE partial index on (agent_id, label COLLATE NOCASE) | Constraint catching | None |
 | create_reminder (recurring) | Partial unique index on label | None | None |
 | store_fact (person) | UNIQUE on canonical_name + upsert | None | None |
-| store_fact (commitment) | UNIQUE on description + upsert | None | None |
+| store_fact (commitment) | UNIQUE partial index on (agent_id, description COLLATE NOCASE, due_date) WHERE status='pending' | Constraint catching | None |
 | store_fact (preference) | PK on category + upsert | None | None |
 | store_fact (event with date) | UNIQUE partial index on (agent_id, description COLLATE NOCASE, event_date) | Constraint catching | None |
 | store_fact (event without date) | None (intentional -- dateless events are notes) | None | None |

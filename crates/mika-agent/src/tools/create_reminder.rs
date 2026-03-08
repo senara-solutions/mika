@@ -156,18 +156,14 @@ impl Tool for CreateReminderTool {
                     tasks
                         .iter()
                         .find(|t| {
-                            t.label.eq_ignore_ascii_case(message)
-                                && t.action_type == "send_message"
+                            t.label.eq_ignore_ascii_case(message) && t.action_type == "send_message"
                         })
                         .map(|t| {
                             let time_info = t
                                 .next_fire_at
                                 .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
                                 .map(|dt| {
-                                    format!(
-                                        ", next fire: {}",
-                                        dt.format("%Y-%m-%d %H:%M UTC")
-                                    )
+                                    format!(", next fire: {}", dt.format("%Y-%m-%d %H:%M UTC"))
                                 })
                                 .unwrap_or_default();
                             format!(

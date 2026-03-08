@@ -59,9 +59,10 @@ on memory of past actions.
 **Layer 2 -- DB UNIQUE partial indexes (hard layer):** Added uniqueness constraints that prevent exact duplicates at the database level, even if the prompt layer fails:
 - One-shot reminders: `UNIQUE (agent_id, label COLLATE NOCASE)` partial index
 - Dated events: `UNIQUE (agent_id, description COLLATE NOCASE, event_date)` partial index
-- Dateless events have no constraint by design (they function as notes)
+- Pending commitments: `UNIQUE (agent_id, description COLLATE NOCASE, due_date) WHERE status = 'pending'` partial index — completed/cancelled commitments don't block new ones
+- Dateless events and dateless commitments have no constraint by design (NULL != NULL in SQLite UNIQUE indexes)
 
-**Layer 3 -- Tool-level constraint catching (graceful fallback):** `create_reminder` and `store_fact` catch DB constraint violations and return informational success messages ("already exists") instead of errors. This prevents the agent from retrying or confusing the user with error messages.
+**Layer 3 -- Tool-level constraint catching (graceful fallback):** `create_reminder`, `store_fact` (event), and `store_fact` (commitment) catch DB constraint violations and return informational success messages ("already exists") instead of errors. This prevents the agent from retrying or confusing the user with error messages.
 
 **Why a general principle for the prompt layer, not per-tool instructions:**
 - Covers all current and future write tools with one instruction
