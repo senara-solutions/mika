@@ -4,7 +4,7 @@ import { useSessionDetail, useSessionMessages } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatTimestamp } from '../hooks/useFormatTime.ts'
-import { ArrowLeft, User, Bot, Settings, Wrench, Download } from 'lucide-react'
+import { ArrowLeft, User, Bot, Settings, Wrench } from 'lucide-react'
 
 function roleConfig(role: string) {
   switch (role) {
@@ -85,9 +85,14 @@ export default function SessionDetail() {
               <h2 className="text-heading text-lg font-semibold font-mono">
                 sess_{sessionId?.slice(0, 10)}
               </h2>
-              {session && (
+              {session && !session.ended_at && (
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
                   Active
+                </span>
+              )}
+              {session && session.ended_at && (
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-white/[0.06] text-muted/60">
+                  Ended
                 </span>
               )}
             </div>
@@ -100,10 +105,6 @@ export default function SessionDetail() {
             )}
           </div>
         </div>
-        <button className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.06] text-xs text-muted hover:text-heading hover:border-white/[0.1] transition-colors">
-          <Download size={13} />
-          Export
-        </button>
       </div>
 
       {/* Session info bar */}

@@ -31,9 +31,9 @@ pub struct PaginatedResponse<T: Serialize> {
 }
 
 fn resolve_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, u32) {
-    let page = page.unwrap_or(1).max(1);
+    let page = page.unwrap_or(1).clamp(1, 100_000);
     let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE);
-    let offset = (page - 1) * per_page;
+    let offset = (page - 1).saturating_mul(per_page);
     (page, per_page, offset)
 }
 
@@ -226,24 +226,17 @@ pub async fn handle_agent_detail(
         }
     };
 
-    // Get agent row from DB for basic info
-    let agents = match state.dashboard_db.list_agents_with_stats().await {
-        Ok(a) => a,
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let agent = match agents
-        .into_iter()
-        .find(|a| a.id == agent_id || a.name == agent_id)
-    {
-        Some(a) => a,
-        None => {
+    // Get agent row from DB (single-row query, not list-all)
+    let agent = match state.dashboard_db.get_agent_with_stats(&agent_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": format!("agent '{}' not found", agent_id)})),
             )
                 .into_response();
         }
+        Err(e) => return internal_error(e).into_response(),
     };
 
     // Get core memory
@@ -344,14 +337,18 @@ pub async fn handle_agent_sessions(
 
     let data = match state
         .dashboard_db
-        .list_agent_sessions_paginated(&agent_id, per_page, offset)
+        .list_sessions_paginated(Some(agent_id.clone()), None, per_page, offset)
         .await
     {
         Ok(rows) => rows,
         Err(e) => return internal_error(e).into_response(),
     };
 
-    let total = match state.dashboard_db.count_agent_sessions(&agent_id).await {
+    let total = match state
+        .dashboard_db
+        .count_sessions(Some(agent_id), None)
+        .await
+    {
         Ok(n) => n,
         Err(e) => return internal_error(e).into_response(),
     };

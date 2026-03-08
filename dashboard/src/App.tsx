@@ -7,7 +7,7 @@ import Agents from './pages/Agents.tsx'
 import AgentDetail from './pages/AgentDetail.tsx'
 import Sessions from './pages/Sessions.tsx'
 import SessionDetail from './pages/SessionDetail.tsx'
-import SettingsPage from './pages/SettingsPage.tsx'
+import NotFound from './pages/NotFound.tsx'
 
 export default function App() {
   return (
@@ -20,7 +20,7 @@ export default function App() {
         <Route path="agents/:agentId" element={<AgentDetail />} />
         <Route path="sessions" element={<Sessions />} />
         <Route path="sessions/:sessionId" element={<SessionDetail />} />
-        <Route path="settings" element={<SettingsPage />} />
+        <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
   )

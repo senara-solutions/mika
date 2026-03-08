@@ -4,7 +4,7 @@ import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatTimestamp } from '../hooks/useFormatTime.ts'
-import { Search, Download } from 'lucide-react'
+import { Search } from 'lucide-react'
 
 const EVENT_TYPES = ['', 'message', 'audit', 'task']
 
@@ -34,7 +34,7 @@ export default function Timeline() {
     per_page: 50,
   }
 
-  const { data, isLoading, error } = useTimeline(filters, autoRefresh)
+  const { data, isLoading, error } = useTimeline(filters, true, autoRefresh)
 
   function updateFilter(key: string, value: string) {
     const next = new URLSearchParams(searchParams)
@@ -64,10 +64,12 @@ export default function Timeline() {
         <div>
           <div className="flex items-center gap-3">
             <h2 className="text-heading text-xl font-semibold">Unified Event Timeline</h2>
-            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              Live
-            </span>
+            {autoRefresh && (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Live
+              </span>
+            )}
           </div>
           <p className="text-sm text-muted/60 mt-1">
             Monitor live events across Messages, Audit Log, and Tasks
@@ -77,6 +79,8 @@ export default function Timeline() {
           <label className="flex items-center gap-2 text-xs text-muted cursor-pointer">
             Auto-refresh
             <button
+              role="switch"
+              aria-checked={autoRefresh}
               onClick={() => setAutoRefresh(!autoRefresh)}
               className={`relative w-9 h-5 rounded-full transition-colors ${
                 autoRefresh ? 'bg-accent' : 'bg-white/[0.1]'
@@ -89,10 +93,6 @@ export default function Timeline() {
               />
             </button>
           </label>
-          <button className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.06] text-xs text-muted hover:text-heading hover:border-white/[0.1] transition-colors">
-            <Download size={13} />
-            Export
-          </button>
         </div>
       </div>
 
@@ -103,6 +103,7 @@ export default function Timeline() {
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" />
             <input
               type="text"
+              aria-label="Search events by trace ID, summary, or payload"
               placeholder="Search Trace ID, Event Summary, or Payload..."
               value={traceSearch}
               onChange={(e) => setTraceSearch(e.target.value)}

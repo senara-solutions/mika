@@ -287,32 +287,33 @@ pub struct TimelineFilters {
 
 impl TimelineFilters {
     /// Build a WHERE clause and parameter values from the filters.
-    fn to_sql(&self) -> (String, Vec<String>) {
+    /// Uses `rusqlite::types::Value` to preserve native types (integers pass as integers).
+    fn to_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
         let mut conditions = Vec::new();
-        let mut params = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(ref aid) = self.agent_id {
-            params.push(aid.clone());
+            params.push(rusqlite::types::Value::Text(aid.clone()));
             conditions.push(format!("agent_id = ?{}", params.len()));
         }
         if let Some(ref et) = self.event_type {
-            params.push(et.clone());
+            params.push(rusqlite::types::Value::Text(et.clone()));
             conditions.push(format!("event_type = ?{}", params.len()));
         }
         if let Some(ref tid) = self.trace_id {
-            params.push(tid.clone());
+            params.push(rusqlite::types::Value::Text(tid.clone()));
             conditions.push(format!("trace_id = ?{}", params.len()));
         }
         if let Some(ref sid) = self.session_id {
-            params.push(sid.clone());
+            params.push(rusqlite::types::Value::Text(sid.clone()));
             conditions.push(format!("session_id = ?{}", params.len()));
         }
         if let Some(from) = self.from {
-            params.push(from.to_string());
+            params.push(rusqlite::types::Value::Integer(from));
             conditions.push(format!("created_at >= ?{}", params.len()));
         }
         if let Some(to) = self.to {
-            params.push(to.to_string());
+            params.push(rusqlite::types::Value::Integer(to));
             conditions.push(format!("created_at <= ?{}", params.len()));
         }
 
@@ -3006,12 +3007,11 @@ impl Database {
             params.len() + 2,
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            params.into_iter().map(|s| Box::new(s) as _).collect();
-        all_params.push(Box::new(limit));
-        all_params.push(Box::new(offset));
+        let mut all_params: Vec<rusqlite::types::Value> = params;
+        all_params.push(rusqlite::types::Value::Integer(limit as i64));
+        all_params.push(rusqlite::types::Value::Integer(offset as i64));
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| &**p).collect();
+            all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
         let rows = stmt
             .query_map(&*param_refs, |r| {
                 Ok(TimelineRow {
@@ -3031,11 +3031,10 @@ impl Database {
     /// Count total rows in unified_timeline matching filters.
     pub fn query_timeline_count(&self, filters: &TimelineFilters) -> Result<u64> {
         let (where_clause, params) = filters.to_sql();
-        let sql = format!("SELECT COUNT(*) FROM unified_timeline {}", where_clause,);
+        let sql = format!("SELECT COUNT(*) FROM unified_timeline {}", where_clause);
         let mut stmt = self.conn.prepare(&sql)?;
-        let boxed: Vec<Box<dyn rusqlite::types::ToSql>> =
-            params.into_iter().map(|s| Box::new(s) as _).collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|p| &**p).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
         let count: i64 = stmt.query_row(&*param_refs, |r| r.get(0))?;
         Ok(count as u64)
     }
@@ -3083,6 +3082,30 @@ impl Database {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Get a single agent with stats by id or name.
+    pub fn get_agent_with_stats(&self, agent_id: &str) -> Result<Option<AgentWithStats>> {
+        self.conn
+            .query_row(
+                "SELECT a.id, a.name, a.home_dir, a.active, a.last_seen, a.created_at,
+                        (SELECT COUNT(*) FROM messages m WHERE m.agent_id = a.id AND m.role != 'summary') as msg_count
+                 FROM agents a WHERE a.id = ?1 OR a.name = ?1",
+                params![agent_id],
+                |r| {
+                    Ok(AgentWithStats {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        home_dir: r.get(2)?,
+                        active: r.get(3)?,
+                        last_seen: r.get(4)?,
+                        created_at: r.get(5)?,
+                        message_count: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// List sessions with optional filters and pagination.
@@ -3271,44 +3294,6 @@ impl Database {
         Ok(n as u64)
     }
 
-    /// List sessions for an agent with pagination.
-    pub fn list_agent_sessions_paginated(
-        &self,
-        agent_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<SessionWithStats>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.agent_id, s.channel_type, s.started_at, s.ended_at, s.metadata,
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) as msg_count
-             FROM sessions s WHERE s.agent_id = ?1
-             ORDER BY s.started_at DESC LIMIT ?2 OFFSET ?3",
-        )?;
-        let rows = stmt
-            .query_map(params![agent_id, limit as i64, offset as i64], |r| {
-                Ok(SessionWithStats {
-                    id: r.get(0)?,
-                    agent_id: r.get(1)?,
-                    channel_type: r.get(2)?,
-                    started_at: r.get(3)?,
-                    ended_at: r.get(4)?,
-                    metadata: r.get(5)?,
-                    message_count: r.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
-    }
-
-    /// Count sessions for an agent.
-    pub fn count_agent_sessions(&self, agent_id: &str) -> Result<u64> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE agent_id = ?1",
-            params![agent_id],
-            |r| r.get(0),
-        )?;
-        Ok(n as u64)
-    }
 }
 
 // ===== Utility Functions =====

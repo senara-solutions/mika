@@ -1,9 +1,10 @@
+import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatRelativeTime } from '../hooks/useFormatTime.ts'
-import { Search, Terminal, MessageSquare, Users, Settings, Download } from 'lucide-react'
+import { Search, Terminal, MessageSquare, Users, Settings } from 'lucide-react'
 
 const CHANNEL_TYPES = ['', 'cli', 'telegram', 'team', 'system']
 
@@ -31,6 +32,8 @@ export default function Sessions() {
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
+
+  const [agentSearch, setAgentSearch] = useState(filters.agent_id ?? '')
 
   const { data, isLoading, error } = useSessions(filters)
 
@@ -60,10 +63,6 @@ export default function Sessions() {
             {data ? `${data.total} session${data.total !== 1 ? 's' : ''} found` : 'Loading sessions...'}
           </p>
         </div>
-        <button className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.06] text-xs text-muted hover:text-heading hover:border-white/[0.1] transition-colors">
-          <Download size={13} />
-          Export
-        </button>
       </div>
 
       {/* Filters */}
@@ -73,9 +72,11 @@ export default function Sessions() {
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" />
             <input
               type="text"
+              aria-label="Search sessions by agent"
               placeholder="Search agent..."
-              value={filters.agent_id ?? ''}
-              onChange={(e) => updateFilter('agent_id', e.target.value)}
+              value={agentSearch}
+              onChange={(e) => setAgentSearch(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && updateFilter('agent_id', agentSearch.trim())}
               className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40"
             />
           </div>

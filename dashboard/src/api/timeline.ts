@@ -22,7 +22,7 @@ export interface TimelineFilters {
   per_page?: number
 }
 
-export function useTimeline(filters: TimelineFilters, enabled = true) {
+export function useTimeline(filters: TimelineFilters, enabled = true, autoRefresh = true) {
   const isDefaultView =
     !filters.agent_id &&
     !filters.event_type &&
@@ -35,7 +35,7 @@ export function useTimeline(filters: TimelineFilters, enabled = true) {
   return useQuery<PaginatedResponse<TimelineRow>>({
     queryKey: ['timeline', filters],
     queryFn: () => apiFetch('/timeline', filters as Record<string, string | number | undefined>),
-    refetchInterval: isDefaultView ? 5000 : false,
+    refetchInterval: autoRefresh && isDefaultView ? 5000 : false,
     enabled,
   })
 }

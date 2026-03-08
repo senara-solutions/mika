@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
-use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -44,7 +44,7 @@ const HEARTBEAT_CRON: &str = "0 0 * * * *";
 ///
 /// Shared between production `run_server` and test `test_app`.
 fn build_router(state: AppState) -> Router {
-    // CORS — allow dashboard origin (default: http://localhost:5173)
+    // CORS — scoped to dashboard routes only, restricted to GET + OPTIONS
     let cors_origin =
         std::env::var("MIKA_CORS_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
     let cors = CorsLayer::new()
@@ -53,47 +53,45 @@ fn build_router(state: AppState) -> Router {
                 .parse::<http::HeaderValue>()
                 .expect("MIKA_CORS_ORIGIN must be a valid header value"),
         )
-        .allow_methods(AllowMethods::any())
-        .allow_headers(AllowHeaders::any());
+        .allow_methods([http::Method::GET, http::Method::OPTIONS])
+        .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]);
 
+    // Dashboard API routes (read-only, with CORS for browser access)
+    let dashboard_routes = Router::new()
+        .route("/timeline", get(dashboard::handle_timeline))
+        .route(
+            "/timeline/trace/{trace_id}",
+            get(dashboard::handle_trace_detail),
+        )
+        .route("/agents", get(dashboard::handle_agents_list))
+        .route("/agents/{id}", get(dashboard::handle_agent_detail))
+        .route(
+            "/agents/{id}/sessions",
+            get(dashboard::handle_agent_sessions),
+        )
+        .route("/agents/{id}/audit", get(dashboard::handle_agent_audit))
+        .route("/sessions", get(dashboard::handle_sessions_list))
+        .route("/sessions/{id}", get(dashboard::handle_session_detail))
+        .route(
+            "/sessions/{id}/messages",
+            get(dashboard::handle_session_messages),
+        )
+        .layer(cors);
+
+    // Mutation routes (no CORS — gateway-to-agent only)
     Router::new()
         .route(
             "/message",
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
         .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
-        // Dashboard API routes (read-only)
-        .route("/api/v1/timeline", get(dashboard::handle_timeline))
-        .route(
-            "/api/v1/timeline/trace/{trace_id}",
-            get(dashboard::handle_trace_detail),
-        )
-        .route("/api/v1/agents", get(dashboard::handle_agents_list))
-        .route("/api/v1/agents/{id}", get(dashboard::handle_agent_detail))
-        .route(
-            "/api/v1/agents/{id}/sessions",
-            get(dashboard::handle_agent_sessions),
-        )
-        .route(
-            "/api/v1/agents/{id}/audit",
-            get(dashboard::handle_agent_audit),
-        )
-        .route("/api/v1/sessions", get(dashboard::handle_sessions_list))
-        .route(
-            "/api/v1/sessions/{id}",
-            get(dashboard::handle_session_detail),
-        )
-        .route(
-            "/api/v1/sessions/{id}/messages",
-            get(dashboard::handle_session_messages),
-        )
+        .nest("/api/v1", dashboard_routes)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
         ))
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
-        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

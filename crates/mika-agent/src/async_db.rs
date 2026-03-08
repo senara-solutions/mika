@@ -1049,6 +1049,11 @@ impl AsyncDatabase {
         self.with_db(|db| db.list_agents_with_stats()).await
     }
 
+    pub async fn get_agent_with_stats(&self, agent_id: &str) -> Result<Option<AgentWithStats>> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.get_agent_with_stats(&aid)).await
+    }
+
     pub async fn list_sessions_paginated(
         &self,
         agent_id: Option<String>,
@@ -1109,21 +1114,6 @@ impl AsyncDatabase {
         self.with_db(move |db| db.count_audit_events(&aid)).await
     }
 
-    pub async fn list_agent_sessions_paginated(
-        &self,
-        agent_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<SessionWithStats>> {
-        let aid = agent_id.to_owned();
-        self.with_db(move |db| db.list_agent_sessions_paginated(&aid, limit, offset))
-            .await
-    }
-
-    pub async fn count_agent_sessions(&self, agent_id: &str) -> Result<u64> {
-        let aid = agent_id.to_owned();
-        self.with_db(move |db| db.count_agent_sessions(&aid)).await
-    }
 }
 
 #[cfg(test)]

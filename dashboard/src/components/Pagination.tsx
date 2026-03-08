@@ -18,6 +18,7 @@ export default function Pagination({ page, perPage, total, onPageChange }: Pagin
       </span>
       <div className="flex gap-1">
         <button
+          aria-label="Previous page"
           onClick={() => onPageChange(page - 1)}
           disabled={page <= 1}
           className="p-1.5 rounded-lg hover:bg-white/[0.05] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
@@ -25,6 +26,7 @@ export default function Pagination({ page, perPage, total, onPageChange }: Pagin
           <ChevronLeft size={16} />
         </button>
         <button
+          aria-label="Next page"
           onClick={() => onPageChange(page + 1)}
           disabled={page >= totalPages}
           className="p-1.5 rounded-lg hover:bg-white/[0.05] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
