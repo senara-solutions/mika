@@ -15,4 +15,3 @@ pub mod teams;
 #[cfg(test)]
 pub mod test_utils;
 pub mod tools;
-pub mod trace;

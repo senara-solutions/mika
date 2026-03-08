@@ -582,7 +582,7 @@ pub struct AgentParams<'a> {
 /// Run the agent loop for a single inbound message.
 /// Returns `AgentOutput` with text response, thinking, and usage info.
 pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
-    let trace_id = crate::trace::generate_trace_id();
+    let trace_id = mika_common::trace::generate_trace_id();
 
     // Save the user message (with image annotation if images attached)
     let save_text = if params.user_images.is_empty() {
@@ -1353,7 +1353,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     }];
 
     let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
-    let trace_id = crate::trace::generate_trace_id();
+    let trace_id = mika_common::trace::generate_trace_id();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
@@ -1546,7 +1546,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         content: MessageContent::Text(params.task_message.to_string()),
     }];
 
-    let trace_id = crate::trace::generate_trace_id();
+    let trace_id = mika_common::trace::generate_trace_id();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db: params.db,

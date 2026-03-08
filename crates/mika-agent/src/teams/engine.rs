@@ -164,7 +164,7 @@ impl TeamEngine {
             brave_api_key: settings.brave_api_key.clone(),
             team_db,
             goal_msg_id: None,
-            trace_id: crate::trace::generate_trace_id(),
+            trace_id: mika_common::trace::generate_trace_id(),
         })
     }
 
@@ -189,7 +189,7 @@ impl TeamEngine {
             brave_api_key: settings.brave_api_key.clone(),
             team_db,
             goal_msg_id: None,
-            trace_id: crate::trace::generate_trace_id(),
+            trace_id: mika_common::trace::generate_trace_id(),
         })
     }
 

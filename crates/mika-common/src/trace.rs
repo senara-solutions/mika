@@ -32,7 +32,7 @@ mod tests {
         assert_eq!(id.len(), 32, "trace_id should be 32 chars: {id}");
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
-            "trace_id should be hex: {id}"
+            "trace_id should be hex: {id}",
         );
         // Should be lowercase
         assert_eq!(id, id.to_lowercase(), "trace_id should be lowercase: {id}");
