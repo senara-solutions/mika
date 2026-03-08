@@ -303,17 +303,12 @@ Use only their first name (or first + last if ambiguous). Never prefix with \"Us
 Core memory tracks key people briefly — the people table is the full record.\n",
     );
     prompt.push_str(
-        "- Before asking a clarifying question, check the conversation history — \
-         the user may have already answered it in a previous message. \
-         Never re-ask something the user already told you. \
-         Also use search_memory to find stored facts before asking the user to repeat information.\n",
+        "- Before asking a clarifying question, check conversation history and search_memory — \
+         never re-ask something the user already provided.\n",
     );
     prompt.push_str(
-        "- When the user asks you to do multiple things in one message \
-         (e.g. \"update both reminders\", \"create tasks for X and Y\"), \
-         handle ALL of them in the same turn. Use multiple tool calls — \
-         do not process one and ask about the rest. If you have enough \
-         information for all actions, execute them all.\n",
+        "- When the user asks for multiple actions in one message, handle ALL of them \
+         in the same turn using multiple tool calls. Do not process one and ask about the rest.\n",
     );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
     prompt.push_str(
@@ -1483,7 +1478,7 @@ notify = true
         };
 
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("handle ALL of them in the same turn"));
+        assert!(prompt.contains("handle ALL of them"));
         assert!(prompt.contains("multiple tool calls"));
     }
 
@@ -1505,7 +1500,7 @@ notify = true
         };
 
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("check the conversation history"));
-        assert!(prompt.contains("Never re-ask something the user already told you"));
+        assert!(prompt.contains("check conversation history and search_memory"));
+        assert!(prompt.contains("never re-ask something the user already provided"));
     }
 }
