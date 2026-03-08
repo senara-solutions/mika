@@ -18,7 +18,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -177,6 +177,7 @@ pub struct Person {
     pub notes: Option<String>,
     pub first_mentioned: String,
     pub last_mentioned: String,
+    pub mention_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +455,10 @@ impl Database {
             self.migrate_v4_to_v5()?;
             info!(version = 5, "database migrated to v5");
         }
+        if (3..=5).contains(&version) {
+            self.migrate_v5_to_v6()?;
+            info!(version = 6, "database migrated to v6");
+        }
         Ok(())
     }
 
@@ -503,7 +508,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (5);
+            INSERT INTO schema_version (version) VALUES (6);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -626,6 +631,7 @@ impl Database {
                 notes TEXT,
                 first_mentioned INTEGER NOT NULL DEFAULT (unixepoch()),
                 last_mentioned INTEGER NOT NULL DEFAULT (unixepoch()),
+                mention_count INTEGER NOT NULL DEFAULT 1,
                 UNIQUE (agent_id, canonical_name)
             );
 
@@ -920,6 +926,21 @@ impl Database {
         // 7. Update schema version
         self.conn
             .execute("INSERT INTO schema_version (version) VALUES (5)", [])?;
+
+        Ok(())
+    }
+
+    fn migrate_v5_to_v6(&self) -> Result<()> {
+        info!("migrating database schema v5 → v6 (people mention_count)");
+
+        if !self.column_exists("people", "mention_count")? {
+            self.conn.execute_batch(
+                "ALTER TABLE people ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 1",
+            )?;
+        }
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (6)", [])?;
 
         Ok(())
     }
@@ -1874,7 +1895,8 @@ impl Database {
             self.conn.execute(
                 "UPDATE people SET relationship = COALESCE(?1, relationship),
                   notes = COALESCE(?2, notes),
-                  last_mentioned = unixepoch()
+                  last_mentioned = unixepoch(),
+                  mention_count = mention_count + 1
                   WHERE id = ?3",
                 params![relationship, notes, id],
             )?;
@@ -1894,7 +1916,8 @@ impl Database {
             .query_row(
                 "SELECT id, canonical_name, relationship, notes,
                          datetime(first_mentioned, 'unixepoch'),
-                         datetime(last_mentioned, 'unixepoch')
+                         datetime(last_mentioned, 'unixepoch'),
+                         mention_count
                   FROM people WHERE agent_id = ?1 AND canonical_name = ?2",
                 params![agent_id, name],
                 |r| {
@@ -1905,6 +1928,7 @@ impl Database {
                         notes: r.get(3)?,
                         first_mentioned: r.get(4)?,
                         last_mentioned: r.get(5)?,
+                        mention_count: r.get(6)?,
                     })
                 },
             )
@@ -1916,7 +1940,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, canonical_name, relationship, notes,
                      datetime(first_mentioned, 'unixepoch'),
-                     datetime(last_mentioned, 'unixepoch')
+                     datetime(last_mentioned, 'unixepoch'),
+                     mention_count
               FROM people WHERE agent_id = ?1 ORDER BY canonical_name",
         )?;
         let rows = stmt
@@ -1928,6 +1953,7 @@ impl Database {
                     notes: r.get(3)?,
                     first_mentioned: r.get(4)?,
                     last_mentioned: r.get(5)?,
+                    mention_count: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1939,7 +1965,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, canonical_name, relationship, notes,
                      datetime(first_mentioned, 'unixepoch'),
-                     datetime(last_mentioned, 'unixepoch')
+                     datetime(last_mentioned, 'unixepoch'),
+                     mention_count
               FROM people
               WHERE agent_id = ?1 AND (
                   canonical_name LIKE ?2 OR relationship LIKE ?2 OR notes LIKE ?2
@@ -1955,6 +1982,7 @@ impl Database {
                     notes: r.get(3)?,
                     first_mentioned: r.get(4)?,
                     last_mentioned: r.get(5)?,
+                    mention_count: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
