@@ -290,6 +290,16 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
                 "Use `list_agents` for details. Use `get_team_status`/`get_team_history` for run results.\n",
             );
         }
+
+        // Agent creation guidance (always shown when home_dir is available)
+        prompt.push_str(
+            "\nYou can create new agents using the `create_agent` tool. When creating agents \
+             based on real people, use your knowledge to craft an appropriate personality in the \
+             `soul` parameter — capture their known communication style, philosophy, and expertise. \
+             Use `web_search` if you need to research someone you're less familiar with. The `name` \
+             parameter must be lowercase with hyphens (e.g. \"elon-musk\"), while `display_name` is \
+             the human-readable name (e.g. \"Elon Musk\").\n",
+        );
     }
 
     // Tool usage instructions (builtin tools are always available)

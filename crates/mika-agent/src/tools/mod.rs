@@ -1,6 +1,7 @@
 mod cancel_reminder;
 mod cancel_task;
 mod complete_task;
+mod create_agent;
 mod create_reminder;
 pub(crate) mod create_skill;
 mod create_task;
@@ -397,44 +398,40 @@ pub fn default_tools() -> ToolRegistry {
     registry
 }
 
-/// Return management tools only when the system has multiple agents or teams.
+/// Return management tools based on the current agent/team configuration.
 ///
-/// Checks the filesystem and returns an empty vec when the current setup
-/// is single-agent with no teams (the common case), avoiding unnecessary
-/// tool exposure.
+/// `create_agent` and `list_agents` are always available so the agent can
+/// create new agents even from a single-agent setup. Delegation and team
+/// tools (`delegate_task`, `run_team`, etc.) are only added when multiple
+/// agents or teams exist.
 pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
-    let agents = mika_common::agent::list_agents(home_dir);
-    let teams = mika_common::team::list_teams(home_dir);
-    if agents.len() > 1 || !teams.is_empty() {
-        management_tools(home_dir, settings)
-    } else {
-        Vec::new()
-    }
-}
-
-/// Create management tools for multi-agent and team workflows.
-///
-/// Includes agent listing, delegation, team execution, and team status/history.
-/// These are separate from `default_tools()` so they can be conditionally
-/// added only when multiple agents or teams are configured.
-/// Prefer `management_tools_if_needed()` which checks the condition automatically.
-pub fn management_tools(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(create_agent::CreateAgentTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
         Box::new(list_agents::ListAgentsTool {
             home_dir: home_dir.to_path_buf(),
         }),
-        Box::new(list_teams::ListTeamsTool {
+    ];
+
+    let agents = mika_common::agent::list_agents(home_dir);
+    let teams = mika_common::team::list_teams(home_dir);
+    if agents.len() > 1 || !teams.is_empty() {
+        tools.push(Box::new(list_teams::ListTeamsTool {
             home_dir: home_dir.to_path_buf(),
-        }),
-        Box::new(run_team::RunTeamTool {
+        }));
+        tools.push(Box::new(run_team::RunTeamTool {
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
-        }),
-        Box::new(delegate_task::DelegateTaskTool {
+        }));
+        tools.push(Box::new(delegate_task::DelegateTaskTool {
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
-        }),
-        Box::new(get_team_status::GetTeamStatusTool),
-        Box::new(get_team_history::GetTeamHistoryTool),
-    ]
+        }));
+        tools.push(Box::new(get_team_status::GetTeamStatusTool));
+        tools.push(Box::new(get_team_history::GetTeamHistoryTool));
+    }
+
+    tools
 }
+
