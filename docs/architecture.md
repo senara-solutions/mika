@@ -71,7 +71,7 @@ following steps for each inbound user message:
 
 Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 
-1. **Save user message** to the `conversations` table via `AsyncDatabase::save_message()`.
+1. **Generate trace_id** via `trace::generate_trace_id()` (OTel extraction or UUID v4 hex fallback). **Save user message** to the `messages` table via `AsyncDatabase::save_message()` with trace_id.
 
 2. **Load context** for system prompt assembly:
    - `soul.md` (agent personality, read from `home_dir`)
@@ -151,7 +151,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
 - Per-session edit limit: `MAX_CORE_MEMORY_EDITS_PER_SESSION = 3` (onboarding sessions exempt)
 - Actions: `replace`, `append`, `remove_line`, `reset`
-- All mutations are recorded in the `memory_events` audit table
+- All mutations are recorded in the `audit_events` table (with `trace_id` for correlation)
 
 ### Layer 2: Structured Facts
 
@@ -524,6 +524,11 @@ WHERE status IN ('pending', 'recurring_active');
 -- TUI callback polling efficiency
 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at)
 WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status = 'completed';
+
+-- Trace correlation (partial indexes — only non-NULL trace_ids)
+CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
 ```
 
 
@@ -668,10 +673,24 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 
 ## 16. Observability & Telemetry
 
-Mika follows an "always instrument, optionally export" pattern. Tracing spans are
-compiled unconditionally into the binary — no feature flags needed. Spans cover the
-agent loop (`agent_turn`), Claude API calls, per-tool execution, team engine
-(`team_run`, `team_agent_task`), and server HTTP handlers (`tower_http::TraceLayer`).
+Mika follows an "always instrument, optionally export" pattern with two orthogonal
+correlation axes:
+
+- **`trace_id`** (per-request/per-turn): 32-char lowercase hex string generated via
+  `trace::generate_trace_id()` (`crates/mika-agent/src/trace.rs`). Extracts the OTel
+  trace ID from the current span when the `telemetry` feature is active; falls back to
+  UUID v4 hex otherwise. Threaded through `ToolContext`, `LongRunningContext`,
+  `TeamEngine`, and all DB write paths (messages, audit_events, tasks, team_workspace).
+- **`session_id` / `agent_id`** (system-level): Identifies the conversation session and
+  owning agent.
+
+The `unified_timeline` VIEW (`UNION ALL` across messages, audit_events, tasks) enables
+cross-subsystem queries by trace_id — e.g., "show all messages, audit events, and tasks
+from a single agent turn."
+
+Tracing spans are compiled unconditionally into the binary — no feature flags needed.
+Spans cover the agent loop (`agent_turn`), Claude API calls, per-tool execution, team
+engine (`team_run`, `team_agent_task`), and server HTTP handlers (`tower_http::TraceLayer`).
 
 ### Optional OTLP Export
 
@@ -708,7 +727,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 2 (v1: consolidated clean-slate baseline; v2: adds `delivered` task status and `tool_result` conversation role)
+**Schema version:** 5 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation)
 
 ### Tables
 
@@ -717,24 +736,26 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `schema_version` | Migration tracking |
 | `agents` | Agent registry (name, display_name, model, active flag) |
 | `teams` | Team registry (name, display_name, orchestrator) |
-| `conversations` | Message history (user, assistant, summary rows; `channel_type`, `agent_id` FK) |
+| `sessions` | Conversation sessions (`agent_id` FK, `channel_type`, timestamps) |
+| `messages` | Message history (`session_id` FK, `role`, `content`, `trace_id`, `metadata`) |
 | `core_memory` | Layer 1 persistent memory blocks (`agent_id` FK) |
 | `people` | Layer 2 people/contacts (`agent_id` FK) |
 | `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
 | `preferences` | Layer 2 user preferences (`agent_id` FK) |
 | `events` | Layer 2 notable events (`agent_id` FK) |
-| `memory_events` | Audit log for all memory mutations (`agent_id` FK) |
+| `audit_events` | Audit log for all memory mutations (`agent_id` FK, `trace_id`) |
 | `customer_config` | Key-value store (timezone, chat_id) |
 | `failed_sends` | Durable outbox for failed outbound messages |
-| `memory_event_summaries` | Tiered retention summaries (monthly) |
+| `audit_event_summaries` | Tiered retention summaries (monthly) |
 | `skills` | Skill metadata (name, description, builtin flag, enabled) |
 | `skill_tools` | Tool definitions per skill |
 | `search_content` | Unified search content for Layer 3 hybrid search |
 | `fts_search` | FTS5 virtual table for full-text search |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
-| `tasks` | Unified task scheduler — replaces `reminders`; all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`) |
-| `team_runs` | Team run metadata (goal, status, iterations, deliverable) |
-| `team_messages` | Graph-structured team messages with `parent_id` links; `agent_name` column (not FK) |
+| `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint) |
+| `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
+| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks for cross-subsystem correlation by trace_id |
 
 ### SQLite Pragmas
 
