@@ -32,7 +32,7 @@ pub struct PaginatedResponse<T: Serialize> {
 
 fn resolve_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, u32) {
     let page = page.unwrap_or(1).max(1);
-    let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).min(MAX_PER_PAGE).max(1);
+    let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE);
     let offset = (page - 1) * per_page;
     (page, per_page, offset)
 }
@@ -100,7 +100,11 @@ pub async fn handle_timeline(
     };
     let count_filters = filters.clone();
 
-    let data = match state.dashboard_db.query_timeline(filters, per_page, offset).await {
+    let data = match state
+        .dashboard_db
+        .query_timeline(filters, per_page, offset)
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => return internal_error(e).into_response(),
     };
@@ -228,7 +232,10 @@ pub async fn handle_agent_detail(
         Err(e) => return internal_error(e).into_response(),
     };
 
-    let agent = match agents.into_iter().find(|a| a.id == agent_id || a.name == agent_id) {
+    let agent = match agents
+        .into_iter()
+        .find(|a| a.id == agent_id || a.name == agent_id)
+    {
         Some(a) => a,
         None => {
             return (
@@ -513,7 +520,11 @@ fn strip_base64_images(content: &str) -> String {
     // and add a note. This prevents multi-MB payloads.
     if content.len() > 50_000 {
         let truncated = &content[..1000];
-        return format!("{}... [content truncated, {} bytes total — contains base64 image data]", truncated, content.len());
+        return format!(
+            "{}... [content truncated, {} bytes total — contains base64 image data]",
+            truncated,
+            content.len()
+        );
     }
 
     content.to_string()
@@ -536,11 +547,7 @@ pub async fn handle_session_messages(
         Err(e) => return internal_error(e).into_response(),
     };
 
-    let total = match state
-        .dashboard_db
-        .count_session_messages(&session_id)
-        .await
-    {
+    let total = match state.dashboard_db.count_session_messages(&session_id).await {
         Ok(n) => n,
         Err(e) => return internal_error(e).into_response(),
     };

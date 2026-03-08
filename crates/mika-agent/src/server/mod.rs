@@ -45,8 +45,8 @@ const HEARTBEAT_CRON: &str = "0 0 * * * *";
 /// Shared between production `run_server` and test `test_app`.
 fn build_router(state: AppState) -> Router {
     // CORS — allow dashboard origin (default: http://localhost:5173)
-    let cors_origin = std::env::var("MIKA_CORS_ORIGIN")
-        .unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let cors_origin =
+        std::env::var("MIKA_CORS_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
     let cors = CorsLayer::new()
         .allow_origin(
             cors_origin

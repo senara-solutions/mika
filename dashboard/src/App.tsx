@@ -1,0 +1,23 @@
+import { Routes, Route } from 'react-router'
+import Layout from './components/Layout.tsx'
+import Timeline from './pages/Timeline.tsx'
+import TraceDetail from './pages/TraceDetail.tsx'
+import Agents from './pages/Agents.tsx'
+import AgentDetail from './pages/AgentDetail.tsx'
+import Sessions from './pages/Sessions.tsx'
+import SessionDetail from './pages/SessionDetail.tsx'
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<Timeline />} />
+        <Route path="traces/:traceId" element={<TraceDetail />} />
+        <Route path="agents" element={<Agents />} />
+        <Route path="agents/:agentId" element={<AgentDetail />} />
+        <Route path="sessions" element={<Sessions />} />
+        <Route path="sessions/:sessionId" element={<SessionDetail />} />
+      </Route>
+    </Routes>
+  )
+}

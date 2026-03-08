@@ -3010,7 +3010,8 @@ impl Database {
             params.into_iter().map(|s| Box::new(s) as _).collect();
         all_params.push(Box::new(limit));
         all_params.push(Box::new(offset));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| &**p).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| &**p).collect();
         let rows = stmt
             .query_map(&*param_refs, |r| {
                 Ok(TimelineRow {
@@ -3030,10 +3031,7 @@ impl Database {
     /// Count total rows in unified_timeline matching filters.
     pub fn query_timeline_count(&self, filters: &TimelineFilters) -> Result<u64> {
         let (where_clause, params) = filters.to_sql();
-        let sql = format!(
-            "SELECT COUNT(*) FROM unified_timeline {}",
-            where_clause,
-        );
+        let sql = format!("SELECT COUNT(*) FROM unified_timeline {}", where_clause,);
         let mut stmt = self.conn.prepare(&sql)?;
         let boxed: Vec<Box<dyn rusqlite::types::ToSql>> =
             params.into_iter().map(|s| Box::new(s) as _).collect();
@@ -3127,7 +3125,8 @@ impl Database {
             param_values.into_iter().map(|s| Box::new(s) as _).collect();
         all_params.push(Box::new(limit));
         all_params.push(Box::new(offset));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| &**p).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| &**p).collect();
 
         let rows = stmt
             .query_map(&*param_refs, |r| {

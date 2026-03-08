@@ -1057,12 +1057,7 @@ impl AsyncDatabase {
         offset: u32,
     ) -> Result<Vec<SessionWithStats>> {
         self.with_db(move |db| {
-            db.list_sessions_paginated(
-                agent_id.as_deref(),
-                channel_type.as_deref(),
-                limit,
-                offset,
-            )
+            db.list_sessions_paginated(agent_id.as_deref(), channel_type.as_deref(), limit, offset)
         })
         .await
     }
@@ -1072,10 +1067,8 @@ impl AsyncDatabase {
         agent_id: Option<String>,
         channel_type: Option<String>,
     ) -> Result<u64> {
-        self.with_db(move |db| {
-            db.count_sessions(agent_id.as_deref(), channel_type.as_deref())
-        })
-        .await
+        self.with_db(move |db| db.count_sessions(agent_id.as_deref(), channel_type.as_deref()))
+            .await
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
