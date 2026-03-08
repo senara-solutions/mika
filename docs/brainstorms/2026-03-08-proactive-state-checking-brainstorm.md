@@ -22,13 +22,11 @@ This affects all write operations: reminders, facts, events, people. The agent h
 
 ## Why This Approach
 
-**Prompt-only solution chosen over code-level guards because:**
+**Three-layer defense-in-depth chosen to combine soft guidance with hard guarantees:**
 
-- Covers all current and future write tools with one instruction
-- No code to maintain or update when new tools are added
-- The query tools already exist -- the agent just needs to be told to use them
-- DB-level constraints already handle exact-match dedup for people, commitments, and preferences
-- The gap is specifically in the LLM's decision-making, not in missing infrastructure
+- Layer 1 (Prompt instruction): Covers all current and future write tools with one general instruction. The query tools already exist -- the agent just needs to be told to use them. This is the soft layer that guides the agent's decision-making.
+- Layer 2 (DB UNIQUE partial indexes): Added as hard guarantees for one-shot reminders and dated events. Even if the prompt fails to prevent a duplicate attempt, the DB rejects exact-match inserts. People, commitments, preferences, and recurring reminders already had DB-level constraints.
+- Layer 3 (Tool-level constraint catching): Tools catch DB constraint violations and return informational success ("already exists") instead of errors. This prevents the agent from retrying or confusing the user with error messages.
 
 **General principle over per-tool instructions because:**
 
@@ -39,7 +37,7 @@ This affects all write operations: reminders, facts, events, people. The agent h
 
 ## Key Decisions
 
-1. **Prompt-only implementation** -- no code-level duplicate detection in tool execute() methods. The DB schema handles exact-match dedup; the prompt handles semantic/fuzzy awareness.
+1. **Three-layer defense-in-depth** -- prompt instruction as the soft guidance layer, DB UNIQUE partial indexes as the hard guarantee layer, and tool-level constraint catching as the graceful fallback layer. The prompt handles semantic/fuzzy awareness; the DB prevents exact-match duplicates; the tools catch constraint violations and return informational messages instead of errors.
 
 2. **Single general instruction** -- one bullet point covering all write operations rather than per-tool instructions. The agent uses judgment to pick the right query tool.
 
@@ -63,15 +61,16 @@ tools rather than relying on memory of past actions.
 
 | Tool / Table | DB-Level Dedup | Tool-Level Pre-Check | Prompt Guidance |
 |---|---|---|---|
-| create_reminder (one-shot) | None | None | None |
+| create_reminder (one-shot) | UNIQUE partial index on (agent_id, label COLLATE NOCASE) | Constraint catching | None |
 | create_reminder (recurring) | Partial unique index on label | None | None |
 | store_fact (person) | UNIQUE on canonical_name + upsert | None | None |
 | store_fact (commitment) | UNIQUE on description + upsert | None | None |
 | store_fact (preference) | PK on category + upsert | None | None |
-| store_fact (event) | **None** | None | None |
+| store_fact (event with date) | UNIQUE partial index on (agent_id, description COLLATE NOCASE, event_date) | Constraint catching | None |
+| store_fact (event without date) | None (intentional -- dateless events are notes) | None | None |
 | update_core_memory | UNIQUE on key + upsert | Reads existing value | None |
 
-After this change, all rows get "Prompt Guidance: Yes (general principle)".
+After this change, all rows get "Prompt Guidance: Yes (general principle)". One-shot reminders and dated events also get DB-level and tool-level dedup.
 
 ## Scope
 
@@ -79,9 +78,9 @@ After this change, all rows get "Prompt Guidance: Yes (general principle)".
 - System prompt instruction in `build_system_prompt()` Tool Usage section
 - CLAUDE.md convention documenting the pattern
 - Tests verifying the instruction appears in the generated prompt
+- DB-level UNIQUE partial indexes for one-shot reminders and dated events
+- Tool-level constraint violation catching (returns informational success, not error)
 
 **Out of scope (future work):**
 - Code-level fuzzy duplicate detection in tool execute() methods
-- DB-level uniqueness constraints for events table
 - Semantic similarity matching for near-duplicate detection
-- Tool return messages distinguishing "created new" vs "updated existing"

@@ -148,7 +148,43 @@ impl Tool for CreateReminderTool {
             created_by_session: Some(ctx.session_id.to_string()),
         };
 
-        let id = ctx.db.create_task(task).await?;
+        let id = match ctx.db.create_task(task).await {
+            Ok(id) => id,
+            Err(e) if crate::db::is_unique_violation(&e) => {
+                // Query for existing reminder to provide details
+                let detail = if let Ok(tasks) = ctx.db.get_user_visible_tasks().await {
+                    tasks
+                        .iter()
+                        .find(|t| {
+                            t.label.eq_ignore_ascii_case(message)
+                                && t.action_type == "send_message"
+                        })
+                        .map(|t| {
+                            let time_info = t
+                                .next_fire_at
+                                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                                .map(|dt| {
+                                    format!(
+                                        ", next fire: {}",
+                                        dt.format("%Y-%m-%d %H:%M UTC")
+                                    )
+                                })
+                                .unwrap_or_default();
+                            format!(
+                                "A reminder '{}' already exists (id: {}{}). No duplicate created.",
+                                t.label, t.id, time_info
+                            )
+                        })
+                } else {
+                    None
+                };
+                return Ok(ToolOutput::success(detail.unwrap_or_else(|| {
+                    "A similar reminder already exists and is still active. No duplicate created."
+                        .to_string()
+                })));
+            }
+            Err(e) => return Err(e),
+        };
 
         ctx.db
             .log_memory_event(
@@ -328,6 +364,108 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("too frequently"));
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_blocks_duplicate() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+        let input = serde_json::json!({
+            "fire_at": "2099-12-31T23:59:59Z",
+            "message": "Year-end review"
+        });
+
+        // First creation succeeds
+        let result = tool.execute(input.clone(), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("scheduled"));
+
+        // Second creation with same label is blocked — with details
+        let result = tool.execute(input, &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("already exists"));
+        assert!(
+            result.content.contains("Year-end review"),
+            "should contain label"
+        );
+        assert!(result.content.contains("id:"), "should contain task id");
+        assert!(
+            result.content.contains("next fire:"),
+            "should contain next fire time"
+        );
+
+        // Only one reminder in DB
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(reminders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_allows_different_label() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        tool.execute(
+            serde_json::json!({
+                "fire_at": "2099-12-31T23:59:59Z",
+                "message": "Year-end review"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Different reminder"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("scheduled"));
+
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(reminders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_case_insensitive_duplicate() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        tool.execute(
+            serde_json::json!({
+                "fire_at": "2099-12-31T23:59:59Z",
+                "message": "Year-end review"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Different case should still be blocked — with details from original
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "YEAR-END REVIEW"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("already exists"));
+        assert!(result.content.contains("id:"), "should contain task id");
+
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(reminders.len(), 1);
     }
 
     #[tokio::test]
