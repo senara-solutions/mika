@@ -253,6 +253,7 @@ async fn spawn_agent_worker(
                             "tool_result",
                             &result,
                             Some(&metadata),
+                            None,
                         )
                         .await;
 

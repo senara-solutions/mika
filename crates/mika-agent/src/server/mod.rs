@@ -166,15 +166,15 @@ async fn startup_cleanup(db: AsyncDatabase) {
     }
 
     // Compact old memory events into monthly summaries
-    match db.compact_old_memory_events(90).await {
+    match db.compact_old_audit_events(90).await {
         Ok(deleted) if deleted > 0 => {
-            info!(deleted, "compacted old memory events");
+            info!(deleted, "compacted old audit events");
             if let Err(e) = db.vacuum().await {
                 warn!(error = %e, "failed to vacuum database");
             }
         }
         Ok(_) => {}
-        Err(e) => warn!(error = %e, "failed to compact old memory events"),
+        Err(e) => warn!(error = %e, "failed to compact old audit events"),
     }
 
     // Warn if DB is growing large
@@ -1058,6 +1058,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         })
         .await
         .unwrap()
@@ -1231,6 +1232,7 @@ mod tests {
                 action_config: r#"{"text":"hi"}"#.to_string(),
                 input_context: None,
                 created_by_session: None,
+                created_trace_id: None,
             })
             .await
             .unwrap();

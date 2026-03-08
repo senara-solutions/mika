@@ -47,7 +47,7 @@ impl Tool for SendMessageTool {
 
         // Persist the outbound message for conversation history
         ctx.db
-            .save_message(ctx.session_id, "assistant", text)
+            .save_message(ctx.session_id, "assistant", text, None)
             .await?;
 
         match &ctx.message_sender {

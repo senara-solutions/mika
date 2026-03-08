@@ -101,6 +101,7 @@ mod tests {
                 action_config: "{}".to_string(),
                 input_context: None,
                 created_by_session: None,
+                created_trace_id: None,
             })
             .await
             .unwrap()

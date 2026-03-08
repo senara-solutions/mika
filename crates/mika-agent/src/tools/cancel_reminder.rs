@@ -62,6 +62,7 @@ mod tests {
                 action_config: serde_json::json!({"text": message}).to_string(),
                 input_context: None,
                 created_by_session: None,
+                created_trace_id: None,
             })
             .await
             .unwrap()

@@ -133,13 +133,14 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
         None
     };
     ctx.db
-        .log_memory_event(
+        .log_audit_event(
             ctx.session_id,
             "update_fact",
             &target,
             before_status.as_deref(),
             &after,
             reasoning.as_deref(),
+            None,
         )
         .await?;
 
@@ -363,7 +364,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = harness.db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_fact");
         assert!(events[0].target_key.starts_with("commitment:"));
@@ -438,7 +439,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = harness.db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].before_value.as_deref(),

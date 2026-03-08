@@ -193,13 +193,14 @@ impl Tool for UpdateCoreMemoryTool {
             reasoning.to_string()
         };
         ctx.db
-            .log_memory_event(
+            .log_audit_event(
                 ctx.session_id,
                 "update_core_memory",
                 section,
                 before_value,
                 &new_value,
                 Some(&audit_reasoning),
+                None,
             )
             .await?;
 
@@ -453,7 +454,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = harness.db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_core_memory");
         assert_eq!(events[0].target_key, "user_summary");
@@ -582,7 +583,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = harness.db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         let reasoning = events[0].reasoning.as_deref().unwrap();
         assert!(reasoning.contains("[evidence]"));

@@ -388,6 +388,7 @@ async fn run_loop(
                             "assistant",
                             &text,
                             metadata.as_deref(),
+                            None,
                         )
                         .await?;
                     }
@@ -593,7 +594,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
     };
     params
         .db
-        .save_message(params.session_id, "user", &save_text)
+        .save_message(params.session_id, "user", &save_text, None)
         .await?;
 
     let agent_name = params
@@ -642,7 +643,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
             params
                 .db
-                .save_message(params.session_id, "assistant", fallback)
+                .save_message(params.session_id, "assistant", fallback, None)
                 .await?;
             Ok(AgentOutput {
                 text: Some(fallback.to_string()),
@@ -874,7 +875,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         };
 
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref())
+        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref(), None)
             .await?;
         return Ok(AgentOutput {
             text: Some(text),
@@ -1214,7 +1215,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
             };
 
             // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
-            let memory_events = db.get_memory_events_since(midnight_unix).await?;
+            let memory_events = db.get_audit_events_since(midnight_unix).await?;
             let mem_digest = if memory_events.is_empty() {
                 None
             } else {
@@ -1387,13 +1388,13 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     // Post-loop: record reflection results and optionally notify user
     if is_reflection {
         let changes = db
-            .count_memory_events_for_session(params.session_id)
+            .count_audit_events_for_session(params.session_id)
             .await
             .unwrap_or(0);
 
         // Build summary from memory events
         let summary = if changes > 0 {
-            let events = db.get_memory_events(params.session_id).await?;
+            let events = db.get_audit_events(params.session_id).await?;
             let lines: Vec<String> = events
                 .iter()
                 .map(|e| format!("  - {} on {}", e.tool_name, e.target_key))
@@ -2129,6 +2130,7 @@ mod tests {
             "assistant",
             "I searched your memory.",
             Some(metadata),
+            None,
         )
         .await
         .unwrap();
@@ -2143,7 +2145,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_without_metadata_loads_as_none() {
         let db = test_async_db();
-        db.save_message("test-session", "user", "Hello")
+        db.save_message("test-session", "user", "Hello", None)
             .await
             .unwrap();
 
@@ -2155,7 +2157,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_with_null_metadata() {
         let db = test_async_db();
-        db.save_message_with_metadata("test-session", "assistant", "No tools used.", None)
+        db.save_message_with_metadata("test-session", "assistant", "No tools used.", None, None)
             .await
             .unwrap();
 

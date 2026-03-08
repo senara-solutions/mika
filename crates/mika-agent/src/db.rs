@@ -18,7 +18,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// Check if an anyhow error is a SQLite UNIQUE constraint violation.
 pub fn is_unique_violation(err: &anyhow::Error) -> bool {
@@ -114,6 +114,7 @@ pub struct NewTask {
     pub action_config: String,
     pub input_context: Option<String>,
     pub created_by_session: Option<String>,
+    pub created_trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,7 +184,7 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone)]
-pub struct MemoryEvent {
+pub struct AuditEvent {
     pub id: i64,
     pub session_id: String,
     pub tool_name: String,
@@ -340,6 +341,10 @@ impl Database {
             self.migrate_v3_to_v4()?;
             info!(version = 4, "database migrated to v4");
         }
+        if version == 4 || version == 3 {
+            self.migrate_v4_to_v5()?;
+            info!(version = 5, "database migrated to v5");
+        }
         Ok(())
     }
 
@@ -355,6 +360,8 @@ impl Database {
             "DROP TABLE IF EXISTS reflection_runs",
             "DROP TABLE IF EXISTS failed_sends",
             "DROP TABLE IF EXISTS customer_config",
+            "DROP TABLE IF EXISTS audit_event_summaries",
+            "DROP TABLE IF EXISTS audit_events",
             "DROP TABLE IF EXISTS memory_event_summaries",
             "DROP TABLE IF EXISTS memory_events",
             "DROP TABLE IF EXISTS search_content",
@@ -387,7 +394,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (4);
+            INSERT INTO schema_version (version) VALUES (5);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -452,6 +459,7 @@ impl Database {
                 input_context TEXT,
                 result TEXT,
                 created_by_session TEXT,
+                created_trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 fired_at INTEGER,
@@ -483,11 +491,13 @@ impl Database {
                 role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
                 content TEXT NOT NULL,
                 metadata TEXT,
+                trace_id TEXT,
                 compacted_through_id INTEGER,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
             CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
+            CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
 
             CREATE TABLE core_memory (
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -543,7 +553,7 @@ impl Database {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
 
-            CREATE TABLE memory_events (
+            CREATE TABLE audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 session_id TEXT NOT NULL,
@@ -552,12 +562,14 @@ impl Database {
                 before_value TEXT,
                 after_value TEXT NOT NULL,
                 reasoning TEXT,
+                trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            CREATE INDEX idx_memev_agent_created ON memory_events(agent_id, created_at DESC);
-            CREATE INDEX idx_memev_session ON memory_events(session_id);
+            CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
+            CREATE INDEX idx_audit_session ON audit_events(session_id);
+            CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
 
-            CREATE TABLE memory_event_summaries (
+            CREATE TABLE audit_event_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 year INTEGER NOT NULL,
@@ -587,6 +599,7 @@ impl Database {
                 agent_name TEXT,
                 entry_type TEXT NOT NULL,
                 content TEXT NOT NULL,
+                trace_id TEXT,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
@@ -639,6 +652,41 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_description
                 ON events(agent_id, description COLLATE NOCASE, event_date)
                 WHERE event_date IS NOT NULL;
+
+            -- Unified timeline VIEW for cross-subsystem queries
+            CREATE VIEW IF NOT EXISTS unified_timeline AS
+            SELECT
+                trace_id,
+                session_id,
+                agent_id,
+                'message' AS event_type,
+                role AS event_subtype,
+                CASE
+                    WHEN length(content) > 200 THEN substr(content, 1, 200) || '...'
+                    ELSE content
+                END AS summary,
+                created_at
+            FROM messages
+            UNION ALL
+            SELECT
+                trace_id,
+                session_id,
+                agent_id,
+                'audit' AS event_type,
+                tool_name AS event_subtype,
+                target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || after_value AS summary,
+                created_at
+            FROM audit_events
+            UNION ALL
+            SELECT
+                created_trace_id AS trace_id,
+                created_by_session AS session_id,
+                agent_id,
+                'task' AS event_type,
+                action_type AS event_subtype,
+                label || ' [' || status || ']' AS summary,
+                created_at
+            FROM tasks;
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -716,6 +764,127 @@ impl Database {
         self.conn
             .execute("INSERT INTO schema_version (version) VALUES (4)", [])?;
         Ok(())
+    }
+
+    /// Migration v4 → v5: Rename memory_events → audit_events, add trace_id columns,
+    /// create unified_timeline VIEW.
+    ///
+    /// Idempotent: each step checks existence before acting, since `ALTER TABLE RENAME TO`
+    /// auto-commits outside transactions in SQLite and a crash mid-migration could leave
+    /// partial state.
+    fn migrate_v4_to_v5(&self) -> Result<()> {
+        info!("migrating database schema v4 → v5 (orthogonal observability)");
+
+        // 1. Rename memory_events → audit_events (idempotent)
+        let has_old: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memory_events'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_old {
+            self.conn
+                .execute_batch("ALTER TABLE memory_events RENAME TO audit_events")?;
+        }
+
+        // 2. Recreate indexes with new names
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_memev_agent_created;
+             DROP INDEX IF EXISTS idx_memev_session;
+             CREATE INDEX IF NOT EXISTS idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id);",
+        )?;
+
+        // 3. Rename memory_event_summaries → audit_event_summaries (idempotent)
+        let has_old_summaries: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memory_event_summaries'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_old_summaries {
+            self.conn.execute_batch(
+                "ALTER TABLE memory_event_summaries RENAME TO audit_event_summaries",
+            )?;
+        }
+
+        // 4. Add trace_id columns (idempotent — ALTER TABLE ADD COLUMN is a no-op if exists)
+        // We check column existence via pragma to avoid "duplicate column" errors on re-run.
+        if !self.column_exists("messages", "trace_id")? {
+            self.conn
+                .execute_batch("ALTER TABLE messages ADD COLUMN trace_id TEXT")?;
+        }
+        if !self.column_exists("tasks", "created_trace_id")? {
+            self.conn
+                .execute_batch("ALTER TABLE tasks ADD COLUMN created_trace_id TEXT")?;
+        }
+        if !self.column_exists("audit_events", "trace_id")? {
+            self.conn
+                .execute_batch("ALTER TABLE audit_events ADD COLUMN trace_id TEXT")?;
+        }
+        if !self.column_exists("team_workspace", "trace_id")? {
+            self.conn
+                .execute_batch("ALTER TABLE team_workspace ADD COLUMN trace_id TEXT")?;
+        }
+
+        // 5. Create partial indexes on trace_id columns
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;",
+        )?;
+
+        // 6. Create unified_timeline VIEW
+        self.conn.execute_batch(
+            "DROP VIEW IF EXISTS unified_timeline;
+             CREATE VIEW unified_timeline AS
+             SELECT
+                 trace_id,
+                 session_id,
+                 agent_id,
+                 'message' AS event_type,
+                 role AS event_subtype,
+                 CASE
+                     WHEN length(content) > 200 THEN substr(content, 1, 200) || '...'
+                     ELSE content
+                 END AS summary,
+                 created_at
+             FROM messages
+             UNION ALL
+             SELECT
+                 trace_id,
+                 session_id,
+                 agent_id,
+                 'audit' AS event_type,
+                 tool_name AS event_subtype,
+                 target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || after_value AS summary,
+                 created_at
+             FROM audit_events
+             UNION ALL
+             SELECT
+                 created_trace_id AS trace_id,
+                 created_by_session AS session_id,
+                 agent_id,
+                 'task' AS event_type,
+                 action_type AS event_subtype,
+                 label || ' [' || status || ']' AS summary,
+                 created_at
+             FROM tasks;",
+        )?;
+
+        // 7. Update schema version
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (5)", [])?;
+
+        Ok(())
+    }
+
+    /// Check if a column exists on a table (used for idempotent migrations).
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info('{table}')"))?;
+        let exists = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .any(|name| name.as_ref().map_or(false, |n| n == column));
+        Ok(exists)
     }
 
     // ===== Agent CRUD =====
@@ -803,12 +972,12 @@ impl Database {
                 id, agent_id, team_run_id, parent_task_id, depth, label,
                 trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
                 next_fire_at, timeout_at, action_type, action_config,
-                input_context, created_by_session
+                input_context, created_by_session, created_trace_id
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15,
-                ?16, ?17
+                ?16, ?17, ?18
              )",
             params![
                 id,
@@ -828,6 +997,7 @@ impl Database {
                 task.action_config,
                 task.input_context,
                 task.created_by_session,
+                task.created_trace_id,
             ],
         )?;
         Ok(id)
@@ -842,14 +1012,15 @@ impl Database {
              (id, agent_id, team_run_id, parent_task_id, depth, label,
               trigger_type, cron_expr, event_source, event_offset_secs,
               condition_expr, next_fire_at, timeout_at, action_type,
-              action_config, status, input_context, created_by_session)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17)",
+              action_config, status, input_context, created_by_session, created_trace_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18)",
             params![
                 id, task.agent_id, task.team_run_id, task.parent_task_id,
                 task.depth, task.label, task.trigger_type, task.cron_expr,
                 task.event_source, task.event_offset_secs, task.condition_expr,
                 task.next_fire_at, task.timeout_at, task.action_type,
-                task.action_config, task.input_context, task.created_by_session
+                task.action_config, task.input_context, task.created_by_session,
+                task.created_trace_id
             ],
         )?;
         if n > 0 {
@@ -1341,11 +1512,12 @@ impl Database {
         session_id: &str,
         role: &str,
         content: &str,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (session_id, agent_id, role, content)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, agent_id, role, content],
+            "INSERT INTO messages (session_id, agent_id, role, content, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, agent_id, role, content, trace_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1357,11 +1529,12 @@ impl Database {
         role: &str,
         content: &str,
         metadata: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (session_id, agent_id, role, content, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, agent_id, role, content, metadata],
+            "INSERT INTO messages (session_id, agent_id, role, content, metadata, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session_id, agent_id, role, content, metadata, trace_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1953,10 +2126,10 @@ impl Database {
         Ok(rows)
     }
 
-    // ===== Memory Events (Audit Log) =====
+    // ===== Audit Events =====
 
     #[allow(clippy::too_many_arguments)]
-    pub fn log_memory_event(
+    pub fn log_audit_event(
         &self,
         agent_id: &str,
         session_id: &str,
@@ -1965,11 +2138,12 @@ impl Database {
         before_value: Option<&str>,
         after_value: &str,
         reasoning: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO memory_events
-             (agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO audit_events
+             (agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 agent_id,
                 session_id,
@@ -1977,22 +2151,23 @@ impl Database {
                 target_key,
                 before_value,
                 after_value,
-                reasoning
+                reasoning,
+                trace_id
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_memory_events(&self, agent_id: &str, session_id: &str) -> Result<Vec<MemoryEvent>> {
+    pub fn get_audit_events(&self, agent_id: &str, session_id: &str) -> Result<Vec<AuditEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
                      datetime(created_at, 'unixepoch')
-              FROM memory_events WHERE agent_id = ?1 AND session_id = ?2
+              FROM audit_events WHERE agent_id = ?1 AND session_id = ?2
               ORDER BY created_at ASC",
         )?;
         let rows = stmt
             .query_map(params![agent_id, session_id], |r| {
-                Ok(MemoryEvent {
+                Ok(AuditEvent {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
                     tool_name: r.get(2)?,
@@ -2007,20 +2182,20 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn get_memory_events_since(
+    pub fn get_audit_events_since(
         &self,
         agent_id: &str,
         since_unix: i64,
-    ) -> Result<Vec<MemoryEvent>> {
+    ) -> Result<Vec<AuditEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
                      datetime(created_at, 'unixepoch')
-              FROM memory_events WHERE agent_id = ?1 AND created_at >= ?2
+              FROM audit_events WHERE agent_id = ?1 AND created_at >= ?2
               ORDER BY created_at ASC",
         )?;
         let rows = stmt
             .query_map(params![agent_id, since_unix], |r| {
-                Ok(MemoryEvent {
+                Ok(AuditEvent {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
                     tool_name: r.get(2)?,
@@ -2035,16 +2210,16 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn count_memory_events_for_session(&self, agent_id: &str, session_id: &str) -> Result<i64> {
+    pub fn count_audit_events_for_session(&self, agent_id: &str, session_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memory_events WHERE agent_id = ?1 AND session_id = ?2",
+            "SELECT COUNT(*) FROM audit_events WHERE agent_id = ?1 AND session_id = ?2",
             params![agent_id, session_id],
             |r| r.get(0),
         )?;
         Ok(n)
     }
 
-    pub fn compact_old_memory_events(&self, agent_id: &str, days: u32) -> Result<usize> {
+    pub fn compact_old_audit_events(&self, agent_id: &str, days: u32) -> Result<usize> {
         let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
         let mut stmt = self.conn.prepare(
             "SELECT
@@ -2055,7 +2230,7 @@ impl Database {
                      tool_name || ': ' || target_key || ' = ' || substr(after_value, 1, 100),
                      '; '
                  ) AS summary
-             FROM memory_events
+             FROM audit_events
              WHERE agent_id = ?1 AND created_at < ?2
              GROUP BY year, month",
         )?;
@@ -2070,14 +2245,14 @@ impl Database {
         let count = groups.len();
         for (year, month, event_count, summary) in groups {
             self.conn.execute(
-                "INSERT OR REPLACE INTO memory_event_summaries
+                "INSERT OR REPLACE INTO audit_event_summaries
                  (agent_id, year, month, summary, event_count)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![agent_id, year, month, summary, event_count],
             )?;
         }
         self.conn.execute(
-            "DELETE FROM memory_events WHERE agent_id = ?1 AND created_at < ?2",
+            "DELETE FROM audit_events WHERE agent_id = ?1 AND created_at < ?2",
             params![agent_id, cutoff],
         )?;
         Ok(count)
@@ -2430,11 +2605,12 @@ impl Database {
         entry_type: &str,
         content: &str,
         iteration: u32,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO team_workspace (run_id, parent_id, agent_name, entry_type, content, iteration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run_id, parent_id, agent_name, entry_type, content, iteration],
+            "INSERT INTO team_workspace (run_id, parent_id, agent_name, entry_type, content, iteration, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![run_id, parent_id, agent_name, entry_type, content, iteration, trace_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -2830,7 +3006,7 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
                   AND name IN ('agents','teams','tasks','sessions','messages','core_memory',
                                'people','commitments','preferences','events',
-                               'memory_events','memory_event_summaries','search_content',
+                               'audit_events','audit_event_summaries','search_content',
                                'team_runs','team_workspace','heartbeat_sends',
                                'reflection_runs','customer_config','failed_sends')",
                 [],
@@ -2857,8 +3033,8 @@ mod tests {
     #[test]
     fn test_save_and_load_messages() {
         let (db, sid) = db_with_session();
-        db.save_message("mika", &sid, "user", "Hello!").unwrap();
-        db.save_message("mika", &sid, "assistant", "Hi!").unwrap();
+        db.save_message("mika", &sid, "user", "Hello!", None).unwrap();
+        db.save_message("mika", &sid, "assistant", "Hi!", None).unwrap();
         let msgs = db.load_recent_messages("mika", 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
@@ -2870,7 +3046,7 @@ mod tests {
     fn test_load_recent_messages_limit() {
         let (db, sid) = db_with_session();
         for i in 0..5 {
-            db.save_message("mika", &sid, "user", &format!("msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
                 .unwrap();
         }
         let msgs = db.load_recent_messages("mika", 3).unwrap();
@@ -2881,9 +3057,9 @@ mod tests {
     #[test]
     fn test_load_messages_after() {
         let (db, sid) = db_with_session();
-        db.save_message("mika", &sid, "user", "msg 1").unwrap();
-        db.save_message("mika", &sid, "user", "msg 2").unwrap();
-        db.save_message("mika", &sid, "user", "msg 3").unwrap();
+        db.save_message("mika", &sid, "user", "msg 1", None).unwrap();
+        db.save_message("mika", &sid, "user", "msg 2", None).unwrap();
+        db.save_message("mika", &sid, "user", "msg 3", None).unwrap();
 
         let all = db.load_messages_after("mika", 0).unwrap();
         assert_eq!(all.len(), 3);
@@ -2901,9 +3077,9 @@ mod tests {
         let db = db();
         db.create_session("tg-session", "mika", "telegram").unwrap();
         db.create_session("cli-session", "mika", "cli").unwrap();
-        db.save_message("mika", "tg-session", "user", "telegram msg")
+        db.save_message("mika", "tg-session", "user", "telegram msg", None)
             .unwrap();
-        db.save_message("mika", "cli-session", "user", "cli msg")
+        db.save_message("mika", "cli-session", "user", "cli msg", None)
             .unwrap();
 
         let msgs = db.load_recent_messages("mika", 10).unwrap();
@@ -2918,9 +3094,9 @@ mod tests {
         let db = db();
         db.create_session("team-session", "mika", "team").unwrap();
         db.create_session("cli-session", "mika", "cli").unwrap();
-        db.save_message("mika", "team-session", "assistant", "team msg")
+        db.save_message("mika", "team-session", "assistant", "team msg", None)
             .unwrap();
-        db.save_message("mika", "cli-session", "user", "cli msg")
+        db.save_message("mika", "cli-session", "user", "cli msg", None)
             .unwrap();
 
         let msgs = db.load_recent_messages("mika", 10).unwrap();
@@ -2933,7 +3109,7 @@ mod tests {
     fn test_load_recent_messages_includes_telegram() {
         let db = db();
         db.create_session("tg-session", "mika", "telegram").unwrap();
-        db.save_message("mika", "tg-session", "user", "hello from telegram")
+        db.save_message("mika", "tg-session", "user", "hello from telegram", None)
             .unwrap();
 
         let msgs = db.load_recent_messages("mika", 10).unwrap();
@@ -2949,15 +3125,15 @@ mod tests {
         db.create_session("tg-session", "mika", "telegram").unwrap();
         db.create_session("team-session", "mika", "team").unwrap();
 
-        db.save_message("mika", "cli-session", "user", "cli 1")
+        db.save_message("mika", "cli-session", "user", "cli 1", None)
             .unwrap();
-        db.save_message("mika", "team-session", "assistant", "team 1")
+        db.save_message("mika", "team-session", "assistant", "team 1", None)
             .unwrap();
-        db.save_message("mika", "tg-session", "user", "tg 1")
+        db.save_message("mika", "tg-session", "user", "tg 1", None)
             .unwrap();
-        db.save_message("mika", "team-session", "assistant", "team 2")
+        db.save_message("mika", "team-session", "assistant", "team 2", None)
             .unwrap();
-        db.save_message("mika", "cli-session", "user", "cli 2")
+        db.save_message("mika", "cli-session", "user", "cli 2", None)
             .unwrap();
 
         let msgs = db.load_recent_messages("mika", 10).unwrap();
@@ -2998,7 +3174,7 @@ mod tests {
     fn test_last_user_message_time() {
         let (db, sid) = db_with_session();
         assert!(db.last_user_message_time("mika").unwrap().is_none());
-        db.save_message("mika", &sid, "user", "hello").unwrap();
+        db.save_message("mika", &sid, "user", "hello", None).unwrap();
         let ts = db.last_user_message_time("mika").unwrap();
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
@@ -3007,8 +3183,8 @@ mod tests {
     #[test]
     fn test_replace_with_summary() {
         let (db, sid) = db_with_session();
-        let id1 = db.save_message("mika", &sid, "user", "msg1").unwrap();
-        db.save_message("mika", &sid, "assistant", "reply1")
+        let id1 = db.save_message("mika", &sid, "user", "msg1", None).unwrap();
+        db.save_message("mika", &sid, "assistant", "reply1", None)
             .unwrap();
         db.replace_with_summary("mika", "Summary text", id1)
             .unwrap();
@@ -3022,8 +3198,8 @@ mod tests {
     #[test]
     fn test_count_messages_excludes_summary() {
         let (db, sid) = db_with_session();
-        db.save_message("mika", &sid, "user", "a").unwrap();
-        db.save_message("mika", &sid, "assistant", "b").unwrap();
+        db.save_message("mika", &sid, "user", "a", None).unwrap();
+        db.save_message("mika", &sid, "assistant", "b", None).unwrap();
         let sys_session = db.get_or_create_system_session("mika").unwrap();
         db.conn
             .execute(
@@ -3110,9 +3286,9 @@ mod tests {
     }
 
     #[test]
-    fn test_log_and_get_memory_events() {
+    fn test_log_and_get_audit_events() {
         let db = db();
-        db.log_memory_event(
+        db.log_audit_event(
             "mika",
             "sess1",
             "update_core_memory",
@@ -3120,19 +3296,20 @@ mod tests {
             None,
             "New summary",
             Some("reason"),
+            None,
         )
         .unwrap();
-        let events = db.get_memory_events("mika", "sess1").unwrap();
+        let events = db.get_audit_events("mika", "sess1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_core_memory");
     }
 
     #[test]
-    fn test_get_memory_events_since() {
+    fn test_get_audit_events_since() {
         let db = db();
         db.conn
             .execute(
-                "INSERT INTO memory_events
+                "INSERT INTO audit_events
                   (agent_id, session_id, tool_name, target_key, after_value, created_at)
                   VALUES ('mika', 's1', 'tool', 'key', 'val', 1000)",
                 [],
@@ -3140,13 +3317,13 @@ mod tests {
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO memory_events
+                "INSERT INTO audit_events
                   (agent_id, session_id, tool_name, target_key, after_value, created_at)
                   VALUES ('mika', 's2', 'tool', 'key', 'val', 2000)",
                 [],
             )
             .unwrap();
-        let evs = db.get_memory_events_since("mika", 1500).unwrap();
+        let evs = db.get_audit_events_since("mika", 1500).unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].session_id, "s2");
     }
@@ -3240,7 +3417,7 @@ mod tests {
         let db = db();
         db.insert_team_run("run-001", "eng", "Goal", 3, 0).unwrap();
         let id = db
-            .insert_team_workspace_entry("run-001", None, Some("mika"), "plan", "Do this", 1)
+            .insert_team_workspace_entry("run-001", None, Some("mika"), "plan", "Do this", 1, None)
             .unwrap();
         let entries = db.load_team_workspace("run-001").unwrap();
         assert_eq!(entries.len(), 1);
@@ -3268,6 +3445,7 @@ mod tests {
             action_config: r#"{"message":"hello"}"#.to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -3296,6 +3474,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(&task).unwrap();
         assert!(db.cancel_task(&id, "mika").unwrap());
@@ -3394,24 +3573,24 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_old_memory_events() {
+    fn test_compact_old_audit_events() {
         let db = db();
         // Insert old events
         db.conn
             .execute_batch(
-                "INSERT INTO memory_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
+                "INSERT INTO audit_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
                   VALUES ('mika', 's1', 'tool', 'k1', 'v1', 1580000000);
-                 INSERT INTO memory_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
+                 INSERT INTO audit_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
                   VALUES ('mika', 's1', 'tool', 'k2', 'v2', 1580000001);",
             )
             .unwrap();
         // Insert recent event
-        db.log_memory_event("mika", "s2", "tool", "k3", None, "v3", None)
+        db.log_audit_event("mika", "s2", "tool", "k3", None, "v3", None, None)
             .unwrap();
-        let compacted = db.compact_old_memory_events("mika", 30).unwrap();
+        let compacted = db.compact_old_audit_events("mika", 30).unwrap();
         assert!(compacted > 0);
         // Old events gone, recent one stays
-        let recent = db.get_memory_events("mika", "s2").unwrap();
+        let recent = db.get_audit_events("mika", "s2").unwrap();
         assert_eq!(recent.len(), 1);
     }
 
@@ -3419,7 +3598,7 @@ mod tests {
     fn test_load_messages_before_window() {
         let (db, sid) = db_with_session();
         for i in 0..5 {
-            db.save_message("mika", &sid, "user", &format!("msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
                 .unwrap();
         }
         let before = db.load_messages_before_window("mika", 2).unwrap();
@@ -3448,6 +3627,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
@@ -3471,6 +3651,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         }
     }
 
@@ -3703,6 +3884,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id1 = db.create_task(&task).unwrap();
         assert!(!id1.is_empty());
@@ -3730,6 +3912,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id2 = db.create_task(&task2).unwrap();
         assert!(!id2.is_empty());
@@ -3759,6 +3942,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         }
     }
 

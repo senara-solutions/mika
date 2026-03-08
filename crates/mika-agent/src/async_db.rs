@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
-    AgentRow, Commitment, CoreMemoryEntry, Database, Event, FailedSend, MemoryEvent, NewTask,
+    AgentRow, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend, NewTask,
     Person, Preference, SearchResult, SessionMessage, Task, TeamRow, TeamRunRow,
     TeamWorkspaceEntry,
 };
@@ -378,14 +378,21 @@ impl AsyncDatabase {
 
     // -- Messages --
 
-    pub async fn save_message(&self, session_id: &str, role: &str, content: &str) -> Result<i64> {
-        let (a, sid, r, c) = (
+    pub async fn save_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        let (a, sid, r, c, t) = (
             self.agent_id.clone(),
             session_id.to_owned(),
             role.to_owned(),
             content.to_owned(),
+            trace_id.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.save_message(&a, &sid, &r, &c))
+        self.with_db(move |db| db.save_message(&a, &sid, &r, &c, t.as_deref()))
             .await
     }
 
@@ -395,16 +402,20 @@ impl AsyncDatabase {
         role: &str,
         content: &str,
         metadata: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
-        let (a, sid, r, c, m) = (
+        let (a, sid, r, c, m, t) = (
             self.agent_id.clone(),
             session_id.to_owned(),
             role.to_owned(),
             content.to_owned(),
             metadata.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref()))
-            .await
+        self.with_db(move |db| {
+            db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref(), t.as_deref())
+        })
+        .await
     }
 
     pub async fn load_recent_messages(&self, limit: usize) -> Result<Vec<SessionMessage>> {
@@ -675,9 +686,9 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn compact_old_memory_events(&self, days: u32) -> Result<usize> {
+    pub async fn compact_old_audit_events(&self, days: u32) -> Result<usize> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.compact_old_memory_events(&a, days))
+        self.with_db(move |db| db.compact_old_audit_events(&a, days))
             .await
     }
 
@@ -726,7 +737,7 @@ impl AsyncDatabase {
 
     // -- Audit --
 
-    pub async fn log_memory_event(
+    pub async fn log_audit_event(
         &self,
         session_id: &str,
         tool_name: &str,
@@ -734,8 +745,9 @@ impl AsyncDatabase {
         before_value: Option<&str>,
         after_value: &str,
         reasoning: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<()> {
-        let (a, sid, tn, tk, bv, av, r) = (
+        let (a, sid, tn, tk, bv, av, r, t) = (
             self.agent_id.clone(),
             session_id.to_owned(),
             tool_name.to_owned(),
@@ -743,16 +755,26 @@ impl AsyncDatabase {
             before_value.map(|s| s.to_owned()),
             after_value.to_owned(),
             reasoning.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
-            db.log_memory_event(&a, &sid, &tn, &tk, bv.as_deref(), &av, r.as_deref())
+            db.log_audit_event(
+                &a,
+                &sid,
+                &tn,
+                &tk,
+                bv.as_deref(),
+                &av,
+                r.as_deref(),
+                t.as_deref(),
+            )
         })
         .await
     }
 
-    pub async fn get_memory_events(&self, session_id: &str) -> Result<Vec<MemoryEvent>> {
+    pub async fn get_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>> {
         let (a, s) = (self.agent_id.clone(), session_id.to_owned());
-        self.with_db(move |db| db.get_memory_events(&a, &s)).await
+        self.with_db(move |db| db.get_audit_events(&a, &s)).await
     }
 
     // -- Reflection --
@@ -763,9 +785,9 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn get_memory_events_since(&self, since_unix: i64) -> Result<Vec<MemoryEvent>> {
+    pub async fn get_audit_events_since(&self, since_unix: i64) -> Result<Vec<AuditEvent>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_memory_events_since(&a, since_unix))
+        self.with_db(move |db| db.get_audit_events_since(&a, since_unix))
             .await
     }
 
@@ -796,9 +818,9 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn count_memory_events_for_session(&self, session_id: &str) -> Result<i64> {
+    pub async fn count_audit_events_for_session(&self, session_id: &str) -> Result<i64> {
         let (a, s) = (self.agent_id.clone(), session_id.to_owned());
-        self.with_db(move |db| db.count_memory_events_for_session(&a, &s))
+        self.with_db(move |db| db.count_audit_events_for_session(&a, &s))
             .await
     }
 
@@ -960,15 +982,25 @@ impl AsyncDatabase {
         entry_type: &str,
         content: &str,
         iteration: u32,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
-        let (ri, an, et, c) = (
+        let (ri, an, et, c, t) = (
             run_id.to_owned(),
             agent_name.map(|s| s.to_owned()),
             entry_type.to_owned(),
             content.to_owned(),
+            trace_id.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
-            db.insert_team_workspace_entry(&ri, parent_id, an.as_deref(), &et, &c, iteration)
+            db.insert_team_workspace_entry(
+                &ri,
+                parent_id,
+                an.as_deref(),
+                &et,
+                &c,
+                iteration,
+                t.as_deref(),
+            )
         })
         .await
     }
@@ -1009,8 +1041,8 @@ mod tests {
     #[tokio::test]
     async fn test_async_save_and_load() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "Hello!").await.unwrap();
-        db.save_message(&sid, "assistant", "Hi there!")
+        db.save_message(&sid, "user", "Hello!", None).await.unwrap();
+        db.save_message(&sid, "assistant", "Hi there!", None)
             .await
             .unwrap();
         let messages = db.load_recent_messages(10).await.unwrap();
@@ -1022,8 +1054,8 @@ mod tests {
     #[tokio::test]
     async fn test_async_concurrent_reads() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "Message 1").await.unwrap();
-        db.save_message(&sid, "user", "Message 2").await.unwrap();
+        db.save_message(&sid, "user", "Message 1", None).await.unwrap();
+        db.save_message(&sid, "user", "Message 2", None).await.unwrap();
         let mut handles = Vec::new();
         for _ in 0..5 {
             let db_clone = db.clone();
@@ -1041,7 +1073,7 @@ mod tests {
     async fn test_async_clone_shares_connection() {
         let (db, sid) = test_async_db_with_session().await;
         let db2 = db.clone();
-        db.save_message(&sid, "user", "From clone 1").await.unwrap();
+        db.save_message(&sid, "user", "From clone 1", None).await.unwrap();
         let messages = db2.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);
     }
@@ -1049,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_survives_panic() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "before panic").await.unwrap();
+        db.save_message(&sid, "user", "before panic", None).await.unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         db.inner
             .sender
@@ -1080,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_joins_thread() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "before shutdown")
+        db.save_message(&sid, "user", "before shutdown", None)
             .await
             .unwrap();
         let messages = db.load_recent_messages(10).await.unwrap();
@@ -1091,7 +1123,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_rejects_subsequent_operations() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "msg").await.unwrap();
+        db.save_message(&sid, "user", "msg", None).await.unwrap();
         db.shutdown();
         let result = db.load_recent_messages(10).await;
         assert!(result.is_err());
@@ -1101,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_idempotent() {
         let (db, sid) = test_async_db_with_session().await;
-        db.save_message(&sid, "user", "msg").await.unwrap();
+        db.save_message(&sid, "user", "msg", None).await.unwrap();
         db.shutdown();
         db.shutdown();
     }
@@ -1110,7 +1142,7 @@ mod tests {
     async fn test_last_user_message_time_returns_i64() {
         let (db, sid) = test_async_db_with_session().await;
         assert!(db.last_user_message_time().await.unwrap().is_none());
-        db.save_message(&sid, "user", "hello").await.unwrap();
+        db.save_message(&sid, "user", "hello", None).await.unwrap();
         let ts = db.last_user_message_time().await.unwrap();
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
@@ -1125,8 +1157,8 @@ mod tests {
         db2.create_session("agent2-session", "agent2", "cli")
             .await
             .unwrap();
-        db.save_message(&sid, "user", "from main").await.unwrap();
-        db2.save_message("agent2-session", "user", "from agent2")
+        db.save_message(&sid, "user", "from main", None).await.unwrap();
+        db2.save_message("agent2-session", "user", "from agent2", None)
             .await
             .unwrap();
         let main_msgs = db.load_recent_messages(10).await.unwrap();
@@ -1157,6 +1189,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(task).await.unwrap();
         let t = db.get_task(&id).await.unwrap().unwrap();
