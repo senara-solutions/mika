@@ -307,7 +307,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
     );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
     prompt.push_str(
-        "- You can create reminders with create_reminder (requires ISO 8601 datetime in UTC).\n",
+        "- You can create reminders with create_reminder: one-shot (fire_at in ISO 8601 UTC) or periodic (cron_expr, 6-field cron with seconds first, e.g. '0 0 9 * * 1' for every Monday 9am UTC).\n",
     );
     prompt
         .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");

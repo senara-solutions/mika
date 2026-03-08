@@ -39,7 +39,14 @@ impl Tool for ListRemindersTool {
                 .next_fire_at
                 .map(format_unix_ts)
                 .unwrap_or_else(|| "unknown".to_string());
-            output.push_str(&format!("- {}: \"{}\" at {}\n", t.id, t.label, fire_at));
+            if let Some(ref cron) = t.cron_expr {
+                output.push_str(&format!(
+                    "- {}: \"{}\" next: {} (recurring: {})\n",
+                    t.id, t.label, fire_at, cron
+                ));
+            } else {
+                output.push_str(&format!("- {}: \"{}\" at {}\n", t.id, t.label, fire_at));
+            }
         }
 
         Ok(ToolOutput::success(output))
@@ -103,6 +110,41 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Meeting prep"));
         assert!(result.content.contains("Birthday party"));
+    }
+
+    #[tokio::test]
+    async fn test_list_reminders_shows_recurrence() {
+        let harness = TestHarness::new();
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Daily standup".to_string(),
+                trigger_type: "recurring".to_string(),
+                cron_expr: Some("0 0 9 * * *".to_string()),
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(4_070_908_800),
+                timeout_at: None,
+                action_type: "send_message".to_string(),
+                action_config: serde_json::json!({"text": "Daily standup"}).to_string(),
+                input_context: None,
+                created_by_session: None,
+            })
+            .await
+            .unwrap();
+
+        let ctx = harness.ctx();
+        let tool = ListRemindersTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Daily standup"));
+        assert!(result.content.contains("recurring: 0 0 9 * * *"));
     }
 
     #[tokio::test]
