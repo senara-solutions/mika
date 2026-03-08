@@ -140,7 +140,7 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
             before_status.as_deref(),
             &after,
             reasoning.as_deref(),
-            None,
+            Some(ctx.trace_id),
         )
         .await?;
 

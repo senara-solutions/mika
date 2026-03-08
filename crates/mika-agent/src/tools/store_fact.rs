@@ -140,7 +140,7 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
             None,
             &after,
             reasoning.as_deref(),
-            None,
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -222,7 +222,7 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
             None,
             description,
             reasoning.as_deref(),
-            None,
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -268,7 +268,7 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
             None,
             value,
             reasoning.as_deref(),
-            None,
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -337,7 +337,7 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
             None,
             description,
             reasoning.as_deref(),
-            None,
+            Some(ctx.trace_id),
         )
         .await?;
 

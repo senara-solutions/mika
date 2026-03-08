@@ -388,7 +388,7 @@ async fn run_loop(
                             "assistant",
                             &text,
                             metadata.as_deref(),
-                            None,
+                            Some(tool_ctx.trace_id),
                         )
                         .await?;
                     }
@@ -582,6 +582,8 @@ pub struct AgentParams<'a> {
 /// Run the agent loop for a single inbound message.
 /// Returns `AgentOutput` with text response, thinking, and usage info.
 pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
+    let trace_id = crate::trace::generate_trace_id();
+
     // Save the user message (with image annotation if images attached)
     let save_text = if params.user_images.is_empty() {
         params.user_message.to_string()
@@ -594,7 +596,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
     };
     params
         .db
-        .save_message(params.session_id, "user", &save_text, None)
+        .save_message(params.session_id, "user", &save_text, Some(&trace_id))
         .await?;
 
     let agent_name = params
@@ -606,12 +608,13 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         "agent_turn",
         agent = %agent_name,
         mode = "conversation",
+        trace_id = %trace_id,
         channel = %params.channel_type,
     );
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_agent_inner(params).instrument(span),
+        run_agent_inner(params, &trace_id).instrument(span),
     )
     .await;
 
@@ -643,7 +646,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
             params
                 .db
-                .save_message(params.session_id, "assistant", fallback, None)
+                .save_message(params.session_id, "assistant", fallback, Some(&trace_id))
                 .await?;
             Ok(AgentOutput {
                 text: Some(fallback.to_string()),
@@ -655,7 +658,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
 }
 
 /// Inner agent loop, separated so the outer function can wrap it in a timeout.
-async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
+async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<AgentOutput> {
     let db = params.db;
     let claude = params.claude;
     let tools = params.tools;
@@ -762,6 +765,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let tool_ctx = ToolContext {
         db,
         session_id: params.session_id,
+        trace_id,
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: params.is_onboarding,
@@ -875,7 +879,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         };
 
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref(), None)
+        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref(), Some(trace_id))
             .await?;
         return Ok(AgentOutput {
             text: Some(text),
@@ -1342,10 +1346,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     }];
 
     let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
+    let trace_id = crate::trace::generate_trace_id();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
         session_id: params.session_id,
+        trace_id: &trace_id,
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
@@ -1533,10 +1539,12 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         content: MessageContent::Text(params.task_message.to_string()),
     }];
 
+    let trace_id = crate::trace::generate_trace_id();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db: params.db,
         session_id: params.session_id,
+        trace_id: &trace_id,
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,

@@ -47,7 +47,7 @@ impl Tool for SendMessageTool {
 
         // Persist the outbound message for conversation history
         ctx.db
-            .save_message(ctx.session_id, "assistant", text, None)
+            .save_message(ctx.session_id, "assistant", text, Some(ctx.trace_id))
             .await?;
 
         match &ctx.message_sender {
@@ -127,6 +127,7 @@ mod tests {
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
             home_dir: std::path::Path::new("/tmp"),
             core_memory_edit_count: &harness.counter,
             is_onboarding: false,

@@ -4059,4 +4059,77 @@ mod tests {
         );
         assert!(!is_unique_violation(&anyhow::Error::from(notnull_err)));
     }
+
+    #[test]
+    fn test_trace_id_propagation() {
+        let (db, sid) = db_with_session();
+        let trace = "abcd1234abcd1234abcd1234abcd1234";
+
+        // Save message with trace_id
+        db.save_message("mika", &sid, "user", "traced msg", Some(trace))
+            .unwrap();
+
+        // Log audit event with trace_id
+        db.log_audit_event("mika", &sid, "store_fact", "person:Alice", None, "new", None, Some(trace))
+            .unwrap();
+
+        // Create task with trace_id
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "traced-task".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some(sid.clone()),
+            created_trace_id: Some(trace.to_string()),
+        };
+        db.create_task(&task).unwrap();
+
+        // Query unified_timeline for this trace_id
+        let rows: Vec<(String, String)> = db
+            .conn
+            .prepare("SELECT event_type, summary FROM unified_timeline WHERE trace_id = ?1 ORDER BY event_type")
+            .unwrap()
+            .query_map([trace], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "expected message + audit + task in unified_timeline");
+        let types: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(types.contains(&"audit"), "missing audit event");
+        assert!(types.contains(&"message"), "missing message");
+        assert!(types.contains(&"task"), "missing task");
+    }
+
+    #[test]
+    fn test_unified_timeline_includes_null_trace_id() {
+        let (db, sid) = db_with_session();
+
+        // Save message without trace_id (legacy behavior)
+        db.save_message("mika", &sid, "user", "legacy msg", None)
+            .unwrap();
+
+        // Query for NULL trace_id rows
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM unified_timeline WHERE trace_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(count >= 1, "legacy rows with NULL trace_id should appear in unified_timeline");
+    }
 }

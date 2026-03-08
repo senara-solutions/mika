@@ -96,7 +96,7 @@ impl Tool for CompleteTaskTool {
                 None,
                 &format!("Completed callback task: {} ({})", task.label, id),
                 None,
-                None,
+                Some(ctx.trace_id),
             )
             .await?;
 

@@ -212,7 +212,7 @@ impl Tool for CreateTaskTool {
             action_config: action_config_str.to_string(),
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
-            created_trace_id: None,
+            created_trace_id: Some(ctx.trace_id.to_string()),
         };
 
         let id = ctx.db.create_task(task).await?;
@@ -225,7 +225,7 @@ impl Tool for CreateTaskTool {
                 None,
                 &format!("{trigger_type_str}/{action_type_val} — {label}"),
                 None,
-                None,
+                Some(ctx.trace_id),
             )
             .await?;
 

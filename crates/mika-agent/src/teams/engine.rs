@@ -57,6 +57,8 @@ pub struct TeamEngine {
     team_db: AsyncDatabase,
     /// Message ID of the root goal message (set after insert).
     goal_msg_id: Option<i64>,
+    /// Trace ID for correlating all events within this team run.
+    trace_id: String,
 }
 
 impl TeamEngine {
@@ -162,6 +164,7 @@ impl TeamEngine {
             brave_api_key: settings.brave_api_key.clone(),
             team_db,
             goal_msg_id: None,
+            trace_id: crate::trace::generate_trace_id(),
         })
     }
 
@@ -186,6 +189,7 @@ impl TeamEngine {
             brave_api_key: settings.brave_api_key.clone(),
             team_db,
             goal_msg_id: None,
+            trace_id: crate::trace::generate_trace_id(),
         })
     }
 
@@ -347,7 +351,7 @@ impl TeamEngine {
         // Insert the goal as the root workspace entry
         match self
             .team_db
-            .insert_team_workspace_entry(&self.run.run_id, None, None, "goal", &self.run.goal, 0, None)
+            .insert_team_workspace_entry(&self.run.run_id, None, None, "goal", &self.run.goal, 0, Some(&self.trace_id))
             .await
         {
             Ok(id) => self.goal_msg_id = Some(id),
@@ -392,7 +396,7 @@ impl TeamEngine {
                             "error",
                             &e.to_string(),
                             self.run.iteration,
-                            None,
+                            Some(&self.trace_id),
                         )
                         .await
                 {
@@ -604,7 +608,7 @@ impl TeamEngine {
                             "orchestrator",
                             &response,
                             iteration,
-                            None,
+                            Some(&self.trace_id),
                         )
                         .await
                 {
@@ -626,7 +630,7 @@ impl TeamEngine {
                     "orchestrator",
                     &response,
                     iteration,
-                    None,
+                    Some(&self.trace_id),
                 )
                 .await
                 .ok();
@@ -643,7 +647,7 @@ impl TeamEngine {
                             "assignment",
                             &task.task,
                             iteration,
-                            None,
+                            Some(&self.trace_id),
                         )
                         .await
                     {
@@ -736,7 +740,7 @@ impl TeamEngine {
             .to_string(),
             input_context: Some(team_state),
             created_by_session: Some(format!("team-{}", self.run.run_id)),
-            created_trace_id: None,
+            created_trace_id: Some(self.trace_id.clone()),
         };
 
         let parent_task_id = self
@@ -766,7 +770,7 @@ impl TeamEngine {
                 .to_string(),
                 input_context: None,
                 created_by_session: Some(format!("team-{}-{}", self.run.run_id, input.agent_name)),
-                created_trace_id: None,
+                created_trace_id: Some(self.trace_id.clone()),
             };
 
             match self.team_db.create_task(child_task).await {
@@ -1067,7 +1071,7 @@ impl TeamEngine {
                     "critic",
                     &response,
                     self.run.iteration,
-                    None,
+                    Some(&self.trace_id),
                 )
                 .await
         {
@@ -1111,7 +1115,7 @@ impl TeamEngine {
         .to_string();
         if let Err(e) = self
             .team_db
-            .save_message_with_metadata(&team_session_id, "assistant", &response, Some(&metadata), None)
+            .save_message_with_metadata(&team_session_id, "assistant", &response, Some(&metadata), Some(&self.trace_id))
             .await
         {
             warn!(error = %e, "failed to persist deliverable message");

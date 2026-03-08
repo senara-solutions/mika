@@ -36,6 +36,7 @@ pub mod test_helpers {
         ToolContext {
             db,
             session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
             home_dir: std::path::Path::new(HOME_DIR),
             core_memory_edit_count: edit_count,
             is_onboarding,
@@ -99,6 +100,7 @@ pub mod test_helpers {
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
+                trace_id: "00000000000000000000000000000000",
                 home_dir: std::path::Path::new("/tmp/mika-test"),
                 core_memory_edit_count: &self.counter,
                 is_onboarding: false,
@@ -116,6 +118,7 @@ pub mod test_helpers {
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
+                trace_id: "00000000000000000000000000000000",
                 home_dir: home,
                 core_memory_edit_count: &self.counter,
                 is_onboarding: false,

@@ -165,9 +165,9 @@ Consistent with the existing pattern where `migrate_v1` creates the latest schem
 
 **Tasks:**
 
-- [ ] Create `crates/mika-agent/src/trace.rs` — `generate_trace_id()` function with OTel extraction (`#[cfg(feature = "telemetry")]`) and 128-bit random hex fallback
-- [ ] `crates/mika-agent/src/db.rs` — Bump `CURRENT_SCHEMA_VERSION` from 4 to 5
-- [ ] `crates/mika-agent/src/db.rs` — Add `migrate_v4_to_v5()` function (idempotent — each step checks existence before acting, since `ALTER TABLE RENAME TO` auto-commits outside transactions in SQLite):
+- [x] Create `crates/mika-agent/src/trace.rs` — `generate_trace_id()` function with OTel extraction (`#[cfg(feature = "telemetry")]`) and 128-bit random hex fallback
+- [x] `crates/mika-agent/src/db.rs` — Bump `CURRENT_SCHEMA_VERSION` from 4 to 5
+- [x] `crates/mika-agent/src/db.rs` — Add `migrate_v4_to_v5()` function (idempotent — each step checks existence before acting, since `ALTER TABLE RENAME TO` auto-commits outside transactions in SQLite):
   - Check `SELECT name FROM sqlite_master WHERE type='table' AND name='memory_events'` — only rename if old name still exists
   - `ALTER TABLE memory_events RENAME TO audit_events`
   - `DROP INDEX IF EXISTS idx_memev_agent_created` + recreate as `idx_audit_agent_created`
@@ -180,13 +180,13 @@ Consistent with the existing pattern where `migrate_v1` creates the latest schem
   - Create index: `CREATE INDEX idx_msg_trace ON messages(trace_id)` (partial: `WHERE trace_id IS NOT NULL`)
   - Create index: `CREATE INDEX idx_audit_trace ON audit_events(trace_id)` (partial: `WHERE trace_id IS NOT NULL`)
   - Create `unified_timeline` VIEW (see VIEW schema below)
-- [ ] `crates/mika-agent/src/db.rs` — Update `migrate_v1()` to create v5 schema directly:
+- [x] `crates/mika-agent/src/db.rs` — Update `migrate_v1()` to create v5 schema directly:
   - Tables named `audit_events` and `audit_event_summaries` (not `memory_events`)
   - All tables include `trace_id` columns
   - `unified_timeline` VIEW included
   - Insert `schema_version = 5`
-- [ ] `crates/mika-agent/src/db.rs` — Update migration dispatch to call `migrate_v4_to_v5()` when version == 4
-- [ ] Rename all Rust types and functions:
+- [x] `crates/mika-agent/src/db.rs` — Update migration dispatch to call `migrate_v4_to_v5()` when version == 4
+- [x] Rename all Rust types and functions:
   - `MemoryEvent` struct → `AuditEvent`
   - `log_memory_event()` → `log_audit_event()` (both `Database` and `AsyncDatabase`)
   - `get_memory_events()` → `get_audit_events()`
@@ -197,11 +197,11 @@ Consistent with the existing pattern where `migrate_v1` creates the latest schem
   - Update all 10 call sites in tool files
   - Update all references in `async_db.rs`
   - Update prompt text that mentions "memory events" in `prompt.rs`
-- [ ] Update `save_message()` and `save_message_with_metadata()` signatures to accept `Option<&str>` for trace_id (default `None` for now)
-- [ ] Update `create_task()` signature to accept `Option<&str>` for `created_trace_id` (default `None` for now)
-- [ ] Update `insert_team_workspace_entry()` signature to accept `Option<&str>` for trace_id (default `None` for now)
-- [ ] Tests: verify v4→v5 migration, verify clean-slate v1 creates v5 schema, verify VIEW returns rows, verify `unified_timeline WHERE trace_id IS NULL` includes legacy rows
-- [ ] Tests: verify idempotent migration (running v4→v5 twice does not fail — handles partial state from interrupted first run)
+- [x] Update `save_message()` and `save_message_with_metadata()` signatures to accept `Option<&str>` for trace_id (default `None` for now)
+- [x] Update `create_task()` signature to accept `Option<&str>` for `created_trace_id` (default `None` for now)
+- [x] Update `insert_team_workspace_entry()` signature to accept `Option<&str>` for trace_id (default `None` for now)
+- [x] Tests: verify v4→v5 migration, verify clean-slate v1 creates v5 schema, verify VIEW returns rows, verify `unified_timeline WHERE trace_id IS NULL` includes legacy rows
+- [x] Tests: verify idempotent migration (running v4→v5 twice does not fail — handles partial state from interrupted first run)
 
 **unified_timeline VIEW schema:**
 
@@ -249,8 +249,8 @@ FROM tasks;
 
 **Tasks:**
 
-- [ ] `crates/mika-agent/src/tools/mod.rs` — Add `pub trace_id: &'a str` field to `ToolContext`
-- [ ] `crates/mika-agent/src/agent.rs` — In `run_agent()` (line ~604): generate trace_id before span creation, add as span field:
+- [x] `crates/mika-agent/src/tools/mod.rs` — Add `pub trace_id: &'a str` field to `ToolContext`
+- [x] `crates/mika-agent/src/agent.rs` — In `run_agent()` (line ~604): generate trace_id before span creation, add as span field:
   ```rust
   let trace_id = generate_trace_id();
   let span = info_span!(
@@ -261,11 +261,11 @@ FROM tasks;
       channel = %params.channel_type,
   );
   ```
-- [ ] `crates/mika-agent/src/agent.rs` — In `run_agent_inner()`: pass `&trace_id` when constructing `ToolContext`
-- [ ] `crates/mika-agent/src/agent.rs` — In `run_silent_agent()` (line ~1150): same pattern — generate trace_id, add to span
-- [ ] `crates/mika-agent/src/agent.rs` — Update all `save_message` / `save_message_with_metadata` calls in agent loop to pass `Some(&trace_id)`
-- [ ] `crates/mika-agent/src/agent.rs` — Update compaction to pass trace_id for summary messages
-- [ ] Update all 10 `log_audit_event` call sites in tool files to pass `ctx.trace_id`:
+- [x] `crates/mika-agent/src/agent.rs` — In `run_agent_inner()`: pass `&trace_id` when constructing `ToolContext`
+- [x] `crates/mika-agent/src/agent.rs` — In `run_silent_agent()` / `run_silent_inner()`: generate trace_id in inner function, passed to ToolContext
+- [x] `crates/mika-agent/src/agent.rs` — Update all `save_message` / `save_message_with_metadata` calls in agent loop to pass `Some(&trace_id)`
+- [x] `crates/mika-agent/src/agent.rs` — Compaction summaries use `None` trace_id (system-generated, not tied to agent turn)
+- [x] Update all 10 `log_audit_event` call sites in tool files to pass `ctx.trace_id`:
   - `tools/update_core_memory.rs`
   - `tools/store_fact.rs` (4 call sites)
   - `tools/update_fact.rs`
@@ -273,13 +273,13 @@ FROM tasks;
   - `tools/create_reminder.rs`
   - `tools/create_task.rs`
   - `tools/complete_task.rs`
-- [ ] Update `create_task` tool to pass `ctx.trace_id` as `created_trace_id`
-- [ ] Update task engine dispatcher to generate trace_id per dispatched task and pass to `run_silent_agent`
-- [ ] Update team engine to generate trace_id and pass to `insert_team_workspace_entry` calls
-- [ ] `crates/mika-agent/src/teams/engine.rs` — Thread trace_id through team agent runs (each delegated agent gets its own trace_id from its `run_team_agent` call)
-- [ ] `crates/mika-agent/src/server/handlers.rs` — Generate trace_id in message handler, pass through `AgentParams` (or generate inside `run_agent`)
+- [x] Update `create_task` and `create_reminder` tools to pass `ctx.trace_id` as `created_trace_id`
+- [x] Task engine dispatcher: `run_silent_agent` now generates its own trace_id internally
+- [x] Update team engine to generate trace_id and pass to `insert_team_workspace_entry` calls
+- [x] `crates/mika-agent/src/teams/engine.rs` — `TeamEngine` has `trace_id` field; `run_team_agent` generates its own trace_id
+- [x] `crates/mika-agent/src/server/handlers.rs` — `run_agent()` generates trace_id internally, no handler changes needed
 - [ ] Add task lifecycle audit events: log `audit_event` rows when task engine fires, completes, expires, or delivers a task (trace_id from the tick that caused the transition)
-- [ ] Tests: verify trace_id propagation end-to-end (agent turn → tool → DB row → unified_timeline query)
+- [x] Tests: verify trace_id propagation end-to-end (message + audit_event + task → unified_timeline query by trace_id)
 
 #### Phase C: btrfs snapshot integration (separate PR)
 

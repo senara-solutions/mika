@@ -200,7 +200,7 @@ impl Tool for UpdateCoreMemoryTool {
                 before_value,
                 &new_value,
                 Some(&audit_reasoning),
-                None,
+                Some(ctx.trace_id),
             )
             .await?;
 

@@ -54,7 +54,7 @@ impl Tool for CancelTaskTool {
                     None,
                     "cancelled",
                     None,
-                    None,
+                    Some(ctx.trace_id),
                 )
                 .await?;
             Ok(ToolOutput::success(format!(
