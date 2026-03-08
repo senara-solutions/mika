@@ -388,6 +388,7 @@ async fn run_loop(
                             "assistant",
                             &text,
                             metadata.as_deref(),
+                            Some(tool_ctx.trace_id),
                         )
                         .await?;
                     }
@@ -581,6 +582,8 @@ pub struct AgentParams<'a> {
 /// Run the agent loop for a single inbound message.
 /// Returns `AgentOutput` with text response, thinking, and usage info.
 pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
+    let trace_id = mika_common::trace::generate_trace_id();
+
     // Save the user message (with image annotation if images attached)
     let save_text = if params.user_images.is_empty() {
         params.user_message.to_string()
@@ -593,7 +596,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
     };
     params
         .db
-        .save_message(params.session_id, "user", &save_text)
+        .save_message(params.session_id, "user", &save_text, Some(&trace_id))
         .await?;
 
     let agent_name = params
@@ -605,12 +608,13 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         "agent_turn",
         agent = %agent_name,
         mode = "conversation",
+        trace_id = %trace_id,
         channel = %params.channel_type,
     );
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_agent_inner(params).instrument(span),
+        run_agent_inner(params, &trace_id).instrument(span),
     )
     .await;
 
@@ -642,7 +646,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
             params
                 .db
-                .save_message(params.session_id, "assistant", fallback)
+                .save_message(params.session_id, "assistant", fallback, Some(&trace_id))
                 .await?;
             Ok(AgentOutput {
                 text: Some(fallback.to_string()),
@@ -654,7 +658,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
 }
 
 /// Inner agent loop, separated so the outer function can wrap it in a timeout.
-async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
+async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<AgentOutput> {
     let db = params.db;
     let claude = params.claude;
     let tools = params.tools;
@@ -761,6 +765,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let tool_ctx = ToolContext {
         db,
         session_id: params.session_id,
+        trace_id,
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: params.is_onboarding,
@@ -801,6 +806,7 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
             db: db.clone(),
             agent_name: db.agent_id.clone(),
             session_id: params.session_id.to_string(),
+            trace_id: trace_id.to_string(),
         })
     };
     let result = run_loop(
@@ -874,8 +880,14 @@ async fn run_agent_inner(params: &AgentParams<'_>) -> Result<AgentOutput> {
         };
 
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata(session_id, "assistant", &text, metadata.as_deref())
-            .await?;
+        db.save_message_with_metadata(
+            session_id,
+            "assistant",
+            &text,
+            metadata.as_deref(),
+            Some(trace_id),
+        )
+        .await?;
         return Ok(AgentOutput {
             text: Some(text),
             thinking: result.thinking,
@@ -1188,7 +1200,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let pending_commitments = db.list_commitments("pending").await?;
 
     // For reflection, prepare conversation and memory event digests
-    let (conversations_digest, memory_events_digest) =
+    let (conversations_digest, audit_events_digest) =
         if matches!(&params.trigger, SilentTrigger::Reflection) {
             let tz_str = db
                 .get_customer_config("timezone")
@@ -1214,12 +1226,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
             };
 
             // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
-            let memory_events = db.get_memory_events_since(midnight_unix).await?;
-            let mem_digest = if memory_events.is_empty() {
+            let audit_events = db.get_audit_events_since(midnight_unix).await?;
+            let mem_digest = if audit_events.is_empty() {
                 None
             } else {
                 let mut buf = String::new();
-                for evt in &memory_events {
+                for evt in &audit_events {
                     let line = format!(
                         "[{}] {} on {}: {} -> {}\n",
                         evt.created_at,
@@ -1308,7 +1320,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         telegram_configured: chat_id.is_some(),
         has_message_sender: params.message_sender.is_some(),
         recent_conversations: conversations_digest.as_deref(),
-        recent_memory_events: memory_events_digest.as_deref(),
+        recent_audit_events: audit_events_digest.as_deref(),
         home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
@@ -1341,10 +1353,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     }];
 
     let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
+    let trace_id = mika_common::trace::generate_trace_id();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
         session_id: params.session_id,
+        trace_id: &trace_id,
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
@@ -1387,13 +1401,13 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     // Post-loop: record reflection results and optionally notify user
     if is_reflection {
         let changes = db
-            .count_memory_events_for_session(params.session_id)
+            .count_audit_events_for_session(params.session_id)
             .await
             .unwrap_or(0);
 
         // Build summary from memory events
         let summary = if changes > 0 {
-            let events = db.get_memory_events(params.session_id).await?;
+            let events = db.get_audit_events(params.session_id).await?;
             let lines: Vec<String> = events
                 .iter()
                 .map(|e| format!("  - {} on {}", e.tool_name, e.target_key))
@@ -1532,10 +1546,12 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         content: MessageContent::Text(params.task_message.to_string()),
     }];
 
+    let trace_id = mika_common::trace::generate_trace_id();
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db: params.db,
         session_id: params.session_id,
+        trace_id: &trace_id,
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
@@ -2129,6 +2145,7 @@ mod tests {
             "assistant",
             "I searched your memory.",
             Some(metadata),
+            None,
         )
         .await
         .unwrap();
@@ -2143,7 +2160,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_without_metadata_loads_as_none() {
         let db = test_async_db();
-        db.save_message("test-session", "user", "Hello")
+        db.save_message("test-session", "user", "Hello", None)
             .await
             .unwrap();
 
@@ -2155,7 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_with_null_metadata() {
         let db = test_async_db();
-        db.save_message_with_metadata("test-session", "assistant", "No tools used.", None)
+        db.save_message_with_metadata("test-session", "assistant", "No tools used.", None, None)
             .await
             .unwrap();
 

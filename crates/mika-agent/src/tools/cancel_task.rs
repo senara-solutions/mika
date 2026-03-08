@@ -47,13 +47,14 @@ impl Tool for CancelTaskTool {
         let cancelled = ctx.db.cancel_task(id).await?;
         if cancelled {
             ctx.db
-                .log_memory_event(
+                .log_audit_event(
                     ctx.session_id,
                     "cancel_task",
                     &format!("task:{id}"),
                     None,
                     "cancelled",
                     None,
+                    Some(ctx.trace_id),
                 )
                 .await?;
             Ok(ToolOutput::success(format!(
@@ -93,6 +94,7 @@ mod tests {
                 action_config: "{}".to_string(),
                 input_context: None,
                 created_by_session: None,
+                created_trace_id: None,
             })
             .await
             .unwrap()

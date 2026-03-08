@@ -719,6 +719,7 @@ mod tests {
             action_config: "{}".to_string(), // missing "text" key
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -748,6 +749,7 @@ mod tests {
             action_config: r#"{"text": "hello"}"#.to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -776,6 +778,7 @@ mod tests {
             action_config: r#"{"context": "some context"}"#.to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;

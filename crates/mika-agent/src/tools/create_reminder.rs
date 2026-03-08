@@ -146,6 +146,7 @@ impl Tool for CreateReminderTool {
             action_config,
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
+            created_trace_id: Some(ctx.trace_id.to_string()),
         };
 
         let id = match ctx.db.create_task(task).await {
@@ -183,13 +184,14 @@ impl Tool for CreateReminderTool {
         };
 
         ctx.db
-            .log_memory_event(
+            .log_audit_event(
                 ctx.session_id,
                 "create_reminder",
                 &format!("task:{id}"),
                 None,
                 &format!("{display} — {message}"),
                 None,
+                Some(ctx.trace_id),
             )
             .await?;
 

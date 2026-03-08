@@ -185,7 +185,7 @@ mod tests {
     fn test_compaction_skips_below_threshold() {
         let (db, sid) = test_db_with_session();
         for i in 0..10 {
-            db.save_message("mika", &sid, "user", &format!("msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
                 .unwrap();
         }
         assert!(db.count_messages("mika").unwrap() <= COMPACTION_THRESHOLD);
@@ -195,7 +195,7 @@ mod tests {
     fn test_compaction_identifies_old_messages() {
         let (db, sid) = test_db_with_session();
         for i in 0..(COMPACTION_THRESHOLD + 10) {
-            db.save_message("mika", &sid, "user", &format!("msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
                 .unwrap();
         }
 
@@ -212,7 +212,7 @@ mod tests {
     fn test_replace_with_summary_preserves_recent() {
         let (db, sid) = test_db_with_session();
         for i in 0..60 {
-            db.save_message("mika", &sid, "user", &format!("msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
                 .unwrap();
         }
 
@@ -237,7 +237,7 @@ mod tests {
         let (db, sid) = test_db_with_session();
 
         for i in 0..60 {
-            db.save_message("mika", &sid, "user", &format!("batch1 msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("batch1 msg {i}"), None)
                 .unwrap();
         }
 
@@ -249,7 +249,7 @@ mod tests {
             .unwrap();
 
         for i in 0..40 {
-            db.save_message("mika", &sid, "user", &format!("batch2 msg {i}"))
+            db.save_message("mika", &sid, "user", &format!("batch2 msg {i}"), None)
                 .unwrap();
         }
 

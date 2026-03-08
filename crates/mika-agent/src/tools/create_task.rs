@@ -212,18 +212,20 @@ impl Tool for CreateTaskTool {
             action_config: action_config_str.to_string(),
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
+            created_trace_id: Some(ctx.trace_id.to_string()),
         };
 
         let id = ctx.db.create_task(task).await?;
 
         ctx.db
-            .log_memory_event(
+            .log_audit_event(
                 ctx.session_id,
                 "create_task",
                 &format!("task:{id}"),
                 None,
                 &format!("{trigger_type_str}/{action_type_val} — {label}"),
                 None,
+                Some(ctx.trace_id),
             )
             .await?;
 

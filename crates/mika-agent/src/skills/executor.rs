@@ -61,6 +61,7 @@ pub struct LongRunningContext {
     pub db: AsyncDatabase,
     pub agent_name: String,
     pub session_id: String,
+    pub trace_id: String,
 }
 
 /// Execute a skill tool with the appropriate handler.
@@ -474,6 +475,7 @@ async fn execute_long_running(
         action_config: "{}".to_string(),
         input_context: Some(serde_json::to_string(&input).unwrap_or_default()),
         created_by_session: Some(ctx.session_id.clone()),
+        created_trace_id: None,
     };
 
     let task_id = match ctx.db.create_task(task).await {
@@ -1119,6 +1121,7 @@ mod tests {
             db: async_db.clone(),
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
         };
 
         let output =
@@ -1172,6 +1175,7 @@ mod tests {
             db: async_db,
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
         };
 
         let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx)).await;
@@ -1199,6 +1203,7 @@ mod tests {
             db: async_db.clone(),
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
         };
 
         let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx)).await;

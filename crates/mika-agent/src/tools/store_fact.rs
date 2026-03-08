@@ -133,13 +133,14 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
     );
     let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(
+        .log_audit_event(
             ctx.session_id,
             "store_fact",
             &target,
             None,
             &after,
             reasoning.as_deref(),
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -214,13 +215,14 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
     let target = format!("commitment:{description}");
     let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(
+        .log_audit_event(
             ctx.session_id,
             "store_fact",
             &target,
             None,
             description,
             reasoning.as_deref(),
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -259,13 +261,14 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
     let target = format!("preference:{key}");
     let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(
+        .log_audit_event(
             ctx.session_id,
             "store_fact",
             &target,
             None,
             value,
             reasoning.as_deref(),
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -327,13 +330,14 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
     let target = format!("event:{description}");
     let reasoning = reflection_reasoning(ctx, input);
     ctx.db
-        .log_memory_event(
+        .log_audit_event(
             ctx.session_id,
             "store_fact",
             &target,
             None,
             description,
             reasoning.as_deref(),
+            Some(ctx.trace_id),
         )
         .await?;
 
@@ -564,7 +568,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = harness.db.get_memory_events("test-session").await.unwrap();
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "store_fact");
         assert!(events[0].target_key.starts_with("person:"));

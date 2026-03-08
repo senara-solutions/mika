@@ -89,13 +89,14 @@ impl Tool for CompleteTaskTool {
 
         // Audit log
         ctx.db
-            .log_memory_event(
+            .log_audit_event(
                 ctx.session_id,
                 "complete_task",
                 &format!("task:{id}"),
                 None,
                 &format!("Completed callback task: {} ({})", task.label, id),
                 None,
+                Some(ctx.trace_id),
             )
             .await?;
 
@@ -132,6 +133,7 @@ mod tests {
                 action_config: "{}".to_string(),
                 input_context: None,
                 created_by_session: None,
+                created_trace_id: None,
             })
             .await
             .unwrap()

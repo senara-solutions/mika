@@ -551,6 +551,7 @@ mod tests {
             action_config: r#"{"text": "hello"}"#.to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         }
     }
 
@@ -701,6 +702,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -734,6 +736,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -767,6 +770,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -788,6 +792,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let c1_id = db.create_task(child1).await.unwrap();
         db.update_task_completed(&c1_id, Some("done"))
@@ -811,6 +816,7 @@ mod tests {
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: None,
+            created_trace_id: None,
         };
         let c2_id = db.create_task(child2).await.unwrap();
         // Mark expired manually (in real flow, expire_timed_out_tasks does this)

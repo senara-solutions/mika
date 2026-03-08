@@ -151,7 +151,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
 - Per-session edit limit: `MAX_CORE_MEMORY_EDITS_PER_SESSION = 3` (onboarding sessions exempt)
 - Actions: `replace`, `append`, `remove_line`, `reset`
-- All mutations are recorded in the `memory_events` audit table
+- All mutations are recorded in the `audit_events` audit table
 
 ### Layer 2: Structured Facts
 
@@ -714,10 +714,10 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
 | `preferences` | Layer 2 user preferences (`agent_id` FK) |
 | `events` | Layer 2 notable events (`agent_id` FK) |
-| `memory_events` | Audit log for all memory mutations (`agent_id` FK) |
+| `audit_events` | Audit log for all memory mutations (`agent_id` FK) |
 | `customer_config` | Key-value store (timezone, chat_id) |
 | `failed_sends` | Durable outbox for failed outbound messages |
-| `memory_event_summaries` | Tiered retention summaries (monthly) |
+| `audit_event_summaries` | Tiered retention summaries (monthly) |
 | `skills` | Skill metadata (name, description, builtin flag, enabled) |
 | `skill_tools` | Tool definitions per skill |
 | `search_content` | Unified search content for Layer 3 hybrid search |

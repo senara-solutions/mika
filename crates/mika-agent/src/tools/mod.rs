@@ -53,6 +53,7 @@ pub const MAX_INPUT_LEN: usize = 10_000;
 pub struct ToolContext<'a> {
     pub db: &'a AsyncDatabase,
     pub session_id: &'a str,
+    pub trace_id: &'a str,
     pub home_dir: &'a Path,
     pub core_memory_edit_count: &'a AtomicU32,
     pub is_onboarding: bool,

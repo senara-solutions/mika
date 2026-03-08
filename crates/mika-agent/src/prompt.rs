@@ -401,8 +401,8 @@ pub struct SilentPromptContext<'a> {
     pub has_message_sender: bool,
     /// Pre-formatted digest of today's conversations (reflection mode only).
     pub recent_conversations: Option<&'a str>,
-    /// Pre-formatted digest of today's memory events (reflection mode only).
-    pub recent_memory_events: Option<&'a str>,
+    /// Pre-formatted digest of today's audit events (reflection mode only).
+    pub recent_audit_events: Option<&'a str>,
     /// Agent home directory. When set, file tool instructions include the absolute path.
     pub home_dir: Option<&'a std::path::Path>,
 }
@@ -445,18 +445,18 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         );
     }
 
-    // Reflection context (today's conversations and memory events)
+    // Reflection context (today's conversations and audit events)
     if let Some(conversations) = ctx.recent_conversations.filter(|c| !c.is_empty()) {
         prompt.push_str("## Today's Conversations\n");
         prompt.push_str("<conversations>\n");
         prompt.push_str(conversations);
         prompt.push_str("\n</conversations>\n\n");
     }
-    if let Some(events) = ctx.recent_memory_events.filter(|e| !e.is_empty()) {
-        prompt.push_str("## Recent Memory Changes\n");
-        prompt.push_str("<memory-events>\n");
+    if let Some(events) = ctx.recent_audit_events.filter(|e| !e.is_empty()) {
+        prompt.push_str("## Recent Audit Events\n");
+        prompt.push_str("<audit-events>\n");
         prompt.push_str(events);
-        prompt.push_str("\n</memory-events>\n\n");
+        prompt.push_str("\n</audit-events>\n\n");
     }
 
     // File tools — mention home-scoped file tools so heartbeat agents can discover them
@@ -692,7 +692,7 @@ mod tests {
             telegram_configured: false,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -717,7 +717,7 @@ mod tests {
             telegram_configured: false,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -750,7 +750,7 @@ mod tests {
             telegram_configured: false,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -884,7 +884,7 @@ mod tests {
             telegram_configured: false,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -908,7 +908,7 @@ mod tests {
             telegram_configured: false,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -1216,7 +1216,7 @@ max_iterations = 3
             telegram_configured: true,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -1238,7 +1238,7 @@ max_iterations = 3
             telegram_configured: false,
             has_message_sender: true,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -1260,7 +1260,7 @@ max_iterations = 3
             telegram_configured: false,
             has_message_sender: false,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
@@ -1364,14 +1364,14 @@ notify = true
             telegram_configured: false,
             has_message_sender: false,
             recent_conversations: Some("User discussed Series A fundraise with Alice."),
-            recent_memory_events: Some("update_core_memory: current_priorities -> fundraise"),
+            recent_audit_events: Some("update_core_memory: current_priorities -> fundraise"),
             home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
         assert!(prompt.contains("## Today's Conversations"));
         assert!(prompt.contains("Series A fundraise"));
-        assert!(prompt.contains("## Recent Memory Changes"));
+        assert!(prompt.contains("## Recent Audit Events"));
         assert!(prompt.contains("current_priorities"));
     }
 
@@ -1389,13 +1389,13 @@ notify = true
             telegram_configured: false,
             has_message_sender: false,
             recent_conversations: None,
-            recent_memory_events: None,
+            recent_audit_events: None,
             home_dir: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
         assert!(!prompt.contains("## Today's Conversations"));
-        assert!(!prompt.contains("## Recent Memory Changes"));
+        assert!(!prompt.contains("## Recent Audit Events"));
     }
 
     #[test]
