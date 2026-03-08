@@ -611,17 +611,81 @@ Properties:
 
 The per-customer agent container runs an Axum HTTP server:
 
+### Mutation Endpoints
+
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/health` | GET | None | Liveness/readiness probe |
 | `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
 | `/tasks/{id}/complete` | POST | Bearer | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
 
+### Dashboard API (read-only)
+
+All dashboard routes are nested under `/api/v1/` with CORS scoped to
+`MIKA_CORS_ORIGIN` (default `http://localhost:5173`), restricted to
+GET + OPTIONS methods and `Authorization` + `Content-Type` headers only.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/v1/timeline` | GET | Paginated unified timeline with filters (agent_id, event_type, trace_id, session_id, from/to timestamps) |
+| `/api/v1/timeline/trace/{trace_id}` | GET | All events for a specific trace |
+| `/api/v1/agents` | GET | List all agents with message counts |
+| `/api/v1/agents/{id}` | GET | Agent detail with core memory, soul.md, and stats |
+| `/api/v1/agents/{id}/sessions` | GET | Paginated sessions for an agent |
+| `/api/v1/agents/{id}/audit` | GET | Paginated audit events for an agent |
+| `/api/v1/sessions` | GET | Paginated sessions with optional agent_id/channel_type filters |
+| `/api/v1/sessions/{id}` | GET | Session detail |
+| `/api/v1/sessions/{id}/messages` | GET | Paginated messages for a session (base64 images stripped) |
+
+Pagination: `?page=1&per_page=50` (max 200 per page, page clamped to 1–100,000).
+Response format: `{ data: [...], total: N, page: P, per_page: PP }`.
+
 `AppState` is Clone via Arc-wrapped dependencies. Agent lock
 (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock`
 (429 if busy).
 
 See [ADR-001](adr/001-axum-http-server-architecture.md) for design decisions.
+
+
+## 13a. Observability Dashboard
+
+Source: `dashboard/`
+
+A React SPA for monitoring agent activity. Stack: React 19, TypeScript, Vite,
+Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
+
+### Pages
+
+| Route | Page | Description |
+|-------|------|-------------|
+| `/` | Event Timeline | Unified timeline with live polling (5s), subsystem badges, trace links |
+| `/agents` | Agents | Agent list with status and message counts |
+| `/agents/:id` | Agent Detail | Core memory (raw/view), soul.md, recent audit events, sessions |
+| `/sessions` | Sessions | Filterable session list with channel type icons |
+| `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling |
+| `/traces` | Traces | Trace ID search |
+| `/traces/:id` | Trace Detail | All events for a trace |
+
+### Development
+
+```bash
+# Terminal 1: Start mika-server
+MIKA_ANTHROPIC_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
+  MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-server
+
+# Terminal 2: Start dashboard dev server
+VITE_MIKA_TOKEN=<same-64-hex> npm run dev --prefix dashboard
+```
+
+The Vite dev server proxies `/api` requests to `http://localhost:8080`
+(configurable in `dashboard/vite.config.ts`). Auth: the dashboard reads
+`VITE_MIKA_TOKEN` from env and sends it as `Authorization: Bearer <token>`.
+
+### Design System
+
+Dark theme: `#0d0f12` background, `#151820` cards, `#7c6af7` accent.
+Fonts: Plus Jakarta Sans (UI), JetBrains Mono (code/IDs).
+Subsystem colors: blue (messages), amber (audit), emerald (tasks).
 
 
 ## 14. Failed Sends (Durable Outbox Pattern)

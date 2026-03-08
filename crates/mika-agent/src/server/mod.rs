@@ -1,4 +1,5 @@
 mod auth;
+pub mod dashboard;
 mod handlers;
 pub mod json_extractor;
 pub mod openapi;
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -42,12 +44,48 @@ const HEARTBEAT_CRON: &str = "0 0 * * * *";
 ///
 /// Shared between production `run_server` and test `test_app`.
 fn build_router(state: AppState) -> Router {
+    // CORS — scoped to dashboard routes only, restricted to GET + OPTIONS
+    let cors_origin =
+        std::env::var("MIKA_CORS_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let cors = CorsLayer::new()
+        .allow_origin(
+            cors_origin
+                .parse::<http::HeaderValue>()
+                .expect("MIKA_CORS_ORIGIN must be a valid header value"),
+        )
+        .allow_methods([http::Method::GET, http::Method::OPTIONS])
+        .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]);
+
+    // Dashboard API routes (read-only, with CORS for browser access)
+    let dashboard_routes = Router::new()
+        .route("/timeline", get(dashboard::handle_timeline))
+        .route(
+            "/timeline/trace/{trace_id}",
+            get(dashboard::handle_trace_detail),
+        )
+        .route("/agents", get(dashboard::handle_agents_list))
+        .route("/agents/{id}", get(dashboard::handle_agent_detail))
+        .route(
+            "/agents/{id}/sessions",
+            get(dashboard::handle_agent_sessions),
+        )
+        .route("/agents/{id}/audit", get(dashboard::handle_agent_audit))
+        .route("/sessions", get(dashboard::handle_sessions_list))
+        .route("/sessions/{id}", get(dashboard::handle_session_detail))
+        .route(
+            "/sessions/{id}/messages",
+            get(dashboard::handle_session_messages),
+        )
+        .layer(cors);
+
+    // Mutation routes (no CORS — gateway-to-agent only)
     Router::new()
         .route(
             "/message",
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
         .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
+        .nest("/api/v1", dashboard_routes)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
@@ -313,6 +351,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         agents.len()
     );
 
+    // Create an unscoped dashboard DB handle that shares the same DB thread
+    // as the default agent. Dashboard queries don't filter by agent_id.
+    let dashboard_db = agents
+        .get(&default_agent)
+        .expect("default agent must exist")
+        .db
+        .clone();
+
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,
@@ -326,6 +372,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         brave_api_key: settings.brave_api_key.clone(),
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
+        dashboard_db,
     };
 
     let app = build_router(state.clone());
@@ -454,6 +501,7 @@ mod tests {
 
     fn test_state() -> AppState {
         let db = test_async_db();
+        let dashboard_db = db.clone();
         let claude = ClaudeClient::new(
             Some("test-key".to_string()),
             "claude-sonnet-4-6".to_string(),
@@ -514,6 +562,7 @@ mod tests {
                 otlp_endpoint: None,
                 otlp_auth_header: None,
             },
+            dashboard_db,
         }
     }
 

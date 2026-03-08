@@ -8,9 +8,9 @@ use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
-    AgentRow, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend, NewTask,
-    Person, Preference, SearchResult, SessionMessage, Task, TeamRow, TeamRunRow,
-    TeamWorkspaceEntry,
+    AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
+    NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats, Task,
+    TeamRow, TeamRunRow, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -1021,6 +1021,99 @@ impl AsyncDatabase {
         let ri = run_id.to_owned();
         self.with_db(move |db| db.load_team_workspace(&ri)).await
     }
+
+    // -- Dashboard queries (cross-agent) --
+
+    pub async fn query_timeline(
+        &self,
+        filters: TimelineFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TimelineRow>> {
+        self.with_db(move |db| db.query_timeline(&filters, limit, offset))
+            .await
+    }
+
+    pub async fn query_timeline_count(&self, filters: TimelineFilters) -> Result<u64> {
+        self.with_db(move |db| db.query_timeline_count(&filters))
+            .await
+    }
+
+    pub async fn query_timeline_by_trace(&self, trace_id: &str) -> Result<Vec<TimelineRow>> {
+        let tid = trace_id.to_owned();
+        self.with_db(move |db| db.query_timeline_by_trace(&tid))
+            .await
+    }
+
+    pub async fn list_agents_with_stats(&self) -> Result<Vec<AgentWithStats>> {
+        self.with_db(|db| db.list_agents_with_stats()).await
+    }
+
+    pub async fn get_agent_with_stats(&self, agent_id: &str) -> Result<Option<AgentWithStats>> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.get_agent_with_stats(&aid)).await
+    }
+
+    pub async fn list_sessions_paginated(
+        &self,
+        agent_id: Option<String>,
+        channel_type: Option<String>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionWithStats>> {
+        self.with_db(move |db| {
+            db.list_sessions_paginated(agent_id.as_deref(), channel_type.as_deref(), limit, offset)
+        })
+        .await
+    }
+
+    pub async fn count_sessions(
+        &self,
+        agent_id: Option<String>,
+        channel_type: Option<String>,
+    ) -> Result<u64> {
+        self.with_db(move |db| db.count_sessions(agent_id.as_deref(), channel_type.as_deref()))
+            .await
+    }
+
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
+        let sid = session_id.to_owned();
+        self.with_db(move |db| db.get_session(&sid)).await
+    }
+
+    pub async fn load_session_messages_paginated(
+        &self,
+        session_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionMessage>> {
+        let sid = session_id.to_owned();
+        self.with_db(move |db| db.load_session_messages_paginated(&sid, limit, offset))
+            .await
+    }
+
+    pub async fn count_session_messages(&self, session_id: &str) -> Result<u64> {
+        let sid = session_id.to_owned();
+        self.with_db(move |db| db.count_session_messages(&sid))
+            .await
+    }
+
+    pub async fn list_audit_events_paginated(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<AuditEvent>> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.list_audit_events_paginated(&aid, limit, offset))
+            .await
+    }
+
+    pub async fn count_audit_events(&self, agent_id: &str) -> Result<u64> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.count_audit_events(&aid)).await
+    }
+
 }
 
 #[cfg(test)]

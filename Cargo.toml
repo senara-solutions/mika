@@ -70,7 +70,7 @@ http = "1"
 # HTTP server
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "limit", "set-header"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "cors"] }
 subtle = "2"
 http-body-util = "0.1"
 

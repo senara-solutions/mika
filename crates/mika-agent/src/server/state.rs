@@ -51,6 +51,8 @@ pub struct AppState {
     pub brave_api_key: Option<String>,
     pub global_home_dir: PathBuf,
     pub settings: Settings,
+    /// Unscoped database handle for dashboard API endpoints (cross-agent queries).
+    pub dashboard_db: AsyncDatabase,
 }
 
 impl AppState {
@@ -76,6 +78,7 @@ impl std::fmt::Debug for AppState {
             .field("gateway_url", &self.gateway_url)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents.keys().collect::<Vec<_>>())
+            .field("dashboard_db", &"AsyncDatabase(unscoped)")
             .finish_non_exhaustive()
     }
 }
