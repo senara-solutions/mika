@@ -203,7 +203,7 @@ export default function Timeline() {
                             to={`/traces/${row.trace_id}`}
                             className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
                           >
-                            trc_{row.trace_id.slice(0, 12)}
+                            {row.trace_id}
                           </Link>
                         ) : (
                           <span className="text-muted/30 text-xs">-</span>

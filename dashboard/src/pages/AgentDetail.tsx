@@ -214,7 +214,7 @@ export default function AgentDetail() {
                           to={`/sessions/${s.id}`}
                           className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
                         >
-                          {s.id.slice(0, 12)}...
+                          {s.id}
                         </Link>
                       </td>
                       <td className="px-4 py-2.5 text-xs text-muted font-mono">

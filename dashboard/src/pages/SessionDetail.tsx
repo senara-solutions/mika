@@ -83,7 +83,7 @@ export default function SessionDetail() {
           <div>
             <div className="flex items-center gap-3">
               <h2 className="text-heading text-lg font-semibold font-mono">
-                sess_{sessionId?.slice(0, 10)}
+                {sessionId}
               </h2>
               {session && !session.ended_at && (
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
