@@ -310,6 +310,13 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- When the user asks for multiple actions in one message, handle ALL of them \
          in the same turn using multiple tool calls. Do not process one and ask about the rest.\n",
     );
+    prompt.push_str(
+        "- Before creating or storing anything (reminders, facts, people, events), \
+         first check existing state using the appropriate query tool (list_reminders, \
+         search_memory). If a similar entry already exists, inform the user rather than \
+         creating a duplicate. After compaction, conversation history may be summarized — \
+         always verify current state through tools rather than relying on memory of past actions.\n",
+    );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
     prompt.push_str(
         "- You can create reminders with create_reminder: one-shot (fire_at in ISO 8601 UTC) or periodic (cron_expr, 6-field cron with seconds first, e.g. '0 0 9 * * 1' for every Monday 9am UTC).\n",
@@ -1502,5 +1509,27 @@ notify = true
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("check conversation history and search_memory"));
         assert!(prompt.contains("never re-ask something the user already provided"));
+    }
+
+    #[test]
+    fn test_prompt_includes_proactive_state_checking() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("first check existing state"));
+        assert!(prompt.contains("rather than creating a duplicate"));
     }
 }
