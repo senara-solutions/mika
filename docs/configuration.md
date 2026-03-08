@@ -335,6 +335,7 @@ are required for inter-service communication:
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
+| `MIKA_CORS_ORIGIN` | No | Allowed origin for dashboard CORS (default: `http://localhost:5173`) |
 
 ### Token Generation
 
