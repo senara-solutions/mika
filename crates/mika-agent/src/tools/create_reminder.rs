@@ -84,12 +84,12 @@ impl Tool for CreateReminderTool {
             const MIN_INTERVAL_SECS: i64 = 60;
             if next_fire - now < MIN_INTERVAL_SECS {
                 // Check second interval to confirm (the first might be short due to alignment)
-                if let Ok(second_fire) = next_fire_from_cron(cron_expr_input, next_fire) {
-                    if second_fire - next_fire < MIN_INTERVAL_SECS {
-                        return Ok(ToolOutput::error(
-                            "Cron expression fires too frequently. Minimum interval is 1 minute.",
-                        ));
-                    }
+                if let Ok(second_fire) = next_fire_from_cron(cron_expr_input, next_fire)
+                    && second_fire - next_fire < MIN_INTERVAL_SECS
+                {
+                    return Ok(ToolOutput::error(
+                        "Cron expression fires too frequently. Minimum interval is 1 minute.",
+                    ));
                 }
             }
 
