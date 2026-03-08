@@ -159,30 +159,30 @@ tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "cor
 
 ### Backend (mika-server)
 
-- [ ] `GET /api/v1/timeline` returns paginated unified timeline, filterable by agent_id, event_type, trace_id, session_id, from/to date range
-- [ ] `GET /api/v1/timeline/trace/:trace_id` returns all events for a trace_id across messages, audit_events, and tasks
-- [ ] `GET /api/v1/agents` returns all agents with active status, last_seen, and message count
-- [ ] `GET /api/v1/agents/:id` returns agent detail with core memory blocks and soul.md content
-- [ ] `GET /api/v1/agents/:id/sessions` and `/agents/:id/audit` return paginated, agent-scoped data
-- [ ] `GET /api/v1/sessions` returns paginated sessions, filterable by agent_id and channel_type
-- [ ] `GET /api/v1/sessions/:id/messages` returns paginated messages with base64 images stripped
-- [ ] All endpoints use Bearer auth (MIKA_INTERNAL_TOKEN) and return JSON errors
-- [ ] CORS configured via `MIKA_CORS_ORIGIN` env var
+- [x] `GET /api/v1/timeline` returns paginated unified timeline, filterable by agent_id, event_type, trace_id, session_id, from/to date range
+- [x] `GET /api/v1/timeline/trace/:trace_id` returns all events for a trace_id across messages, audit_events, and tasks
+- [x] `GET /api/v1/agents` returns all agents with active status, last_seen, and message count
+- [x] `GET /api/v1/agents/:id` returns agent detail with core memory blocks and soul.md content
+- [x] `GET /api/v1/agents/:id/sessions` and `/agents/:id/audit` return paginated, agent-scoped data
+- [x] `GET /api/v1/sessions` returns paginated sessions, filterable by agent_id and channel_type
+- [x] `GET /api/v1/sessions/:id/messages` returns paginated messages with base64 images stripped
+- [x] All endpoints use Bearer auth (MIKA_INTERNAL_TOKEN) and return JSON errors
+- [x] CORS configured via `MIKA_CORS_ORIGIN` env var
 - [ ] OpenAPI spec updated with all new endpoints
 - [ ] Handler tests for each endpoint using existing `test_state()` pattern
 
 ### Frontend (dashboard/)
 
-- [ ] Vite + React 19 + TypeScript + Tailwind v4 project matching site/ design system
-- [ ] React Router with routes: `/` (timeline), `/traces/:id`, `/agents`, `/agents/:id`, `/sessions`, `/sessions/:id`
-- [ ] TanStack Query for all data fetching with 5s smart polling on timeline
-- [ ] Timeline view: paginated table with filter bar (agent, event_type, date range, trace_id search)
-- [ ] Trace detail view: all events for a trace_id, grouped chronologically
-- [ ] Agents view: card grid with agent stats, click to see core memory + sessions + audit tabs
-- [ ] Sessions view: filterable list, click to see conversation with role-based message rendering
-- [ ] Filter state persisted in URL query parameters (deep linking, back button support)
-- [ ] Loading states (skeleton/spinner), empty states, error states for all views
-- [ ] Bearer token from `VITE_MIKA_TOKEN` env var sent on every request
+- [x] Vite + React 19 + TypeScript + Tailwind v4 project matching site/ design system
+- [x] React Router with routes: `/` (timeline), `/traces/:id`, `/agents`, `/agents/:id`, `/sessions`, `/sessions/:id`
+- [x] TanStack Query for all data fetching with 5s smart polling on timeline
+- [x] Timeline view: paginated table with filter bar (agent, event_type, date range, trace_id search)
+- [x] Trace detail view: all events for a trace_id, grouped chronologically
+- [x] Agents view: card grid with agent stats, click to see core memory + sessions + audit tabs
+- [x] Sessions view: filterable list, click to see conversation with role-based message rendering
+- [x] Filter state persisted in URL query parameters (deep linking, back button support)
+- [x] Loading states (skeleton/spinner), empty states, error states for all views
+- [x] Bearer token from `VITE_MIKA_TOKEN` env var sent on every request
 
 ## Success Metrics
 
