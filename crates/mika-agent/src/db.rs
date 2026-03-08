@@ -20,6 +20,29 @@ pub fn init_sqlite_vec() {
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
+/// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
+/// Used in both clean-slate schema creation and incremental migration.
+const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
+    CREATE VIEW IF NOT EXISTS unified_timeline AS \
+    SELECT trace_id, session_id, agent_id, 'message' AS event_type, \
+        role AS event_subtype, \
+        CASE WHEN length(content) > 200 THEN substr(content, 1, 200) || '...' \
+             ELSE content END AS summary, \
+        created_at \
+    FROM messages \
+    UNION ALL \
+    SELECT trace_id, session_id, agent_id, 'audit' AS event_type, \
+        tool_name AS event_subtype, \
+        target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || after_value AS summary, \
+        created_at \
+    FROM audit_events \
+    UNION ALL \
+    SELECT created_trace_id AS trace_id, created_by_session AS session_id, agent_id, \
+        'task' AS event_type, action_type AS event_subtype, \
+        label || ' [' || status || ']' AS summary, \
+        created_at \
+    FROM tasks";
+
 /// Check if an anyhow error is a SQLite UNIQUE constraint violation.
 pub fn is_unique_violation(err: &anyhow::Error) -> bool {
     if let Some(rusqlite::Error::SqliteFailure(e, _)) = err.downcast_ref::<rusqlite::Error>() {
@@ -473,6 +496,7 @@ impl Database {
                 WHERE status IN ('pending','recurring_active');
             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
 
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
@@ -653,41 +677,6 @@ impl Database {
                 ON events(agent_id, description COLLATE NOCASE, event_date)
                 WHERE event_date IS NOT NULL;
 
-            -- Unified timeline VIEW for cross-subsystem queries
-            CREATE VIEW IF NOT EXISTS unified_timeline AS
-            SELECT
-                trace_id,
-                session_id,
-                agent_id,
-                'message' AS event_type,
-                role AS event_subtype,
-                CASE
-                    WHEN length(content) > 200 THEN substr(content, 1, 200) || '...'
-                    ELSE content
-                END AS summary,
-                created_at
-            FROM messages
-            UNION ALL
-            SELECT
-                trace_id,
-                session_id,
-                agent_id,
-                'audit' AS event_type,
-                tool_name AS event_subtype,
-                target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || after_value AS summary,
-                created_at
-            FROM audit_events
-            UNION ALL
-            SELECT
-                created_trace_id AS trace_id,
-                created_by_session AS session_id,
-                agent_id,
-                'task' AS event_type,
-                action_type AS event_subtype,
-                label || ' [' || status || ']' AS summary,
-                created_at
-            FROM tasks;
-
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
 
@@ -695,6 +684,11 @@ impl Database {
             ",
             )
             .context("failed to create v1 schema")?;
+
+        // Unified timeline VIEW (uses shared constant)
+        self.conn
+            .execute_batch(UNIFIED_TIMELINE_VIEW_SQL)
+            .context("failed to create unified_timeline view")?;
 
         // Virtual tables must be outside transactions
         let _ = self.conn.execute_batch(
@@ -828,46 +822,14 @@ impl Database {
         // 5. Create partial indexes on trace_id columns
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
-             CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;",
+             CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;",
         )?;
 
-        // 6. Create unified_timeline VIEW
-        self.conn.execute_batch(
-            "DROP VIEW IF EXISTS unified_timeline;
-             CREATE VIEW unified_timeline AS
-             SELECT
-                 trace_id,
-                 session_id,
-                 agent_id,
-                 'message' AS event_type,
-                 role AS event_subtype,
-                 CASE
-                     WHEN length(content) > 200 THEN substr(content, 1, 200) || '...'
-                     ELSE content
-                 END AS summary,
-                 created_at
-             FROM messages
-             UNION ALL
-             SELECT
-                 trace_id,
-                 session_id,
-                 agent_id,
-                 'audit' AS event_type,
-                 tool_name AS event_subtype,
-                 target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || after_value AS summary,
-                 created_at
-             FROM audit_events
-             UNION ALL
-             SELECT
-                 created_trace_id AS trace_id,
-                 created_by_session AS session_id,
-                 agent_id,
-                 'task' AS event_type,
-                 action_type AS event_subtype,
-                 label || ' [' || status || ']' AS summary,
-                 created_at
-             FROM tasks;",
-        )?;
+        // 6. Create unified_timeline VIEW (uses shared constant)
+        self.conn
+            .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
         // 7. Update schema version
         self.conn
@@ -877,13 +839,13 @@ impl Database {
     }
 
     /// Check if a column exists on a table (used for idempotent migrations).
-    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+    fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
             .conn
             .prepare(&format!("PRAGMA table_info('{table}')"))?;
         let exists = stmt
             .query_map([], |r| r.get::<_, String>(1))?
-            .any(|name| name.as_ref().map_or(false, |n| n == column));
+            .any(|name| name.as_ref().is_ok_and(|n| n == column));
         Ok(exists)
     }
 

@@ -806,6 +806,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             db: db.clone(),
             agent_name: db.agent_id.clone(),
             session_id: params.session_id.to_string(),
+            trace_id: trace_id.to_string(),
         })
     };
     let result = run_loop(
@@ -1193,7 +1194,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let pending_commitments = db.list_commitments("pending").await?;
 
     // For reflection, prepare conversation and memory event digests
-    let (conversations_digest, memory_events_digest) =
+    let (conversations_digest, audit_events_digest) =
         if matches!(&params.trigger, SilentTrigger::Reflection) {
             let tz_str = db
                 .get_customer_config("timezone")
@@ -1219,12 +1220,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
             };
 
             // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
-            let memory_events = db.get_audit_events_since(midnight_unix).await?;
-            let mem_digest = if memory_events.is_empty() {
+            let audit_events = db.get_audit_events_since(midnight_unix).await?;
+            let mem_digest = if audit_events.is_empty() {
                 None
             } else {
                 let mut buf = String::new();
-                for evt in &memory_events {
+                for evt in &audit_events {
                     let line = format!(
                         "[{}] {} on {}: {} -> {}\n",
                         evt.created_at,
@@ -1313,7 +1314,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         telegram_configured: chat_id.is_some(),
         has_message_sender: params.message_sender.is_some(),
         recent_conversations: conversations_digest.as_deref(),
-        recent_memory_events: memory_events_digest.as_deref(),
+        recent_audit_events: audit_events_digest.as_deref(),
         home_dir: Some(params.home_dir),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);

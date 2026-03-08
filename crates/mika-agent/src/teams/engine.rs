@@ -805,6 +805,7 @@ impl TeamEngine {
             let team_name = team_name.clone();
             let brave_api_key = brave_api_key.clone();
             let team_db = team_db.clone();
+            let trace_id = self.trace_id.clone();
 
             let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
             join_set.spawn(
@@ -872,7 +873,7 @@ impl TeamEngine {
                                     "assistant",
                                     response,
                                     Some(&metadata),
-                                    None,
+                                    Some(&trace_id),
                                 )
                                 .await
                             {
@@ -901,7 +902,7 @@ impl TeamEngine {
                                     "system",
                                     &error_str,
                                     Some(&metadata),
-                                    None,
+                                    Some(&trace_id),
                                 )
                                 .await
                             {

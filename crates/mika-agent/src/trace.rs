@@ -19,14 +19,7 @@ pub fn generate_trace_id() -> String {
         }
     }
     // Fallback: random 128-bit value as 32-char hex
-    let id = uuid::Uuid::new_v4();
-    id.as_bytes()
-        .iter()
-        .fold(String::with_capacity(32), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 #[cfg(test)]
