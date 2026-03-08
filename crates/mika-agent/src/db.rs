@@ -262,6 +262,91 @@ pub struct TeamWorkspaceEntry {
     pub created_at: i64,
 }
 
+// ===== Dashboard Types =====
+
+#[derive(Debug, Clone)]
+pub struct TimelineRow {
+    pub trace_id: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_id: String,
+    pub event_type: String,
+    pub event_subtype: String,
+    pub summary: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TimelineFilters {
+    pub agent_id: Option<String>,
+    pub event_type: Option<String>,
+    pub trace_id: Option<String>,
+    pub session_id: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+impl TimelineFilters {
+    /// Build a WHERE clause and parameter values from the filters.
+    fn to_sql(&self) -> (String, Vec<String>) {
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+
+        if let Some(ref aid) = self.agent_id {
+            params.push(aid.clone());
+            conditions.push(format!("agent_id = ?{}", params.len()));
+        }
+        if let Some(ref et) = self.event_type {
+            params.push(et.clone());
+            conditions.push(format!("event_type = ?{}", params.len()));
+        }
+        if let Some(ref tid) = self.trace_id {
+            params.push(tid.clone());
+            conditions.push(format!("trace_id = ?{}", params.len()));
+        }
+        if let Some(ref sid) = self.session_id {
+            params.push(sid.clone());
+            conditions.push(format!("session_id = ?{}", params.len()));
+        }
+        if let Some(from) = self.from {
+            params.push(from.to_string());
+            conditions.push(format!("created_at >= ?{}", params.len()));
+        }
+        if let Some(to) = self.to {
+            params.push(to.to_string());
+            conditions.push(format!("created_at <= ?{}", params.len()));
+        }
+
+        let clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        (clause, params)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentWithStats {
+    pub id: String,
+    pub name: String,
+    pub home_dir: String,
+    pub active: bool,
+    pub last_seen: Option<i64>,
+    pub created_at: i64,
+    pub message_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionWithStats {
+    pub id: String,
+    pub agent_id: String,
+    pub channel_type: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub metadata: Option<String>,
+    pub message_count: i64,
+}
+
 // ===== Database =====
 
 pub struct Database {
@@ -2901,6 +2986,329 @@ impl Database {
     pub fn vacuum(&self) -> Result<()> {
         self.conn.execute_batch("VACUUM;")?;
         Ok(())
+    }
+
+    // ===== Dashboard Queries (unscoped, cross-agent) =====
+
+    /// Query the unified_timeline VIEW with optional filters and pagination.
+    pub fn query_timeline(
+        &self,
+        filters: &TimelineFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TimelineRow>> {
+        let (where_clause, params) = filters.to_sql();
+        let sql = format!(
+            "SELECT trace_id, session_id, agent_id, event_type, event_subtype, summary, created_at \
+             FROM unified_timeline {} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+            where_clause,
+            params.len() + 1,
+            params.len() + 2,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            params.into_iter().map(|s| Box::new(s) as _).collect();
+        all_params.push(Box::new(limit));
+        all_params.push(Box::new(offset));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| &**p).collect();
+        let rows = stmt
+            .query_map(&*param_refs, |r| {
+                Ok(TimelineRow {
+                    trace_id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    event_type: r.get(3)?,
+                    event_subtype: r.get(4)?,
+                    summary: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count total rows in unified_timeline matching filters.
+    pub fn query_timeline_count(&self, filters: &TimelineFilters) -> Result<u64> {
+        let (where_clause, params) = filters.to_sql();
+        let sql = format!(
+            "SELECT COUNT(*) FROM unified_timeline {}",
+            where_clause,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let boxed: Vec<Box<dyn rusqlite::types::ToSql>> =
+            params.into_iter().map(|s| Box::new(s) as _).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|p| &**p).collect();
+        let count: i64 = stmt.query_row(&*param_refs, |r| r.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Get all events for a specific trace_id from the unified_timeline VIEW.
+    pub fn query_timeline_by_trace(&self, trace_id: &str) -> Result<Vec<TimelineRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT trace_id, session_id, agent_id, event_type, event_subtype, summary, created_at \
+             FROM unified_timeline WHERE trace_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![trace_id], |r| {
+                Ok(TimelineRow {
+                    trace_id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    event_type: r.get(3)?,
+                    event_subtype: r.get(4)?,
+                    summary: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// List all agents with message count.
+    pub fn list_agents_with_stats(&self) -> Result<Vec<AgentWithStats>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.name, a.home_dir, a.active, a.last_seen, a.created_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.agent_id = a.id AND m.role != 'summary') as msg_count
+             FROM agents a ORDER BY a.name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AgentWithStats {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    home_dir: r.get(2)?,
+                    active: r.get(3)?,
+                    last_seen: r.get(4)?,
+                    created_at: r.get(5)?,
+                    message_count: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// List sessions with optional filters and pagination.
+    pub fn list_sessions_paginated(
+        &self,
+        agent_id: Option<&str>,
+        channel_type: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionWithStats>> {
+        let mut conditions = Vec::new();
+        let mut param_values: Vec<String> = Vec::new();
+
+        if let Some(aid) = agent_id {
+            param_values.push(aid.to_string());
+            conditions.push(format!("s.agent_id = ?{}", param_values.len()));
+        }
+        if let Some(ct) = channel_type {
+            param_values.push(ct.to_string());
+            conditions.push(format!("s.channel_type = ?{}", param_values.len()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT s.id, s.agent_id, s.channel_type, s.started_at, s.ended_at, s.metadata,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) as msg_count
+             FROM sessions s {} ORDER BY s.started_at DESC LIMIT ?{} OFFSET ?{}",
+            where_clause,
+            param_values.len() + 1,
+            param_values.len() + 2,
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            param_values.into_iter().map(|s| Box::new(s) as _).collect();
+        all_params.push(Box::new(limit));
+        all_params.push(Box::new(offset));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| &**p).collect();
+
+        let rows = stmt
+            .query_map(&*param_refs, |r| {
+                Ok(SessionWithStats {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    channel_type: r.get(2)?,
+                    started_at: r.get(3)?,
+                    ended_at: r.get(4)?,
+                    metadata: r.get(5)?,
+                    message_count: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count sessions matching optional filters.
+    pub fn count_sessions(
+        &self,
+        agent_id: Option<&str>,
+        channel_type: Option<&str>,
+    ) -> Result<u64> {
+        let mut conditions = Vec::new();
+        let mut param_values: Vec<String> = Vec::new();
+
+        if let Some(aid) = agent_id {
+            param_values.push(aid.to_string());
+            conditions.push(format!("agent_id = ?{}", param_values.len()));
+        }
+        if let Some(ct) = channel_type {
+            param_values.push(ct.to_string());
+            conditions.push(format!("channel_type = ?{}", param_values.len()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!("SELECT COUNT(*) FROM sessions {}", where_clause);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let boxed: Vec<Box<dyn rusqlite::types::ToSql>> =
+            param_values.into_iter().map(|s| Box::new(s) as _).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|p| &**p).collect();
+        let count: i64 = stmt.query_row(&*param_refs, |r| r.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Get a single session by id.
+    pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, channel_type, started_at, ended_at, metadata
+                 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| {
+                    Ok(Session {
+                        id: r.get(0)?,
+                        agent_id: r.get(1)?,
+                        channel_type: r.get(2)?,
+                        started_at: r.get(3)?,
+                        ended_at: r.get(4)?,
+                        metadata: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Load messages for a session with pagination.
+    pub fn load_session_messages_paginated(
+        &self,
+        session_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.session_id = ?1
+              ORDER BY m.created_at ASC, m.id ASC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![session_id, limit as i64, offset as i64],
+                Self::row_to_session_message,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count messages in a session.
+    pub fn count_session_messages(&self, session_id: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// List audit events for an agent with pagination.
+    pub fn list_audit_events_paginated(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<AuditEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
+                     datetime(created_at, 'unixepoch')
+              FROM audit_events WHERE agent_id = ?1
+              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, limit as i64, offset as i64], |r| {
+                Ok(AuditEvent {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    tool_name: r.get(2)?,
+                    target_key: r.get(3)?,
+                    before_value: r.get(4)?,
+                    after_value: r.get(5)?,
+                    reasoning: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count audit events for an agent.
+    pub fn count_audit_events(&self, agent_id: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// List sessions for an agent with pagination.
+    pub fn list_agent_sessions_paginated(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionWithStats>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.agent_id, s.channel_type, s.started_at, s.ended_at, s.metadata,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) as msg_count
+             FROM sessions s WHERE s.agent_id = ?1
+             ORDER BY s.started_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, limit as i64, offset as i64], |r| {
+                Ok(SessionWithStats {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    channel_type: r.get(2)?,
+                    started_at: r.get(3)?,
+                    ended_at: r.get(4)?,
+                    metadata: r.get(5)?,
+                    message_count: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count sessions for an agent.
+    pub fn count_agent_sessions(&self, agent_id: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 }
 
