@@ -2559,6 +2559,7 @@ impl Database {
 
     // ===== Team Workspace =====
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_team_workspace_entry(
         &self,
         run_id: &str,

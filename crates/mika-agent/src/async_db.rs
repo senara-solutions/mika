@@ -737,6 +737,7 @@ impl AsyncDatabase {
 
     // -- Audit --
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_audit_event(
         &self,
         session_id: &str,
@@ -974,6 +975,7 @@ impl AsyncDatabase {
 
     // -- Team Workspace --
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_team_workspace_entry(
         &self,
         run_id: &str,
