@@ -2,13 +2,13 @@ mod cancel_reminder;
 mod cancel_task;
 mod complete_task;
 mod create_agent;
-mod create_team;
-mod delete_team;
 mod create_reminder;
 pub(crate) mod create_skill;
 mod create_task;
+mod create_team;
 mod delegate_task;
 mod delete_skill;
+mod delete_team;
 mod get_config;
 mod get_task;
 mod get_team_history;
@@ -446,4 +446,3 @@ pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<B
 
     tools
 }
-

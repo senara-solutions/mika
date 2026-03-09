@@ -18,7 +18,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -263,6 +263,15 @@ pub struct TeamWorkspaceEntry {
     pub created_at: i64,
 }
 
+// ===== Skill Override Types =====
+
+/// A user override for a skill property (persists across bundled skill re-sync).
+#[derive(Debug, Clone)]
+pub struct SkillOverride {
+    pub skill_name: String,
+    pub always_on: Option<bool>,
+}
+
 // ===== Dashboard Types =====
 
 #[derive(Debug, Clone)]
@@ -459,6 +468,10 @@ impl Database {
             self.migrate_v5_to_v6()?;
             info!(version = 6, "database migrated to v6");
         }
+        if (3..=6).contains(&version) {
+            self.migrate_v6_to_v7()?;
+            info!(version = 7, "database migrated to v7");
+        }
         Ok(())
     }
 
@@ -508,7 +521,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (6);
+            INSERT INTO schema_version (version) VALUES (7);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -755,6 +768,13 @@ impl Database {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
 
+            CREATE TABLE skill_overrides (
+                agent_id   TEXT NOT NULL COLLATE NOCASE,
+                skill_name TEXT NOT NULL COLLATE NOCASE,
+                always_on  INTEGER,
+                PRIMARY KEY (agent_id, skill_name)
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
                 ON tasks(agent_id, label COLLATE NOCASE)
                 WHERE trigger_type = 'recurring'
@@ -945,6 +965,24 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v6_to_v7(&self) -> Result<()> {
+        info!("migrating database schema v6 → v7 (skill_overrides table)");
+
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_overrides (
+                agent_id   TEXT NOT NULL COLLATE NOCASE,
+                skill_name TEXT NOT NULL COLLATE NOCASE,
+                always_on  INTEGER,
+                PRIMARY KEY (agent_id, skill_name)
+            )",
+        )?;
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (7)", [])?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -1003,6 +1041,49 @@ impl Database {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    // ===== Skill Overrides =====
+
+    /// Get all skill overrides for an agent.
+    pub fn get_skill_overrides(&self, agent_id: &str) -> Result<Vec<SkillOverride>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT skill_name, always_on FROM skill_overrides WHERE agent_id = ?1")?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| {
+                Ok(SkillOverride {
+                    skill_name: r.get(0)?,
+                    always_on: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Set (upsert) an always_on override for a skill.
+    pub fn set_skill_override(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        always_on: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO skill_overrides (agent_id, skill_name, always_on)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id, skill_name) DO UPDATE SET always_on = excluded.always_on",
+            params![agent_id, skill_name, always_on],
+        )?;
+        Ok(())
+    }
+
+    /// Delete an override for a skill (revert to bundled default).
+    pub fn delete_skill_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM skill_overrides WHERE agent_id = ?1 AND skill_name = ?2",
+            params![agent_id, skill_name],
+        )?;
+        Ok(())
     }
 
     // ===== Team CRUD =====
@@ -3077,8 +3158,10 @@ impl Database {
         let mut all_params: Vec<rusqlite::types::Value> = params;
         all_params.push(rusqlite::types::Value::Integer(limit as i64));
         all_params.push(rusqlite::types::Value::Integer(offset as i64));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt
             .query_map(&*param_refs, |r| {
                 Ok(TimelineRow {
@@ -3100,8 +3183,10 @@ impl Database {
         let (where_clause, params) = filters.to_sql();
         let sql = format!("SELECT COUNT(*) FROM unified_timeline {}", where_clause);
         let mut stmt = self.conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         let count: i64 = stmt.query_row(&*param_refs, |r| r.get(0))?;
         Ok(count as u64)
     }
@@ -3360,7 +3445,6 @@ impl Database {
         )?;
         Ok(n as u64)
     }
-
 }
 
 // ===== Utility Functions =====
@@ -4576,5 +4660,81 @@ mod tests {
             count >= 1,
             "legacy rows with NULL trace_id should appear in unified_timeline"
         );
+    }
+
+    // ===== Skill Override Tests =====
+
+    #[test]
+    fn test_skill_override_crud() {
+        let db = db();
+
+        // Initially empty
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert!(overrides.is_empty());
+
+        // Set an override
+        db.set_skill_override("mika", "web-search", true).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].skill_name, "web-search");
+        assert_eq!(overrides[0].always_on, Some(true));
+
+        // Update the override
+        db.set_skill_override("mika", "web-search", false).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].always_on, Some(false));
+
+        // Delete the override
+        db.delete_skill_override("mika", "web-search").unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn test_skill_override_per_agent_isolation() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "").unwrap();
+        db.register_agent("agent-b", "Agent B", "").unwrap();
+
+        db.set_skill_override("agent-a", "shell-exec", true)
+            .unwrap();
+        db.set_skill_override("agent-b", "shell-exec", false)
+            .unwrap();
+
+        let a_overrides = db.get_skill_overrides("agent-a").unwrap();
+        let b_overrides = db.get_skill_overrides("agent-b").unwrap();
+        assert_eq!(a_overrides[0].always_on, Some(true));
+        assert_eq!(b_overrides[0].always_on, Some(false));
+    }
+
+    #[test]
+    fn test_skill_override_case_insensitive() {
+        let db = db();
+
+        db.set_skill_override("mika", "Web-Search", true).unwrap();
+
+        // Query with different case should find it
+        let overrides = db.get_skill_overrides("MIKA").unwrap();
+        assert_eq!(overrides.len(), 1);
+
+        // Upsert with different case should update (not create duplicate)
+        db.set_skill_override("MIKA", "web-search", false).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].always_on, Some(false));
+    }
+
+    #[test]
+    fn test_skill_override_delete_nonexistent_is_noop() {
+        let db = db();
+        // Should not error
+        db.delete_skill_override("mika", "nonexistent").unwrap();
+    }
+
+    #[test]
+    fn test_schema_version_is_7() {
+        let db = db();
+        assert_eq!(db.schema_version().unwrap(), 7);
     }
 }

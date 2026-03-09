@@ -107,8 +107,11 @@ impl Tool for DelegateTaskTool {
         };
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, agent_name);
 
-        // Load delegate agent's skills
-        let skills = crate::skills::SkillRegistry::from_dir(&agent_home.join("skills"));
+        // Load delegate agent's skills (with DB overrides)
+        let mut skills = crate::skills::SkillRegistry::from_dir(&agent_home.join("skills"));
+        if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
+            skills.apply_overrides(&overrides);
+        }
 
         // Build tools: default_tools only — NO management tools (prevents recursion)
         let tool_registry = crate::tools::default_tools();

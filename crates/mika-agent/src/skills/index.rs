@@ -36,6 +36,8 @@ pub struct SkillEntry {
     pub skill_tools: Vec<ResolvedSkillTool>,
     /// Whether the skill is enabled (no `.disabled` marker file).
     pub enabled: bool,
+    /// Whether this entry has a DB override applied (for display purposes).
+    pub has_override: bool,
 }
 
 /// Scan a skills directory and load all valid skill manifests.
@@ -132,6 +134,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
             prompt_snippet,
             skill_tools,
             enabled,
+            has_override: false,
         });
     }
 

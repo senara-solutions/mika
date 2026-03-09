@@ -64,9 +64,7 @@ impl Tool for CreateAgentTool {
         }
 
         if agent::agent_exists(&self.home_dir, &name) {
-            return Ok(ToolOutput::error(format!(
-                "Agent '{name}' already exists."
-            )));
+            return Ok(ToolOutput::error(format!("Agent '{name}' already exists.")));
         }
 
         // Ensure agents directory exists
@@ -151,7 +149,11 @@ mod tests {
             .execute(serde_json::json!({"name": "researcher"}), &ctx)
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("researcher"));
 
         // Verify agent was created
@@ -178,7 +180,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("Elon Musk"));
 
         let agent_home = agent::agent_dir(tmp.path(), "elon-musk");
@@ -248,7 +254,11 @@ mod tests {
             .await
             .unwrap();
         // "myagent" after normalization (lowercase, trimmed)
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(agent::agent_exists(tmp.path(), "myagent"));
     }
 }

@@ -90,8 +90,11 @@ impl TeamEngine {
             let identity = crate::prompt::load_identity(&home_dir);
             db.register_agent(&ta.name, &identity.name, home_dir.to_str().unwrap_or(""))?;
             startup::seed_core_memory_if_empty(&db, &home_dir, &ta.name)?;
+            let mut skills = SkillRegistry::from_dir(&home_dir.join("skills"));
+            if let Ok(overrides) = db.get_skill_overrides(&ta.name) {
+                skills.apply_overrides(&overrides);
+            }
             let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
-            let skills = SkillRegistry::from_dir(&home_dir.join("skills"));
 
             agents.insert(
                 ta.name.clone(),

@@ -30,7 +30,21 @@ impl Tool for ListSkillsTool {
 
     async fn execute(&self, _input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let skills_dir = ctx.home_dir.join("skills");
-        let entries = crate::skills::index::scan_skills_dir(&skills_dir);
+        let mut entries = crate::skills::index::scan_skills_dir(&skills_dir);
+
+        // Apply DB overrides so the listing reflects effective values
+        if let Ok(overrides) = ctx.db.get_skill_overrides(ctx.db.agent_id()).await {
+            for ov in &overrides {
+                if let Some(always_on) = ov.always_on
+                    && let Some(entry) = entries
+                        .iter_mut()
+                        .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(&ov.skill_name))
+                {
+                    entry.manifest.skill.always_on = always_on;
+                    entry.has_override = true;
+                }
+            }
+        }
 
         if entries.is_empty() {
             return Ok(ToolOutput::success("No skills installed."));
@@ -49,6 +63,11 @@ impl Tool for ListSkillsTool {
             } else {
                 ""
             };
+            let override_badge = if entry.has_override {
+                " [override]"
+            } else {
+                ""
+            };
             let tools_count = entry.skill_tools.len();
             let name = &entry.manifest.skill.name;
             let origin = if is_bundled_skill(name) {
@@ -60,12 +79,13 @@ impl Tool for ListSkillsTool {
             };
 
             output.push_str(&format!(
-                "- {} ({}){} — {}{}\n  Keywords: {}\n  Tools: {}\n",
+                "- {} ({}){} — {}{}{}\n  Keywords: {}\n  Tools: {}\n",
                 entry.manifest.skill.name,
                 status,
                 origin,
                 entry.manifest.skill.description,
                 always_on,
+                override_badge,
                 keywords,
                 tools_count,
             ));

@@ -9,8 +9,8 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
-    NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats, Task,
-    TeamRow, TeamRunRow, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats,
+    SkillOverride, Task, TeamRow, TeamRunRow, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -142,6 +142,30 @@ impl AsyncDatabase {
 
     pub async fn list_agents_db(&self) -> Result<Vec<AgentRow>> {
         self.with_db(|db| db.list_agents_db()).await
+    }
+
+    // -- Skill Overrides --
+
+    pub async fn get_skill_overrides(&self, agent_id: &str) -> Result<Vec<SkillOverride>> {
+        let a = agent_id.to_owned();
+        self.with_db(move |db| db.get_skill_overrides(&a)).await
+    }
+
+    pub async fn set_skill_override(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        always_on: bool,
+    ) -> Result<()> {
+        let (a, s) = (agent_id.to_owned(), skill_name.to_owned());
+        self.with_db(move |db| db.set_skill_override(&a, &s, always_on))
+            .await
+    }
+
+    pub async fn delete_skill_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
+        let (a, s) = (agent_id.to_owned(), skill_name.to_owned());
+        self.with_db(move |db| db.delete_skill_override(&a, &s))
+            .await
     }
 
     // -- Team CRUD --
@@ -1130,7 +1154,6 @@ impl AsyncDatabase {
         let aid = agent_id.to_owned();
         self.with_db(move |db| db.count_audit_events(&aid)).await
     }
-
 }
 
 #[cfg(test)]
