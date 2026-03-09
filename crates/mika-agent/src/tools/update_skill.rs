@@ -163,9 +163,7 @@ impl Tool for UpdateSkillTool {
                         }
                     } else {
                         // Setting to a non-default value — persist the override
-                        if let Err(e) =
-                            ctx.db.set_skill_override(agent_id, name, always_on).await
-                        {
+                        if let Err(e) = ctx.db.set_skill_override(agent_id, name, always_on).await {
                             return Ok(ToolOutput::error(format!(
                                 "Failed to save skill override: {e}"
                             )));
