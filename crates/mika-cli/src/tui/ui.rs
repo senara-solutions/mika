@@ -47,12 +47,17 @@ struct WrappedInput {
 }
 
 /// Wrap input text lines at character-width boundaries and track cursor position.
+///
+/// When `selection` is `Some(((start_row, start_col), (end_row, end_col)))`,
+/// characters inside the selection range are highlighted with a distinct style.
 fn wrap_input_with_cursor(
     text_lines: &[impl AsRef<str>],
     cursor_row: usize,
     cursor_col: usize,
     width: usize,
+    selection: Option<((usize, usize), (usize, usize))>,
 ) -> WrappedInput {
+    let sel_highlight = Style::default().bg(Color::LightBlue).fg(Color::Black);
     let mut display_lines: Vec<Line<'static>> = Vec::new();
     let mut cursor_x: u16 = 0;
     let mut cursor_y: u16 = 0;
@@ -70,15 +75,49 @@ fn wrap_input_with_cursor(
             continue;
         }
 
-        let mut seg_start = 0;
+        // Build per-character selection flags for this line
+        let sel_flags: Vec<bool> = if let Some(((sr, sc), (er, ec))) = selection {
+            line.chars()
+                .enumerate()
+                .map(|(char_idx, _)| {
+                    if line_idx > sr && line_idx < er {
+                        true
+                    } else if line_idx == sr && line_idx == er {
+                        char_idx >= sc && char_idx < ec
+                    } else if line_idx == sr {
+                        char_idx >= sc
+                    } else if line_idx == er {
+                        char_idx < ec
+                    } else {
+                        false
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let has_selection = !sel_flags.is_empty();
+        let mut seg_start_byte = 0;
+        let mut seg_start_idx = 0;
         let mut col = 0usize;
 
         for (char_idx, (byte_offset, ch)) in line.char_indices().enumerate() {
             let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
 
             if col + ch_w > width && col > 0 {
-                display_lines.push(Line::from(line[seg_start..byte_offset].to_string()));
-                seg_start = byte_offset;
+                let seg = &line[seg_start_byte..byte_offset];
+                if has_selection {
+                    display_lines.push(build_selection_line(
+                        seg,
+                        &sel_flags[seg_start_idx..char_idx],
+                        sel_highlight,
+                    ));
+                } else {
+                    display_lines.push(Line::from(seg.to_string()));
+                }
+                seg_start_byte = byte_offset;
+                seg_start_idx = char_idx;
                 col = 0;
             }
 
@@ -91,7 +130,17 @@ fn wrap_input_with_cursor(
             col += ch_w;
         }
 
-        display_lines.push(Line::from(line[seg_start..].to_string()));
+        // Emit the final segment
+        let seg = &line[seg_start_byte..];
+        if has_selection {
+            display_lines.push(build_selection_line(
+                seg,
+                &sel_flags[seg_start_idx..],
+                sel_highlight,
+            ));
+        } else {
+            display_lines.push(Line::from(seg.to_string()));
+        }
 
         if line_idx == cursor_row && !found_cursor {
             cursor_y = (display_lines.len() - 1) as u16;
@@ -105,6 +154,47 @@ fn wrap_input_with_cursor(
         cursor_x,
         cursor_y,
     }
+}
+
+/// Build a `Line` with selection-highlighted spans from a segment of characters.
+///
+/// `selected_flags` has one `bool` per character indicating if it's selected.
+fn build_selection_line(text: &str, selected_flags: &[bool], highlight: Style) -> Line<'static> {
+    if selected_flags.is_empty() {
+        return Line::from(text.to_string());
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let mut current_selected = false;
+    let mut first = true;
+
+    for (ch, &selected) in text.chars().zip(selected_flags.iter()) {
+        if first {
+            current_selected = selected;
+            first = false;
+        } else if selected != current_selected {
+            if !current.is_empty() {
+                if current_selected {
+                    spans.push(Span::styled(std::mem::take(&mut current), highlight));
+                } else {
+                    spans.push(Span::raw(std::mem::take(&mut current)));
+                }
+            }
+            current_selected = selected;
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        if current_selected {
+            spans.push(Span::styled(current, highlight));
+        } else {
+            spans.push(Span::raw(current));
+        }
+    }
+
+    Line::from(spans)
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
@@ -474,37 +564,46 @@ fn get_highlighted_lines(
     lines: &[Line<'static>],
     selection: &SelectionState,
 ) -> Option<Vec<Line<'static>>> {
-    let (sel_msg, start, end) = match selection {
-        SelectionState::Dragging {
-            message_idx: m,
-            anchor,
-            current,
-        } => {
-            if *m != message_idx {
-                return None;
-            }
-            // Normalize direction
+    let (sel_start, sel_end) = match selection {
+        SelectionState::Dragging { anchor, current } => {
             if anchor <= current {
-                (*m, *anchor, *current)
+                (*anchor, *current)
             } else {
-                (*m, *current, *anchor)
+                (*current, *anchor)
             }
         }
-        SelectionState::Selected {
-            message_idx: m,
-            start,
-            end,
-        } => {
-            if *m != message_idx {
-                return None;
-            }
-            (*m, *start, *end)
-        }
+        SelectionState::Selected { start, end } => (*start, *end),
         SelectionState::None => return None,
     };
-    let _ = sel_msg; // used only for matching
 
-    Some(apply_selection_highlight(lines, start, end))
+    // Is this message in the selection range?
+    if message_idx < sel_start.message_idx || message_idx > sel_end.message_idx {
+        return None;
+    }
+
+    let text_start = if message_idx == sel_start.message_idx {
+        sel_start.text_pos
+    } else {
+        TextPosition {
+            line: 0,
+            char_offset: 0,
+        }
+    };
+    let text_end = if message_idx == sel_end.message_idx {
+        sel_end.text_pos
+    } else {
+        TextPosition {
+            line: usize::MAX,
+            char_offset: usize::MAX,
+        }
+    };
+
+    // Empty selection within a single message
+    if text_start == text_end {
+        return None;
+    }
+
+    Some(apply_selection_highlight(lines, text_start, text_end))
 }
 
 /// Apply reverse-video selection highlight to lines within [start, end].
@@ -769,7 +868,14 @@ pub fn extract_selected_text(
         for span in &line.spans {
             for ch in span.content.chars() {
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if col >= sel_start && col < sel_end {
+                if w == 0 {
+                    // Zero-width chars (combining marks, etc.) attach to preceding char:
+                    // include them if the preceding char was in the selection range
+                    // (col > sel_start means at least one char before was included)
+                    if col > sel_start && col <= sel_end {
+                        result.push(ch);
+                    }
+                } else if col >= sel_start && col < sel_end {
                     result.push(ch);
                 }
                 col += w;
@@ -819,6 +925,7 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     f.render_widget(prompt, input_chunks[0]);
 
     let textarea_area = input_chunks[1];
+    app.textarea_inner_rect = Some(textarea_area);
     let width = textarea_area.width as usize;
 
     let lines = app.textarea.lines();
@@ -835,8 +942,9 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
         return;
     }
 
-    // Wrap input and track cursor position
-    let wrapped = wrap_input_with_cursor(lines, cursor_row, cursor_col, width);
+    // Wrap input and track cursor position (with optional selection highlighting)
+    let selection = app.textarea.selection_range();
+    let wrapped = wrap_input_with_cursor(lines, cursor_row, cursor_col, width, selection);
 
     // Scroll the input view if cursor is beyond the visible area
     let visible_height = textarea_area.height;
@@ -845,6 +953,7 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     } else {
         0
     };
+    app.textarea_scroll_offset = scroll_offset;
 
     // Render display lines (with scroll offset)
     let display_lines: Vec<Line<'static>> = wrapped
@@ -1009,7 +1118,7 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-    if !app.selection_state.is_none() {
+    if !app.selection_state.is_none() || app.textarea.selection_range().is_some() {
         spans.push(Span::styled(
             "Ctrl+C copy",
             Style::default().fg(Color::Cyan),

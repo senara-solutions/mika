@@ -51,6 +51,27 @@ pub enum ChatRole {
     Thinking,
 }
 
+/// A position within a specific message (message index + position within that message).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessagePosition {
+    pub message_idx: usize,
+    pub text_pos: TextPosition,
+}
+
+impl PartialOrd for MessagePosition {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MessagePosition {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.message_idx
+            .cmp(&other.message_idx)
+            .then(self.text_pos.cmp(&other.text_pos))
+    }
+}
+
 /// Text position within a message's rendered lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextPosition {
@@ -67,15 +88,13 @@ pub enum SelectionState {
     None,
     /// Mouse button is held, drag in progress.
     Dragging {
-        message_idx: usize,
-        anchor: TextPosition,
-        current: TextPosition,
+        anchor: MessagePosition,
+        current: MessagePosition,
     },
     /// Selection complete (mouse released).
     Selected {
-        message_idx: usize,
-        start: TextPosition,
-        end: TextPosition,
+        start: MessagePosition,
+        end: MessagePosition,
     },
 }
 
@@ -391,6 +410,12 @@ pub struct App<'a> {
     pub messages_layout: MessagesLayout,
     /// The inner rect of the messages panel (set during draw, used for hit-testing).
     pub messages_inner_rect: Option<Rect>,
+    /// The inner rect of the textarea (set during draw, used for mouse hit-testing).
+    pub textarea_inner_rect: Option<Rect>,
+    /// Textarea scroll offset (display rows skipped, set during draw).
+    pub textarea_scroll_offset: u16,
+    /// Whether the user is actively dragging a selection in the textarea.
+    pub textarea_selecting: bool,
 
     // Shared resources for slash commands
     pub db: AsyncDatabase,
@@ -488,6 +513,9 @@ impl<'a> App<'a> {
             selection_state: SelectionState::default(),
             messages_layout: MessagesLayout::default(),
             messages_inner_rect: None,
+            textarea_inner_rect: None,
+            textarea_scroll_offset: 0,
+            textarea_selecting: false,
             db,
             claude,
             home_dir,
@@ -548,6 +576,9 @@ impl<'a> App<'a> {
             selection_state: SelectionState::default(),
             messages_layout: MessagesLayout::default(),
             messages_inner_rect: None,
+            textarea_inner_rect: None,
+            textarea_scroll_offset: 0,
+            textarea_selecting: false,
             // Team mode does not use agent-specific resources. These are set to
             // safe defaults. Slash command handlers check `is_team_mode()` before
             // accessing them.
