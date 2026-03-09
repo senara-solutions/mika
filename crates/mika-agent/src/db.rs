@@ -1750,6 +1750,45 @@ impl Database {
         Ok(id)
     }
 
+    /// Load a single message by its row ID.
+    pub fn get_message_by_id(&self, message_id: i64) -> Result<Option<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.id = ?1",
+        )?;
+        let mut rows = stmt
+            .query_map(params![message_id], Self::row_to_session_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.pop())
+    }
+
+    /// Load messages surrounding a given message ID within the same session.
+    /// Returns up to `before` messages before and `after` messages after the target.
+    pub fn get_surrounding_messages(
+        &self,
+        session_id: &str,
+        target_id: i64,
+        before: u32,
+        after: u32,
+    ) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.session_id = ?1
+                AND (m.id >= (SELECT id FROM (SELECT id FROM messages WHERE session_id = ?1 AND id <= ?2 ORDER BY id DESC LIMIT ?3) sub ORDER BY id ASC LIMIT 1))
+                AND m.id <= (SELECT id FROM (SELECT id FROM messages WHERE session_id = ?1 AND id >= ?2 ORDER BY id ASC LIMIT ?4) sub ORDER BY id DESC LIMIT 1)
+              ORDER BY m.created_at ASC, m.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![session_id, target_id, before + 1, after + 1],
+                Self::row_to_session_message,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn get_messages_since(
         &self,
         agent_id: &str,

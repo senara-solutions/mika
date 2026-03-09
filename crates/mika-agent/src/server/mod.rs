@@ -1,6 +1,7 @@
 mod auth;
 pub mod dashboard;
 mod handlers;
+pub mod investigate;
 pub mod json_extractor;
 pub mod openapi;
 pub mod state;
@@ -44,7 +45,7 @@ const HEARTBEAT_CRON: &str = "0 0 * * * *";
 ///
 /// Shared between production `run_server` and test `test_app`.
 fn build_router(state: AppState) -> Router {
-    // CORS — scoped to dashboard routes only, restricted to GET + OPTIONS
+    // CORS — scoped to dashboard routes only (GET + POST + OPTIONS)
     let cors_origin =
         std::env::var("MIKA_CORS_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
     let cors = CorsLayer::new()
@@ -53,7 +54,7 @@ fn build_router(state: AppState) -> Router {
                 .parse::<http::HeaderValue>()
                 .expect("MIKA_CORS_ORIGIN must be a valid header value"),
         )
-        .allow_methods([http::Method::GET, http::Method::OPTIONS])
+        .allow_methods([http::Method::GET, http::Method::OPTIONS, http::Method::POST])
         .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]);
 
     // Dashboard API routes (read-only, with CORS for browser access)
@@ -75,6 +76,11 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/sessions/{id}/messages",
             get(dashboard::handle_session_messages),
+        )
+        .route(
+            "/investigate",
+            post(investigate::handle_investigate)
+                .layer(RequestBodyLimitLayer::new(investigate::INVESTIGATE_BODY_LIMIT)),
         )
         .layer(cors);
 
@@ -373,6 +379,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
         dashboard_db,
+        investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
     };
 
     let app = build_router(state.clone());
@@ -563,6 +571,8 @@ mod tests {
                 otlp_auth_header: None,
             },
             dashboard_db,
+            investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
