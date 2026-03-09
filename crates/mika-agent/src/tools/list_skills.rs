@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bundled_skills::is_bundled_skill;
+use crate::skills::SkillRegistry;
 use crate::skills::marketplace::is_marketplace_skill;
 
 pub struct ListSkillsTool;
@@ -30,28 +31,21 @@ impl Tool for ListSkillsTool {
 
     async fn execute(&self, _input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let skills_dir = ctx.home_dir.join("skills");
-        let mut entries = crate::skills::index::scan_skills_dir(&skills_dir);
+        let mut registry = SkillRegistry::from_dir(&skills_dir);
 
         // Apply DB overrides so the listing reflects effective values
         if let Ok(overrides) = ctx.db.get_skill_overrides(ctx.db.agent_id()).await {
-            for ov in &overrides {
-                if let Some(always_on) = ov.always_on
-                    && let Some(entry) = entries
-                        .iter_mut()
-                        .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(&ov.skill_name))
-                {
-                    entry.manifest.skill.always_on = always_on;
-                    entry.has_override = true;
-                }
-            }
+            registry.apply_overrides(&overrides);
         }
+
+        let entries = registry.skills();
 
         if entries.is_empty() {
             return Ok(ToolOutput::success("No skills installed."));
         }
 
         let mut output = format!("Installed skills ({}):\n", entries.len());
-        for entry in &entries {
+        for entry in entries {
             let status = if entry.enabled { "enabled" } else { "disabled" };
             let keywords = if entry.manifest.triggers.keywords.is_empty() {
                 "none".to_string()
