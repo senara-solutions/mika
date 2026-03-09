@@ -3,6 +3,9 @@ import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
+import InvestigationPanel, {
+  type InvestigationContext,
+} from '../components/InvestigationPanel.tsx'
 import { formatTimestamp } from '../hooks/useFormatTime.ts'
 import {
   ArrowLeft,
@@ -14,6 +17,7 @@ import {
   Check,
   ChevronRight,
   ChevronDown,
+  Search,
 } from 'lucide-react'
 
 interface ToolCall {
@@ -107,7 +111,13 @@ function truncateText(text: string, maxLen = 80): string {
   return cleaned.slice(0, maxLen) + '...'
 }
 
-function ToolCallsTable({ metadata }: { metadata: string | null }) {
+function ToolCallsTable({
+  metadata,
+  onInvestigate,
+}: {
+  metadata: string | null
+  onInvestigate?: (toolCallIndex: number, toolName: string) => void
+}) {
   const toolCalls = parseToolCalls(metadata)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
@@ -141,6 +151,7 @@ function ToolCallsTable({ metadata }: { metadata: string | null }) {
               <th className="text-left px-2 py-2 font-medium">Tool</th>
               <th className="text-left px-2 py-2 font-medium">Input</th>
               <th className="text-left px-2 py-2 font-medium">Output</th>
+              {onInvestigate && <th className="w-8 px-2 py-2" />}
             </tr>
           </thead>
           <tbody className="divide-y divide-white/[0.03]">
@@ -212,11 +223,25 @@ function ToolCallsTable({ metadata }: { metadata: string | null }) {
                         {tc.output_summary && <CopyButton text={tc.output_summary} />}
                       </div>
                     </td>
+                    {onInvestigate && (
+                      <td className="px-2 py-2">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onInvestigate(i, tc.name)
+                          }}
+                          className="p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
+                          title="Investigate this tool call"
+                        >
+                          <Search size={12} />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                   {/* Expanded detail row */}
                   {isOpen && (
                     <tr>
-                      <td colSpan={5} className="px-4 py-3 bg-white/[0.02]">
+                      <td colSpan={onInvestigate ? 6 : 5} className="px-4 py-3 bg-white/[0.02]">
                         <div className="space-y-2">
                           {tc.input_summary && (
                             <div>
@@ -309,6 +334,7 @@ function roleConfig(role: string) {
 export default function SessionDetail() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const [page, setPage] = useState(1)
+  const [investigationCtx, setInvestigationCtx] = useState<InvestigationContext | null>(null)
 
   const { data: session, isLoading: sessionLoading } = useSessionDetail(sessionId ?? '')
   const { data: messages, isLoading: messagesLoading } = useSessionMessages(
@@ -317,6 +343,20 @@ export default function SessionDetail() {
   )
 
   const isLoading = sessionLoading || messagesLoading
+
+  const openInvestigation = (
+    messageId: number,
+    toolCallIndex?: number,
+    toolName?: string,
+  ) => {
+    setInvestigationCtx({
+      messageId,
+      toolCallIndex,
+      toolName,
+      sessionId: sessionId ?? '',
+      agentId: session?.agent_id ?? '',
+    })
+  }
 
   return (
     <div>
@@ -400,6 +440,15 @@ export default function SessionDetail() {
                       <span className={`text-xs font-semibold ${config.label}`}>
                         {config.name}
                       </span>
+                      {msg.role === 'assistant' && (
+                        <button
+                          onClick={() => openInvestigation(msg.id)}
+                          className="ml-2 p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
+                          title="Investigate this message"
+                        >
+                          <Search size={12} />
+                        </button>
+                      )}
                       <span className="text-[10px] text-muted/30 ml-auto font-mono">
                         {formatTimestamp(msg.created_at)}
                       </span>
@@ -407,7 +456,14 @@ export default function SessionDetail() {
                     <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-8">
                       {msg.content}
                     </div>
-                    {msg.role === 'assistant' && <ToolCallsTable metadata={msg.metadata} />}
+                    {msg.role === 'assistant' && (
+                      <ToolCallsTable
+                        metadata={msg.metadata}
+                        onInvestigate={(toolCallIndex, toolName) =>
+                          openInvestigation(msg.id, toolCallIndex, toolName)
+                        }
+                      />
+                    )}
                   </div>
                 </div>
               )
@@ -420,6 +476,13 @@ export default function SessionDetail() {
             onPageChange={setPage}
           />
         </>
+      )}
+
+      {investigationCtx && (
+        <InvestigationPanel
+          context={investigationCtx}
+          onClose={() => setInvestigationCtx(null)}
+        />
       )}
     </div>
   )
