@@ -300,7 +300,7 @@ pub struct TimelineFilters {
 impl TimelineFilters {
     /// Build a WHERE clause and parameter values from the filters.
     /// Uses `rusqlite::types::Value` to preserve native types (integers pass as integers).
-    fn to_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
+    pub(crate) fn to_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
         let mut conditions = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
 

@@ -372,3 +372,193 @@ pub async fn handle_session_messages(
     })
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::TimelineFilters;
+
+    // ===== strip_base64_images tests =====
+
+    #[test]
+    fn strip_base64_images_short_content_unchanged() {
+        let input = "Hello, world!";
+        assert_eq!(strip_base64_images(input), input);
+    }
+
+    #[test]
+    fn strip_base64_images_no_base64_marker_unchanged() {
+        // Content over 1000 chars but no "base64" marker => returned as-is
+        let input = "x".repeat(2000);
+        assert_eq!(strip_base64_images(&input), input);
+    }
+
+    #[test]
+    fn strip_base64_images_under_1000_with_base64_unchanged() {
+        let input = "some base64 data here";
+        assert_eq!(strip_base64_images(input), input);
+    }
+
+    #[test]
+    fn strip_base64_images_moderate_content_with_base64_unchanged() {
+        // Between 1000 and 50_000 chars with base64 marker => returned as-is
+        let mut input = "x".repeat(1500);
+        input.push_str(" base64 ");
+        input.push_str(&"y".repeat(1000));
+        assert_eq!(strip_base64_images(&input), input);
+    }
+
+    #[test]
+    fn strip_base64_images_large_content_truncated() {
+        // Over 50_000 chars with base64 marker => truncated
+        let mut input = "HEADER_".to_string();
+        input.push_str(&"a".repeat(1000));
+        input.push_str(" base64 ");
+        input.push_str(&"b".repeat(60_000));
+        let result = strip_base64_images(&input);
+        assert!(result.len() < input.len());
+        assert!(result.contains("[content truncated,"));
+        assert!(result.contains("bytes total"));
+        assert!(result.contains("base64 image data"));
+        // First 1000 chars of input should be preserved
+        assert!(result.starts_with(&input[..1000]));
+    }
+
+    #[test]
+    fn strip_base64_images_exactly_50000_unchanged() {
+        // Exactly 50_000 chars with base64 marker => not truncated (> 50_000 required)
+        let mut input = "base64".to_string();
+        input.push_str(&"x".repeat(50_000 - 6));
+        assert_eq!(input.len(), 50_000);
+        assert_eq!(strip_base64_images(&input), input);
+    }
+
+    #[test]
+    fn strip_base64_images_empty_string() {
+        assert_eq!(strip_base64_images(""), "");
+    }
+
+    // ===== resolve_pagination tests =====
+
+    #[test]
+    fn resolve_pagination_defaults() {
+        let (page, per_page, offset) = resolve_pagination(None, None);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, DEFAULT_PER_PAGE);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn resolve_pagination_page_2() {
+        let (page, per_page, offset) = resolve_pagination(Some(2), Some(10));
+        assert_eq!(page, 2);
+        assert_eq!(per_page, 10);
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn resolve_pagination_page_0_clamped_to_1() {
+        let (page, _per_page, offset) = resolve_pagination(Some(0), None);
+        assert_eq!(page, 1);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn resolve_pagination_per_page_0_clamped_to_1() {
+        let (_page, per_page, _offset) = resolve_pagination(None, Some(0));
+        assert_eq!(per_page, 1);
+    }
+
+    #[test]
+    fn resolve_pagination_per_page_over_max_clamped() {
+        let (_page, per_page, _offset) = resolve_pagination(None, Some(500));
+        assert_eq!(per_page, MAX_PER_PAGE);
+    }
+
+    #[test]
+    fn resolve_pagination_large_page_clamped() {
+        let (page, _per_page, _offset) = resolve_pagination(Some(999_999), None);
+        assert_eq!(page, 100_000);
+    }
+
+    #[test]
+    fn resolve_pagination_offset_calculation() {
+        // page=3, per_page=25 => offset = (3-1)*25 = 50
+        let (page, per_page, offset) = resolve_pagination(Some(3), Some(25));
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 25);
+        assert_eq!(offset, 50);
+    }
+
+    // ===== TimelineFilters::to_sql tests =====
+
+    #[test]
+    fn timeline_filters_empty() {
+        let f = TimelineFilters::default();
+        let (clause, params) = f.to_sql();
+        assert_eq!(clause, "");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn timeline_filters_single_agent_id() {
+        let f = TimelineFilters {
+            agent_id: Some("mika".to_string()),
+            ..Default::default()
+        };
+        let (clause, params) = f.to_sql();
+        assert_eq!(clause, "WHERE agent_id = ?1");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn timeline_filters_multiple_fields() {
+        let f = TimelineFilters {
+            agent_id: Some("mika".to_string()),
+            event_type: Some("message".to_string()),
+            from: Some(1000),
+            to: Some(2000),
+            ..Default::default()
+        };
+        let (clause, params) = f.to_sql();
+        assert!(clause.starts_with("WHERE "));
+        assert!(clause.contains("agent_id = ?1"));
+        assert!(clause.contains("event_type = ?2"));
+        assert!(clause.contains("created_at >= ?3"));
+        assert!(clause.contains("created_at <= ?4"));
+        assert_eq!(params.len(), 4);
+    }
+
+    #[test]
+    fn timeline_filters_all_fields() {
+        let f = TimelineFilters {
+            agent_id: Some("mika".to_string()),
+            event_type: Some("audit".to_string()),
+            trace_id: Some("abc123".to_string()),
+            session_id: Some("sess-1".to_string()),
+            from: Some(100),
+            to: Some(200),
+        };
+        let (clause, params) = f.to_sql();
+        assert_eq!(params.len(), 6);
+        assert!(clause.contains("agent_id = ?1"));
+        assert!(clause.contains("event_type = ?2"));
+        assert!(clause.contains("trace_id = ?3"));
+        assert!(clause.contains("session_id = ?4"));
+        assert!(clause.contains("created_at >= ?5"));
+        assert!(clause.contains("created_at <= ?6"));
+    }
+
+    #[test]
+    fn timeline_filters_only_time_range() {
+        let f = TimelineFilters {
+            from: Some(500),
+            to: Some(600),
+            ..Default::default()
+        };
+        let (clause, params) = f.to_sql();
+        assert_eq!(params.len(), 2);
+        assert!(clause.contains("created_at >= ?1"));
+        assert!(clause.contains("created_at <= ?2"));
+    }
+}
