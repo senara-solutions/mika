@@ -50,6 +50,15 @@ pub enum ChatRole {
     Thinking,
 }
 
+/// Extract callback task label from message metadata JSON.
+pub fn callback_label_from_metadata(metadata: &Option<String>) -> String {
+    metadata
+        .as_ref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get("label")?.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "background task".to_string())
+}
+
 /// Messages flowing between the TUI and the agent worker.
 pub enum AgentRequest {
     Message {
@@ -1037,8 +1046,15 @@ impl<'a> App<'a> {
 
         for msg in &new_msgs {
             let role = match msg.role.as_str() {
-                "user" => ChatRole::User,
+                "user" => {
+                    // Skip stale framing messages saved before the callback save fix
+                    if msg.content.starts_with("A background task has completed.") {
+                        continue;
+                    }
+                    ChatRole::User
+                }
                 "assistant" => ChatRole::Assistant,
+                "tool_result" => ChatRole::System,
                 _ => continue,
             };
             // CLI messages from other processes don't need a channel badge
@@ -1048,9 +1064,16 @@ impl<'a> App<'a> {
             } else {
                 Some(msg.channel_type.clone())
             };
+            // For tool_result, show a brief summary with label from metadata
+            let content = if msg.role == "tool_result" {
+                let label = callback_label_from_metadata(&msg.metadata);
+                format!("[Task: {}] Result received", label)
+            } else {
+                msg.content.clone()
+            };
             self.messages.push(ChatMessage {
                 role,
-                content: msg.content.clone(),
+                content,
                 rendered: None,
                 channel,
             });
@@ -1337,5 +1360,30 @@ mod tests {
     fn test_visual_line_rows_zero_width() {
         use crate::tui::ui::visual_line_rows;
         assert_eq!(visual_line_rows("hello", 0), 1);
+    }
+
+    // === callback_label_from_metadata tests ===
+
+    #[test]
+    fn test_callback_label_with_valid_metadata() {
+        let meta = Some(r#"{"callback_task_id":"abc","label":"analyze_codebase"}"#.to_string());
+        assert_eq!(callback_label_from_metadata(&meta), "analyze_codebase");
+    }
+
+    #[test]
+    fn test_callback_label_with_missing_label() {
+        let meta = Some(r#"{"callback_task_id":"abc"}"#.to_string());
+        assert_eq!(callback_label_from_metadata(&meta), "background task");
+    }
+
+    #[test]
+    fn test_callback_label_with_none_metadata() {
+        assert_eq!(callback_label_from_metadata(&None), "background task");
+    }
+
+    #[test]
+    fn test_callback_label_with_invalid_json() {
+        let meta = Some("not json".to_string());
+        assert_eq!(callback_label_from_metadata(&meta), "background task");
     }
 }
