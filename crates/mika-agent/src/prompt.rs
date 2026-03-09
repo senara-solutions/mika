@@ -300,6 +300,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
              parameter must be lowercase with hyphens (e.g. \"elon-musk\"), while `display_name` is \
              the human-readable name (e.g. \"Elon Musk\").\n",
         );
+        prompt.push_str(
+            "\nTo create a team, use the `create_team` tool — do NOT write team.toml manually. \
+             Provide a `name`, `orchestrator` (must be one of the agents), and an `agents` array \
+             where each entry has `name`, `role`, and `mandate`. All agents must already exist \
+             (create them first with `create_agent` if needed).\n",
+        );
     }
 
     // Tool usage instructions (builtin tools are always available)
