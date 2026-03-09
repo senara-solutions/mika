@@ -1,10 +1,20 @@
-import { useState } from 'react'
+import { useState, Fragment } from 'react'
 import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatTimestamp } from '../hooks/useFormatTime.ts'
-import { ArrowLeft, User, Bot, Settings, Wrench, CheckCircle2, XCircle } from 'lucide-react'
+import {
+  ArrowLeft,
+  User,
+  Bot,
+  Settings,
+  Wrench,
+  Copy,
+  Check,
+  ChevronRight,
+  ChevronDown,
+} from 'lucide-react'
 
 interface ToolCall {
   step: number
@@ -24,53 +34,175 @@ function parseToolCalls(metadata: string | null): ToolCall[] {
   }
 }
 
-function ToolCallsSection({ metadata }: { metadata: string | null }) {
-  const toolCalls = parseToolCalls(metadata)
-  if (toolCalls.length === 0) return null
+function CopyButton({ text, className }: { text: string; className?: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Silently fail — clipboard may be unavailable
+    }
+  }
 
   return (
-    <div className="mt-3 pl-8 space-y-1.5">
-      {toolCalls.map((tc, i) => (
-        <div
-          key={i}
-          className="bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-2"
-        >
-          <div className="flex items-center gap-2">
-            <Wrench size={12} className="text-muted/40" />
-            <span className="font-mono text-xs text-heading">{tc.name}</span>
-            {tc.success ? (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-400/15 text-emerald-400">
-                <CheckCircle2 size={10} /> ok
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-400/15 text-red-400">
-                <XCircle size={10} /> failed
-              </span>
-            )}
-            <span className="text-[10px] text-muted/30 ml-auto">step {tc.step}</span>
-          </div>
-          {tc.input_summary && (
-            <details className="mt-1.5">
-              <summary className="text-[10px] text-muted/40 cursor-pointer hover:text-muted/60">
-                Input
-              </summary>
-              <div className="font-mono text-xs text-muted/60 mt-1 pl-2 border-l border-white/[0.06]">
-                {tc.input_summary}
-              </div>
-            </details>
-          )}
-          {tc.output_summary && (
-            <details className="mt-1">
-              <summary className="text-[10px] text-muted/40 cursor-pointer hover:text-muted/60">
-                Output
-              </summary>
-              <div className="font-mono text-xs text-muted/60 mt-1 pl-2 border-l border-white/[0.06]">
-                {tc.output_summary}
-              </div>
-            </details>
-          )}
+    <button
+      onClick={handleCopy}
+      className={`opacity-40 hover:opacity-100 transition-opacity shrink-0 ${className ?? ''}`}
+      title="Copy to clipboard"
+    >
+      {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+    </button>
+  )
+}
+
+function truncateText(text: string, maxLen = 80): string {
+  if (text.length <= maxLen) return text
+  // Strip backend's trailing "..." before re-truncating to avoid "text......"
+  const cleaned = text.endsWith('...') ? text.slice(0, -3) : text
+  if (cleaned.length <= maxLen) return text
+  return cleaned.slice(0, maxLen) + '...'
+}
+
+function ToolCallsTable({ metadata }: { metadata: string | null }) {
+  const toolCalls = parseToolCalls(metadata)
+  const [expanded, setExpanded] = useState<Set<number>>(new Set())
+
+  if (toolCalls.length === 0) return null
+
+  const toggleExpand = (index: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.has(index) ? next.delete(index) : next.add(index)
+      return next
+    })
+  }
+
+  return (
+    <div className="mt-3 pl-8">
+      <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl overflow-x-auto">
+        {/* Header */}
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-white/[0.06]">
+          <Wrench size={12} className="text-muted/40" />
+          <span className="text-[10px] text-muted/40 uppercase tracking-wider">
+            {toolCalls.length} tool call{toolCalls.length !== 1 ? 's' : ''}
+          </span>
         </div>
-      ))}
+
+        {/* Table */}
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-white/[0.05] text-muted/40 text-[10px] uppercase tracking-wider">
+              <th className="w-6 px-2 py-2" />
+              <th className="w-12 px-2 py-2" />
+              <th className="text-left px-2 py-2 font-medium">Tool</th>
+              <th className="text-left px-2 py-2 font-medium">Input</th>
+              <th className="text-left px-2 py-2 font-medium">Output</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/[0.03]">
+            {toolCalls.map((tc, i) => {
+              const isOpen = expanded.has(i)
+              return (
+                <Fragment key={i}>
+                  <tr
+                    onClick={() => toggleExpand(i)}
+                    className="hover:bg-white/[0.02] transition-colors cursor-pointer"
+                  >
+                    {/* Chevron */}
+                    <td className="px-2 py-2 text-muted/30">
+                      {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    </td>
+                    {/* Status */}
+                    <td className="px-2 py-2">
+                      {tc.success ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                          <span className="text-[10px]">ok</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-red-400">
+                          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                          <span className="text-[10px]">fail</span>
+                        </span>
+                      )}
+                    </td>
+                    {/* Tool name */}
+                    <td className="px-2 py-2 font-mono text-heading font-medium max-w-[160px] truncate">
+                      {tc.name}
+                    </td>
+                    {/* Input */}
+                    <td className="px-2 py-2 font-mono text-muted/60 max-w-[200px]">
+                      <div className="flex items-center gap-1">
+                        <span className="truncate">
+                          {tc.input_summary ? (
+                            truncateText(tc.input_summary)
+                          ) : (
+                            <span className="text-muted/30">&mdash;</span>
+                          )}
+                        </span>
+                        {tc.input_summary && <CopyButton text={tc.input_summary} />}
+                      </div>
+                    </td>
+                    {/* Output */}
+                    <td className="px-2 py-2 font-mono text-muted/60 max-w-[240px]">
+                      <div className="flex items-center gap-1">
+                        <span className="truncate">
+                          {tc.output_summary ? (
+                            truncateText(tc.output_summary)
+                          ) : (
+                            <span className="text-muted/30">&mdash;</span>
+                          )}
+                        </span>
+                        {tc.output_summary && <CopyButton text={tc.output_summary} />}
+                      </div>
+                    </td>
+                  </tr>
+                  {/* Expanded detail row */}
+                  {isOpen && (
+                    <tr>
+                      <td colSpan={5} className="px-4 py-3 bg-white/[0.02]">
+                        <div className="space-y-2">
+                          {tc.input_summary && (
+                            <div>
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[10px] text-muted/40 uppercase tracking-wider">
+                                  Input
+                                </span>
+                                <CopyButton text={tc.input_summary} />
+                              </div>
+                              <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06]">
+                                {tc.input_summary}
+                              </div>
+                            </div>
+                          )}
+                          {tc.output_summary && (
+                            <div>
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[10px] text-muted/40 uppercase tracking-wider">
+                                  Output
+                                </span>
+                                <CopyButton text={tc.output_summary} />
+                              </div>
+                              <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06]">
+                                {tc.output_summary}
+                              </div>
+                            </div>
+                          )}
+                          <div className="text-[10px] text-muted/30">Step {tc.step}</div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -151,9 +283,8 @@ export default function SessionDetail() {
           </Link>
           <div>
             <div className="flex items-center gap-3">
-              <h2 className="text-heading text-lg font-semibold font-mono">
-                {sessionId}
-              </h2>
+              <h2 className="text-heading text-lg font-semibold font-mono">{sessionId}</h2>
+              <CopyButton text={sessionId ?? ''} className="ml-1" />
               {session && !session.ended_at && (
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
                   Active
@@ -168,7 +299,8 @@ export default function SessionDetail() {
             {session && (
               <div className="flex items-center gap-3 mt-1">
                 <span className="text-xs text-muted/60">
-                  Session initialized via {session.channel_type} &middot; {formatTimestamp(session.started_at)}
+                  Session initialized via {session.channel_type} &middot;{' '}
+                  {formatTimestamp(session.started_at)}
                 </span>
               </div>
             )}
@@ -212,7 +344,9 @@ export default function SessionDetail() {
                 <div key={msg.id} className={config.align}>
                   <div className={`border rounded-xl p-4 ${config.bg}`}>
                     <div className="flex items-center gap-2 mb-2">
-                      <div className={`w-6 h-6 rounded-md flex items-center justify-center ${config.iconBg}`}>
+                      <div
+                        className={`w-6 h-6 rounded-md flex items-center justify-center ${config.iconBg}`}
+                      >
                         {config.icon}
                       </div>
                       <span className={`text-xs font-semibold ${config.label}`}>
@@ -225,9 +359,7 @@ export default function SessionDetail() {
                     <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-8">
                       {msg.content}
                     </div>
-                    {msg.role === 'assistant' && (
-                      <ToolCallsSection metadata={msg.metadata} />
-                    )}
+                    {msg.role === 'assistant' && <ToolCallsTable metadata={msg.metadata} />}
                   </div>
                 </div>
               )
