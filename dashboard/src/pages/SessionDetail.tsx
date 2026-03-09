@@ -34,7 +34,47 @@ function parseToolCalls(metadata: string | null): ToolCall[] {
   }
 }
 
-function CopyButton({ text, className }: { text: string; className?: string }) {
+const QUICK_COPY_KEYS: Record<string, string> = {
+  run_shell: 'command',
+  read_workspace: 'path',
+  read_home_file: 'path',
+  write_file: 'path',
+  list_home_files: 'path',
+  search_memory: 'query',
+  create_agent: 'name',
+  delegate_task: 'task',
+  store_fact: 'name',
+  update_fact: 'name',
+  create_reminder: 'label',
+  create_skill: 'name',
+  delete_skill: 'name',
+  web_search: 'query',
+  read_file: 'path',
+  run_team: 'goal',
+  get_documentation: 'topic',
+}
+
+function extractQuickCopy(toolName: string, inputSummary: string): string | null {
+  const key = QUICK_COPY_KEYS[toolName]
+  if (!key) return null
+  try {
+    const parsed = JSON.parse(inputSummary)
+    const value = parsed[key]
+    return typeof value === 'string' ? value : null
+  } catch {
+    return null
+  }
+}
+
+function CopyButton({
+  text,
+  className,
+  title = 'Copy to clipboard',
+}: {
+  text: string
+  className?: string
+  title?: string
+}) {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = async (e: React.MouseEvent) => {
@@ -52,7 +92,7 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
     <button
       onClick={handleCopy}
       className={`opacity-40 hover:opacity-100 transition-opacity shrink-0 ${className ?? ''}`}
-      title="Copy to clipboard"
+      title={title}
     >
       {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
     </button>
@@ -136,15 +176,27 @@ function ToolCallsTable({ metadata }: { metadata: string | null }) {
                     </td>
                     {/* Input */}
                     <td className="px-2 py-2 font-mono text-muted/60 max-w-[200px]">
-                      <div className="flex items-center gap-1">
-                        <span className="truncate">
-                          {tc.input_summary ? (
-                            truncateText(tc.input_summary)
+                      <div className="flex items-center gap-1.5">
+                        {tc.input_summary ? (() => {
+                          const qk = QUICK_COPY_KEYS[tc.name]
+                          const qv = qk ? extractQuickCopy(tc.name, tc.input_summary) : null
+                          return qv ? (
+                            <>
+                              <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent/60 font-medium">
+                                {qk}
+                              </span>
+                              <span className="truncate">{qv}</span>
+                              <CopyButton text={qv} title={`Copy ${qk}`} />
+                            </>
                           ) : (
-                            <span className="text-muted/30">&mdash;</span>
-                          )}
-                        </span>
-                        {tc.input_summary && <CopyButton text={tc.input_summary} />}
+                            <>
+                              <span className="truncate">{truncateText(tc.input_summary)}</span>
+                              <CopyButton text={tc.input_summary} title="Copy input" />
+                            </>
+                          )
+                        })() : (
+                          <span className="text-muted/30">&mdash;</span>
+                        )}
                       </div>
                     </td>
                     {/* Output */}
@@ -168,26 +220,22 @@ function ToolCallsTable({ metadata }: { metadata: string | null }) {
                         <div className="space-y-2">
                           {tc.input_summary && (
                             <div>
-                              <div className="flex items-center gap-2 mb-1">
-                                <span className="text-[10px] text-muted/40 uppercase tracking-wider">
-                                  Input
-                                </span>
-                                <CopyButton text={tc.input_summary} />
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] text-muted/40 uppercase tracking-wider">Input</span>
+                                <CopyButton text={tc.input_summary} title="Copy all" />
                               </div>
-                              <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06]">
+                              <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all">
                                 {tc.input_summary}
                               </div>
                             </div>
                           )}
                           {tc.output_summary && (
                             <div>
-                              <div className="flex items-center gap-2 mb-1">
-                                <span className="text-[10px] text-muted/40 uppercase tracking-wider">
-                                  Output
-                                </span>
-                                <CopyButton text={tc.output_summary} />
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] text-muted/40 uppercase tracking-wider">Output</span>
+                                <CopyButton text={tc.output_summary} title="Copy all" />
                               </div>
-                              <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06]">
+                              <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all">
                                 {tc.output_summary}
                               </div>
                             </div>

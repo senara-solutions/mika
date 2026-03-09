@@ -142,12 +142,6 @@ pub struct ToolCallSummary {
     pub success: bool,
 }
 
-/// Maximum characters for tool call input summary.
-/// Sized so that MAX_TOOL_STEPS entries fit within TOOL_METADATA_MAX in a single pass.
-const TOOL_INPUT_SUMMARY_MAX: usize = 120;
-/// Maximum characters for tool call output summary.
-/// Sized so that MAX_TOOL_STEPS entries fit within TOOL_METADATA_MAX in a single pass.
-const TOOL_OUTPUT_SUMMARY_MAX: usize = 180;
 /// Maximum total characters for serialized tool call metadata.
 const TOOL_METADATA_MAX: usize = 4000;
 /// Maximum characters of conversation/memory digest injected into the reflection prompt.
@@ -172,10 +166,8 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
 
 /// Serialize tool call summaries to JSON metadata string, capped at [`TOOL_METADATA_MAX`].
 ///
-/// With `TOOL_INPUT_SUMMARY_MAX=120` and `TOOL_OUTPUT_SUMMARY_MAX=180`, a single pass
-/// fits within the cap for up to `MAX_TOOL_STEPS` entries. If the result still exceeds
-/// the cap (e.g., many entries from a pathological case), entries are dropped from the
-/// tail until the size fits.
+/// If the serialized result exceeds the cap, entries are dropped from the tail until
+/// the size fits.
 pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String> {
     if summaries.is_empty() {
         return None;
@@ -923,7 +915,7 @@ async fn process_tool_calls(
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
-            let input_summary = truncate_summary(&input.to_string(), TOOL_INPUT_SUMMARY_MAX);
+            let input_summary = input.to_string();
             let dispatch = ToolDispatchCtx {
                 tools,
                 skill_tools,
@@ -935,13 +927,9 @@ async fn process_tool_calls(
             let output = execute_tool(&dispatch, name, input.clone()).await;
             let image_count = output.images.len();
             let output_summary = if image_count > 0 {
-                format!(
-                    "{} [+{} image(s)]",
-                    truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX),
-                    image_count
-                )
+                format!("{} [+{} image(s)]", output.content, image_count)
             } else {
-                truncate_summary(&output.content, TOOL_OUTPUT_SUMMARY_MAX)
+                output.content.clone()
             };
             summaries.push(ToolCallSummary {
                 step,
@@ -2080,8 +2068,8 @@ mod tests {
             .map(|i| ToolCallSummary {
                 step: i,
                 name: format!("tool_{i}"),
-                input_summary: "x".repeat(TOOL_INPUT_SUMMARY_MAX),
-                output_summary: "y".repeat(TOOL_OUTPUT_SUMMARY_MAX),
+                input_summary: "x".repeat(200),
+                output_summary: "y".repeat(300),
                 success: true,
             })
             .collect();
