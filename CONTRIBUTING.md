@@ -10,6 +10,16 @@ Mika is developed using [Claude Code](https://docs.anthropic.com/en/docs/claude-
 
 Build with `cargo build` and run tests with `cargo test`. Tests are fully mocked and do not require a `MIKA_ANTHROPIC_API_KEY`.
 
+## Git Hooks
+
+Enable the shared pre-commit hook to catch formatting and lint issues before they reach CI:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This runs `cargo fmt --check` and `cargo clippy` on every commit, matching the CI checks exactly.
+
 ## Development Workflow with Claude Code
 
 The recommended workflow uses the `/mika` slash command, which chains every step from planning through documentation:

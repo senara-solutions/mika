@@ -555,7 +555,11 @@ fn handle_skills(app: &App<'_>) -> String {
             format!("{tool_count} tools")
         };
         let disabled = if entry.enabled { "" } else { " [disabled]" };
-        let overridden = if entry.has_override { " [override]" } else { "" };
+        let overridden = if entry.has_override {
+            " [override]"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
             "  ● {:<width$}  {:<9}  {}{}{}",
