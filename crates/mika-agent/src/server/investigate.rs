@@ -195,7 +195,8 @@ impl Tool for QueryMessagesTool {
         let mut output = format!("Found {} messages in session {}:\n\n", msgs.len(), session_id);
         for m in &msgs {
             let content_preview = if m.content.len() > 200 {
-                format!("{}...", &m.content[..200])
+                let truncated: String = m.content.chars().take(200).collect();
+                format!("{truncated}...")
             } else {
                 m.content.clone()
             };
@@ -266,7 +267,8 @@ impl Tool for QueryAuditEventsTool {
                 e.target_key,
                 e.before_value.as_deref().unwrap_or("(none)"),
                 if e.after_value.len() > 100 {
-                    format!("{}...", &e.after_value[..100])
+                    let truncated: String = e.after_value.chars().take(100).collect();
+                    format!("{truncated}...")
                 } else {
                     e.after_value.clone()
                 },
@@ -401,7 +403,8 @@ impl Tool for GetAgentInfoTool {
             let soul_path = agent_state.home_dir.join("soul.md");
             if let Ok(soul) = tokio::fs::read_to_string(&soul_path).await {
                 let preview = if soul.len() > 500 {
-                    format!("{}...", &soul[..500])
+                    let truncated: String = soul.chars().take(500).collect();
+                    format!("{truncated}...")
                 } else {
                     soul
                 };
@@ -487,7 +490,8 @@ async fn build_investigation_context(
     prompt.push_str("## Conversation Context\n");
     for m in &surrounding {
         let content_preview = if m.content.len() > 500 {
-            format!("{}...", &m.content[..500])
+            let truncated: String = m.content.chars().take(500).collect();
+            format!("{truncated}...")
         } else {
             m.content.clone()
         };
@@ -643,7 +647,8 @@ async fn run_investigation(
             };
 
             let summary = if output.content.len() > 100 {
-                format!("{}...", &output.content[..100])
+                let truncated: String = output.content.chars().take(100).collect();
+                format!("{truncated}...")
             } else {
                 output.content.clone()
             };
