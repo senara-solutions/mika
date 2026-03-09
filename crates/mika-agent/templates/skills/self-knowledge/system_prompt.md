@@ -20,8 +20,6 @@ Available topics for `get_documentation`:
 
 **Your own files and configuration:**
 
-Beyond system documentation, you also have files in your home directory that define your configuration and identity. When asked about your own setup, configuration, or how specific parts of you work, check these files before answering.
-
 Key files:
 - `soul.md` — your personality, communication style, and behavioral boundaries
 - `identity.toml` — your name and emoji
