@@ -14,7 +14,11 @@ fn extract_bearer(req: &axum::extract::Request) -> Option<&str> {
 
 /// Constant-time comparison of a candidate token against a secret.
 fn token_matches(candidate: &str, secret: &secrecy::SecretString) -> bool {
-    bool::from(candidate.as_bytes().ct_eq(secret.expose_secret().as_bytes()))
+    bool::from(
+        candidate
+            .as_bytes()
+            .ct_eq(secret.expose_secret().as_bytes()),
+    )
 }
 
 /// Middleware that validates the `Authorization: Bearer <token>` header
@@ -26,9 +30,7 @@ pub async fn require_internal_token(
     next: Next,
 ) -> impl IntoResponse {
     match extract_bearer(&req) {
-        Some(t) if token_matches(t, &state.internal_token) => {
-            next.run(req).await.into_response()
-        }
+        Some(t) if token_matches(t, &state.internal_token) => next.run(req).await.into_response(),
         _ => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "unauthorized"})),

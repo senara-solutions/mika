@@ -189,12 +189,7 @@ mod tests {
         for i in 0..5 {
             harness
                 .db
-                .save_message(
-                    "test-session",
-                    "user",
-                    &format!("Message {i}"),
-                    None,
-                )
+                .save_message("test-session", "user", &format!("Message {i}"), None)
                 .await
                 .unwrap();
         }

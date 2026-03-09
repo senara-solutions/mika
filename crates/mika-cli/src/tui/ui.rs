@@ -1395,7 +1395,7 @@ mod tests {
             char_offset: 0,
         };
         assert!(a <= b);
-        assert!(!(b <= a));
+        assert!(b > a);
 
         let c = TextPosition {
             line: 0,
