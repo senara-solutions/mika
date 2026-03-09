@@ -68,7 +68,7 @@ pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
                     app.selection_state.clear();
                 } else {
                     // Normalize direction: start before end
-                    let (start, end) = if anchor.is_before_or_equal(&current) {
+                    let (start, end) = if anchor <= current {
                         (anchor, current)
                     } else {
                         (current, anchor)
@@ -114,6 +114,12 @@ pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
             }
         }
         return;
+    }
+
+    // Clear selection on any keypress (Ctrl+C already handled above)
+    if !app.selection_state.is_none() {
+        app.selection_state.clear();
+        app.needs_redraw = true;
     }
 
     if app.autocomplete.visible() {

@@ -52,19 +52,12 @@ pub enum ChatRole {
 }
 
 /// Text position within a message's rendered lines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextPosition {
     /// Line index within the message's rendered lines.
     pub line: usize,
     /// Character offset within the line (by unicode width columns).
     pub char_offset: usize,
-}
-
-impl TextPosition {
-    /// Returns true if self is before or equal to other in document order.
-    pub fn is_before_or_equal(&self, other: &Self) -> bool {
-        self.line < other.line || (self.line == other.line && self.char_offset <= other.char_offset)
-    }
 }
 
 /// Selection state machine for text selection in the messages panel.

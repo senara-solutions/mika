@@ -453,7 +453,7 @@ fn draw_messages(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
         // The sub-rect for this entry within the inner area
         let entry_rect = Rect {
             x: inner.x,
-            y: inner.y + y_offset as u16,
+            y: inner.y + y_offset.min(u16::MAX as usize) as u16,
             width: inner.width,
             height: (available_from_top - y_offset).min(entry.wrapped_line_count - skip_lines)
                 as u16,
@@ -463,7 +463,7 @@ fn draw_messages(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
             continue;
         }
 
-        let paragraph = paragraph.scroll((skip_lines as u16, 0));
+        let paragraph = paragraph.scroll((skip_lines.min(u16::MAX as usize) as u16, 0));
         f.render_widget(paragraph, entry_rect);
     }
 }
@@ -484,7 +484,7 @@ fn get_highlighted_lines(
                 return None;
             }
             // Normalize direction
-            if anchor.is_before_or_equal(current) {
+            if anchor <= *current {
                 (*m, *anchor, *current)
             } else {
                 (*m, *current, *anchor)
@@ -1394,14 +1394,14 @@ mod tests {
             line: 1,
             char_offset: 0,
         };
-        assert!(a.is_before_or_equal(&b));
-        assert!(!b.is_before_or_equal(&a));
+        assert!(a <= b);
+        assert!(!(b <= a));
 
         let c = TextPosition {
             line: 0,
             char_offset: 5,
         };
-        assert!(a.is_before_or_equal(&c));
+        assert!(a <= c);
     }
 
     #[test]
