@@ -277,32 +277,53 @@ fn build_message_lines(
     lines
 }
 
+/// Sentinel index for the pending response entry.
+const PENDING_RESPONSE_IDX: usize = usize::MAX;
+/// Sentinel index for the thinking indicator entry.
+const THINKING_INDICATOR_IDX: usize = usize::MAX - 1;
+
 /// Recompute the messages layout if stale.
 fn ensure_messages_layout(app: &mut App<'_>, width: u16) {
     let is_thinking = app.status == AgentStatus::Thinking;
     let has_pending = app.pending_response.is_some();
     let msg_count = app.messages.len();
+    let dots_phase = (app.tick_count / 5) % 4;
 
-    if !app
-        .messages_layout
-        .is_stale(width, msg_count, has_pending, app.reveal_index, is_thinking)
-    {
+    if !app.messages_layout.is_stale(
+        width,
+        msg_count,
+        has_pending,
+        app.reveal_index,
+        is_thinking,
+        dots_phase,
+    ) {
         return;
     }
 
-    let mut entries = Vec::with_capacity(msg_count + 2);
+    // Incremental rebuild: reuse message entries if only streaming/thinking changed
+    let width_or_count_changed = app.messages_layout.computed_at_width != width
+        || app.messages_layout.computed_at_count != msg_count;
 
-    // Build entries for each message
-    for (idx, msg) in app.messages.iter().enumerate() {
-        let lines = build_message_lines(msg, &app.identity_name);
-        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-        let wrapped_line_count = paragraph.line_count(width);
-        entries.push(MessageLayout {
-            message_idx: idx,
-            lines,
-            wrapped_line_count,
-        });
-    }
+    let mut entries = if width_or_count_changed {
+        // Full rebuild needed
+        let mut entries = Vec::with_capacity(msg_count + 2);
+        for (idx, msg) in app.messages.iter().enumerate() {
+            let lines = build_message_lines(msg, &app.identity_name);
+            let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+            let wrapped_line_count = paragraph.line_count(width);
+            entries.push(MessageLayout {
+                message_idx: idx,
+                lines,
+                wrapped_line_count,
+            });
+        }
+        entries
+    } else {
+        // Reuse existing message entries, strip trailing pending/thinking entries
+        let mut entries = std::mem::take(&mut app.messages_layout.entries);
+        entries.retain(|e| e.message_idx < msg_count);
+        entries
+    };
 
     // Pending response (streaming)
     if let Some(ref full) = app.pending_response {
@@ -320,7 +341,7 @@ fn ensure_messages_layout(app: &mut App<'_>, width: u16) {
         let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
         let wrapped_line_count = paragraph.line_count(width);
         entries.push(MessageLayout {
-            message_idx: usize::MAX, // sentinel for pending response
+            message_idx: PENDING_RESPONSE_IDX,
             lines,
             wrapped_line_count,
         });
@@ -328,7 +349,7 @@ fn ensure_messages_layout(app: &mut App<'_>, width: u16) {
 
     // Thinking indicator
     if is_thinking {
-        let dots = match (app.tick_count / 5) % 4 {
+        let dots = match dots_phase {
             0 => ".",
             1 => "..",
             2 => "...",
@@ -346,7 +367,7 @@ fn ensure_messages_layout(app: &mut App<'_>, width: u16) {
         let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
         let wrapped_line_count = paragraph.line_count(width);
         entries.push(MessageLayout {
-            message_idx: usize::MAX - 1, // sentinel for thinking indicator
+            message_idx: THINKING_INDICATOR_IDX,
             lines,
             wrapped_line_count,
         });
@@ -362,6 +383,7 @@ fn ensure_messages_layout(app: &mut App<'_>, width: u16) {
         had_pending: has_pending,
         computed_at_reveal: app.reveal_index,
         computed_at_thinking: is_thinking,
+        computed_at_dots_phase: dots_phase,
     };
 }
 
@@ -405,21 +427,23 @@ fn draw_messages(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
             break;
         }
 
-        // This entry is at least partially visible
-        let lines_to_render = if entry.message_idx < app.messages.len() {
-            // Check if this message has a selection to highlight
-            if let Some(highlighted) =
+        // This entry is at least partially visible.
+        // Only clone lines when selection highlight needs to modify spans.
+        let highlighted;
+        let lines_to_render: &[Line<'static>] = if entry.message_idx < app.messages.len() {
+            if let Some(h) =
                 get_highlighted_lines(entry.message_idx, &entry.lines, &app.selection_state)
             {
-                highlighted
+                highlighted = h;
+                &highlighted
             } else {
-                entry.lines.clone()
+                &entry.lines
             }
         } else {
-            entry.lines.clone()
+            &entry.lines
         };
 
-        let paragraph = Paragraph::new(lines_to_render).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines_to_render.to_vec()).wrap(Wrap { trim: false });
 
         // Calculate where this entry renders within the viewport
         let skip_lines = viewport_start.saturating_sub(entry_start);

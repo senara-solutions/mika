@@ -125,6 +125,8 @@ pub struct MessagesLayout {
     pub computed_at_reveal: usize,
     /// Agent status when last computed (for thinking indicator).
     pub computed_at_thinking: bool,
+    /// Thinking dots phase when last computed (0-3).
+    pub computed_at_dots_phase: u64,
 }
 
 impl MessagesLayout {
@@ -136,12 +138,14 @@ impl MessagesLayout {
         has_pending: bool,
         reveal_index: usize,
         is_thinking: bool,
+        dots_phase: u64,
     ) -> bool {
         self.computed_at_width != width
             || self.computed_at_count != msg_count
             || self.had_pending != has_pending
             || (has_pending && self.computed_at_reveal != reveal_index)
             || self.computed_at_thinking != is_thinking
+            || (is_thinking && self.computed_at_dots_phase != dots_phase)
     }
 }
 
