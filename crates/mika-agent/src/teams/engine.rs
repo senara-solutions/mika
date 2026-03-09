@@ -879,7 +879,8 @@ impl TeamEngine {
                             })
                             .to_string();
                             if let Err(e) = team_db
-                                .save_message_with_metadata(
+                                .save_message_as(
+                                    agent_name,
                                     &team_session_id,
                                     "assistant",
                                     response,
@@ -908,7 +909,8 @@ impl TeamEngine {
                             })
                             .to_string();
                             if let Err(e) = team_db
-                                .save_message_with_metadata(
+                                .save_message_as(
+                                    agent_name,
                                     &team_session_id,
                                     "system",
                                     &error_str,
@@ -1127,7 +1129,8 @@ impl TeamEngine {
         .to_string();
         if let Err(e) = self
             .team_db
-            .save_message_with_metadata(
+            .save_message_as(
+                &agent_name,
                 &team_session_id,
                 "assistant",
                 &response,

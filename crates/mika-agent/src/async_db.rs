@@ -439,8 +439,32 @@ impl AsyncDatabase {
         metadata: Option<&str>,
         trace_id: Option<&str>,
     ) -> Result<i64> {
+        self.save_message_as(
+            &self.agent_id.clone(),
+            session_id,
+            role,
+            content,
+            metadata,
+            trace_id,
+        )
+        .await
+    }
+
+    /// Save a message with an explicit `agent_id` (instead of using `self.agent_id`).
+    ///
+    /// Used by the team engine where the calling DB handle belongs to the orchestrator
+    /// but the message was produced by a different agent.
+    pub async fn save_message_as(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
         let (a, sid, r, c, m, t) = (
-            self.agent_id.clone(),
+            agent_id.to_owned(),
             session_id.to_owned(),
             role.to_owned(),
             content.to_owned(),
@@ -1403,5 +1427,83 @@ mod tests {
         let t = db.get_task(&id).await.unwrap().unwrap();
         assert_eq!(t.label, "Async reminder");
         assert_eq!(t.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_save_message_as_uses_explicit_agent_id() {
+        let (db, _sid) = test_async_db_with_session().await;
+
+        // Register a second agent and create a team session
+        db.register_agent("researcher", "Researcher", "")
+            .await
+            .unwrap();
+        let team_sid = "team-run-123";
+        // Create session owned by the orchestrator (mika)
+        db.create_session(team_sid, "mika", "team").await.unwrap();
+
+        // save_message_with_metadata uses self.agent_id (default "mika")
+        db.save_message_with_metadata(team_sid, "assistant", "from default", None, None)
+            .await
+            .unwrap();
+
+        // save_message_as uses explicit agent_id
+        db.save_message_as(
+            "researcher",
+            team_sid,
+            "assistant",
+            "from researcher",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Verify: load all messages for the session and check agent_ids
+        let msgs = db
+            .with_db({
+                let sid = team_sid.to_owned();
+                move |db_inner| db_inner.load_session_messages_paginated(&sid, 10, 0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].agent_id, "mika");
+        assert_eq!(msgs[0].content, "from default");
+        assert_eq!(msgs[1].agent_id, "researcher");
+        assert_eq!(msgs[1].content, "from researcher");
+    }
+
+    #[tokio::test]
+    async fn test_save_message_as_with_metadata() {
+        let (db, _sid) = test_async_db_with_session().await;
+
+        db.register_agent("writer", "Writer", "").await.unwrap();
+        let team_sid = "team-run-456";
+        db.create_session(team_sid, "mika", "team").await.unwrap();
+
+        let metadata = r#"{"agent_name":"writer","team_run_id":"run-456"}"#;
+        let trace = "aabbccdd00000000aabbccdd00000000";
+        db.save_message_as(
+            "writer",
+            team_sid,
+            "assistant",
+            "deliverable content",
+            Some(metadata),
+            Some(trace),
+        )
+        .await
+        .unwrap();
+
+        let msgs = db
+            .with_db({
+                let sid = team_sid.to_owned();
+                move |db_inner| db_inner.load_session_messages_paginated(&sid, 10, 0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].agent_id, "writer");
+        assert_eq!(msgs[0].content, "deliverable content");
+        assert!(msgs[0].metadata.as_ref().unwrap().contains("writer"));
     }
 }
