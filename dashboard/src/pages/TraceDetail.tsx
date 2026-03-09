@@ -1,34 +1,9 @@
 import { useParams, Link } from 'react-router'
 import { useTraceDetail } from '../api/timeline.ts'
 import EmptyState from '../components/EmptyState.tsx'
-import { formatTimestamp } from '../hooks/useFormatTime.ts'
+import { formatTimestamp } from '../utils/formatTime.ts'
+import { eventTypeBadge, eventTypeColor } from '../utils/badges.ts'
 import { ArrowLeft } from 'lucide-react'
-
-function eventTypeColor(type: string): string {
-  switch (type) {
-    case 'message':
-      return 'border-blue-400/20 bg-blue-400/5'
-    case 'audit':
-      return 'border-amber-400/20 bg-amber-400/5'
-    case 'task':
-      return 'border-emerald-400/20 bg-emerald-400/5'
-    default:
-      return 'border-white/[0.05] bg-bg-card'
-  }
-}
-
-function eventTypeBadge(type: string): { bg: string; text: string } {
-  switch (type) {
-    case 'message':
-      return { bg: 'bg-blue-500/15', text: 'text-blue-400' }
-    case 'audit':
-      return { bg: 'bg-amber-500/15', text: 'text-amber-400' }
-    case 'task':
-      return { bg: 'bg-emerald-500/15', text: 'text-emerald-400' }
-    default:
-      return { bg: 'bg-white/[0.05]', text: 'text-muted' }
-  }
-}
 
 export default function TraceDetail() {
   const { traceId } = useParams<{ traceId: string }>()

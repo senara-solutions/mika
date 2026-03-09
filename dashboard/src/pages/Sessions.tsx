@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { Link, useSearchParams } from 'react-router'
+import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
-import { formatRelativeTime } from '../hooks/useFormatTime.ts'
+import { formatRelativeTime } from '../utils/formatTime.ts'
+import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, Terminal, MessageSquare, Users, Settings } from 'lucide-react'
 
 const CHANNEL_TYPES = ['', 'cli', 'telegram', 'team', 'system']
@@ -24,7 +25,7 @@ function channelIcon(type: string) {
 }
 
 export default function Sessions() {
-  const [searchParams, setSearchParams] = useSearchParams()
+  const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
 
   const filters: SessionsFilters = {
     agent_id: searchParams.get('agent_id') ?? undefined,
@@ -36,23 +37,6 @@ export default function Sessions() {
   const [agentSearch, setAgentSearch] = useState(filters.agent_id ?? '')
 
   const { data, isLoading, error } = useSessions(filters)
-
-  function updateFilter(key: string, value: string) {
-    const next = new URLSearchParams(searchParams)
-    if (value) {
-      next.set(key, value)
-    } else {
-      next.delete(key)
-    }
-    next.delete('page')
-    setSearchParams(next)
-  }
-
-  function setPage(page: number) {
-    const next = new URLSearchParams(searchParams)
-    next.set('page', String(page))
-    setSearchParams(next)
-  }
 
   return (
     <div>
