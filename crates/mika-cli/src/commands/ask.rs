@@ -105,7 +105,15 @@ pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Resu
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
-    let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
+    let mut skill_registry = SkillRegistry::from_dir(&ctx.home_dir.join("skills"));
+    if let Ok(overrides) = ctx
+        .async_db
+        .get_skill_overrides(&ctx.async_db.agent_id)
+        .await
+    {
+        skill_registry.apply_overrides(&overrides);
+    }
+    let skill_registry = Arc::new(skill_registry);
     let is_onboarding = check_onboarding(&ctx.async_db).await;
     let skills_dirty = AtomicBool::new(false);
     let mcp_manager = init::connect_mcp(&ctx.home_dir).await;

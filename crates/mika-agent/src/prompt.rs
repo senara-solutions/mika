@@ -348,7 +348,10 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- You have built-in skills (use list_skills to see which). Built-in skills cannot be overwritten.\n",
     );
     prompt.push_str("- You can enable or disable skills with toggle_skill.\n");
-    prompt.push_str("- You can update existing skill descriptions, keywords, prompts, or always_on settings with update_skill.\n");
+    prompt.push_str("- To change whether a skill runs on every turn, use update_skill with always_on. For built-in skills, this persists in the database and survives restarts. Always use this tool rather than inspecting skill files directly.\n");
+    prompt.push_str(
+        "- You can also update skill descriptions, keywords, and prompts with update_skill.\n",
+    );
     prompt.push_str("- Skills may be [built-in], [marketplace] (installed from Git repos via CLI), or [custom] (created locally). You can delete marketplace and custom skills.\n");
     prompt.push_str("- You can permanently remove custom skills with delete_skill. Built-in skills cannot be deleted.\n");
     prompt.push_str(

@@ -188,9 +188,12 @@ pub async fn handle_message(
             // Hot-reload skills if the dirty flag was set by a previous turn
             let skills = if a.skills_dirty.load(Ordering::Acquire) {
                 a.skills_dirty.store(false, Ordering::Release);
-                let new = Arc::new(crate::skills::SkillRegistry::from_dir(
-                    &a.home_dir.join("skills"),
-                ));
+                let mut registry =
+                    crate::skills::SkillRegistry::from_dir(&a.home_dir.join("skills"));
+                if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
+                    registry.apply_overrides(&overrides);
+                }
+                let new = Arc::new(registry);
                 *a.skills.lock().unwrap() = new.clone();
                 new
             } else {

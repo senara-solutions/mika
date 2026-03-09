@@ -9,16 +9,16 @@ import { Search } from 'lucide-react'
 
 const EVENT_TYPES = ['', 'message', 'audit', 'task']
 
-function eventTypeBadge(type: string): { bg: string; text: string; label: string } {
+function eventTypeBadge(type: string): { bg: string; text: string; dot: string; label: string } {
   switch (type) {
     case 'message':
-      return { bg: 'bg-blue-500/15', text: 'text-blue-400', label: 'Messages' }
+      return { bg: 'bg-blue-500/15', text: 'text-blue-400', dot: 'bg-blue-400', label: 'Messages' }
     case 'audit':
-      return { bg: 'bg-amber-500/15', text: 'text-amber-400', label: 'Audit Log' }
+      return { bg: 'bg-amber-500/15', text: 'text-amber-400', dot: 'bg-amber-400', label: 'Audit Log' }
     case 'task':
-      return { bg: 'bg-emerald-500/15', text: 'text-emerald-400', label: 'Tasks' }
+      return { bg: 'bg-emerald-500/15', text: 'text-emerald-400', dot: 'bg-emerald-400', label: 'Tasks' }
     default:
-      return { bg: 'bg-white/[0.05]', text: 'text-muted', label: type }
+      return { bg: 'bg-white/[0.05]', text: 'text-muted', dot: 'bg-muted', label: type }
   }
 }
 
@@ -120,7 +120,7 @@ export default function Timeline() {
           >
             <option value="">All Agents</option>
             {agents?.map((a) => (
-              <option key={a.name} value={a.name}>
+              <option key={a.name} value={a.id}>
                 {a.name}
               </option>
             ))}
@@ -194,7 +194,7 @@ export default function Timeline() {
                         <span
                           className={`inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full ${badge.bg} ${badge.text}`}
                         >
-                          <span className={`w-1.5 h-1.5 rounded-full ${badge.text.replace('text-', 'bg-')}`} />
+                          <span className={`w-1.5 h-1.5 rounded-full ${badge.dot}`} />
                           {badge.label}
                         </span>
                       </td>

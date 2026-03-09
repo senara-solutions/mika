@@ -46,6 +46,7 @@ mod tests {
             prompt_snippet: String::new(),
             skill_tools: vec![],
             enabled: true,
+            has_override: false,
         }
     }
 

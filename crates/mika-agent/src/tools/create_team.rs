@@ -89,9 +89,7 @@ impl Tool for CreateTeamTool {
         }
 
         if team::team_exists(&self.home_dir, &name) {
-            return Ok(ToolOutput::error(format!(
-                "Team '{name}' already exists."
-            )));
+            return Ok(ToolOutput::error(format!("Team '{name}' already exists.")));
         }
 
         // Validate orchestrator
@@ -122,9 +120,7 @@ impl Tool for CreateTeamTool {
         };
 
         if agents_val.len() < 2 {
-            return Ok(ToolOutput::error(
-                "A team requires at least 2 agents.",
-            ));
+            return Ok(ToolOutput::error("A team requires at least 2 agents."));
         }
 
         // Parse and validate each agent entry
@@ -132,11 +128,7 @@ impl Tool for CreateTeamTool {
         let mut seen_names = HashSet::new();
 
         for (i, agent_val) in agents_val.iter().enumerate() {
-            let agent_name = agent_val["name"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let agent_name = agent_val["name"].as_str().unwrap_or("").trim().to_string();
             if agent_name.is_empty() {
                 return Ok(ToolOutput::error(format!(
                     "Agent at index {i}: 'name' is required and cannot be empty."
@@ -148,11 +140,7 @@ impl Tool for CreateTeamTool {
                 )));
             }
 
-            let role = agent_val["role"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let role = agent_val["role"].as_str().unwrap_or("").trim().to_string();
             if role.is_empty() {
                 return Ok(ToolOutput::error(format!(
                     "Agent '{agent_name}': 'role' is required and cannot be empty."
@@ -226,9 +214,7 @@ impl Tool for CreateTeamTool {
             }
             Some(Value::Null) | None => 3,
             _ => {
-                return Ok(ToolOutput::error(
-                    "'max_iterations' must be an integer.",
-                ));
+                return Ok(ToolOutput::error("'max_iterations' must be an integer."));
             }
         };
 
@@ -268,9 +254,7 @@ impl Tool for CreateTeamTool {
         };
 
         if let Err(e) = std::fs::write(team_dir.join("team.toml"), &toml_content) {
-            return Ok(ToolOutput::error(format!(
-                "Failed to write team.toml: {e}"
-            )));
+            return Ok(ToolOutput::error(format!("Failed to write team.toml: {e}")));
         }
 
         let agent_count = def.agents.len();
@@ -320,7 +304,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("dev-team"));
         assert!(result.content.contains("2 agents"));
         assert!(team::team_exists(tmp.path(), "dev-team"));
@@ -685,7 +673,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(team::team_exists(tmp.path(), "my-team"));
     }
 }

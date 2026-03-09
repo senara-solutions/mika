@@ -105,13 +105,9 @@ impl Tool for UpdateTeamTool {
         let mut changes = Vec::new();
 
         // Check if anything was actually provided to update
-        let has_orchestrator = input
-            .get("orchestrator")
-            .is_some_and(|v| !v.is_null());
+        let has_orchestrator = input.get("orchestrator").is_some_and(|v| !v.is_null());
         let has_agents = input.get("agents").is_some_and(|v| !v.is_null());
-        let has_max_iterations = input
-            .get("max_iterations")
-            .is_some_and(|v| !v.is_null());
+        let has_max_iterations = input.get("max_iterations").is_some_and(|v| !v.is_null());
 
         if !has_orchestrator && !has_agents && !has_max_iterations {
             return Ok(ToolOutput::error(
@@ -129,20 +125,14 @@ impl Tool for UpdateTeamTool {
             };
 
             if agents_val.len() < 2 {
-                return Ok(ToolOutput::error(
-                    "A team requires at least 2 agents.",
-                ));
+                return Ok(ToolOutput::error("A team requires at least 2 agents."));
             }
 
             let mut agents = Vec::with_capacity(agents_val.len());
             let mut seen_names = HashSet::new();
 
             for (i, agent_val) in agents_val.iter().enumerate() {
-                let agent_name = agent_val["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let agent_name = agent_val["name"].as_str().unwrap_or("").trim().to_string();
                 if agent_name.is_empty() {
                     return Ok(ToolOutput::error(format!(
                         "Agent at index {i}: 'name' is required and cannot be empty."
@@ -154,11 +144,7 @@ impl Tool for UpdateTeamTool {
                     )));
                 }
 
-                let role = agent_val["role"]
-                    .as_str()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let role = agent_val["role"].as_str().unwrap_or("").trim().to_string();
                 if role.is_empty() {
                     return Ok(ToolOutput::error(format!(
                         "Agent '{agent_name}': 'role' is required and cannot be empty."
@@ -217,9 +203,7 @@ impl Tool for UpdateTeamTool {
                 .trim()
                 .to_string();
             if orchestrator.is_empty() {
-                return Ok(ToolOutput::error(
-                    "'orchestrator' cannot be empty.",
-                ));
+                return Ok(ToolOutput::error("'orchestrator' cannot be empty."));
             }
             if orchestrator.len() > MAX_INPUT_LEN {
                 return Ok(ToolOutput::error(format!(
@@ -262,9 +246,7 @@ impl Tool for UpdateTeamTool {
                     changes.push(format!("max_iterations → {val}"));
                 }
                 _ => {
-                    return Ok(ToolOutput::error(
-                        "'max_iterations' must be an integer.",
-                    ));
+                    return Ok(ToolOutput::error("'max_iterations' must be an integer."));
                 }
             }
         }
@@ -288,9 +270,7 @@ impl Tool for UpdateTeamTool {
 
         let team_dir = team::team_dir(&self.home_dir, &name);
         if let Err(e) = std::fs::write(team_dir.join("team.toml"), &toml_content) {
-            return Ok(ToolOutput::error(format!(
-                "Failed to write team.toml: {e}"
-            )));
+            return Ok(ToolOutput::error(format!("Failed to write team.toml: {e}")));
         }
 
         Ok(ToolOutput::success(format!(
@@ -314,13 +294,16 @@ mod tests {
     }
 
     /// Helper to create a team via filesystem.
-    fn create_team_fs(home_dir: &std::path::Path, name: &str, orchestrator: &str, agents: &[(&str, &str, &str)]) {
+    fn create_team_fs(
+        home_dir: &std::path::Path,
+        name: &str,
+        orchestrator: &str,
+        agents: &[(&str, &str, &str)],
+    ) {
         let dir = team::team_dir(home_dir, name);
         fs::create_dir_all(dir.join("workspace")).unwrap();
 
-        let mut toml = format!(
-            "[team]\nname = \"{name}\"\norchestrator = \"{orchestrator}\"\n\n"
-        );
+        let mut toml = format!("[team]\nname = \"{name}\"\norchestrator = \"{orchestrator}\"\n\n");
         for (aname, role, mandate) in agents {
             toml.push_str(&format!(
                 "[[agents]]\nname = \"{aname}\"\nrole = \"{role}\"\nmandate = \"{mandate}\"\n\n"
@@ -361,7 +344,12 @@ mod tests {
 
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         let result = tool
             .execute(serde_json::json!({"name": "my-team"}), &ctx)
@@ -382,7 +370,12 @@ mod tests {
 
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         let result = tool
             .execute(
@@ -391,7 +384,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("orchestrator → b"));
 
         let def = team::load_team(tmp.path(), "my-team").unwrap();
@@ -412,7 +409,12 @@ mod tests {
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
         create_agent(tmp.path(), "c");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         let result = tool
             .execute(
@@ -428,7 +430,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("3 agents"));
 
         let def = team::load_team(tmp.path(), "my-team").unwrap();
@@ -447,7 +453,12 @@ mod tests {
 
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         let result = tool
             .execute(
@@ -456,7 +467,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("max_iterations → 7"));
 
         let def = team::load_team(tmp.path(), "my-team").unwrap();
@@ -475,7 +490,12 @@ mod tests {
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
         create_agent(tmp.path(), "c");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         let result = tool
             .execute(
@@ -492,7 +512,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
 
         let def = team::load_team(tmp.path(), "my-team").unwrap();
         assert_eq!(def.team.orchestrator, "c");
@@ -513,7 +537,12 @@ mod tests {
 
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         // Orchestrator not in agents list
         let result = tool
@@ -550,7 +579,12 @@ mod tests {
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
         create_agent(tmp.path(), "c");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         // c exists as agent but is not in the team's agents list
         let result = tool
@@ -575,7 +609,12 @@ mod tests {
 
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         let result = tool
             .execute(
@@ -609,7 +648,12 @@ mod tests {
 
         create_agent(tmp.path(), "a");
         create_agent(tmp.path(), "b");
-        create_team_fs(tmp.path(), "my-team", "a", &[("a", "lead", "Lead"), ("b", "worker", "Work")]);
+        create_team_fs(
+            tmp.path(),
+            "my-team",
+            "a",
+            &[("a", "lead", "Lead"), ("b", "worker", "Work")],
+        );
 
         // Too few agents
         let result = tool

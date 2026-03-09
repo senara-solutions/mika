@@ -178,10 +178,7 @@ impl Tool for QueryMessagesTool {
         input: serde_json::Value,
         ctx: &crate::tools::ToolContext<'_>,
     ) -> Result<ToolOutput> {
-        let session_id = input["session_id"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
+        let session_id = input["session_id"].as_str().unwrap_or("").to_owned();
         if session_id.is_empty() {
             return Ok(ToolOutput::error("session_id is required"));
         }
@@ -192,10 +189,15 @@ impl Tool for QueryMessagesTool {
             .db
             .load_session_messages_paginated(&session_id, limit, offset)
             .await?;
-        let mut output = format!("Found {} messages in session {}:\n\n", msgs.len(), session_id);
+        let mut output = format!(
+            "Found {} messages in session {}:\n\n",
+            msgs.len(),
+            session_id
+        );
         for m in &msgs {
             let content_preview = if m.content.len() > 200 {
-                format!("{}...", &m.content[..200])
+                let truncated: String = m.content.chars().take(200).collect();
+                format!("{truncated}...")
             } else {
                 m.content.clone()
             };
@@ -244,10 +246,7 @@ impl Tool for QueryAuditEventsTool {
         input: serde_json::Value,
         ctx: &crate::tools::ToolContext<'_>,
     ) -> Result<ToolOutput> {
-        let agent_id = input["agent_id"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
+        let agent_id = input["agent_id"].as_str().unwrap_or("").to_owned();
         if agent_id.is_empty() {
             return Ok(ToolOutput::error("agent_id is required"));
         }
@@ -257,7 +256,11 @@ impl Tool for QueryAuditEventsTool {
             .db
             .list_audit_events_paginated(&agent_id, limit, 0)
             .await?;
-        let mut output = format!("Found {} audit events for agent {}:\n\n", events.len(), agent_id);
+        let mut output = format!(
+            "Found {} audit events for agent {}:\n\n",
+            events.len(),
+            agent_id
+        );
         for e in &events {
             output.push_str(&format!(
                 "- [{}] {} on '{}': {} → {}\n",
@@ -266,7 +269,8 @@ impl Tool for QueryAuditEventsTool {
                 e.target_key,
                 e.before_value.as_deref().unwrap_or("(none)"),
                 if e.after_value.len() > 100 {
-                    format!("{}...", &e.after_value[..100])
+                    let truncated: String = e.after_value.chars().take(100).collect();
+                    format!("{truncated}...")
                 } else {
                     e.after_value.clone()
                 },
@@ -322,7 +326,11 @@ impl Tool for SearchMemoryTool {
         // Instead, we look it up from the session_id (which carries the investigation context).
         // For now, use the dashboard_db's FTS search if the agent is the scoped one.
         let results = ctx.db.fts_search(&query, 20, None).await?;
-        let mut output = format!("Found {} memory results for '{}':\n\n", results.len(), query);
+        let mut output = format!(
+            "Found {} memory results for '{}':\n\n",
+            results.len(),
+            query
+        );
         for r in &results {
             output.push_str(&format!(
                 "- [{}] (score={:.2}) {}\n",
@@ -401,7 +409,8 @@ impl Tool for GetAgentInfoTool {
             let soul_path = agent_state.home_dir.join("soul.md");
             if let Ok(soul) = tokio::fs::read_to_string(&soul_path).await {
                 let preview = if soul.len() > 500 {
-                    format!("{}...", &soul[..500])
+                    let truncated: String = soul.chars().take(500).collect();
+                    format!("{truncated}...")
                 } else {
                     soul
                 };
@@ -469,25 +478,30 @@ async fn build_investigation_context(
          check audit events, or search memory to provide thorough answers.\n\n",
     );
 
-    prompt.push_str(&format!("## Agent Under Investigation\nAgent: {}\nSession: {}\n\n", agent_id, message.session_id));
+    prompt.push_str(&format!(
+        "## Agent Under Investigation\nAgent: {}\nSession: {}\n\n",
+        agent_id, message.session_id
+    ));
 
     // Include core memory if available
     let normalized = mika_common::agent::normalize_agent_name(agent_id);
     if let Some(agent_state) = agents.get(&normalized)
         && let Ok(entries) = agent_state.db.get_all_core_memory().await
-            && !entries.is_empty() {
-                prompt.push_str("## Core Memory\n");
-                for e in &entries {
-                    prompt.push_str(&format!("- {}: {}\n", e.key, e.value));
-                }
-                prompt.push('\n');
-            }
+        && !entries.is_empty()
+    {
+        prompt.push_str("## Core Memory\n");
+        for e in &entries {
+            prompt.push_str(&format!("- {}: {}\n", e.key, e.value));
+        }
+        prompt.push('\n');
+    }
 
     // Include surrounding messages as context
     prompt.push_str("## Conversation Context\n");
     for m in &surrounding {
         let content_preview = if m.content.len() > 500 {
-            format!("{}...", &m.content[..500])
+            let truncated: String = m.content.chars().take(500).collect();
+            format!("{truncated}...")
         } else {
             m.content.clone()
         };
@@ -501,16 +515,17 @@ async fn build_investigation_context(
     // Include specific tool call if requested
     if let Some(idx) = tool_call_index
         && let Some(meta) = &message.metadata
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta)
-                && let Some(calls) = parsed["tool_calls"].as_array()
-                    && let Some(tc) = calls.get(idx)
-                        && let Ok(tc) = serde_json::from_value::<ToolCallMeta>(tc.clone()) {
-                            prompt.push_str(&format!(
-                                "## Specific Tool Call Under Investigation\n\
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta)
+        && let Some(calls) = parsed["tool_calls"].as_array()
+        && let Some(tc) = calls.get(idx)
+        && let Ok(tc) = serde_json::from_value::<ToolCallMeta>(tc.clone())
+    {
+        prompt.push_str(&format!(
+            "## Specific Tool Call Under Investigation\n\
                                  Tool: {}\nStep: {}\nInput: {}\nOutput: {}\nSuccess: {}\n\n",
-                                tc.name, tc.step, tc.input_summary, tc.output_summary, tc.success,
-                            ));
-                        }
+            tc.name, tc.step, tc.input_summary, tc.output_summary, tc.success,
+        ));
+    }
 
     Ok(prompt)
 }
@@ -565,17 +580,23 @@ async fn run_investigation(
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
-                let _ = send_event(&tx, InvestigateEvent::Error {
-                    message: format!("Claude API error: {e}"),
-                })
+                let _ = send_event(
+                    &tx,
+                    InvestigateEvent::Error {
+                        message: format!("Claude API error: {e}"),
+                    },
+                )
                 .await;
                 let _ = send_event(&tx, InvestigateEvent::Done {}).await;
                 return;
             }
             Err(_) => {
-                let _ = send_event(&tx, InvestigateEvent::Error {
-                    message: "Investigation timed out".to_string(),
-                })
+                let _ = send_event(
+                    &tx,
+                    InvestigateEvent::Error {
+                        message: "Investigation timed out".to_string(),
+                    },
+                )
                 .await;
                 let _ = send_event(&tx, InvestigateEvent::Done {}).await;
                 return;
@@ -619,11 +640,14 @@ async fn run_investigation(
         let mut tool_results = Vec::new();
         for (id, name, input) in &tool_uses {
             // Notify client that a tool is running
-            if send_event(&tx, InvestigateEvent::ToolUse {
-                name: name.clone(),
-                status: "running".to_string(),
-                summary: None,
-            })
+            if send_event(
+                &tx,
+                InvestigateEvent::ToolUse {
+                    name: name.clone(),
+                    status: "running".to_string(),
+                    summary: None,
+                },
+            )
             .await
             .is_err()
             {
@@ -643,17 +667,21 @@ async fn run_investigation(
             };
 
             let summary = if output.content.len() > 100 {
-                format!("{}...", &output.content[..100])
+                let truncated: String = output.content.chars().take(100).collect();
+                format!("{truncated}...")
             } else {
                 output.content.clone()
             };
 
             // Notify client that tool completed
-            if send_event(&tx, InvestigateEvent::ToolUse {
-                name: name.clone(),
-                status: "completed".to_string(),
-                summary: Some(summary),
-            })
+            if send_event(
+                &tx,
+                InvestigateEvent::ToolUse {
+                    name: name.clone(),
+                    status: "completed".to_string(),
+                    summary: Some(summary),
+                },
+            )
             .await
             .is_err()
             {
@@ -795,9 +823,7 @@ pub async fn handle_investigate(
     // --- Lazy-init investigation tools ---
     let tools = state
         .investigation_tools
-        .get_or_init(|| async {
-            Arc::new(build_investigation_tools(state.agents.clone()))
-        })
+        .get_or_init(|| async { Arc::new(build_investigation_tools(state.agents.clone())) })
         .await
         .clone();
 

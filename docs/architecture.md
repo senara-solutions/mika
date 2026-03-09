@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 7 management tools (2 always-on + 5 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -210,20 +210,23 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 
 ### Management Tools
 
-7 tools for multi-agent and team workflows, registered via
-`management_tools_if_needed()`. `create_agent` and `list_agents` are always
-registered (enabling agent bootstrapping from a single-agent setup). The
-remaining 5 tools are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
+10 tools for multi-agent and team workflows, registered via
+`management_tools_if_needed()`. `create_agent`, `list_agents`, and `create_team` are always
+registered (enabling agent and team bootstrapping from a single-agent setup). The
+remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
 | Tool | Description | Timeout | Always registered |
 |------|-------------|---------|-------------------|
 | `create_agent` | Create a new agent with name, display name, soul (personality), and optional model override. | default (30s) | Yes |
 | `list_agents` | List all configured agents with their identities and role hints. | default (30s) | Yes |
+| `create_team` | Create a new team definition with specified agents and flow. All referenced agents must exist. | default (30s) | Yes |
 | `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
 | `list_teams` | List all configured teams with full configuration (roles, mandates, max_iterations). | default (30s) | No |
 | `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s | No |
 | `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) | No |
 | `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
+| `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
+| `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,
 preventing infinite delegation chains.
@@ -272,7 +275,7 @@ keywords = ["search", "look up", "find online"]
 | `skill.name` | yes | — | Unique skill identifier |
 | `skill.description` | yes | — | Human-readable description |
 | `skill.version` | no | `""` | Semantic version |
-| `skill.always_on` | no | `false` | Active every turn regardless of keywords |
+| `skill.always_on` | no | `false` | Active every turn regardless of keywords. For built-in skills, user overrides stored in `skill_overrides` DB table (v7); for custom/marketplace, stored in `skill.toml`. |
 | `skill.timeout_secs` | no | `30` | Per-tool execution timeout (seconds) |
 | `triggers.keywords` | no | `[]` | Case-insensitive substring-matched keywords |
 
@@ -626,7 +629,7 @@ The per-customer agent container runs an Axum HTTP server:
 
 All dashboard routes are nested under `/api/v1/` with CORS scoped to
 `MIKA_CORS_ORIGIN` (default `http://localhost:5173`), restricted to
-GET + OPTIONS methods and `Authorization` + `Content-Type` headers only.
+GET + POST + OPTIONS methods and `Authorization` + `Content-Type` headers only.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -639,6 +642,7 @@ GET + OPTIONS methods and `Authorization` + `Content-Type` headers only.
 | `/api/v1/sessions` | GET | Paginated sessions with optional agent_id/channel_type filters |
 | `/api/v1/sessions/{id}` | GET | Session detail |
 | `/api/v1/sessions/{id}/messages` | GET | Paginated messages for a session (base64 images stripped) |
+| `/api/v1/investigate` | POST | SSE streaming investigation endpoint — lightweight read-only agent loop (max 5 steps, 120s timeout, 64KB body limit) for analyzing agent behavior from the dashboard |
 
 Pagination: `?page=1&per_page=50` (max 200 per page, page clamped to 1–100,000).
 Response format: `{ data: [...], total: N, page: P, per_page: PP }`.
@@ -665,7 +669,7 @@ Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
 | `/agents` | Agents | Agent list with status and message counts |
 | `/agents/:id` | Agent Detail | Core memory (raw/view), soul.md, recent audit events, sessions |
 | `/sessions` | Sessions | Filterable session list with channel type icons |
-| `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling |
+| `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling, tool call summaries, and investigation side panel (SSE-powered agent analysis) |
 | `/traces` | Traces | Trace ID search |
 | `/traces/:id` | Trace Detail | All events for a trace |
 
@@ -794,7 +798,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 6 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call)
+**Schema version:** 7 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles)
 
 ### Tables
 
@@ -822,6 +826,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
 | `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint) |
 | `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
+| `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
 | `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks for cross-subsystem correlation by trace_id |
 
 ### SQLite Pragmas

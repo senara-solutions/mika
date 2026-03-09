@@ -79,6 +79,11 @@ impl Tool for DeleteSkillTool {
             tracing::warn!(skill = name, error = %e, "failed to update marketplace lock after delete");
         }
 
+        // Clean up any DB override for this skill
+        if let Err(e) = ctx.db.delete_skill_override(ctx.db.agent_id(), name).await {
+            tracing::warn!(skill = name, error = %e, "failed to delete skill override after delete");
+        }
+
         ctx.skills_dirty.store(true, Ordering::Release);
 
         Ok(ToolOutput::success(format!(

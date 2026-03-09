@@ -10,6 +10,7 @@ pub mod matcher;
 use std::path::Path;
 
 use self::index::SkillEntry;
+use crate::db::SkillOverride;
 
 /// Registry of discovered skills, built once at startup.
 #[derive(Debug)]
@@ -56,6 +57,24 @@ impl SkillRegistry {
             .iter()
             .filter(|e| e.enabled && e.manifest.skill.always_on)
             .collect()
+    }
+
+    /// Apply database-backed overrides to skill entries.
+    ///
+    /// For each override, finds the matching skill by name (case-insensitive)
+    /// and applies the `always_on` value, marking the entry as overridden.
+    pub fn apply_overrides(&mut self, overrides: &[SkillOverride]) {
+        for ov in overrides {
+            if let Some(always_on) = ov.always_on
+                && let Some(entry) = self
+                    .skills
+                    .iter_mut()
+                    .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(&ov.skill_name))
+            {
+                entry.manifest.skill.always_on = always_on;
+                entry.has_override = true;
+            }
+        }
     }
 
     /// Return always-on skills that are safe for silent/background mode.
@@ -105,6 +124,7 @@ mod tests {
             prompt_snippet: String::new(),
             skill_tools: vec![],
             enabled,
+            has_override: false,
         }
     }
 
@@ -222,5 +242,99 @@ mod tests {
     fn test_safe_always_on_skills_empty() {
         let registry = SkillRegistry::empty();
         assert!(registry.safe_always_on_skills().is_empty());
+    }
+
+    #[test]
+    fn test_apply_overrides_sets_always_on() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skills: vec![
+                make_entry("web-search", false, true),
+                make_entry("tmux", false, true),
+            ],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: Some(true),
+        }]);
+
+        assert!(registry.skills[0].manifest.skill.always_on);
+        assert!(registry.skills[0].has_override);
+        assert!(!registry.skills[1].manifest.skill.always_on);
+        assert!(!registry.skills[1].has_override);
+    }
+
+    #[test]
+    fn test_apply_overrides_case_insensitive_match() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skills: vec![make_entry("Web-Search", false, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: Some(true),
+        }]);
+
+        assert!(registry.skills[0].manifest.skill.always_on);
+        assert!(registry.skills[0].has_override);
+    }
+
+    #[test]
+    fn test_apply_overrides_none_skips() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: None,
+        }]);
+
+        assert!(!registry.skills[0].manifest.skill.always_on);
+        assert!(!registry.skills[0].has_override);
+    }
+
+    #[test]
+    fn test_apply_overrides_nonexistent_skill_ignored() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "nonexistent".to_string(),
+            always_on: Some(true),
+        }]);
+
+        // No crash, web-search unchanged
+        assert!(!registry.skills[0].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_apply_overrides_affects_always_on_skills_filter() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skills: vec![
+                make_entry("web-search", false, true),
+                make_entry("shell-exec", true, true),
+            ],
+        };
+
+        assert_eq!(registry.always_on_skills().len(), 1);
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: Some(true),
+        }]);
+
+        assert_eq!(registry.always_on_skills().len(), 2);
     }
 }

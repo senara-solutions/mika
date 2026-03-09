@@ -79,8 +79,9 @@ fn build_router(state: AppState) -> Router {
         )
         .route(
             "/investigate",
-            post(investigate::handle_investigate)
-                .layer(RequestBodyLimitLayer::new(investigate::INVESTIGATE_BODY_LIMIT)),
+            post(investigate::handle_investigate).layer(RequestBodyLimitLayer::new(
+                investigate::INVESTIGATE_BODY_LIMIT,
+            )),
         )
         .layer(cors);
 
@@ -132,7 +133,11 @@ async fn init_agent(
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
-    let skill_registry = Arc::new(SkillRegistry::from_dir(&agent_home.join("skills")));
+    let mut skill_registry = SkillRegistry::from_dir(&agent_home.join("skills"));
+    if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
+        skill_registry.apply_overrides(&overrides);
+    }
+    let skill_registry = Arc::new(skill_registry);
 
     let engine_sender = GatewayMessageSender::new(
         gateway_url.to_string(),

@@ -137,7 +137,15 @@ max_iterations = 3
         assert!(result.content.contains("## dev-team"));
         assert!(result.content.contains("Orchestrator: planner"));
         assert!(result.content.contains("Max iterations: 3"));
-        assert!(result.content.contains("planner (role: orchestrator) — Plan tasks"));
-        assert!(result.content.contains("coder (role: specialist) — Write code"));
+        assert!(
+            result
+                .content
+                .contains("planner (role: orchestrator) — Plan tasks")
+        );
+        assert!(
+            result
+                .content
+                .contains("coder (role: specialist) — Write code")
+        );
     }
 }

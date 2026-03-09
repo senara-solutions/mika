@@ -1880,6 +1880,7 @@ mod tests {
                 })
                 .collect(),
             enabled: true,
+            has_override: false,
         }
     }
 

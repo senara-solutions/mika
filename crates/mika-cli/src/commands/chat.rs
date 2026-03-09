@@ -65,7 +65,15 @@ async fn spawn_agent_worker(
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
-    let skill_registry = Arc::new(SkillRegistry::from_dir(&ctx.home_dir.join("skills")));
+    let mut skill_registry = SkillRegistry::from_dir(&ctx.home_dir.join("skills"));
+    if let Ok(overrides) = ctx
+        .async_db
+        .get_skill_overrides(&ctx.async_db.agent_id)
+        .await
+    {
+        skill_registry.apply_overrides(&overrides);
+    }
+    let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
     let message_sender =
@@ -158,8 +166,13 @@ async fn spawn_agent_worker(
                     let mut skills_reloaded = false;
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
-                        worker_skills =
-                            Arc::new(SkillRegistry::from_dir(&worker_home.join("skills")));
+                        let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
+                        if let Ok(overrides) =
+                            worker_db.get_skill_overrides(&worker_db.agent_id).await
+                        {
+                            registry.apply_overrides(&overrides);
+                        }
+                        worker_skills = Arc::new(registry);
                         skills_reloaded = true;
                     }
 
@@ -205,8 +218,13 @@ async fn spawn_agent_worker(
                     // can send the updated registry to the TUI for autocomplete.
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
-                        worker_skills =
-                            Arc::new(SkillRegistry::from_dir(&worker_home.join("skills")));
+                        let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
+                        if let Ok(overrides) =
+                            worker_db.get_skill_overrides(&worker_db.agent_id).await
+                        {
+                            registry.apply_overrides(&overrides);
+                        }
+                        worker_skills = Arc::new(registry);
                         skills_reloaded = true;
                     }
 

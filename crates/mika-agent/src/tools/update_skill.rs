@@ -9,6 +9,7 @@ use super::create_skill::{
     verify_skill_path,
 };
 use super::{Tool, ToolContext, ToolOutput};
+use crate::bundled_skills::is_bundled_skill;
 use crate::skills::manifest::SkillManifest;
 
 pub struct UpdateSkillTool;
@@ -146,8 +147,38 @@ impl Tool for UpdateSkillTool {
                         return Ok(ToolOutput::error("'always_on' must be a boolean."));
                     }
                 };
-                manifest.skill.always_on = always_on;
-                updated.push("always_on");
+
+                if is_bundled_skill(name) {
+                    // For built-in skills: persist override in DB, not skill.toml.
+                    // The bundled default is what's on disk (before we modify manifest).
+                    let bundled_default = manifest.skill.always_on;
+                    let agent_id = ctx.db.agent_id();
+
+                    if always_on == bundled_default {
+                        // Setting to the bundled default — remove any existing override
+                        if let Err(e) = ctx.db.delete_skill_override(agent_id, name).await {
+                            return Ok(ToolOutput::error(format!(
+                                "Failed to remove skill override: {e}"
+                            )));
+                        }
+                    } else {
+                        // Setting to a non-default value — persist the override
+                        if let Err(e) = ctx.db.set_skill_override(agent_id, name, always_on).await {
+                            return Ok(ToolOutput::error(format!(
+                                "Failed to save skill override: {e}"
+                            )));
+                        }
+                    }
+
+                    // Update the in-memory manifest for the post-update validation below,
+                    // but do NOT write it to skill.toml (the file keeps the bundled default).
+                    manifest.skill.always_on = always_on;
+                    updated.push("always_on");
+                } else {
+                    // Custom/marketplace: write directly to skill.toml (existing behavior)
+                    manifest.skill.always_on = always_on;
+                    updated.push("always_on");
+                }
             }
 
             // Validate post-update state: must have trigger mechanism
@@ -158,18 +189,24 @@ impl Tool for UpdateSkillTool {
                 ));
             }
 
-            let new_toml = match toml::to_string_pretty(&manifest) {
-                Ok(s) => s,
-                Err(e) => {
+            // Only write skill.toml if non-always_on fields changed, OR if it's not a
+            // built-in skill (built-in always_on is stored in DB, not the file).
+            let write_toml =
+                has_description || has_keywords || (has_always_on && !is_bundled_skill(name));
+            if write_toml {
+                let new_toml = match toml::to_string_pretty(&manifest) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Ok(ToolOutput::error(format!(
+                            "Failed to serialize skill manifest: {e}"
+                        )));
+                    }
+                };
+                if let Err(e) = std::fs::write(&toml_path, &new_toml) {
                     return Ok(ToolOutput::error(format!(
-                        "Failed to serialize skill manifest: {e}"
+                        "Failed to write skill.toml: {e}"
                     )));
                 }
-            };
-            if let Err(e) = std::fs::write(&toml_path, &new_toml) {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to write skill.toml: {e}"
-                )));
             }
         }
 
@@ -577,5 +614,132 @@ keywords = []
         assert_eq!(manifest.skill.timeout_secs, 30);
         assert!(!manifest.skill.always_on);
         assert_eq!(manifest.triggers.keywords, vec!["original"]);
+    }
+
+    /// Create a temp dir with a bundled skill name (e.g., "shell-exec") for
+    /// testing built-in override behavior.
+    fn setup_with_bundled_skill(name: &str, always_on: bool) -> (TempDir, TestHarness) {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            format!(
+                r#"[skill]
+name = "{name}"
+description = "A bundled skill"
+version = "0.1.0"
+always_on = {always_on}
+timeout_secs = 30
+
+[triggers]
+keywords = ["test"]
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "Bundled prompt.").unwrap();
+        let harness = TestHarness::new();
+        (tmp, harness)
+    }
+
+    #[tokio::test]
+    async fn test_update_builtin_always_on_writes_to_db() {
+        let (tmp, harness) = setup_with_bundled_skill("shell-exec", false);
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let output = tool
+            .execute(
+                json!({
+                    "name": "shell-exec",
+                    "always_on": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+        assert!(output.content.contains("always_on"));
+
+        // The file should NOT have been modified (still shows bundled default)
+        let manifest = read_manifest(&tmp, "shell-exec");
+        assert!(
+            !manifest.skill.always_on,
+            "skill.toml should keep bundled default (false)"
+        );
+
+        // The DB should have the override
+        let overrides = harness.db.get_skill_overrides("mika").await.unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].skill_name, "shell-exec");
+        assert_eq!(overrides[0].always_on, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_update_builtin_always_on_to_default_removes_override() {
+        let (tmp, harness) = setup_with_bundled_skill("shell-exec", false);
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        // First, set an override
+        harness
+            .db
+            .set_skill_override("mika", "shell-exec", true)
+            .await
+            .unwrap();
+
+        // Now set always_on back to the bundled default (false)
+        let output = tool
+            .execute(
+                json!({
+                    "name": "shell-exec",
+                    "always_on": false
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+
+        // The override should be removed (reverted to default)
+        let overrides = harness.db.get_skill_overrides("mika").await.unwrap();
+        assert!(
+            overrides.is_empty(),
+            "override should be deleted when setting to bundled default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_custom_always_on_writes_to_file() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "always_on": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+
+        // The file SHOULD be modified (custom skill)
+        let manifest = read_manifest(&tmp, "test-skill");
+        assert!(
+            manifest.skill.always_on,
+            "custom skill should write to skill.toml"
+        );
+
+        // No DB override should exist
+        let overrides = harness.db.get_skill_overrides("mika").await.unwrap();
+        assert!(
+            overrides.is_empty(),
+            "custom skills should not use DB overrides"
+        );
     }
 }

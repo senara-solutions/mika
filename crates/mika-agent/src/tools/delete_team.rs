@@ -112,7 +112,11 @@ mod tests {
             .execute(serde_json::json!({"name": "my-team"}), &ctx)
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(result.content.contains("Deleted team 'my-team'"));
         assert!(!team::team_exists(tmp.path(), "my-team"));
         assert!(!dir.exists());
@@ -136,7 +140,11 @@ mod tests {
             .execute(serde_json::json!({"name": "  My-Team  "}), &ctx)
             .await
             .unwrap();
-        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
         assert!(!team::team_exists(tmp.path(), "my-team"));
     }
 

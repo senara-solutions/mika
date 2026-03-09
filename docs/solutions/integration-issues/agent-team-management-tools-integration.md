@@ -233,9 +233,60 @@ never reproduce the condition inline.
 - No UTF-8 multibyte content test for deliverable truncation
 - `management_tools_if_needed` condition boundary untested
 
+## Update: Team CRUD Tools (2026-03-09)
+
+Three new tools expanded the management suite from 7 to 10 tools:
+
+### `create_team` (always-on)
+
+Creates a team definition at runtime. Registered alongside `create_agent` and
+`list_agents` in the always-on tier — agents can bootstrap teams even from a
+single-agent setup.
+
+Validation: name normalization (trim + lowercase), `validate_team_name()`
+(1-32 chars, lowercase + digits + hyphens), duplicate check via
+`team_exists()`, minimum 2 agents, all agents must exist, orchestrator must
+be in agents list, `max_iterations` in 1-10 range (defaults to 3).
+
+Creates `{home_dir}/teams/{name}/team.toml` and workspace directory.
+
+### `delete_team` (conditional)
+
+Deletes team directory and all data via `remove_dir_all()`. Irreversible.
+Minimal validation: name normalization and existence check.
+
+### `update_team` (conditional)
+
+Partial updates — only provided fields are changed. At least one of
+orchestrator/agents/max_iterations must be present. Agents updated before
+orchestrator validation to ensure consistency. Reports changes made.
+
+### Serde Defaults Pattern
+
+`TeamDefinition` and its sub-structs use `#[serde(default)]` for flexible
+parsing. Minimal TOML (just name, orchestrator, and agent names) parses
+successfully — missing `role`, `mandate`, `flow` fields get default values.
+The `create_team` tool validates these at creation time (non-empty required),
+but `update_team` and file-based definitions allow empty strings.
+
+### Registration Update
+
+`management_tools_if_needed()` now has 3 always-on tools:
+
+```rust
+let mut tools: Vec<Box<dyn Tool>> = vec![
+    Box::new(CreateAgentTool { ... }),
+    Box::new(CreateTeamTool { ... }),   // NEW: always-on
+    Box::new(ListAgentsTool { ... }),
+];
+```
+
+`delete_team` and `update_team` are conditional (same gate as other team tools).
+
 ## Related Documentation
 
 - [ADR-004: Multi-Agent Teams Orchestration](../../adr/004-multi-agent-teams-orchestration.md)
 - [Architecture: Multi-Agent Support](../../architecture.md#13-multi-agent-support)
 - [Architecture: Tools](../../architecture.md#6-tools)
 - [Implementation Plan](../../plans/2026-03-02-feat-agent-team-management-tools-plan.md)
+- [Investigation Panel](../architecture/investigation-panel-sse-agent-loop.md)

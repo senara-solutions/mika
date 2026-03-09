@@ -128,7 +128,9 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
 
 /// Check whether a skill name matches a bundled (built-in) skill.
 pub fn is_bundled_skill(name: &str) -> bool {
-    BUNDLED_SKILLS.iter().any(|s| s.name == name)
+    BUNDLED_SKILLS
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case(name))
 }
 
 /// Seed bundled skills into the given skills directory.
