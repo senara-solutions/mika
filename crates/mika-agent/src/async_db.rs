@@ -1154,6 +1154,58 @@ impl AsyncDatabase {
         let aid = agent_id.to_owned();
         self.with_db(move |db| db.count_audit_events(&aid)).await
     }
+
+    // -- Combined data+count queries (single channel round-trip) --
+
+    pub async fn query_timeline_with_count(
+        &self,
+        filters: TimelineFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<TimelineRow>, u64)> {
+        self.with_db(move |db| db.query_timeline_with_count(&filters, limit, offset))
+            .await
+    }
+
+    pub async fn list_sessions_paginated_with_count(
+        &self,
+        agent_id: Option<String>,
+        channel_type: Option<String>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SessionWithStats>, u64)> {
+        self.with_db(move |db| {
+            db.list_sessions_paginated_with_count(
+                agent_id.as_deref(),
+                channel_type.as_deref(),
+                limit,
+                offset,
+            )
+        })
+        .await
+    }
+
+    pub async fn load_session_messages_paginated_with_count(
+        &self,
+        session_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SessionMessage>, u64)> {
+        let sid = session_id.to_owned();
+        self.with_db(move |db| db.load_session_messages_paginated_with_count(&sid, limit, offset))
+            .await
+    }
+
+    pub async fn list_audit_events_paginated_with_count(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<AuditEvent>, u64)> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.list_audit_events_paginated_with_count(&aid, limit, offset))
+            .await
+    }
 }
 
 #[cfg(test)]

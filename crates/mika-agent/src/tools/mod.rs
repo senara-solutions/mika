@@ -10,16 +10,19 @@ mod delegate_task;
 mod delete_skill;
 mod delete_team;
 mod get_config;
+mod get_session_messages;
 mod get_task;
 mod get_team_history;
 mod get_team_status;
 mod list_agents;
+mod list_audit_events;
 mod list_home_files;
 mod list_reminders;
 mod list_skills;
 mod list_tasks;
 mod list_teams;
 mod list_workspace;
+mod query_timeline;
 mod read_home_file;
 mod read_workspace;
 mod run_team;
@@ -398,6 +401,9 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(read_home_file::ReadHomeFileTool));
     registry.register(Box::new(list_home_files::ListHomeFilesTool));
     registry.register(Box::new(list_tasks::ListTasksTool));
+    registry.register(Box::new(query_timeline::QueryTimelineTool));
+    registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
+    registry.register(Box::new(list_audit_events::ListAuditEventsTool));
     registry
 }
 

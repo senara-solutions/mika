@@ -46,6 +46,9 @@ pub struct AppState {
     pub tools: Arc<ToolRegistry>,
     pub ready: Arc<AtomicBool>,
     pub internal_token: SecretString,
+    /// Separate bearer token for read-only dashboard API routes.
+    /// If `None`, dashboard routes accept only `internal_token` (backwards compat).
+    pub dashboard_token: Option<SecretString>,
     pub gateway_url: String,
     pub startup_time: std::time::Instant,
     pub http_client: reqwest::Client,
@@ -80,6 +83,10 @@ impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("internal_token", &"[REDACTED]")
+            .field(
+                "dashboard_token",
+                &self.dashboard_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("gateway_url", &self.gateway_url)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents.keys().collect::<Vec<_>>())

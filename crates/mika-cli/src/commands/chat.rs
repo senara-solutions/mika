@@ -481,6 +481,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
                 app.tick().await;
             }
             Some(AppEvent::Resize) => {
+                app.selection_state.clear();
                 app.needs_redraw = true;
             }
             None => break,
@@ -710,6 +711,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                 app.tick().await;
             }
             Some(AppEvent::Resize) => {
+                app.selection_state.clear();
                 app.needs_redraw = true;
             }
             None => break,

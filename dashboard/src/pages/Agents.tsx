@@ -3,7 +3,7 @@ import { Link } from 'react-router'
 import { useAgents } from '../api/agents.ts'
 import StatusBadge from '../components/StatusBadge.tsx'
 import EmptyState from '../components/EmptyState.tsx'
-import { formatRelativeTime } from '../hooks/useFormatTime.ts'
+import { formatRelativeTime } from '../utils/formatTime.ts'
 import { MessageSquare, Search } from 'lucide-react'
 
 export default function Agents() {

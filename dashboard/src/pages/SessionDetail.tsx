@@ -6,7 +6,7 @@ import EmptyState from '../components/EmptyState.tsx'
 import InvestigationPanel, {
   type InvestigationContext,
 } from '../components/InvestigationPanel.tsx'
-import { formatTimestamp } from '../hooks/useFormatTime.ts'
+import { formatTimestamp } from '../utils/formatTime.ts'
 import {
   ArrowLeft,
   User,

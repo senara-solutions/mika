@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
@@ -48,6 +49,116 @@ pub enum ChatRole {
     System,
     Command,
     Thinking,
+}
+
+/// A position within a specific message (message index + position within that message).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessagePosition {
+    pub message_idx: usize,
+    pub text_pos: TextPosition,
+}
+
+impl PartialOrd for MessagePosition {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MessagePosition {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.message_idx
+            .cmp(&other.message_idx)
+            .then(self.text_pos.cmp(&other.text_pos))
+    }
+}
+
+/// Text position within a message's rendered lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPosition {
+    /// Line index within the message's rendered lines.
+    pub line: usize,
+    /// Character offset within the line (by unicode width columns).
+    pub char_offset: usize,
+}
+
+/// Selection state machine for text selection in the messages panel.
+#[derive(Clone, Debug, Default)]
+pub enum SelectionState {
+    #[default]
+    None,
+    /// Mouse button is held, drag in progress.
+    Dragging {
+        anchor: MessagePosition,
+        current: MessagePosition,
+    },
+    /// Selection complete (mouse released).
+    Selected {
+        start: MessagePosition,
+        end: MessagePosition,
+    },
+}
+
+impl SelectionState {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Clear selection back to None.
+    pub fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+/// Layout info for a single rendered message.
+#[derive(Clone, Debug)]
+pub struct MessageLayout {
+    /// Index into app.messages (or special: pending response, thinking indicator).
+    pub message_idx: usize,
+    /// The rendered lines for this message (including spacer).
+    pub lines: Vec<Line<'static>>,
+    /// Wrapped line count at current width.
+    pub wrapped_line_count: usize,
+}
+
+/// Cached layout state for the messages panel.
+#[derive(Clone, Debug, Default)]
+pub struct MessagesLayout {
+    /// Per-message layout entries in display order.
+    pub entries: Vec<MessageLayout>,
+    /// Sum of all wrapped line counts.
+    pub total_lines: usize,
+    /// Width used to compute this layout.
+    pub computed_at_width: u16,
+    /// Message count + pending state when last computed.
+    pub computed_at_count: usize,
+    /// Whether pending_response was present when computed.
+    pub had_pending: bool,
+    /// Reveal index when last computed (for streaming).
+    pub computed_at_reveal: usize,
+    /// Agent status when last computed (for thinking indicator).
+    pub computed_at_thinking: bool,
+    /// Thinking dots phase when last computed (0-3).
+    pub computed_at_dots_phase: u64,
+}
+
+impl MessagesLayout {
+    /// Check if the layout needs recomputation.
+    pub fn is_stale(
+        &self,
+        width: u16,
+        msg_count: usize,
+        has_pending: bool,
+        reveal_index: usize,
+        is_thinking: bool,
+        dots_phase: u64,
+    ) -> bool {
+        self.computed_at_width != width
+            || self.computed_at_count != msg_count
+            || self.had_pending != has_pending
+            || (has_pending && self.computed_at_reveal != reveal_index)
+            || self.computed_at_thinking != is_thinking
+            || (is_thinking && self.computed_at_dots_phase != dots_phase)
+    }
 }
 
 /// Extract callback task label from message metadata JSON.
@@ -293,6 +404,19 @@ pub struct App<'a> {
     /// Whether the UI needs to be redrawn (set true on state changes).
     pub needs_redraw: bool,
 
+    /// Text selection state for the messages panel.
+    pub selection_state: SelectionState,
+    /// Cached messages layout for per-message rendering.
+    pub messages_layout: MessagesLayout,
+    /// The inner rect of the messages panel (set during draw, used for hit-testing).
+    pub messages_inner_rect: Option<Rect>,
+    /// The inner rect of the textarea (set during draw, used for mouse hit-testing).
+    pub textarea_inner_rect: Option<Rect>,
+    /// Textarea scroll offset (display rows skipped, set during draw).
+    pub textarea_scroll_offset: u16,
+    /// Whether the user is actively dragging a selection in the textarea.
+    pub textarea_selecting: bool,
+
     // Shared resources for slash commands
     pub db: AsyncDatabase,
     pub claude: ClaudeClient,
@@ -386,6 +510,12 @@ impl<'a> App<'a> {
             identity_name,
             tick_count: 0,
             needs_redraw: true,
+            selection_state: SelectionState::default(),
+            messages_layout: MessagesLayout::default(),
+            messages_inner_rect: None,
+            textarea_inner_rect: None,
+            textarea_scroll_offset: 0,
+            textarea_selecting: false,
             db,
             claude,
             home_dir,
@@ -443,6 +573,12 @@ impl<'a> App<'a> {
             identity_name: format!("Team: {team_name}"),
             tick_count: 0,
             needs_redraw: true,
+            selection_state: SelectionState::default(),
+            messages_layout: MessagesLayout::default(),
+            messages_inner_rect: None,
+            textarea_inner_rect: None,
+            textarea_scroll_offset: 0,
+            textarea_selecting: false,
             // Team mode does not use agent-specific resources. These are set to
             // safe defaults. Slash command handlers check `is_team_mode()` before
             // accessing them.
@@ -918,6 +1054,7 @@ impl<'a> App<'a> {
 
     pub fn scroll_up(&mut self, amount: usize) {
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
+        self.selection_state.clear();
         self.needs_redraw = true;
     }
 
@@ -926,6 +1063,7 @@ impl<'a> App<'a> {
         if self.scroll_offset == 0 {
             self.has_new_message = false;
         }
+        self.selection_state.clear();
         self.needs_redraw = true;
     }
 

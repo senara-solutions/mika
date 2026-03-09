@@ -1,29 +1,18 @@
 import { useState } from 'react'
-import { Link, useSearchParams } from 'react-router'
+import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
-import { formatTimestamp } from '../hooks/useFormatTime.ts'
+import { formatTimestamp } from '../utils/formatTime.ts'
+import { eventTypeBadge } from '../utils/badges.ts'
+import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
 const EVENT_TYPES = ['', 'message', 'audit', 'task']
 
-function eventTypeBadge(type: string): { bg: string; text: string; dot: string; label: string } {
-  switch (type) {
-    case 'message':
-      return { bg: 'bg-blue-500/15', text: 'text-blue-400', dot: 'bg-blue-400', label: 'Messages' }
-    case 'audit':
-      return { bg: 'bg-amber-500/15', text: 'text-amber-400', dot: 'bg-amber-400', label: 'Audit Log' }
-    case 'task':
-      return { bg: 'bg-emerald-500/15', text: 'text-emerald-400', dot: 'bg-emerald-400', label: 'Tasks' }
-    default:
-      return { bg: 'bg-white/[0.05]', text: 'text-muted', dot: 'bg-muted', label: type }
-  }
-}
-
 export default function Timeline() {
-  const [searchParams, setSearchParams] = useSearchParams()
+  const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
   const [traceSearch, setTraceSearch] = useState(searchParams.get('trace_id') ?? '')
   const [autoRefresh, setAutoRefresh] = useState(true)
 
@@ -37,23 +26,6 @@ export default function Timeline() {
 
   const { data, isLoading, error } = useTimeline(filters, true, autoRefresh)
   const { data: agents } = useAgents()
-
-  function updateFilter(key: string, value: string) {
-    const next = new URLSearchParams(searchParams)
-    if (value) {
-      next.set(key, value)
-    } else {
-      next.delete(key)
-    }
-    next.delete('page')
-    setSearchParams(next)
-  }
-
-  function setPage(page: number) {
-    const next = new URLSearchParams(searchParams)
-    next.set('page', String(page))
-    setSearchParams(next)
-  }
 
   function handleTraceSearch() {
     updateFilter('trace_id', traceSearch.trim())

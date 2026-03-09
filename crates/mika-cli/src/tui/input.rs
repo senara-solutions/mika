@@ -1,13 +1,119 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::path::Path;
+use tui_textarea::CursorMove;
+use unicode_width::UnicodeWidthChar;
 
-use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole};
+use crate::tui::app::{
+    AgentStatus, App, ChatMessage, ChatRole, MessagePosition, SelectionState, TextPosition,
+};
 use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands::autocomplete::{
     CompletionContext, CompletionMode, longest_common_prefix,
 };
+use crate::tui::ui;
 
-/// Handle a mouse event (scroll wheel for conversation scrolling).
+/// Check if a screen position falls within the textarea area.
+fn is_in_textarea(app: &App<'_>, col: u16, row: u16) -> bool {
+    if let Some(rect) = app.textarea_inner_rect {
+        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+    } else {
+        false
+    }
+}
+
+/// Map a screen position to textarea logical coordinates (row, char_col).
+///
+/// Returns `None` if the position cannot be mapped. Uses the same wrapping logic
+/// as `wrap_input_with_cursor` to find which logical row and character index
+/// the screen position corresponds to.
+fn screen_to_textarea_pos(
+    app: &App<'_>,
+    screen_col: u16,
+    screen_row: u16,
+) -> Option<(usize, usize)> {
+    let rect = app.textarea_inner_rect?;
+    let rel_col = screen_col.saturating_sub(rect.x) as usize;
+    // Account for scroll offset: the visible area starts at display_row = scroll_offset
+    let rel_row = screen_row.saturating_sub(rect.y) as usize + app.textarea_scroll_offset as usize;
+
+    let width = rect.width as usize;
+    if width == 0 {
+        return None;
+    }
+
+    let lines = app.textarea.lines();
+
+    // Walk through text lines, wrapping as we go, to find which logical line
+    // and display sub-line the target row falls on
+    let mut display_row = 0usize;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            if display_row == rel_row {
+                return Some((line_idx, 0));
+            }
+            display_row += 1;
+            continue;
+        }
+
+        let mut seg_start_char = 0;
+        let mut col = 0usize;
+        let chars: Vec<char> = line.chars().collect();
+
+        for (char_idx, &ch) in chars.iter().enumerate() {
+            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+            if col + ch_w > width && col > 0 {
+                // Wrap break: this starts a new display row
+                if display_row == rel_row {
+                    // Target is in the previous segment
+                    return Some((
+                        line_idx,
+                        find_char_at_col(&chars[seg_start_char..char_idx], seg_start_char, rel_col),
+                    ));
+                }
+                display_row += 1;
+                seg_start_char = char_idx;
+                col = 0;
+            }
+            col += ch_w;
+        }
+
+        // Final segment of this line
+        if display_row == rel_row {
+            return Some((
+                line_idx,
+                find_char_at_col(&chars[seg_start_char..], seg_start_char, rel_col),
+            ));
+        }
+        display_row += 1;
+    }
+
+    // Past the end — clamp to last position
+    if let Some(last_line) = lines.last() {
+        let last_idx = lines.len().saturating_sub(1);
+        Some((last_idx, last_line.chars().count()))
+    } else {
+        Some((0, 0))
+    }
+}
+
+/// Find the character index at a given display column within a slice of chars.
+/// `base_idx` is the starting char index for the slice within the full line.
+fn find_char_at_col(chars: &[char], base_idx: usize, target_col: usize) -> usize {
+    let mut col = 0usize;
+    for (i, &ch) in chars.iter().enumerate() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + ch_w > target_col {
+            return base_idx + i;
+        }
+        col += ch_w;
+    }
+    // Past end of segment
+    base_idx + chars.len()
+}
+
+/// Handle a mouse event (scroll, click-drag for text selection).
 pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -16,22 +122,255 @@ pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => {
             app.scroll_down(3);
         }
-        _ => {} // Ignore clicks, drags, etc.
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Check textarea area first
+            if is_in_textarea(app, mouse.column, mouse.row) {
+                if let Some((row, col)) = screen_to_textarea_pos(app, mouse.column, mouse.row) {
+                    // Cancel any existing message selection
+                    if !app.selection_state.is_none() {
+                        app.selection_state.clear();
+                    }
+                    app.textarea.cancel_selection();
+                    app.textarea
+                        .move_cursor(CursorMove::Jump(row as u16, col as u16));
+                    app.textarea.start_selection();
+                    app.textarea_selecting = true;
+                    app.needs_redraw = true;
+                }
+                return;
+            }
+
+            // Then check message area
+            if let Some((msg_idx, pos)) = ui::hit_test(mouse.column, mouse.row, app) {
+                let mp = MessagePosition {
+                    message_idx: msg_idx,
+                    text_pos: pos,
+                };
+                app.selection_state = SelectionState::Dragging {
+                    anchor: mp,
+                    current: mp,
+                };
+                // Clear any textarea selection
+                app.textarea.cancel_selection();
+                app.textarea_selecting = false;
+                app.needs_redraw = true;
+            } else {
+                // Clicked outside messages — clear all selections
+                if !app.selection_state.is_none() {
+                    app.selection_state.clear();
+                    app.needs_redraw = true;
+                }
+                if app.textarea.selection_range().is_some() {
+                    app.textarea.cancel_selection();
+                    app.textarea_selecting = false;
+                    app.needs_redraw = true;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Textarea drag
+            if app.textarea_selecting {
+                if let Some((row, col)) = screen_to_textarea_pos(app, mouse.column, mouse.row) {
+                    app.textarea
+                        .move_cursor(CursorMove::Jump(row as u16, col as u16));
+                    app.needs_redraw = true;
+                }
+                return;
+            }
+
+            // Message area drag
+            if let SelectionState::Dragging { anchor, .. } = app.selection_state
+                && let Some((msg_idx, pos)) = ui::hit_test(mouse.column, mouse.row, app)
+            {
+                app.selection_state = SelectionState::Dragging {
+                    anchor,
+                    current: MessagePosition {
+                        message_idx: msg_idx,
+                        text_pos: pos,
+                    },
+                };
+                app.needs_redraw = true;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Textarea mouse-up
+            if app.textarea_selecting {
+                app.textarea_selecting = false;
+                // If no actual range selected, cancel
+                if let Some(((sr, sc), (er, ec))) = app.textarea.selection_range()
+                    && sr == er
+                    && sc == ec
+                {
+                    app.textarea.cancel_selection();
+                }
+                app.needs_redraw = true;
+                return;
+            }
+
+            // Message area mouse-up
+            if let SelectionState::Dragging { anchor, current } = app.selection_state {
+                if anchor == current {
+                    app.selection_state.clear();
+                } else {
+                    let (start, end) = if anchor <= current {
+                        (anchor, current)
+                    } else {
+                        (current, anchor)
+                    };
+                    app.selection_state = SelectionState::Selected { start, end };
+                }
+                app.needs_redraw = true;
+            }
+        }
+        _ => {}
     }
 }
 
 /// Handle a key event with autocomplete-aware dispatch.
 pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
-    // Ctrl+C always quits
+    // Ctrl+C: copy when selection exists, quit when it doesn't
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
+        // Textarea selection takes priority (from Ctrl+A select all)
+        if app.textarea.selection_range().is_some() {
+            app.textarea.copy();
+            let yanked = app.textarea.yank_text();
+            if !yanked.is_empty() {
+                copy_text_to_clipboard(&yanked);
+            }
+            app.textarea.cancel_selection();
+            app.needs_redraw = true;
+            return;
+        }
+
+        match &app.selection_state {
+            SelectionState::Selected { start, end } => {
+                // Extract text and copy to clipboard
+                let start = *start;
+                let end = *end;
+                copy_selection_to_clipboard(app, start, end);
+                app.selection_state.clear();
+                app.needs_redraw = true;
+            }
+            SelectionState::Dragging { .. } => {
+                // Cancel drag
+                app.selection_state.clear();
+                app.needs_redraw = true;
+            }
+            SelectionState::None => {
+                let input_text = app.input_text();
+                if !input_text.is_empty() {
+                    copy_text_to_clipboard(&input_text);
+                } else {
+                    app.should_quit = true;
+                }
+            }
+        }
         return;
+    }
+
+    // Clear selection on any keypress (Ctrl+C already handled above)
+    if !app.selection_state.is_none() {
+        app.selection_state.clear();
+        app.needs_redraw = true;
+    }
+
+    // Clear textarea selection on any keypress (except Ctrl+A/Ctrl+C handled above)
+    if app.textarea.selection_range().is_some() {
+        app.textarea.cancel_selection();
+        app.needs_redraw = true;
     }
 
     if app.autocomplete.visible() {
         handle_key_autocomplete(app, key);
     } else {
         handle_key_normal(app, key);
+    }
+}
+
+/// Copy text to the system clipboard using subprocess-based approach.
+///
+/// On macOS, uses `pbcopy`. On Linux, tries `xclip -selection clipboard`
+/// then `wl-copy` (Wayland). Falls back to arboard as a last resort.
+/// Returns `true` on success.
+fn copy_text_to_clipboard(text: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        return try_subprocess_copy(text, "pbcopy", &[]);
+    }
+
+    // Linux: try xclip, then wl-copy, then arboard fallback
+    if try_subprocess_copy(text, "xclip", &["-selection", "clipboard"]) {
+        return true;
+    }
+    if try_subprocess_copy(text, "wl-copy", &[]) {
+        return true;
+    }
+
+    // Last resort (Windows or if subprocesses unavailable)
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text))
+        .is_ok()
+}
+
+/// Pipe text to a clipboard subprocess. Returns `true` on success.
+fn try_subprocess_copy(text: &str, cmd: &str, args: &[&str]) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin);
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Copy the selected text to the system clipboard (supports cross-message selection).
+fn copy_selection_to_clipboard(app: &mut App<'_>, start: MessagePosition, end: MessagePosition) {
+    let mut parts: Vec<String> = Vec::new();
+    for msg_idx in start.message_idx..=end.message_idx {
+        let Some(entry) = app
+            .messages_layout
+            .entries
+            .iter()
+            .find(|e| e.message_idx == msg_idx)
+        else {
+            continue;
+        };
+        let text_start = if msg_idx == start.message_idx {
+            start.text_pos
+        } else {
+            TextPosition {
+                line: 0,
+                char_offset: 0,
+            }
+        };
+        let text_end = if msg_idx == end.message_idx {
+            end.text_pos
+        } else {
+            TextPosition {
+                line: usize::MAX,
+                char_offset: usize::MAX,
+            }
+        };
+        let text = ui::extract_selected_text(&entry.lines, text_start, text_end);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    let combined = parts.join("\n");
+    if !combined.is_empty() && !copy_text_to_clipboard(&combined) {
+        tracing::debug!("clipboard write failed");
     }
 }
 
@@ -204,6 +543,15 @@ fn update_autocomplete_for_input(app: &mut App<'_>) {
 
 /// Key handling when autocomplete is NOT visible (normal mode).
 fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
+    // Ctrl+A: select all input text
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+        if !app.textarea.is_empty() {
+            app.textarea.select_all();
+            app.needs_redraw = true;
+        }
+        return;
+    }
+
     // Ctrl+V: check clipboard for image first, else fall through to normal paste
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
         match try_clipboard_image() {

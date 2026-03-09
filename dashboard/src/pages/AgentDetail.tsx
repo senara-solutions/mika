@@ -4,7 +4,7 @@ import { useAgentDetail, useAgentSessions, useAgentAudit } from '../api/agents.t
 import StatusBadge from '../components/StatusBadge.tsx'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
-import { formatRelativeTime } from '../hooks/useFormatTime.ts'
+import { formatRelativeTime } from '../utils/formatTime.ts'
 import { ArrowLeft, Eye, Code } from 'lucide-react'
 
 type MemoryView = 'raw' | 'view'
