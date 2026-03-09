@@ -78,6 +78,14 @@ fn build_router(state: AppState) -> Router {
             get(dashboard::handle_session_messages),
         )
         .route(
+            "/team-runs/{run_id}",
+            get(dashboard::handle_team_run_detail),
+        )
+        .route(
+            "/team-runs/{run_id}/workspace",
+            get(dashboard::handle_team_workspace),
+        )
+        .route(
             "/investigate",
             post(investigate::handle_investigate).layer(RequestBodyLimitLayer::new(
                 investigate::INVESTIGATE_BODY_LIMIT,

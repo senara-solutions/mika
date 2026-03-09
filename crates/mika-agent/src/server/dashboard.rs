@@ -302,6 +302,7 @@ pub async fn handle_session_detail(
 pub struct MessageResponse {
     pub id: i64,
     pub session_id: String,
+    pub agent_id: String,
     pub role: String,
     pub content: String,
     pub channel_type: String,
@@ -314,6 +315,7 @@ impl From<SessionMessage> for MessageResponse {
         Self {
             id: m.id,
             session_id: m.session_id,
+            agent_id: m.agent_id,
             role: m.role,
             // Strip base64 image data from tool_result content to prevent multi-MB payloads
             content: strip_base64_images(&m.content),
@@ -371,6 +373,35 @@ pub async fn handle_session_messages(
         per_page,
     })
     .into_response()
+}
+
+// ===== Team Runs =====
+
+/// GET /api/v1/team-runs/:run_id — team run metadata.
+pub async fn handle_team_run_detail(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.load_team_run_by_id(&run_id).await {
+        Ok(Some(run)) => Json(run).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("team run '{}' not found", run_id)})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
+/// GET /api/v1/team-runs/:run_id/workspace — team workspace entries.
+pub async fn handle_team_workspace(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.load_team_workspace(&run_id).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
 }
 
 #[cfg(test)]

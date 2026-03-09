@@ -156,6 +156,7 @@ pub struct Session {
 pub struct SessionMessage {
     pub id: i64,
     pub session_id: String,
+    pub agent_id: String,
     pub role: String,
     pub content: String,
     pub channel_type: String,
@@ -239,7 +240,7 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TeamRunRow {
     pub id: String,
     pub team_name: String,
@@ -253,7 +254,7 @@ pub struct TeamRunRow {
     pub ended_at: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TeamWorkspaceEntry {
     pub id: i64,
     pub run_id: String,
@@ -1451,6 +1452,33 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get callback tasks that completed but have not yet been delivered,
+    /// scoped to a specific session. Used by TUI to avoid cross-session leakage.
+    pub fn get_undelivered_callback_tasks_for_session(
+        &self,
+        agent_id: &str,
+        since_unix: i64,
+        session_id: &str,
+    ) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND action_type = 'resume_agent'
+               AND status = 'completed'
+               AND completed_at IS NOT NULL
+               AND completed_at > ?2
+               AND created_by_session = ?3
+             ORDER BY completed_at ASC",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id, since_unix, session_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Atomically mark a completed callback task as delivered.
     /// Returns `false` if the task was already claimed (not in 'completed' status).
     pub fn mark_task_delivered(&self, id: &str) -> Result<bool> {
@@ -1696,11 +1724,12 @@ impl Database {
         Ok(SessionMessage {
             id: r.get(0)?,
             session_id: r.get(1)?,
-            role: r.get(2)?,
-            content: r.get(3)?,
-            channel_type: r.get(4)?,
-            metadata: r.get(5)?,
-            created_at: r.get::<_, i64>(6)?,
+            agent_id: r.get(2)?,
+            role: r.get(3)?,
+            content: r.get(4)?,
+            channel_type: r.get(5)?,
+            metadata: r.get(6)?,
+            created_at: r.get::<_, i64>(7)?,
         })
     }
 
@@ -1710,7 +1739,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
@@ -1728,7 +1757,7 @@ impl Database {
     pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<SessionMessage>> {
         self.conn
             .query_row(
-                "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+                "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
                   FROM messages m JOIN sessions s ON m.session_id = s.id
                   WHERE m.agent_id = ?1 AND m.role = 'summary'
                   ORDER BY m.created_at DESC LIMIT 1",
@@ -1767,7 +1796,7 @@ impl Database {
             None => return Ok(vec![]),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.role != 'summary' AND m.id <= ?2
               ORDER BY m.created_at ASC, m.id ASC",
@@ -1814,7 +1843,7 @@ impl Database {
         after_id: i64,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.id > ?2
               ORDER BY m.created_at ASC, m.id ASC",
@@ -1837,7 +1866,7 @@ impl Database {
     /// Load a single message by its row ID.
     pub fn get_message_by_id(&self, message_id: i64) -> Result<Option<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.id = ?1",
         )?;
@@ -1857,7 +1886,7 @@ impl Database {
         after: u32,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.session_id = ?1
                 AND (m.id >= (SELECT id FROM (SELECT id FROM messages WHERE session_id = ?1 AND id <= ?2 ORDER BY id DESC LIMIT ?3) sub ORDER BY id ASC LIMIT 1))
@@ -1879,7 +1908,7 @@ impl Database {
         since_unix: i64,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.created_at >= ?2 AND m.role != 'summary'
               ORDER BY m.created_at ASC",
@@ -3385,7 +3414,7 @@ impl Database {
         offset: u32,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.session_id = ?1
               ORDER BY m.created_at ASC, m.id ASC LIMIT ?2 OFFSET ?3",
@@ -4565,6 +4594,42 @@ mod tests {
         assert!(db.update_task_completed(&id, "agent_a", Some("x")).unwrap());
 
         let results = db.get_undelivered_callback_tasks("agent_b", 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_for_session_scoped() {
+        let db = db();
+        // Create a task in session_a
+        let mut task = callback_task("mika");
+        task.created_by_session = Some("session_a".to_string());
+        let id = db.create_task(&task).unwrap();
+        assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
+
+        // Session A should see it
+        let results = db
+            .get_undelivered_callback_tasks_for_session("mika", 0, "session_a")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+
+        // Session B should NOT see it
+        let results = db
+            .get_undelivered_callback_tasks_for_session("mika", 0, "session_b")
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_for_session_excludes_no_session() {
+        let db = db();
+        // Task with no session (created_by_session = None) should not appear
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
+
+        let results = db
+            .get_undelivered_callback_tasks_for_session("mika", 0, "session_a")
+            .unwrap();
         assert!(results.is_empty());
     }
 

@@ -1229,7 +1229,11 @@ impl<'a> App<'a> {
     async fn poll_callback_tasks(&mut self) {
         // Look back 7 days for undelivered callbacks
         let since = chrono::Utc::now().timestamp() - 7 * 24 * 3600;
-        let tasks = match self.db.get_undelivered_callback_tasks(since).await {
+        let tasks = match self
+            .db
+            .get_undelivered_callback_tasks_for_session(since, &self.session_id)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("callback poll failed: {e}");

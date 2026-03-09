@@ -1,12 +1,14 @@
-import { useState, Fragment } from 'react'
+import { useState, Fragment, useMemo } from 'react'
 import { useParams, Link } from 'react-router'
-import { useSessionDetail, useSessionMessages } from '../api/sessions.ts'
+import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
+import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import InvestigationPanel, {
   type InvestigationContext,
 } from '../components/InvestigationPanel.tsx'
 import { formatTimestamp } from '../utils/formatTime.ts'
+import { getAgentColor } from '../utils/agentColors.ts'
 import {
   ArrowLeft,
   User,
@@ -18,7 +20,13 @@ import {
   ChevronRight,
   ChevronDown,
   Search,
+  Users,
+  Target,
 } from 'lucide-react'
+
+type TimelineItem =
+  | { kind: 'workspace'; entry: TeamWorkspaceEntry }
+  | { kind: 'message'; msg: Message }
 
 interface ToolCall {
   step: number
@@ -35,6 +43,16 @@ function parseToolCalls(metadata: string | null): ToolCall[] {
     return Array.isArray(parsed.tool_calls) ? parsed.tool_calls : []
   } catch {
     return []
+  }
+}
+
+function getAgentNameFromMetadata(metadata: string | null): string | null {
+  if (!metadata) return null
+  try {
+    const parsed = JSON.parse(metadata)
+    return parsed.agent_name ?? null
+  } catch {
+    return null
   }
 }
 
@@ -280,6 +298,34 @@ function ToolCallsTable({
   )
 }
 
+
+function AgentAvatar({ name }: { name: string }) {
+  const color = getAgentColor(name)
+  return (
+    <div
+      className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${color.bg} ${color.text}`}
+      title={name}
+    >
+      {name.charAt(0).toUpperCase()}
+    </div>
+  )
+}
+
+function statusBadge(status: string) {
+  const styles: Record<string, string> = {
+    running: 'bg-blue-500/15 text-blue-400',
+    completed: 'bg-emerald-500/15 text-emerald-400',
+    failed: 'bg-red-500/15 text-red-400',
+    suspended: 'bg-amber-500/15 text-amber-400',
+    cancelled: 'bg-white/[0.06] text-muted/60',
+  }
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${styles[status] ?? styles.cancelled}`}>
+      {status}
+    </span>
+  )
+}
+
 function roleConfig(role: string) {
   switch (role) {
     case 'user':
@@ -342,6 +388,55 @@ export default function SessionDetail() {
     page,
   )
 
+  const isTeamSession = session?.channel_type === 'team'
+  // Team session IDs follow the pattern "team-{run_id}"
+  const teamRunId = isTeamSession && sessionId ? sessionId.replace(/^team-/, '') : undefined
+  const { data: teamRun } = useTeamRun(teamRunId)
+  const { data: workspaceEntries } = useTeamWorkspace(teamRunId)
+
+  // Collect unique agent names from workspace for the header avatar row
+  const teamAgentNames = useMemo(() => {
+    if (!workspaceEntries) return [] as string[]
+    const seen = new Set<string>()
+    const names: string[] = []
+    for (const e of workspaceEntries) {
+      if (e.entry_type === 'assignment' && e.agent_name && !seen.has(e.agent_name)) {
+        seen.add(e.agent_name)
+        names.push(e.agent_name)
+      }
+    }
+    return names
+  }, [workspaceEntries])
+
+  // Get goal text from workspace entries
+  const goalText = useMemo(() => {
+    if (!workspaceEntries) return null
+    const goal = workspaceEntries.find((e) => e.entry_type === 'goal')
+    return goal?.content ?? null
+  }, [workspaceEntries])
+
+  // Build unified timeline merging workspace entries + messages for team sessions
+  const teamTimeline = useMemo((): TimelineItem[] => {
+    if (!isTeamSession) return []
+    const items: TimelineItem[] = []
+    if (workspaceEntries) {
+      for (const entry of workspaceEntries) {
+        items.push({ kind: 'workspace', entry })
+      }
+    }
+    if (messages?.data) {
+      for (const msg of messages.data) {
+        items.push({ kind: 'message', msg })
+      }
+    }
+    items.sort((a, b) => {
+      const tsA = a.kind === 'workspace' ? a.entry.created_at : a.msg.created_at
+      const tsB = b.kind === 'workspace' ? b.entry.created_at : b.msg.created_at
+      return tsA - tsB
+    })
+    return items
+  }, [isTeamSession, workspaceEntries, messages])
+
   const isLoading = sessionLoading || messagesLoading
 
   const openInvestigation = (
@@ -356,6 +451,198 @@ export default function SessionDetail() {
       sessionId: sessionId ?? '',
       agentId: session?.agent_id ?? '',
     })
+  }
+
+  const orchestratorName = session?.agent_id
+    ? session.agent_id.charAt(0).toUpperCase() + session.agent_id.slice(1)
+    : 'Orchestrator'
+
+  const renderOrchestratorCard = (content: string, timestamp: number, label?: string) => {
+    return (
+      <div className="ml-12">
+        <div className="border rounded-xl p-4 bg-bg-card border-white/[0.06]">
+          <div className="flex items-center gap-2 mb-2">
+            <div className="w-6 h-6 rounded-md flex items-center justify-center bg-violet-400/15 text-violet-400">
+              <Users size={14} />
+            </div>
+            <span className="text-xs font-semibold text-violet-300">{orchestratorName}</span>
+            {label && <span className="text-[10px] text-muted/40 uppercase tracking-wider">{label}</span>}
+            <span className="text-[10px] text-muted/30 ml-auto font-mono">{formatTimestamp(timestamp)}</span>
+          </div>
+          <div className="text-sm text-muted/80 whitespace-pre-wrap break-words pl-8">{content}</div>
+        </div>
+      </div>
+    )
+  }
+
+  const formatOrchestratorPlan = (content: string): string => {
+    try {
+      const parsed = JSON.parse(content)
+      if (Array.isArray(parsed)) {
+        const lines = parsed.map((item: { agent: string; task: string }) =>
+          `\u2022 ${item.agent} \u2192 ${item.task}`
+        )
+        return `Here's the plan:\n${lines.join('\n')}`
+      }
+      return content
+    } catch {
+      return content
+    }
+  }
+
+  const renderWorkspaceEntry = (entry: TeamWorkspaceEntry) => {
+    switch (entry.entry_type) {
+      case 'goal':
+        // Skip — goal bar at top is sufficient
+        return null
+      case 'orchestrator':
+        return renderOrchestratorCard(formatOrchestratorPlan(entry.content), entry.created_at, 'Plan')
+      case 'assignment': {
+        const agentMention = entry.agent_name ? `@${entry.agent_name}: ` : ''
+        const mentionColor = entry.agent_name ? getAgentColor(entry.agent_name) : null
+        return (
+          <div className="ml-12">
+            <div className="border rounded-xl p-4 bg-bg-card border-white/[0.06]">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-6 h-6 rounded-md flex items-center justify-center bg-violet-400/15 text-violet-400">
+                  <Users size={14} />
+                </div>
+                <span className="text-xs font-semibold text-violet-300">{orchestratorName}</span>
+                <span className="text-[10px] text-muted/40 uppercase tracking-wider">Assignment</span>
+                <span className="text-[10px] text-muted/30 ml-auto font-mono">{formatTimestamp(entry.created_at)}</span>
+              </div>
+              <div className="text-sm text-muted/80 whitespace-pre-wrap break-words pl-8">
+                {mentionColor && (
+                  <span className={`font-semibold ${mentionColor.text}`}>{agentMention}</span>
+                )}
+                {entry.content}
+              </div>
+            </div>
+          </div>
+        )
+      }
+      case 'critic':
+        return renderOrchestratorCard(
+          entry.content,
+          entry.created_at,
+          `Feedback · Iteration ${entry.iteration}`,
+        )
+      case 'final_deliverable':
+        return renderOrchestratorCard(entry.content, entry.created_at, 'Deliverable')
+      default:
+        // error or unknown entry types — render as orchestrator message
+        return renderOrchestratorCard(entry.content, entry.created_at, entry.entry_type)
+    }
+  }
+
+  const renderTeamMessageCard = (msg: Message) => {
+    const agentName = getAgentNameFromMetadata(msg.metadata)
+
+    // Non-agent messages (user, system, tool_result) render with standard config
+    if (!agentName || msg.role !== 'assistant') {
+      const config = roleConfig(msg.role)
+      return (
+        <div className={`border rounded-xl p-4 ${config.bg}`}>
+          <div className="flex items-center gap-2 mb-2">
+            <div className={`w-6 h-6 rounded-md flex items-center justify-center ${config.iconBg}`}>
+              {config.icon}
+            </div>
+            <span className={`text-xs font-semibold ${config.label}`}>
+              {config.name}
+            </span>
+            <span className="text-[10px] text-muted/30 ml-auto font-mono">
+              {formatTimestamp(msg.created_at)}
+            </span>
+          </div>
+          <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-8">
+            {msg.content}
+          </div>
+        </div>
+      )
+    }
+
+    // Agent card with colored accent
+    const color = getAgentColor(agentName)
+
+    return (
+      <div className={`border rounded-xl p-4 ${color.bg} border-current/10`} style={{ borderColor: `color-mix(in srgb, currentColor 10%, transparent)` }}>
+        {/* Agent header */}
+        <div className="flex items-center gap-3 mb-2">
+          <AgentAvatar name={agentName} />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className={`text-sm font-semibold ${color.text}`}>{agentName}</span>
+              <span className="text-[10px] text-muted/30 font-mono">
+                {formatTimestamp(msg.created_at)}
+              </span>
+              <button
+                onClick={() => openInvestigation(msg.id)}
+                className="ml-1 p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
+                title="Investigate this message"
+              >
+                <Search size={12} />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Message content */}
+        <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-11">
+          {msg.content}
+        </div>
+
+        {/* Tool calls */}
+        <ToolCallsTable
+          metadata={msg.metadata}
+          onInvestigate={(toolCallIndex, toolName) =>
+            openInvestigation(msg.id, toolCallIndex, toolName)
+          }
+        />
+      </div>
+    )
+  }
+
+  const renderRegularMessageCard = (msg: { id: number; role: string; content: string; metadata: string | null; created_at: number }) => {
+    const config = roleConfig(msg.role)
+    return (
+      <div key={msg.id} className={config.align}>
+        <div className={`border rounded-xl p-4 ${config.bg}`}>
+          <div className="flex items-center gap-2 mb-2">
+            <div className={`w-6 h-6 rounded-md flex items-center justify-center ${config.iconBg}`}>
+              {config.icon}
+            </div>
+            <span className={`text-xs font-semibold ${config.label}`}>
+              {msg.role === 'assistant' && session?.agent_id
+                ? session.agent_id.charAt(0).toUpperCase() + session.agent_id.slice(1)
+                : config.name}
+            </span>
+            {msg.role === 'assistant' && (
+              <button
+                onClick={() => openInvestigation(msg.id)}
+                className="ml-2 p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
+                title="Investigate this message"
+              >
+                <Search size={12} />
+              </button>
+            )}
+            <span className="text-[10px] text-muted/30 ml-auto font-mono">
+              {formatTimestamp(msg.created_at)}
+            </span>
+          </div>
+          <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-8">
+            {msg.content}
+          </div>
+          {msg.role === 'assistant' && (
+            <ToolCallsTable
+              metadata={msg.metadata}
+              onInvestigate={(toolCallIndex, toolName) =>
+                openInvestigation(msg.id, toolCallIndex, toolName)
+              }
+            />
+          )}
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -383,12 +670,19 @@ export default function SessionDetail() {
                   Ended
                 </span>
               )}
+              {isTeamSession && (
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-purple-500/15 text-purple-400">
+                  <Users size={10} /> Team
+                </span>
+              )}
+              {teamRun && statusBadge(teamRun.status)}
             </div>
             {session && (
               <div className="flex items-center gap-3 mt-1">
                 <span className="text-xs text-muted/60">
-                  Session initialized via {session.channel_type} &middot;{' '}
-                  {formatTimestamp(session.started_at)}
+                  {isTeamSession && teamRun
+                    ? `${teamRun.team_name} \u00b7 ${formatTimestamp(session.started_at)}`
+                    : `Session initialized via ${session.channel_type} \u00b7 ${formatTimestamp(session.started_at)}`}
                 </span>
               </div>
             )}
@@ -396,8 +690,39 @@ export default function SessionDetail() {
         </div>
       </div>
 
-      {/* Session info bar */}
-      {session && (
+      {/* Goal bar (team sessions only) */}
+      {isTeamSession && goalText && (
+        <div className="flex items-center gap-4 mb-5 px-4 py-3 bg-bg-card border border-white/[0.05] rounded-xl">
+          <Target size={14} className="text-muted/40 shrink-0" />
+          <p className="text-xs text-muted/80 flex-1 min-w-0 truncate">
+            <span className="font-medium text-muted/60">Goal:</span> {goalText}
+          </p>
+          {teamRun && (
+            <span className="text-[10px] text-muted/40 shrink-0 font-mono">
+              {teamRun.iteration}/{teamRun.max_iterations}
+            </span>
+          )}
+          {teamAgentNames.length > 0 && (
+            <div className="flex items-center -space-x-1.5 shrink-0">
+              {teamAgentNames.map((name) => {
+                const c = getAgentColor(name)
+                return (
+                  <div
+                    key={name}
+                    className={`w-6 h-6 rounded-full flex items-center justify-center text-[9px] font-bold ring-2 ring-bg-card ${c.bg} ${c.text}`}
+                    title={name}
+                  >
+                    {name.charAt(0).toUpperCase()}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Session info bar (non-team sessions) */}
+      {session && !isTeamSession && (
         <div className="flex items-center gap-4 mb-5 px-4 py-2.5 bg-bg-card border border-white/[0.05] rounded-xl">
           <div className="flex items-center gap-2">
             <span className="text-[10px] text-muted/40 uppercase tracking-wider">Agent</span>
@@ -418,56 +743,37 @@ export default function SessionDetail() {
         </div>
       )}
 
-      {/* Messages */}
+      {/* Content area — single column for both team and regular */}
       {isLoading ? (
         <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+      ) : isTeamSession ? (
+        teamTimeline.length === 0 ? (
+          <EmptyState message="No messages in this session" />
+        ) : (
+          <>
+            <div className="space-y-3">
+              {teamTimeline.map((item) => {
+                if (item.kind === 'workspace') {
+                  const rendered = renderWorkspaceEntry(item.entry)
+                  return rendered ? <div key={`ws-${item.entry.id}`}>{rendered}</div> : null
+                }
+                return <div key={`msg-${item.msg.id}`}>{renderTeamMessageCard(item.msg)}</div>
+              })}
+            </div>
+            <Pagination
+              page={page}
+              perPage={50}
+              total={messages?.total ?? 0}
+              onPageChange={setPage}
+            />
+          </>
+        )
       ) : !messages || messages.data.length === 0 ? (
         <EmptyState message="No messages in this session" />
       ) : (
         <>
           <div className="space-y-3">
-            {messages.data.map((msg) => {
-              const config = roleConfig(msg.role)
-              return (
-                <div key={msg.id} className={config.align}>
-                  <div className={`border rounded-xl p-4 ${config.bg}`}>
-                    <div className="flex items-center gap-2 mb-2">
-                      <div
-                        className={`w-6 h-6 rounded-md flex items-center justify-center ${config.iconBg}`}
-                      >
-                        {config.icon}
-                      </div>
-                      <span className={`text-xs font-semibold ${config.label}`}>
-                        {config.name}
-                      </span>
-                      {msg.role === 'assistant' && (
-                        <button
-                          onClick={() => openInvestigation(msg.id)}
-                          className="ml-2 p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
-                          title="Investigate this message"
-                        >
-                          <Search size={12} />
-                        </button>
-                      )}
-                      <span className="text-[10px] text-muted/30 ml-auto font-mono">
-                        {formatTimestamp(msg.created_at)}
-                      </span>
-                    </div>
-                    <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-8">
-                      {msg.content}
-                    </div>
-                    {msg.role === 'assistant' && (
-                      <ToolCallsTable
-                        metadata={msg.metadata}
-                        onInvestigate={(toolCallIndex, toolName) =>
-                          openInvestigation(msg.id, toolCallIndex, toolName)
-                        }
-                      />
-                    )}
-                  </div>
-                </div>
-              )
-            })}
+            {messages.data.map((msg) => renderRegularMessageCard(msg))}
           </div>
           <Pagination
             page={page}
@@ -487,3 +793,4 @@ export default function SessionDetail() {
     </div>
   )
 }
+

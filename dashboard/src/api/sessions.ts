@@ -14,6 +14,7 @@ export interface SessionDetail {
 export interface Message {
   id: number
   session_id: string
+  agent_id: string
   role: string
   content: string
   channel_type: string
