@@ -4,7 +4,76 @@ import { useSessionDetail, useSessionMessages } from '../api/sessions.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatTimestamp } from '../hooks/useFormatTime.ts'
-import { ArrowLeft, User, Bot, Settings, Wrench } from 'lucide-react'
+import { ArrowLeft, User, Bot, Settings, Wrench, CheckCircle2, XCircle } from 'lucide-react'
+
+interface ToolCall {
+  step: number
+  name: string
+  input_summary: string
+  output_summary: string
+  success: boolean
+}
+
+function parseToolCalls(metadata: string | null): ToolCall[] {
+  if (!metadata) return []
+  try {
+    const parsed = JSON.parse(metadata)
+    return Array.isArray(parsed.tool_calls) ? parsed.tool_calls : []
+  } catch {
+    return []
+  }
+}
+
+function ToolCallsSection({ metadata }: { metadata: string | null }) {
+  const toolCalls = parseToolCalls(metadata)
+  if (toolCalls.length === 0) return null
+
+  return (
+    <div className="mt-3 pl-8 space-y-1.5">
+      {toolCalls.map((tc, i) => (
+        <div
+          key={i}
+          className="bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-2"
+        >
+          <div className="flex items-center gap-2">
+            <Wrench size={12} className="text-muted/40" />
+            <span className="font-mono text-xs text-heading">{tc.name}</span>
+            {tc.success ? (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-400/15 text-emerald-400">
+                <CheckCircle2 size={10} /> ok
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-400/15 text-red-400">
+                <XCircle size={10} /> failed
+              </span>
+            )}
+            <span className="text-[10px] text-muted/30 ml-auto">step {tc.step}</span>
+          </div>
+          {tc.input_summary && (
+            <details className="mt-1.5">
+              <summary className="text-[10px] text-muted/40 cursor-pointer hover:text-muted/60">
+                Input
+              </summary>
+              <div className="font-mono text-xs text-muted/60 mt-1 pl-2 border-l border-white/[0.06]">
+                {tc.input_summary}
+              </div>
+            </details>
+          )}
+          {tc.output_summary && (
+            <details className="mt-1">
+              <summary className="text-[10px] text-muted/40 cursor-pointer hover:text-muted/60">
+                Output
+              </summary>
+              <div className="font-mono text-xs text-muted/60 mt-1 pl-2 border-l border-white/[0.06]">
+                {tc.output_summary}
+              </div>
+            </details>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
 
 function roleConfig(role: string) {
   switch (role) {
@@ -156,6 +225,9 @@ export default function SessionDetail() {
                     <div className="text-sm text-muted/80 whitespace-pre-wrap break-words max-h-96 overflow-y-auto pl-8">
                       {msg.content}
                     </div>
+                    {msg.role === 'assistant' && (
+                      <ToolCallsSection metadata={msg.metadata} />
+                    )}
                   </div>
                 </div>
               )
