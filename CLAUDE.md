@@ -113,8 +113,9 @@ Optional (telemetry — requires `--features telemetry` build):
 - `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint URL with `/v1/traces` path (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` or `http://localhost:4318/v1/traces`)
 - `MIKA_OTLP_AUTH_HEADER` — OTLP auth header value (Base64-encoded credentials for Langfuse)
 
-Optional (dashboard CORS):
+Optional (dashboard):
 - `MIKA_CORS_ORIGIN` — Allowed origin for dashboard CORS (default: `http://localhost:5173`). Only applies to `/api/v1/*` dashboard routes.
+- `MIKA_DASHBOARD_TOKEN` — Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN` (backwards compatible). `MIKA_INTERNAL_TOKEN` is always accepted on all routes (superuser). Dashboard frontend uses `VITE_MIKA_DASHBOARD_TOKEN` env var (falls back to `VITE_MIKA_TOKEN`).
 
 Optional (log files — logs go to stdout + file when set):
 - `MIKA_SERVER_LOG_FILE` — File path for mika-server log output

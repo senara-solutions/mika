@@ -83,20 +83,27 @@ fn build_router(state: AppState) -> Router {
                 investigate::INVESTIGATE_BODY_LIMIT,
             )),
         )
-        .layer(cors);
+        .layer(cors)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_dashboard_or_internal_token,
+        ));
 
-    // Mutation routes (no CORS — gateway-to-agent only)
-    Router::new()
+    // Mutation routes (no CORS — gateway-to-agent only).
+    // Accepts only MIKA_INTERNAL_TOKEN.
+    let mutation_routes = Router::new()
         .route(
             "/message",
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
         .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
-        .nest("/api/v1", dashboard_routes)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
-        ))
+        ));
+
+    mutation_routes
+        .nest("/api/v1", dashboard_routes)
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
         .layer(TraceLayer::new_for_http())
@@ -296,6 +303,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("MIKA_INTERNAL_TOKEN is required in server mode"))?;
 
+    let dashboard_token = settings.dashboard_token.clone();
+    if dashboard_token.is_some() {
+        info!("dashboard token configured — dashboard routes use separate auth");
+    }
+
     let embedding_client = settings.make_embedding_client();
     if embedding_client.is_some() {
         info!("Layer 3 vector search enabled (embedding client configured)");
@@ -377,6 +389,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         tools: tool_registry,
         ready: ready.clone(),
         internal_token,
+        dashboard_token,
         gateway_url,
         startup_time: std::time::Instant::now(),
         http_client,
@@ -549,6 +562,7 @@ mod tests {
             tools: tools_reg,
             ready: Arc::new(AtomicBool::new(false)),
             internal_token: SecretString::from("test-token-secret"),
+            dashboard_token: None,
             gateway_url: "http://localhost:9999".to_string(),
             startup_time: std::time::Instant::now(),
             http_client: reqwest::Client::new(),
@@ -564,6 +578,7 @@ mod tests {
                 customer_id: None,
                 server_port: 8080,
                 internal_token: None,
+                dashboard_token: None,
                 openai_api_key: None,
                 embedding_model: "text-embedding-3-small".to_string(),
                 embedding_dimensions: 512,

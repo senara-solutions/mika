@@ -41,6 +41,13 @@ pub struct Settings {
     #[serde(default)]
     pub internal_token: Option<SecretString>,
 
+    /// Separate bearer token for read-only dashboard API routes (env: MIKA_DASHBOARD_TOKEN).
+    /// If unset, dashboard routes accept `internal_token` for backwards compatibility.
+    /// This token only grants access to `/api/v1/*` routes — mutation endpoints still
+    /// require `internal_token`.
+    #[serde(default)]
+    pub dashboard_token: Option<SecretString>,
+
     /// OpenAI API key for embeddings (optional; enables Layer 3 vector search)
     #[serde(default)]
     pub openai_api_key: Option<String>,
@@ -216,6 +223,10 @@ impl std::fmt::Debug for Settings {
             .field(
                 "internal_token",
                 &self.internal_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "dashboard_token",
+                &self.dashboard_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "openai_api_key",
