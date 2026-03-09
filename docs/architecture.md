@@ -275,7 +275,7 @@ keywords = ["search", "look up", "find online"]
 | `skill.name` | yes | — | Unique skill identifier |
 | `skill.description` | yes | — | Human-readable description |
 | `skill.version` | no | `""` | Semantic version |
-| `skill.always_on` | no | `false` | Active every turn regardless of keywords |
+| `skill.always_on` | no | `false` | Active every turn regardless of keywords. For built-in skills, user overrides stored in `skill_overrides` DB table (v7); for custom/marketplace, stored in `skill.toml`. |
 | `skill.timeout_secs` | no | `30` | Per-tool execution timeout (seconds) |
 | `triggers.keywords` | no | `[]` | Case-insensitive substring-matched keywords |
 
@@ -798,7 +798,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 6 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call)
+**Schema version:** 7 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles)
 
 ### Tables
 
@@ -826,6 +826,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
 | `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint) |
 | `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
+| `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
 | `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks for cross-subsystem correlation by trace_id |
 
 ### SQLite Pragmas
