@@ -1,13 +1,14 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::path::Path;
 
-use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole};
+use crate::tui::app::{AgentStatus, App, ChatMessage, ChatRole, SelectionState, TextPosition};
 use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands::autocomplete::{
     CompletionContext, CompletionMode, longest_common_prefix,
 };
+use crate::tui::ui;
 
-/// Handle a mouse event (scroll wheel for conversation scrolling).
+/// Handle a mouse event (scroll, click-drag for text selection).
 pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -16,15 +17,102 @@ pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => {
             app.scroll_down(3);
         }
-        _ => {} // Ignore clicks, drags, etc.
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Start a potential selection
+            if let Some((msg_idx, pos)) = ui::hit_test(mouse.column, mouse.row, app) {
+                app.selection_state = SelectionState::Dragging {
+                    message_idx: msg_idx,
+                    anchor: pos,
+                    current: pos,
+                };
+                app.needs_redraw = true;
+            } else {
+                // Clicked outside messages — clear selection
+                if !app.selection_state.is_none() {
+                    app.selection_state.clear();
+                    app.needs_redraw = true;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let SelectionState::Dragging {
+                message_idx,
+                anchor,
+                ..
+            } = app.selection_state
+            {
+                // Update current position, clamped to the same message
+                if let Some((msg_idx, pos)) = ui::hit_test(mouse.column, mouse.row, app)
+                    && msg_idx == message_idx
+                {
+                    app.selection_state = SelectionState::Dragging {
+                        message_idx,
+                        anchor,
+                        current: pos,
+                    };
+                    app.needs_redraw = true;
+                    // If dragged to a different message, keep the current position
+                    // (clamped to original message bounds)
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let SelectionState::Dragging {
+                message_idx,
+                anchor,
+                current,
+            } = app.selection_state
+            {
+                if anchor == current {
+                    // Click without drag — clear selection
+                    app.selection_state.clear();
+                } else {
+                    // Normalize direction: start before end
+                    let (start, end) = if anchor.is_before_or_equal(&current) {
+                        (anchor, current)
+                    } else {
+                        (current, anchor)
+                    };
+                    app.selection_state = SelectionState::Selected {
+                        message_idx,
+                        start,
+                        end,
+                    };
+                }
+                app.needs_redraw = true;
+            }
+        }
+        _ => {}
     }
 }
 
 /// Handle a key event with autocomplete-aware dispatch.
 pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
-    // Ctrl+C always quits
+    // Ctrl+C: copy when selection exists, quit when it doesn't
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
+        match &app.selection_state {
+            SelectionState::Selected {
+                message_idx,
+                start,
+                end,
+            } => {
+                // Extract text and copy to clipboard
+                let msg_idx = *message_idx;
+                let start = *start;
+                let end = *end;
+                copy_selection_to_clipboard(app, msg_idx, start, end);
+                app.selection_state.clear();
+                app.needs_redraw = true;
+            }
+            SelectionState::Dragging { .. } => {
+                // Cancel drag
+                app.selection_state.clear();
+                app.needs_redraw = true;
+            }
+            SelectionState::None => {
+                app.should_quit = true;
+            }
+        }
         return;
     }
 
@@ -32,6 +120,51 @@ pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
         handle_key_autocomplete(app, key);
     } else {
         handle_key_normal(app, key);
+    }
+}
+
+/// Copy the selected text to the system clipboard.
+fn copy_selection_to_clipboard(
+    app: &mut App<'_>,
+    message_idx: usize,
+    start: TextPosition,
+    end: TextPosition,
+) {
+    // Find the message's lines from the layout cache
+    let lines = app
+        .messages_layout
+        .entries
+        .iter()
+        .find(|e| e.message_idx == message_idx)
+        .map(|e| &e.lines);
+
+    let Some(lines) = lines else {
+        return;
+    };
+
+    let text = ui::extract_selected_text(lines, start, end);
+    if text.is_empty() {
+        return;
+    }
+
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+        Ok(()) => {
+            app.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: format!("Copied {} chars to clipboard.", text.len()),
+                rendered: None,
+                channel: None,
+            });
+        }
+        Err(e) => {
+            tracing::debug!("clipboard write failed: {e}");
+            app.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: "Failed to copy to clipboard.".to_string(),
+                rendered: None,
+                channel: None,
+            });
+        }
     }
 }
 

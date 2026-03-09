@@ -5,7 +5,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
-use crate::tui::app::{AgentStatus, App, ChatRole, DashboardAgentStatus};
+use crate::tui::app::{
+    AgentStatus, App, ChatRole, DashboardAgentStatus, MessageLayout, SelectionState, TextPosition,
+};
 use crate::tui::markdown;
 
 /// Build a yellow `[channel] ` prefix span for non-CLI messages.
@@ -135,14 +137,15 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
 
     // Split-pane: show dashboard panel when team dashboard is active and terminal is wide enough
     let show_dashboard = app.team_dashboard.is_some() && chunks[1].width >= 80;
-    if show_dashboard {
+    let messages_area = if show_dashboard {
         let horiz = Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(chunks[1]);
-        draw_messages(f, app, horiz[0]);
         draw_team_dashboard(f, app, horiz[1]);
+        horiz[0]
     } else {
-        draw_messages(f, app, chunks[1]);
-    }
+        chunks[1]
+    };
+    draw_messages(f, app, messages_area);
 
     draw_input(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
@@ -187,7 +190,182 @@ fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     f.render_widget(Paragraph::new(header), area);
 }
 
-fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
+/// Build the rendered lines for a single message (including leading spacer line).
+fn build_message_lines(
+    msg: &crate::tui::app::ChatMessage,
+    identity_name: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match msg.role {
+        ChatRole::User => {
+            lines.push(Line::default());
+            let mut spans = Vec::new();
+            if let Some(span) = channel_prefix_span(&msg.channel) {
+                spans.push(span);
+            }
+            spans.push(Span::styled(
+                "You: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(msg.content.clone()));
+            lines.push(Line::from(spans));
+        }
+        ChatRole::Assistant => {
+            lines.push(Line::default());
+            let mut prefix_spans = Vec::new();
+            if let Some(span) = channel_prefix_span(&msg.channel) {
+                prefix_spans.push(span);
+            }
+            prefix_spans.push(Span::styled(
+                format!("{identity_name}: "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::from(prefix_spans));
+            if let Some(ref cached) = msg.rendered {
+                lines.extend(cached.clone());
+            } else {
+                let md_lines = markdown::render(&msg.content);
+                lines.extend(md_lines);
+            }
+        }
+        ChatRole::System => {
+            lines.push(Line::default());
+            for line in msg.content.lines() {
+                lines.push(Line::from(vec![Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Red),
+                )]));
+            }
+        }
+        ChatRole::Thinking => {
+            lines.push(Line::default());
+            if let Some(ref cached) = msg.rendered {
+                lines.extend(cached.clone());
+            } else {
+                lines.push(Line::from(vec![Span::styled(
+                    "thinking:",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+                )]));
+                for line in msg.content.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {line}"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )]));
+                }
+                lines.push(Line::from(vec![Span::styled(
+                    "  ---",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+        ChatRole::Command => {
+            lines.push(Line::default());
+            for line in msg.content.lines() {
+                lines.push(Line::from(vec![Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+    }
+    lines
+}
+
+/// Recompute the messages layout if stale.
+fn ensure_messages_layout(app: &mut App<'_>, width: u16) {
+    let is_thinking = app.status == AgentStatus::Thinking;
+    let has_pending = app.pending_response.is_some();
+    let msg_count = app.messages.len();
+
+    if !app
+        .messages_layout
+        .is_stale(width, msg_count, has_pending, app.reveal_index, is_thinking)
+    {
+        return;
+    }
+
+    let mut entries = Vec::with_capacity(msg_count + 2);
+
+    // Build entries for each message
+    for (idx, msg) in app.messages.iter().enumerate() {
+        let lines = build_message_lines(msg, &app.identity_name);
+        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let wrapped_line_count = paragraph.line_count(width);
+        entries.push(MessageLayout {
+            message_idx: idx,
+            lines,
+            wrapped_line_count,
+        });
+    }
+
+    // Pending response (streaming)
+    if let Some(ref full) = app.pending_response {
+        let mut lines = Vec::new();
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            format!("{}: ", app.identity_name),
+            Style::default().add_modifier(Modifier::BOLD),
+        )]));
+        let safe_index = full.floor_char_boundary(app.reveal_index.min(full.len()));
+        let revealed = &full[..safe_index];
+        let md_lines = markdown::render(revealed);
+        lines.extend(md_lines);
+
+        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let wrapped_line_count = paragraph.line_count(width);
+        entries.push(MessageLayout {
+            message_idx: usize::MAX, // sentinel for pending response
+            lines,
+            wrapped_line_count,
+        });
+    }
+
+    // Thinking indicator
+    if is_thinking {
+        let dots = match (app.tick_count / 5) % 4 {
+            0 => ".",
+            1 => "..",
+            2 => "...",
+            _ => "",
+        };
+        let lines = vec![
+            Line::default(),
+            Line::from(vec![Span::styled(
+                format!("  thinking{dots}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]),
+        ];
+        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let wrapped_line_count = paragraph.line_count(width);
+        entries.push(MessageLayout {
+            message_idx: usize::MAX - 1, // sentinel for thinking indicator
+            lines,
+            wrapped_line_count,
+        });
+    }
+
+    let total_lines = entries.iter().map(|e| e.wrapped_line_count).sum();
+
+    app.messages_layout = crate::tui::app::MessagesLayout {
+        entries,
+        total_lines,
+        computed_at_width: width,
+        computed_at_count: msg_count,
+        had_pending: has_pending,
+        computed_at_reveal: app.reveal_index,
+        computed_at_thinking: is_thinking,
+    };
+}
+
+fn draw_messages(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -195,138 +373,387 @@ fn draw_messages(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Store the inner rect for hit-testing in mouse handlers
+    app.messages_inner_rect = Some(inner);
 
-    for msg in &app.messages {
-        match msg.role {
-            ChatRole::User => {
-                lines.push(Line::default());
-                let mut spans = Vec::new();
-                if let Some(span) = channel_prefix_span(&msg.channel) {
-                    spans.push(span);
-                }
-                spans.push(Span::styled(
-                    "You: ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::raw(msg.content.clone()));
-                lines.push(Line::from(spans));
-            }
-            ChatRole::Assistant => {
-                lines.push(Line::default());
-                let mut prefix_spans = Vec::new();
-                if let Some(span) = channel_prefix_span(&msg.channel) {
-                    prefix_spans.push(span);
-                }
-                prefix_spans.push(Span::styled(
-                    format!("{}: ", app.identity_name),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                lines.push(Line::from(prefix_spans));
-                // Use cached rendered lines if available, otherwise render now
-                if let Some(ref cached) = msg.rendered {
-                    lines.extend(cached.clone());
-                } else {
-                    let md_lines = markdown::render(&msg.content);
-                    lines.extend(md_lines);
-                }
-            }
-            ChatRole::System => {
-                lines.push(Line::default());
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::Red),
-                    )]));
-                }
-            }
-            ChatRole::Thinking => {
-                lines.push(Line::default());
-                // Use cached rendered lines if available
-                if let Some(ref cached) = msg.rendered {
-                    lines.extend(cached.clone());
-                } else {
-                    lines.push(Line::from(vec![Span::styled(
-                        "thinking:",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC | Modifier::BOLD),
-                    )]));
-                    for line in msg.content.lines() {
-                        lines.push(Line::from(vec![Span::styled(
-                            format!("  {line}"),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )]));
-                    }
-                    lines.push(Line::from(vec![Span::styled(
-                        "  ---",
-                        Style::default().fg(Color::DarkGray),
-                    )]));
-                }
-            }
-            ChatRole::Command => {
-                lines.push(Line::default());
-                // Render each line of command output in cyan
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
-                }
-            }
-        }
-    }
+    // Recompute layout if stale
+    ensure_messages_layout(app, inner.width);
 
-    // Progressive reveal of pending response (re-rendered each frame since content changes)
-    if let Some(ref full) = app.pending_response {
-        lines.push(Line::default());
-        let prefix = Line::from(vec![Span::styled(
-            format!("{}: ", app.identity_name),
-            Style::default().add_modifier(Modifier::BOLD),
-        )]);
-        lines.push(prefix);
-
-        // Use floor_char_boundary to ensure we slice on a valid UTF-8 char boundary
-        let safe_index = full.floor_char_boundary(app.reveal_index.min(full.len()));
-        let revealed = &full[..safe_index];
-        let md_lines = markdown::render(revealed);
-        lines.extend(md_lines);
-    }
-
-    // Thinking indicator
-    if app.status == AgentStatus::Thinking {
-        let dots = match (app.tick_count / 5) % 4 {
-            0 => ".",
-            1 => "..",
-            2 => "...",
-            _ => "",
-        };
-        lines.push(Line::default());
-        lines.push(Line::from(vec![Span::styled(
-            format!("  thinking{dots}"),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )]));
-    }
-
-    // Build paragraph with wrapping first, then use ratatui's accurate line counting
-    // to calculate scroll. This avoids the discrepancy between our manual character-count
-    // estimation and ratatui's word-boundary wrapping (WordWrapper), which can produce
-    // more visual rows when words straddle line boundaries.
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let total_lines = paragraph.line_count(inner.width);
+    let total_lines = app.messages_layout.total_lines;
     let visible_height = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset);
 
-    let scroll_u16 = effective_scroll.min(u16::MAX as usize) as u16;
-    let paragraph = paragraph.scroll((scroll_u16, 0));
-    f.render_widget(paragraph, inner);
+    // Determine which messages are visible and render them
+    // We walk from the top of the layout, accumulating lines, and render
+    // each message that falls within the visible viewport.
+    let mut cumulative = 0usize;
+    let viewport_start = effective_scroll;
+    let viewport_end = effective_scroll + visible_height;
+
+    for entry in &app.messages_layout.entries {
+        let entry_start = cumulative;
+        let entry_end = cumulative + entry.wrapped_line_count;
+        cumulative = entry_end;
+
+        // Skip entries entirely above the viewport
+        if entry_end <= viewport_start {
+            continue;
+        }
+        // Stop if entirely below the viewport
+        if entry_start >= viewport_end {
+            break;
+        }
+
+        // This entry is at least partially visible
+        let lines_to_render = if entry.message_idx < app.messages.len() {
+            // Check if this message has a selection to highlight
+            if let Some(highlighted) =
+                get_highlighted_lines(entry.message_idx, &entry.lines, &app.selection_state)
+            {
+                highlighted
+            } else {
+                entry.lines.clone()
+            }
+        } else {
+            entry.lines.clone()
+        };
+
+        let paragraph = Paragraph::new(lines_to_render).wrap(Wrap { trim: false });
+
+        // Calculate where this entry renders within the viewport
+        let skip_lines = viewport_start.saturating_sub(entry_start);
+        let available_from_top = inner.height as usize;
+        let y_offset = entry_start.saturating_sub(viewport_start);
+
+        // The sub-rect for this entry within the inner area
+        let entry_rect = Rect {
+            x: inner.x,
+            y: inner.y + y_offset as u16,
+            width: inner.width,
+            height: (available_from_top - y_offset).min(entry.wrapped_line_count - skip_lines)
+                as u16,
+        };
+
+        if entry_rect.height == 0 {
+            continue;
+        }
+
+        let paragraph = paragraph.scroll((skip_lines as u16, 0));
+        f.render_widget(paragraph, entry_rect);
+    }
+}
+
+/// If the given message index has an active selection, return lines with highlight applied.
+fn get_highlighted_lines(
+    message_idx: usize,
+    lines: &[Line<'static>],
+    selection: &SelectionState,
+) -> Option<Vec<Line<'static>>> {
+    let (sel_msg, start, end) = match selection {
+        SelectionState::Dragging {
+            message_idx: m,
+            anchor,
+            current,
+        } => {
+            if *m != message_idx {
+                return None;
+            }
+            // Normalize direction
+            if anchor.is_before_or_equal(current) {
+                (*m, *anchor, *current)
+            } else {
+                (*m, *current, *anchor)
+            }
+        }
+        SelectionState::Selected {
+            message_idx: m,
+            start,
+            end,
+        } => {
+            if *m != message_idx {
+                return None;
+            }
+            (*m, *start, *end)
+        }
+        SelectionState::None => return None,
+    };
+    let _ = sel_msg; // used only for matching
+
+    Some(apply_selection_highlight(lines, start, end))
+}
+
+/// Apply reverse-video selection highlight to lines within [start, end].
+pub fn apply_selection_highlight(
+    lines: &[Line<'static>],
+    start: TextPosition,
+    end: TextPosition,
+) -> Vec<Line<'static>> {
+    let highlight_style = Style::default().bg(Color::White).fg(Color::Black);
+
+    lines
+        .iter()
+        .enumerate()
+        .map(|(line_idx, line)| {
+            if line_idx < start.line || line_idx > end.line {
+                return line.clone();
+            }
+
+            let sel_start_col = if line_idx == start.line {
+                start.char_offset
+            } else {
+                0
+            };
+            let sel_end_col = if line_idx == end.line {
+                end.char_offset
+            } else {
+                usize::MAX
+            };
+
+            if sel_start_col == sel_end_col {
+                return line.clone();
+            }
+
+            // Split spans at selection boundaries and apply highlight
+            let mut new_spans: Vec<Span<'static>> = Vec::new();
+            let mut col = 0usize;
+
+            for span in &line.spans {
+                let span_start = col;
+                let span_len: usize = span
+                    .content
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                    .sum();
+                let span_end = col + span_len;
+                col = span_end;
+
+                if span_end <= sel_start_col || span_start >= sel_end_col {
+                    // Entirely outside selection
+                    new_spans.push(span.clone());
+                    continue;
+                }
+
+                // This span overlaps the selection. Split it.
+                let mut char_col = span_start;
+                let mut before = String::new();
+                let mut selected = String::new();
+                let mut after = String::new();
+
+                for ch in span.content.chars() {
+                    let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if char_col < sel_start_col {
+                        before.push(ch);
+                    } else if char_col < sel_end_col {
+                        selected.push(ch);
+                    } else {
+                        after.push(ch);
+                    }
+                    char_col += w;
+                }
+
+                if !before.is_empty() {
+                    new_spans.push(Span::styled(before, span.style));
+                }
+                if !selected.is_empty() {
+                    new_spans.push(Span::styled(selected, highlight_style));
+                }
+                if !after.is_empty() {
+                    new_spans.push(Span::styled(after, span.style));
+                }
+            }
+
+            Line::from(new_spans)
+        })
+        .collect()
+}
+
+/// Map screen (col, row) to a (message_idx, TextPosition) within a visible message.
+/// Returns None if the position is outside any message or outside the messages area.
+pub fn hit_test(col: u16, row: u16, app: &App<'_>) -> Option<(usize, TextPosition)> {
+    let inner = app.messages_inner_rect?;
+
+    // Check if click is within the messages area
+    if col < inner.x
+        || col >= inner.x + inner.width
+        || row < inner.y
+        || row >= inner.y + inner.height
+    {
+        return None;
+    }
+
+    let visible_height = inner.height as usize;
+    let total_lines = app.messages_layout.total_lines;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let effective_scroll = max_scroll.saturating_sub(app.scroll_offset);
+
+    // Convert screen row to absolute line index within the full content
+    let screen_row = (row - inner.y) as usize;
+    let abs_line = effective_scroll + screen_row;
+
+    // Find which message entry this line falls into
+    let mut cumulative = 0usize;
+    for entry in &app.messages_layout.entries {
+        let entry_start = cumulative;
+        let entry_end = cumulative + entry.wrapped_line_count;
+        cumulative = entry_end;
+
+        if abs_line >= entry_start && abs_line < entry_end {
+            // Only allow selection on actual messages (not pending/thinking sentinels)
+            if entry.message_idx >= app.messages.len() {
+                return None;
+            }
+
+            // Map abs_line to a line within this entry's rendered lines,
+            // accounting for word wrapping.
+            let line_within_entry = abs_line - entry_start;
+            let local_col = (col - inner.x) as usize;
+
+            // Walk through the entry's lines with wrapping to find the
+            // logical line and character offset.
+            let text_pos = screen_to_text_position(
+                &entry.lines,
+                inner.width as usize,
+                line_within_entry,
+                local_col,
+            );
+
+            return Some((entry.message_idx, text_pos));
+        }
+    }
+
+    None
+}
+
+/// Convert a (wrapped_line_index, screen_col) to a TextPosition within rendered lines.
+/// This accounts for word wrapping that ratatui applies.
+fn screen_to_text_position(
+    lines: &[Line<'static>],
+    width: usize,
+    target_wrapped_line: usize,
+    screen_col: usize,
+) -> TextPosition {
+    let mut wrapped_line = 0usize;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        // Calculate how many wrapped lines this logical line produces
+        let line_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let wrapped_count = visual_line_rows(&line_text, width);
+
+        if wrapped_line + wrapped_count > target_wrapped_line {
+            // The target is within this logical line
+            let sub_line = target_wrapped_line - wrapped_line;
+
+            // Walk through characters to find the offset at (sub_line, screen_col)
+            let char_offset =
+                find_char_offset_in_wrapped_line(&line_text, width, sub_line, screen_col);
+
+            return TextPosition {
+                line: line_idx,
+                char_offset,
+            };
+        }
+
+        wrapped_line += wrapped_count;
+    }
+
+    // Past the end — clamp to the last position
+    let last_line = lines.len().saturating_sub(1);
+    let last_width: usize = if let Some(line) = lines.last() {
+        line.spans
+            .iter()
+            .flat_map(|s| s.content.chars())
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum()
+    } else {
+        0
+    };
+    TextPosition {
+        line: last_line,
+        char_offset: last_width,
+    }
+}
+
+/// Find the character column offset for a given position within a wrapped line.
+fn find_char_offset_in_wrapped_line(
+    text: &str,
+    width: usize,
+    target_sub_line: usize,
+    screen_col: usize,
+) -> usize {
+    if width == 0 || text.is_empty() {
+        return 0;
+    }
+
+    let mut current_sub_line = 0usize;
+    let mut col = 0usize;
+    let mut char_offset = 0usize;
+
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+        // Check for wrap
+        if col + ch_w > width && col > 0 {
+            current_sub_line += 1;
+            col = 0;
+        }
+
+        if current_sub_line == target_sub_line && col >= screen_col {
+            return char_offset;
+        }
+        if current_sub_line > target_sub_line {
+            return char_offset;
+        }
+
+        col += ch_w;
+        char_offset += ch_w;
+    }
+
+    // Clamp to end of line
+    char_offset
+}
+
+/// Extract the plain text within a selection range from rendered lines.
+pub fn extract_selected_text(
+    lines: &[Line<'static>],
+    start: TextPosition,
+    end: TextPosition,
+) -> String {
+    let mut result = String::new();
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line_idx < start.line || line_idx > end.line {
+            continue;
+        }
+
+        let sel_start = if line_idx == start.line {
+            start.char_offset
+        } else {
+            0
+        };
+        let sel_end = if line_idx == end.line {
+            end.char_offset
+        } else {
+            usize::MAX
+        };
+
+        if line_idx > start.line {
+            result.push('\n');
+        }
+
+        let mut col = 0usize;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col >= sel_start && col < sel_end {
+                    result.push(ch);
+                }
+                col += w;
+            }
+        }
+    }
+
+    result
 }
 
 fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
@@ -558,10 +985,17 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(
-        "Ctrl+C quit",
-        Style::default().fg(Color::DarkGray),
-    ));
+    if !app.selection_state.is_none() {
+        spans.push(Span::styled(
+            "Ctrl+C copy",
+            Style::default().fg(Color::Cyan),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "Ctrl+C quit",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     let footer = Line::from(spans);
     f.render_widget(Paragraph::new(footer), area);
@@ -749,4 +1183,206 @@ fn draw_autocomplete(f: &mut Frame<'_>, app: &App<'_>, input_area: Rect) {
     );
 
     f.render_widget(list, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::TextPosition;
+
+    #[test]
+    fn test_visual_line_rows_empty() {
+        assert_eq!(visual_line_rows("", 80), 1);
+    }
+
+    #[test]
+    fn test_visual_line_rows_short() {
+        assert_eq!(visual_line_rows("hello", 80), 1);
+    }
+
+    #[test]
+    fn test_visual_line_rows_exact_width() {
+        assert_eq!(visual_line_rows("abcde", 5), 1);
+    }
+
+    #[test]
+    fn test_visual_line_rows_wraps() {
+        assert_eq!(visual_line_rows("abcdef", 5), 2);
+    }
+
+    #[test]
+    fn test_visual_line_rows_zero_width() {
+        assert_eq!(visual_line_rows("abc", 0), 1);
+    }
+
+    #[test]
+    fn test_extract_selected_text_single_span() {
+        let lines = vec![Line::from(vec![Span::raw("Hello, world!")])];
+        let text = extract_selected_text(
+            &lines,
+            TextPosition {
+                line: 0,
+                char_offset: 0,
+            },
+            TextPosition {
+                line: 0,
+                char_offset: 5,
+            },
+        );
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn test_extract_selected_text_multi_span() {
+        let lines = vec![Line::from(vec![
+            Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" normal"),
+        ])];
+        let text = extract_selected_text(
+            &lines,
+            TextPosition {
+                line: 0,
+                char_offset: 2,
+            },
+            TextPosition {
+                line: 0,
+                char_offset: 7,
+            },
+        );
+        assert_eq!(text, "ld no");
+    }
+
+    #[test]
+    fn test_extract_selected_text_multi_line() {
+        let lines = vec![
+            Line::from(vec![Span::raw("first line")]),
+            Line::from(vec![Span::raw("second line")]),
+            Line::from(vec![Span::raw("third line")]),
+        ];
+        let text = extract_selected_text(
+            &lines,
+            TextPosition {
+                line: 0,
+                char_offset: 6,
+            },
+            TextPosition {
+                line: 2,
+                char_offset: 5,
+            },
+        );
+        assert_eq!(text, "line\nsecond line\nthird");
+    }
+
+    #[test]
+    fn test_apply_selection_highlight_partial_span() {
+        let lines = vec![Line::from(vec![Span::raw("Hello, world!")])];
+        let result = apply_selection_highlight(
+            &lines,
+            TextPosition {
+                line: 0,
+                char_offset: 7,
+            },
+            TextPosition {
+                line: 0,
+                char_offset: 12,
+            },
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].spans.len(), 3); // before + highlighted + after
+        assert_eq!(result[0].spans[0].content, "Hello, ");
+        assert_eq!(result[0].spans[1].content, "world");
+        assert_eq!(result[0].spans[1].style.bg, Some(Color::White));
+        assert_eq!(result[0].spans[2].content, "!");
+    }
+
+    #[test]
+    fn test_apply_selection_highlight_no_selection_on_line() {
+        let lines = vec![
+            Line::from(vec![Span::raw("not selected")]),
+            Line::from(vec![Span::raw("selected text")]),
+        ];
+        let result = apply_selection_highlight(
+            &lines,
+            TextPosition {
+                line: 1,
+                char_offset: 0,
+            },
+            TextPosition {
+                line: 1,
+                char_offset: 8,
+            },
+        );
+        // First line should be unchanged
+        assert_eq!(result[0].spans.len(), 1);
+        assert_eq!(result[0].spans[0].content, "not selected");
+        // Second line should have selection
+        assert_eq!(result[1].spans[0].content, "selected");
+        assert_eq!(result[1].spans[0].style.bg, Some(Color::White));
+    }
+
+    #[test]
+    fn test_find_char_offset_in_wrapped_line_first_sub_line() {
+        // "abcdefghij" at width 5 wraps to:
+        // sub-line 0: "abcde"
+        // sub-line 1: "fghij"
+        let offset = find_char_offset_in_wrapped_line("abcdefghij", 5, 0, 3);
+        assert_eq!(offset, 3);
+    }
+
+    #[test]
+    fn test_find_char_offset_in_wrapped_line_second_sub_line() {
+        let offset = find_char_offset_in_wrapped_line("abcdefghij", 5, 1, 2);
+        assert_eq!(offset, 7); // 5 (first sub-line) + 2
+    }
+
+    #[test]
+    fn test_find_char_offset_empty() {
+        let offset = find_char_offset_in_wrapped_line("", 5, 0, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_screen_to_text_position_single_line() {
+        let lines = vec![Line::from(vec![Span::raw("Hello")])];
+        let pos = screen_to_text_position(&lines, 80, 0, 3);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.char_offset, 3);
+    }
+
+    #[test]
+    fn test_screen_to_text_position_second_line() {
+        let lines = vec![
+            Line::from(vec![Span::raw("first")]),
+            Line::from(vec![Span::raw("second")]),
+        ];
+        let pos = screen_to_text_position(&lines, 80, 1, 2);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.char_offset, 2);
+    }
+
+    #[test]
+    fn test_text_position_ordering() {
+        let a = TextPosition {
+            line: 0,
+            char_offset: 5,
+        };
+        let b = TextPosition {
+            line: 1,
+            char_offset: 0,
+        };
+        assert!(a.is_before_or_equal(&b));
+        assert!(!b.is_before_or_equal(&a));
+
+        let c = TextPosition {
+            line: 0,
+            char_offset: 5,
+        };
+        assert!(a.is_before_or_equal(&c));
+    }
+
+    #[test]
+    fn test_selection_state_default_is_none() {
+        let state = SelectionState::default();
+        assert!(state.is_none());
+    }
 }
