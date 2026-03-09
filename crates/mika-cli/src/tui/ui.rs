@@ -484,7 +484,7 @@ fn get_highlighted_lines(
                 return None;
             }
             // Normalize direction
-            if anchor <= *current {
+            if anchor <= current {
                 (*m, *anchor, *current)
             } else {
                 (*m, *current, *anchor)
