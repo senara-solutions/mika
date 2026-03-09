@@ -335,6 +335,11 @@ Core memory tracks key people briefly — the people table is the full record.\n
          creating a duplicate. After compaction, conversation history may be summarized — \
          always verify current state through tools rather than relying on memory of past actions.\n",
     );
+    prompt.push_str(
+        "- When asked about your own configuration, setup files, or how specific parts of you work, \
+         check your own files (list_home_files, read_home_file) and documentation (get_documentation) \
+         before answering. Never guess about your own internals.\n",
+    );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
     prompt.push_str(
         "- You can create reminders with create_reminder: one-shot (fire_at in ISO 8601 UTC) or periodic (cron_expr, 6-field cron with seconds first, e.g. '0 0 9 * * 1' for every Monday 9am UTC).\n",
