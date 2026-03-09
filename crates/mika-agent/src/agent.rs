@@ -576,20 +576,24 @@ pub struct AgentParams<'a> {
 pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let trace_id = mika_common::trace::generate_trace_id();
 
-    // Save the user message (with image annotation if images attached)
-    let save_text = if params.user_images.is_empty() {
-        params.user_message.to_string()
-    } else {
-        format!(
-            "[{} image(s) attached]\n{}",
-            params.user_images.len(),
-            params.user_message
-        )
-    };
-    params
-        .db
-        .save_message(params.session_id, "user", &save_text, Some(&trace_id))
-        .await?;
+    // Save the user message (with image annotation if images attached).
+    // Skip for callback turns — the raw result is already persisted as role='tool_result'
+    // by the caller, and the framing wrapper is an internal prompt construct.
+    if !params.is_callback_turn {
+        let save_text = if params.user_images.is_empty() {
+            params.user_message.to_string()
+        } else {
+            format!(
+                "[{} image(s) attached]\n{}",
+                params.user_images.len(),
+                params.user_message
+            )
+        };
+        params
+            .db
+            .save_message(params.session_id, "user", &save_text, Some(&trace_id))
+            .await?;
+    }
 
     let agent_name = params
         .home_dir
