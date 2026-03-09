@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
 use tracing::{debug, info};
+use utoipa::ToSchema;
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
 pub fn init_sqlite_vec() {
@@ -140,7 +142,7 @@ pub struct NewTask {
     pub created_trace_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Session {
     pub id: String,
     pub agent_id: String,
@@ -161,7 +163,7 @@ pub struct SessionMessage {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CoreMemoryEntry {
     pub key: String,
     pub value: String,
@@ -207,7 +209,7 @@ pub struct Event {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AuditEvent {
     pub id: i64,
     pub session_id: String,
@@ -274,7 +276,7 @@ pub struct SkillOverride {
 
 // ===== Dashboard Types =====
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TimelineRow {
     pub trace_id: Option<String>,
     pub session_id: Option<String>,
@@ -336,10 +338,11 @@ impl TimelineFilters {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AgentWithStats {
     pub id: String,
     pub name: String,
+    #[serde(skip)]
     pub home_dir: String,
     pub active: bool,
     pub last_seen: Option<i64>,
@@ -347,7 +350,7 @@ pub struct AgentWithStats {
     pub message_count: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SessionWithStats {
     pub id: String,
     pub agent_id: String,
@@ -3444,6 +3447,57 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    // ===== Combined data+count queries (single DB round-trip) =====
+
+    /// Query timeline data and count in a single closure (avoids TOCTOU race).
+    pub fn query_timeline_with_count(
+        &self,
+        filters: &TimelineFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<TimelineRow>, u64)> {
+        let count = self.query_timeline_count(filters)?;
+        let data = self.query_timeline(filters, limit, offset)?;
+        Ok((data, count))
+    }
+
+    /// List sessions and count in a single closure.
+    pub fn list_sessions_paginated_with_count(
+        &self,
+        agent_id: Option<&str>,
+        channel_type: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SessionWithStats>, u64)> {
+        let count = self.count_sessions(agent_id, channel_type)?;
+        let data = self.list_sessions_paginated(agent_id, channel_type, limit, offset)?;
+        Ok((data, count))
+    }
+
+    /// Load session messages and count in a single closure.
+    pub fn load_session_messages_paginated_with_count(
+        &self,
+        session_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SessionMessage>, u64)> {
+        let count = self.count_session_messages(session_id)?;
+        let data = self.load_session_messages_paginated(session_id, limit, offset)?;
+        Ok((data, count))
+    }
+
+    /// List audit events and count in a single closure.
+    pub fn list_audit_events_paginated_with_count(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<AuditEvent>, u64)> {
+        let count = self.count_audit_events(agent_id)?;
+        let data = self.list_audit_events_paginated(agent_id, limit, offset)?;
+        Ok((data, count))
     }
 }
 

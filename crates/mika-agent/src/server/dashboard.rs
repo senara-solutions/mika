@@ -1,4 +1,9 @@
 //! Dashboard API handlers — read-only endpoints for the observability dashboard.
+//!
+//! DB structs (`TimelineRow`, `AgentWithStats`, `CoreMemoryEntry`, `SessionWithStats`,
+//! `AuditEvent`, `Session`) derive `Serialize` + `ToSchema` directly, so no wrapper
+//! response types are needed for 1:1 mappings. Only `MessageResponse` is kept because
+//! it applies a `strip_base64_images` transformation.
 
 use axum::{
     Json,
@@ -10,10 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::db::{
-    AgentWithStats, AuditEvent, CoreMemoryEntry, Session, SessionMessage, SessionWithStats,
-    TimelineFilters, TimelineRow,
-};
+use crate::db::{CoreMemoryEntry, SessionMessage, TimelineFilters};
 
 use super::state::AppState;
 
@@ -59,31 +61,6 @@ pub struct TimelineQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct TimelineRowResponse {
-    pub trace_id: Option<String>,
-    pub session_id: Option<String>,
-    pub agent_id: String,
-    pub event_type: String,
-    pub event_subtype: String,
-    pub summary: Option<String>,
-    pub created_at: i64,
-}
-
-impl From<TimelineRow> for TimelineRowResponse {
-    fn from(r: TimelineRow) -> Self {
-        Self {
-            trace_id: r.trace_id,
-            session_id: r.session_id,
-            agent_id: r.agent_id,
-            event_type: r.event_type,
-            event_subtype: r.event_subtype,
-            summary: r.summary,
-            created_at: r.created_at,
-        }
-    }
-}
-
 /// GET /api/v1/timeline — paginated unified timeline with filters.
 pub async fn handle_timeline(
     State(state): State<AppState>,
@@ -98,24 +75,18 @@ pub async fn handle_timeline(
         from: q.from,
         to: q.to,
     };
-    let count_filters = filters.clone();
 
-    let data = match state
+    let (data, total) = match state
         .dashboard_db
-        .query_timeline(filters, per_page, offset)
+        .query_timeline_with_count(filters, per_page, offset)
         .await
     {
-        Ok(rows) => rows,
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let total = match state.dashboard_db.query_timeline_count(count_filters).await {
-        Ok(n) => n,
+        Ok(result) => result,
         Err(e) => return internal_error(e).into_response(),
     };
 
     Json(PaginatedResponse {
-        data: data.into_iter().map(TimelineRowResponse::from).collect(),
+        data,
         total,
         page,
         per_page,
@@ -129,40 +100,12 @@ pub async fn handle_trace_detail(
     Path(trace_id): Path<String>,
 ) -> impl IntoResponse {
     match state.dashboard_db.query_timeline_by_trace(&trace_id).await {
-        Ok(rows) => Json(
-            rows.into_iter()
-                .map(TimelineRowResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(rows) => Json(rows).into_response(),
         Err(e) => internal_error(e).into_response(),
     }
 }
 
 // ===== Agents =====
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AgentResponse {
-    pub id: String,
-    pub name: String,
-    pub active: bool,
-    pub last_seen: Option<i64>,
-    pub created_at: i64,
-    pub message_count: i64,
-}
-
-impl From<AgentWithStats> for AgentResponse {
-    fn from(a: AgentWithStats) -> Self {
-        Self {
-            id: a.id,
-            name: a.name,
-            active: a.active,
-            last_seen: a.last_seen,
-            created_at: a.created_at,
-            message_count: a.message_count,
-        }
-    }
-}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AgentDetailResponse {
@@ -172,39 +115,14 @@ pub struct AgentDetailResponse {
     pub last_seen: Option<i64>,
     pub created_at: i64,
     pub message_count: i64,
-    pub core_memory: Vec<CoreMemoryResponse>,
+    pub core_memory: Vec<CoreMemoryEntry>,
     pub soul_md: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CoreMemoryResponse {
-    pub key: String,
-    pub value: String,
-    pub token_count: i32,
-    pub updated_at: String,
-}
-
-impl From<CoreMemoryEntry> for CoreMemoryResponse {
-    fn from(e: CoreMemoryEntry) -> Self {
-        Self {
-            key: e.key,
-            value: e.value,
-            token_count: e.token_count,
-            updated_at: e.updated_at,
-        }
-    }
 }
 
 /// GET /api/v1/agents — list all agents with stats.
 pub async fn handle_agents_list(State(state): State<AppState>) -> impl IntoResponse {
     match state.dashboard_db.list_agents_with_stats().await {
-        Ok(agents) => Json(
-            agents
-                .into_iter()
-                .map(AgentResponse::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(agents) => Json(agents).into_response(),
         Err(e) => internal_error(e).into_response(),
     }
 }
@@ -241,7 +159,7 @@ pub async fn handle_agent_detail(
 
     // Get core memory
     let core_memory = match agent_state.db.get_all_core_memory().await {
-        Ok(entries) => entries.into_iter().map(CoreMemoryResponse::from).collect(),
+        Ok(entries) => entries,
         Err(e) => {
             error!(error = %e, "failed to load core memory");
             vec![]
@@ -275,58 +193,6 @@ pub struct PaginationQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SessionResponse {
-    pub id: String,
-    pub agent_id: String,
-    pub channel_type: String,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-    pub metadata: Option<String>,
-    pub message_count: i64,
-}
-
-impl From<SessionWithStats> for SessionResponse {
-    fn from(s: SessionWithStats) -> Self {
-        Self {
-            id: s.id,
-            agent_id: s.agent_id,
-            channel_type: s.channel_type,
-            started_at: s.started_at,
-            ended_at: s.ended_at,
-            metadata: s.metadata,
-            message_count: s.message_count,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AuditEventResponse {
-    pub id: i64,
-    pub session_id: String,
-    pub tool_name: String,
-    pub target_key: String,
-    pub before_value: Option<String>,
-    pub after_value: String,
-    pub reasoning: Option<String>,
-    pub created_at: String,
-}
-
-impl From<AuditEvent> for AuditEventResponse {
-    fn from(e: AuditEvent) -> Self {
-        Self {
-            id: e.id,
-            session_id: e.session_id,
-            tool_name: e.tool_name,
-            target_key: e.target_key,
-            before_value: e.before_value,
-            after_value: e.after_value,
-            reasoning: e.reasoning,
-            created_at: e.created_at,
-        }
-    }
-}
-
 /// GET /api/v1/agents/:id/sessions — paginated sessions for an agent.
 pub async fn handle_agent_sessions(
     State(state): State<AppState>,
@@ -335,26 +201,17 @@ pub async fn handle_agent_sessions(
 ) -> impl IntoResponse {
     let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
 
-    let data = match state
+    let (data, total) = match state
         .dashboard_db
-        .list_sessions_paginated(Some(agent_id.clone()), None, per_page, offset)
+        .list_sessions_paginated_with_count(Some(agent_id.clone()), None, per_page, offset)
         .await
     {
-        Ok(rows) => rows,
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let total = match state
-        .dashboard_db
-        .count_sessions(Some(agent_id), None)
-        .await
-    {
-        Ok(n) => n,
+        Ok(result) => result,
         Err(e) => return internal_error(e).into_response(),
     };
 
     Json(PaginatedResponse {
-        data: data.into_iter().map(SessionResponse::from).collect(),
+        data,
         total,
         page,
         per_page,
@@ -370,22 +227,17 @@ pub async fn handle_agent_audit(
 ) -> impl IntoResponse {
     let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
 
-    let data = match state
+    let (data, total) = match state
         .dashboard_db
-        .list_audit_events_paginated(&agent_id, per_page, offset)
+        .list_audit_events_paginated_with_count(&agent_id, per_page, offset)
         .await
     {
-        Ok(rows) => rows,
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let total = match state.dashboard_db.count_audit_events(&agent_id).await {
-        Ok(n) => n,
+        Ok(result) => result,
         Err(e) => return internal_error(e).into_response(),
     };
 
     Json(PaginatedResponse {
-        data: data.into_iter().map(AuditEventResponse::from).collect(),
+        data,
         total,
         page,
         per_page,
@@ -410,54 +262,22 @@ pub async fn handle_sessions_list(
 ) -> impl IntoResponse {
     let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
 
-    let data = match state
+    let (data, total) = match state
         .dashboard_db
-        .list_sessions_paginated(q.agent_id.clone(), q.channel_type.clone(), per_page, offset)
+        .list_sessions_paginated_with_count(q.agent_id, q.channel_type, per_page, offset)
         .await
     {
-        Ok(rows) => rows,
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let total = match state
-        .dashboard_db
-        .count_sessions(q.agent_id, q.channel_type)
-        .await
-    {
-        Ok(n) => n,
+        Ok(result) => result,
         Err(e) => return internal_error(e).into_response(),
     };
 
     Json(PaginatedResponse {
-        data: data.into_iter().map(SessionResponse::from).collect(),
+        data,
         total,
         page,
         per_page,
     })
     .into_response()
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SessionDetailResponse {
-    pub id: String,
-    pub agent_id: String,
-    pub channel_type: String,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-    pub metadata: Option<String>,
-}
-
-impl From<Session> for SessionDetailResponse {
-    fn from(s: Session) -> Self {
-        Self {
-            id: s.id,
-            agent_id: s.agent_id,
-            channel_type: s.channel_type,
-            started_at: s.started_at,
-            ended_at: s.ended_at,
-            metadata: s.metadata,
-        }
-    }
 }
 
 /// GET /api/v1/sessions/:id — session detail.
@@ -466,7 +286,7 @@ pub async fn handle_session_detail(
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
     match state.dashboard_db.get_session(&session_id).await {
-        Ok(Some(session)) => Json(SessionDetailResponse::from(session)).into_response(),
+        Ok(Some(session)) => Json(session).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("session '{}' not found", session_id)})),
@@ -535,17 +355,12 @@ pub async fn handle_session_messages(
 ) -> impl IntoResponse {
     let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
 
-    let data = match state
+    let (data, total) = match state
         .dashboard_db
-        .load_session_messages_paginated(&session_id, per_page, offset)
+        .load_session_messages_paginated_with_count(&session_id, per_page, offset)
         .await
     {
-        Ok(rows) => rows,
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let total = match state.dashboard_db.count_session_messages(&session_id).await {
-        Ok(n) => n,
+        Ok(result) => result,
         Err(e) => return internal_error(e).into_response(),
     };
 
