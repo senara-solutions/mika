@@ -524,30 +524,64 @@ fn handle_skills(app: &App<'_>) -> String {
         return "No skills loaded.".to_string();
     }
 
-    let mut out = String::from("Loaded skills:\n");
-    for entry in skills {
+    let max_name_width = skills
+        .iter()
+        .map(|e| e.manifest.skill.name.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut always_on: Vec<&_> = skills
+        .iter()
+        .filter(|e| e.manifest.skill.always_on)
+        .collect();
+    let mut on_demand: Vec<&_> = skills
+        .iter()
+        .filter(|e| !e.manifest.skill.always_on)
+        .collect();
+
+    // Within each group: enabled first, disabled last
+    always_on.sort_by_key(|e| !e.enabled);
+    on_demand.sort_by_key(|e| !e.enabled);
+
+    let mut out = format!("Loaded skills ({}):\n", skills.len());
+
+    let format_entry = |out: &mut String, entry: &mika_agent::skills::index::SkillEntry| {
         let tool_count = entry.skill_tools.len();
-        let handler_desc = if tool_count > 0 {
-            format!("{} tools", tool_count)
+        let tool_info = if tool_count == 0 {
+            "—".to_string()
+        } else if tool_count == 1 {
+            "1 tool".to_string()
         } else {
-            "no tools".to_string()
+            format!("{tool_count} tools")
         };
-        let always_on = if entry.manifest.skill.always_on {
-            " [always on]"
-        } else {
-            ""
-        };
-        let enabled = if entry.enabled { "" } else { " [disabled]" };
+        let disabled = if entry.enabled { "" } else { " [disabled]" };
+        let overridden = if entry.has_override { " [override]" } else { "" };
         let _ = writeln!(
             out,
-            "  {} ({}) — {}{}{}",
+            "  ● {:<width$}  {:<9}  {}{}{}",
             entry.manifest.skill.name,
-            handler_desc,
+            tool_info,
             entry.manifest.skill.description,
-            always_on,
-            enabled
+            disabled,
+            overridden,
+            width = max_name_width
         );
+    };
+
+    if !always_on.is_empty() {
+        let _ = writeln!(out, "\n  ALWAYS ON");
+        for entry in &always_on {
+            format_entry(&mut out, entry);
+        }
     }
+
+    if !on_demand.is_empty() {
+        let _ = writeln!(out, "\n  ON DEMAND");
+        for entry in &on_demand {
+            format_entry(&mut out, entry);
+        }
+    }
+
     out
 }
 
