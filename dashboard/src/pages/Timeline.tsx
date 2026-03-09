@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
+import { useAgents } from '../api/agents.ts'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatTimestamp } from '../hooks/useFormatTime.ts'
@@ -35,6 +36,7 @@ export default function Timeline() {
   }
 
   const { data, isLoading, error } = useTimeline(filters, true, autoRefresh)
+  const { data: agents } = useAgents()
 
   function updateFilter(key: string, value: string) {
     const next = new URLSearchParams(searchParams)
@@ -117,6 +119,11 @@ export default function Timeline() {
             className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
           >
             <option value="">All Agents</option>
+            {agents?.map((a) => (
+              <option key={a.name} value={a.name}>
+                {a.name}
+              </option>
+            ))}
           </select>
           <select
             value={filters.event_type ?? ''}
@@ -203,7 +210,7 @@ export default function Timeline() {
                             to={`/traces/${row.trace_id}`}
                             className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
                           >
-                            trc_{row.trace_id.slice(0, 12)}
+                            {row.trace_id}
                           </Link>
                         ) : (
                           <span className="text-muted/30 text-xs">-</span>

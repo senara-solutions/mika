@@ -64,7 +64,7 @@ export default function Agents() {
                       {agent.name}
                     </h3>
                     <p className="text-[10px] text-muted/40 font-mono mt-0.5">
-                      {agent.id.slice(0, 16)}...
+                      {agent.id}
                     </p>
                   </div>
                 </div>

@@ -51,11 +51,14 @@ fn list(global_home: &std::path::Path) -> Result<()> {
 
     println!("\n  Teams:");
     for name in &teams {
-        let agent_count = match team::load_team(global_home, name) {
-            Ok(def) => def.agents.len(),
-            Err(_) => 0,
-        };
-        println!("    {name} ({agent_count} agents)");
+        match team::load_team(global_home, name) {
+            Ok(def) => {
+                println!("    {name} ({} agents)", def.agents.len());
+            }
+            Err(e) => {
+                println!("    {name} (error loading: {e})");
+            }
+        }
     }
     println!();
     Ok(())

@@ -13,6 +13,7 @@ fn default_max_iterations() -> u32 {
 pub struct TeamDefinition {
     pub team: TeamMeta,
     pub agents: Vec<TeamAgent>,
+    #[serde(default)]
     pub flow: TeamFlow,
 }
 
@@ -27,7 +28,9 @@ pub struct TeamMeta {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct TeamAgent {
     pub name: String,
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub mandate: String,
 }
 
@@ -36,6 +39,14 @@ pub struct TeamAgent {
 pub struct TeamFlow {
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+}
+
+impl Default for TeamFlow {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_max_iterations(),
+        }
+    }
 }
 
 /// Validate a team name.
@@ -439,5 +450,25 @@ steps = ["decompose", "execute"]
 
         let err = validate_team(tmp.path(), &def).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_minimal_team_toml_parses() {
+        let toml = r#"
+[team]
+name = "minimal"
+orchestrator = "lead"
+
+[[agents]]
+name = "lead"
+
+[[agents]]
+name = "worker"
+"#;
+        let def: TeamDefinition = toml::from_str(toml).unwrap();
+        assert_eq!(def.agents.len(), 2);
+        assert_eq!(def.agents[0].role, "");
+        assert_eq!(def.agents[0].mandate, "");
+        assert_eq!(def.flow.max_iterations, 3);
     }
 }

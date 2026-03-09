@@ -45,7 +45,7 @@ export default function TraceDetail() {
         </Link>
         <div>
           <h2 className="text-heading text-xl font-semibold">Trace Detail</h2>
-          <p className="text-xs text-accent font-mono mt-0.5">trc_{traceId}</p>
+          <p className="text-xs text-accent font-mono mt-0.5">{traceId}</p>
         </div>
       </div>
 

@@ -8,6 +8,7 @@ use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use secrecy::SecretString;
+use tokio::sync::OnceCell;
 
 use crate::async_db::AsyncDatabase;
 use crate::mcp::McpManager;
@@ -53,6 +54,10 @@ pub struct AppState {
     pub settings: Settings,
     /// Unscoped database handle for dashboard API endpoints (cross-agent queries).
     pub dashboard_db: AsyncDatabase,
+    /// Serializes investigation agent runs (independent of per-agent locks).
+    pub investigation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Lazily initialized investigation tool registry.
+    pub investigation_tools: Arc<OnceCell<Arc<ToolRegistry>>>,
 }
 
 impl AppState {

@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 7 management tools (2 always-on + 5 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -160,7 +160,7 @@ Stored in dedicated SQLite tables. Managed by the agent via `store_fact`,
 
 | Category | Table | Key Columns |
 |----------|-------|-------------|
-| People | `people` | `canonical_name` (UNIQUE COLLATE NOCASE), `relationship`, `notes` |
+| People | `people` | `canonical_name` (UNIQUE COLLATE NOCASE), `relationship`, `notes`, `mention_count` |
 | Commitments | `commitments` | `description` (UNIQUE COLLATE NOCASE), `status` (pending/completed/cancelled), `due_date`, `person_id` FK |
 | Preferences | `preferences` | `category` (UNIQUE COLLATE NOCASE), `value` |
 | Events | `events` | `description`, `event_date`, `context` |
@@ -210,17 +210,20 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 
 ### Management Tools
 
-6 tools for multi-agent and team workflows, registered conditionally via
-`management_tools_if_needed()` only when `agents.len() > 1 || !teams.is_empty()`:
+7 tools for multi-agent and team workflows, registered via
+`management_tools_if_needed()`. `create_agent` and `list_agents` are always
+registered (enabling agent bootstrapping from a single-agent setup). The
+remaining 5 tools are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
-| Tool | Description | Timeout |
-|------|-------------|---------|
-| `list_agents` | List all configured agents with their identities and role hints. | default (30s) |
-| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s |
-| `list_teams` | List all configured teams with agent counts. | default (30s) |
-| `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s |
-| `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) |
-| `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) |
+| Tool | Description | Timeout | Always registered |
+|------|-------------|---------|-------------------|
+| `create_agent` | Create a new agent with name, display name, soul (personality), and optional model override. | default (30s) | Yes |
+| `list_agents` | List all configured agents with their identities and role hints. | default (30s) | Yes |
+| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
+| `list_teams` | List all configured teams with full configuration (roles, mandates, max_iterations). | default (30s) | No |
+| `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s | No |
+| `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) | No |
+| `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,
 preventing infinite delegation chains.
@@ -791,7 +794,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 5 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation)
+**Schema version:** 6 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call)
 
 ### Tables
 

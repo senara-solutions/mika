@@ -40,17 +40,28 @@ impl Tool for ListTeamsTool {
         for name in &names {
             match team::load_team(&self.home_dir, name) {
                 Ok(def) => {
-                    let agent_count = def.agents.len();
-                    let agent_names: Vec<&str> =
-                        def.agents.iter().map(|a| a.name.as_str()).collect();
-                    lines.push(format!(
-                        "- {} ({} agent{}, orchestrator: {}, members: {})",
-                        name,
-                        agent_count,
-                        if agent_count == 1 { "" } else { "s" },
-                        def.team.orchestrator,
-                        agent_names.join(", "),
+                    let mut block = format!("## {name}");
+                    block.push_str(&format!(
+                        "\nOrchestrator: {}\nMax iterations: {}\nAgents:",
+                        def.team.orchestrator, def.flow.max_iterations,
                     ));
+                    for agent in &def.agents {
+                        let role = if agent.role.is_empty() {
+                            "unspecified"
+                        } else {
+                            &agent.role
+                        };
+                        let mandate_part = if agent.mandate.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", agent.mandate)
+                        };
+                        block.push_str(&format!(
+                            "\n  - {} (role: {}){mandate_part}",
+                            agent.name, role,
+                        ));
+                    }
+                    lines.push(block);
                 }
                 Err(e) => {
                     lines.push(format!("- {} (error loading: {})", name, e));
@@ -123,9 +134,10 @@ max_iterations = 3
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("dev-team"));
-        assert!(result.content.contains("2 agents"));
-        assert!(result.content.contains("orchestrator: planner"));
-        assert!(result.content.contains("planner, coder"));
+        assert!(result.content.contains("## dev-team"));
+        assert!(result.content.contains("Orchestrator: planner"));
+        assert!(result.content.contains("Max iterations: 3"));
+        assert!(result.content.contains("planner (role: orchestrator) — Plan tasks"));
+        assert!(result.content.contains("coder (role: specialist) — Write code"));
     }
 }

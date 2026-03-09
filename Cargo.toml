@@ -64,6 +64,9 @@ cron = "0.12"
 # Async trait
 async-trait = "0.1"
 
+# Streaming
+tokio-stream = "0.1"
+
 # HTTP
 http = "1"
 

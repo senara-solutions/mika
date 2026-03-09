@@ -1098,6 +1098,23 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_message_by_id(&self, message_id: i64) -> Result<Option<SessionMessage>> {
+        self.with_db(move |db| db.get_message_by_id(message_id))
+            .await
+    }
+
+    pub async fn get_surrounding_messages(
+        &self,
+        session_id: &str,
+        target_id: i64,
+        before: u32,
+        after: u32,
+    ) -> Result<Vec<SessionMessage>> {
+        let sid = session_id.to_owned();
+        self.with_db(move |db| db.get_surrounding_messages(&sid, target_id, before, after))
+            .await
+    }
+
     pub async fn list_audit_events_paginated(
         &self,
         agent_id: &str,
