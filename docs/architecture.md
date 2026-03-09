@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -207,6 +207,9 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `write_file` | Write content to a file in the agent's home directory. Requires `confirm: true` to overwrite existing files — returns current content first. | Files |
 | `read_home_file` | Read a file from the agent's home directory. Uses `validate_and_resolve_path` with `create_parents: false`. Reports resolved absolute path. | Files |
 | `list_home_files` | List files in a directory within the agent's home directory. Includes sizes and modification ages. Uses `spawn_blocking` for I/O. | Files |
+| `query_timeline` | Query the unified timeline of events across all subsystems (messages, audit events, tasks). Returns recent activity sorted by time. Non-orchestrator agents scoped to own agent_id. | Introspection |
+| `get_session_messages` | Retrieve messages from a past conversation session. Useful for replaying or summarizing old conversations. Non-orchestrator agents can only access their own sessions. | Introspection |
+| `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
 
 ### Management Tools
 
@@ -617,19 +620,29 @@ Properties:
 
 The per-customer agent container runs an Axum HTTP server:
 
+### Auth Split
+
+The server has two auth layers:
+
+- **Mutation endpoints** (`/message`, `/tasks/{id}/complete`) require `MIKA_INTERNAL_TOKEN` only (gateway-to-agent traffic).
+- **Dashboard API** (`/api/v1/*`) accepts either `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN` (superuser). If `MIKA_DASHBOARD_TOKEN` is not set, dashboard routes fall back to `MIKA_INTERNAL_TOKEN` (backwards compatible).
+
+This separation lets you give dashboard users a read-only token that cannot mutate agent state.
+
 ### Mutation Endpoints
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/health` | GET | None | Liveness/readiness probe |
-| `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
-| `/tasks/{id}/complete` | POST | Bearer | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
+| `/message` | POST | Internal token | Receives messages (202 async processing, 10MB body limit) |
+| `/tasks/{id}/complete` | POST | Internal token | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
 
 ### Dashboard API (read-only)
 
 All dashboard routes are nested under `/api/v1/` with CORS scoped to
 `MIKA_CORS_ORIGIN` (default `http://localhost:5173`), restricted to
 GET + POST + OPTIONS methods and `Authorization` + `Content-Type` headers only.
+Auth: accepts `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN`.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|

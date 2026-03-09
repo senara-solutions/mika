@@ -146,7 +146,8 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
-| `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. |
+| `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
+| `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
 | `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
@@ -159,7 +160,7 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key`, `internal_token`, `brave_api_key`, and `otlp_auth_header` are redacted in
+- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, and `otlp_auth_header` are redacted in
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
@@ -336,6 +337,7 @@ are required for inter-service communication:
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
 | `MIKA_CORS_ORIGIN` | No | Allowed origin for dashboard CORS (default: `http://localhost:5173`) |
+| `MIKA_DASHBOARD_TOKEN` | No | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN`. |
 
 ### Token Generation
 
