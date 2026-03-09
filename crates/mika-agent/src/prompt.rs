@@ -304,7 +304,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
             "\nTo create a team, use the `create_team` tool — do NOT write team.toml manually. \
              Provide a `name`, `orchestrator` (must be one of the agents), and an `agents` array \
              where each entry has `name`, `role`, and `mandate`. All agents must already exist \
-             (create them first with `create_agent` if needed).\n",
+             (create them first with `create_agent` if needed).\n\
+             To modify a team, use `update_team` — you can change the orchestrator, agents, or max_iterations.\n\
+             To delete a team, use `delete_team`.\n",
         );
     }
 

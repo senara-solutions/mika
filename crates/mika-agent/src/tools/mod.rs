@@ -2,6 +2,8 @@ mod cancel_reminder;
 mod cancel_task;
 mod complete_task;
 mod create_agent;
+mod create_team;
+mod delete_team;
 mod create_reminder;
 pub(crate) mod create_skill;
 mod create_task;
@@ -29,6 +31,7 @@ mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod update_skill;
+mod update_team;
 mod write_file;
 mod write_workspace;
 
@@ -409,6 +412,9 @@ pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<B
         Box::new(create_agent::CreateAgentTool {
             home_dir: home_dir.to_path_buf(),
         }),
+        Box::new(create_team::CreateTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
         Box::new(list_agents::ListAgentsTool {
             home_dir: home_dir.to_path_buf(),
         }),
@@ -430,6 +436,12 @@ pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<B
         }));
         tools.push(Box::new(get_team_status::GetTeamStatusTool));
         tools.push(Box::new(get_team_history::GetTeamHistoryTool));
+        tools.push(Box::new(delete_team::DeleteTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(update_team::UpdateTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
     }
 
     tools
