@@ -9,34 +9,14 @@ use crate::tui::app::{
     AgentStatus, App, ChatRole, DashboardAgentStatus, MessageLayout, SelectionState, TextPosition,
 };
 use crate::tui::markdown;
+pub(crate) use crate::tui::wrap::visual_line_rows;
+use crate::tui::wrap::{WrappedChars, find_char_offset_in_wrapped_line};
 
 /// Build a yellow `[channel] ` prefix span for non-CLI messages.
 fn channel_prefix_span(channel: &Option<String>) -> Option<Span<'static>> {
     channel
         .as_ref()
         .map(|ch| Span::styled(format!("[{ch}] "), Style::default().fg(Color::Yellow)))
-}
-
-/// Count visual rows a line occupies when wrapped at the given width, using character display widths.
-pub(crate) fn visual_line_rows(line: &str, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    if line.is_empty() {
-        return 1;
-    }
-    let mut rows = 1;
-    let mut col = 0;
-    for ch in line.chars() {
-        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if col + ch_w > width && col > 0 {
-            rows += 1;
-            col = ch_w;
-        } else {
-            col += ch_w;
-        }
-    }
-    rows
 }
 
 /// Result of wrapping multi-line input text with cursor tracking.
@@ -100,34 +80,31 @@ fn wrap_input_with_cursor(
         let has_selection = !sel_flags.is_empty();
         let mut seg_start_byte = 0;
         let mut seg_start_idx = 0;
-        let mut col = 0usize;
+        let mut prev_display_row = 0;
 
-        for (char_idx, (byte_offset, ch)) in line.char_indices().enumerate() {
-            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-
-            if col + ch_w > width && col > 0 {
-                let seg = &line[seg_start_byte..byte_offset];
+        for wc in WrappedChars::new(line, width) {
+            if wc.display_row != prev_display_row {
+                // Wrap break: emit the previous segment
+                let seg = &line[seg_start_byte..wc.byte_offset];
                 if has_selection {
                     display_lines.push(build_selection_line(
                         seg,
-                        &sel_flags[seg_start_idx..char_idx],
+                        &sel_flags[seg_start_idx..wc.char_idx],
                         sel_highlight,
                     ));
                 } else {
                     display_lines.push(Line::from(seg.to_string()));
                 }
-                seg_start_byte = byte_offset;
-                seg_start_idx = char_idx;
-                col = 0;
+                seg_start_byte = wc.byte_offset;
+                seg_start_idx = wc.char_idx;
+                prev_display_row = wc.display_row;
             }
 
-            if line_idx == cursor_row && char_idx == cursor_col && !found_cursor {
+            if line_idx == cursor_row && wc.char_idx == cursor_col && !found_cursor {
                 cursor_y = display_lines.len() as u16;
-                cursor_x = col as u16;
+                cursor_x = wc.display_col as u16;
                 found_cursor = true;
             }
-
-            col += ch_w;
         }
 
         // Emit the final segment
@@ -143,8 +120,12 @@ fn wrap_input_with_cursor(
         }
 
         if line_idx == cursor_row && !found_cursor {
+            let final_col = WrappedChars::new(line, width)
+                .last()
+                .map(|wc| wc.display_col + wc.char_width)
+                .unwrap_or(0);
             cursor_y = (display_lines.len() - 1) as u16;
-            cursor_x = col as u16;
+            cursor_x = final_col as u16;
             found_cursor = true;
         }
     }
@@ -797,45 +778,6 @@ fn screen_to_text_position(
     }
 }
 
-/// Find the character column offset for a given position within a wrapped line.
-fn find_char_offset_in_wrapped_line(
-    text: &str,
-    width: usize,
-    target_sub_line: usize,
-    screen_col: usize,
-) -> usize {
-    if width == 0 || text.is_empty() {
-        return 0;
-    }
-
-    let mut current_sub_line = 0usize;
-    let mut col = 0usize;
-    let mut char_offset = 0usize;
-
-    for ch in text.chars() {
-        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-
-        // Check for wrap
-        if col + ch_w > width && col > 0 {
-            current_sub_line += 1;
-            col = 0;
-        }
-
-        if current_sub_line == target_sub_line && col >= screen_col {
-            return char_offset;
-        }
-        if current_sub_line > target_sub_line {
-            return char_offset;
-        }
-
-        col += ch_w;
-        char_offset += ch_w;
-    }
-
-    // Clamp to end of line
-    char_offset
-}
-
 /// Extract the plain text within a selection range from rendered lines.
 pub fn extract_selected_text(
     lines: &[Line<'static>],
@@ -1324,31 +1266,6 @@ mod tests {
     use crate::tui::app::TextPosition;
 
     #[test]
-    fn test_visual_line_rows_empty() {
-        assert_eq!(visual_line_rows("", 80), 1);
-    }
-
-    #[test]
-    fn test_visual_line_rows_short() {
-        assert_eq!(visual_line_rows("hello", 80), 1);
-    }
-
-    #[test]
-    fn test_visual_line_rows_exact_width() {
-        assert_eq!(visual_line_rows("abcde", 5), 1);
-    }
-
-    #[test]
-    fn test_visual_line_rows_wraps() {
-        assert_eq!(visual_line_rows("abcdef", 5), 2);
-    }
-
-    #[test]
-    fn test_visual_line_rows_zero_width() {
-        assert_eq!(visual_line_rows("abc", 0), 1);
-    }
-
-    #[test]
     fn test_extract_selected_text_single_span() {
         let lines = vec![Line::from(vec![Span::raw("Hello, world!")])];
         let text = extract_selected_text(
@@ -1451,27 +1368,6 @@ mod tests {
         // Second line should have selection
         assert_eq!(result[1].spans[0].content, "selected");
         assert_eq!(result[1].spans[0].style.bg, Some(Color::White));
-    }
-
-    #[test]
-    fn test_find_char_offset_in_wrapped_line_first_sub_line() {
-        // "abcdefghij" at width 5 wraps to:
-        // sub-line 0: "abcde"
-        // sub-line 1: "fghij"
-        let offset = find_char_offset_in_wrapped_line("abcdefghij", 5, 0, 3);
-        assert_eq!(offset, 3);
-    }
-
-    #[test]
-    fn test_find_char_offset_in_wrapped_line_second_sub_line() {
-        let offset = find_char_offset_in_wrapped_line("abcdefghij", 5, 1, 2);
-        assert_eq!(offset, 7); // 5 (first sub-line) + 2
-    }
-
-    #[test]
-    fn test_find_char_offset_empty() {
-        let offset = find_char_offset_in_wrapped_line("", 5, 0, 0);
-        assert_eq!(offset, 0);
     }
 
     #[test]
