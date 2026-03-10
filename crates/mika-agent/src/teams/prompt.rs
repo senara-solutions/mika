@@ -3,7 +3,7 @@ use std::path::Path;
 
 use mika_common::team::TeamDefinition;
 
-use crate::db::TeamRunRow;
+use crate::db::{TeamRunRow, TeamRunSummary};
 
 use super::types::TeamRun;
 
@@ -16,6 +16,7 @@ pub fn build_orchestrator_context(
     workspace_listing: &str,
     previous_feedback: Option<&str>,
     history: &[TeamRunRow],
+    previous_run: Option<&TeamRunSummary>,
 ) -> String {
     let mut members = String::new();
     for agent in &def.agents {
@@ -29,25 +30,49 @@ pub fn build_orchestrator_context(
         );
     }
 
-    let history_section = if history.is_empty() {
+    // Build enriched previous run context (most recent) + condensed older runs
+    let previous_run_section = previous_run
+        .map(build_previous_run_context)
+        .unwrap_or_default();
+
+    // Exclude the most recent run from condensed history if we have an enriched summary
+    let skip_run_id = previous_run.map(|s| s.run.id.as_str());
+
+    let history_section = if history.is_empty() && previous_run_section.is_empty() {
         String::new()
     } else {
-        let mut buf = String::from("\n## Conversation History\n");
-        let mut budget = 5000usize; // total character budget for history section
-        // Show oldest first (load_team_runs returns DESC, so reverse)
-        for run in history.iter().rev() {
-            if budget == 0 {
-                break;
-            }
-            let entry_start = buf.len();
-            let _ = writeln!(buf, "<context type=\"history_goal\">{}</context>", run.goal);
-            if let Some(ref d) = run.deliverable {
-                let _ = writeln!(buf, "<context type=\"history_deliverable\">{d}</context>");
-            }
+        let mut buf = String::new();
+
+        // First: enriched previous run summary (up to 2500 chars)
+        if !previous_run_section.is_empty() {
             buf.push('\n');
-            let entry_len = buf.len() - entry_start;
-            budget = budget.saturating_sub(entry_len);
+            buf.push_str(&previous_run_section);
         }
+
+        // Then: condensed older runs
+        let older_runs: Vec<_> = history
+            .iter()
+            .filter(|r| skip_run_id != Some(r.id.as_str()))
+            .collect();
+
+        if !older_runs.is_empty() {
+            buf.push_str("\n## Older Runs\n");
+            let mut budget = 1500usize;
+            for run in older_runs.iter().rev() {
+                if budget == 0 {
+                    break;
+                }
+                let entry_start = buf.len();
+                let _ = writeln!(buf, "<context type=\"history_goal\">{}</context>", run.goal);
+                if let Some(ref d) = run.deliverable {
+                    let _ = writeln!(buf, "<context type=\"history_deliverable\">{d}</context>");
+                }
+                buf.push('\n');
+                let entry_len = buf.len() - entry_start;
+                budget = budget.saturating_sub(entry_len);
+            }
+        }
+
         buf
     };
 
@@ -96,6 +121,101 @@ pub fn build_orchestrator_context(
         team_name = def.team.name,
         mi = def.flow.max_iterations,
     )
+}
+
+/// Build a structured context block from a previous team run summary.
+///
+/// Renders goal, agent results, deliverable, task statuses, and pending tasks
+/// into a markdown block. Enforces a 2500-character budget.
+pub fn build_previous_run_context(summary: &TeamRunSummary) -> String {
+    let run = &summary.run;
+
+    // Format date from unix timestamp
+    let date = chrono::DateTime::from_timestamp(run.started_at, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let status_label = if run.status == "completed" {
+        format!(
+            "completed in {}/{} iterations",
+            run.iteration, run.max_iterations
+        )
+    } else {
+        run.status.clone()
+    };
+
+    let mut buf = format!(
+        "<context type=\"previous_run\">\n## Previous Team Run ({date}, {status_label})\n\n"
+    );
+
+    // Goal (truncated to 200 chars)
+    let goal: String = if run.goal.chars().count() > 200 {
+        format!("{}...", run.goal.chars().take(200).collect::<String>())
+    } else {
+        run.goal.clone()
+    };
+    let _ = writeln!(buf, "**Goal:** {goal}\n");
+
+    // Agent Results
+    if !summary.agent_results.is_empty() {
+        buf.push_str("**Agent Results:**\n");
+        for ar in &summary.agent_results {
+            let _ = writeln!(buf, "- {}: {}", ar.agent_name, ar.response_preview);
+        }
+        buf.push('\n');
+    }
+
+    // Deliverable (truncated to 500 chars)
+    if let Some(ref deliverable) = run.deliverable {
+        let d: String = if deliverable.chars().count() > 500 {
+            format!("{}...", deliverable.chars().take(500).collect::<String>())
+        } else {
+            deliverable.clone()
+        };
+        let _ = writeln!(buf, "**Deliverable:** {d}\n");
+    }
+
+    // Critic feedback
+    if let Some(ref feedback) = summary.critic_feedback {
+        let _ = writeln!(buf, "**Critic Feedback:** {feedback}\n");
+    }
+
+    // Task statuses
+    if !summary.task_statuses.is_empty() {
+        buf.push_str("**Task Status:**\n");
+        for ts in &summary.task_statuses {
+            let _ = writeln!(buf, "- [{}] {}: {}", ts.status, ts.agent_id, ts.label);
+        }
+        buf.push('\n');
+    }
+
+    // Pending tasks (highlighted)
+    if !summary.pending_tasks.is_empty() {
+        buf.push_str("**Pending from previous run:**\n");
+        for pt in &summary.pending_tasks {
+            let _ = writeln!(
+                buf,
+                "- [{}] {}: {} (task {})",
+                pt.status, pt.agent_id, pt.label, pt.task_id
+            );
+        }
+        buf.push('\n');
+    }
+
+    // Failure reason
+    if let Some(ref reason) = run.failure_reason {
+        let _ = writeln!(buf, "**Failure reason:** {reason}\n");
+    }
+
+    buf.push_str("</context>\n");
+
+    // Enforce 2500-char budget
+    if buf.len() > 2500 {
+        buf.truncate(2490);
+        buf.push_str("...\n</context>\n");
+    }
+
+    buf
 }
 
 /// Build the team context injected into a specialist agent's system prompt.
@@ -254,7 +374,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_includes_team_members() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", None, &[]);
+        let ctx = build_orchestrator_context(&def, "", None, &[], None);
         assert!(ctx.contains("ORCHESTRATOR"));
         assert!(ctx.contains("researcher"));
         assert!(ctx.contains("Research topics"));
@@ -265,7 +385,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_with_feedback() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"), &[]);
+        let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"), &[], None);
         assert!(ctx.contains("Previous Review Feedback"));
         assert!(ctx.contains("Needs more detail"));
     }
@@ -299,8 +419,8 @@ mod tests {
                 ended_at: Some(1003),
             },
         ];
-        let ctx = build_orchestrator_context(&def, "", None, &history);
-        assert!(ctx.contains("## Conversation History"));
+        let ctx = build_orchestrator_context(&def, "", None, &history, None);
+        assert!(ctx.contains("## Older Runs"));
         // History returned DESC, rendered oldest first — run-2 (index 0) is newer
         assert!(ctx.contains("How is the team?"));
         assert!(ctx.contains("The team is ready!"));
@@ -314,7 +434,7 @@ mod tests {
     #[test]
     fn test_orchestrator_context_no_history_section_when_empty() {
         let def = test_def();
-        let ctx = build_orchestrator_context(&def, "", None, &[]);
+        let ctx = build_orchestrator_context(&def, "", None, &[], None);
         assert!(!ctx.contains("Conversation History"));
     }
 
@@ -403,8 +523,222 @@ mod tests {
             started_at: 1000,
             ended_at: Some(1001),
         }];
-        let ctx = build_orchestrator_context(&def, "", None, &history);
+        let ctx = build_orchestrator_context(&def, "", None, &history, None);
         assert!(ctx.contains(&goal));
+    }
+
+    #[test]
+    fn test_build_previous_run_context_completed() {
+        use crate::db::{AgentResultSummary, TaskStatusSummary, TeamRunSummary};
+
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "run-1".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Research Rust patterns".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 2,
+                max_iterations: 3,
+                deliverable: Some("Found 5 key patterns for async Rust".to_string()),
+                started_at: 1741000000,
+                ended_at: Some(1741003600),
+            },
+            agent_results: vec![
+                AgentResultSummary {
+                    agent_name: "researcher".to_string(),
+                    response_preview: "Analyzed async patterns in popular crates".to_string(),
+                },
+                AgentResultSummary {
+                    agent_name: "writer".to_string(),
+                    response_preview: "Drafted summary of findings".to_string(),
+                },
+            ],
+            task_statuses: vec![TaskStatusSummary {
+                agent_id: "researcher".to_string(),
+                label: "research-task".to_string(),
+                status: "completed".to_string(),
+                task_id: "task-1".to_string(),
+            }],
+            pending_tasks: vec![],
+            critic_feedback: Some("Good coverage but needs more examples".to_string()),
+        };
+
+        let ctx = build_previous_run_context(&summary);
+        assert!(ctx.contains("<context type=\"previous_run\">"));
+        assert!(ctx.contains("</context>"));
+        assert!(ctx.contains("Previous Team Run"));
+        assert!(ctx.contains("completed in 2/3 iterations"));
+        assert!(ctx.contains("Research Rust patterns"));
+        assert!(ctx.contains("researcher: Analyzed async patterns"));
+        assert!(ctx.contains("writer: Drafted summary"));
+        assert!(ctx.contains("Found 5 key patterns"));
+        assert!(ctx.contains("Good coverage but needs more examples"));
+        assert!(ctx.contains("[completed] researcher: research-task"));
+    }
+
+    #[test]
+    fn test_build_previous_run_context_failed_with_pending() {
+        use crate::db::{TaskStatusSummary, TeamRunSummary};
+
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "run-2".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Deploy service".to_string(),
+                status: "failed".to_string(),
+                failure_reason: Some("Timeout during execution".to_string()),
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: None,
+                started_at: 1741000000,
+                ended_at: Some(1741003600),
+            },
+            agent_results: vec![],
+            task_statuses: vec![],
+            pending_tasks: vec![TaskStatusSummary {
+                agent_id: "deployer".to_string(),
+                label: "deploy-prod".to_string(),
+                status: "pending".to_string(),
+                task_id: "task-99".to_string(),
+            }],
+            critic_feedback: None,
+        };
+
+        let ctx = build_previous_run_context(&summary);
+        assert!(ctx.contains("failed"));
+        assert!(ctx.contains("Timeout during execution"));
+        assert!(ctx.contains("Pending from previous run"));
+        assert!(ctx.contains("[pending] deployer: deploy-prod (task task-99)"));
+    }
+
+    #[test]
+    fn test_build_previous_run_context_empty_summary() {
+        use crate::db::TeamRunSummary;
+
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "run-3".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Simple goal".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: None,
+                started_at: 1741000000,
+                ended_at: Some(1741003600),
+            },
+            agent_results: vec![],
+            task_statuses: vec![],
+            pending_tasks: vec![],
+            critic_feedback: None,
+        };
+
+        let ctx = build_previous_run_context(&summary);
+        assert!(ctx.contains("Previous Team Run"));
+        assert!(ctx.contains("Simple goal"));
+        // No agent results, tasks, or critic sections
+        assert!(!ctx.contains("Agent Results"));
+        assert!(!ctx.contains("Task Status"));
+        assert!(!ctx.contains("Pending from"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_with_previous_run() {
+        use crate::db::TeamRunSummary;
+
+        let def = test_def();
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "run-1".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Previous goal".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: Some("Previous deliverable".to_string()),
+                started_at: 1741000000,
+                ended_at: Some(1741003600),
+            },
+            agent_results: vec![],
+            task_statuses: vec![],
+            pending_tasks: vec![],
+            critic_feedback: None,
+        };
+
+        let ctx = build_orchestrator_context(&def, "", None, &[], Some(&summary));
+        assert!(ctx.contains("Previous Team Run"));
+        assert!(ctx.contains("Previous goal"));
+        assert!(ctx.contains("Previous deliverable"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_history_excludes_enriched_run() {
+        use crate::db::TeamRunSummary;
+
+        let def = test_def();
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "run-2".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Latest goal".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: Some("Latest deliverable".to_string()),
+                started_at: 1002,
+                ended_at: Some(1003),
+            },
+            agent_results: vec![],
+            task_statuses: vec![],
+            pending_tasks: vec![],
+            critic_feedback: None,
+        };
+
+        let history = vec![
+            TeamRunRow {
+                id: "run-2".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Latest goal".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: Some("Latest deliverable".to_string()),
+                started_at: 1002,
+                ended_at: Some(1003),
+            },
+            TeamRunRow {
+                id: "run-1".to_string(),
+                team_name: "dev-team".to_string(),
+                goal: "Older goal".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: Some("Older deliverable".to_string()),
+                started_at: 1000,
+                ended_at: Some(1001),
+            },
+        ];
+
+        let ctx = build_orchestrator_context(&def, "", None, &history, Some(&summary));
+        // Enriched summary should appear
+        assert!(ctx.contains("Previous Team Run"));
+        // Older run should appear in Older Runs section
+        assert!(ctx.contains("Older goal"));
+        // run-2 should NOT be duplicated in the Older Runs section
+        let older_section_pos = ctx.find("## Older Runs");
+        if let Some(pos) = older_section_pos {
+            let older_section = &ctx[pos..];
+            assert!(
+                !older_section.contains("Latest goal"),
+                "run-2 should be excluded from older runs since it's the enriched run"
+            );
+        }
     }
 
     #[test]
