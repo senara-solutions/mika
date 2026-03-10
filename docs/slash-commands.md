@@ -186,7 +186,7 @@ Show the current configuration summary (key settings and config file path). Does
 **Aliases:** `/cfg` | **Arguments:** None
 
 ```
-Configuration: Model: claude-sonnet-4-6 | Home: /home/sami/.mika | Session: a1b2c3d4 | Config file: /home/sami/.mika/config/local.toml
+Configuration: Model: claude-sonnet-4-6 | Home: /home/sami/.mika | Session: a1b2c3d4 | Config file: /home/sami/.mika/config.toml
 ```
 
 ---

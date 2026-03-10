@@ -57,9 +57,6 @@ RUN useradd -m -u 1000 -s /bin/false mika
 # Copy binary
 COPY --from=builder /app/target/release/mika-server /usr/local/bin/mika-server
 
-# Copy default config (loaded as optional by Settings::load)
-COPY config/default.toml /app/config/default.toml
-
 # Set up volume mount point (bootstrap creates data/ and logs/ subdirs on first run)
 ENV MIKA_HOME=/home/mika/.mika
 RUN mkdir -p /home/mika/.mika && chown mika:mika /home/mika/.mika

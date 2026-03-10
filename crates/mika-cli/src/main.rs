@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
         let team_name = team::normalize_team_name(team_name);
         team::validate_team_name(&team_name)?;
         let global_home = home::resolve_home_dir()?;
+        mika_common::dotenv::load_dotenv(&global_home);
 
         if !team::team_exists(&global_home, &team_name) {
             anyhow::bail!("Team '{team_name}' not found.");
@@ -68,9 +69,14 @@ async fn main() -> Result<()> {
         None => init::resolve_active_agent()?,
     };
 
+    // Load .env from ~/.mika/.env (secrets, does not override shell env vars)
+    let global_home = home::resolve_home_dir().ok();
+    if let Some(ref h) = global_home {
+        mika_common::dotenv::load_dotenv(h);
+    }
+
     // Resolve log directory: ~/.mika/agents/{name}/logs/
     // Uses agent-specific home so logs land in the correct agent directory.
-    let global_home = home::resolve_home_dir().ok();
     let agent_home = global_home
         .as_ref()
         .map(|h| home::resolve_agent_home(h, &agent_name));

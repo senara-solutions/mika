@@ -57,7 +57,7 @@ Build details:
 - **User:** `mika` (UID 1000), non-root
 - **Port:** 8080
 - **Healthcheck:** `wget -q --spider http://localhost:8080/health` (10s interval, 5s start period)
-- **Config:** Default config copied to `/app/config/default.toml`
+- **Config:** Serde defaults compiled-in; `~/.mika/.env` for secrets, `~/.mika/config.toml` for overrides
 - **Data dir:** `/home/mika/.mika` (persistent volume mount point)
 
 ### Pushing to Registry

@@ -136,14 +136,10 @@ impl Settings {
     /// Load settings from config files + environment variables.
     ///
     /// Config cascade (lowest to highest priority):
-    ///   1. config/default.toml  (bundled defaults)
-    ///   2. config/local.toml    (gitignored local overrides)
-    ///   3. ~/.mika/config.toml  (user home directory config)
-    ///   4. MIKA_* env vars      (highest priority)
-    ///
-    /// The `home_dir` argument is the resolved Mika home directory.
-    /// If `db_path` is not explicitly set, it defaults to `{home_dir}/data/mika.db` (container DB).
-    /// Load settings from config files + environment variables.
+    ///   1. Rust `Default` / serde defaults  (compiled-in)
+    ///   2. `~/.mika/config.toml`            (user config)
+    ///   3. `~/.mika/.env`                   (secrets, loaded by caller before this)
+    ///   4. `MIKA_*` env vars                (highest priority)
     ///
     /// Backward-compatible wrapper: uses `home_dir` as both global and agent home.
     pub fn load(home_dir: &Path) -> anyhow::Result<Self> {
@@ -153,11 +149,11 @@ impl Settings {
     /// Load settings with multi-agent config cascade.
     ///
     /// Config cascade (lowest to highest priority):
-    ///   1. config/default.toml  (bundled defaults)
-    ///   2. config/local.toml    (gitignored local overrides)
-    ///   3. `{global_home}/config.toml`  (shared settings)
-    ///   4. `{agent_home}/config.toml`   (per-agent overrides)
-    ///   5. MIKA_* env vars              (highest priority)
+    ///   1. Rust `Default` / serde defaults        (compiled-in)
+    ///   2. `{global_home}/config.toml`             (shared settings)
+    ///   3. `{agent_home}/config.toml`              (per-agent overrides)
+    ///   4. `~/.mika/.env`                          (secrets, loaded by caller)
+    ///   5. MIKA_* env vars                         (highest priority)
     ///
     /// `agent_home` is the resolved directory for the specific agent.
     /// `db_path` defaults to `{global_home}/data/mika.db` (single container DB).
@@ -165,10 +161,7 @@ impl Settings {
         let global_config = global_home.join("config.toml");
         let agent_config = agent_home.join("config.toml");
 
-        let mut builder = Config::builder()
-            .add_source(File::with_name("config/default").required(false))
-            .add_source(File::with_name("config/local").required(false))
-            .add_source(File::from(global_config).required(false));
+        let mut builder = Config::builder().add_source(File::from(global_config).required(false));
 
         // Only add agent config if it's different from global config
         if global_home != agent_home {

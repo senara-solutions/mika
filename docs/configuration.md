@@ -12,7 +12,8 @@ When Mika runs for the first time, it bootstraps the home directory at
 
 ```
 ~/.mika/
-  config.toml        # User configuration (cascade layer 3)
+  .env               # Secrets (API keys, tokens) — auto-loaded, 0600 perms
+  config.toml        # User configuration (non-secret settings)
   identity.toml      # Assistant name and emoji
   soul.md            # Personality definition (system prompt)
   heartbeat.md       # Heartbeat checklist for proactive behaviors
@@ -102,12 +103,28 @@ set at a higher layer overrides the same value from a lower layer.
 
 | Priority | Source                    | Description                                |
 |----------|---------------------------|--------------------------------------------|
-| 1 (lowest) | `config/default.toml`   | Bundled defaults, relative to working directory |
-| 2        | `config/local.toml`       | Gitignored local overrides for development |
-| 3        | `~/.mika/config.toml`    | User home directory config                 |
-| 4 (highest) | `MIKA_*` env vars      | Environment variables, highest priority    |
+| 1 (lowest) | Rust defaults           | Compiled-in serde defaults (e.g. `claude-sonnet-4-6`) |
+| 2        | TOML config files         | `~/.mika/config.toml` + optional `~/.mika/agents/X/config.toml` |
+| 3        | `~/.mika/.env`            | Secrets file (API keys, tokens) — loaded via dotenvy |
+| 4 (highest) | `MIKA_*` env vars      | Shell environment variables, always win    |
 
 All config files are optional. If a file does not exist, it is silently skipped.
+
+### Secrets in `~/.mika/.env`
+
+Store API keys and tokens in `~/.mika/.env` instead of config files or shell
+profiles. This file is auto-loaded on startup and does **not** override
+existing shell environment variables. File permissions are set to `0600`.
+
+```sh
+# ~/.mika/.env
+MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
+MIKA_OPENAI_API_KEY=sk-...
+MIKA_BRAVE_API_KEY=BSA...
+```
+
+Run `mika setup` to interactively configure your API key — it writes directly
+to `~/.mika/.env`.
 
 ### Example: Override model in home config
 
@@ -124,7 +141,7 @@ log_level = "debug"
 export MIKA_CLAUDE_MODEL=claude-haiku-4-5
 ```
 
-The environment variable takes precedence over all config files.
+The environment variable takes precedence over all config files and `.env`.
 
 ---
 
@@ -168,7 +185,7 @@ defaults to `~/.mika/`.
   tokens. Mika detects the type from the `sk-ant-oat` prefix and adjusts the
   HTTP auth scheme automatically (Bearer + `anthropic-beta` header for OAuth,
   `x-api-key` header for standard keys).
-- Secrets should be set via environment variables, never committed to config files.
+- Secrets should be set in `~/.mika/.env` or via shell environment variables, never committed to config files.
 - `internal_token` is validated on load: if present, it must be exactly 64
   hex characters. Invalid values cause an immediate startup error.
 
@@ -394,13 +411,6 @@ claude_model = "claude-opus-4-6"
 
 ```sh
 export MIKA_CLAUDE_MODEL=claude-opus-4-6
-```
-
-**Via bundled config** (`config/default.toml`):
-
-```toml
-claude_model = "claude-opus-4-6"
-claude_max_tokens = 4096
 ```
 
 The environment variable always wins if set, regardless of config file values.
