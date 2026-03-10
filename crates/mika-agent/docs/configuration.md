@@ -123,8 +123,10 @@ MIKA_OPENAI_API_KEY=sk-...
 MIKA_BRAVE_API_KEY=BSA...
 ```
 
-Run `mika setup` to interactively configure your API key — it writes directly
-to `~/.mika/.env`.
+Run `mika setup` to interactively configure secrets (API keys, tokens) and
+preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
+`~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
+server mode.
 
 ### Example: Override model in home config
 
@@ -358,7 +360,8 @@ are required for inter-service communication:
 
 ### Token Generation
 
-Use `openssl` to generate compliant 64-character hex tokens for `MIKA_INTERNAL_TOKEN`:
+`mika setup` automatically generates a compliant `MIKA_INTERNAL_TOKEN` and saves
+it to `~/.mika/.env`. To generate a token manually:
 
 ```sh
 openssl rand -hex 32

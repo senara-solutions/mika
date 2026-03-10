@@ -67,16 +67,11 @@ docker tag mika-agent:dev registry.example.com/mika-agent:v0.1.0
 docker push registry.example.com/mika-agent:v0.1.0
 ```
 
-### Dependency Caching
+### BuildKit Cache Mounts
 
-The Dockerfile uses a dependency caching strategy:
+Both Dockerfiles use BuildKit `--mount=type=cache` for the cargo registry and `target/` directory, providing incremental compilation across builds without dummy-source layers. The final binary is copied out of the cache mount to the runtime stage.
 
-1. Copy only `Cargo.toml`, `Cargo.lock`, and crate manifests.
-2. Create dummy source files and build dependencies.
-3. Remove workspace crate artifacts but keep dependency cache.
-4. Copy real source code and rebuild (only workspace crates recompile).
-
-Rebuilds after source changes are fast because dependency compilation is cached in the Docker layer.
+Requires Docker BuildKit (enabled by default in Docker 23+). Rebuilds after source changes are fast because compiled dependencies persist in the named cache volumes.
 
 ---
 
@@ -94,7 +89,7 @@ Build details:
 - **Port:** 8080
 - **Healthcheck:** `wget -q --spider http://localhost:8080/readyz` (10s interval, 10s start period)
 
-The gateway image is leaner than the agent image — no GitHub CLI, no file/jq utilities, no home directory. It uses the same dependency caching strategy as the agent image.
+The gateway image is leaner than the agent image — no GitHub CLI, no file/jq utilities, no home directory. It uses the same BuildKit cache mount strategy as the agent image.
 
 ---
 
@@ -135,6 +130,33 @@ curl -fsSL https://raw.githubusercontent.com/senara-solutions/mika/main/install.
 ```
 
 The script detects platform/architecture, downloads from GitHub Releases, verifies SHA256 checksum, and installs to `~/.local/bin/mika`.
+
+---
+
+## 3d. Docker Compose (Local Development)
+
+A `docker-compose.yml` is provided for local multi-service development:
+
+```bash
+# Generate a .env file with all required secrets
+mika setup --mode compose
+
+# Start agent + gateway (uses .env in current directory)
+docker compose up
+
+# Include a local Postgres instance
+docker compose --profile db up
+```
+
+**Services:**
+
+| Service | Image | Port | Notes |
+|---------|-------|------|-------|
+| `agent` | `Dockerfile.agent` | 8081→8080 | Persistent volume at `/home/mika/.mika` |
+| `gateway` | `Dockerfile.gateway` | 8080→8080 | Reads `.env` from CWD |
+| `postgres` | `postgres:17-alpine` | 5433→5432 | Only with `--profile db` |
+
+The `mika setup --mode compose` command generates a `.env` file in the current directory with all required variables (API keys, tokens, database URL, Telegram config). It prompts interactively for secrets and auto-generates the internal token.
 
 ---
 

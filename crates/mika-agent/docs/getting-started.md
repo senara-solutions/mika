@@ -106,13 +106,18 @@ re-run `claude setup-token` to get a fresh token.
 
 ### Persisting your credential
 
-Do NOT put your credential in `config.toml` -- it must be set as an environment variable.
-Add it to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so it persists:
+The recommended way is to run `mika setup`, which writes secrets to `~/.mika/.env`
+with echo suppression and 0600 file permissions.
+
+Alternatively, set it as an environment variable in your shell profile
+(`~/.bashrc`, `~/.zshrc`, etc.):
 
 ```sh
 echo 'export MIKA_ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
 ```
+
+Do NOT put credentials in `config.toml` -- use `~/.mika/.env` or shell environment variables.
 
 ### Verifying
 
@@ -134,11 +139,30 @@ mika
 ```
 
 On the first run, Mika detects that it has not been initialized and automatically
-runs setup. This creates the `~/.mika/` directory with all default files:
+runs setup. This creates the `~/.mika/` directory with all default files and
+launches a guided wizard to configure secrets and preferences:
 
 ```
-Mika initialized at /home/youruser/.mika
+  Mika Setup
+
+  Anthropic API key: ••••••••••••
+  Brave Search API key (optional, press Enter to skip):
+  Enable telemetry? [y/N]: n
+  Generated internal token for server mode.
+
+  Secrets saved to ~/.mika/.env
+  ✦ Mika initialized at ~/.mika/agents/main/
 ```
+
+The wizard prompts for:
+1. **Anthropic API key** (masked input)
+2. **Brave Search API key** (optional, masked)
+3. **Telemetry configuration** (OTLP endpoint and auth header if enabled)
+4. **Internal token** (auto-generated 64-char hex token for server mode)
+
+Each prompt is skipped if the value is already set (via environment variable or
+`~/.mika/.env`). Secrets are written to `~/.mika/.env` (0600 permissions);
+non-secret config goes to `~/.mika/config.toml`.
 
 After setup completes, the interactive chat TUI opens immediately.
 
@@ -148,8 +172,20 @@ If you prefer to run setup explicitly without starting a chat session:
 mika setup
 ```
 
-Running `mika setup` again after initialization is safe -- it prints a message
-and exits without modifying anything.
+Running `mika setup` again after initialization is safe -- it re-checks
+configuration and only prompts for missing values.
+
+**Setup modes:** The `--mode` flag selects different setup profiles:
+
+| Mode | Command | Purpose |
+|------|---------|---------|
+| `cli` (default) | `mika setup` | Configure API keys, telemetry, internal token |
+| `server` | `mika setup --mode server` | CLI config + routing URL, dashboard token |
+| `compose` | `mika setup --mode compose` | Generate a `.env` for docker-compose in CWD |
+
+**Non-interactive setup:** If stdin is not a terminal, `mika setup` requires all
+secrets to be pre-set via environment variables. Pre-set all `MIKA_*` vars before
+running to skip all prompts.
 
 You can override the home directory by setting `MIKA_HOME`:
 

@@ -175,6 +175,14 @@ mika setup
 Running `mika setup` again after initialization is safe -- it re-checks
 configuration and only prompts for missing values.
 
+**Setup modes:** The `--mode` flag selects different setup profiles:
+
+| Mode | Command | Purpose |
+|------|---------|---------|
+| `cli` (default) | `mika setup` | Configure API keys, telemetry, internal token |
+| `server` | `mika setup --mode server` | CLI config + routing URL, dashboard token |
+| `compose` | `mika setup --mode compose` | Generate a `.env` for docker-compose in CWD |
+
 **Non-interactive setup:** If stdin is not a terminal, `mika setup` requires all
 secrets to be pre-set via environment variables. Pre-set all `MIKA_*` vars before
 running to skip all prompts.
