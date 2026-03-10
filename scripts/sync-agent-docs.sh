@@ -13,6 +13,7 @@ DOCS=(
     configuration.md
     deployment.md
     getting-started.md
+    runtime-structure.md
     skills.md
     slash-commands.md
 )

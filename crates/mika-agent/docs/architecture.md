@@ -752,6 +752,15 @@ Teams are defined in `~/.mika/teams/{name}/team.toml` and orchestrated by the
 database (`~/.mika/data/mika.db`) with graph-structured messages linked via
 `parent_id`. Queryable via `get_team_status` and `get_team_history` tools.
 
+#### Conversation Continuity
+
+At team run start, the engine queries the most recent completed/failed/suspended run
+for the same team via `get_last_completed_team_run_summary()` and injects a structured
+summary into the orchestrator's system prompt. The summary includes the previous goal,
+agent result previews (200 chars each, top 5 agents), deliverable (500 chars), critic
+feedback, task statuses, and any pending tasks. Total budget: 2500 chars. First runs
+skip injection. The summary is available via `GET /api/v1/team-runs/:run_id/summary`.
+
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
 
