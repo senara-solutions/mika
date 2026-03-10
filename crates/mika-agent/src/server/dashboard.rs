@@ -404,6 +404,22 @@ pub async fn handle_team_workspace(
     }
 }
 
+/// GET /api/v1/team-runs/:run_id/summary — enriched team run summary.
+pub async fn handle_team_run_summary(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_team_run_summary(&run_id).await {
+        Ok(Some(summary)) => Json(summary).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("team run '{}' not found", run_id)})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

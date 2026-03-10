@@ -266,6 +266,34 @@ pub struct TeamWorkspaceEntry {
     pub created_at: i64,
 }
 
+// ===== Team Run Summary Types =====
+
+/// Summary of an agent's response from a previous team run.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentResultSummary {
+    pub agent_name: String,
+    pub response_preview: String,
+}
+
+/// Summary of a task's status from a previous team run.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskStatusSummary {
+    pub agent_id: String,
+    pub label: String,
+    pub status: String,
+    pub task_id: String,
+}
+
+/// Enriched summary of a previous team run for context injection.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamRunSummary {
+    pub run: TeamRunRow,
+    pub agent_results: Vec<AgentResultSummary>,
+    pub task_statuses: Vec<TaskStatusSummary>,
+    pub pending_tasks: Vec<TaskStatusSummary>,
+    pub critic_feedback: Option<String>,
+}
+
 // ===== Skill Override Types =====
 
 /// A user override for a skill property (persists across bundled skill re-sync).
@@ -2823,6 +2851,124 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Load the most recent team run that is not running or cancelled.
+    /// Returns completed, failed, or suspended runs only.
+    pub fn get_last_completed_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        self.conn
+            .query_row(
+                "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
+                         r.max_iterations, r.deliverable, r.started_at, r.ended_at
+                  FROM team_runs r JOIN teams t ON r.team_id = t.id
+                  WHERE t.name = ?1 COLLATE NOCASE
+                    AND r.status IN ('completed', 'failed', 'suspended')
+                  ORDER BY r.started_at DESC LIMIT 1",
+                params![team_name],
+                Self::row_to_team_run,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Build an enriched summary of a team run for context injection.
+    /// Queries team_workspace (assignments, critic), messages (agent responses),
+    /// and tasks (statuses) for the given run.
+    pub fn get_team_run_summary(&self, run_id: &str) -> Result<Option<TeamRunSummary>> {
+        let run = match self.load_team_run_by_id(run_id)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Get agent names from assignment entries
+        let agent_names: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT agent_name FROM team_workspace
+                 WHERE run_id = ?1 AND entry_type = 'assignment' AND agent_name IS NOT NULL",
+            )?;
+            stmt.query_map(params![run_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+
+        // Get the last assistant message for each agent (via team session IDs)
+        let mut agent_results = Vec::new();
+        for agent_name in &agent_names {
+            let session_id = format!("team-{}-{}", run_id, agent_name);
+            let response: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT content FROM messages
+                     WHERE session_id = ?1 AND role = 'assistant'
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![session_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(content) = response {
+                let preview = truncate_chars(&content, 200);
+                agent_results.push(AgentResultSummary {
+                    agent_name: agent_name.clone(),
+                    response_preview: preview,
+                });
+            }
+        }
+
+        // Cap at 5 agents to keep context concise
+        agent_results.truncate(5);
+
+        // Get task statuses
+        let all_tasks: Vec<TaskStatusSummary> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT agent_id, label, status, id FROM tasks
+                 WHERE team_run_id = ?1",
+            )?;
+            stmt.query_map(params![run_id], |r| {
+                Ok(TaskStatusSummary {
+                    agent_id: r.get(0)?,
+                    label: r.get(1)?,
+                    status: r.get(2)?,
+                    task_id: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+
+        let (pending_tasks, task_statuses): (Vec<_>, Vec<_>) = all_tasks
+            .into_iter()
+            .partition(|t| t.status == "pending" || t.status == "in_progress");
+
+        // Get critic feedback (final iteration only)
+        let critic_feedback: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT content FROM team_workspace
+                 WHERE run_id = ?1 AND entry_type = 'critic'
+                 ORDER BY iteration DESC, created_at DESC LIMIT 1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .map(|c: String| truncate_chars(&c, 200));
+
+        Ok(Some(TeamRunSummary {
+            run,
+            agent_results,
+            task_statuses,
+            pending_tasks,
+            critic_feedback,
+        }))
+    }
+
+    /// Convenience method: get the enriched summary for the most recent
+    /// completed/failed/suspended run for a team. Returns None if no such run exists.
+    pub fn get_last_completed_team_run_summary(
+        &self,
+        team_name: &str,
+    ) -> Result<Option<TeamRunSummary>> {
+        match self.get_last_completed_team_run(team_name)? {
+            Some(prev) => self.get_team_run_summary(&prev.id),
+            None => Ok(None),
+        }
+    }
+
     // ===== Team Workspace =====
 
     #[allow(clippy::too_many_arguments)]
@@ -3552,6 +3698,16 @@ pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
         .earliest()
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now)
+}
+
+/// Truncate a string to `max_chars` characters, appending "..." if truncated.
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
 }
 
 // ===== Tests =====
@@ -4855,5 +5011,113 @@ mod tests {
     fn test_schema_version_is_7() {
         let db = db();
         assert_eq!(db.schema_version().unwrap(), 7);
+    }
+
+    #[test]
+    fn test_get_last_completed_team_run_no_runs() {
+        let db = db();
+        let result = db.get_last_completed_team_run("nonexistent-team").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_last_completed_team_run_filters_running() {
+        let db = db();
+        let run_id = "run-filter-1";
+        db.insert_team_run(run_id, "filter-team", "test goal", 3, 1000)
+            .unwrap();
+
+        // Run is in "running" status — should not be returned
+        let result = db.get_last_completed_team_run("filter-team").unwrap();
+        assert!(result.is_none());
+
+        // Complete the run
+        db.update_team_run(
+            run_id,
+            "completed",
+            None,
+            2,
+            Some("deliverable"),
+            Some(1001),
+        )
+        .unwrap();
+
+        let result = db.get_last_completed_team_run("filter-team").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, run_id);
+    }
+
+    #[test]
+    fn test_get_team_run_summary_basic() {
+        let db = db();
+        let run_id = "run-summary-1";
+        db.insert_team_run(run_id, "summary-team", "test goal for summary", 3, 1000)
+            .unwrap();
+        db.update_team_run(
+            run_id,
+            "completed",
+            None,
+            1,
+            Some("final output"),
+            Some(1001),
+        )
+        .unwrap();
+
+        let summary = db.get_team_run_summary(run_id).unwrap().unwrap();
+        assert_eq!(summary.run.id, run_id);
+        assert_eq!(summary.run.goal, "test goal for summary");
+        assert_eq!(summary.run.deliverable.as_deref(), Some("final output"));
+        assert!(summary.agent_results.is_empty());
+        assert!(summary.task_statuses.is_empty());
+        assert!(summary.pending_tasks.is_empty());
+        assert!(summary.critic_feedback.is_none());
+    }
+
+    #[test]
+    fn test_get_team_run_summary_with_critic() {
+        let db = db();
+        let run_id = "run-critic-1";
+        db.insert_team_run(run_id, "critic-team", "critic test", 3, 1000)
+            .unwrap();
+
+        // Add critic feedback
+        db.insert_team_workspace_entry(
+            run_id,
+            None,
+            Some("critic"),
+            "critic",
+            "Needs improvement in error handling",
+            1,
+            None,
+        )
+        .unwrap();
+
+        let summary = db.get_team_run_summary(run_id).unwrap().unwrap();
+        assert_eq!(
+            summary.critic_feedback.as_deref(),
+            Some("Needs improvement in error handling")
+        );
+    }
+
+    #[test]
+    fn test_get_team_run_summary_not_found() {
+        let db = db();
+        let result = db.get_team_run_summary("nonexistent-run-id").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_truncate_chars_short() {
+        assert_eq!(super::truncate_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_chars_exact() {
+        assert_eq!(super::truncate_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_chars_long() {
+        assert_eq!(super::truncate_chars("hello world", 5), "hello...");
     }
 }

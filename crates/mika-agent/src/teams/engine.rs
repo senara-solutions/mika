@@ -493,11 +493,32 @@ impl TeamEngine {
             .await
             .unwrap_or_default();
 
+        // Load enriched summary for the most recent previous run
+        let previous_run_summary = self
+            .team_db
+            .get_last_completed_team_run_summary(&self.run.team_name)
+            .await
+            .unwrap_or_else(|e| {
+                debug!("Failed to load previous team run summary: {e}");
+                None
+            });
+        if let Some(ref summary) = previous_run_summary {
+            info!(
+                previous_run_id = %summary.run.id,
+                previous_run_status = %summary.run.status,
+                agent_results_count = summary.agent_results.len(),
+                "Injecting previous team run context"
+            );
+        }
+
         // Step 1: Decompose -- orchestrator produces task assignments
         self.run.iteration = 1;
         self.transition_phase(TeamPhase::Decompose);
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
-        match self.decompose(None, &history).await? {
+        match self
+            .decompose(None, &history, previous_run_summary.as_ref())
+            .await?
+        {
             DecomposeResult::Tasks(tasks) => {
                 self.run.tasks = tasks;
             }
@@ -546,7 +567,10 @@ impl TeamEngine {
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
             )));
-            match self.decompose(Some(&feedback), &history).await? {
+            match self
+                .decompose(Some(&feedback), &history, previous_run_summary.as_ref())
+                .await?
+            {
                 DecomposeResult::Tasks(tasks) => {
                     self.run.tasks = tasks;
                 }
@@ -578,9 +602,16 @@ impl TeamEngine {
         &self,
         feedback: Option<&str>,
         history: &[crate::db::TeamRunRow],
+        previous_run: Option<&crate::db::TeamRunSummary>,
     ) -> Result<DecomposeResult> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
-        let context = prompt::build_orchestrator_context(&self.team, &listing, feedback, history);
+        let context = prompt::build_orchestrator_context(
+            &self.team,
+            &listing,
+            feedback,
+            history,
+            previous_run,
+        );
 
         let orchestrator_name = &self.team.team.orchestrator;
 

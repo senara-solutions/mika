@@ -10,7 +10,8 @@ use tokio::sync::oneshot;
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
     NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats,
-    SkillOverride, Task, TeamRow, TeamRunRow, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    SkillOverride, Task, TeamRow, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters,
+    TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -1030,6 +1031,26 @@ impl AsyncDatabase {
     pub async fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
         let ri = run_id.to_owned();
         self.with_db(move |db| db.load_team_run_by_id(&ri)).await
+    }
+
+    pub async fn get_last_completed_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.get_last_completed_team_run(&tn))
+            .await
+    }
+
+    pub async fn get_team_run_summary(&self, run_id: &str) -> Result<Option<TeamRunSummary>> {
+        let ri = run_id.to_owned();
+        self.with_db(move |db| db.get_team_run_summary(&ri)).await
+    }
+
+    pub async fn get_last_completed_team_run_summary(
+        &self,
+        team_name: &str,
+    ) -> Result<Option<TeamRunSummary>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.get_last_completed_team_run_summary(&tn))
+            .await
     }
 
     // -- Team Workspace --
