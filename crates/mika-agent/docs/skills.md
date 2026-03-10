@@ -76,7 +76,7 @@ The `type` field uses `#[serde(tag = "type")]` deserialization, so it must appea
 
 | Field          | Type | Required | Default | Description                                      |
 |----------------|------|----------|---------|--------------------------------------------------|
-| `always_on`    | bool | No       | `false` | If true, this skill is active on every turn regardless of keywords. |
+| `always_on`    | bool | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
 | `timeout_secs` | u64  | No       | `30`    | Per-tool execution timeout in seconds (applies to exec and http handlers). |
 
 If the `[options]` section is omitted, both fields take their defaults.
@@ -344,7 +344,7 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 | file-reader    | Yes       | read, file, open, show, cat, view, look at, display, print, content, what does, what's in         | `read_file`  | Yes            |
 | shell-exec     | No        | run command, execute, shell, terminal, bash                                                       | `shell_exec` | Yes            |
 | tmux           | No        | tmux, terminal, session, pane, window                                                             | `tmux`       | Yes            |
-| web-search     | No        | search, look up, find out, google, browse, web                                                    | `web_search` | Yes            |
+| web-search     | Yes       | search, look up, find out, google, browse, web                                                    | `web_search` | Yes            |
 | github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status | `run_gh`     | Yes            |
 
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
@@ -362,7 +362,7 @@ All bundled exec-handler scripts require `jq` for JSON input parsing and will fa
 | mcp             | mcp, model context protocol, mcp server, mcp tool              | Yes            |
 | agents-teams    | delegate, delegate task, run team, list agents, list teams, team workflow, team status, team history, multi-agent | Yes |
 
-These skills provide only system prompt guidance — they have no tools of their own. The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands. The **agents-teams** skill provides behavioral guidance for using the 6 management tools (`delegate_task`, `run_team`, `list_agents`, `list_teams`, `get_team_status`, `get_team_history`) — when to delegate vs run a team, delegate limitations, and timeout expectations.
+These skills provide only system prompt guidance — they have no tools of their own. The **self-knowledge** skill (`always_on = true`) instructs the agent to use `get_documentation` before answering questions about its systems (architecture, CLI, API, skills, etc.) and to check its home directory files (`list_home_files`, `read_home_file`) before answering questions about its own configuration or internals (soul.md, identity.toml, mcp.json, installed skills). The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands. The **agents-teams** skill provides behavioral guidance for using the 6 management tools (`delegate_task`, `run_team`, `list_agents`, `list_teams`, `get_team_status`, `get_team_history`) — when to delegate vs run a team, delegate limitations, and timeout expectations.
 
 ---
 
@@ -600,14 +600,15 @@ Bundled skills are re-synced from compiled-in templates on every startup, ensuri
 
 ### Example: Disable always-on for reminders
 
-Edit `~/.mika/skills/reminders/skill.toml` and change:
+For built-in skills, use the `update_skill` tool (which persists the override in the database, surviving restarts):
 
-```toml
-[options]
-always_on = false
+```
+update_skill(name: "reminders", always_on: false)
 ```
 
-Restart Mika for the manifest change to take effect. The reminders tools will then only be available when the user's message contains one of the trigger keywords (remind, reminder, schedule, alarm, alert).
+The override is stored in the `skill_overrides` table and applied automatically on startup. Setting `always_on` back to the bundled default (`true` for reminders) removes the override row. The `list_skills` tool shows an `[override]` badge when the effective value differs from the bundled default.
+
+> **Note:** Directly editing `skill.toml` for built-in skills will not persist — `seed_bundled_skills()` overwrites it on every startup.
 
 ### Example: Add keywords to a skill
 
@@ -661,6 +662,27 @@ To reset a built-in skill to its shipped defaults, delete the skill directory an
 ```bash
 rm -rf ~/.mika/skills/memory
 # Restart Mika -- bootstrap recreates the memory skill from templates
+```
+
+### Persistent overrides for built-in skills (v7+)
+
+Built-in skill `always_on` preferences are stored in the SQLite `skill_overrides` table (schema v7). This table survives `seed_bundled_skills()` re-sync cycles, which overwrite `skill.toml` on every startup.
+
+**How it works:**
+
+1. `update_skill` detects whether a skill is built-in or custom/marketplace
+2. For built-in skills, `always_on` changes are written to the DB via `set_skill_override()`
+3. For custom/marketplace skills, `always_on` is written to `skill.toml` as before
+4. After `scan_skills_dir()` loads manifests from disk, `SkillRegistry::apply_overrides()` applies DB overrides
+5. Setting `always_on` back to the bundled default automatically deletes the override row (prevents stale overrides from blocking future bundled default changes)
+6. `delete_skill` and `mika skills uninstall` clean up override rows
+
+**Viewing overrides:**
+
+The `list_skills` tool shows an `[override]` badge when the effective `always_on` value differs from the bundled default:
+
+```
+- web-search (enabled) [built-in] — Search the web [always-on] [override]
 ```
 
 ---

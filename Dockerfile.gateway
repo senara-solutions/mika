@@ -5,29 +5,22 @@ FROM rust:1.93-slim AS builder
 
 WORKDIR /app
 
-# 1. Copy workspace manifests and lockfile (dependency cache layer)
+# Copy workspace manifests, lockfile, and source code
 COPY Cargo.toml Cargo.lock ./
-COPY crates/mika-common/Cargo.toml crates/mika-common/Cargo.toml
-COPY crates/mika-gateway/Cargo.toml crates/mika-gateway/Cargo.toml
-
-# 2. Create dummy source files to compile dependencies
-RUN mkdir -p crates/mika-common/src && echo "pub fn _dummy() {}" > crates/mika-common/src/lib.rs \
-    && mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
-    && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
-
-# 3. Build dependencies only, then clean workspace crate artifacts (keep dependency cache)
-RUN cargo build --release --bin mika-gateway -p mika-gateway || true \
-    && rm -rf crates/ \
-    && rm -f target/release/mika-gateway \
-    && rm -rf target/release/.fingerprint/mika-* \
-    && rm -rf target/release/deps/libmika_* target/release/deps/mika_*
-
-# 4. Copy real source code
 COPY crates/mika-common/ crates/mika-common/
 COPY crates/mika-gateway/ crates/mika-gateway/
 
-# 5. Build the actual binary (dependencies are cached, only workspace crates rebuild)
-RUN cargo build --release --bin mika-gateway -p mika-gateway
+# Dummy stubs for workspace members not being built
+COPY crates/mika-agent/Cargo.toml crates/mika-agent/Cargo.toml
+RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-server.rs \
+    && echo "" > crates/mika-agent/src/lib.rs \
+    && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs
+
+# Build with BuildKit cache mounts for incremental compilation
+RUN --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --bin mika-gateway -p mika-gateway \
+    && cp target/release/mika-gateway /usr/local/bin/mika-gateway
 
 # === Runtime stage ===
 FROM debian:bookworm-slim
@@ -39,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN useradd -u 1000 -s /bin/false mika
 
 # Copy binary
-COPY --from=builder /app/target/release/mika-gateway /usr/local/bin/mika-gateway
+COPY --from=builder /usr/local/bin/mika-gateway /usr/local/bin/mika-gateway
 
 USER mika
 EXPOSE 8080

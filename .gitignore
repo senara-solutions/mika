@@ -17,9 +17,6 @@
 .DS_Store
 Thumbs.db
 
-# Local config
-config/local.*
-
 # Data
 data/
 *.db

@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     let home_dir = mika_common::home::resolve_home_dir()?;
+    mika_common::dotenv::load_dotenv(&home_dir);
 
     if !mika_common::home::is_initialized(&home_dir) {
         mika_common::home::bootstrap_fresh_install(&home_dir)?;

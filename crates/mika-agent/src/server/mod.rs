@@ -294,10 +294,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let http_client = reqwest::Client::new();
 
     // Validate required settings for server mode
-    let gateway_url = settings
-        .routing_url
-        .clone()
-        .ok_or_else(|| anyhow!("MIKA_ROUTING_URL is required in server mode"))?;
+    let gateway_url = settings.routing_url.clone().ok_or_else(|| {
+        anyhow!(
+            "MIKA_ROUTING_URL is required in server mode. \
+             Run `mika setup --mode server` to configure, or set the env var directly."
+        )
+    })?;
 
     // Validate gateway URL is well-formed and uses http(s) scheme
     let parsed_url = reqwest::Url::parse(&gateway_url)
@@ -306,10 +308,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         return Err(anyhow!("MIKA_ROUTING_URL must use http or https scheme"));
     }
 
-    let internal_token = settings
-        .internal_token
-        .clone()
-        .ok_or_else(|| anyhow!("MIKA_INTERNAL_TOKEN is required in server mode"))?;
+    let internal_token = settings.internal_token.clone().ok_or_else(|| {
+        anyhow!(
+            "MIKA_INTERNAL_TOKEN is required in server mode. \
+             Run `mika setup --mode server` to configure, or set the env var directly."
+        )
+    })?;
 
     let dashboard_token = settings.dashboard_token.clone();
     if dashboard_token.is_some() {

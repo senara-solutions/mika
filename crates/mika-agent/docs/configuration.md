@@ -12,7 +12,8 @@ When Mika runs for the first time, it bootstraps the home directory at
 
 ```
 ~/.mika/
-  config.toml        # User configuration (cascade layer 3)
+  .env               # Secrets (API keys, tokens) — auto-loaded, 0600 perms
+  config.toml        # User configuration (non-secret settings)
   identity.toml      # Assistant name and emoji
   soul.md            # Personality definition (system prompt)
   heartbeat.md       # Heartbeat checklist for proactive behaviors
@@ -102,12 +103,30 @@ set at a higher layer overrides the same value from a lower layer.
 
 | Priority | Source                    | Description                                |
 |----------|---------------------------|--------------------------------------------|
-| 1 (lowest) | `config/default.toml`   | Bundled defaults, relative to working directory |
-| 2        | `config/local.toml`       | Gitignored local overrides for development |
-| 3        | `~/.mika/config.toml`    | User home directory config                 |
-| 4 (highest) | `MIKA_*` env vars      | Environment variables, highest priority    |
+| 1 (lowest) | Rust defaults           | Compiled-in serde defaults (e.g. `claude-sonnet-4-6`) |
+| 2        | TOML config files         | `~/.mika/config.toml` + optional `~/.mika/agents/X/config.toml` |
+| 3        | `~/.mika/.env`            | Secrets file (API keys, tokens) — loaded via dotenvy |
+| 4 (highest) | `MIKA_*` env vars      | Shell environment variables, always win    |
 
 All config files are optional. If a file does not exist, it is silently skipped.
+
+### Secrets in `~/.mika/.env`
+
+Store API keys and tokens in `~/.mika/.env` instead of config files or shell
+profiles. This file is auto-loaded on startup and does **not** override
+existing shell environment variables. File permissions are set to `0600`.
+
+```sh
+# ~/.mika/.env
+MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
+MIKA_OPENAI_API_KEY=sk-...
+MIKA_BRAVE_API_KEY=BSA...
+```
+
+Run `mika setup` to interactively configure secrets (API keys, tokens) and
+preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
+`~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
+server mode.
 
 ### Example: Override model in home config
 
@@ -124,7 +143,7 @@ log_level = "debug"
 export MIKA_CLAUDE_MODEL=claude-haiku-4-5
 ```
 
-The environment variable takes precedence over all config files.
+The environment variable takes precedence over all config files and `.env`.
 
 ---
 
@@ -146,7 +165,8 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
-| `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. |
+| `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
+| `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
 | `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
@@ -159,7 +179,7 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key`, `internal_token`, `brave_api_key`, and `otlp_auth_header` are redacted in
+- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, and `otlp_auth_header` are redacted in
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
@@ -167,7 +187,7 @@ defaults to `~/.mika/`.
   tokens. Mika detects the type from the `sk-ant-oat` prefix and adjusts the
   HTTP auth scheme automatically (Bearer + `anthropic-beta` header for OAuth,
   `x-api-key` header for standard keys).
-- Secrets should be set via environment variables, never committed to config files.
+- Secrets should be set in `~/.mika/.env` or via shell environment variables, never committed to config files.
 - `internal_token` is validated on load: if present, it must be exactly 64
   hex characters. Invalid values cause an immediate startup error.
 
@@ -335,10 +355,13 @@ are required for inter-service communication:
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
+| `MIKA_CORS_ORIGIN` | No | Allowed origin for dashboard CORS (default: `http://localhost:5173`) |
+| `MIKA_DASHBOARD_TOKEN` | No | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN`. |
 
 ### Token Generation
 
-Use `openssl` to generate compliant 64-character hex tokens for `MIKA_INTERNAL_TOKEN`:
+`mika setup` automatically generates a compliant `MIKA_INTERNAL_TOKEN` and saves
+it to `~/.mika/.env`. To generate a token manually:
 
 ```sh
 openssl rand -hex 32
@@ -391,13 +414,6 @@ claude_model = "claude-opus-4-6"
 
 ```sh
 export MIKA_CLAUDE_MODEL=claude-opus-4-6
-```
-
-**Via bundled config** (`config/default.toml`):
-
-```toml
-claude_model = "claude-opus-4-6"
-claude_max_tokens = 4096
 ```
 
 The environment variable always wins if set, regardless of config file values.

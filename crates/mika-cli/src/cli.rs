@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "mika", version, about = "Mika — AI Executive Assistant")]
@@ -20,7 +20,14 @@ pub enum Commands {
     /// Open interactive chat (default)
     Chat,
     /// First-run bootstrap
-    Setup,
+    Setup {
+        /// Setup mode: cli (default), server, or compose
+        #[arg(long, value_enum, default_value = "cli")]
+        mode: SetupMode,
+        /// Anthropic API key (non-interactive, for CI/automation)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
     /// Inspect stored memory
     Memory(MemoryArgs),
     /// List or cancel reminders
@@ -48,6 +55,16 @@ pub enum Commands {
     Mcp(McpArgs),
     /// List or cancel pending tasks
     Tasks(TaskArgs),
+}
+
+#[derive(Clone, ValueEnum)]
+pub enum SetupMode {
+    /// CLI mode (default): configure API keys, telemetry, internal token
+    Cli,
+    /// Server mode: CLI config + routing URL, dashboard token, server port
+    Server,
+    /// Compose mode: generate a .env file for docker-compose in the current directory
+    Compose,
 }
 
 #[derive(clap::Args)]

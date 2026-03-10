@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
         let team_name = team::normalize_team_name(team_name);
         team::validate_team_name(&team_name)?;
         let global_home = home::resolve_home_dir()?;
+        mika_common::dotenv::load_dotenv(&global_home);
 
         if !team::team_exists(&global_home, &team_name) {
             anyhow::bail!("Team '{team_name}' not found.");
@@ -68,9 +69,14 @@ async fn main() -> Result<()> {
         None => init::resolve_active_agent()?,
     };
 
+    // Load .env from ~/.mika/.env (secrets, does not override shell env vars)
+    let global_home = home::resolve_home_dir().ok();
+    if let Some(ref h) = global_home {
+        mika_common::dotenv::load_dotenv(h);
+    }
+
     // Resolve log directory: ~/.mika/agents/{name}/logs/
     // Uses agent-specific home so logs land in the correct agent directory.
-    let global_home = home::resolve_home_dir().ok();
     let agent_home = global_home
         .as_ref()
         .map(|h| home::resolve_agent_home(h, &agent_name));
@@ -125,12 +131,14 @@ async fn main() -> Result<()> {
         None => {
             let home_dir = home::resolve_home_dir()?;
             if !home::is_initialized(&home_dir) {
-                commands::setup::run(&agent_name).await?;
+                commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
             commands::chat::run(&agent_name).await
         }
         Some(Commands::Chat) => commands::chat::run(&agent_name).await,
-        Some(Commands::Setup) => commands::setup::run(&agent_name).await,
+        Some(Commands::Setup { mode, api_key }) => {
+            commands::setup::run(&agent_name, mode, api_key.as_deref()).await
+        }
         Some(Commands::Memory(args)) => commands::memory::run(args, &agent_name).await,
         Some(Commands::Reminders(args)) => commands::reminders::run(args, &agent_name).await,
         Some(Commands::Status) => commands::status::run(&agent_name).await,
@@ -337,5 +345,12 @@ mod tests {
             markdown.contains("--team"),
             "clap-markdown output missing --team flag"
         );
+    }
+
+    /// `mika setup --api-key <key>` should parse successfully.
+    #[test]
+    fn test_setup_accepts_api_key_flag() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "setup", "--api-key", "sk-test"]);
+        assert!(cli.is_ok());
     }
 }

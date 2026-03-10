@@ -16,19 +16,18 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **HTTP client:** reqwest 0.12 with rustls-tls (Claude API client with typed errors and retry)
 - **Async runtime:** tokio
 - **MCP client:** rmcp 0.17 (official Rust MCP SDK) — stdio and Streamable HTTP transports
-- **Config:** config-rs with `MIKA_` env prefix
+- **Config:** config-rs with `MIKA_` env prefix + dotenvy for `~/.mika/.env` secrets
 - **Logging:** tracing + tracing-subscriber (JSON for prod, pretty for dev) + optional OpenTelemetry export via `telemetry` feature flag
 - **Telemetry:** opentelemetry 0.31 + tracing-opentelemetry 0.32, feature-gated OTLP HTTP export (Langfuse-compatible)
 - **Dashboard:** React 19 + TypeScript + Vite + Tailwind CSS v4 + TanStack React Query — observability dashboard SPA served separately, proxied to mika-server API
 
 ## Directory Structure
 
-- `crates/mika-common/` — Shared library: config, Claude API client, logging, telemetry (feature-gated OTel export), home directory
+- `crates/mika-common/` — Shared library: config, dotenv (`~/.mika/.env` load/read/write via dotenvy), Claude API client, logging, telemetry (feature-gated OTel export), home directory
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
 - `crates/mika-gateway/` — Telegram webhook router: Postgres customer registry, message routing, pairing flow, outbound relay
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup, mcp, skills, tasks, ask). `mika ask` sends a single non-interactive message and prints the response; `--task-id <uuid>` flag marks the callback task complete (via `update_task_completed` + `try_complete_parent_on_sibling_done`) and exits — no silent agent run. 100KB result limit matches server. CLI entry point for background scripts performing long-running work. TUI handles delivery via callback polling. Global flags: `--agent <name>` (override active agent), `--team <name>` (launch TUI in team mode, mutually exclusive with `--agent`). Team mode sends user messages as goals to `run_team()`, streams typed `TeamEvent` callbacks (progress, phase changes, agent status, errors) as system messages, shows deliverables as assistant responses; split-pane TUI dashboard (right panel, 30% width when terminal >= 80 cols) shows live phase, iteration, per-agent status (running/completed/failed), and elapsed time during team runs; `/verbose` toggles display of individual agent responses in team mode; team runs and message graphs persisted to the shared container database (`~/.mika/data/mika.db`); agent-specific slash commands are gated via an allowlist. TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Shell-like Tab completion: bash-style longest-common-prefix for command names, context-aware argument completers (model aliases, thinking levels, agent/team/skill names, config keys+values, file paths with tilde expansion). `CompletionMode` state machine (Hidden/Command/Argument) with contextual popup titles. Smart Enter (execute argless, transition for arg commands). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Persistent input history (`{home_dir}/.input_history` JSON, per-agent, atomic writes, 0600 permissions). Shell-like Up/Down arrows (cursor-position-aware, draft saving). Bracketed paste inserts at cursor position with `\r\n` normalization and 100KB size limit. Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer. Mouse click-drag text selection in both message area (cross-message) and textarea input, with Ctrl+A select-all and Ctrl+C copy to system clipboard (subprocess-based: pbcopy/xclip/wl-copy with arboard fallback). Ctrl+C with non-empty input copies text; with empty input quits.
 - `dashboard/` — React observability dashboard (Vite dev server on :5173, proxies `/api` to mika-server). Pages: Event Timeline, Agents, Sessions, Traces. Auth via `VITE_MIKA_DASHBOARD_TOKEN` env var (falls back to `VITE_MIKA_TOKEN`). Bearer token.
-- `config/` — Configuration files (default.toml; local.toml is gitignored)
 - `docs/` — Public documentation (architecture, configuration, deployment, skills, slash-commands, getting-started) — **single source of truth** for all docs
 - `docs/adr/` — Architecture Decision Records (numbered)
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
@@ -53,7 +52,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~1066 tests)
+- `cargo test` — Run all tests (~1095 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_TOKEN=<token> npm run dev --prefix dashboard` — Run dashboard dev server (requires mika-server on :8080)
@@ -62,6 +61,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `cargo fmt` — Format
 - `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image
 - `docker build -f Dockerfile.gateway -t mika-gateway:dev .` — Build gateway container image
+- `docker compose up` — Run agent + gateway (add `--profile db` for local Postgres)
+- `mika setup --mode compose` — Generate `.env` for docker-compose in current directory
 
 ## Architecture
 
@@ -88,7 +89,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
 - **Schema version:** 7 — sessions + messages two-table pattern (replaces single `conversations` table), `team_workspace` table (replaces `team_messages`), `SessionMessage` struct (replaces `ConversationMessage`), `TeamWorkspaceEntry` struct (replaces `TeamMessageRow`). Session-based message storage: each conversation gets a session (id, agent_id, channel_type, started_at, ended_at, metadata), messages reference sessions via FK. System sessions (`system-{agent_id}`) store compaction summaries. v1→v3 and v2→v3 migrations are clean-slate (backup + recreate). **v4→v5 migration:** Renames `memory_events` → `audit_events` and `memory_event_summaries` → `audit_event_summaries`, adds `trace_id` columns to `messages`, `audit_events`, `team_workspace`, and `tasks` (as `created_trace_id`), creates partial indexes on trace_id columns (`idx_msg_trace`, `idx_audit_trace`, `idx_tasks_trace`), and creates the `unified_timeline` VIEW for cross-subsystem event correlation. Migration is idempotent with per-step existence checks. **v5→v6 migration:** Adds `mention_count INTEGER NOT NULL DEFAULT 1` column to `people` table; incremented on each `update_person` call. **v6→v7 migration:** Adds `skill_overrides` table (`agent_id TEXT COLLATE NOCASE`, `skill_name TEXT COLLATE NOCASE`, `always_on INTEGER`, PK `(agent_id, skill_name)`) to persist user overrides for built-in skill `always_on` flag across `seed_bundled_skills()` re-sync cycles. `update_skill` routes built-in skill `always_on` changes to DB (not `skill.toml`); setting value to bundled default deletes the override row. `list_skills` shows `[override]` badge. `delete_skill` cleans up override rows.
 - **mika-gateway** (`crates/mika-gateway/` in this repo)**:** Telegram webhook router with Postgres customer registry. Handles text messages and images. Endpoints: `/webhook/telegram` (inbound), `/send` (outbound relay), `/health` + `/readyz` + `/livez` (health probes). Stateless, env-var-only config.
-- **Docker images:** Multi-stage builds with dependency layer caching. Builder: `rust:1.93-slim`. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). `Dockerfile.gateway` for the stateless gateway (leaner: ca-certificates + wget only, no home dir). Both use rustls (no OpenSSL build deps). Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip. **Host dependency:** `jq` is required by all skill handler scripts (shell-exec, tmux, github, file-reader) for JSON input parsing; handlers fail with a clear error if `jq` is not found.
+- **Docker images:** Multi-stage builds with BuildKit `--mount=type=cache` for cargo registry and target dir caching. Builder: `rust:1.93-slim`. `Dockerfile.agent` (95MB) for per-customer containers (runtime deps: ca-certificates, wget, file, jq, gh). `Dockerfile.gateway` for the stateless gateway (leaner: ca-certificates + wget only, no home dir). Both use rustls (no OpenSSL build deps). Both run as non-root user `mika` (UID 1000). Release profile: LTO + strip. `docker-compose.yml` defines agent, gateway, and postgres services (`db` profile for postgres). **Host dependency:** `jq` is required by all skill handler scripts (shell-exec, tmux, github, file-reader) for JSON input parsing; handlers fail with a clear error if `jq` is not found.
 - **CI/CD:** Three GitHub Actions workflows: `ci.yml` (PR checks: fmt, clippy, test, test with `--features telemetry`), `release-plz.yml` (automated versioning, changelog, crates.io publishing, git tagging via conventional commits), `release.yml` (cross-platform binary builds on tag push: x86_64/aarch64 Linux + macOS). All actions pinned to commit SHAs. Binaries published to GitHub Releases with SHA256 checksums. Installer script: `install.sh`.
 
 ## Environment Variables
@@ -130,7 +131,7 @@ Gateway mode (`mika-gateway` binary) additionally requires:
 
 ## Pending Work
 
-- **Deployment:** Deployment manifests, production deployment guide, Docker image CI
+- **Deployment:** Production deployment guide, Docker image CI, Kubernetes/cloud manifests
 - **Future features:** WhatsApp channel adapter, morning briefings, admin API
 
 ## Reference Repositories

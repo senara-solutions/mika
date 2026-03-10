@@ -19,6 +19,9 @@ use telegram::TelegramClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env from CWD (gateway has no ~/.mika/ home directory)
+    let _ = dotenvy::dotenv();
+
     let settings = GatewaySettings::load()?;
 
     // Initialize tracing (JSON structured logging for production, + optional file output)

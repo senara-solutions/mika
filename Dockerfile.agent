@@ -6,34 +6,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libc-dev pk
 
 WORKDIR /app
 
-# 1. Copy workspace manifests and lockfile (dependency cache layer)
+# Copy workspace manifests, lockfile, and source code
 COPY Cargo.toml Cargo.lock ./
-COPY crates/mika-common/Cargo.toml crates/mika-common/Cargo.toml
-COPY crates/mika-agent/Cargo.toml crates/mika-agent/Cargo.toml
+COPY crates/mika-common/ crates/mika-common/
+COPY crates/mika-agent/ crates/mika-agent/
 COPY crates/mika-gateway/Cargo.toml crates/mika-gateway/Cargo.toml
-
-# 2. Create dummy source files to compile dependencies
-RUN mkdir -p crates/mika-common/src && echo "pub fn _dummy() {}" > crates/mika-common/src/lib.rs \
-    && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs \
-    && mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-server.rs \
-    && echo "" > crates/mika-agent/src/lib.rs \
-    && mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
+RUN mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
     && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
-
-# 3. Build dependencies only, then clean workspace crate artifacts (keep dependency cache)
-RUN cargo build --release --bin mika-server -p mika-agent || true \
-    && rm -rf crates/ \
-    && rm -f target/release/mika-server target/release/mika \
-    && rm -rf target/release/.fingerprint/mika-* \
-    && rm -rf target/release/deps/libmika_* target/release/deps/mika_*
-
-# 4. Copy real source code (+ templates and docs for include_str! macros)
-COPY crates/ crates/
 COPY templates/ templates/
 COPY docs/ docs/
 
-# 5. Build the actual binary (dependencies are cached, only workspace crates rebuild)
-RUN cargo build --release --bin mika-server -p mika-agent
+# Build with BuildKit cache mounts for incremental compilation
+RUN --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --bin mika-server -p mika-agent \
+    && cp target/release/mika-server /usr/local/bin/mika-server
 
 # === Runtime stage ===
 FROM debian:bookworm-slim
@@ -55,10 +42,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 RUN useradd -m -u 1000 -s /bin/false mika
 
 # Copy binary
-COPY --from=builder /app/target/release/mika-server /usr/local/bin/mika-server
-
-# Copy default config (loaded as optional by Settings::load)
-COPY config/default.toml /app/config/default.toml
+COPY --from=builder /usr/local/bin/mika-server /usr/local/bin/mika-server
 
 # Set up volume mount point (bootstrap creates data/ and logs/ subdirs on first run)
 ENV MIKA_HOME=/home/mika/.mika

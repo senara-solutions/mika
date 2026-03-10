@@ -58,8 +58,8 @@ from the `mika-agent` crate.
 
 | Crate | Path | Responsibility |
 |-------|------|---------------|
-| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 23 builtin tools + 6 conditional management tools, prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -71,7 +71,7 @@ following steps for each inbound user message:
 
 Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 
-1. **Save user message** to the `conversations` table via `AsyncDatabase::save_message()`.
+1. **Generate trace_id** via `trace::generate_trace_id()` (OTel extraction or UUID v4 hex fallback). **Save user message** to the `messages` table via `AsyncDatabase::save_message()` with trace_id.
 
 2. **Load context** for system prompt assembly:
    - `soul.md` (agent personality, read from `home_dir`)
@@ -151,7 +151,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
 - Per-session edit limit: `MAX_CORE_MEMORY_EDITS_PER_SESSION = 3` (onboarding sessions exempt)
 - Actions: `replace`, `append`, `remove_line`, `reset`
-- All mutations are recorded in the `audit_events` audit table
+- All mutations are recorded in the `audit_events` table (with `trace_id` for correlation)
 
 ### Layer 2: Structured Facts
 
@@ -160,7 +160,7 @@ Stored in dedicated SQLite tables. Managed by the agent via `store_fact`,
 
 | Category | Table | Key Columns |
 |----------|-------|-------------|
-| People | `people` | `canonical_name` (UNIQUE COLLATE NOCASE), `relationship`, `notes` |
+| People | `people` | `canonical_name` (UNIQUE COLLATE NOCASE), `relationship`, `notes`, `mention_count` |
 | Commitments | `commitments` | `description` (UNIQUE COLLATE NOCASE), `status` (pending/completed/cancelled), `due_date`, `person_id` FK |
 | Preferences | `preferences` | `category` (UNIQUE COLLATE NOCASE), `value` |
 | Events | `events` | `description`, `event_date`, `context` |
@@ -188,8 +188,8 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `store_fact` | Store a new structured fact (person, commitment, preference, or event) into Layer 2 tables. | Memory |
 | `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events). | Memory |
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
-| `create_reminder` | Schedule a future reminder with ISO 8601 `fire_at` timestamp and message text. Outputs full UUID. | Reminders |
-| `list_reminders` | List pending and future reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
+| `create_reminder` | Schedule a one-shot reminder (`fire_at` ISO 8601 UTC) or periodic reminder (`cron_expr` 6-field cron with seconds first, e.g. `0 0 9 * * 1`). Minimum interval: 1 minute. Outputs full UUID. | Reminders |
+| `list_reminders` | List pending and future reminders. Shows cron expression for periodic reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
 | `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
 | `list_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
 | `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
@@ -207,20 +207,29 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `write_file` | Write content to a file in the agent's home directory. Requires `confirm: true` to overwrite existing files — returns current content first. | Files |
 | `read_home_file` | Read a file from the agent's home directory. Uses `validate_and_resolve_path` with `create_parents: false`. Reports resolved absolute path. | Files |
 | `list_home_files` | List files in a directory within the agent's home directory. Includes sizes and modification ages. Uses `spawn_blocking` for I/O. | Files |
+| `query_timeline` | Query the unified timeline of events across all subsystems (messages, audit events, tasks). Returns recent activity sorted by time. Non-orchestrator agents scoped to own agent_id. | Introspection |
+| `get_session_messages` | Retrieve messages from a past conversation session. Useful for replaying or summarizing old conversations. Non-orchestrator agents can only access their own sessions. | Introspection |
+| `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
 
 ### Management Tools
 
-6 tools for multi-agent and team workflows, registered conditionally via
-`management_tools_if_needed()` only when `agents.len() > 1 || !teams.is_empty()`:
+10 tools for multi-agent and team workflows, registered via
+`management_tools_if_needed()`. `create_agent`, `list_agents`, and `create_team` are always
+registered (enabling agent and team bootstrapping from a single-agent setup). The
+remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
-| Tool | Description | Timeout |
-|------|-------------|---------|
-| `list_agents` | List all configured agents with their identities and role hints. | default (30s) |
-| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s |
-| `list_teams` | List all configured teams with agent counts. | default (30s) |
-| `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s |
-| `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) |
-| `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) |
+| Tool | Description | Timeout | Always registered |
+|------|-------------|---------|-------------------|
+| `create_agent` | Create a new agent with name, display name, soul (personality), and optional model override. | default (30s) | Yes |
+| `list_agents` | List all configured agents with their identities and role hints. | default (30s) | Yes |
+| `create_team` | Create a new team definition with specified agents and flow. All referenced agents must exist. | default (30s) | Yes |
+| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
+| `list_teams` | List all configured teams with full configuration (roles, mandates, max_iterations). | default (30s) | No |
+| `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s | No |
+| `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) | No |
+| `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
+| `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
+| `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,
 preventing infinite delegation chains.
@@ -269,7 +278,7 @@ keywords = ["search", "look up", "find online"]
 | `skill.name` | yes | — | Unique skill identifier |
 | `skill.description` | yes | — | Human-readable description |
 | `skill.version` | no | `""` | Semantic version |
-| `skill.always_on` | no | `false` | Active every turn regardless of keywords |
+| `skill.always_on` | no | `false` | Active every turn regardless of keywords. For built-in skills, user overrides stored in `skill_overrides` DB table (v7); for custom/marketplace, stored in `skill.toml`. |
 | `skill.timeout_secs` | no | `30` | Per-tool execution timeout (seconds) |
 | `triggers.keywords` | no | `[]` | Case-insensitive substring-matched keywords |
 
@@ -490,10 +499,14 @@ Agent-created callback tasks follow this end-to-end pattern:
 1. Agent calls `create_task` with `trigger_type="callback"` and `action_type="resume_agent"`. Receives full UUID.
 2. Agent or background script does long-running work.
 3. External process completes the task via one of:
-   - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — agent runs first with result injected, then task marked complete
+   - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — marks task complete and exits (no silent agent run). TUI handles delivery.
    - **HTTP:** `POST /tasks/{id}/complete` with Bearer auth and `{"result": "..."}` body
 4. `update_task_completed` validates status (`AND status IN ('pending','in_progress')`) before writing — returns `false` if already completed (TOCTOU guard).
-5. `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }`. The result is wrapped in `<callback_result trust="untrusted">` delimiters before LLM injection to mitigate prompt injection.
+5. **Delivery** depends on the path:
+   - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }` → marks task `delivered` on success.
+   - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry.
+
+The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered`.
 
 ### SilentTrigger Variants
 
@@ -510,11 +523,21 @@ Agent-created callback tasks follow this end-to-end pattern:
 
 `prune_old_tasks()` runs at startup and deletes completed, failed, and cancelled tasks older than 30 days to prevent unbounded table growth.
 
-### Composite Partial Index
+### Key Indexes
 
 ```sql
+-- Scheduling efficiency
 CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC)
 WHERE status IN ('pending', 'recurring_active');
+
+-- TUI callback polling efficiency
+CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at)
+WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status = 'completed';
+
+-- Trace correlation (partial indexes — only non-NULL trace_ids)
+CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
 ```
 
 
@@ -597,17 +620,92 @@ Properties:
 
 The per-customer agent container runs an Axum HTTP server:
 
+### Auth Split
+
+The server has two auth layers:
+
+- **Mutation endpoints** (`/message`, `/tasks/{id}/complete`) require `MIKA_INTERNAL_TOKEN` only (gateway-to-agent traffic).
+- **Dashboard API** (`/api/v1/*`) accepts either `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN` (superuser). If `MIKA_DASHBOARD_TOKEN` is not set, dashboard routes fall back to `MIKA_INTERNAL_TOKEN` (backwards compatible).
+
+This separation lets you give dashboard users a read-only token that cannot mutate agent state.
+
+### Mutation Endpoints
+
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/health` | GET | None | Liveness/readiness probe |
-| `/message` | POST | Bearer | Receives messages (202 async processing, 10MB body limit) |
-| `/tasks/{id}/complete` | POST | Bearer | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
+| `/message` | POST | Internal token | Receives messages (202 async processing, 10MB body limit) |
+| `/tasks/{id}/complete` | POST | Internal token | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
+
+### Dashboard API (read-only)
+
+All dashboard routes are nested under `/api/v1/` with CORS scoped to
+`MIKA_CORS_ORIGIN` (default `http://localhost:5173`), restricted to
+GET + POST + OPTIONS methods and `Authorization` + `Content-Type` headers only.
+Auth: accepts `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN`.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/v1/timeline` | GET | Paginated unified timeline with filters (agent_id, event_type, trace_id, session_id, from/to timestamps) |
+| `/api/v1/timeline/trace/{trace_id}` | GET | All events for a specific trace |
+| `/api/v1/agents` | GET | List all agents with message counts |
+| `/api/v1/agents/{id}` | GET | Agent detail with core memory, soul.md, and stats |
+| `/api/v1/agents/{id}/sessions` | GET | Paginated sessions for an agent |
+| `/api/v1/agents/{id}/audit` | GET | Paginated audit events for an agent |
+| `/api/v1/sessions` | GET | Paginated sessions with optional agent_id/channel_type filters |
+| `/api/v1/sessions/{id}` | GET | Session detail |
+| `/api/v1/sessions/{id}/messages` | GET | Paginated messages for a session (base64 images stripped) |
+| `/api/v1/investigate` | POST | SSE streaming investigation endpoint — lightweight read-only agent loop (max 5 steps, 120s timeout, 64KB body limit) for analyzing agent behavior from the dashboard |
+
+Pagination: `?page=1&per_page=50` (max 200 per page, page clamped to 1–100,000).
+Response format: `{ data: [...], total: N, page: P, per_page: PP }`.
 
 `AppState` is Clone via Arc-wrapped dependencies. Agent lock
 (`tokio::sync::Mutex<()>`) serializes agent loops with non-blocking `try_lock`
 (429 if busy).
 
 See [ADR-001](adr/001-axum-http-server-architecture.md) for design decisions.
+
+
+## 13a. Observability Dashboard
+
+Source: `dashboard/`
+
+A React SPA for monitoring agent activity. Stack: React 19, TypeScript, Vite,
+Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
+
+### Pages
+
+| Route | Page | Description |
+|-------|------|-------------|
+| `/` | Event Timeline | Unified timeline with live polling (5s), subsystem badges, trace links |
+| `/agents` | Agents | Agent list with status and message counts |
+| `/agents/:id` | Agent Detail | Core memory (raw/view), soul.md, recent audit events, sessions |
+| `/sessions` | Sessions | Filterable session list with channel type icons |
+| `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling, tool call summaries, and investigation side panel (SSE-powered agent analysis) |
+| `/traces` | Traces | Trace ID search |
+| `/traces/:id` | Trace Detail | All events for a trace |
+
+### Development
+
+```bash
+# Terminal 1: Start mika-server
+MIKA_ANTHROPIC_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
+  MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-server
+
+# Terminal 2: Start dashboard dev server
+VITE_MIKA_TOKEN=<same-64-hex> npm run dev --prefix dashboard
+```
+
+The Vite dev server proxies `/api` requests to `http://localhost:8080`
+(configurable in `dashboard/vite.config.ts`). Auth: the dashboard reads
+`VITE_MIKA_TOKEN` from env and sends it as `Authorization: Bearer <token>`.
+
+### Design System
+
+Dark theme: `#0d0f12` background, `#151820` cards, `#7c6af7` accent.
+Fonts: Plus Jakarta Sans (UI), JetBrains Mono (code/IDs).
+Subsystem colors: blue (messages), amber (audit), emerald (tasks).
 
 
 ## 14. Failed Sends (Durable Outbox Pattern)
@@ -659,10 +757,24 @@ See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration
 
 ## 16. Observability & Telemetry
 
-Mika follows an "always instrument, optionally export" pattern. Tracing spans are
-compiled unconditionally into the binary — no feature flags needed. Spans cover the
-agent loop (`agent_turn`), Claude API calls, per-tool execution, team engine
-(`team_run`, `team_agent_task`), and server HTTP handlers (`tower_http::TraceLayer`).
+Mika follows an "always instrument, optionally export" pattern with two orthogonal
+correlation axes:
+
+- **`trace_id`** (per-request/per-turn): 32-char lowercase hex string generated via
+  `trace::generate_trace_id()` (`crates/mika-agent/src/trace.rs`). Extracts the OTel
+  trace ID from the current span when the `telemetry` feature is active; falls back to
+  UUID v4 hex otherwise. Threaded through `ToolContext`, `LongRunningContext`,
+  `TeamEngine`, and all DB write paths (messages, audit_events, tasks, team_workspace).
+- **`session_id` / `agent_id`** (system-level): Identifies the conversation session and
+  owning agent.
+
+The `unified_timeline` VIEW (`UNION ALL` across messages, audit_events, tasks) enables
+cross-subsystem queries by trace_id — e.g., "show all messages, audit events, and tasks
+from a single agent turn."
+
+Tracing spans are compiled unconditionally into the binary — no feature flags needed.
+Spans cover the agent loop (`agent_turn`), Claude API calls, per-tool execution, team
+engine (`team_run`, `team_agent_task`), and server HTTP handlers (`tower_http::TraceLayer`).
 
 ### Optional OTLP Export
 
@@ -699,7 +811,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 1 (consolidated clean-slate baseline)
+**Schema version:** 7 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles)
 
 ### Tables
 
@@ -708,13 +820,14 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `schema_version` | Migration tracking |
 | `agents` | Agent registry (name, display_name, model, active flag) |
 | `teams` | Team registry (name, display_name, orchestrator) |
-| `conversations` | Message history (user, assistant, summary rows; `channel_type`, `agent_id` FK) |
+| `sessions` | Conversation sessions (`agent_id` FK, `channel_type`, timestamps) |
+| `messages` | Message history (`session_id` FK, `role`, `content`, `trace_id`, `metadata`) |
 | `core_memory` | Layer 1 persistent memory blocks (`agent_id` FK) |
 | `people` | Layer 2 people/contacts (`agent_id` FK) |
 | `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
 | `preferences` | Layer 2 user preferences (`agent_id` FK) |
 | `events` | Layer 2 notable events (`agent_id` FK) |
-| `audit_events` | Audit log for all memory mutations (`agent_id` FK) |
+| `audit_events` | Audit log for all memory mutations (`agent_id` FK, `trace_id`) |
 | `customer_config` | Key-value store (timezone, chat_id) |
 | `failed_sends` | Durable outbox for failed outbound messages |
 | `audit_event_summaries` | Tiered retention summaries (monthly) |
@@ -723,9 +836,11 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `search_content` | Unified search content for Layer 3 hybrid search |
 | `fts_search` | FTS5 virtual table for full-text search |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
-| `tasks` | Unified task scheduler — replaces `reminders`; all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`) |
-| `team_runs` | Team run metadata (goal, status, iterations, deliverable) |
-| `team_messages` | Graph-structured team messages with `parent_id` links; `agent_name` column (not FK) |
+| `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint) |
+| `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
+| `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
+| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks for cross-subsystem correlation by trace_id |
 
 ### SQLite Pragmas
 
