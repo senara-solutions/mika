@@ -1,5 +1,4 @@
-const API_BASE = '/api/v1'
-const TOKEN = import.meta.env.VITE_MIKA_TOKEN ?? ''
+import { API_BASE, TOKEN } from './client'
 
 export interface InvestigateRequest {
   message_id: number

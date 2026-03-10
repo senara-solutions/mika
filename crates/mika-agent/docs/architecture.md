@@ -694,12 +694,12 @@ MIKA_ANTHROPIC_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
   MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-server
 
 # Terminal 2: Start dashboard dev server
-VITE_MIKA_TOKEN=<same-64-hex> npm run dev --prefix dashboard
+VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev --prefix dashboard
 ```
 
 The Vite dev server proxies `/api` requests to `http://localhost:8080`
 (configurable in `dashboard/vite.config.ts`). Auth: the dashboard reads
-`VITE_MIKA_TOKEN` from env and sends it as `Authorization: Bearer <token>`.
+`VITE_MIKA_DASHBOARD_TOKEN` from env and sends it as `Authorization: Bearer <token>`.
 
 ### Design System
 
