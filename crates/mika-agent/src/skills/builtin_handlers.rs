@@ -23,6 +23,8 @@ static DOC_DEPLOYMENT: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/deplo
 static DOC_GETTING_STARTED: &str =
     include_str!(concat!(env!("OUT_DIR"), "/docs/getting-started.md"));
 static DOC_SKILLS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/skills.md"));
+static DOC_RUNTIME_STRUCTURE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/docs/runtime-structure.md"));
 static DOC_SLASH_COMMANDS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/slash-commands.md"));
 
 /// Known builtin function names, used for startup validation.
@@ -95,10 +97,11 @@ async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> 
         "configuration" => ToolOutput::success(DOC_CONFIGURATION.to_string()),
         "deployment" => ToolOutput::success(DOC_DEPLOYMENT.to_string()),
         "getting-started" => ToolOutput::success(DOC_GETTING_STARTED.to_string()),
+        "runtime-structure" => ToolOutput::success(DOC_RUNTIME_STRUCTURE.to_string()),
         "skills" => ToolOutput::success(DOC_SKILLS.to_string()),
         "slash-commands" => ToolOutput::success(DOC_SLASH_COMMANDS.to_string()),
         _ => ToolOutput::error(
-            "Invalid topic. Use one of: architecture, api-spec, cli-reference, configuration, deployment, getting-started, skills, slash-commands."
+            "Invalid topic. Use one of: architecture, api-spec, cli-reference, configuration, deployment, getting-started, runtime-structure, skills, slash-commands."
                 .to_string(),
         ),
     }
@@ -230,6 +233,7 @@ mod tests {
             "configuration",
             "deployment",
             "getting-started",
+            "runtime-structure",
             "skills",
             "slash-commands",
         ] {
@@ -399,6 +403,7 @@ mod tests {
             "configuration.md",
             "deployment.md",
             "getting-started.md",
+            "runtime-structure.md",
             "skills.md",
             "slash-commands.md",
             "openapi/mika-server.yaml",
