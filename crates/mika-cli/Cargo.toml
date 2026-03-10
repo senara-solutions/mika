@@ -44,6 +44,8 @@ base64.workspace = true
 png.workspace = true
 unicode-width.workspace = true
 dialoguer.workspace = true
+rand.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

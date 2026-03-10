@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p3
 issue_id: 604
 tags: [code-review, security, ux]
@@ -21,4 +21,4 @@ Use `rpassword::read_password()` or `dialoguer` (already a dependency) with pass
 
 ## Acceptance Criteria
 
-- [ ] API key input is not echoed to terminal
+- [x] API key input is not echoed to terminal
