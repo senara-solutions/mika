@@ -2910,8 +2910,7 @@ impl Database {
             }
         }
 
-        // Sort by response length descending (longest = most informative), cap at 5
-        agent_results.sort_by(|a, b| b.response_preview.len().cmp(&a.response_preview.len()));
+        // Cap at 5 agents to keep context concise
         agent_results.truncate(5);
 
         // Get task statuses
@@ -2955,6 +2954,18 @@ impl Database {
             pending_tasks,
             critic_feedback,
         })
+    }
+
+    /// Convenience method: get the enriched summary for the most recent
+    /// completed/failed/suspended run for a team. Returns None if no such run exists.
+    pub fn get_last_completed_team_run_summary(
+        &self,
+        team_name: &str,
+    ) -> Result<Option<TeamRunSummary>> {
+        match self.get_last_completed_team_run(team_name)? {
+            Some(prev) => Ok(Some(self.get_team_run_summary(&prev.id)?)),
+            None => Ok(None),
+        }
     }
 
     // ===== Team Workspace =====
@@ -3689,7 +3700,7 @@ pub fn today_midnight_utc(timezone: &str) -> chrono::DateTime<chrono::Utc> {
 }
 
 /// Truncate a string to `max_chars` characters, appending "..." if truncated.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {

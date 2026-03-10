@@ -1044,6 +1044,15 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_team_run_summary(&ri)).await
     }
 
+    pub async fn get_last_completed_team_run_summary(
+        &self,
+        team_name: &str,
+    ) -> Result<Option<TeamRunSummary>> {
+        let tn = team_name.to_owned();
+        self.with_db(move |db| db.get_last_completed_team_run_summary(&tn))
+            .await
+    }
+
     // -- Team Workspace --
 
     #[allow(clippy::too_many_arguments)]

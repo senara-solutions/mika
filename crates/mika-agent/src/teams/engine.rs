@@ -494,48 +494,22 @@ impl TeamEngine {
             .unwrap_or_default();
 
         // Load enriched summary for the most recent previous run
-        let previous_run_summary = match self
+        let previous_run_summary = self
             .team_db
-            .get_last_completed_team_run(&self.run.team_name)
+            .get_last_completed_team_run_summary(&self.run.team_name)
             .await
-        {
-            Ok(Some(prev_run)) => {
-                match self.team_db.get_team_run_summary(&prev_run.id).await {
-                    Ok(summary) => {
-                        info!(
-                            previous_run_id = %prev_run.id,
-                            previous_run_status = %prev_run.status,
-                            agent_results_count = summary.agent_results.len(),
-                            "Injecting previous team run context"
-                        );
-                        // Log audit event for observability
-                        let session_id = format!("team-{}", self.run.run_id);
-                        self.team_db
-                            .log_audit_event(
-                                &session_id,
-                                "team_context_injection",
-                                &format!("team_run:{}", self.run.run_id),
-                                None,
-                                &format!("previous_run_id={}", prev_run.id),
-                                Some("Injected previous team run context into orchestrator prompt"),
-                                Some(&self.trace_id),
-                            )
-                            .await
-                            .ok();
-                        Some(summary)
-                    }
-                    Err(e) => {
-                        debug!("Failed to load previous run summary: {e}");
-                        None
-                    }
-                }
-            }
-            Ok(None) => None,
-            Err(e) => {
-                debug!("Failed to query previous team run: {e}");
+            .unwrap_or_else(|e| {
+                debug!("Failed to load previous team run summary: {e}");
                 None
-            }
-        };
+            });
+        if let Some(ref summary) = previous_run_summary {
+            info!(
+                previous_run_id = %summary.run.id,
+                previous_run_status = %summary.run.status,
+                agent_results_count = summary.agent_results.len(),
+                "Injecting previous team run context"
+            );
+        }
 
         // Step 1: Decompose -- orchestrator produces task assignments
         self.run.iteration = 1;

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use mika_common::team::TeamDefinition;
 
-use crate::db::{TeamRunRow, TeamRunSummary};
+use crate::db::{TeamRunRow, TeamRunSummary, truncate_chars};
 
 use super::types::TeamRun;
 
@@ -149,11 +149,7 @@ pub fn build_previous_run_context(summary: &TeamRunSummary) -> String {
     );
 
     // Goal (truncated to 200 chars)
-    let goal: String = if run.goal.chars().count() > 200 {
-        format!("{}...", run.goal.chars().take(200).collect::<String>())
-    } else {
-        run.goal.clone()
-    };
+    let goal = truncate_chars(&run.goal, 200);
     let _ = writeln!(buf, "**Goal:** {goal}\n");
 
     // Agent Results
@@ -167,11 +163,7 @@ pub fn build_previous_run_context(summary: &TeamRunSummary) -> String {
 
     // Deliverable (truncated to 500 chars)
     if let Some(ref deliverable) = run.deliverable {
-        let d: String = if deliverable.chars().count() > 500 {
-            format!("{}...", deliverable.chars().take(500).collect::<String>())
-        } else {
-            deliverable.clone()
-        };
+        let d = truncate_chars(deliverable, 500);
         let _ = writeln!(buf, "**Deliverable:** {d}\n");
     }
 
