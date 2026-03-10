@@ -1,7 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::path::Path;
 use tui_textarea::CursorMove;
-use unicode_width::UnicodeWidthChar;
 
 use crate::tui::app::{
     AgentStatus, App, ChatMessage, ChatRole, MessagePosition, SelectionState, TextPosition,
@@ -11,6 +10,7 @@ use crate::tui::commands::autocomplete::{
     CompletionContext, CompletionMode, longest_common_prefix,
 };
 use crate::tui::ui;
+use crate::tui::wrap::{WrappedChars, find_char_at_display_col};
 
 /// Check if a screen position falls within the textarea area.
 fn is_in_textarea(app: &App<'_>, col: u16, row: u16) -> bool {
@@ -23,9 +23,9 @@ fn is_in_textarea(app: &App<'_>, col: u16, row: u16) -> bool {
 
 /// Map a screen position to textarea logical coordinates (row, char_col).
 ///
-/// Returns `None` if the position cannot be mapped. Uses the same wrapping logic
-/// as `wrap_input_with_cursor` to find which logical row and character index
-/// the screen position corresponds to.
+/// Returns `None` if the position cannot be mapped. Uses the shared wrapping
+/// iterator to find which logical row and character index the screen position
+/// corresponds to.
 fn screen_to_textarea_pos(
     app: &App<'_>,
     screen_col: u16,
@@ -57,60 +57,47 @@ fn screen_to_textarea_pos(
         }
 
         let mut seg_start_char = 0;
-        let mut col = 0usize;
-        let chars: Vec<char> = line.chars().collect();
+        let mut seg_start_byte = 0;
+        let mut prev_wrap_row = 0;
 
-        for (char_idx, &ch) in chars.iter().enumerate() {
-            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-
-            if col + ch_w > width && col > 0 {
+        for wc in WrappedChars::new(line, width) {
+            if wc.display_row != prev_wrap_row {
                 // Wrap break: this starts a new display row
                 if display_row == rel_row {
                     // Target is in the previous segment
                     return Some((
                         line_idx,
-                        find_char_at_col(&chars[seg_start_char..char_idx], seg_start_char, rel_col),
+                        find_char_at_display_col(
+                            &line[seg_start_byte..wc.byte_offset],
+                            seg_start_char,
+                            rel_col,
+                        ),
                     ));
                 }
                 display_row += 1;
-                seg_start_char = char_idx;
-                col = 0;
+                seg_start_char = wc.char_idx;
+                seg_start_byte = wc.byte_offset;
+                prev_wrap_row = wc.display_row;
             }
-            col += ch_w;
         }
 
         // Final segment of this line
         if display_row == rel_row {
             return Some((
                 line_idx,
-                find_char_at_col(&chars[seg_start_char..], seg_start_char, rel_col),
+                find_char_at_display_col(&line[seg_start_byte..], seg_start_char, rel_col),
             ));
         }
         display_row += 1;
     }
 
-    // Past the end — clamp to last position
+    // Past the end -- clamp to last position
     if let Some(last_line) = lines.last() {
         let last_idx = lines.len().saturating_sub(1);
         Some((last_idx, last_line.chars().count()))
     } else {
         Some((0, 0))
     }
-}
-
-/// Find the character index at a given display column within a slice of chars.
-/// `base_idx` is the starting char index for the slice within the full line.
-fn find_char_at_col(chars: &[char], base_idx: usize, target_col: usize) -> usize {
-    let mut col = 0usize;
-    for (i, &ch) in chars.iter().enumerate() {
-        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if col + ch_w > target_col {
-            return base_idx + i;
-        }
-        col += ch_w;
-    }
-    // Past end of segment
-    base_idx + chars.len()
 }
 
 /// Handle a mouse event (scroll, click-drag for text selection).
