@@ -2872,10 +2872,11 @@ impl Database {
     /// Build an enriched summary of a team run for context injection.
     /// Queries team_workspace (assignments, critic), messages (agent responses),
     /// and tasks (statuses) for the given run.
-    pub fn get_team_run_summary(&self, run_id: &str) -> Result<TeamRunSummary> {
-        let run = self
-            .load_team_run_by_id(run_id)?
-            .ok_or_else(|| anyhow::anyhow!("team run '{}' not found", run_id))?;
+    pub fn get_team_run_summary(&self, run_id: &str) -> Result<Option<TeamRunSummary>> {
+        let run = match self.load_team_run_by_id(run_id)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
 
         // Get agent names from assignment entries
         let agent_names: Vec<String> = {
@@ -2947,13 +2948,13 @@ impl Database {
             .optional()?
             .map(|c: String| truncate_chars(&c, 200));
 
-        Ok(TeamRunSummary {
+        Ok(Some(TeamRunSummary {
             run,
             agent_results,
             task_statuses,
             pending_tasks,
             critic_feedback,
-        })
+        }))
     }
 
     /// Convenience method: get the enriched summary for the most recent
@@ -2963,7 +2964,7 @@ impl Database {
         team_name: &str,
     ) -> Result<Option<TeamRunSummary>> {
         match self.get_last_completed_team_run(team_name)? {
-            Some(prev) => Ok(Some(self.get_team_run_summary(&prev.id)?)),
+            Some(prev) => self.get_team_run_summary(&prev.id),
             None => Ok(None),
         }
     }
@@ -5062,7 +5063,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = db.get_team_run_summary(run_id).unwrap();
+        let summary = db.get_team_run_summary(run_id).unwrap().unwrap();
         assert_eq!(summary.run.id, run_id);
         assert_eq!(summary.run.goal, "test goal for summary");
         assert_eq!(summary.run.deliverable.as_deref(), Some("final output"));
@@ -5091,7 +5092,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = db.get_team_run_summary(run_id).unwrap();
+        let summary = db.get_team_run_summary(run_id).unwrap().unwrap();
         assert_eq!(
             summary.critic_feedback.as_deref(),
             Some("Needs improvement in error handling")
@@ -5101,8 +5102,8 @@ mod tests {
     #[test]
     fn test_get_team_run_summary_not_found() {
         let db = db();
-        let result = db.get_team_run_summary("nonexistent-run-id");
-        assert!(result.is_err());
+        let result = db.get_team_run_summary("nonexistent-run-id").unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

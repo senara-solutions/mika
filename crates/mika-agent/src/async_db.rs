@@ -1039,7 +1039,7 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn get_team_run_summary(&self, run_id: &str) -> Result<TeamRunSummary> {
+    pub async fn get_team_run_summary(&self, run_id: &str) -> Result<Option<TeamRunSummary>> {
         let ri = run_id.to_owned();
         self.with_db(move |db| db.get_team_run_summary(&ri)).await
     }

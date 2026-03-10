@@ -410,19 +410,13 @@ pub async fn handle_team_run_summary(
     Path(run_id): Path<String>,
 ) -> impl IntoResponse {
     match state.dashboard_db.get_team_run_summary(&run_id).await {
-        Ok(summary) => Json(summary).into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": msg})),
-                )
-                    .into_response()
-            } else {
-                internal_error(e).into_response()
-            }
-        }
+        Ok(Some(summary)) => Json(summary).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("team run '{}' not found", run_id)})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
     }
 }
 

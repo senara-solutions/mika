@@ -203,7 +203,12 @@ pub fn build_previous_run_context(summary: &TeamRunSummary) -> String {
 
     // Enforce 2500-char budget
     if buf.len() > 2500 {
-        buf.truncate(2490);
+        // Find a safe char boundary to avoid panicking on multi-byte UTF-8
+        let mut end = 2490;
+        while !buf.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        buf.truncate(end);
         buf.push_str("...\n</context>\n");
     }
 
