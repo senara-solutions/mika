@@ -131,12 +131,14 @@ async fn main() -> Result<()> {
         None => {
             let home_dir = home::resolve_home_dir()?;
             if !home::is_initialized(&home_dir) {
-                commands::setup::run(&agent_name).await?;
+                commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
             commands::chat::run(&agent_name).await
         }
         Some(Commands::Chat) => commands::chat::run(&agent_name).await,
-        Some(Commands::Setup) => commands::setup::run(&agent_name).await,
+        Some(Commands::Setup { mode, api_key }) => {
+            commands::setup::run(&agent_name, mode, api_key.as_deref()).await
+        }
         Some(Commands::Memory(args)) => commands::memory::run(args, &agent_name).await,
         Some(Commands::Reminders(args)) => commands::reminders::run(args, &agent_name).await,
         Some(Commands::Status) => commands::status::run(&agent_name).await,
@@ -343,5 +345,12 @@ mod tests {
             markdown.contains("--team"),
             "clap-markdown output missing --team flag"
         );
+    }
+
+    /// `mika setup --api-key <key>` should parse successfully.
+    #[test]
+    fn test_setup_accepts_api_key_flag() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "setup", "--api-key", "sk-test"]);
+        assert!(cli.is_ok());
     }
 }

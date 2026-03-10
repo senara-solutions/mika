@@ -20,19 +20,18 @@ pub fn load_dotenv(home_dir: &Path) {
     }
 }
 
-/// Read a single key from `{home_dir}/.env` without loading into process env.
-/// Uses dotenvy's parser for consistent behavior with `load_dotenv`.
-pub fn get_env_var(home_dir: &Path, key: &str) -> Option<String> {
-    let env_path = home_dir.join(".env");
-    dotenvy::from_path_iter(&env_path).ok()?.find_map(|r| {
-        let (k, v) = r.ok()?;
-        (k == key).then_some(v)
-    })
-}
-
 /// Write or update a key in `{home_dir}/.env`. Creates the file if it doesn't exist.
 /// Sets file permissions to 0600 on Unix (secrets file).
 pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
+    // Validate key: non-empty, ASCII alphanumeric or underscore
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        anyhow::bail!("invalid .env key: must be non-empty ASCII alphanumeric/underscore");
+    }
+    // Reject newlines in both key and value to prevent injection
+    if key.contains('\n') || key.contains('\r') || value.contains('\n') || value.contains('\r') {
+        anyhow::bail!(".env key and value must not contain newline characters");
+    }
+
     let env_path = home_dir.join(".env");
     let mut lines: Vec<String> = Vec::new();
     let mut found = false;
@@ -45,7 +44,8 @@ pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
                 && let Some((k, _)) = trimmed.split_once('=')
                 && k.trim() == key
             {
-                lines.push(format!("{key}={value}"));
+                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                lines.push(format!("{key}=\"{escaped}\""));
                 found = true;
                 continue;
             }
@@ -54,7 +54,8 @@ pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
     }
 
     if !found {
-        lines.push(format!("{key}={value}"));
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        lines.push(format!("{key}=\"{escaped}\""));
     }
 
     // Ensure trailing newline
@@ -68,7 +69,11 @@ pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
     }
 
     std::fs::rename(&tmp_path, &env_path).with_context(|| {
@@ -148,7 +153,7 @@ mod tests {
         set_env_var(tmp.path(), "MY_KEY", "my_value").unwrap();
 
         let content = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
-        assert!(content.contains("MY_KEY=my_value"));
+        assert!(content.contains("MY_KEY=\"my_value\""));
     }
 
     #[test]
@@ -159,7 +164,7 @@ mod tests {
         set_env_var(tmp.path(), "FOO", "updated").unwrap();
 
         let content = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
-        assert!(content.contains("FOO=updated"));
+        assert!(content.contains("FOO=\"updated\""));
         assert!(content.contains("BAZ=qux"));
         assert!(content.contains("# Comment"));
         // Should not have duplicate FOO
@@ -183,32 +188,52 @@ mod tests {
     }
 
     #[test]
-    fn test_get_env_var_reads_key() {
+    #[serial]
+    fn test_set_env_var_roundtrip_special_chars() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join(".env"),
-            "# Comment\nKEY_A=value_a\nKEY_B=\"quoted_value\"\nKEY_C='single_quoted'\n",
-        )
-        .unwrap();
+        let key = "MIKA_TEST_ROUNDTRIP_SPECIAL";
+        // Value with hash, equals, quotes, spaces
+        let value = "val#ue=with \"quotes\" and spaces";
+        set_env_var(tmp.path(), key, value).unwrap();
 
-        assert_eq!(
-            get_env_var(tmp.path(), "KEY_A"),
-            Some("value_a".to_string())
-        );
-        assert_eq!(
-            get_env_var(tmp.path(), "KEY_B"),
-            Some("quoted_value".to_string())
-        );
-        assert_eq!(
-            get_env_var(tmp.path(), "KEY_C"),
-            Some("single_quoted".to_string())
-        );
-        assert_eq!(get_env_var(tmp.path(), "MISSING"), None);
+        unsafe { std::env::remove_var(key) };
+        load_dotenv(tmp.path());
+        assert_eq!(std::env::var(key).ok().as_deref(), Some(value));
+
+        // Cleanup
+        unsafe { std::env::remove_var(key) };
     }
 
     #[test]
-    fn test_get_env_var_missing_file() {
+    #[serial]
+    fn test_set_env_var_roundtrip_backslash() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(get_env_var(tmp.path(), "ANY_KEY"), None);
+        let key = "MIKA_TEST_ROUNDTRIP_BSLASH";
+        let value = r"C:\Users\test";
+        set_env_var(tmp.path(), key, value).unwrap();
+
+        unsafe { std::env::remove_var(key) };
+        load_dotenv(tmp.path());
+        assert_eq!(std::env::var(key).ok().as_deref(), Some(value));
+
+        // Cleanup
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn test_set_env_var_rejects_newlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(set_env_var(tmp.path(), "KEY", "value\nINJECTED=bad").is_err());
+        assert!(set_env_var(tmp.path(), "KEY\nBAD", "value").is_err());
+        assert!(set_env_var(tmp.path(), "KEY", "value\rINJECTED=bad").is_err());
+    }
+
+    #[test]
+    fn test_set_env_var_rejects_invalid_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(set_env_var(tmp.path(), "", "value").is_err());
+        assert!(set_env_var(tmp.path(), "has space", "value").is_err());
+        assert!(set_env_var(tmp.path(), "has=equals", "value").is_err());
+        assert!(set_env_var(tmp.path(), "has-dash", "value").is_err());
     }
 }
