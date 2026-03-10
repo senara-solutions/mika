@@ -27,7 +27,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, HTTP server binary
 - `crates/mika-gateway/` — Telegram webhook router: Postgres customer registry, message routing, pairing flow, outbound relay
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (status, memory, reminders, config, setup, mcp, skills, tasks, ask). `mika ask` sends a single non-interactive message and prints the response; `--task-id <uuid>` flag marks the callback task complete (via `update_task_completed` + `try_complete_parent_on_sibling_done`) and exits — no silent agent run. 100KB result limit matches server. CLI entry point for background scripts performing long-running work. TUI handles delivery via callback polling. Global flags: `--agent <name>` (override active agent), `--team <name>` (launch TUI in team mode, mutually exclusive with `--agent`). Team mode sends user messages as goals to `run_team()`, streams typed `TeamEvent` callbacks (progress, phase changes, agent status, errors) as system messages, shows deliverables as assistant responses; split-pane TUI dashboard (right panel, 30% width when terminal >= 80 cols) shows live phase, iteration, per-agent status (running/completed/failed), and elapsed time during team runs; `/verbose` toggles display of individual agent responses in team mode; team runs and message graphs persisted to the shared container database (`~/.mika/data/mika.db`); agent-specific slash commands are gated via an allowlist. TUI slash commands: `/think` (persistent thinking level), `/model` (runtime model switching), `/agent` (agent switching). Shell-like Tab completion: bash-style longest-common-prefix for command names, context-aware argument completers (model aliases, thinking levels, agent/team/skill names, config keys+values, file paths with tilde expansion). `CompletionMode` state machine (Hidden/Command/Argument) with contextual popup titles. Smart Enter (execute argless, transition for arg commands). Supports image paste via Ctrl+V (arboard + xclip/wl-paste fallbacks on Linux). Persistent input history (`{home_dir}/.input_history` JSON, per-agent, atomic writes, 0600 permissions). Shell-like Up/Down arrows (cursor-position-aware, draft saving). Bracketed paste inserts at cursor position with `\r\n` normalization and 100KB size limit. Mouse scroll and Ctrl+Up/Down for conversation scrolling. Unicode-width-aware input text wrapping. Scroll and new-message indicators in footer. Mouse click-drag text selection in both message area (cross-message) and textarea input, with Ctrl+A select-all and Ctrl+C copy to system clipboard (subprocess-based: pbcopy/xclip/wl-copy with arboard fallback). Ctrl+C with non-empty input copies text; with empty input quits.
-- `dashboard/` — React observability dashboard (Vite dev server on :5173, proxies `/api` to mika-server). Pages: Event Timeline, Agents, Sessions, Traces. Auth via `VITE_MIKA_DASHBOARD_TOKEN` env var (falls back to `VITE_MIKA_TOKEN`). Bearer token.
+- `dashboard/` — React observability dashboard (Vite dev server on :5173, proxies `/api` to mika-server). Pages: Event Timeline, Agents, Sessions, Traces. Auth via `VITE_MIKA_DASHBOARD_TOKEN` env var. Bearer token.
 - `docs/` — Public documentation (architecture, configuration, deployment, skills, slash-commands, getting-started) — **single source of truth** for all docs
 - `docs/adr/` — Architecture Decision Records (numbered)
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
@@ -55,7 +55,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `cargo test` — Run all tests (~1095 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
-- `VITE_MIKA_TOKEN=<token> npm run dev --prefix dashboard` — Run dashboard dev server (requires mika-server on :8080)
+- `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev --prefix dashboard` — Run dashboard dev server (requires mika-server on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
@@ -117,7 +117,7 @@ Optional (telemetry — requires `--features telemetry` build):
 
 Optional (dashboard):
 - `MIKA_CORS_ORIGIN` — Allowed origin for dashboard CORS (default: `http://localhost:5173`). Only applies to `/api/v1/*` dashboard routes.
-- `MIKA_DASHBOARD_TOKEN` — Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN` (backwards compatible). `MIKA_INTERNAL_TOKEN` is always accepted on all routes (superuser). Dashboard frontend uses `VITE_MIKA_DASHBOARD_TOKEN` env var (falls back to `VITE_MIKA_TOKEN`).
+- `MIKA_DASHBOARD_TOKEN` — Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN` (backwards compatible). `MIKA_INTERNAL_TOKEN` is always accepted on all routes (superuser). Dashboard frontend uses `VITE_MIKA_DASHBOARD_TOKEN` env var.
 
 Optional (log files — logs go to stdout + file when set):
 - `MIKA_SERVER_LOG_FILE` — File path for mika-server log output

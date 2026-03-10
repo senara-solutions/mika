@@ -1,5 +1,5 @@
-const API_BASE = '/api/v1'
-const TOKEN = import.meta.env.VITE_MIKA_DASHBOARD_TOKEN ?? import.meta.env.VITE_MIKA_TOKEN ?? ''
+export const API_BASE = '/api/v1'
+export const TOKEN = import.meta.env.VITE_MIKA_DASHBOARD_TOKEN ?? ''
 
 export interface PaginatedResponse<T> {
   data: T[]

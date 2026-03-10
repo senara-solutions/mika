@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_MIKA_TOKEN: string
+  readonly VITE_MIKA_DASHBOARD_TOKEN: string
 }
 
 interface ImportMeta {
