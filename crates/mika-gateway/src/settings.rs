@@ -57,7 +57,14 @@ impl GatewaySettings {
                     .separator("__"),
             )
             .build()?
-            .try_deserialize()?;
+            .try_deserialize()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load gateway settings: {e}. \
+                 Run `mika setup --mode compose` to generate a .env file, \
+                 or set the required MIKA_* env vars directly."
+                )
+            })?;
 
         // Validate webhook URL is well-formed
         reqwest::Url::parse(&settings.telegram_webhook_url)

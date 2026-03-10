@@ -8,3 +8,4 @@ todos/
 scripts/
 .claude/
 .github/
+docker-compose.yml

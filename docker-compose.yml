@@ -1,0 +1,49 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    env_file: .env
+    ports:
+      - "8081:8080"
+    volumes:
+      - agent-data:/home/mika/.mika
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    env_file: .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    profiles: [db]
+    environment:
+      POSTGRES_USER: mika
+      POSTGRES_PASSWORD: mika
+      POSTGRES_DB: mika
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mika"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  agent-data:
+  pg-data:
