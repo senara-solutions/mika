@@ -382,13 +382,29 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         }
     }
 
-    let default_agent = home::read_active_agent(global_home);
+    let mut default_agent = home::read_active_agent(global_home);
     info!(
         agents = ?agents.keys().collect::<Vec<_>>(),
         default = %default_agent,
         "discovered {} agent(s)",
         agents.len()
     );
+
+    // Validate the active agent exists; fall back to the first available agent
+    // if the active_agent file points to a name that no longer exists.
+    if !agents.contains_key(&default_agent) {
+        if let Some(fallback) = agents.keys().next() {
+            warn!(
+                requested = %default_agent,
+                fallback = %fallback,
+                "active agent not found, falling back"
+            );
+            default_agent = fallback.clone();
+            let _ = home::write_active_agent(global_home, &default_agent);
+        } else {
+            anyhow::bail!("no agents available");
+        }
+    }
 
     // Create an unscoped dashboard DB handle that shares the same DB thread
     // as the default agent. Dashboard queries don't filter by agent_id.

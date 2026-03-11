@@ -1036,9 +1036,20 @@ impl Database {
 
         // SQLite cannot ALTER CHECK constraints, so we must rebuild the tasks table.
         // Entire migration wrapped in a transaction to prevent partial state on crash.
+        //
+        // PRAGMA foreign_keys must be OFF during the table rebuild because the INSERT
+        // copies self-referencing parent_task_id rows, and ALTER TABLE RENAME validates
+        // FK references. Also disable FK checks to avoid issues with the temporary table.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
 
         let result = (|| -> Result<()> {
+            // Drop the unified_timeline VIEW first — it references the `tasks` table.
+            // SQLite 3.25+ validates all views/triggers during ALTER TABLE RENAME,
+            // so the view must not exist when we rename tasks_new → tasks.
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+
             self.conn.execute_batch(
             "CREATE TABLE tasks_new (
                 id TEXT PRIMARY KEY,
@@ -1129,9 +1140,7 @@ impl Database {
                 AND status IN ('pending', 'in_progress', 'blocked');",
         )?;
 
-            // Recreate unified_timeline VIEW (references tasks table)
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+            // Recreate unified_timeline VIEW (was dropped before table rebuild)
             self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
             self.conn
@@ -1143,10 +1152,12 @@ impl Database {
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT;")?;
+                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
                 Ok(())
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK;");
+                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
                 Err(e)
             }
         }
