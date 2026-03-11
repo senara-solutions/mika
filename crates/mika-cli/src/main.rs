@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
+        Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
     }
 }
 
@@ -302,6 +303,7 @@ mod tests {
             "ask",
             "agents",
             "teams",
+            "doctor",
         ] {
             assert!(
                 markdown.contains(name),
