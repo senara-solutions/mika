@@ -61,6 +61,11 @@ pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     ("self_model", "No interaction history yet."),
     ("current_priorities", "No priorities set yet."),
     ("key_people", "No people tracked yet."),
+    (
+        "workflows",
+        "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a \
+         corresponding work item created first (via create_work_item). No exceptions.",
+    ),
 ];
 
 pub fn core_memory_section_names() -> Vec<&'static str> {
