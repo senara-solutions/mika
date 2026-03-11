@@ -7,6 +7,7 @@ pub mod db;
 pub mod mcp;
 pub mod messaging;
 pub mod prompt;
+pub mod rewind;
 pub mod server;
 pub mod skills;
 pub mod startup;

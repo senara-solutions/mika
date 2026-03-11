@@ -2874,6 +2874,270 @@ impl Database {
         Ok(count)
     }
 
+    // ===== Rewind =====
+
+    /// Get audit events by a list of trace_ids, ordered by id DESC for reverse-chronological reversal.
+    /// Excludes events already marked as rewound.
+    pub fn get_audit_events_by_trace_ids(
+        &self,
+        agent_id: &str,
+        trace_ids: &[String],
+    ) -> Result<Vec<AuditEvent>> {
+        if trace_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders: Vec<String> = (0..trace_ids.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM audit_events WHERE agent_id = ?1 AND trace_id IN ({}) AND rewound_by_trace_id IS NULL ORDER BY id DESC",
+            Self::AUDIT_EVENT_COLS,
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(agent_id.to_string()));
+        for tid in trace_ids {
+            params_vec.push(Box::new(tid.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(&*param_refs, Self::row_to_audit_event)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Get messages after a given message ID within a session.
+    pub fn get_messages_after_id(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.session_id = ?2 AND m.id > ?3
+              ORDER BY m.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![agent_id, session_id, after_id],
+                Self::row_to_session_message,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Get the compaction boundary — the highest message ID that has been compacted.
+    pub fn get_compaction_boundary(&self, agent_id: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT compacted_through_id FROM messages
+                  WHERE agent_id = ?1 AND role = 'summary'
+                  ORDER BY id DESC LIMIT 1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Delete messages after a given ID in a session. Returns count deleted.
+    pub fn delete_messages_after_id(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        after_id: i64,
+    ) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM messages WHERE agent_id = ?1 AND session_id = ?2 AND id > ?3",
+            params![agent_id, session_id, after_id],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Mark audit events as rewound by setting rewound_by_trace_id.
+    pub fn mark_audit_events_rewound(
+        &self,
+        agent_id: &str,
+        trace_ids: &[String],
+        rewind_trace_id: &str,
+    ) -> Result<usize> {
+        if trace_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders: Vec<String> = (0..trace_ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect();
+        let sql = format!(
+            "UPDATE audit_events SET rewound_by_trace_id = ?1
+             WHERE agent_id = ?2 AND trace_id IN ({}) AND rewound_by_trace_id IS NULL",
+            placeholders.join(", ")
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(rewind_trace_id.to_string()));
+        params_vec.push(Box::new(agent_id.to_string()));
+        for tid in trace_ids {
+            params_vec.push(Box::new(tid.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let updated = self.conn.execute(&sql, &*param_refs)?;
+        Ok(updated)
+    }
+
+    /// Delete a person by canonical name. Unlinks commitments first (sets person_id = NULL).
+    /// Returns true if a person was deleted.
+    pub fn delete_person_by_name(&self, agent_id: &str, name: &str) -> Result<bool> {
+        // Unlink commitments from this person
+        let person_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM people WHERE agent_id = ?1 AND canonical_name = ?2",
+                params![agent_id, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(pid) = person_id else {
+            return Ok(false);
+        };
+        self.conn.execute(
+            "UPDATE commitments SET person_id = NULL WHERE person_id = ?1",
+            params![pid],
+        )?;
+        // Delete search content
+        self.delete_search_content(agent_id, "person", pid)?;
+        // Delete the person
+        let deleted = self.conn.execute(
+            "DELETE FROM people WHERE agent_id = ?1 AND canonical_name = ?2",
+            params![agent_id, name],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete a preference by category. Returns true if deleted.
+    pub fn delete_preference(&self, agent_id: &str, category: &str) -> Result<bool> {
+        // Clean up search content — preference content is "{category}: {value}".
+        // source_id from set_preference (last_insert_rowid) can be unreliable for upserts,
+        // so we find the search_content row by content prefix match instead.
+        let content_prefix = format!("{category}: ");
+        let existing: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, content FROM search_content
+                  WHERE agent_id = ?1 AND source_type = 'preference' AND content LIKE ?2 || '%'",
+                params![agent_id, content_prefix],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, content)) = existing {
+            let _ = self.conn.execute(
+                "INSERT INTO fts_search(fts_search, rowid, content) VALUES ('delete', ?1, ?2)",
+                params![id, content],
+            );
+            let _ = self
+                .conn
+                .execute("DELETE FROM vec_search WHERE rowid = ?1", params![id]);
+            self.conn
+                .execute("DELETE FROM search_content WHERE id = ?1", params![id])?;
+        }
+        let deleted = self.conn.execute(
+            "DELETE FROM preferences WHERE agent_id = ?1 AND category = ?2",
+            params![agent_id, category],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete a commitment by description. Returns true if deleted.
+    pub fn delete_commitment_by_description(
+        &self,
+        agent_id: &str,
+        description: &str,
+    ) -> Result<bool> {
+        let commitment_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM commitments WHERE agent_id = ?1 AND description = ?2 COLLATE NOCASE",
+                params![agent_id, description],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(cid) = commitment_id else {
+            return Ok(false);
+        };
+        self.delete_search_content(agent_id, "commitment", cid)?;
+        let deleted = self.conn.execute(
+            "DELETE FROM commitments WHERE id = ?1 AND agent_id = ?2",
+            params![cid, agent_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete an event by description. Returns true if deleted.
+    pub fn delete_event_by_description(&self, agent_id: &str, description: &str) -> Result<bool> {
+        let event_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM events WHERE agent_id = ?1 AND description = ?2 COLLATE NOCASE",
+                params![agent_id, description],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(eid) = event_id else {
+            return Ok(false);
+        };
+        self.delete_search_content(agent_id, "event", eid)?;
+        let deleted = self.conn.execute(
+            "DELETE FROM events WHERE id = ?1 AND agent_id = ?2",
+            params![eid, agent_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Get tasks created by the given trace_ids (via created_trace_id column).
+    /// Returns tasks ordered by created_at DESC.
+    pub fn get_tasks_by_trace_ids(
+        &self,
+        agent_id: &str,
+        trace_ids: &[String],
+    ) -> Result<Vec<Task>> {
+        if trace_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders: Vec<String> = (0..trace_ids.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE agent_id = ?1 AND created_trace_id IN ({}) ORDER BY created_at DESC",
+            Self::TASK_COLUMNS,
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(agent_id.to_string()));
+        for tid in trace_ids {
+            params_vec.push(Box::new(tid.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(&*param_refs, Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Delete a task by ID. Returns true if deleted.
+    /// Only deletes tasks that are not in a terminal actioned state.
+    pub fn delete_task_by_id(&self, id: &str, agent_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM tasks WHERE id = ?1 AND agent_id = ?2",
+            params![id, agent_id],
+        )?;
+        Ok(n > 0)
+    }
+
     // ===== Heartbeat =====
 
     pub fn record_heartbeat_send(&self, agent_id: &str) -> Result<()> {

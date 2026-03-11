@@ -883,6 +883,85 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_audit_events(&a, &s)).await
     }
 
+    // -- Rewind --
+
+    pub async fn get_audit_events_by_trace_ids(
+        &self,
+        trace_ids: Vec<String>,
+    ) -> Result<Vec<AuditEvent>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_audit_events_by_trace_ids(&a, &trace_ids))
+            .await
+    }
+
+    pub async fn get_messages_after_id(
+        &self,
+        session_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<SessionMessage>> {
+        let (a, s) = (self.agent_id.clone(), session_id.to_owned());
+        self.with_db(move |db| db.get_messages_after_id(&a, &s, after_id))
+            .await
+    }
+
+    pub async fn get_compaction_boundary(&self) -> Result<Option<i64>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_compaction_boundary(&a)).await
+    }
+
+    pub async fn delete_messages_after_id(&self, session_id: &str, after_id: i64) -> Result<usize> {
+        let (a, s) = (self.agent_id.clone(), session_id.to_owned());
+        self.with_db(move |db| db.delete_messages_after_id(&a, &s, after_id))
+            .await
+    }
+
+    pub async fn mark_audit_events_rewound(
+        &self,
+        trace_ids: Vec<String>,
+        rewind_trace_id: &str,
+    ) -> Result<usize> {
+        let (a, rt) = (self.agent_id.clone(), rewind_trace_id.to_owned());
+        self.with_db(move |db| db.mark_audit_events_rewound(&a, &trace_ids, &rt))
+            .await
+    }
+
+    pub async fn delete_person_by_name(&self, name: &str) -> Result<bool> {
+        let (a, n) = (self.agent_id.clone(), name.to_owned());
+        self.with_db(move |db| db.delete_person_by_name(&a, &n))
+            .await
+    }
+
+    pub async fn delete_preference(&self, category: &str) -> Result<bool> {
+        let (a, c) = (self.agent_id.clone(), category.to_owned());
+        self.with_db(move |db| db.delete_preference(&a, &c)).await
+    }
+
+    pub async fn delete_commitment_by_description(&self, description: &str) -> Result<bool> {
+        let (a, d) = (self.agent_id.clone(), description.to_owned());
+        self.with_db(move |db| db.delete_commitment_by_description(&a, &d))
+            .await
+    }
+
+    pub async fn delete_event_by_description(&self, description: &str) -> Result<bool> {
+        let (a, d) = (self.agent_id.clone(), description.to_owned());
+        self.with_db(move |db| db.delete_event_by_description(&a, &d))
+            .await
+    }
+
+    pub async fn get_tasks_by_trace_ids(
+        &self,
+        trace_ids: &[String],
+    ) -> Result<Vec<crate::db::Task>> {
+        let (a, t) = (self.agent_id.clone(), trace_ids.to_vec());
+        self.with_db(move |db| db.get_tasks_by_trace_ids(&a, &t))
+            .await
+    }
+
+    pub async fn delete_task_by_id(&self, id: &str) -> Result<bool> {
+        let (a, i) = (self.agent_id.clone(), id.to_owned());
+        self.with_db(move |db| db.delete_task_by_id(&i, &a)).await
+    }
+
     // -- Reflection --
 
     pub async fn get_messages_since(&self, since_unix: i64) -> Result<Vec<SessionMessage>> {
