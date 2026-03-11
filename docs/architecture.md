@@ -146,6 +146,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 | `self_model` | "I am {agent_id}. No interaction history yet." |
 | `current_priorities` | "No priorities set yet." |
 | `key_people` | "No people tracked yet." |
+| `workflows` | "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a corresponding work item created first (via create_work_item). No exceptions." |
 
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
@@ -223,7 +224,7 @@ remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_em
 | `create_agent` | Create a new agent with name, display name, soul (personality), and optional model override. | default (30s) | Yes |
 | `list_agents` | List all configured agents with their identities and role hints. | default (30s) | Yes |
 | `create_team` | Create a new team definition with specified agents and flow. All referenced agents must exist. | default (30s) | Yes |
-| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
+| `delegate_task` | Delegate a task to another agent and get their response. Requires `work_item_id` (must create a work item first). Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
 | `list_teams` | List all configured teams with full configuration (roles, mandates, max_iterations). | default (30s) | No |
 | `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s | No |
 | `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) | No |
@@ -740,10 +741,14 @@ sends in a background task (does not block message processing).
 ### Agent Delegation
 
 When multiple agents are configured, the primary agent can delegate tasks to other
-agents via the `delegate_task` tool. The delegate runs with its own personality,
-memory, and skills but receives only `default_tools()` (no management tools, no MCP)
-to prevent infinite delegation chains. The system prompt includes an "Agents & Teams"
-section listing available agents with their identities (emoji + name).
+agents via the `delegate_task` tool. **Work item guard:** `delegate_task` requires a
+`work_item_id` parameter — the agent must create a work item first using
+`create_work_item`, then pass its ID. Calls without a valid, active work item are
+rejected at code level. Long-running skill executions enforce the same guard via
+schema injection (`inject_work_item_id_field`). The delegate runs with its own
+personality, memory, and skills but receives only `default_tools()` (no management
+tools, no MCP) to prevent infinite delegation chains. The system prompt includes an
+"Agents & Teams" section listing available agents with their identities (emoji + name).
 
 ### Team Workflows
 
