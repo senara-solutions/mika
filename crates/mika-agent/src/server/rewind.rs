@@ -13,6 +13,9 @@ pub struct RewindRequest {
     /// Target agent name (defaults to the server's default agent if absent).
     #[serde(default)]
     pub agent: String,
+    /// For cross-session rewinds, the session that initiated the rewind.
+    #[serde(default)]
+    pub originating_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +59,7 @@ pub struct RewindResultResponse {
     pub tasks_deleted: usize,
     pub tasks_cancelled: usize,
     pub warnings: Vec<String>,
+    pub reversal_descriptions: Vec<String>,
     pub rewind_trace_id: String,
 }
 
@@ -277,7 +281,13 @@ pub async fn handle_rewind_execute(
         }
     };
 
-    match rewind::execute_rewind(&agent_state.db, &req.session_id, req.after_message_id, None).await
+    match rewind::execute_rewind(
+        &agent_state.db,
+        &req.session_id,
+        req.after_message_id,
+        req.originating_session_id.as_deref(),
+    )
+    .await
     {
         Ok(result) => {
             let resp = RewindResultResponse {
@@ -287,6 +297,7 @@ pub async fn handle_rewind_execute(
                 tasks_deleted: result.tasks_deleted,
                 tasks_cancelled: result.tasks_cancelled,
                 warnings: result.warnings,
+                reversal_descriptions: result.reversal_descriptions,
                 rewind_trace_id: result.rewind_trace_id,
             };
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()

@@ -33,8 +33,6 @@ pub enum ReversalAction {
     Restore,
     /// Creation: delete the created record
     Delete,
-    /// Deletion: re-insert from before_value (not yet needed — no delete tools exist)
-    Reinsert,
     /// Cannot reverse (missing data)
     Skip,
 }
@@ -702,10 +700,13 @@ fn build_rewind_marker(result: &RewindResult, originating_session_id: Option<&st
         result.messages_deleted
     );
     if !result.reversal_descriptions.is_empty() {
+        marker.push_str("\n<rewind_reversals trust=\"internal\">");
         marker.push_str("\nMemory changes reversed:");
         for desc in &result.reversal_descriptions {
-            marker.push_str(&format!("\n- {desc}"));
+            let sanitized = truncate_content(desc, 200);
+            marker.push_str(&format!("\n- {sanitized}"));
         }
+        marker.push_str("\n</rewind_reversals>");
     }
     if let Some(orig) = originating_session_id {
         let truncated = &orig[..orig.len().min(8)];
@@ -752,7 +753,6 @@ pub fn format_preview(preview: &RewindPreview) -> String {
             let icon = match rev.action {
                 ReversalAction::Restore => "↩",
                 ReversalAction::Delete => "🗑",
-                ReversalAction::Reinsert => "➕",
                 ReversalAction::Skip => "⏭",
             };
             lines.push(format!("  {icon} {}", rev.description));
@@ -1442,9 +1442,11 @@ mod tests {
             rewind_trace_id: "test".to_string(),
         };
         let marker = build_rewind_marker(&result, None);
+        assert!(marker.contains("<rewind_reversals trust=\"internal\">"));
         assert!(marker.contains("Memory changes reversed:"));
         assert!(marker.contains("- Restore core_memory"));
         assert!(marker.contains("- Delete person:Sarah"));
+        assert!(marker.contains("</rewind_reversals>"));
     }
 
     #[test]
@@ -1461,5 +1463,25 @@ mod tests {
         };
         let marker = build_rewind_marker(&result, Some("abcdefghijklmnop"));
         assert!(marker.contains("initiated from a different session (abcdefgh)"));
+    }
+
+    #[test]
+    fn test_build_rewind_marker_truncates_long_descriptions() {
+        let long_desc = "A".repeat(300);
+        let result = RewindResult {
+            messages_deleted: 1,
+            reversals_applied: 1,
+            reversals_skipped: 0,
+            tasks_deleted: 0,
+            tasks_cancelled: 0,
+            warnings: vec![],
+            reversal_descriptions: vec![long_desc],
+            rewind_trace_id: "test".to_string(),
+        };
+        let marker = build_rewind_marker(&result, None);
+        // 200 chars + "..." = 203 chars max per description
+        assert!(marker.contains(&"A".repeat(200)));
+        assert!(marker.contains(&format!("{}...", "A".repeat(200))));
+        assert!(!marker.contains(&"A".repeat(201)));
     }
 }

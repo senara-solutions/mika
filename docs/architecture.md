@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -636,6 +636,9 @@ This separation lets you give dashboard users a read-only token that cannot muta
 | `/health` | GET | None | Liveness/readiness probe |
 | `/message` | POST | Internal token | Receives messages (202 async processing, 10MB body limit) |
 | `/tasks/{id}/complete` | POST | Internal token | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
+| `/api/v1/rewind/resolve` | POST | Internal token | Resolve recent exchanges for a session (returns anchor point and trace IDs) |
+| `/api/v1/rewind/preview` | POST | Internal token | Preview a rewind operation (messages to delete, reversals, task cancellations, warnings) |
+| `/api/v1/rewind/execute` | POST | Internal token | Execute a rewind (delete messages, reverse mutations, cancel tasks, inject context marker) |
 
 ### Dashboard API (read-only)
 
@@ -820,7 +823,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 8 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index)
+**Schema version:** 9 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index)
 
 ### Tables
 
@@ -836,7 +839,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
 | `preferences` | Layer 2 user preferences (`agent_id` FK) |
 | `events` | Layer 2 notable events (`agent_id` FK) |
-| `audit_events` | Audit log for all memory mutations (`agent_id` FK, `trace_id`) |
+| `audit_events` | Audit log for all memory mutations (`agent_id` FK, `trace_id`, `rewound_by_trace_id`) |
 | `customer_config` | Key-value store (timezone, chat_id) |
 | `failed_sends` | Durable outbox for failed outbound messages |
 | `audit_event_summaries` | Tiered retention summaries (monthly) |
