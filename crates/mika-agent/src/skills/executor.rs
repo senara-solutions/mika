@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use base64::Engine;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::index::ResolvedSkillTool;
 use super::manifest::ToolHandler;
@@ -267,8 +267,8 @@ async fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec
 ///
 /// - Resolves the command path relative to the skill directory
 /// - Pipes input JSON to stdin
-/// - Returns stdout on success, stderr + exit code on failure
-/// - Detects `__mika_v1` envelope for image-bearing results
+/// - Returns stdout regardless of exit code; prefixes `Exit code: N` on non-zero
+/// - Detects `__mika_v1` envelope for image-bearing results (exit 0 only)
 async fn execute_exec(
     command: &str,
     skill_dir: &std::path::Path,
@@ -322,41 +322,42 @@ async fn execute_exec(
 
     let output = child.wait_with_output().await?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Log successful output for debugging silent failures
-        // Use char-boundary-safe slicing to avoid panics on multi-byte UTF-8
-        let stdout_end = {
-            let mut b = stdout.len().min(200);
-            while b > 0 && !stdout.is_char_boundary(b) {
+    // Log output for debugging (regardless of exit code)
+    // Use char-boundary-safe slicing to avoid panics on multi-byte UTF-8
+    let stdout_end = {
+        let mut b = stdout.len().min(200);
+        while b > 0 && !stdout.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    };
+    debug!(
+        tool = %tool_name,
+        exit_success = output.status.success(),
+        stdout_len = stdout.len(),
+        stdout_preview = %&stdout[..stdout_end],
+        "skill exec output"
+    );
+    if !stderr.trim().is_empty() {
+        let stderr_end = {
+            let mut b = stderr.len().min(500);
+            while b > 0 && !stderr.is_char_boundary(b) {
                 b -= 1;
             }
             b
         };
-        tracing::debug!(
+        debug!(
             tool = %tool_name,
-            stdout_len = stdout.len(),
-            stdout_preview = %&stdout[..stdout_end],
-            "skill exec succeeded"
+            stderr = %&stderr[..stderr_end],
+            "skill exec stderr"
         );
-        if !stderr.trim().is_empty() {
-            let stderr_end = {
-                let mut b = stderr.len().min(500);
-                while b > 0 && !stderr.is_char_boundary(b) {
-                    b -= 1;
-                }
-                b
-            };
-            tracing::debug!(
-                tool = %tool_name,
-                stderr = %&stderr[..stderr_end],
-                "skill exec stderr on success"
-            );
-        }
+    }
 
-        // Try to parse as __mika_v1 image envelope
+    if output.status.success() {
+        // Exit 0: parse envelope and return stdout
         if let Some(envelope) = try_parse_envelope(&stdout) {
             let (images, errors) = process_envelope_images(&envelope.images).await;
             let mut text = truncate_output(&envelope.text);
@@ -374,12 +375,41 @@ async fn execute_exec(
             Ok(ToolOutput::success(truncate_output(&stdout)))
         }
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
-        Ok(ToolOutput::error(format!(
-            "Process exited with code {exit_code}: {}",
-            truncate_output(&stderr)
-        )))
+        // Non-zero exit: return success with exit code prefix.
+        // The agent decides whether the exit code represents a real failure —
+        // many tools (grep, linters, health checks) use non-zero to signal
+        // status, not errors.
+        let code_display = match output.status.code() {
+            Some(code) => format!("Exit code: {code}"),
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    match output.status.signal() {
+                        Some(sig) => format!("Killed by signal: {sig}"),
+                        None => "Exit code: unknown".to_string(),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    "Exit code: unknown".to_string()
+                }
+            }
+        };
+
+        // Combine stdout and stderr. Append stderr only if it has content
+        // not already in stdout (run.sh merges them with 2>&1).
+        let mut combined = stdout.to_string();
+        let stderr_trimmed = stderr.trim();
+        if !stderr_trimmed.is_empty() && stderr_trimmed != stdout.trim() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(stderr_trimmed);
+        }
+
+        let truncated = truncate_output(&combined);
+        Ok(ToolOutput::success(format!("{code_display}\n{truncated}")))
     }
 }
 
@@ -699,7 +729,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_exec_handler_failure() {
+    async fn test_exec_handler_nonzero_exit_returns_output() {
         let tmp = tempfile::tempdir().unwrap();
         write_script(
             &tmp.path().join("fail.sh"),
@@ -708,9 +738,126 @@ mod tests {
 
         let tool = make_exec_tool(tmp.path(), "fail.sh");
         let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
-        assert!(output.is_error);
-        assert!(output.content.contains("exit"));
-        assert!(output.content.contains("error msg"));
+        // Non-zero exit is NOT a tool error — the process ran to completion
+        assert!(!output.is_error, "non-zero exit should not be is_error");
+        assert!(
+            output.content.contains("Exit code: 1"),
+            "should contain exit code, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("error msg"),
+            "should contain stderr output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_with_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("status.sh"),
+            "#!/bin/sh\necho 'CRITICAL: disk usage 95%'\nexit 2",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "status.sh");
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        assert!(
+            !output.is_error,
+            "non-zero exit should not be is_error, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("Exit code: 2"),
+            "should contain exit code 2, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("CRITICAL: disk usage 95%"),
+            "should contain stdout, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_empty_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("silent_fail.sh"), "#!/bin/sh\nexit 3");
+
+        let tool = make_exec_tool(tmp.path(), "silent_fail.sh");
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        assert!(!output.is_error, "non-zero exit should not be is_error");
+        assert!(
+            output.content.contains("Exit code: 3"),
+            "should contain exit code 3, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_via_run_sh() {
+        // Regression test for the double problem: run.sh merges stderr into stdout
+        // via 2>&1, so on non-zero exit the executor must read stdout (not stderr).
+        let (_tmp, tool) = setup_shell_exec_handler();
+        let input = serde_json::json!({"command": "echo 'health check output' && exit 2"});
+        let output = execute_skill_tool(&tool, input, 30, None).await;
+        assert!(
+            !output.is_error,
+            "non-zero exit via run.sh should not be is_error, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("Exit code: 2"),
+            "should contain exit code 2, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("health check output"),
+            "should contain stdout from run.sh, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_exit_zero_unchanged() {
+        // Exit 0 should NOT have an exit code prefix
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("ok.sh"), "#!/bin/sh\necho 'all good'");
+
+        let tool = make_exec_tool(tmp.path(), "ok.sh");
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        assert!(!output.is_error);
+        assert!(
+            !output.content.contains("Exit code:"),
+            "exit 0 should not have exit code prefix, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("all good"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_stdout_and_stderr() {
+        // When stdout and stderr have different content, both should appear
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("both.sh"),
+            "#!/bin/sh\necho 'stdout line'\necho 'stderr line' >&2\nexit 1",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "both.sh");
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        assert!(!output.is_error);
+        assert!(output.content.contains("Exit code: 1"));
+        assert!(
+            output.content.contains("stdout line"),
+            "should contain stdout, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("stderr line"),
+            "should contain stderr, got: {}",
+            output.content
+        );
     }
 
     #[tokio::test]
