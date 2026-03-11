@@ -213,6 +213,8 @@ impl Tool for CreateTaskTool {
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
             created_trace_id: Some(ctx.trace_id.to_string()),
+            reference_url: None,
+            source: None,
         };
 
         let id = ctx.db.create_task(task).await?;

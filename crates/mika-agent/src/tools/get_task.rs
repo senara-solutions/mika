@@ -57,9 +57,11 @@ impl Tool for GetTaskTool {
             .unwrap_or_else(|| "none".to_string());
         let result = task.result.as_deref().unwrap_or("none");
         let created = format_unix_ts(task.created_at);
+        let ref_url = task.reference_url.as_deref().unwrap_or("none");
+        let source = task.source.as_deref().unwrap_or("none");
 
         let output = format!(
-            "Task: {}\nLabel: {}\nStatus: {}\nTrigger: {}\nAction: {}\nCreated: {}\nNext fire: {}\nTimeout: {}\nResult: {}",
+            "Task: {}\nLabel: {}\nStatus: {}\nTrigger: {}\nAction: {}\nCreated: {}\nNext fire: {}\nTimeout: {}\nReference: {}\nSource: {}\nResult: {}",
             task.id,
             task.label,
             task.status,
@@ -68,6 +70,8 @@ impl Tool for GetTaskTool {
             created,
             next_fire,
             timeout,
+            ref_url,
+            source,
             result,
         );
 
@@ -102,6 +106,8 @@ mod tests {
                 input_context: None,
                 created_by_session: None,
                 created_trace_id: None,
+                reference_url: None,
+                source: None,
             })
             .await
             .unwrap()

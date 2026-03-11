@@ -783,6 +783,8 @@ impl TeamEngine {
             input_context: Some(team_state),
             created_by_session: Some(format!("team-{}", self.run.run_id)),
             created_trace_id: Some(self.trace_id.clone()),
+            reference_url: None,
+            source: None,
         };
 
         let parent_task_id = self
@@ -813,6 +815,8 @@ impl TeamEngine {
                 input_context: None,
                 created_by_session: Some(format!("team-{}-{}", self.run.run_id, input.agent_name)),
                 created_trace_id: Some(self.trace_id.clone()),
+                reference_url: None,
+                source: None,
             };
 
             match self.team_db.create_task(child_task).await {

@@ -560,6 +560,8 @@ async fn run_investigation(
         brave_api_key: None,
         skills_dirty: &skills_dirty,
         is_reflection: false,
+        is_task_context: false,
+        is_callback_turn: false,
     };
 
     for _step in 0..MAX_INVESTIGATION_STEPS {

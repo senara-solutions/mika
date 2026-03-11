@@ -770,6 +770,8 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
+        is_task_context: false,
+        is_callback_turn: params.is_callback_turn,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -919,7 +921,7 @@ async fn process_tool_calls(
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
-            let input_summary = input.to_string();
+            let input_summary = truncate_summary(&input.to_string(), 500);
             let dispatch = ToolDispatchCtx {
                 tools,
                 skill_tools,
@@ -931,9 +933,12 @@ async fn process_tool_calls(
             let output = execute_tool(&dispatch, name, input.clone()).await;
             let image_count = output.images.len();
             let output_summary = if image_count > 0 {
-                format!("{} [+{} image(s)]", output.content, image_count)
+                truncate_summary(
+                    &format!("{} [+{image_count} image(s)]", output.content),
+                    500,
+                )
             } else {
-                output.content.clone()
+                truncate_summary(&output.content, 500)
             };
             summaries.push(ToolCallSummary {
                 step,
@@ -1300,6 +1305,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         }
     };
 
+    let pending_work_items = db.list_active_work_items().await.unwrap_or_default();
     let chat_id = db.get_customer_config("chat_id").await?;
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
@@ -1314,6 +1320,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         recent_conversations: conversations_digest.as_deref(),
         recent_audit_events: audit_events_digest.as_deref(),
         home_dir: Some(params.home_dir),
+        pending_work_items: &pending_work_items,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -1359,6 +1366,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
         is_reflection,
+        is_task_context: true,
+        is_callback_turn: false,
     };
 
     let mut request = MessagesRequest {
@@ -1552,6 +1561,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
+        is_task_context: true,
+        is_callback_turn: false,
     };
 
     let mut request = MessagesRequest {
@@ -2087,6 +2098,48 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!parsed["tool_calls"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_summary_truncates_large_inputs() {
+        // Simulate what happens when building a ToolCallSummary with large content
+        let large_input = "x".repeat(10_000);
+        let large_output = "y".repeat(10_000);
+        let input_summary = truncate_summary(&large_input, 500);
+        let output_summary = truncate_summary(&large_output, 500);
+
+        assert!(
+            input_summary.len() <= 503,
+            "input_summary too long: {} chars",
+            input_summary.len()
+        );
+        assert!(
+            output_summary.len() <= 503,
+            "output_summary too long: {} chars",
+            output_summary.len()
+        );
+        assert!(input_summary.ends_with("..."));
+        assert!(output_summary.ends_with("..."));
+
+        // Verify that a full turn of 10 truncated summaries fits in metadata cap
+        let summaries: Vec<ToolCallSummary> = (0..10)
+            .map(|i| ToolCallSummary {
+                step: i,
+                name: format!("tool_{i}"),
+                input_summary: truncate_summary(&"x".repeat(10_000), 500),
+                output_summary: truncate_summary(&"y".repeat(10_000), 500),
+                success: true,
+            })
+            .collect();
+        let json = tool_calls_metadata_json(&summaries).unwrap();
+        assert!(
+            json.len() <= TOOL_METADATA_MAX,
+            "truncated summaries still exceed cap: {} chars",
+            json.len()
+        );
+        // Should retain at least 3 entries (with tail-drop)
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["tool_calls"].as_array().unwrap().len() >= 3);
     }
 
     #[test]

@@ -55,7 +55,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 7
+**Current schema version:** 8
 
 ### Core Tables
 
@@ -85,7 +85,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Task Engine
 
-**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at INTEGER`, `timeout_at INTEGER`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `created_at`, `updated_at`, `fired_at`, `completed_at`
+**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at INTEGER`, `timeout_at INTEGER`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at`, `updated_at`, `fired_at`, `completed_at`
 
 ### Team Tables
 

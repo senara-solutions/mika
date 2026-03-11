@@ -156,16 +156,27 @@ fn extract_tool_names(metadata: &Option<String>) -> String {
     if calls.is_empty() {
         return String::new();
     }
-    let names: Vec<&str> = calls
+    let entries: Vec<String> = calls
         .iter()
-        .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+        .filter_map(|c| {
+            let name = c.get("name").and_then(|n| n.as_str())?;
+            let ok = c.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
+            Some(if ok {
+                name.to_string()
+            } else {
+                format!("{name}(err)")
+            })
+        })
         .collect();
-    if names.is_empty() {
+    if entries.is_empty() {
         return String::new();
     }
     // Deduplicate while preserving order
     let mut seen = std::collections::HashSet::new();
-    let unique: Vec<&str> = names.into_iter().filter(|n| seen.insert(*n)).collect();
+    let unique: Vec<String> = entries
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect();
     format!(" [used: {}]", unique.join(", "))
 }
 
@@ -304,6 +315,25 @@ mod tests {
         assert_eq!(
             extract_tool_names(&Some(meta.to_string())),
             " [used: search_memory, store_fact]"
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_shows_failure() {
+        let meta = r#"{"tool_calls":[{"name":"write_file","step":0,"success":true},{"name":"read_home_file","step":1,"success":false}]}"#;
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: write_file, read_home_file(err)]"
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_deduplicates_with_failure() {
+        let meta = r#"{"tool_calls":[{"name":"search_memory","step":0,"success":true},{"name":"search_memory","step":1,"success":false}]}"#;
+        // First occurrence wins in dedup
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: search_memory, search_memory(err)]"
         );
     }
 }
