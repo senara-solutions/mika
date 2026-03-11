@@ -4,6 +4,7 @@ mod handlers;
 pub mod investigate;
 pub mod json_extractor;
 pub mod openapi;
+pub mod rewind;
 pub mod state;
 pub mod types;
 
@@ -109,6 +110,14 @@ fn build_router(state: AppState) -> Router {
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
         .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
+        .route(
+            "/api/v1/rewind/preview",
+            post(rewind::handle_rewind_preview),
+        )
+        .route(
+            "/api/v1/rewind/execute",
+            post(rewind::handle_rewind_execute),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
