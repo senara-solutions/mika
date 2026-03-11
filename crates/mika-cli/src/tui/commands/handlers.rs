@@ -62,6 +62,8 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "verbose" | "v" => Some(handle_verbose(app)),
         "think" | "t" => handle_think(app, args).await,
         "attach" | "img" => Some(handle_attach(app, args)),
+        "undo" => Some(handle_undo(app).await),
+        "rewind" => Some(handle_rewind(app, args).await),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -848,6 +850,114 @@ fn handle_attach(app: &mut App<'_>, args: &str) -> String {
     }
 }
 
+async fn handle_undo(app: &mut App<'_>) -> String {
+    handle_rewind_impl(app, 1, None).await
+}
+
+async fn handle_rewind(app: &mut App<'_>, args: &str) -> String {
+    let args = args.trim();
+
+    if args.is_empty() {
+        return "Usage: /rewind <count> or /rewind to <message_id>".to_string();
+    }
+
+    // /rewind to <message_id>
+    if let Some(id_str) = args
+        .strip_prefix("to ")
+        .or_else(|| args.strip_prefix("to\t"))
+    {
+        let id_str = id_str.trim();
+        match id_str.parse::<i64>() {
+            Ok(msg_id) if msg_id > 0 => return handle_rewind_impl(app, 0, Some(msg_id)).await,
+            _ => return format!("Invalid message ID: '{id_str}'. Must be a positive integer."),
+        }
+    }
+
+    // /rewind <count>
+    match args.parse::<usize>() {
+        Ok(count) if count > 0 => handle_rewind_impl(app, count, None).await,
+        Ok(_) => "Rewind count must be at least 1.".to_string(),
+        Err(_) => {
+            format!("Invalid argument: '{args}'. Usage: /rewind <count> or /rewind to <message_id>")
+        }
+    }
+}
+
+async fn handle_rewind_impl(
+    app: &mut App<'_>,
+    exchange_count: usize,
+    after_message_id: Option<i64>,
+) -> String {
+    use mika_agent::rewind;
+
+    if app.status != AgentStatus::Idle {
+        return "Cannot rewind while agent is busy.".to_string();
+    }
+
+    // Determine the anchor message ID
+    let anchor_id = if let Some(id) = after_message_id {
+        id
+    } else {
+        // Find N recent exchanges
+        match rewind::find_recent_exchanges(&app.db, &app.session_id, exchange_count).await {
+            Ok(Some((anchor, _trace_ids))) => anchor,
+            Ok(None) => return "No exchanges found to rewind.".to_string(),
+            Err(e) => return format!("Error finding exchanges: {e}"),
+        }
+    };
+
+    // Preview
+    let preview = match rewind::preview_rewind(&app.db, &app.session_id, anchor_id).await {
+        Ok(p) => p,
+        Err(e) => return format!("Error previewing rewind: {e}"),
+    };
+
+    if preview.blocked {
+        return format!(
+            "Rewind blocked: {}",
+            preview.block_reason.unwrap_or_default()
+        );
+    }
+
+    // Show preview and execute (no confirmation in TUI — the preview is shown as output)
+    let preview_text = rewind::format_preview(&preview);
+
+    // Execute
+    match rewind::execute_rewind(&app.db, &app.session_id, anchor_id).await {
+        Ok(result) => {
+            // Remove rewound messages from the TUI display.
+            // Count the user+assistant messages being deleted and remove from the end.
+            let display_msgs_to_remove = preview
+                .messages
+                .iter()
+                .filter(|m| m.role == "user" || m.role == "assistant")
+                .count();
+            let keep = app.messages.len().saturating_sub(display_msgs_to_remove);
+            app.messages.truncate(keep);
+
+            let mut output = preview_text;
+            output.push_str(&format!(
+                "\n\nRewind complete: {} messages deleted, {} reversals applied.",
+                result.messages_deleted, result.reversals_applied
+            ));
+            if result.tasks_deleted > 0 || result.tasks_cancelled > 0 {
+                output.push_str(&format!(
+                    "\nTasks: {} deleted, {} cancelled.",
+                    result.tasks_deleted, result.tasks_cancelled
+                ));
+            }
+            if !result.warnings.is_empty() {
+                output.push_str("\n\nWarnings:");
+                for w in &result.warnings {
+                    output.push_str(&format!("\n  - {w}"));
+                }
+            }
+            output
+        }
+        Err(e) => format!("Rewind failed: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +985,8 @@ mod tests {
         let output = handle_help();
         assert!(output.contains("/think"));
         assert!(output.contains("/attach"));
+        assert!(output.contains("/undo"));
+        assert!(output.contains("/rewind"));
     }
 
     #[test]
@@ -913,6 +1025,7 @@ mod tests {
         // Verify agent-specific commands are NOT in the allowlist
         for cmd in &[
             "compact", "memory", "model", "think", "soul", "config", "skills", "agent", "attach",
+            "undo", "rewind",
         ] {
             assert!(
                 !TEAM_MODE_ALLOWED_COMMANDS.contains(cmd),

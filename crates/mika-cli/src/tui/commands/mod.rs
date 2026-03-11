@@ -166,6 +166,20 @@ pub const COMMANDS: &[SlashCommand] = &[
         args_hint: None,
         completer: None,
     },
+    SlashCommand {
+        name: "undo",
+        aliases: &[],
+        description: "Undo last exchange and reverse memory changes",
+        args_hint: None,
+        completer: None,
+    },
+    SlashCommand {
+        name: "rewind",
+        aliases: &[],
+        description: "Rewind N exchanges or to a message ID",
+        args_hint: Some("[<count> | to <message_id>]"),
+        completer: None,
+    },
 ];
 
 /// Resolve a thinking level keyword to (budget_tokens, level_name).
