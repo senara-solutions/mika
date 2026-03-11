@@ -255,7 +255,7 @@ The most commonly used commands:
 | `mika ask "<message>"`       | Send a message non-interactively                  |
 | `mika ask --task-id <uuid> "<result>"` | Complete a callback task (TUI delivers result to conversation) |
 | `mika tasks`                 | List scheduled tasks for the active agent         |
-| `mika skills`                | List, install, update, and manage skills           |
+| `mika skills`                | List, install, validate, and manage skills          |
 | `mika config get <key>`      | Get a configuration value                          |
 | `mika config set <key> [val]`| Set a configuration value (prompts for secrets)    |
 | `mika config list`           | List all configuration keys and values             |
