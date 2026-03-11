@@ -89,17 +89,7 @@ async fn run_get(agent_name: &str, key: &str, verbose: bool) -> Result<()> {
         get_effective_value(key, &ctx.settings)
     };
 
-    let display_value = match &value {
-        Some(v) if info.secret => {
-            if v.is_empty() {
-                "[NOT SET]".to_string()
-            } else {
-                "[REDACTED]".to_string()
-            }
-        }
-        Some(v) => v.clone(),
-        None => "[NOT SET]".to_string(),
-    };
+    let display_value = format_display_value(&value, info.secret);
 
     if verbose {
         let source = resolve_source(key, info, &ctx.home_dir, &ctx.global_home);
@@ -211,17 +201,7 @@ async fn run_list(agent_name: &str, verbose: bool) -> Result<()> {
             get_effective_value(info.key, &ctx.settings)
         };
 
-        let display_value = match &value {
-            Some(v) if info.secret => {
-                if v.is_empty() {
-                    "[NOT SET]".to_string()
-                } else {
-                    "[REDACTED]".to_string()
-                }
-            }
-            Some(v) => v.clone(),
-            None => "[NOT SET]".to_string(),
-        };
+        let display_value = format_display_value(&value, info.secret);
 
         if verbose {
             let source = resolve_source(info.key, info, &ctx.home_dir, &ctx.global_home);
@@ -236,6 +216,21 @@ async fn run_list(agent_name: &str, verbose: bool) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Format a config value for display, redacting secrets.
+fn format_display_value(value: &Option<String>, secret: bool) -> String {
+    match value {
+        Some(v) if secret => {
+            if v.is_empty() {
+                "[NOT SET]".to_string()
+            } else {
+                "[REDACTED]".to_string()
+            }
+        }
+        Some(v) => v.clone(),
+        None => "[NOT SET]".to_string(),
+    }
 }
 
 /// Determine where the current value is coming from.
@@ -439,5 +434,40 @@ mod tests {
 
         let perms = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(perms, 0o600);
+    }
+
+    #[test]
+    fn test_format_display_value() {
+        assert_eq!(format_display_value(&Some("hello".into()), false), "hello");
+        assert_eq!(
+            format_display_value(&Some("secret".into()), true),
+            "[REDACTED]"
+        );
+        assert_eq!(format_display_value(&Some("".into()), true), "[NOT SET]");
+        assert_eq!(format_display_value(&None, false), "[NOT SET]");
+        assert_eq!(format_display_value(&None, true), "[NOT SET]");
+    }
+
+    #[test]
+    fn test_get_effective_value_covers_all_non_db_non_env_keys() {
+        use mika_common::config::{CONFIG_KEYS, ConfigBackend};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Create minimal config.toml so Settings::load doesn't fail
+        std::fs::write(home.join("config.toml"), "").unwrap();
+        let settings = mika_common::config::Settings::load(home).unwrap();
+
+        for info in CONFIG_KEYS {
+            match info.backend {
+                ConfigBackend::File | ConfigBackend::ReadOnly => {
+                    // Should not panic — every File/ReadOnly key must have a branch
+                    let _ = get_effective_value(info.key, &settings);
+                }
+                ConfigBackend::Env | ConfigBackend::Database => {
+                    // Env/DB keys are resolved through other paths, skip
+                }
+            }
+        }
     }
 }

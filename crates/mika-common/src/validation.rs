@@ -25,10 +25,7 @@ pub fn validate_api_key_format(key: &str) -> Result<ApiKeyFormat, String> {
     } else if key.starts_with("sk-ant-") {
         Ok(ApiKeyFormat::ApiKey)
     } else {
-        Err(format!(
-            "Unrecognized API key format (expected sk-ant-* prefix, got {}...)",
-            &key[..key.len().min(10)]
-        ))
+        Err("Unrecognized API key format (expected sk-ant-* or sk-ant-oat* prefix)".to_string())
     }
 }
 

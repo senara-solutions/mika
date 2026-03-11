@@ -1,7 +1,7 @@
 ---
 title: "feat: Add mika doctor and config set/get/list commands"
 type: feat
-status: active
+status: completed
 date: 2026-03-11
 issues: ["#62", "#63"]
 parent: "#60"
@@ -261,35 +261,35 @@ This is the standard crate for comment-preserving TOML manipulation. Already use
 
 ### mika doctor (#62)
 
-- [ ] `mika doctor` runs all checks and shows colored [OK]/[WARN]/[FAIL] output
-- [ ] `mika doctor --json` outputs valid JSON matching defined schema
-- [ ] `mika doctor --verify-api` makes a live API call and reports result
-- [ ] Works on uninitialized installation (reports failures, doesn't crash)
-- [ ] Exit code 0 when all critical checks pass, 1 when any critical fails
-- [ ] Respects `--agent <name>` flag for agent-specific checks
-- [ ] Shared validation module in `mika-common/src/validation.rs`
+- [x] `mika doctor` runs all checks and shows colored [OK]/[WARN]/[FAIL] output
+- [x] `mika doctor --json` outputs valid JSON matching defined schema
+- [x] `mika doctor --verify-api` makes a live API call and reports result
+- [x] Works on uninitialized installation (reports failures, doesn't crash)
+- [x] Exit code 0 when all critical checks pass, 1 when any critical fails
+- [x] Respects `--agent <name>` flag for agent-specific checks
+- [x] Shared validation module in `mika-common/src/validation.rs`
 
 ### mika config set/get/list (#63)
 
-- [ ] `mika config get <key>` shows effective value for any registered key
-- [ ] `mika config set <key> <value>` writes to correct backend (File/Env/DB)
-- [ ] `mika config set <secret_key>` prompts via dialoguer::Password (never accepts CLI arg)
-- [ ] `mika config set <secret_key>` fails gracefully in non-TTY with actionable message
-- [ ] `mika config list` shows all keys with values (secrets redacted)
-- [ ] `--verbose` flag shows value source on get/list
-- [ ] File writes use `toml_edit` (preserves comments)
-- [ ] Secret writes use `dotenv::set_env_var` (atomic, 0600 perms)
-- [ ] Validates values before writing; rejects invalid input with clear error
-- [ ] Warns when env var override makes the written value ineffective
-- [ ] Existing `mika config` (no subcommand), `edit`, `soul` behavior unchanged
-- [ ] ReadOnly keys (`home_dir`, `db_path`) reject `set` with clear error
+- [x] `mika config get <key>` shows effective value for any registered key
+- [x] `mika config set <key> <value>` writes to correct backend (File/Env/DB)
+- [x] `mika config set <secret_key>` prompts via dialoguer::Password (never accepts CLI arg)
+- [x] `mika config set <secret_key>` fails gracefully in non-TTY with actionable message
+- [x] `mika config list` shows all keys with values (secrets redacted)
+- [x] `--verbose` flag shows value source on get/list
+- [x] File writes use `toml_edit` (preserves comments)
+- [x] Secret writes use `dotenv::set_env_var` (atomic, 0600 perms)
+- [x] Validates values before writing; rejects invalid input with clear error
+- [x] Warns when env var override makes the written value ineffective
+- [x] Existing `mika config` (no subcommand), `edit`, `soul` behavior unchanged
+- [x] ReadOnly keys (`home_dir`, `db_path`) reject `set` with clear error
 
 ### Shared
 
-- [ ] All new code has inline `#[cfg(test)] mod tests`
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` clean
-- [ ] `cargo fmt` clean
+- [x] All new code has inline `#[cfg(test)] mod tests`
+- [x] `cargo test` passes
+- [x] `cargo clippy` clean
+- [x] `cargo fmt` clean
 
 ## Sources & References
 
