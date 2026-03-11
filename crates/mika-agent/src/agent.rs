@@ -140,6 +140,22 @@ pub struct ToolCallSummary {
     pub input_summary: String,
     pub output_summary: String,
     pub success: bool,
+    /// True when the tool output starts with a non-zero exit code prefix
+    /// (e.g. "Exit code: 1" or "Killed by signal: 9"). These are not errors
+    /// (`success` is still true) but indicate the subprocess exited non-zero.
+    #[serde(default)]
+    pub non_zero_exit: bool,
+}
+
+/// Check whether tool output content starts with a non-zero exit code prefix
+/// produced by the exec handler for subprocesses that exit non-zero.
+fn has_non_zero_exit_prefix(content: &str) -> bool {
+    if let Some(rest) = content.strip_prefix("Exit code: ") {
+        // "Exit code: 0" is never emitted (exit 0 has no prefix), but guard anyway
+        rest.starts_with(|c: char| c.is_ascii_digit()) && !rest.starts_with('0')
+    } else {
+        content.starts_with("Killed by signal:")
+    }
 }
 
 /// Maximum total characters for serialized tool call metadata.
@@ -216,7 +232,17 @@ pub fn format_tool_summary_block(metadata_json: &str) -> Option<String> {
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let status = if success { "" } else { " [FAILED]" };
+            let non_zero_exit = call
+                .get("non_zero_exit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let status = if !success {
+                " [FAILED]"
+            } else if non_zero_exit {
+                " [NON-ZERO]"
+            } else {
+                ""
+            };
             let short_input = truncate_summary(input, 60);
             let short_output = truncate_summary(output, 80);
             if short_input.is_empty() {
@@ -241,7 +267,13 @@ fn format_step_exceeded_fallback(summaries: &[ToolCallSummary]) -> String {
     let mut msg = String::from("I ran out of steps working on that. Here's what I did:\n");
     let start = summaries.len().saturating_sub(5);
     for s in &summaries[start..] {
-        let status = if s.success { "done" } else { "failed" };
+        let status = if !s.success {
+            "failed"
+        } else if s.non_zero_exit {
+            "non-zero exit"
+        } else {
+            "done"
+        };
         msg.push_str(&format!("- {} ({})\n", s.name, status));
     }
     msg.push_str("\nYou can ask me to continue where I left off.");
@@ -941,12 +973,14 @@ async fn process_tool_calls(
             } else {
                 truncate_summary(&output.content, 500)
             };
+            let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
             summaries.push(ToolCallSummary {
                 step,
                 name: name.clone(),
                 input_summary,
                 output_summary,
                 success: !output.is_error,
+                non_zero_exit,
             });
 
             let content = if output.images.is_empty() {
@@ -2069,6 +2103,7 @@ mod tests {
             input_summary: r#"{"query":"meetings"}"#.to_string(),
             output_summary: "Found 3 results".to_string(),
             success: true,
+            non_zero_exit: false,
         }];
         let json = tool_calls_metadata_json(&summaries).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2088,6 +2123,7 @@ mod tests {
                 input_summary: "x".repeat(200),
                 output_summary: "y".repeat(300),
                 success: true,
+                non_zero_exit: false,
             })
             .collect();
         let json = tool_calls_metadata_json(&summaries).unwrap();
@@ -2130,6 +2166,7 @@ mod tests {
                 input_summary: truncate_summary(&"x".repeat(10_000), 500),
                 output_summary: truncate_summary(&"y".repeat(10_000), 500),
                 success: true,
+                non_zero_exit: false,
             })
             .collect();
         let json = tool_calls_metadata_json(&summaries).unwrap();
@@ -2179,6 +2216,53 @@ mod tests {
     #[test]
     fn test_format_tool_summary_block_invalid_json_returns_none() {
         assert!(format_tool_summary_block("not json").is_none());
+    }
+
+    #[test]
+    fn test_format_tool_summary_block_non_zero_exit() {
+        let json = r#"{"tool_calls":[{"step":0,"name":"shell_exec","input_summary":"grep foo","output_summary":"Exit code: 1\nno matches","success":true,"non_zero_exit":true}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(
+            block.contains("[NON-ZERO]"),
+            "expected [NON-ZERO] tag in: {block}"
+        );
+        assert!(!block.contains("[FAILED]"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_block_non_zero_exit_missing_defaults_false() {
+        // Backward compat: old metadata without non_zero_exit field
+        let json = r#"{"tool_calls":[{"step":0,"name":"shell_exec","input_summary":"ls","output_summary":"files","success":true}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(!block.contains("[NON-ZERO]"));
+        assert!(!block.contains("[FAILED]"));
+    }
+
+    #[test]
+    fn test_has_non_zero_exit_prefix() {
+        assert!(has_non_zero_exit_prefix("Exit code: 1\nsome output"));
+        assert!(has_non_zero_exit_prefix("Exit code: 127\n"));
+        assert!(has_non_zero_exit_prefix("Killed by signal: 9\n"));
+        assert!(!has_non_zero_exit_prefix("Exit code: unknown\nstuff"));
+        assert!(!has_non_zero_exit_prefix("All good, no errors"));
+        assert!(!has_non_zero_exit_prefix(""));
+    }
+
+    #[test]
+    fn test_format_step_exceeded_fallback_non_zero_exit() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "shell_exec".to_string(),
+            input_summary: "grep foo".to_string(),
+            output_summary: "Exit code: 1".to_string(),
+            success: true,
+            non_zero_exit: true,
+        }];
+        let result = format_step_exceeded_fallback(&summaries);
+        assert!(
+            result.contains("- shell_exec (non-zero exit)"),
+            "expected non-zero exit status in: {result}"
+        );
     }
 
     // -- DB metadata integration tests --
@@ -2457,6 +2541,7 @@ mod tests {
                 input_summary: "query".to_string(),
                 output_summary: "found 3 results".to_string(),
                 success: true,
+                non_zero_exit: false,
             },
             ToolCallSummary {
                 step: 1,
@@ -2464,6 +2549,7 @@ mod tests {
                 input_summary: "ls".to_string(),
                 output_summary: "error".to_string(),
                 success: false,
+                non_zero_exit: false,
             },
             ToolCallSummary {
                 step: 2,
@@ -2471,6 +2557,7 @@ mod tests {
                 input_summary: "/tmp/test".to_string(),
                 output_summary: "contents".to_string(),
                 success: true,
+                non_zero_exit: false,
             },
         ];
         let result = format_step_exceeded_fallback(&summaries);
@@ -2489,6 +2576,7 @@ mod tests {
                 input_summary: String::new(),
                 output_summary: String::new(),
                 success: true,
+                non_zero_exit: false,
             })
             .collect();
         let result = format_step_exceeded_fallback(&summaries);
