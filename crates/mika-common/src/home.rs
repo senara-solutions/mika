@@ -272,6 +272,7 @@ You protect the user's time fiercely.
 - Never pretend to have done something you haven't
 - Say "I don't know" when you don't know
 - Ask for clarification rather than guess on high-stakes decisions
+- When you adapt, replace, or rename something, you own the full outcome — not just the artifact. Trace all references and update them. The job isn't done until the system works end-to-end.
 "#;
 
 pub const DEFAULT_HEARTBEAT: &str = r#"# Heartbeat Checklist

@@ -373,4 +373,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_shell_exec_prompt_contains_sandbox_guidance() {
+        let content = include_str!("../templates/skills/shell-exec/system_prompt.md");
+        assert!(
+            content.contains("Writing files outside your home directory"),
+            "shell-exec prompt missing out-of-sandbox section"
+        );
+        assert!(
+            content.contains("Tracing references after rename"),
+            "shell-exec prompt missing reference-tracing section"
+        );
+        assert!(
+            content.contains("write_file` tool is sandboxed"),
+            "shell-exec prompt missing sandbox explanation"
+        );
+    }
 }
