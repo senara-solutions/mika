@@ -1170,6 +1170,12 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_messages_by_trace_id(&self, trace_id: &str) -> Result<Vec<SessionMessage>> {
+        let tid = trace_id.to_owned();
+        self.with_db(move |db| db.get_messages_by_trace_id(&tid))
+            .await
+    }
+
     pub async fn list_agents_with_stats(&self) -> Result<Vec<AgentWithStats>> {
         self.with_db(|db| db.list_agents_with_stats()).await
     }

@@ -47,3 +47,22 @@ export function useTraceDetail(traceId: string) {
     enabled: !!traceId,
   })
 }
+
+export interface TraceMessage {
+  id: number
+  session_id: string
+  agent_id: string
+  role: string
+  content: string
+  channel_type: string
+  metadata: string | null
+  created_at: number
+}
+
+export function useTraceMessages(traceId: string) {
+  return useQuery<TraceMessage[]>({
+    queryKey: ['trace-messages', traceId],
+    queryFn: () => apiFetch(`/timeline/trace/${traceId}/messages`),
+    enabled: !!traceId,
+  })
+}

@@ -3672,6 +3672,20 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get full messages for a specific trace_id (for rich trace detail rendering).
+    pub fn get_messages_by_trace_id(&self, trace_id: &str) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.trace_id = ?1
+              ORDER BY m.created_at ASC, m.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![trace_id], Self::row_to_session_message)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// List all agents with message count.
     pub fn list_agents_with_stats(&self) -> Result<Vec<AgentWithStats>> {
         let mut stmt = self.conn.prepare(

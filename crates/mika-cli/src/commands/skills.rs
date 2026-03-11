@@ -3,9 +3,10 @@ use mika_agent::bundled_skills;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::executor;
 use mika_agent::skills::git;
-use mika_agent::skills::index::scan_skills_dir;
+use mika_agent::skills::index::{DiagnosticLevel, scan_skills_dir, validate_skill};
 use mika_agent::skills::install;
 use mika_agent::skills::marketplace;
+use mika_agent::tools::create_skill::validate_skill_name;
 use mika_common::home;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -47,6 +48,9 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         }
         Some(SkillsCommand::Update { name }) => {
             update_skills(&agent_home, &skills_dir, name.as_deref())?;
+        }
+        Some(SkillsCommand::Validate { name }) => {
+            validate_skills(&skills_dir, name.as_deref())?;
         }
     }
     Ok(())
@@ -218,11 +222,10 @@ keywords = ["{name}"]
 # Input: JSON on stdin
 # Output: text on stdout
 
-# Read input
-INPUT=$(cat)
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required" >&2; exit 1; }
 
-# Extract query field
-QUERY=$(echo "$INPUT" | grep -o '"query":"[^"]*"' | head -1 | cut -d'"' -f4)
+INPUT=$(cat)
+QUERY=$(printf '%s\n' "$INPUT" | jq -r '.query // empty')
 
 echo "TODO: implement handler for query: $QUERY"
 "#;
@@ -257,8 +260,9 @@ async fn test_skill_tool(
     tool_name: &str,
     input_json: &str,
 ) -> Result<()> {
-    let entries = scan_skills_dir(skills_dir);
-    let entry = entries
+    let scan = scan_skills_dir(skills_dir);
+    let entry = scan
+        .entries
         .iter()
         .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(skill_name))
         .ok_or_else(|| anyhow::anyhow!("Skill '{skill_name}' not found"))?;
@@ -524,5 +528,90 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
     }
 
     println!();
+    Ok(())
+}
+
+fn validate_skills(skills_dir: &Path, name: Option<&str>) -> Result<()> {
+    if !skills_dir.is_dir() {
+        println!(
+            "\n  No skills directory found at {}\n",
+            skills_dir.display()
+        );
+        return Ok(());
+    }
+
+    let dirs: Vec<_> = match name {
+        Some(n) => {
+            if let Err(e) = validate_skill_name(n) {
+                println!("\n  Invalid skill name: {e}\n");
+                return Ok(());
+            }
+            let skill_dir = skills_dir.join(n);
+            if !skill_dir.is_dir() {
+                println!("\n  Skill '{n}' not found at {}\n", skill_dir.display());
+                return Ok(());
+            }
+            vec![(n.to_string(), skill_dir)]
+        }
+        None => {
+            let mut found = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(skills_dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if path.is_dir()
+                        && let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
+                    {
+                        found.push((dir_name.to_string(), path));
+                    }
+                }
+            }
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            found
+        }
+    };
+
+    if dirs.is_empty() {
+        println!("\n  No skills found to validate.\n");
+        return Ok(());
+    }
+
+    println!();
+    let mut total_errors = 0;
+    let mut total_warnings = 0;
+
+    for (dir_name, dir_path) in &dirs {
+        let diags = validate_skill(dir_path);
+        let has_errors = diags.iter().any(|d| d.level == DiagnosticLevel::Fail);
+        let has_warnings = diags.iter().any(|d| d.level == DiagnosticLevel::Warn);
+
+        if has_errors {
+            total_errors += 1;
+        }
+        if has_warnings {
+            total_warnings += 1;
+        }
+
+        println!("  {dir_name}/");
+        for diag in &diags {
+            println!("    {} {}", diag.tag(), diag.message);
+        }
+    }
+
+    println!();
+    let total = dirs.len();
+    let ok_count = total - total_errors;
+    if total_errors == 0 && total_warnings == 0 {
+        println!("  All {total} skill(s) valid.");
+    } else {
+        println!(
+            "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
+        );
+    }
+    println!();
+
+    if total_errors > 0 {
+        bail!("skill validation failed: {} error(s) found", total_errors);
+    }
+
     Ok(())
 }
