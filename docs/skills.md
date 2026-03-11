@@ -378,6 +378,8 @@ The file contains a JSON array of `SkillToolDef` objects:
 ```
 Optional fields: `long_running` (bool), `estimated_duration_secs` (u64).
 
+Exec handlers always capture and return stdout regardless of exit code. Non-zero exits are **not** treated as tool errors — the output includes an `Exit code: N` prefix and the agent interprets the exit code contextually. Only OS-level failures (command not found, timeout) produce tool errors. The `__mika_v1` image envelope protocol is only parsed on exit 0.
+
 **Http** — POSTs to a URL:
 ```json
 {"type": "http", "url": "http://localhost:8080/tools", "method": "POST"}
