@@ -3,7 +3,7 @@ mod cancel_task;
 mod complete_task;
 mod create_agent;
 mod create_reminder;
-pub(crate) mod create_skill;
+pub mod create_skill;
 mod create_task;
 mod create_team;
 mod create_work_item;

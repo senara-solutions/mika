@@ -187,7 +187,7 @@ When creating a custom skill with a long-running exec handler:
 
 1. **Consult bundled skill examples** before authoring custom skills — `crates/mika-agent/templates/skills/shell-exec/` is the canonical exec handler pattern
 2. **Check tracing logs** if a skill doesn't appear — `scan_skills_dir()` logs `warn!` on failures
-3. **Consider a `mika skills validate` command** (not yet implemented) to catch format errors before startup
+3. **Run `mika skills validate`** to catch format errors before startup
 4. **Broaden `is_legacy_format()` detection** to catch `[handler]` with any `type` value, not just `"builtin"`
 
 ## Related Documentation

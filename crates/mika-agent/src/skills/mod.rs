@@ -16,19 +16,36 @@ use crate::db::SkillOverride;
 #[derive(Debug)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
+    skipped_count: usize,
 }
 
 impl SkillRegistry {
     /// Scan a skills directory and build the registry.
     pub fn from_dir(skills_dir: &Path) -> Self {
+        let result = index::scan_skills_dir(skills_dir);
+        if result.skipped_count > 0 {
+            tracing::warn!(
+                count = result.skipped_count,
+                "skipped invalid skill(s) at startup — run `mika skills validate` for details"
+            );
+        }
         Self {
-            skills: index::scan_skills_dir(skills_dir),
+            skills: result.entries,
+            skipped_count: result.skipped_count,
         }
     }
 
     /// Create an empty registry (no skills directory).
     pub fn empty() -> Self {
-        Self { skills: Vec::new() }
+        Self {
+            skills: Vec::new(),
+            skipped_count: 0,
+        }
+    }
+
+    /// Number of skill directories that were skipped during scan (invalid, legacy, etc.).
+    pub fn skipped_count(&self) -> usize {
+        self.skipped_count
     }
 
     /// Match skills against a user message.
@@ -145,6 +162,7 @@ mod tests {
     #[test]
     fn test_always_on_skills() {
         let registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![
                 make_entry("memory", true, true),
                 make_entry("reminders", false, true),
@@ -160,6 +178,7 @@ mod tests {
     #[test]
     fn test_always_on_skills_filters_disabled() {
         let registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![
                 make_entry("memory", true, true),
                 make_entry("disabled-skill", true, false),
@@ -225,6 +244,7 @@ mod tests {
         let prompt_only = make_entry("guidelines", true, true);
 
         let registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
         };
 
@@ -249,6 +269,7 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![
                 make_entry("web-search", false, true),
                 make_entry("tmux", false, true),
@@ -271,6 +292,7 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![make_entry("Web-Search", false, true)],
         };
 
@@ -288,6 +310,7 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![make_entry("web-search", false, true)],
         };
 
@@ -305,6 +328,7 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![make_entry("web-search", false, true)],
         };
 
@@ -322,6 +346,7 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
+            skipped_count: 0,
             skills: vec![
                 make_entry("web-search", false, true),
                 make_entry("shell-exec", true, true),

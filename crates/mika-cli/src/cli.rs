@@ -215,6 +215,11 @@ pub enum SkillsCommand {
         /// Skill name to update (omit to update all)
         name: Option<String>,
     },
+    /// Validate skill manifests and handler scripts
+    Validate {
+        /// Skill name to validate (omit to validate all)
+        name: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
