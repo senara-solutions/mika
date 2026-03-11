@@ -10,6 +10,8 @@ use crate::task_engine::types::{action_type, trigger_type};
 /// Maximum agent-created work items per session (Guard 5).
 const MAX_WORK_ITEMS_PER_SESSION: i64 = 5;
 
+const VALID_SOURCES: &[&str] = &["user_request", "github_issue", "team_run", "self_dev"];
+
 pub struct CreateWorkItemTool;
 
 #[async_trait]
@@ -24,7 +26,9 @@ impl Tool for CreateWorkItemTool {
             description: "Create a trackable work item to represent a piece of work. \
                 Work items can be linked to external references (GitHub issues, URLs) \
                 and progressed through status stages. Use for significant tasks like \
-                feature implementation, research projects, or items waiting on external input."
+                feature implementation, research projects, or items waiting on external input. \
+                Cannot be used during callback turns. Max 5 agent-created items per session. \
+                Max nesting depth of 3."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -39,7 +43,8 @@ impl Tool for CreateWorkItemTool {
                     },
                     "source": {
                         "type": "string",
-                        "description": "Origin of the work item: 'user_request', 'github_issue', 'team_run', 'self_dev'"
+                        "enum": ["user_request", "github_issue", "team_run", "self_dev"],
+                        "description": "Origin of the work item"
                     },
                     "parent_task_id": {
                         "type": "string",
@@ -80,6 +85,15 @@ impl Tool for CreateWorkItemTool {
             && url.len() > MAX_INPUT_LEN
         {
             return Ok(ToolOutput::error("'reference_url' is too long."));
+        }
+        if let Some(src) = source
+            && !VALID_SOURCES.contains(&src)
+        {
+            return Ok(ToolOutput::error(format!(
+                "Invalid source '{}'. Must be one of: {}",
+                src,
+                VALID_SOURCES.join(", ")
+            )));
         }
 
         // Guard 3: Callback turns block ALL work item creation

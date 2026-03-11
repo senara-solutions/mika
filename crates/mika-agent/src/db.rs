@@ -643,6 +643,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+            CREATE INDEX idx_tasks_manual_active
+                ON tasks(agent_id, created_at DESC)
+                WHERE trigger_type = 'manual'
+                AND status IN ('pending', 'in_progress', 'blocked');
 
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
@@ -1031,7 +1035,11 @@ impl Database {
         );
 
         // SQLite cannot ALTER CHECK constraints, so we must rebuild the tasks table.
-        self.conn.execute_batch(
+        // Entire migration wrapped in a transaction to prevent partial state on crash.
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            self.conn.execute_batch(
             "CREATE TABLE tasks_new (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -1093,8 +1101,8 @@ impl Database {
             ALTER TABLE tasks_new RENAME TO tasks;",
         )?;
 
-        // Recreate all indexes
-        self.conn.execute_batch(
+            // Recreate all indexes (still within the transaction)
+            self.conn.execute_batch(
             "CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
              CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
                 WHERE status IN ('pending','recurring_active');
@@ -1114,18 +1122,34 @@ impl Database {
                 AND action_type = 'send_message';
              CREATE INDEX IF NOT EXISTS idx_tasks_callback_delivery
                 ON tasks(agent_id, completed_at)
-                WHERE trigger_type='callback' AND action_type='resume_agent' AND status='completed';",
+                WHERE trigger_type='callback' AND action_type='resume_agent' AND status='completed';
+             CREATE INDEX IF NOT EXISTS idx_tasks_manual_active
+                ON tasks(agent_id, created_at DESC)
+                WHERE trigger_type = 'manual'
+                AND status IN ('pending', 'in_progress', 'blocked');",
         )?;
 
-        // Recreate unified_timeline VIEW (references tasks table)
-        self.conn
-            .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
-        self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+            // Recreate unified_timeline VIEW (references tasks table)
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
-        self.conn
-            .execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
 
-        Ok(())
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Check if a column exists on a table (used for idempotent migrations).
@@ -1532,24 +1556,21 @@ impl Database {
             return Ok(Some(old.clone()));
         }
 
-        if new_status == "completed" {
-            self.conn.execute(
-                "UPDATE tasks SET status = ?1, completed_at = unixepoch(), updated_at = unixepoch()
-                 WHERE id = ?2 AND agent_id = ?3 AND trigger_type = 'manual'",
-                params![new_status, task_id, agent_id],
-            )?;
-        } else {
-            self.conn.execute(
-                "UPDATE tasks SET status = ?1, updated_at = unixepoch()
-                 WHERE id = ?2 AND agent_id = ?3 AND trigger_type = 'manual'",
-                params![new_status, task_id, agent_id],
-            )?;
-        }
+        self.conn.execute(
+            "UPDATE tasks SET status = ?1, updated_at = unixepoch(),
+                    completed_at = CASE WHEN ?1 = 'completed' THEN unixepoch() ELSE NULL END
+             WHERE id = ?2 AND agent_id = ?3 AND trigger_type = 'manual'",
+            params![new_status, task_id, agent_id],
+        )?;
 
         Ok(old_status)
     }
 
+    /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
+    const TASK_COLUMN_COUNT: usize = 26;
+
     /// List manual (work item) tasks for an agent with optional filters.
+    /// Uses parameterized NULL checks to avoid dynamic SQL construction.
     pub fn list_manual_tasks(
         &self,
         agent_id: &str,
@@ -1557,58 +1578,35 @@ impl Database {
         source_filter: Option<&str>,
         include_children: bool,
     ) -> Result<Vec<(Task, Option<i64>)>> {
-        let mut conditions = vec![
-            "t.agent_id = ?1".to_string(),
-            "t.trigger_type = 'manual'".to_string(),
-        ];
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(agent_id.to_string())];
-        let mut param_idx = 2;
-
-        if let Some(status) = status_filter {
-            conditions.push(format!("t.status = ?{param_idx}"));
-            param_values.push(Box::new(status.to_string()));
-            param_idx += 1;
-        }
-        if let Some(source) = source_filter {
-            conditions.push(format!("t.source = ?{param_idx}"));
-            param_values.push(Box::new(source.to_string()));
-            // param_idx not needed after this
-        }
-
-        let where_clause = conditions.join(" AND ");
-
-        let sql = if include_children {
-            format!(
-                "SELECT {}, (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = t.id) AS child_count
-                 FROM tasks t WHERE {where_clause}
-                 ORDER BY t.created_at DESC LIMIT 50",
-                Self::TASK_COLUMNS
-                    .split(", ")
-                    .map(|c| format!("t.{c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+        let child_expr = if include_children {
+            "(SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = t.id)"
         } else {
-            format!(
-                "SELECT {}, NULL AS child_count
-                 FROM tasks t WHERE {where_clause}
-                 ORDER BY t.created_at DESC LIMIT 50",
-                Self::TASK_COLUMNS
-                    .split(", ")
-                    .map(|c| format!("t.{c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+            "NULL"
         };
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|b| b.as_ref()).collect();
+        let sql = format!(
+            "SELECT {columns}, {child_expr} AS child_count
+             FROM tasks t
+             WHERE t.agent_id = ?1 AND t.trigger_type = 'manual'
+               AND (?2 IS NULL OR t.status = ?2)
+               AND (?3 IS NULL OR t.source = ?3)
+             ORDER BY t.created_at DESC LIMIT 50",
+            columns = Self::TASK_COLUMNS
+                .split(", ")
+                .map(|c| format!("t.{c}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        let status_param: Option<String> = status_filter.map(|s| s.to_string());
+        let source_param: Option<String> = source_filter.map(|s| s.to_string());
+
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params_refs.as_slice(), |r| {
+            .query_map(params![agent_id, status_param, source_param], |r| {
                 let task = Self::row_to_task(r)?;
-                let child_count: Option<i64> = r.get(26)?;
+                // child_count is at ordinal Self::TASK_COLUMN_COUNT (one past last task column)
+                let child_count: Option<i64> = r.get(Self::TASK_COLUMN_COUNT)?;
                 Ok((task, child_count))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1616,23 +1614,25 @@ impl Database {
     }
 
     /// Count agent-created work items in a session (for per-session cap enforcement).
-    pub fn count_session_work_items(&self, session_id: &str) -> Result<i64> {
+    /// Scoped to agent_id for defense-in-depth.
+    pub fn count_session_work_items(&self, agent_id: &str, session_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE created_by_session = ?1 AND trigger_type = 'manual'
+             WHERE agent_id = ?1 AND created_by_session = ?2 AND trigger_type = 'manual'
                AND (source IS NULL OR source != 'user_request')",
-            params![session_id],
+            params![agent_id, session_id],
             |r| r.get(0),
         )?;
         Ok(n)
     }
 
     /// Get the depth of a task by ID (for computing child depth).
-    pub fn get_task_depth(&self, task_id: &str) -> Result<Option<i64>> {
+    /// Scoped to agent_id to prevent cross-agent parent linking.
+    pub fn get_task_depth(&self, task_id: &str, agent_id: &str) -> Result<Option<i64>> {
         self.conn
             .query_row(
-                "SELECT depth FROM tasks WHERE id = ?1",
-                params![task_id],
+                "SELECT depth FROM tasks WHERE id = ?1 AND agent_id = ?2",
+                params![task_id, agent_id],
                 |r| r.get(0),
             )
             .optional()

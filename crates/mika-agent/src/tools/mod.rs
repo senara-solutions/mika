@@ -36,8 +36,8 @@ mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod update_skill;
-mod update_task_status;
 mod update_team;
+mod update_work_item_status;
 mod write_file;
 mod write_workspace;
 
@@ -410,7 +410,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(list_home_files::ListHomeFilesTool));
     registry.register(Box::new(list_tasks::ListTasksTool));
     registry.register(Box::new(create_work_item::CreateWorkItemTool));
-    registry.register(Box::new(update_task_status::UpdateTaskStatusTool));
+    registry.register(Box::new(update_work_item_status::UpdateWorkItemStatusTool));
     registry.register(Box::new(list_work_items::ListWorkItemsTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));

@@ -13,18 +13,19 @@ const VALID_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
-pub struct UpdateTaskStatusTool;
+pub struct UpdateWorkItemStatusTool;
 
 #[async_trait]
-impl Tool for UpdateTaskStatusTool {
+impl Tool for UpdateWorkItemStatusTool {
     fn name(&self) -> &str {
-        "update_task_status"
+        "update_work_item_status"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "update_task_status".to_string(),
+            name: "update_work_item_status".to_string(),
             description: "Update the status of a work item (manual task). \
+                Only works on manual work items, not system tasks (reminders, callbacks, etc.). \
                 Free transitions allowed — any status can move to any other status. \
                 Every transition is logged as an audit event."
                 .to_string(),
@@ -103,7 +104,7 @@ impl Tool for UpdateTaskStatusTool {
         ctx.db
             .log_audit_event(
                 ctx.session_id,
-                "update_task_status",
+                "update_work_item_status",
                 &format!("task:{task_id}"),
                 Some(&old_status),
                 status,
@@ -161,7 +162,7 @@ mod tests {
         let harness = TestHarness::new();
         let id = create_work_item(&harness, "Test work item").await;
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(
@@ -179,7 +180,7 @@ mod tests {
         let harness = TestHarness::new();
         let id = create_work_item(&harness, "Noted item").await;
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(
@@ -202,7 +203,7 @@ mod tests {
         let harness = TestHarness::new();
         let id = create_work_item(&harness, "Same status").await;
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(
@@ -219,7 +220,7 @@ mod tests {
     async fn test_update_status_invalid_status() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(
@@ -236,7 +237,7 @@ mod tests {
     async fn test_update_status_not_found() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(
@@ -282,7 +283,7 @@ mod tests {
             .await
             .unwrap();
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(
@@ -299,7 +300,7 @@ mod tests {
     async fn test_update_status_empty_fields() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateTaskStatusTool;
+        let tool = UpdateWorkItemStatusTool;
 
         let result = tool
             .execute(serde_json::json!({"status": "completed"}), &ctx)

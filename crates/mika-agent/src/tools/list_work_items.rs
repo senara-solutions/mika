@@ -26,11 +26,13 @@ impl Tool for ListWorkItemsTool {
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "Filter by status: pending, in_progress, blocked, completed, cancelled"
+                        "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"],
+                        "description": "Filter by status"
                     },
                     "source": {
                         "type": "string",
-                        "description": "Filter by source: user_request, github_issue, team_run, self_dev"
+                        "enum": ["user_request", "github_issue", "team_run", "self_dev"],
+                        "description": "Filter by source"
                     },
                     "include_children": {
                         "type": "boolean",
@@ -51,6 +53,34 @@ impl Tool for ListWorkItemsTool {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
         let include_children = input["include_children"].as_bool().unwrap_or(false);
+
+        const VALID_STATUSES: &[&str] = &[
+            "pending",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled",
+        ];
+        const VALID_SOURCES: &[&str] = &["user_request", "github_issue", "team_run", "self_dev"];
+
+        if let Some(s) = status
+            && !VALID_STATUSES.contains(&s)
+        {
+            return Ok(ToolOutput::error(format!(
+                "Invalid status '{}'. Must be one of: {}",
+                s,
+                VALID_STATUSES.join(", ")
+            )));
+        }
+        if let Some(s) = source
+            && !VALID_SOURCES.contains(&s)
+        {
+            return Ok(ToolOutput::error(format!(
+                "Invalid source '{}'. Must be one of: {}",
+                s,
+                VALID_SOURCES.join(", ")
+            )));
+        }
 
         let items = ctx
             .db

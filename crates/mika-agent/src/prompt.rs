@@ -511,23 +511,28 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     }
     prompt.push('\n');
 
-    // Pending work items
+    // Pending work items (labels sanitized to prevent prompt injection)
     if !ctx.pending_work_items.is_empty() {
         prompt.push_str("## Pending Work Items\n");
         prompt.push_str("<pending-work-items>\n");
         for item in ctx.pending_work_items {
             let age_days = (ctx.current_utc.timestamp() - item.created_at) / 86400;
+            // Sanitize label: truncate to 200 chars and strip angle brackets
+            let label = item.label.chars().take(200).collect::<String>();
+            let label = label.replace(['<', '>'], "");
             let ref_url = item
                 .reference_url
                 .as_deref()
-                .map(|u| format!(" ref:{u}"))
+                .map(|u| {
+                    let u = u.chars().take(200).collect::<String>();
+                    format!(" ref:{}", u.replace(['<', '>'], ""))
+                })
                 .unwrap_or_default();
             writeln!(
                 prompt,
                 "- [{status}] {id}: {label} (age: {age_days}d{ref_url})",
                 status = item.status,
                 id = item.id,
-                label = item.label,
             )
             .unwrap();
         }

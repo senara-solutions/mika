@@ -302,14 +302,16 @@ impl AsyncDatabase {
     }
 
     pub async fn count_session_work_items(&self, session_id: &str) -> Result<i64> {
+        let a = self.agent_id.clone();
         let s = session_id.to_owned();
-        self.with_db(move |db| db.count_session_work_items(&s))
+        self.with_db(move |db| db.count_session_work_items(&a, &s))
             .await
     }
 
     pub async fn get_task_depth(&self, task_id: &str) -> Result<Option<i64>> {
+        let a = self.agent_id.clone();
         let i = task_id.to_owned();
-        self.with_db(move |db| db.get_task_depth(&i)).await
+        self.with_db(move |db| db.get_task_depth(&i, &a)).await
     }
 
     pub async fn list_active_work_items(&self) -> Result<Vec<Task>> {
