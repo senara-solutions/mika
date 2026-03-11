@@ -770,6 +770,8 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
+        is_task_context: false,
+        is_callback_turn: params.is_callback_turn,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -1303,6 +1305,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         }
     };
 
+    let pending_work_items = db.list_active_work_items().await.unwrap_or_default();
     let chat_id = db.get_customer_config("chat_id").await?;
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
@@ -1317,6 +1320,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         recent_conversations: conversations_digest.as_deref(),
         recent_audit_events: audit_events_digest.as_deref(),
         home_dir: Some(params.home_dir),
+        pending_work_items: &pending_work_items,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -1362,6 +1366,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
         is_reflection,
+        is_task_context: true,
+        is_callback_turn: false,
     };
 
     let mut request = MessagesRequest {
@@ -1555,6 +1561,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
+        is_task_context: true,
+        is_callback_turn: false,
     };
 
     let mut request = MessagesRequest {

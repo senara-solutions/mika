@@ -15,6 +15,7 @@ pub async fn run(
     agent_name: &str,
     task_id: Option<&str>,
     session: Option<&str>,
+    parent_task: Option<&str>,
 ) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
 
@@ -126,6 +127,13 @@ pub async fn run(
 
         return Ok(());
     }
+
+    // Prepend work item context if --parent-task is provided
+    let user_message = if let Some(pt) = parent_task {
+        format!("[work-item:{pt}] {user_message}")
+    } else {
+        user_message
+    };
 
     // Normal ask mode — full conversation agent
     let mut tool_registry = tools::default_tools();

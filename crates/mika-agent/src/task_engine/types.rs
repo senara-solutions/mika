@@ -11,6 +11,7 @@ pub mod task_status {
     pub const EXPIRED: &str = "expired";
     pub const RECURRING_ACTIVE: &str = "recurring_active";
     pub const DELIVERED: &str = "delivered";
+    pub const BLOCKED: &str = "blocked";
 }
 
 /// String constants for task action type values stored in the `tasks.action_type` column.
@@ -23,6 +24,7 @@ pub mod action_type {
     pub const INJECT_CONTEXT: &str = "inject_context";
     pub const RESUME_AGENT: &str = "resume_agent";
     pub const INVOKE_ORCHESTRATOR: &str = "invoke_orchestrator";
+    pub const NONE: &str = "none";
 }
 
 /// String constants for task trigger type values stored in the `tasks.trigger_type` column.
@@ -33,4 +35,5 @@ pub mod trigger_type {
     pub const USER_REPLY: &str = "user_reply";
     pub const EVENT: &str = "event";
     pub const CONDITION: &str = "condition";
+    pub const MANUAL: &str = "manual";
 }

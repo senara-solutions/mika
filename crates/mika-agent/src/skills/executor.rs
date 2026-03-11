@@ -476,6 +476,8 @@ async fn execute_long_running(
         input_context: Some(serde_json::to_string(&input).unwrap_or_default()),
         created_by_session: Some(ctx.session_id.clone()),
         created_trace_id: None,
+        reference_url: None,
+        source: None,
     };
 
     let task_id = match ctx.db.create_task(task).await {

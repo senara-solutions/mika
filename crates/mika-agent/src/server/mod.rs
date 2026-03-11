@@ -1154,6 +1154,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         })
         .await
         .unwrap()
@@ -1328,6 +1330,8 @@ mod tests {
                 input_context: None,
                 created_by_session: None,
                 created_trace_id: None,
+                reference_url: None,
+                source: None,
             })
             .await
             .unwrap();

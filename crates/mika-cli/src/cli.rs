@@ -51,6 +51,10 @@ pub enum Commands {
         /// Used by background processes: mika ask --task-id <uuid> "findings..."
         #[arg(long)]
         task_id: Option<String>,
+        /// Link this message to a parent work item (metadata threading).
+        /// Used by claude-asked relay: mika ask --parent-task <uuid> "question"
+        #[arg(long)]
+        parent_task: Option<String>,
     },
     /// Manage agents
     Agents(AgentsArgs),

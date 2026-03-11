@@ -1,4 +1,4 @@
-use crate::db::{Commitment, CoreMemoryEntry, core_memory_section_names};
+use crate::db::{Commitment, CoreMemoryEntry, Task, core_memory_section_names};
 use chrono::{DateTime, NaiveTime, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
@@ -221,7 +221,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push_str("## Callback Result Turn\n");
         prompt.push_str(
             "A background task has completed and the results are provided in the user message below.\n\
-             IMPORTANT: You MUST NOT submit new long-running tasks during this turn.\n\
+             IMPORTANT: You MUST NOT submit new long-running tasks or create work items during this turn.\n\
              Process the results and respond directly to the user with your analysis.\n\n",
         );
         prompt.push_str(context);
@@ -372,6 +372,12 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
     );
     prompt.push_str(
+        "- Use create_work_item to track significant pieces of work (feature implementations, \
+         research projects, items waiting on external input). Check list_work_items before creating \
+         to avoid duplicates. Use update_task_status to progress work items through their lifecycle \
+         (pending → in_progress → blocked → completed).\n",
+    );
+    prompt.push_str(
         "- Some tools are long-running and return a task ID instead of immediate results. \
          When this happens, inform the user that a background task is running and you'll follow up \
          when results arrive. Do not retry the tool.\n",
@@ -431,6 +437,8 @@ pub struct SilentPromptContext<'a> {
     pub recent_audit_events: Option<&'a str>,
     /// Agent home directory. When set, file tool instructions include the absolute path.
     pub home_dir: Option<&'a std::path::Path>,
+    /// Pending/in_progress/blocked work items for heartbeat awareness.
+    pub pending_work_items: &'a [Task],
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -502,6 +510,30 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         );
     }
     prompt.push('\n');
+
+    // Pending work items
+    if !ctx.pending_work_items.is_empty() {
+        prompt.push_str("## Pending Work Items\n");
+        prompt.push_str("<pending-work-items>\n");
+        for item in ctx.pending_work_items {
+            let age_days = (ctx.current_utc.timestamp() - item.created_at) / 86400;
+            let ref_url = item
+                .reference_url
+                .as_deref()
+                .map(|u| format!(" ref:{u}"))
+                .unwrap_or_default();
+            writeln!(
+                prompt,
+                "- [{status}] {id}: {label} (age: {age_days}d{ref_url})",
+                status = item.status,
+                id = item.id,
+                label = item.label,
+            )
+            .unwrap();
+        }
+        prompt.push_str("</pending-work-items>\n");
+        prompt.push_str("Review these work items. If any are stale or need attention, consider notifying the user.\n\n");
+    }
 
     // Trigger-specific context
     prompt.push_str("## Trigger\n");
@@ -720,6 +752,7 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -745,6 +778,7 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -778,6 +812,7 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -912,6 +947,7 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -936,6 +972,7 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1244,6 +1281,7 @@ max_iterations = 3
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1266,6 +1304,7 @@ max_iterations = 3
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1288,6 +1327,7 @@ max_iterations = 3
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1392,6 +1432,7 @@ notify = true
             recent_conversations: Some("User discussed Series A fundraise with Alice."),
             recent_audit_events: Some("update_core_memory: current_priorities -> fundraise"),
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1417,6 +1458,7 @@ notify = true
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
+            pending_work_items: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);

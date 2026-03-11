@@ -20,7 +20,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -119,6 +119,8 @@ pub struct Task {
     pub updated_at: i64,
     pub fired_at: Option<i64>,
     pub completed_at: Option<i64>,
+    pub reference_url: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +142,8 @@ pub struct NewTask {
     pub input_context: Option<String>,
     pub created_by_session: Option<String>,
     pub created_trace_id: Option<String>,
+    pub reference_url: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -504,6 +508,10 @@ impl Database {
             self.migrate_v6_to_v7()?;
             info!(version = 7, "database migrated to v7");
         }
+        if (3..=7).contains(&version) {
+            self.migrate_v7_to_v8()?;
+            info!(version = 8, "database migrated to v8");
+        }
         Ok(())
     }
 
@@ -553,7 +561,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (7);
+            INSERT INTO schema_version (version) VALUES (8);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -595,7 +603,7 @@ impl Database {
                 depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
                 label TEXT NOT NULL,
                 trigger_type TEXT NOT NULL CHECK (
-                    trigger_type IN ('time','recurring','callback','user_reply','event','condition')
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual')
                 ),
                 cron_expr TEXT,
                 event_source TEXT,
@@ -606,17 +614,19 @@ impl Database {
                 action_type TEXT NOT NULL CHECK (
                     action_type IN (
                         'send_message','resume_agent','inject_context',
-                        'run_skill','invoke_orchestrator'
+                        'run_skill','invoke_orchestrator','none'
                     )
                 ),
                 action_config TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'pending' CHECK (
                     status IN ('pending','in_progress','completed','failed',
-                               'cancelled','expired','recurring_active','delivered')
+                               'cancelled','expired','recurring_active','delivered','blocked')
                 ),
                 process_id INTEGER,
                 input_context TEXT,
                 result TEXT,
+                reference_url TEXT,
+                source TEXT,
                 created_by_session TEXT,
                 created_trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -1015,6 +1025,109 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v7_to_v8(&self) -> Result<()> {
+        info!(
+            "migrating database schema v7 → v8 (work items: manual trigger_type, blocked status, none action_type, reference_url, source)"
+        );
+
+        // SQLite cannot ALTER CHECK constraints, so we must rebuild the tasks table.
+        self.conn.execute_batch(
+            "CREATE TABLE tasks_new (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
+                depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                label TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK (
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual')
+                ),
+                cron_expr TEXT,
+                event_source TEXT,
+                event_offset_secs INTEGER,
+                condition_expr TEXT,
+                next_fire_at INTEGER,
+                timeout_at INTEGER,
+                action_type TEXT NOT NULL CHECK (
+                    action_type IN (
+                        'send_message','resume_agent','inject_context',
+                        'run_skill','invoke_orchestrator','none'
+                    )
+                ),
+                action_config TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    status IN ('pending','in_progress','completed','failed',
+                               'cancelled','expired','recurring_active','delivered','blocked')
+                ),
+                process_id INTEGER,
+                input_context TEXT,
+                result TEXT,
+                reference_url TEXT,
+                source TEXT,
+                created_by_session TEXT,
+                created_trace_id TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                fired_at INTEGER,
+                completed_at INTEGER
+            );
+
+            INSERT INTO tasks_new (
+                id, agent_id, team_run_id, parent_task_id, depth, label,
+                trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
+                next_fire_at, timeout_at, action_type, action_config,
+                status, process_id, input_context, result,
+                created_by_session, created_trace_id,
+                created_at, updated_at, fired_at, completed_at
+            )
+            SELECT
+                id, agent_id, team_run_id, parent_task_id, depth, label,
+                trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
+                next_fire_at, timeout_at, action_type, action_config,
+                status, process_id, input_context, result,
+                created_by_session, created_trace_id,
+                created_at, updated_at, fired_at, completed_at
+            FROM tasks;
+
+            DROP TABLE tasks;
+            ALTER TABLE tasks_new RENAME TO tasks;",
+        )?;
+
+        // Recreate all indexes
+        self.conn.execute_batch(
+            "CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
+                WHERE status IN ('pending','recurring_active');
+             CREATE INDEX idx_tasks_schedulable
+                ON tasks(agent_id, next_fire_at ASC)
+                WHERE status IN ('pending','recurring_active');
+             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE trigger_type = 'recurring'
+                AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_reminder
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE status IN ('pending', 'in_progress', 'recurring_active')
+                AND action_type = 'send_message';
+             CREATE INDEX IF NOT EXISTS idx_tasks_callback_delivery
+                ON tasks(agent_id, completed_at)
+                WHERE trigger_type='callback' AND action_type='resume_agent' AND status='completed';",
+        )?;
+
+        // Recreate unified_timeline VIEW (references tasks table)
+        self.conn
+            .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -1154,12 +1267,14 @@ impl Database {
                 id, agent_id, team_run_id, parent_task_id, depth, label,
                 trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
                 next_fire_at, timeout_at, action_type, action_config,
-                input_context, created_by_session, created_trace_id
+                input_context, created_by_session, created_trace_id,
+                reference_url, source
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18
+                ?16, ?17, ?18,
+                ?19, ?20
              )",
             params![
                 id,
@@ -1180,6 +1295,8 @@ impl Database {
                 task.input_context,
                 task.created_by_session,
                 task.created_trace_id,
+                task.reference_url,
+                task.source,
             ],
         )?;
         Ok(id)
@@ -1194,15 +1311,16 @@ impl Database {
              (id, agent_id, team_run_id, parent_task_id, depth, label,
               trigger_type, cron_expr, event_source, event_offset_secs,
               condition_expr, next_fire_at, timeout_at, action_type,
-              action_config, status, input_context, created_by_session, created_trace_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18)",
+              action_config, status, input_context, created_by_session, created_trace_id,
+              reference_url, source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18,?19,?20)",
             params![
                 id, task.agent_id, task.team_run_id, task.parent_task_id,
                 task.depth, task.label, task.trigger_type, task.cron_expr,
                 task.event_source, task.event_offset_secs, task.condition_expr,
                 task.next_fire_at, task.timeout_at, task.action_type,
                 task.action_config, task.input_context, task.created_by_session,
-                task.created_trace_id
+                task.created_trace_id, task.reference_url, task.source
             ],
         )?;
         if n > 0 {
@@ -1276,6 +1394,8 @@ impl Database {
             updated_at: r.get(21)?,
             fired_at: r.get(22)?,
             completed_at: r.get(23)?,
+            reference_url: r.get(24)?,
+            source: r.get(25)?,
         })
     }
 
@@ -1283,7 +1403,8 @@ impl Database {
          trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
-         created_at, updated_at, fired_at, completed_at";
+         created_at, updated_at, fired_at, completed_at,
+         reference_url, source";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
@@ -1300,7 +1421,7 @@ impl Database {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1 AND status IN ('pending','recurring_active')
-               AND trigger_type != 'callback'
+               AND trigger_type NOT IN ('callback', 'manual')
              ORDER BY next_fire_at ASC NULLS LAST",
             Self::TASK_COLUMNS
         );
@@ -1383,6 +1504,155 @@ impl Database {
             params![id, agent_id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Update the status of a manual (work item) task. Free transitions allowed.
+    /// Sets `completed_at` when transitioning to `completed`.
+    /// Returns the old status for audit logging.
+    pub fn update_manual_task_status(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        new_status: &str,
+    ) -> Result<Option<String>> {
+        let old_status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'",
+                params![task_id, agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let Some(old) = &old_status else {
+            return Ok(None);
+        };
+
+        if old == new_status {
+            return Ok(Some(old.clone()));
+        }
+
+        if new_status == "completed" {
+            self.conn.execute(
+                "UPDATE tasks SET status = ?1, completed_at = unixepoch(), updated_at = unixepoch()
+                 WHERE id = ?2 AND agent_id = ?3 AND trigger_type = 'manual'",
+                params![new_status, task_id, agent_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE tasks SET status = ?1, updated_at = unixepoch()
+                 WHERE id = ?2 AND agent_id = ?3 AND trigger_type = 'manual'",
+                params![new_status, task_id, agent_id],
+            )?;
+        }
+
+        Ok(old_status)
+    }
+
+    /// List manual (work item) tasks for an agent with optional filters.
+    pub fn list_manual_tasks(
+        &self,
+        agent_id: &str,
+        status_filter: Option<&str>,
+        source_filter: Option<&str>,
+        include_children: bool,
+    ) -> Result<Vec<(Task, Option<i64>)>> {
+        let mut conditions = vec![
+            "t.agent_id = ?1".to_string(),
+            "t.trigger_type = 'manual'".to_string(),
+        ];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(agent_id.to_string())];
+        let mut param_idx = 2;
+
+        if let Some(status) = status_filter {
+            conditions.push(format!("t.status = ?{param_idx}"));
+            param_values.push(Box::new(status.to_string()));
+            param_idx += 1;
+        }
+        if let Some(source) = source_filter {
+            conditions.push(format!("t.source = ?{param_idx}"));
+            param_values.push(Box::new(source.to_string()));
+            // param_idx not needed after this
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        let sql = if include_children {
+            format!(
+                "SELECT {}, (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = t.id) AS child_count
+                 FROM tasks t WHERE {where_clause}
+                 ORDER BY t.created_at DESC LIMIT 50",
+                Self::TASK_COLUMNS
+                    .split(", ")
+                    .map(|c| format!("t.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            format!(
+                "SELECT {}, NULL AS child_count
+                 FROM tasks t WHERE {where_clause}
+                 ORDER BY t.created_at DESC LIMIT 50",
+                Self::TASK_COLUMNS
+                    .split(", ")
+                    .map(|c| format!("t.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |r| {
+                let task = Self::row_to_task(r)?;
+                let child_count: Option<i64> = r.get(26)?;
+                Ok((task, child_count))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Count agent-created work items in a session (for per-session cap enforcement).
+    pub fn count_session_work_items(&self, session_id: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE created_by_session = ?1 AND trigger_type = 'manual'
+               AND (source IS NULL OR source != 'user_request')",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Get the depth of a task by ID (for computing child depth).
+    pub fn get_task_depth(&self, task_id: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT depth FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// List pending/in_progress/blocked manual tasks for prompt injection (heartbeat awareness).
+    pub fn list_active_work_items(&self, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1 AND trigger_type = 'manual'
+               AND status IN ('pending', 'in_progress', 'blocked')
+             ORDER BY created_at DESC LIMIT 10",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn mark_tasks_expired(&self, now_unix: i64, agent_id: &str) -> Result<usize> {
@@ -4198,6 +4468,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -4227,6 +4499,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id = db.create_task(&task).unwrap();
         assert!(db.cancel_task(&id, "mika").unwrap());
@@ -4380,6 +4654,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
@@ -4404,6 +4680,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         }
     }
 
@@ -4637,6 +4915,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id1 = db.create_task(&task).unwrap();
         assert!(!id1.is_empty());
@@ -4665,6 +4945,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id2 = db.create_task(&task2).unwrap();
         assert!(!id2.is_empty());
@@ -4695,6 +4977,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         }
     }
 
@@ -4889,6 +5173,8 @@ mod tests {
             input_context: None,
             created_by_session: Some(sid.clone()),
             created_trace_id: Some(trace.to_string()),
+            reference_url: None,
+            source: None,
         };
         db.create_task(&task).unwrap();
 
@@ -5008,9 +5294,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_7() {
+    fn test_schema_version_is_8() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
     }
 
     #[test]

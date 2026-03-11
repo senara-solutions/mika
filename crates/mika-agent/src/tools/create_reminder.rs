@@ -147,6 +147,8 @@ impl Tool for CreateReminderTool {
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
             created_trace_id: Some(ctx.trace_id.to_string()),
+            reference_url: None,
+            source: None,
         };
 
         let id = match ctx.db.create_task(task).await {

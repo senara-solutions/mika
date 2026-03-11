@@ -274,6 +274,49 @@ impl AsyncDatabase {
         self.with_db(move |db| db.cancel_task(&i, &a)).await
     }
 
+    pub async fn update_manual_task_status(
+        &self,
+        task_id: &str,
+        new_status: &str,
+    ) -> Result<Option<String>> {
+        let i = task_id.to_owned();
+        let a = self.agent_id.clone();
+        let s = new_status.to_owned();
+        self.with_db(move |db| db.update_manual_task_status(&i, &a, &s))
+            .await
+    }
+
+    pub async fn list_manual_tasks(
+        &self,
+        status_filter: Option<&str>,
+        source_filter: Option<&str>,
+        include_children: bool,
+    ) -> Result<Vec<(Task, Option<i64>)>> {
+        let a = self.agent_id.clone();
+        let sf = status_filter.map(|s| s.to_owned());
+        let src = source_filter.map(|s| s.to_owned());
+        self.with_db(move |db| {
+            db.list_manual_tasks(&a, sf.as_deref(), src.as_deref(), include_children)
+        })
+        .await
+    }
+
+    pub async fn count_session_work_items(&self, session_id: &str) -> Result<i64> {
+        let s = session_id.to_owned();
+        self.with_db(move |db| db.count_session_work_items(&s))
+            .await
+    }
+
+    pub async fn get_task_depth(&self, task_id: &str) -> Result<Option<i64>> {
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.get_task_depth(&i)).await
+    }
+
+    pub async fn list_active_work_items(&self) -> Result<Vec<Task>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.list_active_work_items(&a)).await
+    }
+
     pub async fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.mark_tasks_expired(now_unix, &id))
@@ -1443,6 +1486,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id = db.create_task(task).await.unwrap();
         let t = db.get_task(&id).await.unwrap().unwrap();

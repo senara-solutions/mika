@@ -6,6 +6,7 @@ mod create_reminder;
 pub(crate) mod create_skill;
 mod create_task;
 mod create_team;
+mod create_work_item;
 mod delegate_task;
 mod delete_skill;
 mod delete_team;
@@ -21,6 +22,7 @@ mod list_reminders;
 mod list_skills;
 mod list_tasks;
 mod list_teams;
+mod list_work_items;
 mod list_workspace;
 mod query_timeline;
 mod read_home_file;
@@ -34,6 +36,7 @@ mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod update_skill;
+mod update_task_status;
 mod update_team;
 mod write_file;
 mod write_workspace;
@@ -74,6 +77,11 @@ pub struct ToolContext<'a> {
     /// True when running in reflection mode (daily memory review).
     /// Memory tools require an `evidence` field and use a higher edit cap.
     pub is_reflection: bool,
+    /// True when running within a task context (callback, delegation, team agent).
+    /// Blocks top-level work item creation (Guard 1).
+    pub is_task_context: bool,
+    /// True when running in a callback turn (Guard 3 — blocks ALL work item creation).
+    pub is_callback_turn: bool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
@@ -401,6 +409,9 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(read_home_file::ReadHomeFileTool));
     registry.register(Box::new(list_home_files::ListHomeFilesTool));
     registry.register(Box::new(list_tasks::ListTasksTool));
+    registry.register(Box::new(create_work_item::CreateWorkItemTool));
+    registry.register(Box::new(update_task_status::UpdateTaskStatusTool));
+    registry.register(Box::new(list_work_items::ListWorkItemsTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));

@@ -45,6 +45,8 @@ pub mod test_helpers {
             brave_api_key: None,
             skills_dirty: &SKILLS_DIRTY,
             is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
         }
     }
 
@@ -109,6 +111,8 @@ pub mod test_helpers {
                 brave_api_key: None,
                 skills_dirty: &SKILLS_DIRTY,
                 is_reflection: true,
+                is_task_context: false,
+                is_callback_turn: false,
             }
         }
 
@@ -127,6 +131,8 @@ pub mod test_helpers {
                 brave_api_key: None,
                 skills_dirty: &SKILLS_DIRTY,
                 is_reflection: false,
+                is_task_context: false,
+                is_callback_turn: false,
             }
         }
     }

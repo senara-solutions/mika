@@ -85,6 +85,11 @@ impl TaskEngine {
             .unwrap_or_default();
 
         for task in in_progress {
+            // Manual (work item) tasks represent human work — don't invalidate on restart
+            if task.trigger_type == trigger_type::MANUAL {
+                debug!(task_id = %task.id, "skipping manual task during startup recovery");
+                continue;
+            }
             debug!(task_id = %task.id, "marking orphaned in_progress task as failed on startup");
             if let Err(e) = self
                 .db
@@ -552,6 +557,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         }
     }
 
@@ -703,6 +710,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -737,6 +746,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -771,6 +782,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -793,6 +806,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let c1_id = db.create_task(child1).await.unwrap();
         db.update_task_completed(&c1_id, Some("done"))
@@ -817,6 +832,8 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
+            reference_url: None,
+            source: None,
         };
         let c2_id = db.create_task(child2).await.unwrap();
         // Mark expired manually (in real flow, expire_timed_out_tasks does this)
