@@ -10,9 +10,25 @@ use mika_agent::tools;
 
 use crate::init;
 
-pub async fn run(message: &str, agent_name: &str, task_id: Option<&str>) -> Result<()> {
+pub async fn run(
+    message: &str,
+    agent_name: &str,
+    task_id: Option<&str>,
+    session: Option<&str>,
+) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
-    let session_id = Uuid::new_v4().to_string();
+
+    // Use provided session ID or generate a new one.
+    // When --session is passed (e.g., from claude-asked-relay), messages from the
+    // same Claude Code run share a session for grouping and introspection.
+    if let Some(s) = session
+        && s.is_empty()
+    {
+        anyhow::bail!("--session value must not be empty");
+    }
+    let session_id = session
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     if let Err(e) = ctx
         .async_db
         .create_session(&session_id, ctx.async_db.agent_id(), "cli")

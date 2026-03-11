@@ -144,8 +144,19 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => commands::status::run(&agent_name).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
-        Some(Commands::Ask { message, task_id }) => {
-            match commands::ask::run(&message, &agent_name, task_id.as_deref()).await {
+        Some(Commands::Ask {
+            message,
+            task_id,
+            session,
+        }) => {
+            match commands::ask::run(
+                &message,
+                &agent_name,
+                task_id.as_deref(),
+                session.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     eprintln!("Error: {e}");

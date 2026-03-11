@@ -46,6 +46,10 @@ pub enum Commands {
         /// Used by background processes: mika ask --task-id <uuid> "findings..."
         #[arg(long)]
         task_id: Option<String>,
+        /// Reuse an existing session instead of creating a new one.
+        /// If the session does not exist yet, it will be created with this ID.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Manage agents
     Agents(AgentsArgs),
