@@ -2,6 +2,100 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5](https://github.com/senara-solutions/mika/releases/tag/v0.1.5) — 2026-03-11
+
+### Added
+
+- out-of-sandbox file writes and task completeness prompts
+- *(cli)* add mika doctor and config set/get/list commands
+- *(common)* add serde defaults to TeamDefinition for flexible parsing
+- *(server)* add rewind preview and execute API endpoints
+- *(agent)* add conversation rewind engine with preview and execute
+- *(agent)* schema v9 and audit trail completeness for conversation rewind
+- *(agent)* add generic work item tracking with create_work_item, update_task_status, list_work_items tools
+- *(teams)* add conversation continuity across team runs
+- *(prompt)* instruct agent to check own files before answering self-knowledge questions
+- *(dashboard)* convert team session view to conversational timeline
+- *(tools)* add read-only introspection tools for agent-native parity
+- *(skills)* respect user overrides for builtin skill always_on flag ([#73](https://github.com/senara-solutions/mika/pull/73))
+- *(server)* add investigation SSE endpoint with read-only agent loop
+- *(agent)* add create_team, delete_team, update_team tools
+- *(agent)* enrich list_teams output with full team configuration
+- *(agent)* add create_team guidance to system prompt
+- *(db)* add mention_count to people table
+- *(agent)* add create_agent tool for runtime agent creation
+- *(dashboard)* add React observability dashboard
+- *(server)* add dashboard REST API endpoints
+- *(observability)* thread trace_id through all write paths
+- *(db)* schema v5 — rename memory_events to audit_events, add trace_id columns
+- *(reminders)* add periodic reminder support via cron_expr
+- *(cli)* add /undo and /rewind TUI slash commands
+- *(cli)* add --session flag to mika ask for session reuse
+- enhance mika setup with multi-secret wizard, proper TOML parsing, and TTY guard
+- *(tui)* add textarea selection rendering and mouse support
+- *(tui)* add mouse-based text selection and clipboard copy
+- *(cli)* improve /skills display with grouped columnar layout
+
+### Changed
+
+- address code review findings for doctor and config commands
+- simplify config cascade from 6 layers to 4 sources with dotenvy .env support
+- *(teams)* simplify based on code review findings
+- *(prompt)* trim filler paragraph from self-knowledge skill prompt
+- *(prompt)* tighten multi-action and continuity instructions for token efficiency
+- *(reminders)* unify NewTask construction and add min interval guard
+- *(tui)* unify textarea selection highlighting via post-processing
+- *(tui)* extract shared unicode-width wrapping iterator
+- *(tui)* derive Ord on TextPosition, clear selection on keypress, add u16 guards
+
+### Documentation
+
+- update documentation for recent changes
+- add runtime structure reference for ~/.mika layout, DB schema, and logs
+- update documentation for recent changes
+- add callback result display plan from PR #92
+
+### Fixed
+
+- harden dotenv and setup — newline injection, atomic writes, non-interactive mode
+- move trace.rs to mika-common to fix telemetry feature build
+- *(rewind)* code review fixes and documentation updates
+- *(rewind)* inject context marker after rewind to prevent agent confabulation
+- *(rewind)* cross-session support and code review improvements
+- *(agent)* drop unified_timeline view before tasks table rebuild in v7→v8 migration
+- *(agent)* address code review findings for work item tracking
+- *(agent)* truncate tool call metadata to prevent silent entry drops
+- *(ci)* regenerate OpenAPI spec to match utoipa annotations
+- *(dashboard)* consolidate token env var to VITE_MIKA_DASHBOARD_TOKEN
+- *(teams)* address code review findings
+- *(teams)* store correct agent_id in team session messages
+- *(tui)* display callback task results as system messages instead of 'You:'
+- *(prompt)* guide agent to use update_skill for always_on changes
+- make is_bundled_skill case-insensitive and deduplicate override logic
+- *(server)* use char-based truncation in investigation tools to avoid UTF-8 panics
+- *(dashboard)* store full tool call data and add quick-copy pills
+- *(dashboard)* resolve code review findings from observability dashboard
+- suppress too_many_arguments clippy warnings for trace_id params
+- address code review findings from PR #88
+- *(db)* migrate commitments to partial unique index for status-aware dedup
+- *(db)* add DB-constraint duplicate detection for reminders and events
+- *(clippy)* collapse nested if-let in create_reminder
+- *(prompt)* add proactive state checking before write operations
+- *(prompt)* add multi-action batching and conversation continuity guidance
+- exclude team messages from TUI chat history
+- *(cli)* validate session ownership for --session flag
+- *(tui)* correct TextPosition comparison after Ord derive
+- *(cli)* show error details when team loading fails
+
+### Performance
+
+- *(server)* combine data+count queries and remove response type ceremony
+- *(tui)* optimize text selection rendering and layout caching
+
+### Security
+
+- *(server)* separate dashboard token from mutation endpoints
+
 ## [0.1.4](https://github.com/senara-solutions/mika/releases/tag/v0.1.4) — 2026-03-07
 
 ### Added
