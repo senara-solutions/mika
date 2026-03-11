@@ -15,11 +15,15 @@ changelog_include = ["mika-agent", "mika-cli"]
 name = "mika-agent"
 publish = true
 changelog_update = false
+git_release_enable = false
+git_tag_enable = false
 
 [[package]]
 name = "mika-cli"
 publish = true
 changelog_update = false
+git_release_enable = false
+git_tag_enable = false
 
 [[package]]
 name = "mika-gateway"
