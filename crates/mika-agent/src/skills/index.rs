@@ -377,6 +377,27 @@ fn is_legacy_format(content: &str) -> bool {
     false
 }
 
+/// Inject `work_item_id` as a required field into a tool's input schema.
+///
+/// Long-running exec handlers must track delegation via work items.
+/// This adds the field to the JSON schema so the LLM knows to include it.
+fn inject_work_item_id_field(schema: &mut serde_json::Value) {
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.insert(
+            "work_item_id".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "description": "ID of the work item tracking this task. Create one first using create_work_item."
+            }),
+        );
+    }
+    if let Some(required) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
+        required.push(serde_json::Value::String("work_item_id".to_string()));
+    } else {
+        schema["required"] = serde_json::json!(["work_item_id"]);
+    }
+}
+
 /// Load and parse `tools.json` from a skill directory.
 ///
 /// Returns an empty vec if the file doesn't exist or is invalid.
@@ -424,14 +445,26 @@ fn load_tools_json(skill_dir: &Path) -> Vec<ResolvedSkillTool> {
             }
             true
         })
-        .map(|def| ResolvedSkillTool {
-            definition: ToolDefinition {
-                name: def.name,
-                description: def.description,
-                input_schema: def.input_schema,
-            },
-            handler: def.handler,
-            skill_dir: skill_dir.to_path_buf(),
+        .map(|def| {
+            let mut schema = def.input_schema;
+
+            // Long-running exec handlers require a work_item_id for delegation tracking
+            if let ToolHandler::Exec {
+                long_running: true, ..
+            } = &def.handler
+            {
+                inject_work_item_id_field(&mut schema);
+            }
+
+            ResolvedSkillTool {
+                definition: ToolDefinition {
+                    name: def.name,
+                    description: def.description,
+                    input_schema: schema,
+                },
+                handler: def.handler,
+                skill_dir: skill_dir.to_path_buf(),
+            }
         })
         .collect()
 }
@@ -845,5 +878,97 @@ mod tests {
 
         // Invalid TOML is not legacy
         assert!(!is_legacy_format("{{not toml}}"));
+    }
+
+    #[test]
+    fn test_long_running_tool_gets_work_item_id_injected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("builder");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "builder"
+            description = "Long-running builder"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "build_project",
+                "description": "Build a project",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Build command"}
+                    },
+                    "required": ["command"]
+                },
+                "handler": {"type": "exec", "command": "./build.sh", "long_running": true, "estimated_duration_secs": 300}
+            }]"#,
+        )
+        .unwrap();
+
+        let entries = scan_skills_dir(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].skill_tools.len(), 1);
+
+        let schema = &entries[0].skill_tools[0].definition.input_schema;
+        // work_item_id should be in properties
+        assert!(
+            schema["properties"]["work_item_id"].is_object(),
+            "work_item_id property should be injected for long_running tools"
+        );
+        // work_item_id should be required
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.contains(&serde_json::Value::String("work_item_id".to_string())),
+            "work_item_id should be in required fields"
+        );
+    }
+
+    #[test]
+    fn test_non_long_running_tool_no_work_item_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "search"
+            description = "Web search"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "web_search",
+                "description": "Search the web",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                },
+                "handler": {"type": "exec", "command": "./search.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        let entries = scan_skills_dir(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].skill_tools.len(), 1);
+
+        let schema = &entries[0].skill_tools[0].definition.input_schema;
+        // work_item_id should NOT be injected for non-long-running tools
+        assert!(
+            schema["properties"]["work_item_id"].is_null(),
+            "work_item_id should not be injected for non-long_running tools"
+        );
     }
 }

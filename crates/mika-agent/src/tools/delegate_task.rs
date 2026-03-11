@@ -36,9 +36,13 @@ impl Tool for DelegateTaskTool {
                     "task": {
                         "type": "string",
                         "description": "The task or question for the delegate agent"
+                    },
+                    "work_item_id": {
+                        "type": "string",
+                        "description": "ID of the work item tracking this delegation. You MUST create a work item first using create_work_item, then pass its ID here."
                     }
                 },
-                "required": ["agent_name", "task"]
+                "required": ["agent_name", "task", "work_item_id"]
             }),
         }
     }
@@ -86,6 +90,12 @@ impl Tool for DelegateTaskTool {
                 "'task' too long: {} characters (max: {MAX_INPUT_LEN})",
                 task.len()
             )));
+        }
+
+        // Validate work_item_id — delegation requires a tracked work item
+        let work_item_id = input["work_item_id"].as_str().unwrap_or("");
+        if let Some(err) = super::validate_work_item(ctx.db, work_item_id).await {
+            return Ok(ToolOutput::error(err));
         }
 
         if !agent::agent_exists(&self.home_dir, agent_name) {
@@ -174,7 +184,7 @@ impl Tool for DelegateTaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_helpers::{TestHarness, dummy_settings};
+    use crate::test_utils::test_helpers::{TestHarness, create_test_work_item, dummy_settings};
 
     #[tokio::test]
     async fn test_delegate_task_missing_agent_name() {
@@ -194,7 +204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delegate_task_missing_task() {
+    async fn test_delegate_task_missing_work_item_id() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = DelegateTaskTool {
@@ -203,7 +213,97 @@ mod tests {
         };
 
         let result = tool
-            .execute(serde_json::json!({"agent_name": "researcher"}), &ctx)
+            .execute(
+                serde_json::json!({"agent_name": "researcher", "task": "do something"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("create a work item first"),
+            "expected work item error, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_task_invalid_work_item_id() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = DelegateTaskTool {
+            home_dir: PathBuf::from("/tmp"),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "agent_name": "researcher",
+                    "task": "do something",
+                    "work_item_id": "nonexistent-id"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("not found"),
+            "expected not found error, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_task_completed_work_item_rejected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let wi_id = create_test_work_item(ctx.db).await;
+        // Transition to completed
+        ctx.db
+            .update_manual_task_status(&wi_id, "completed")
+            .await
+            .unwrap();
+        let tool = DelegateTaskTool {
+            home_dir: PathBuf::from("/tmp"),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "agent_name": "researcher",
+                    "task": "do something",
+                    "work_item_id": wi_id
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("not an active work item"),
+            "expected inactive work item error, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_task_missing_task() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let wi_id = create_test_work_item(ctx.db).await;
+        let tool = DelegateTaskTool {
+            home_dir: PathBuf::from("/tmp"),
+            settings: dummy_settings(),
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"agent_name": "researcher", "work_item_id": wi_id}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -215,6 +315,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let harness = TestHarness::new();
         let ctx = harness.ctx();
+        let wi_id = create_test_work_item(ctx.db).await;
         let tool = DelegateTaskTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
@@ -222,7 +323,11 @@ mod tests {
 
         let result = tool
             .execute(
-                serde_json::json!({"agent_name": "nonexistent", "task": "test"}),
+                serde_json::json!({
+                    "agent_name": "nonexistent",
+                    "task": "test",
+                    "work_item_id": wi_id
+                }),
                 &ctx,
             )
             .await

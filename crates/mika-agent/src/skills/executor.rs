@@ -454,6 +454,15 @@ async fn execute_long_running(
     estimated_duration_secs: Option<u64>,
     ctx: &LongRunningContext,
 ) -> ToolOutput {
+    // Validate work_item_id — long-running tasks require tracked work items
+    let work_item_id = input
+        .get("work_item_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Some(err) = crate::tools::validate_work_item(&ctx.db, work_item_id).await {
+        return ToolOutput::error(err);
+    }
+
     let estimated = estimated_duration_secs.unwrap_or(3600);
     let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
     let now = chrono::Utc::now().timestamp();
@@ -1094,6 +1103,35 @@ mod tests {
 
     // -- Long-running exec tests --
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_missing_work_item_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let ctx = LongRunningContext {
+            db: async_db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+        };
+
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, Some(&ctx)).await;
+
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("create a work item first"),
+            "expected work item error, got: {}",
+            output.content
+        );
+    }
+
+    use crate::test_utils::test_helpers::create_test_work_item;
+
     fn make_long_running_tool(skill_dir: &std::path::Path, command: &str) -> ResolvedSkillTool {
         ResolvedSkillTool {
             definition: ToolDefinition {
@@ -1119,6 +1157,7 @@ mod tests {
 
         let db = crate::db::Database::open_in_memory().unwrap();
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_work_item(&async_db).await;
         let ctx = LongRunningContext {
             db: async_db.clone(),
             agent_name: "mika".to_string(),
@@ -1126,8 +1165,13 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
         };
 
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, Some(&ctx)).await;
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test", "work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+        )
+        .await;
 
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
@@ -1136,16 +1180,20 @@ mod tests {
             output.content
         );
 
-        // Verify a callback task was created
+        // Verify a callback task was created (2 tasks total: work item + callback)
         let tasks = async_db
             .get_tasks_by_status(vec!["pending".to_string()])
             .await
             .unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].trigger_type, "callback");
-        assert_eq!(tasks[0].action_type, "resume_agent");
-        assert!(tasks[0].label.starts_with("long_running:"));
-        assert!(tasks[0].timeout_at.is_some());
+        // Work item is pending, callback task is also pending
+        let callback_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.trigger_type == "callback")
+            .collect();
+        assert_eq!(callback_tasks.len(), 1);
+        assert_eq!(callback_tasks[0].action_type, "resume_agent");
+        assert!(callback_tasks[0].label.starts_with("long_running:"));
+        assert!(callback_tasks[0].timeout_at.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1201,6 +1249,7 @@ mod tests {
 
         let db = crate::db::Database::open_in_memory().unwrap();
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_work_item(&async_db).await;
         let ctx = LongRunningContext {
             db: async_db.clone(),
             agent_name: "mika".to_string(),
@@ -1208,7 +1257,13 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
         };
 
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx)).await;
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+        )
+        .await;
 
         // Should return success immediately (task submitted)
         assert!(!output.is_error, "unexpected error: {}", output.content);
