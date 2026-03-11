@@ -17,7 +17,7 @@ jobs:
     name: Check
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
         with:
@@ -34,3 +34,41 @@ jobs:
 
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
+
+      - name: Smoke tests
+        run: cargo test --test smoke -- --ignored
+        env:
+          MIKA_ANTHROPIC_API_KEY: "sk-ant-test-dummy-key-for-smoke"
+          MIKA_INTERNAL_TOKEN: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          MIKA_ROUTING_URL: "http://localhost:19999"
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+  security:
+    name: Security
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
+      - name: Install security tools
+        run: cargo install cargo-audit cargo-deny --locked
+      - name: Run cargo-audit
+        run: cargo audit
+      - name: Run cargo-deny
+        run: cargo deny check
