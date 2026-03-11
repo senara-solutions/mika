@@ -78,6 +78,8 @@ pub struct RewindResult {
     pub tasks_deleted: usize,
     pub tasks_cancelled: usize,
     pub warnings: Vec<String>,
+    /// Human-readable descriptions of each applied reversal (for context marker).
+    pub reversal_descriptions: Vec<String>,
     pub rewind_trace_id: String,
 }
 
@@ -333,6 +335,13 @@ pub async fn execute_rewind(
         vec![]
     };
 
+    // Build reversal descriptions from preview (before applying, so we have the descriptions)
+    let reversal_descriptions: Vec<String> = build_reversal_previews(&audit_events)
+        .iter()
+        .filter(|r| r.action != ReversalAction::Skip)
+        .map(|r| r.description.clone())
+        .collect();
+
     // Apply reversals in reverse chronological order (already ordered by id DESC)
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -412,15 +421,25 @@ pub async fn execute_rewind(
     )
     .await?;
 
-    Ok(RewindResult {
+    let result = RewindResult {
         messages_deleted,
         reversals_applied: applied,
         reversals_skipped: skipped,
         tasks_deleted,
         tasks_cancelled,
         warnings,
-        rewind_trace_id,
-    })
+        reversal_descriptions,
+        rewind_trace_id: rewind_trace_id.clone(),
+    };
+
+    // Inject context marker so the agent knows messages were removed.
+    // Delete any prior rewind markers first to prevent accumulation during rapid rewinds.
+    db.delete_rewind_markers(session_id).await?;
+    let marker = build_rewind_marker(&result, originating_session_id);
+    db.save_message(session_id, "system", &marker, Some(&rewind_trace_id))
+        .await?;
+
+    Ok(result)
 }
 
 /// Apply a single reversal based on the audit event's tool_name, target_key, and before_value.
@@ -674,6 +693,35 @@ fn check_irreversible_effects(
         );
     }
 }
+
+/// Build a context marker message that the agent will see after a rewind.
+/// This prevents confabulation by explicitly telling the agent about the gap.
+fn build_rewind_marker(result: &RewindResult, originating_session_id: Option<&str>) -> String {
+    let mut marker = format!(
+        "[Context notice: A rewind operation removed {} message(s) from this conversation.",
+        result.messages_deleted
+    );
+    if !result.reversal_descriptions.is_empty() {
+        marker.push_str("\nMemory changes reversed:");
+        for desc in &result.reversal_descriptions {
+            marker.push_str(&format!("\n- {desc}"));
+        }
+    }
+    if let Some(orig) = originating_session_id {
+        let truncated = &orig[..orig.len().min(8)];
+        marker.push_str(&format!(
+            "\nThis rewind was initiated from a different session ({truncated})."
+        ));
+    }
+    marker.push_str(
+        "\nDo not attempt to reconstruct or narrate what happened in the removed messages. \
+         Continue from the last visible message above.]",
+    );
+    marker
+}
+
+/// Prefix used for rewind context markers, for identification/deletion.
+pub const REWIND_MARKER_PREFIX: &str = "[Context notice: A rewind";
 
 fn truncate_content(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -1191,5 +1239,227 @@ mod tests {
         };
         let output = format_preview(&preview);
         assert!(output.contains("BLOCKED: Test block reason"));
+    }
+
+    #[tokio::test]
+    async fn test_rewind_injects_context_marker() {
+        let harness = TestHarness::new();
+        let db = &harness.db;
+
+        let trace_id = "test-trace-marker";
+        db.save_message("test-session", "user", "Test msg", Some(trace_id))
+            .await
+            .unwrap();
+        db.save_message("test-session", "assistant", "Reply", Some(trace_id))
+            .await
+            .unwrap();
+
+        let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let anchor_id = messages[0].id - 1;
+
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
+        assert_eq!(result.messages_deleted, 2);
+
+        // Verify a context marker was injected
+        let remaining = db.get_messages_after_id("test-session", 0).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].role, "system");
+        assert!(remaining[0].content.starts_with(REWIND_MARKER_PREFIX));
+        assert!(remaining[0].content.contains("2 message(s)"));
+        assert_eq!(
+            remaining[0].trace_id.as_deref(),
+            Some(result.rewind_trace_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewind_marker_includes_reversal_descriptions() {
+        let harness = TestHarness::new();
+        let db = &harness.db;
+
+        db.set_core_memory("user_summary", "Original")
+            .await
+            .unwrap();
+
+        let trace_id = "test-trace-desc";
+        db.save_message("test-session", "user", "Update", Some(trace_id))
+            .await
+            .unwrap();
+        db.set_core_memory("user_summary", "Changed").await.unwrap();
+        db.log_audit_event(
+            "test-session",
+            "update_core_memory",
+            "user_summary",
+            Some("Original"),
+            Some("Changed"),
+            None,
+            Some(trace_id),
+        )
+        .await
+        .unwrap();
+        db.save_message("test-session", "assistant", "Done", Some(trace_id))
+            .await
+            .unwrap();
+
+        let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let anchor_id = messages[0].id - 1;
+
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
+        assert_eq!(result.reversal_descriptions.len(), 1);
+        assert!(result.reversal_descriptions[0].contains("user_summary"));
+
+        // Verify marker includes the description
+        let remaining = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let marker = &remaining[0];
+        assert!(marker.content.contains("user_summary"));
+        assert!(marker.content.contains("Memory changes reversed:"));
+    }
+
+    #[tokio::test]
+    async fn test_rewind_marker_cross_session_includes_originator() {
+        let harness = TestHarness::new();
+        let db = &harness.db;
+
+        let trace_id = "test-trace-cross";
+        db.save_message("test-session", "user", "Msg", Some(trace_id))
+            .await
+            .unwrap();
+        db.save_message("test-session", "assistant", "Reply", Some(trace_id))
+            .await
+            .unwrap();
+
+        let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let anchor_id = messages[0].id - 1;
+
+        let result = execute_rewind(db, "test-session", anchor_id, Some("other-session-abc123"))
+            .await
+            .unwrap();
+
+        let remaining = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let marker = &remaining[0];
+        assert!(
+            marker
+                .content
+                .contains("initiated from a different session")
+        );
+        assert!(marker.content.contains("other-se")); // truncated to 8 chars
+        assert_eq!(
+            marker.trace_id.as_deref(),
+            Some(result.rewind_trace_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rapid_rewinds_consolidate_markers() {
+        let harness = TestHarness::new();
+        let db = &harness.db;
+
+        // Create 3 exchanges
+        for i in 1..=3 {
+            let trace = format!("trace-rapid-{i}");
+            db.save_message("test-session", "user", &format!("Msg {i}"), Some(&trace))
+                .await
+                .unwrap();
+            db.save_message(
+                "test-session",
+                "assistant",
+                &format!("Reply {i}"),
+                Some(&trace),
+            )
+            .await
+            .unwrap();
+        }
+
+        // First rewind: remove exchange 3
+        let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let anchor_1 = messages[4].id - 1; // before exchange 3's user msg
+        execute_rewind(db, "test-session", anchor_1, None)
+            .await
+            .unwrap();
+
+        // Verify first marker exists
+        let after_first = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let markers_1: Vec<_> = after_first.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(markers_1.len(), 1);
+
+        // Second rewind: remove exchange 2 (marker from first rewind should be replaced)
+        let anchor_2 = after_first
+            .iter()
+            .find(|m| m.role == "user" && m.content == "Msg 2")
+            .unwrap()
+            .id
+            - 1;
+        execute_rewind(db, "test-session", anchor_2, None)
+            .await
+            .unwrap();
+
+        // Verify only ONE marker exists (old one was deleted)
+        let after_second = db.get_messages_after_id("test-session", 0).await.unwrap();
+        let markers_2: Vec<_> = after_second.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(
+            markers_2.len(),
+            1,
+            "Rapid rewinds should consolidate to a single marker"
+        );
+    }
+
+    #[test]
+    fn test_build_rewind_marker_basic() {
+        let result = RewindResult {
+            messages_deleted: 5,
+            reversals_applied: 0,
+            reversals_skipped: 0,
+            tasks_deleted: 0,
+            tasks_cancelled: 0,
+            warnings: vec![],
+            reversal_descriptions: vec![],
+            rewind_trace_id: "test".to_string(),
+        };
+        let marker = build_rewind_marker(&result, None);
+        assert!(marker.starts_with(REWIND_MARKER_PREFIX));
+        assert!(marker.contains("5 message(s)"));
+        assert!(marker.contains("Do not attempt to reconstruct"));
+        assert!(!marker.contains("Memory changes reversed"));
+    }
+
+    #[test]
+    fn test_build_rewind_marker_with_reversals() {
+        let result = RewindResult {
+            messages_deleted: 3,
+            reversals_applied: 2,
+            reversals_skipped: 0,
+            tasks_deleted: 0,
+            tasks_cancelled: 0,
+            warnings: vec![],
+            reversal_descriptions: vec![
+                "Restore core_memory 'user_summary' to: Old value".to_string(),
+                "Delete person:Sarah (was created)".to_string(),
+            ],
+            rewind_trace_id: "test".to_string(),
+        };
+        let marker = build_rewind_marker(&result, None);
+        assert!(marker.contains("Memory changes reversed:"));
+        assert!(marker.contains("- Restore core_memory"));
+        assert!(marker.contains("- Delete person:Sarah"));
+    }
+
+    #[test]
+    fn test_build_rewind_marker_cross_session() {
+        let result = RewindResult {
+            messages_deleted: 2,
+            reversals_applied: 0,
+            reversals_skipped: 0,
+            tasks_deleted: 0,
+            tasks_cancelled: 0,
+            warnings: vec![],
+            reversal_descriptions: vec![],
+            rewind_trace_id: "test".to_string(),
+        };
+        let marker = build_rewind_marker(&result, Some("abcdefghijklmnop"));
+        assert!(marker.contains("initiated from a different session (abcdefgh)"));
     }
 }

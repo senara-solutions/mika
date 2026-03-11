@@ -947,18 +947,18 @@ async fn handle_rewind_impl(
                 app.messages.clear();
                 if let Ok(recent) = app.db.load_recent_messages(20).await {
                     for msg in &recent {
-                        if msg.role == "user" || msg.role == "assistant" {
-                            app.messages.push(ChatMessage {
-                                role: if msg.role == "user" {
-                                    ChatRole::User
-                                } else {
-                                    ChatRole::Assistant
-                                },
-                                content: msg.content.clone(),
-                                rendered: None,
-                                channel: None,
-                            });
-                        }
+                        let chat_role = match msg.role.as_str() {
+                            "user" => ChatRole::User,
+                            "assistant" => ChatRole::Assistant,
+                            "system" => ChatRole::System,
+                            _ => continue,
+                        };
+                        app.messages.push(ChatMessage {
+                            role: chat_role,
+                            content: msg.content.clone(),
+                            rendered: None,
+                            channel: None,
+                        });
                     }
                 }
             }

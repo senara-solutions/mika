@@ -2958,6 +2958,18 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Delete rewind context marker messages from a session.
+    /// Called before injecting a new marker to prevent accumulation during rapid rewinds.
+    pub fn delete_rewind_markers(&self, agent_id: &str, session_id: &str) -> Result<usize> {
+        let pattern = format!("{}%", crate::rewind::REWIND_MARKER_PREFIX);
+        let deleted = self.conn.execute(
+            "DELETE FROM messages WHERE agent_id = ?1 AND session_id = ?2 \
+             AND role = 'system' AND content LIKE ?3",
+            params![agent_id, session_id, pattern],
+        )?;
+        Ok(deleted)
+    }
+
     /// Mark audit events as rewound by setting rewound_by_trace_id.
     pub fn mark_audit_events_rewound(
         &self,

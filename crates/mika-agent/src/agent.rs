@@ -725,9 +725,10 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
                 msg.content.clone()
             };
             Message {
-                // DB stores "tool_result" for callback results (provider-agnostic).
-                // Claude API expects these as "user" role messages.
-                role: if msg.role == "tool_result" {
+                // DB stores "tool_result" for callback results and "system" for
+                // context markers (e.g., rewind notices). Claude API expects
+                // these as "user" role messages.
+                role: if msg.role == "tool_result" || msg.role == "system" {
                     "user".to_string()
                 } else {
                     msg.role.clone()

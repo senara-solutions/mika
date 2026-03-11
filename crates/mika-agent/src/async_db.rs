@@ -915,6 +915,12 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn delete_rewind_markers(&self, session_id: &str) -> Result<usize> {
+        let (a, s) = (self.agent_id.clone(), session_id.to_owned());
+        self.with_db(move |db| db.delete_rewind_markers(&a, &s))
+            .await
+    }
+
     pub async fn mark_audit_events_rewound(
         &self,
         trace_ids: Vec<String>,
