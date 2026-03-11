@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
@@ -60,7 +62,16 @@ impl Tool for WriteFileTool {
 
         let full_path = match validate_and_resolve_path(path, ctx.home_dir, true).await {
             Ok(p) => p,
-            Err(e) => return Ok(e),
+            Err(e) => {
+                // If the path was absolute, hint that run_shell can write outside the home dir
+                if Path::new(path).is_absolute() {
+                    return Ok(ToolOutput::error(format!(
+                        "{} For paths outside your home directory, use run_shell instead.",
+                        e.content
+                    )));
+                }
+                return Ok(e);
+            }
         };
 
         // Check if file already exists
@@ -408,6 +419,46 @@ mod tests {
                 .contains(&expected_path.display().to_string()),
             "expected absolute path '{}' in confirmation: {}",
             expected_path.display(),
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_absolute_path_hints_run_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let tool = WriteFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "/tmp/outside.txt", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("use run_shell instead"),
+            "expected run_shell hint, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_traversal_path_does_not_hint_run_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let tool = WriteFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "../escape.txt", "content": "data" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            !output.content.contains("run_shell"),
+            "traversal error should not mention run_shell, got: {}",
             output.content
         );
     }
