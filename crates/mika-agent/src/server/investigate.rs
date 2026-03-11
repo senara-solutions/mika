@@ -268,11 +268,14 @@ impl Tool for QueryAuditEventsTool {
                 e.tool_name,
                 e.target_key,
                 e.before_value.as_deref().unwrap_or("(none)"),
-                if e.after_value.len() > 100 {
-                    let truncated: String = e.after_value.chars().take(100).collect();
-                    format!("{truncated}...")
-                } else {
-                    e.after_value.clone()
+                {
+                    let av = e.after_value.as_deref().unwrap_or("(none)");
+                    if av.len() > 100 {
+                        let truncated: String = av.chars().take(100).collect();
+                        format!("{truncated}...")
+                    } else {
+                        av.to_string()
+                    }
                 },
             ));
             if let Some(r) = &e.reasoning {

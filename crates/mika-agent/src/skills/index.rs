@@ -911,11 +911,11 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].skill_tools.len(), 1);
+        let result = scan_skills_dir(tmp.path());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].skill_tools.len(), 1);
 
-        let schema = &entries[0].skill_tools[0].definition.input_schema;
+        let schema = &result.entries[0].skill_tools[0].definition.input_schema;
         // work_item_id should be in properties
         assert!(
             schema["properties"]["work_item_id"].is_object(),
@@ -960,11 +960,11 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].skill_tools.len(), 1);
+        let result = scan_skills_dir(tmp.path());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].skill_tools.len(), 1);
 
-        let schema = &entries[0].skill_tools[0].definition.input_schema;
+        let schema = &result.entries[0].skill_tools[0].definition.input_schema;
         // work_item_id should NOT be injected for non-long-running tools
         assert!(
             schema["properties"]["work_item_id"].is_null(),

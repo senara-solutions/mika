@@ -7,7 +7,7 @@ Slash commands are client-side actions executed directly in the Mika TUI. They a
 database and renders output in-place, while typing a regular message (no `/` prefix)
 sends it to the Claude-backed agent loop as usual.
 
-All 21 commands are defined in a single `COMMANDS` array
+All 23 commands are defined in a single `COMMANDS` array
 (`crates/mika-cli/src/tui/commands/mod.rs`), dispatched through pattern matching in
 `handlers.rs`, and surfaced via an autocomplete popup driven by `autocomplete.rs`.
 
@@ -24,7 +24,7 @@ arguments.
 
 ### Command Completion
 
-1. Type `/` -- a popup appears listing all 20 commands.
+1. Type `/` -- a popup appears listing all 23 commands.
 2. Continue typing to narrow the list. For example, `/me` narrows to `/memory`.
    Matching works on both command names and aliases (e.g., typing `/q` matches
    `/exit` via its `q` alias).
@@ -164,7 +164,7 @@ Show system health information: message count, database size, core memory usage,
 **Aliases:** `/stat` | **Arguments:** None
 
 ```
-Status: Messages: 142 | DB size: 384 KB | Core memory: 52/2000 tokens | Schema: v6 | Model: claude-sonnet-4-6 | Session: a1b2c3d4
+Status: Messages: 142 | DB size: 384 KB | Core memory: 52/2000 tokens | Schema: v9 | Model: claude-sonnet-4-6 | Session: a1b2c3d4
 ```
 
 ---
@@ -388,6 +388,51 @@ Only available in team mode (`mika --team <name>`).
 
 ---
 
+### /undo
+
+Undo the last exchange (user message + assistant response) and reverse any memory changes made during that exchange. Equivalent to `/rewind 1`.
+
+**Aliases:** None | **Arguments:** None
+
+Uses the conversation rewind engine: previews the last exchange, shows what will be deleted and which memory mutations will be reversed, then executes the rewind. After execution, a context marker message is injected into the session so the agent knows messages were removed and does not confabulate about the gap.
+
+```
+/undo
+→ Rewind complete: 2 messages removed, 1 reversal applied.
+```
+
+Errors: `Cannot rewind while agent is busy.` or `Nothing to undo.`
+
+---
+
+### /rewind
+
+Rewind multiple exchanges or rewind to a specific message ID. Previews changes before executing.
+
+**Aliases:** None | **Arguments:** `[<count> | to <message_id>]` (optional)
+
+**Without arguments** -- rewinds 1 exchange (same as `/undo`).
+
+**With a count:**
+```
+/rewind 3
+→ Rewind complete: 6 messages removed, 2 reversals applied.
+```
+
+**With a target message ID:**
+```
+/rewind to 42
+→ Rewind complete: 8 messages removed, 0 reversals applied.
+```
+
+The rewind engine automatically reverses memory mutations (core memory edits, fact stores/updates) that occurred in the rewound messages by consulting the audit log. Tasks created during the rewound period are cancelled. A context marker is injected after the rewind to inform the agent of the gap.
+
+Cross-session rewinds are supported -- if the target messages are in a different session than the current one, the marker notes the originating session.
+
+Errors: `Cannot rewind while agent is busy.` or `No messages to rewind.`
+
+---
+
 ## Team Mode
 
 When the TUI is launched with `mika --team <name>`, slash commands are restricted
@@ -398,6 +443,7 @@ to a safe subset. Agent-specific commands are disabled:
 | `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
 | `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
+| | `/undo`, `/rewind` |
 
 In team mode, `/status` and `/team` both show team info (name, orchestrator,
 agents). `/export` writes to the team directory instead of the agent home.

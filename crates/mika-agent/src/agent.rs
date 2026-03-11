@@ -725,9 +725,10 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
                 msg.content.clone()
             };
             Message {
-                // DB stores "tool_result" for callback results (provider-agnostic).
-                // Claude API expects these as "user" role messages.
-                role: if msg.role == "tool_result" {
+                // DB stores "tool_result" for callback results and "system" for
+                // context markers (e.g., rewind notices). Claude API expects
+                // these as "user" role messages.
+                role: if msg.role == "tool_result" || msg.role == "system" {
                     "user".to_string()
                 } else {
                     msg.role.clone()
@@ -1235,7 +1236,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
                         evt.tool_name,
                         evt.target_key,
                         evt.before_value.as_deref().unwrap_or("(none)"),
-                        evt.after_value
+                        evt.after_value.as_deref().unwrap_or("(none)")
                     );
                     if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
                         buf.push_str("... (truncated)\n");

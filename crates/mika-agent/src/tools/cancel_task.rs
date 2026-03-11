@@ -52,7 +52,7 @@ impl Tool for CancelTaskTool {
                     "cancel_task",
                     &format!("task:{id}"),
                     None,
-                    "cancelled",
+                    Some("cancelled"),
                     None,
                     Some(ctx.trace_id),
                 )

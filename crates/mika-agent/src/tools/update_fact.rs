@@ -138,7 +138,7 @@ async fn update_commitment(input: &Value, id: i64, ctx: &ToolContext<'_>) -> Res
             "update_fact",
             &target,
             before_status.as_deref(),
-            &after,
+            Some(&*after),
             reasoning.as_deref(),
             Some(ctx.trace_id),
         )
@@ -368,7 +368,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "update_fact");
         assert!(events[0].target_key.starts_with("commitment:"));
-        assert!(events[0].after_value.contains("completed"));
+        assert!(
+            events[0]
+                .after_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("completed")
+        );
     }
 
     #[tokio::test]
@@ -446,6 +452,12 @@ mod tests {
             Some("pending"),
             "before_value should capture the previous status"
         );
-        assert!(events[0].after_value.contains("completed"));
+        assert!(
+            events[0]
+                .after_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("completed")
+        );
     }
 }

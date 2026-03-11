@@ -191,7 +191,7 @@ impl Tool for CreateReminderTool {
                 "create_reminder",
                 &format!("task:{id}"),
                 None,
-                &format!("{display} — {message}"),
+                Some(&*format!("{display} — {message}")),
                 None,
                 Some(ctx.trace_id),
             )

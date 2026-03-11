@@ -55,7 +55,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 8
+**Current schema version:** 9
 
 ### Core Tables
 
@@ -97,7 +97,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Audit Tables
 
-**audit_events** — `id INTEGER PK AUTO`, `agent_id FK`, `session_id TEXT`, `tool_name TEXT`, `target_key TEXT`, `before_value TEXT`, `after_value TEXT`, `reasoning TEXT`, `trace_id TEXT`, `created_at`
+**audit_events** — `id INTEGER PK AUTO`, `agent_id FK`, `session_id TEXT`, `tool_name TEXT`, `target_key TEXT`, `before_value TEXT`, `after_value TEXT` (nullable), `reasoning TEXT`, `trace_id TEXT`, `rewound_by_trace_id TEXT`, `created_at`
 
 **audit_event_summaries** — `id INTEGER PK AUTO`, `agent_id FK`, `year INTEGER`, `month INTEGER`, `summary TEXT`, `event_count INTEGER`, `created_at`. Unique: `(agent_id, year, month)`.
 

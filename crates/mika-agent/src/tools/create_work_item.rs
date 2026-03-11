@@ -179,7 +179,7 @@ impl Tool for CreateWorkItemTool {
                 "create_work_item",
                 &format!("task:{id}"),
                 None,
-                &after_value,
+                Some(&*after_value),
                 None,
                 Some(ctx.trace_id),
             )

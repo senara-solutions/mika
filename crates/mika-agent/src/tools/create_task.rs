@@ -225,7 +225,7 @@ impl Tool for CreateTaskTool {
                 "create_task",
                 &format!("task:{id}"),
                 None,
-                &format!("{trigger_type_str}/{action_type_val} — {label}"),
+                Some(&*format!("{trigger_type_str}/{action_type_val} — {label}")),
                 None,
                 Some(ctx.trace_id),
             )

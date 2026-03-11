@@ -152,7 +152,7 @@ mod tests {
                 "store_fact",
                 "person:Alice",
                 None,
-                "Added Alice",
+                Some("Added Alice"),
                 None,
                 None,
             )
