@@ -78,7 +78,7 @@ pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
 }
 
 /// Validate a skill name: non-empty, alphanumeric + hyphens only, no path traversal.
-pub(crate) fn validate_skill_name(name: &str) -> Result<(), String> {
+pub fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Skill name cannot be empty.".to_string());
     }
@@ -321,12 +321,12 @@ mod tests {
         tool.execute(valid_input(), &ctx).await.unwrap();
 
         // Verify the created skill is loadable by scan_skills_dir
-        let entries = crate::skills::index::scan_skills_dir(&tmp.path().join("skills"));
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].manifest.skill.name, "test-skill");
-        assert_eq!(entries[0].keywords_lower, vec!["test", "example"]);
+        let scan = crate::skills::index::scan_skills_dir(&tmp.path().join("skills"));
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].manifest.skill.name, "test-skill");
+        assert_eq!(scan.entries[0].keywords_lower, vec!["test", "example"]);
         assert_eq!(
-            entries[0].prompt_snippet,
+            scan.entries[0].prompt_snippet,
             "You are testing the skill system."
         );
     }

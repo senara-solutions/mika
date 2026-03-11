@@ -40,22 +40,32 @@ pub struct SkillEntry {
     pub has_override: bool,
 }
 
+/// Result of scanning a skills directory.
+pub struct ScanResult {
+    pub entries: Vec<SkillEntry>,
+    pub skipped_count: usize,
+}
+
 /// Scan a skills directory and load all valid skill manifests.
 ///
 /// Each immediate subdirectory is expected to contain a `skill.toml`.
 /// Invalid skills are logged at `warn` and skipped — never break startup.
-/// Legacy-format skills (flat fields + `[handler]` with `type = "builtin"`) are
-/// skipped with a deprecation warning.
-pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
+/// Legacy-format skills (has `[handler]` section) are skipped with a
+/// deprecation warning. Returns entries and the count of skipped directories.
+pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
     let read_dir = match std::fs::read_dir(skills_dir) {
         Ok(rd) => rd,
         Err(e) => {
             warn!(path = %skills_dir.display(), error = %e, "cannot read skills directory");
-            return Vec::new();
+            return ScanResult {
+                entries: Vec::new(),
+                skipped_count: 0,
+            };
         }
     };
 
     let mut entries = Vec::new();
+    let mut skipped_count: usize = 0;
     for dir_entry in read_dir {
         let dir_entry = match dir_entry {
             Ok(de) => de,
@@ -81,6 +91,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
                 size = meta.len(),
                 "skill.toml exceeds 64KB, skipping"
             );
+            skipped_count += 1;
             continue;
         }
 
@@ -88,6 +99,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
             Ok(c) => c,
             Err(e) => {
                 warn!(path = %manifest_path.display(), error = %e, "cannot read skill manifest");
+                skipped_count += 1;
                 continue;
             }
         };
@@ -96,9 +108,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
         if is_legacy_format(&content) {
             warn!(
                 path = %manifest_path.display(),
-                "skipping legacy-format skill (flat fields + [handler] type=\"builtin\"). \
-                 Migrate to new [skill] section format."
+                "skipping legacy-format skill (has [handler] section). \
+                 Migrate to new [skill] section format — handler config belongs in tools.json."
             );
+            skipped_count += 1;
             continue;
         }
 
@@ -106,6 +119,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
             Ok(m) => m,
             Err(e) => {
                 warn!(path = %manifest_path.display(), error = %e, "invalid skill manifest");
+                skipped_count += 1;
                 continue;
             }
         };
@@ -138,29 +152,250 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Vec<SkillEntry> {
         });
     }
 
-    entries
+    ScanResult {
+        entries,
+        skipped_count,
+    }
+}
+
+/// Diagnostic level for skill validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// A single diagnostic finding from skill validation.
+#[derive(Debug, Clone)]
+pub struct SkillDiagnostic {
+    pub level: DiagnosticLevel,
+    pub message: String,
+}
+
+impl SkillDiagnostic {
+    fn ok(msg: impl Into<String>) -> Self {
+        Self {
+            level: DiagnosticLevel::Ok,
+            message: msg.into(),
+        }
+    }
+    fn warn(msg: impl Into<String>) -> Self {
+        Self {
+            level: DiagnosticLevel::Warn,
+            message: msg.into(),
+        }
+    }
+    fn fail(msg: impl Into<String>) -> Self {
+        Self {
+            level: DiagnosticLevel::Fail,
+            message: msg.into(),
+        }
+    }
+
+    pub fn tag(&self) -> &'static str {
+        match self.level {
+            DiagnosticLevel::Ok => "[OK]",
+            DiagnosticLevel::Warn => "[WARN]",
+            DiagnosticLevel::Fail => "[FAIL]",
+        }
+    }
+}
+
+/// Validate a single skill directory and return diagnostics.
+pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
+    let mut diags = Vec::new();
+
+    // 1. Check skill.toml exists and is readable
+    let manifest_path = skill_dir.join("skill.toml");
+    if !manifest_path.exists() {
+        diags.push(SkillDiagnostic::fail("skill.toml not found"));
+        return diags;
+    }
+
+    // Check file size
+    if let Ok(meta) = std::fs::metadata(&manifest_path)
+        && meta.len() > MAX_SKILL_TOML_SIZE
+    {
+        diags.push(SkillDiagnostic::fail(format!(
+            "skill.toml exceeds 64KB ({}KB)",
+            meta.len() / 1024
+        )));
+        return diags;
+    }
+
+    let content = match std::fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(e) => {
+            diags.push(SkillDiagnostic::fail(format!(
+                "cannot read skill.toml: {e}"
+            )));
+            return diags;
+        }
+    };
+
+    // 2. Check for valid TOML and legacy format
+    if is_legacy_format(&content) {
+        diags.push(SkillDiagnostic::fail(
+            "legacy format detected: has [handler] section. \
+             Migrate to [skill] section + tools.json per-tool handlers."
+                .to_string(),
+        ));
+        return diags;
+    }
+
+    // 3. Parse as SkillManifest
+    let manifest: SkillManifest = match toml::from_str(&content) {
+        Ok(m) => m,
+        Err(e) => {
+            diags.push(SkillDiagnostic::fail(format!("invalid skill.toml: {e}")));
+            return diags;
+        }
+    };
+    diags.push(SkillDiagnostic::ok(format!(
+        "skill.toml valid — name={}, description={}",
+        manifest.skill.name,
+        manifest
+            .skill
+            .description
+            .chars()
+            .take(60)
+            .collect::<String>()
+    )));
+
+    // 4. Check tools.json if present
+    let tools_path = skill_dir.join("tools.json");
+    if tools_path.exists() {
+        if let Ok(meta) = std::fs::metadata(&tools_path)
+            && meta.len() > MAX_TOOLS_JSON_SIZE
+        {
+            diags.push(SkillDiagnostic::fail(format!(
+                "tools.json exceeds 256KB ({}KB)",
+                meta.len() / 1024
+            )));
+            return diags;
+        }
+        match std::fs::read_to_string(&tools_path) {
+            Ok(json_content) => {
+                match serde_json::from_str::<Vec<super::manifest::SkillToolDef>>(&json_content) {
+                    Ok(tools) => {
+                        diags.push(SkillDiagnostic::ok(format!(
+                            "tools.json valid — {} tool(s)",
+                            tools.len()
+                        )));
+
+                        // 5. Check exec handler commands exist and are executable
+                        for tool in &tools {
+                            if let ToolHandler::Exec { command, .. } = &tool.handler {
+                                let cmd_path = skill_dir.join(command);
+                                if !cmd_path.exists() {
+                                    diags.push(SkillDiagnostic::fail(format!(
+                                        "tool '{}': handler command not found: {} (resolved to {})",
+                                        tool.name,
+                                        command,
+                                        cmd_path.display()
+                                    )));
+                                } else {
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if let Ok(meta) = std::fs::metadata(&cmd_path) {
+                                            if meta.permissions().mode() & 0o111 == 0 {
+                                                diags.push(SkillDiagnostic::fail(format!(
+                                                    "tool '{}': handler command not executable: {}",
+                                                    tool.name,
+                                                    cmd_path.display()
+                                                )));
+                                            } else {
+                                                // Symlink containment check
+                                                if let Ok(canonical) = cmd_path.canonicalize()
+                                                    && !canonical.starts_with(skill_dir)
+                                                {
+                                                    diags.push(SkillDiagnostic::warn(format!(
+                                                        "tool '{}': handler command '{}' resolves outside skill directory",
+                                                        tool.name, command
+                                                    )));
+                                                }
+                                                diags.push(SkillDiagnostic::ok(format!(
+                                                    "tool '{}': handler command OK",
+                                                    tool.name
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        diags.push(SkillDiagnostic::fail(format!("invalid tools.json: {e}")));
+                    }
+                }
+            }
+            Err(e) => {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "cannot read tools.json: {e}"
+                )));
+            }
+        }
+    }
+
+    // 6. Warnings for no-op or never-activates skills
+    let has_tools = tools_path.exists();
+    let has_snippet = skill_dir.join("system_prompt.md").exists();
+    if !has_tools && !has_snippet {
+        diags.push(SkillDiagnostic::warn(
+            "no-op skill: no tools.json and no system_prompt.md",
+        ));
+    }
+    if !manifest.skill.always_on && manifest.triggers.keywords.is_empty() {
+        diags.push(SkillDiagnostic::warn(
+            "skill will never activate: not always_on and no trigger keywords",
+        ));
+    }
+
+    diags
 }
 
 /// Detect whether a skill.toml uses the legacy flat format.
 ///
-/// Legacy format has top-level `name` field and a `[handler]` section.
-/// New format wraps everything under `[skill]`.
+/// Legacy format has a top-level `[handler]` section with a `type` field
+/// (any handler type: builtin, exec, http). New format wraps skill metadata
+/// under `[skill]` and puts handler config in tools.json per-tool.
 fn is_legacy_format(content: &str) -> bool {
     // Parse as generic TOML table and check for legacy markers
     let table: toml::Table = match content.parse() {
         Ok(t) => t,
         Err(_) => return false,
     };
-    // Legacy format has top-level "handler" table with type = "builtin"
+    // Legacy format has top-level "handler" table with any "type" field
     if let Some(handler) = table.get("handler").and_then(|v| v.as_table())
-        && handler
-            .get("type")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| t == "builtin")
+        && handler.get("type").and_then(|v| v.as_str()).is_some()
     {
         return true;
     }
     false
+}
+
+/// Inject `work_item_id` as a required field into a tool's input schema.
+///
+/// Long-running exec handlers must track delegation via work items.
+/// This adds the field to the JSON schema so the LLM knows to include it.
+fn inject_work_item_id_field(schema: &mut serde_json::Value) {
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.insert(
+            "work_item_id".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "description": "ID of the work item tracking this task. Create one first using create_work_item."
+            }),
+        );
+    }
+    if let Some(required) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
+        required.push(serde_json::Value::String("work_item_id".to_string()));
+    } else {
+        schema["required"] = serde_json::json!(["work_item_id"]);
+    }
 }
 
 /// Load and parse `tools.json` from a skill directory.
@@ -210,14 +445,26 @@ fn load_tools_json(skill_dir: &Path) -> Vec<ResolvedSkillTool> {
             }
             true
         })
-        .map(|def| ResolvedSkillTool {
-            definition: ToolDefinition {
-                name: def.name,
-                description: def.description,
-                input_schema: def.input_schema,
-            },
-            handler: def.handler,
-            skill_dir: skill_dir.to_path_buf(),
+        .map(|def| {
+            let mut schema = def.input_schema;
+
+            // Long-running exec handlers require a work_item_id for delegation tracking
+            if let ToolHandler::Exec {
+                long_running: true, ..
+            } = &def.handler
+            {
+                inject_work_item_id_field(&mut schema);
+            }
+
+            ResolvedSkillTool {
+                definition: ToolDefinition {
+                    name: def.name,
+                    description: def.description,
+                    input_schema: schema,
+                },
+                handler: def.handler,
+                skill_dir: skill_dir.to_path_buf(),
+            }
         })
         .collect()
 }
@@ -261,13 +508,14 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].manifest.skill.name, "web-search");
-        assert_eq!(entries[0].keywords_lower, vec!["search", "look up"]);
-        assert_eq!(entries[0].dir, skill_dir);
-        assert!(entries[0].enabled);
-        assert!(entries[0].skill_tools.is_empty());
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.skipped_count, 0);
+        assert_eq!(scan.entries[0].manifest.skill.name, "web-search");
+        assert_eq!(scan.entries[0].keywords_lower, vec!["search", "look up"]);
+        assert_eq!(scan.entries[0].dir, skill_dir);
+        assert!(scan.entries[0].enabled);
+        assert!(scan.entries[0].skill_tools.is_empty());
     }
 
     #[test]
@@ -306,9 +554,10 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].manifest.skill.name, "web-search");
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.skipped_count, 1);
+        assert_eq!(scan.entries[0].manifest.skill.name, "web-search");
     }
 
     #[test]
@@ -337,22 +586,23 @@ mod tests {
         let missing = tmp.path().join("missing");
         fs::create_dir_all(&missing).unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].manifest.skill.name, "good");
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.skipped_count, 2); // bad TOML + missing manifest
+        assert_eq!(scan.entries[0].manifest.skill.name, "good");
     }
 
     #[test]
     fn test_scan_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let entries = scan_skills_dir(tmp.path());
-        assert!(entries.is_empty());
+        let scan = scan_skills_dir(tmp.path());
+        assert!(scan.entries.is_empty());
     }
 
     #[test]
     fn test_scan_nonexistent_dir() {
-        let entries = scan_skills_dir(Path::new("/nonexistent/skills"));
-        assert!(entries.is_empty());
+        let scan = scan_skills_dir(Path::new("/nonexistent/skills"));
+        assert!(scan.entries.is_empty());
     }
 
     #[test]
@@ -360,8 +610,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // A file (not a directory) in the skills dir should be skipped
         fs::write(tmp.path().join("readme.txt"), "not a skill").unwrap();
-        let entries = scan_skills_dir(tmp.path());
-        assert!(entries.is_empty());
+        let scan = scan_skills_dir(tmp.path());
+        assert!(scan.entries.is_empty());
     }
 
     #[test]
@@ -373,8 +623,9 @@ mod tests {
         let big_content = "x".repeat(65 * 1024);
         fs::write(skill_dir.join("skill.toml"), &big_content).unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert!(entries.is_empty());
+        let scan = scan_skills_dir(tmp.path());
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.skipped_count, 1);
     }
 
     #[test]
@@ -393,9 +644,9 @@ mod tests {
         .unwrap();
         fs::write(skill_dir.join("system_prompt.md"), "Use web search wisely.").unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].prompt_snippet, "Use web search wisely.");
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "Use web search wisely.");
     }
 
     #[test]
@@ -413,9 +664,9 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].prompt_snippet, "");
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "");
     }
 
     #[test]
@@ -447,9 +698,9 @@ mod tests {
         // Create .disabled marker
         fs::write(skill_dir.join(".disabled"), "").unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert!(!entries[0].enabled);
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert!(!scan.entries[0].enabled);
     }
 
     #[test]
@@ -483,13 +734,13 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].skill_tools.len(), 1);
-        assert_eq!(entries[0].skill_tools[0].definition.name, "web_search");
-        assert_eq!(entries[0].skill_tools[0].skill_dir, skill_dir);
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].skill_tools.len(), 1);
+        assert_eq!(scan.entries[0].skill_tools[0].definition.name, "web_search");
+        assert_eq!(scan.entries[0].skill_tools[0].skill_dir, skill_dir);
         assert!(matches!(
-            &entries[0].skill_tools[0].handler,
+            &scan.entries[0].skill_tools[0].handler,
             super::super::manifest::ToolHandler::Exec { command, .. } if command == "./handlers/search.sh"
         ));
     }
@@ -511,9 +762,9 @@ mod tests {
         let big_json = "x".repeat(257 * 1024);
         fs::write(skill_dir.join("tools.json"), &big_json).unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].skill_tools.is_empty());
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert!(scan.entries[0].skill_tools.is_empty());
     }
 
     #[test]
@@ -532,9 +783,9 @@ mod tests {
         .unwrap();
         fs::write(skill_dir.join("tools.json"), "not json").unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].skill_tools.is_empty());
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert!(scan.entries[0].skill_tools.is_empty());
     }
 
     #[test]
@@ -570,18 +821,19 @@ mod tests {
         )
         .unwrap();
 
-        let entries = scan_skills_dir(tmp.path());
-        assert_eq!(entries.len(), 1);
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
         assert_eq!(
-            entries[0].skill_tools.len(),
+            scan.entries[0].skill_tools.len(),
             1,
             "unknown builtin should be filtered out"
         );
-        assert_eq!(entries[0].skill_tools[0].definition.name, "valid_tool");
+        assert_eq!(scan.entries[0].skill_tools[0].definition.name, "valid_tool");
     }
 
     #[test]
     fn test_is_legacy_format() {
+        // Legacy builtin handler
         assert!(is_legacy_format(
             r#"
             name = "memory"
@@ -589,6 +841,29 @@ mod tests {
             [handler]
             type = "builtin"
             tools = ["store_fact"]
+            "#
+        ));
+
+        // Legacy exec handler (also detected now)
+        assert!(is_legacy_format(
+            r#"
+            name = "calendar"
+            description = "Calendar"
+            [handler]
+            type = "exec"
+            command = "./handler.sh"
+            tools = ["get_events"]
+            "#
+        ));
+
+        // Legacy http handler
+        assert!(is_legacy_format(
+            r#"
+            name = "weather"
+            description = "Weather"
+            [handler]
+            type = "http"
+            url = "http://localhost:8080/tools"
             "#
         ));
 
@@ -603,5 +878,97 @@ mod tests {
 
         // Invalid TOML is not legacy
         assert!(!is_legacy_format("{{not toml}}"));
+    }
+
+    #[test]
+    fn test_long_running_tool_gets_work_item_id_injected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("builder");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "builder"
+            description = "Long-running builder"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "build_project",
+                "description": "Build a project",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Build command"}
+                    },
+                    "required": ["command"]
+                },
+                "handler": {"type": "exec", "command": "./build.sh", "long_running": true, "estimated_duration_secs": 300}
+            }]"#,
+        )
+        .unwrap();
+
+        let result = scan_skills_dir(tmp.path());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].skill_tools.len(), 1);
+
+        let schema = &result.entries[0].skill_tools[0].definition.input_schema;
+        // work_item_id should be in properties
+        assert!(
+            schema["properties"]["work_item_id"].is_object(),
+            "work_item_id property should be injected for long_running tools"
+        );
+        // work_item_id should be required
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.contains(&serde_json::Value::String("work_item_id".to_string())),
+            "work_item_id should be in required fields"
+        );
+    }
+
+    #[test]
+    fn test_non_long_running_tool_no_work_item_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "search"
+            description = "Web search"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "web_search",
+                "description": "Search the web",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                },
+                "handler": {"type": "exec", "command": "./search.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        let result = scan_skills_dir(tmp.path());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].skill_tools.len(), 1);
+
+        let schema = &result.entries[0].skill_tools[0].definition.input_schema;
+        // work_item_id should NOT be injected for non-long-running tools
+        assert!(
+            schema["properties"]["work_item_id"].is_null(),
+            "work_item_id should not be injected for non-long_running tools"
+        );
     }
 }

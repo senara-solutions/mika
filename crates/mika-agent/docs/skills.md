@@ -40,14 +40,17 @@ Each immediate subdirectory of `~/.mika/skills/` is treated as a skill. The dire
 
 ## Manifest Reference (skill.toml)
 
-The manifest is a TOML file with the following structure:
+The manifest is a TOML file with two sections: `[skill]` (required) and `[triggers]` (optional).
 
-### Top-level fields
+### `[skill]` section
 
-| Field         | Type   | Required | Description                              |
-|---------------|--------|----------|------------------------------------------|
-| `name`        | String | Yes      | Unique skill name (used in prompt headers and logging). |
-| `description` | String | Yes      | Human-readable description of the skill. |
+| Field          | Type   | Required | Default | Description                              |
+|----------------|--------|----------|---------|------------------------------------------|
+| `name`         | String | Yes      | —       | Unique skill name (used in prompt headers and logging). |
+| `description`  | String | Yes      | —       | Human-readable description of the skill. |
+| `version`      | String | No       | `""`    | Skill version. |
+| `always_on`    | bool   | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
+| `timeout_secs` | u64    | No       | `30`    | Per-tool execution timeout in seconds. |
 
 ### `[triggers]` section
 
@@ -57,97 +60,129 @@ The manifest is a TOML file with the following structure:
 
 If the `[triggers]` section is omitted entirely, it defaults to an empty keyword list. A skill with no keywords and `always_on = false` will never activate.
 
-### `[handler]` section
-
-| Field     | Type                     | Required | Description                                              |
-|-----------|--------------------------|----------|----------------------------------------------------------|
-| `type`    | `"builtin"` / `"exec"` / `"http"` | Yes      | Dispatch method for tool calls.                          |
-| `tools`   | Array<String>            | Yes      | Tool names this handler owns (all handler types).        |
-| `command` | String                   | Exec only | Path to the executable to run.                          |
-| `args`    | Array<String>            | No       | Static arguments passed before the tool name (exec only). Default: `[]`. |
-| `long_running` | bool                | No       | If true, exec handler spawns in background and returns a callback task ID immediately (exec only). Default: `false`. |
-| `estimated_duration_secs` | u64     | No       | Expected runtime in seconds; used to compute timeout as `estimated * 3` clamped to 600..7,776,000 (exec only, requires `long_running = true`). |
-| `url`     | String                   | Http only | URL to POST tool calls to.                              |
-| `headers` | Map<String, String>      | No       | HTTP headers added to every request (http only). Default: `{}`. |
-
-The `type` field uses `#[serde(tag = "type")]` deserialization, so it must appear as a string value within the `[handler]` table.
-
-### `[options]` section
-
-| Field          | Type | Required | Default | Description                                      |
-|----------------|------|----------|---------|--------------------------------------------------|
-| `always_on`    | bool | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
-| `timeout_secs` | u64  | No       | `30`    | Per-tool execution timeout in seconds (applies to exec and http handlers). |
-
-If the `[options]` section is omitted, both fields take their defaults.
-
 ### Minimal valid manifest
 
 ```toml
+[skill]
 name = "minimal"
 description = "A minimal skill with no tools"
-
-[handler]
-type = "builtin"
-tools = []
 ```
+
+> **Note:** Handler configuration (exec, http, builtin) lives in `tools.json` per-tool, not in `skill.toml`. See [Tool Definitions](#tool-definitions-toolsjson) below.
 
 ---
 
 ## Handler Types
 
+Each tool in `tools.json` has a `handler` object that controls how that tool is dispatched. There are three handler types: `builtin`, `exec`, and `http`.
+
 ### Builtin
 
-References tools already registered in Mika's Rust `ToolRegistry`. The `tools` array lists tool names that exist in compiled Rust code. No `tools.json` file is needed; tool definitions are pulled from the registry at runtime.
+References functions compiled into Mika's Rust binary. The `function` field names the builtin to call. No handler scripts are needed.
 
+**skill.toml:**
 ```toml
-name = "memory"
-description = "Manage persistent memory, core memory blocks, and stored facts"
+[skill]
+name = "web-search"
+description = "Search the web for current information"
+version = "0.1.0"
+always_on = true
+timeout_secs = 30
 
 [triggers]
-keywords = ["remember", "memory", "fact", "person", "commitment", "preference", "event"]
+keywords = ["search", "look up", "find online", "google", "latest"]
+```
 
-[handler]
-type = "builtin"
-tools = ["update_core_memory", "store_fact", "search_memory", "update_fact"]
-
-[options]
-always_on = true
+**tools.json:**
+```json
+[
+  {
+    "name": "web_search",
+    "description": "Search the web for current information on a topic.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "Search query"}
+      },
+      "required": ["query"]
+    },
+    "handler": {"type": "builtin", "function": "web_search"}
+  }
+]
 ```
 
 When Claude calls a builtin tool, it is dispatched through the standard `ToolRegistry` with full access to the `ToolContext` (database, session, home directory, etc.).
 
 ### Exec
 
-Runs a shell command for each tool call. The command receives the tool name as an additional trailing argument and the tool input JSON via **stdin**. Stdout is returned as the tool result; a non-zero exit code is reported as an error.
+Runs a shell command for each tool call. The command path is resolved relative to the skill directory. The tool input JSON is piped to the process via **stdin**. Stdout is returned as the tool result; a non-zero exit code is reported as an error.
 
+**skill.toml:**
 ```toml
-name = "calendar"
-description = "Calendar integration via local script"
+[skill]
+name = "github"
+description = "Interact with GitHub using the gh CLI"
+version = "0.1.0"
+always_on = false
+timeout_secs = 30
 
 [triggers]
-keywords = ["calendar", "meeting", "schedule", "event"]
+keywords = ["github", "pull request", "open pr", "create issue"]
+```
 
-[handler]
-type = "exec"
-command = "/usr/local/bin/cal-tool"
-args = ["--format", "json"]
-tools = ["get_events", "create_event"]
-
-[options]
-timeout_secs = 15
+**tools.json:**
+```json
+[
+  {
+    "name": "run_gh",
+    "description": "Execute a GitHub CLI (gh) command.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {"type": "string", "description": "The gh subcommand and arguments"}
+      },
+      "required": ["command"]
+    },
+    "handler": {"type": "exec", "command": "handlers/run.sh"}
+  }
+]
 ```
 
 Execution details:
 
-- The command is spawned as: `<command> <args...> <tool_name>`
-- For the example above, calling `get_events` runs: `/usr/local/bin/cal-tool --format json get_events`
-- The tool input JSON is piped to the process via **stdin** (read with `cat`, `jq`, etc.).
+- The command is resolved relative to the skill directory (e.g., `handlers/run.sh` → `~/.mika/skills/github/handlers/run.sh`).
+- The tool input JSON is piped to the process via **stdin** (read with `cat`, then parse with `jq`).
 - The process must complete within `timeout_secs` or it is killed and an error is returned.
 - Stdout is captured as the successful tool result.
 - Stderr is included in the error message on non-zero exit.
+- The command is **not** passed the tool name as an argument — all dispatch context is in the JSON on stdin.
 
 Exec handlers require a `tools.json` file in the skill directory to define the tool schemas sent to Claude.
+
+#### Long-Running Exec Handlers
+
+For tasks that take longer than `timeout_secs` (e.g., code analysis, CI pipelines), set `long_running: true` in the tool's handler:
+
+```json
+{
+  "name": "analyze_codebase",
+  "description": "Run deep code analysis",
+  "input_schema": {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+  "handler": {
+    "type": "exec",
+    "command": "handlers/analyze.sh",
+    "long_running": true,
+    "estimated_duration_secs": 300
+  }
+}
+```
+
+When `long_running` is true:
+- Stdout is redirected to `/dev/null` (output is not captured).
+- A callback task is created and the tool returns immediately with "task created".
+- `__mika_task_id` and `__mika_agent` are injected into the input JSON on stdin.
+- The script must deliver results via `mika ask --task-id <uuid> "result text"` when complete.
+- `estimated_duration_secs` is used to compute a timeout: `estimated * 3`, clamped to 600..7,776,000 seconds.
 
 #### Returning Images from Exec Handlers
 
@@ -195,24 +230,37 @@ jq -n --arg path "$SCREENSHOT" '{"__mika_v1":{"text":"Screenshot captured.","ima
 
 POSTs tool calls to a URL. The request body is JSON with `tool_name` and `input` fields. A 2xx response body is returned as the tool result; non-2xx status codes are reported as errors.
 
+**skill.toml:**
 ```toml
+[skill]
 name = "weather"
 description = "Weather lookup via external API"
+timeout_secs = 10
 
 [triggers]
 keywords = ["weather", "forecast", "temperature"]
+```
 
-[handler]
-type = "http"
-url = "http://localhost:8080/tools"
-tools = ["get_weather"]
-
-[handler.headers]
-Authorization = "Bearer token123"
-X-Custom-Header = "value"
-
-[options]
-timeout_secs = 10
+**tools.json:**
+```json
+[
+  {
+    "name": "get_weather",
+    "description": "Get the current weather for a city",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "city": {"type": "string", "description": "City name (e.g., 'Tokyo')"}
+      },
+      "required": ["city"]
+    },
+    "handler": {
+      "type": "http",
+      "url": "http://localhost:8080/tools",
+      "method": "POST"
+    }
+  }
+]
 ```
 
 Execution details:
@@ -224,11 +272,11 @@ Execution details:
     "input": { "city": "Tokyo" }
   }
   ```
-- All entries in `[handler.headers]` are added to the request.
-- The request timeout is controlled by `timeout_secs`.
+- The request timeout is controlled by `timeout_secs` from `skill.toml`.
 - A successful (2xx) response body is returned verbatim as the tool result.
 - Non-2xx responses return `"HTTP <status>: <body>"` as an error.
 - Connection failures and timeouts are reported as errors.
+- The `method` field defaults to `"POST"` if omitted.
 
 Http handlers require a `tools.json` file in the skill directory to define the tool schemas sent to Claude.
 
@@ -238,7 +286,7 @@ Http handlers require a `tools.json` file in the skill directory to define the t
 
 On each user turn, the `SkillRegistry` determines which skills are active:
 
-1. **Always-on skills** are included unconditionally, regardless of message content. Set `always_on = true` in `[options]`.
+1. **Always-on skills** are included unconditionally, regardless of message content. Set `always_on = true` in `[skill]`.
 
 2. **Keyword-matched skills** are included when at least one keyword from their `triggers.keywords` list appears as a substring of the user's message. Matching is case-insensitive: keywords are pre-lowercased at scan time, and the user message is lowercased before comparison.
 
@@ -286,40 +334,62 @@ If the file is missing or empty, no snippet is injected for that skill. Snippets
 
 ## Tool Definitions (tools.json)
 
-Exec and http handlers need a `tools.json` file to tell Claude what tools are available and what inputs they accept. This file is not needed for builtin handlers (their definitions come from the Rust `ToolRegistry`).
+Skills that provide tools need a `tools.json` file to define the tool schemas sent to Claude **and** the handler dispatch config for each tool. This file is required for exec and http tools; builtin-handler skills also use it to declare which builtin function each tool maps to.
 
-The file contains a JSON array of `ToolDefinition` objects:
+The file contains a JSON array of `SkillToolDef` objects:
 
 ```json
 [
   {
-    "name": "get_weather",
-    "description": "Get the current weather for a city",
+    "name": "run_gh",
+    "description": "Execute a GitHub CLI (gh) command.",
     "input_schema": {
       "type": "object",
       "properties": {
-        "city": {
+        "command": {
           "type": "string",
-          "description": "City name (e.g., 'Tokyo', 'New York')"
+          "description": "The gh subcommand and arguments to execute"
         }
       },
-      "required": ["city"]
+      "required": ["command"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh"
     }
   }
 ]
 ```
 
-### ToolDefinition fields
+### SkillToolDef fields
 
 | Field          | Type   | Required | Description                                                |
 |----------------|--------|----------|------------------------------------------------------------|
-| `name`         | String | Yes      | Tool name. Must appear in the handler's `tools` array.     |
+| `name`         | String | Yes      | Tool name (sent to Claude and used for dispatch).          |
 | `description`  | String | Yes      | Description shown to Claude explaining what the tool does. |
 | `input_schema` | Object | Yes      | JSON Schema object describing the tool's input parameters. |
+| `handler`      | Object | Yes      | Dispatch config — see handler variants below.              |
 
-Only tool definitions whose `name` appears in the handler's `tools` list are sent to Claude. Extra definitions in `tools.json` that are not listed in the handler's `tools` array are ignored.
+### Handler variants in tools.json
 
-Tool definitions are loaded lazily on each turn (via `tokio::fs::read_to_string` and `serde_json` deserialization). Changes take effect immediately without restart.
+**Exec** — runs a shell command:
+```json
+{"type": "exec", "command": "handlers/run.sh"}
+```
+Optional fields: `long_running` (bool), `estimated_duration_secs` (u64).
+
+**Http** — POSTs to a URL:
+```json
+{"type": "http", "url": "http://localhost:8080/tools", "method": "POST"}
+```
+`method` defaults to `"POST"` if omitted.
+
+**Builtin** — calls a compiled Rust function:
+```json
+{"type": "builtin", "function": "web_search"}
+```
+
+Tool definitions are loaded at startup during the skills scan. A restart is required for changes to take effect.
 
 ---
 
@@ -467,12 +537,12 @@ updated_at = "2026-03-02T10:30:00Z"
 
 ## Creating a Custom Skill
 
-This walkthrough creates an exec-based skill that converts between time zones using a shell script.
+This walkthrough creates an exec-based skill that converts between time zones using a shell script. You can also scaffold this with `mika skills create timezone`.
 
 ### Step 1: Create the skill directory
 
 ```bash
-mkdir -p ~/.mika/skills/timezone
+mkdir -p ~/.mika/skills/timezone/handlers
 ```
 
 ### Step 2: Write skill.toml
@@ -480,63 +550,18 @@ mkdir -p ~/.mika/skills/timezone
 Create `~/.mika/skills/timezone/skill.toml`:
 
 ```toml
+[skill]
 name = "timezone"
 description = "Convert times between time zones"
+timeout_secs = 10
 
 [triggers]
 keywords = ["timezone", "time zone", "convert time", "what time"]
-
-[handler]
-type = "exec"
-command = "/home/you/.mika/skills/timezone/handler.sh"
-tools = ["convert_timezone"]
-
-[options]
-timeout_secs = 10
 ```
 
-### Step 3: Write the handler script
+### Step 3: Write tools.json
 
-Create `~/.mika/skills/timezone/handler.sh`:
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
-# Tool name is passed as the last argument
-TOOL="$1"
-
-# Tool input JSON is piped via stdin
-INPUT=$(cat)
-
-case "$TOOL" in
-  convert_timezone)
-    # Parse input fields using jq
-    TIME=$(echo "$INPUT" | jq -r '.time')
-    FROM_TZ=$(echo "$INPUT" | jq -r '.from_timezone')
-    TO_TZ=$(echo "$INPUT" | jq -r '.to_timezone')
-
-    # Convert using date command
-    RESULT=$(TZ="$TO_TZ" date -d "TZ=\"$FROM_TZ\" $TIME" '+%Y-%m-%d %H:%M:%S %Z' 2>&1)
-
-    echo "{\"converted_time\": \"$RESULT\", \"from\": \"$FROM_TZ\", \"to\": \"$TO_TZ\"}"
-    ;;
-  *)
-    echo "Unknown tool: $TOOL" >&2
-    exit 1
-    ;;
-esac
-```
-
-Make it executable:
-
-```bash
-chmod +x ~/.mika/skills/timezone/handler.sh
-```
-
-### Step 4: Write tools.json
-
-Create `~/.mika/skills/timezone/tools.json`:
+Create `~/.mika/skills/timezone/tools.json`. Each tool definition includes the handler dispatch config:
 
 ```json
 [
@@ -560,9 +585,43 @@ Create `~/.mika/skills/timezone/tools.json`:
         }
       },
       "required": ["time", "from_timezone", "to_timezone"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh"
     }
   }
 ]
+```
+
+### Step 4: Write the handler script
+
+Create `~/.mika/skills/timezone/handlers/run.sh`:
+
+```bash
+#!/bin/sh
+set -eu
+
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required" >&2; exit 1; }
+
+# Tool input JSON is piped via stdin
+INPUT=$(cat)
+
+# Parse input fields using jq
+TIME=$(printf '%s\n' "$INPUT" | jq -r '.time')
+FROM_TZ=$(printf '%s\n' "$INPUT" | jq -r '.from_timezone')
+TO_TZ=$(printf '%s\n' "$INPUT" | jq -r '.to_timezone')
+
+# Convert using date command
+RESULT=$(TZ="$TO_TZ" date -d "TZ=\"$FROM_TZ\" $TIME" '+%Y-%m-%d %H:%M:%S %Z' 2>&1)
+
+echo "{\"converted_time\": \"$RESULT\", \"from\": \"$FROM_TZ\", \"to\": \"$TO_TZ\"}"
+```
+
+Make it executable:
+
+```bash
+chmod +x ~/.mika/skills/timezone/handlers/run.sh
 ```
 
 ### Step 5: Write system_prompt.md
@@ -575,7 +634,13 @@ Create `~/.mika/skills/timezone/system_prompt.md`:
 - If the user gives an ambiguous timezone abbreviation, ask for clarification or use the most common interpretation.
 ```
 
-### Step 6: Test it
+### Step 6: Validate and test
+
+Validate the skill structure before starting Mika:
+
+```bash
+mika skills validate timezone
+```
 
 A restart is required for Mika to discover new skill directories, because `skill.toml` manifests are scanned once at startup. After restarting Mika (or the mika-server process), send a message like:
 
@@ -585,12 +650,13 @@ What time is it in Tokyo when it's 3 PM in New York?
 
 The keyword `"time"` in the message matches `"what time"` from the triggers (substring match), so the timezone skill activates. Claude receives the `convert_timezone` tool definition and the prompt snippet, and can call the tool to answer.
 
-If the skill fails to load, check the Mika logs for warnings. Common issues:
+If the skill fails to load, check the Mika logs for warnings or run `mika skills validate`. Common issues:
 
+- Missing `[skill]` section in `skill.toml` (legacy format with `[handler]` section)
 - Invalid TOML syntax in `skill.toml`
 - Handler script not executable (`chmod +x`)
+- `tools.json` missing `handler` field on tool definitions
 - `tools.json` not valid JSON or missing required fields
-- Tool names in `tools.json` not matching the `tools` array in `skill.toml`
 
 ---
 

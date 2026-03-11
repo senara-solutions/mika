@@ -11,7 +11,7 @@ Available topics for `get_documentation`:
 - `configuration` — config file options, environment variables, and setup
 - `deployment` — deployment guide for Docker containers and infrastructure
 - `getting-started` — quickstart guide for new users
-- `runtime-structure` — ~/.mika directory layout, SQLite schema v7, log file locations
+- `runtime-structure` — ~/.mika directory layout, SQLite schema v8, log file locations
 - `skills` — skill authoring, handlers (exec/http/builtin), long_running, marketplace, and skill.toml format
 - `slash-commands` — available TUI slash commands and their usage
 

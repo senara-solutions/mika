@@ -3,6 +3,168 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+// -- Config Key Registry --
+
+/// Storage backend for a configuration key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigBackend {
+    /// config.toml (per-agent or global)
+    File,
+    /// ~/.mika/.env (secrets)
+    Env,
+    /// customer_config DB table
+    Database,
+    /// Computed at runtime, not writable
+    ReadOnly,
+}
+
+/// Metadata for a single configuration key.
+#[derive(Debug, Clone)]
+pub struct ConfigKeyInfo {
+    pub key: &'static str,
+    pub backend: ConfigBackend,
+    /// The MIKA_* env var that can override this key (if any).
+    pub env_var: Option<&'static str>,
+    /// Whether this key contains a secret and should be redacted.
+    pub secret: bool,
+    pub description: &'static str,
+}
+
+/// All known configuration keys across all backends.
+pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
+    // File backend (config.toml)
+    ConfigKeyInfo {
+        key: "claude_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_CLAUDE_MODEL"),
+        secret: false,
+        description: "Claude model ID",
+    },
+    ConfigKeyInfo {
+        key: "claude_max_tokens",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_CLAUDE_MAX_TOKENS"),
+        secret: false,
+        description: "Max response tokens",
+    },
+    ConfigKeyInfo {
+        key: "log_level",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_LOG_LEVEL"),
+        secret: false,
+        description: "Log level (trace/debug/info/warn/error/off)",
+    },
+    ConfigKeyInfo {
+        key: "server_port",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_SERVER_PORT"),
+        secret: false,
+        description: "HTTP server port",
+    },
+    ConfigKeyInfo {
+        key: "embedding_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_EMBEDDING_MODEL"),
+        secret: false,
+        description: "OpenAI embedding model",
+    },
+    ConfigKeyInfo {
+        key: "embedding_dimensions",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_EMBEDDING_DIMENSIONS"),
+        secret: false,
+        description: "Embedding vector dimensions",
+    },
+    // Env backend (.env secrets)
+    ConfigKeyInfo {
+        key: "anthropic_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_ANTHROPIC_API_KEY"),
+        secret: true,
+        description: "Anthropic API key",
+    },
+    ConfigKeyInfo {
+        key: "openai_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_OPENAI_API_KEY"),
+        secret: true,
+        description: "OpenAI API key (for embeddings)",
+    },
+    ConfigKeyInfo {
+        key: "brave_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_BRAVE_API_KEY"),
+        secret: true,
+        description: "Brave Search API key",
+    },
+    ConfigKeyInfo {
+        key: "internal_token",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_INTERNAL_TOKEN"),
+        secret: true,
+        description: "Server internal auth token",
+    },
+    // Database backend (customer_config table)
+    ConfigKeyInfo {
+        key: "timezone",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "User timezone",
+    },
+    ConfigKeyInfo {
+        key: "thinking_level",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Claude thinking level (low/medium/high/off)",
+    },
+    // ReadOnly (runtime-computed)
+    ConfigKeyInfo {
+        key: "home_dir",
+        backend: ConfigBackend::ReadOnly,
+        env_var: Some("MIKA_HOME"),
+        secret: false,
+        description: "Mika home directory",
+    },
+    ConfigKeyInfo {
+        key: "db_path",
+        backend: ConfigBackend::ReadOnly,
+        env_var: None,
+        secret: false,
+        description: "Database file path",
+    },
+];
+
+/// Look up a config key by name.
+pub fn lookup_config_key(key: &str) -> Option<&'static ConfigKeyInfo> {
+    CONFIG_KEYS.iter().find(|k| k.key == key)
+}
+
+/// Get the effective value of a config key from a loaded Settings struct.
+/// For DB keys, returns None (caller must query the database).
+pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
+    match key {
+        "claude_model" => Some(settings.claude_model.clone()),
+        "claude_max_tokens" => Some(settings.claude_max_tokens.to_string()),
+        "log_level" => Some(settings.log_level.clone()),
+        "server_port" => Some(settings.server_port.to_string()),
+        "embedding_model" => Some(settings.embedding_model.clone()),
+        "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
+        "anthropic_api_key" => settings.anthropic_api_key.clone(),
+        "openai_api_key" => settings.openai_api_key.clone(),
+        "brave_api_key" => settings.brave_api_key.clone(),
+        "internal_token" => settings
+            .internal_token
+            .as_ref()
+            .map(|s| s.expose_secret().to_string()),
+        "home_dir" => Some(settings.home_dir.display().to_string()),
+        "db_path" => Some(settings.db_path.display().to_string()),
+        // DB keys (timezone, thinking_level) not available from Settings
+        _ => None,
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct Settings {
     /// Anthropic API key (optional; only required for commands that call the Claude API)

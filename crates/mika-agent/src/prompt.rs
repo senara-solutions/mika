@@ -374,8 +374,13 @@ Core memory tracks key people briefly — the people table is the full record.\n
     prompt.push_str(
         "- Use create_work_item to track significant pieces of work (feature implementations, \
          research projects, items waiting on external input). Check list_work_items before creating \
-         to avoid duplicates. Use update_task_status to progress work items through their lifecycle \
+         to avoid duplicates. Use update_work_item_status to progress work items through their lifecycle \
          (pending → in_progress → blocked → completed).\n",
+    );
+    prompt.push_str(
+        "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \
+         or long-running skills), you MUST first create a work item using create_work_item, then pass \
+         the work_item_id to the delegation tool. The tool will reject calls without a valid work_item_id.\n",
     );
     prompt.push_str(
         "- Some tools are long-running and return a task ID instead of immediate results. \

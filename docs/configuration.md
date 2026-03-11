@@ -147,6 +147,64 @@ The environment variable takes precedence over all config files and `.env`.
 
 ---
 
+## CLI Config Management
+
+The `mika config` command provides subcommands for viewing and modifying
+configuration without editing files manually.
+
+### `mika config` (no subcommand)
+
+Prints a summary of current settings (model, max tokens, log level, auth status).
+
+### `mika config get <key>`
+
+Read a single configuration value:
+
+```sh
+mika config get claude_model          # prints: claude-sonnet-4-6
+mika config get claude_model --verbose # prints: claude_model = claude-sonnet-4-6 (source: default, backend: File)
+```
+
+The `--verbose` flag shows where the value comes from (env var, agent config.toml,
+global config.toml, .env file, database, or default).
+
+### `mika config set <key> [value]`
+
+Write a configuration value:
+
+```sh
+mika config set claude_model claude-opus-4-6     # writes to agent config.toml
+mika config set claude_max_tokens 8192            # validated as integer
+mika config set anthropic_api_key                 # secret: prompts interactively, writes to .env
+```
+
+Behavior depends on the key's backend:
+
+| Backend | Behavior |
+|---------|----------|
+| `File` | Writes to `{agent_home}/config.toml` (preserves comments, atomic write). Validates value format. |
+| `Env` | Prompts for value interactively (never accepts secrets as CLI arguments). Writes to `~/.mika/.env`. |
+| `Database` | Writes to the `customer_config` table in SQLite. |
+| `ReadOnly` | Rejected with an error. |
+
+### `mika config list`
+
+Show all known configuration keys with their current values:
+
+```sh
+mika config list             # key-value pairs
+mika config list --verbose   # includes source and backend per key
+```
+
+Secret values are displayed as `[REDACTED]`. Unset optional values show `[NOT SET]`.
+
+### Other subcommands
+
+- `mika config edit` -- Opens `identity.toml` in `$EDITOR`.
+- `mika config soul` -- Prints `soul.md` to stdout.
+
+---
+
 ## Settings Reference
 
 Complete table of all `Settings` struct fields for the agent (CLI and server modes).

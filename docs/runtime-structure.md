@@ -69,7 +69,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Memory Tables
 
-**core_memory** — `(agent_id, key) PK`, `value TEXT`, `token_count INTEGER`, `updated_at INTEGER`. Sections: `user_summary`, `self_model`, `current_priorities`, `key_people`.
+**core_memory** — `(agent_id, key) PK`, `value TEXT`, `token_count INTEGER`, `updated_at INTEGER`. Sections: `user_summary`, `self_model`, `current_priorities`, `key_people`, `workflows`.
 
 **people** — `id INTEGER PK AUTO`, `agent_id TEXT FK→agents`, `canonical_name TEXT NOCASE`, `relationship TEXT`, `notes TEXT`, `first_mentioned INTEGER`, `last_mentioned INTEGER`, `mention_count INTEGER DEFAULT 1`. Unique: `(agent_id, canonical_name)`.
 

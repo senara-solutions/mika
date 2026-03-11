@@ -105,6 +105,21 @@ pub async fn handle_trace_detail(
     }
 }
 
+/// GET /api/v1/timeline/trace/:trace_id/messages — full messages for a trace.
+pub async fn handle_trace_messages(
+    State(state): State<AppState>,
+    Path(trace_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_messages_by_trace_id(&trace_id).await {
+        Ok(messages) => {
+            let data: Vec<MessageResponse> =
+                messages.into_iter().map(MessageResponse::from).collect();
+            Json(data).into_response()
+        }
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 // ===== Agents =====
 
 #[derive(Debug, Serialize, ToSchema)]

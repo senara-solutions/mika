@@ -137,6 +137,35 @@ pub mod test_helpers {
         }
     }
 
+    /// Create a manual work item in the test DB and return its ID.
+    pub async fn create_test_work_item(db: &crate::async_db::AsyncDatabase) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test work item".to_string(),
+            trigger_type: trigger_type::MANUAL.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::NONE.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+        };
+        db.create_task(task).await.unwrap()
+    }
+
     /// Minimal Settings for validation-only tests (no API key needed).
     pub fn dummy_settings() -> Settings {
         Settings {

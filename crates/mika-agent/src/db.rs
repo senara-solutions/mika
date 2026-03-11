@@ -61,6 +61,11 @@ pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     ("self_model", "No interaction history yet."),
     ("current_priorities", "No priorities set yet."),
     ("key_people", "No people tracked yet."),
+    (
+        "workflows",
+        "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a \
+         corresponding work item created first (via create_work_item). No exceptions.",
+    ),
 ];
 
 pub fn core_memory_section_names() -> Vec<&'static str> {
@@ -4023,6 +4028,20 @@ impl Database {
                     created_at: r.get(6)?,
                 })
             })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Get full messages for a specific trace_id (for rich trace detail rendering).
+    pub fn get_messages_by_trace_id(&self, trace_id: &str) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+              FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.trace_id = ?1
+              ORDER BY m.created_at ASC, m.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![trace_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }

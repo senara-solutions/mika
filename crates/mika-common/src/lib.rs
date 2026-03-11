@@ -8,3 +8,4 @@ pub mod logging;
 pub mod team;
 pub mod telemetry;
 pub mod trace;
+pub mod validation;

@@ -65,6 +65,10 @@ fn build_router(state: AppState) -> Router {
             "/timeline/trace/{trace_id}",
             get(dashboard::handle_trace_detail),
         )
+        .route(
+            "/timeline/trace/{trace_id}/messages",
+            get(dashboard::handle_trace_messages),
+        )
         .route("/agents", get(dashboard::handle_agents_list))
         .route("/agents/{id}", get(dashboard::handle_agent_detail))
         .route(
