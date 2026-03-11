@@ -64,6 +64,8 @@ pub enum Commands {
     Mcp(McpArgs),
     /// List or cancel pending tasks
     Tasks(TaskArgs),
+    /// Check installation health
+    Doctor(DoctorArgs),
 }
 
 #[derive(Clone, ValueEnum)]
@@ -277,12 +279,43 @@ pub enum ConfigCommand {
     Edit,
     /// Print soul.md to stdout
     Soul,
+    /// Get the value of a configuration key
+    Get {
+        /// Configuration key name
+        key: String,
+        /// Show value source (file, env, db, default)
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Set a configuration value
+    Set {
+        /// Configuration key name
+        key: String,
+        /// Value to set (omit for secret keys to use interactive prompt)
+        value: Option<String>,
+    },
+    /// List all configuration keys and their values
+    List {
+        /// Show value source per key
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[derive(clap::Args)]
 pub struct McpArgs {
     #[command(subcommand)]
     pub command: Option<McpCommand>,
+}
+
+#[derive(clap::Args)]
+pub struct DoctorArgs {
+    /// Make a live API call to verify credentials
+    #[arg(long)]
+    pub verify_api: bool,
+    /// Output machine-readable JSON instead of colored text
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand)]

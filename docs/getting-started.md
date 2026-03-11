@@ -128,6 +128,9 @@ anthropic_api_key: OAuth token [REDACTED]   # subscription token
 anthropic_api_key: API key [REDACTED]       # API key
 ```
 
+For a more thorough check, run `mika doctor` to validate the entire
+installation (directory permissions, database, config parsing, etc.).
+
 ---
 
 ## 4. First run
@@ -253,6 +256,10 @@ The most commonly used commands:
 | `mika ask --task-id <uuid> "<result>"` | Complete a callback task (TUI delivers result to conversation) |
 | `mika tasks`                 | List scheduled tasks for the active agent         |
 | `mika skills`                | List, install, update, and manage skills           |
+| `mika config get <key>`      | Get a configuration value                          |
+| `mika config set <key> [val]`| Set a configuration value (prompts for secrets)    |
+| `mika config list`           | List all configuration keys and values             |
+| `mika doctor`                | Check installation health (add `--verify-api` for live API test, `--json` for machine output) |
 
 Run `mika --help` for the complete list of commands and options.
 
@@ -310,7 +317,25 @@ and need to resume an agent with their findings. The referenced task must have
 
 ---
 
-## 9. Next steps
+## 9. Troubleshooting
+
+If something isn't working, run the built-in diagnostic command:
+
+```sh
+mika doctor
+```
+
+This checks home directory permissions, API key format, database integrity,
+`config.toml` parsing, optional keys (OpenAI, Brave), `jq` availability, MCP
+configuration, and installed skills. Add `--verify-api` to make a live Claude
+API call to confirm credentials work end-to-end. Use `--json` for
+machine-readable output (e.g., in CI scripts).
+
+Exit code is non-zero if any check fails.
+
+---
+
+## 10. Next steps
 
 - **[Configuration](configuration.md)** -- Customize model, max tokens, log level,
   and environment variable overrides.
