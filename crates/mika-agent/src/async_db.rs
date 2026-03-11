@@ -849,7 +849,7 @@ impl AsyncDatabase {
         tool_name: &str,
         target_key: &str,
         before_value: Option<&str>,
-        after_value: &str,
+        after_value: Option<&str>,
         reasoning: Option<&str>,
         trace_id: Option<&str>,
     ) -> Result<()> {
@@ -859,7 +859,7 @@ impl AsyncDatabase {
             tool_name.to_owned(),
             target_key.to_owned(),
             before_value.map(|s| s.to_owned()),
-            after_value.to_owned(),
+            after_value.map(|s| s.to_owned()),
             reasoning.map(|s| s.to_owned()),
             trace_id.map(|s| s.to_owned()),
         );
@@ -870,7 +870,7 @@ impl AsyncDatabase {
                 &tn,
                 &tk,
                 bv.as_deref(),
-                &av,
+                av.as_deref(),
                 r.as_deref(),
                 t.as_deref(),
             )

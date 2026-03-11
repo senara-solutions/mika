@@ -20,7 +20,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -35,7 +35,7 @@ const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
     UNION ALL \
     SELECT trace_id, session_id, agent_id, 'audit' AS event_type, \
         tool_name AS event_subtype, \
-        target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || after_value AS summary, \
+        target_key || ': ' || COALESCE(before_value, '(none)') || ' -> ' || COALESCE(after_value, '(none)') AS summary, \
         created_at \
     FROM audit_events \
     UNION ALL \
@@ -165,6 +165,7 @@ pub struct SessionMessage {
     pub content: String,
     pub channel_type: String,
     pub metadata: Option<String>,
+    pub trace_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -217,12 +218,15 @@ pub struct Event {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AuditEvent {
     pub id: i64,
+    pub agent_id: String,
     pub session_id: String,
     pub tool_name: String,
     pub target_key: String,
     pub before_value: Option<String>,
-    pub after_value: String,
+    pub after_value: Option<String>,
     pub reasoning: Option<String>,
+    pub trace_id: Option<String>,
+    pub rewound_by_trace_id: Option<String>,
     pub created_at: String,
 }
 
@@ -512,6 +516,10 @@ impl Database {
             self.migrate_v7_to_v8()?;
             info!(version = 8, "database migrated to v8");
         }
+        if (3..=8).contains(&version) {
+            self.migrate_v8_to_v9()?;
+            info!(version = 9, "database migrated to v9");
+        }
         Ok(())
     }
 
@@ -561,7 +569,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (8);
+            INSERT INTO schema_version (version) VALUES (9);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -735,14 +743,16 @@ impl Database {
                 tool_name TEXT NOT NULL,
                 target_key TEXT NOT NULL,
                 before_value TEXT,
-                after_value TEXT NOT NULL,
+                after_value TEXT,
                 reasoning TEXT,
                 trace_id TEXT,
+                rewound_by_trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
             CREATE INDEX idx_audit_session ON audit_events(session_id);
             CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
+            CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id) WHERE rewound_by_trace_id IS NOT NULL;
 
             CREATE TABLE audit_event_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1145,6 +1155,79 @@ impl Database {
 
             self.conn
                 .execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate_v8_to_v9(&self) -> Result<()> {
+        info!(
+            "migrating database schema v8 → v9 (rewind: nullable after_value, rewound_by_trace_id)"
+        );
+
+        // Rebuild audit_events to make after_value nullable and add rewound_by_trace_id.
+        // SQLite cannot ALTER a NOT NULL constraint, so we must rebuild the table.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            // Drop the unified_timeline VIEW — it references audit_events.
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+
+            self.conn.execute_batch(
+                "CREATE TABLE audit_events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    before_value TEXT,
+                    after_value TEXT,
+                    reasoning TEXT,
+                    trace_id TEXT,
+                    rewound_by_trace_id TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+
+                INSERT INTO audit_events_new (id, agent_id, session_id, tool_name, target_key,
+                    before_value, after_value, reasoning, trace_id, created_at)
+                SELECT id, agent_id, session_id, tool_name, target_key,
+                    before_value, after_value, reasoning, trace_id, created_at
+                FROM audit_events;
+
+                DROP TABLE audit_events;
+                ALTER TABLE audit_events_new RENAME TO audit_events;",
+            )?;
+
+            // Recreate existing indexes + new rewound index
+            self.conn.execute_batch(
+                "CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at);
+                 CREATE INDEX idx_audit_session ON audit_events(session_id);
+                 CREATE INDEX idx_audit_trace ON audit_events(trace_id)
+                     WHERE trace_id IS NOT NULL;
+                 CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id)
+                     WHERE rewound_by_trace_id IS NOT NULL;",
+            )?;
+
+            // Recreate unified_timeline VIEW
+            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (9)", [])?;
 
             Ok(())
         })();
@@ -2038,7 +2121,8 @@ impl Database {
             content: r.get(4)?,
             channel_type: r.get(5)?,
             metadata: r.get(6)?,
-            created_at: r.get::<_, i64>(7)?,
+            trace_id: r.get(7)?,
+            created_at: r.get::<_, i64>(8)?,
         })
     }
 
@@ -2048,7 +2132,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
@@ -2066,7 +2150,7 @@ impl Database {
     pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<SessionMessage>> {
         self.conn
             .query_row(
-                "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+                "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
                   FROM messages m JOIN sessions s ON m.session_id = s.id
                   WHERE m.agent_id = ?1 AND m.role = 'summary'
                   ORDER BY m.created_at DESC LIMIT 1",
@@ -2105,7 +2189,7 @@ impl Database {
             None => return Ok(vec![]),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.role != 'summary' AND m.id <= ?2
               ORDER BY m.created_at ASC, m.id ASC",
@@ -2152,7 +2236,7 @@ impl Database {
         after_id: i64,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.id > ?2
               ORDER BY m.created_at ASC, m.id ASC",
@@ -2175,7 +2259,7 @@ impl Database {
     /// Load a single message by its row ID.
     pub fn get_message_by_id(&self, message_id: i64) -> Result<Option<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.id = ?1",
         )?;
@@ -2195,7 +2279,7 @@ impl Database {
         after: u32,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.session_id = ?1
                 AND (m.id >= (SELECT id FROM (SELECT id FROM messages WHERE session_id = ?1 AND id <= ?2 ORDER BY id DESC LIMIT ?3) sub ORDER BY id ASC LIMIT 1))
@@ -2217,7 +2301,7 @@ impl Database {
         since_unix: i64,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.created_at >= ?2 AND m.role != 'summary'
               ORDER BY m.created_at ASC",
@@ -2673,7 +2757,7 @@ impl Database {
         tool_name: &str,
         target_key: &str,
         before_value: Option<&str>,
-        after_value: &str,
+        after_value: Option<&str>,
         reasoning: Option<&str>,
         trace_id: Option<&str>,
     ) -> Result<()> {
@@ -2695,26 +2779,33 @@ impl Database {
         Ok(())
     }
 
+    /// Standard column list for audit event queries.
+    const AUDIT_EVENT_COLS: &str = "id, agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning, trace_id, rewound_by_trace_id, datetime(created_at, 'unixepoch')";
+
+    fn row_to_audit_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
+        Ok(AuditEvent {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            session_id: r.get(2)?,
+            tool_name: r.get(3)?,
+            target_key: r.get(4)?,
+            before_value: r.get(5)?,
+            after_value: r.get(6)?,
+            reasoning: r.get(7)?,
+            trace_id: r.get(8)?,
+            rewound_by_trace_id: r.get(9)?,
+            created_at: r.get(10)?,
+        })
+    }
+
     pub fn get_audit_events(&self, agent_id: &str, session_id: &str) -> Result<Vec<AuditEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
-                     datetime(created_at, 'unixepoch')
-              FROM audit_events WHERE agent_id = ?1 AND session_id = ?2
-              ORDER BY created_at ASC",
-        )?;
+        let sql = format!(
+            "SELECT {} FROM audit_events WHERE agent_id = ?1 AND session_id = ?2 ORDER BY created_at ASC",
+            Self::AUDIT_EVENT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, session_id], |r| {
-                Ok(AuditEvent {
-                    id: r.get(0)?,
-                    session_id: r.get(1)?,
-                    tool_name: r.get(2)?,
-                    target_key: r.get(3)?,
-                    before_value: r.get(4)?,
-                    after_value: r.get(5)?,
-                    reasoning: r.get(6)?,
-                    created_at: r.get(7)?,
-                })
-            })?
+            .query_map(params![agent_id, session_id], Self::row_to_audit_event)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -2724,25 +2815,13 @@ impl Database {
         agent_id: &str,
         since_unix: i64,
     ) -> Result<Vec<AuditEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
-                     datetime(created_at, 'unixepoch')
-              FROM audit_events WHERE agent_id = ?1 AND created_at >= ?2
-              ORDER BY created_at ASC",
-        )?;
+        let sql = format!(
+            "SELECT {} FROM audit_events WHERE agent_id = ?1 AND created_at >= ?2 ORDER BY created_at ASC",
+            Self::AUDIT_EVENT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, since_unix], |r| {
-                Ok(AuditEvent {
-                    id: r.get(0)?,
-                    session_id: r.get(1)?,
-                    tool_name: r.get(2)?,
-                    target_key: r.get(3)?,
-                    before_value: r.get(4)?,
-                    after_value: r.get(5)?,
-                    reasoning: r.get(6)?,
-                    created_at: r.get(7)?,
-                })
-            })?
+            .query_map(params![agent_id, since_unix], Self::row_to_audit_event)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -2764,7 +2843,7 @@ impl Database {
                  CAST(strftime('%m', datetime(created_at, 'unixepoch')) AS INTEGER) AS month,
                  COUNT(*) AS cnt,
                  GROUP_CONCAT(
-                     tool_name || ': ' || target_key || ' = ' || substr(after_value, 1, 100),
+                     tool_name || ': ' || target_key || ' = ' || substr(COALESCE(after_value, '(none)'), 1, 100),
                      '; '
                  ) AS summary
              FROM audit_events
@@ -3841,7 +3920,7 @@ impl Database {
         offset: u32,
     ) -> Result<Vec<SessionMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
+            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
               FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.session_id = ?1
               ORDER BY m.created_at ASC, m.id ASC LIMIT ?2 OFFSET ?3",
@@ -3872,25 +3951,16 @@ impl Database {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<AuditEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, tool_name, target_key, before_value, after_value, reasoning,
-                     datetime(created_at, 'unixepoch')
-              FROM audit_events WHERE agent_id = ?1
-              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
-        )?;
+        let sql = format!(
+            "SELECT {} FROM audit_events WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+            Self::AUDIT_EVENT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, limit as i64, offset as i64], |r| {
-                Ok(AuditEvent {
-                    id: r.get(0)?,
-                    session_id: r.get(1)?,
-                    tool_name: r.get(2)?,
-                    target_key: r.get(3)?,
-                    before_value: r.get(4)?,
-                    after_value: r.get(5)?,
-                    reasoning: r.get(6)?,
-                    created_at: r.get(7)?,
-                })
-            })?
+            .query_map(
+                params![agent_id, limit as i64, offset as i64],
+                Self::row_to_audit_event,
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -4327,7 +4397,7 @@ mod tests {
             "update_core_memory",
             "user_summary",
             None,
-            "New summary",
+            Some("New summary"),
             Some("reason"),
             None,
         )
@@ -4622,7 +4692,7 @@ mod tests {
             )
             .unwrap();
         // Insert recent event
-        db.log_audit_event("mika", "s2", "tool", "k3", None, "v3", None, None)
+        db.log_audit_event("mika", "s2", "tool", "k3", None, Some("v3"), None, None)
             .unwrap();
         let compacted = db.compact_old_audit_events("mika", 30).unwrap();
         assert!(compacted > 0);
@@ -5159,7 +5229,7 @@ mod tests {
             "store_fact",
             "person:Alice",
             None,
-            "new",
+            Some("new"),
             None,
             Some(trace),
         )
@@ -5305,9 +5375,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_8() {
+    fn test_schema_version_is_9() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
     }
 
     #[test]

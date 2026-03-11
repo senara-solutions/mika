@@ -198,7 +198,7 @@ impl Tool for UpdateCoreMemoryTool {
                 "update_core_memory",
                 section,
                 before_value,
-                &new_value,
+                Some(&*new_value),
                 Some(&audit_reasoning),
                 Some(ctx.trace_id),
             )
@@ -462,7 +462,10 @@ mod tests {
             events[0].before_value,
             Some("No information about the user yet.".to_string())
         );
-        assert_eq!(events[0].after_value, "Alice, CEO of Acme.");
+        assert_eq!(
+            events[0].after_value,
+            Some("Alice, CEO of Acme.".to_string())
+        );
         assert_eq!(
             events[0].reasoning,
             Some("User introduced herself".to_string())

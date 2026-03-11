@@ -94,7 +94,10 @@ impl Tool for CompleteTaskTool {
                 "complete_task",
                 &format!("task:{id}"),
                 None,
-                &format!("Completed callback task: {} ({})", task.label, id),
+                Some(&*format!(
+                    "Completed callback task: {} ({})",
+                    task.label, id
+                )),
                 None,
                 Some(ctx.trace_id),
             )

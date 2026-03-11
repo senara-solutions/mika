@@ -72,7 +72,11 @@ impl Tool for ListAuditEventsTool {
                 .as_deref()
                 .map(|v| truncate(v, 100))
                 .unwrap_or_else(|| "(none)".to_string());
-            let after = truncate(&evt.after_value, 100);
+            let after = evt
+                .after_value
+                .as_deref()
+                .map(|v| truncate(v, 100))
+                .unwrap_or_else(|| "(none)".to_string());
             let reasoning = evt
                 .reasoning
                 .as_deref()
@@ -130,7 +134,7 @@ mod tests {
                 "store_fact",
                 "person:Alice",
                 None,
-                "Added Alice as CTO",
+                Some("Added Alice as CTO"),
                 None,
                 None,
             )
@@ -143,7 +147,7 @@ mod tests {
                 "update_core_memory",
                 "user_summary",
                 Some("Old summary"),
-                "New summary about preferences",
+                Some("New summary about preferences"),
                 Some("User mentioned preferences"),
                 None,
             )
@@ -172,7 +176,7 @@ mod tests {
                     "store_fact",
                     &format!("item:{i}"),
                     None,
-                    &format!("Value {i}"),
+                    Some(&*format!("Value {i}")),
                     None,
                     None,
                 )
@@ -208,7 +212,7 @@ mod tests {
                 "update_fact",
                 "commitment:1",
                 Some("Review budget"),
-                "Review Q4 budget by Friday",
+                Some("Review Q4 budget by Friday"),
                 Some("User clarified the deadline"),
                 None,
             )
@@ -235,7 +239,7 @@ mod tests {
                 "store_fact",
                 "person:Bob",
                 None,
-                "Bob added by mika",
+                Some("Bob added by mika"),
                 None,
                 None,
             )

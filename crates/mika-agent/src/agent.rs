@@ -1235,7 +1235,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
                         evt.tool_name,
                         evt.target_key,
                         evt.before_value.as_deref().unwrap_or("(none)"),
-                        evt.after_value
+                        evt.after_value.as_deref().unwrap_or("(none)")
                     );
                     if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
                         buf.push_str("... (truncated)\n");

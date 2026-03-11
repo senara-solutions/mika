@@ -122,6 +122,21 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
     let relationship = input["relationship"].as_str();
     let notes = input["notes"].as_str();
 
+    // Capture before_value for rewind support (None = creation, Some = upsert)
+    let before_value = if let Some(existing) = ctx.db.get_person(name).await? {
+        Some(
+            serde_json::json!({
+                "name": existing.canonical_name,
+                "relationship": existing.relationship,
+                "notes": existing.notes,
+                "mention_count": existing.mention_count,
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
+
     let person_id = ctx.db.upsert_person(name, relationship, notes).await?;
 
     // Log audit event
@@ -137,8 +152,8 @@ async fn store_person(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput
             ctx.session_id,
             "store_fact",
             &target,
-            None,
-            &after,
+            before_value.as_deref(),
+            Some(&after),
             reasoning.as_deref(),
             Some(ctx.trace_id),
         )
@@ -220,7 +235,7 @@ async fn store_commitment(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
             "store_fact",
             &target,
             None,
-            description,
+            Some(description),
             reasoning.as_deref(),
             Some(ctx.trace_id),
         )
@@ -256,6 +271,9 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
         return Ok(err);
     }
 
+    // Capture before_value for rewind support (None = creation, Some = upsert)
+    let before_value = ctx.db.get_preference(key).await?;
+
     let pref_id = ctx.db.set_preference(key, value).await?;
 
     let target = format!("preference:{key}");
@@ -265,8 +283,8 @@ async fn store_preference(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOu
             ctx.session_id,
             "store_fact",
             &target,
-            None,
-            value,
+            before_value.as_deref(),
+            Some(value),
             reasoning.as_deref(),
             Some(ctx.trace_id),
         )
@@ -335,7 +353,7 @@ async fn store_event(input: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>
             "store_fact",
             &target,
             None,
-            description,
+            Some(description),
             reasoning.as_deref(),
             Some(ctx.trace_id),
         )

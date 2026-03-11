@@ -107,7 +107,7 @@ impl Tool for UpdateWorkItemStatusTool {
                 "update_work_item_status",
                 &format!("task:{task_id}"),
                 Some(&old_status),
-                status,
+                Some(status),
                 note,
                 Some(ctx.trace_id),
             )
