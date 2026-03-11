@@ -378,7 +378,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
          (pending → in_progress → blocked → completed).\n",
     );
     prompt.push_str(
-        "- **Delegation Rule:** Before delegating any implementation work (via delegate_task, tmux, \
+        "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \
          or long-running skills), you MUST first create a work item using create_work_item, then pass \
          the work_item_id to the delegation tool. The tool will reject calls without a valid work_item_id.\n",
     );

@@ -459,31 +459,8 @@ async fn execute_long_running(
         .get("work_item_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if work_item_id.is_empty() {
-        return ToolOutput::error(
-            "You must create a work item first using create_work_item, then pass its ID here. \
-             No delegation without tracking.",
-        );
-    }
-    match ctx.db.get_task(work_item_id).await {
-        Ok(Some(ref wi))
-            if wi.trigger_type == "manual"
-                && matches!(wi.status.as_str(), "pending" | "in_progress" | "blocked") => {}
-        Ok(Some(_)) => {
-            return ToolOutput::error(format!(
-                "Work item '{work_item_id}' is not an active work item. \
-                 It must be a manual work item with status pending, in_progress, or blocked."
-            ));
-        }
-        Ok(None) => {
-            return ToolOutput::error(format!(
-                "Work item '{work_item_id}' not found. \
-                 Create one first using create_work_item."
-            ));
-        }
-        Err(e) => {
-            return ToolOutput::error(format!("Failed to validate work item: {e}"));
-        }
+    if let Some(err) = crate::tools::validate_work_item(&ctx.db, work_item_id).await {
+        return ToolOutput::error(err);
     }
 
     let estimated = estimated_duration_secs.unwrap_or(3600);
@@ -1153,31 +1130,7 @@ mod tests {
         );
     }
 
-    /// Create a manual work item in the test DB and return its ID.
-    async fn create_test_work_item(db: &crate::async_db::AsyncDatabase) -> String {
-        let task = crate::db::NewTask {
-            agent_id: db.agent_id().to_string(),
-            team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: "test work item".to_string(),
-            trigger_type: trigger_type::MANUAL.to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: None,
-            timeout_at: None,
-            action_type: action_type::NONE.to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: Some("test-session".to_string()),
-            created_trace_id: None,
-            reference_url: None,
-            source: None,
-        };
-        db.create_task(task).await.unwrap()
-    }
+    use crate::test_utils::test_helpers::create_test_work_item;
 
     fn make_long_running_tool(skill_dir: &std::path::Path, command: &str) -> ResolvedSkillTool {
         ResolvedSkillTool {

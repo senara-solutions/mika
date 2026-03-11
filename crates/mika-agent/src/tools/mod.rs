@@ -206,6 +206,38 @@ pub(crate) fn check_reflection_evidence(
     None
 }
 
+/// Validate that a `work_item_id` references an active manual work item.
+/// Returns `Some(error_message)` if validation fails, `None` if valid.
+pub(crate) async fn validate_work_item(
+    db: &crate::async_db::AsyncDatabase,
+    work_item_id: &str,
+) -> Option<String> {
+    if work_item_id.is_empty() {
+        return Some(
+            "You must create a work item first using create_work_item, then pass its ID here. \
+             No delegation without tracking."
+                .to_string(),
+        );
+    }
+    match db.get_task(work_item_id).await {
+        Ok(Some(ref wi))
+            if wi.trigger_type == "manual"
+                && matches!(wi.status.as_str(), "pending" | "in_progress" | "blocked") =>
+        {
+            None
+        }
+        Ok(Some(_)) => Some(format!(
+            "Work item '{work_item_id}' is not an active work item. \
+             It must be a manual work item with status pending, in_progress, or blocked."
+        )),
+        Ok(None) => Some(format!(
+            "Work item '{work_item_id}' not found. \
+             Create one first using create_work_item."
+        )),
+        Err(e) => Some(format!("Failed to validate work item: {e}")),
+    }
+}
+
 /// Check if the given agent is an orchestrator (default agent or listed as orchestrator in any team).
 pub(crate) fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
     if agent_id == DEFAULT_AGENT {

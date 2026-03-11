@@ -179,6 +179,8 @@ fn inject_work_item_id_field(schema: &mut serde_json::Value) {
     }
     if let Some(required) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
         required.push(serde_json::Value::String("work_item_id".to_string()));
+    } else {
+        schema["required"] = serde_json::json!(["work_item_id"]);
     }
 }
 
