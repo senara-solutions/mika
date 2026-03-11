@@ -6,6 +6,10 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
 [[advisories.ignore]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa Marvin Attack — pulled in transitively by sqlx-mysql; no patch available upstream. Not exploitable in our usage (no RSA operations)."
+
+[[advisories.ignore]]
 id = "RUSTSEC-2024-0436"
 reason = "paste is unmaintained but has no security impact; widely used transitive dependency with no drop-in replacement yet."
 
