@@ -45,6 +45,7 @@ async fn spawn_agent_worker(
     ctx: AppContext,
     _agent_name: &str,
     http_client: &reqwest::Client,
+    session: Option<&str>,
 ) -> Result<(
     AgentWorker,
     mpsc::UnboundedSender<AgentRequest>,
@@ -55,7 +56,26 @@ async fn spawn_agent_worker(
     Arc<SkillRegistry>,
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
-    let session_id = Uuid::new_v4().to_string();
+    if let Some(s) = session
+        && s.is_empty()
+    {
+        anyhow::bail!("--session value must not be empty");
+    }
+    let session_id = session
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Validate session ownership if reusing an existing session
+    if session.is_some()
+        && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
+        && existing.agent_id != ctx.async_db.agent_id()
+    {
+        anyhow::bail!(
+            "Session '{}' belongs to agent '{}', not '{}'",
+            session_id,
+            existing.agent_id,
+            ctx.async_db.agent_id()
+        );
+    }
     if let Err(e) = ctx
         .async_db
         .create_session(&session_id, ctx.async_db.agent_id(), "cli")
@@ -371,11 +391,11 @@ async fn spawn_agent_worker(
     ))
 }
 
-pub async fn run(agent_name: &str) -> Result<()> {
+pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
     let http_client = reqwest::Client::new();
     let (mut worker, user_tx, agent_rx, session_id, model, identity_name, skill_registry) =
-        spawn_agent_worker(ctx, agent_name, &http_client).await?;
+        spawn_agent_worker(ctx, agent_name, &http_client, session).await?;
 
     // Build app with shared resources
     let mut app = App::new(
@@ -500,7 +520,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
                 Ok(new_ctx) => {
-                    match spawn_agent_worker(new_ctx, &target_name, &http_client).await {
+                    match spawn_agent_worker(new_ctx, &target_name, &http_client, None).await {
                         Ok((
                             new_worker,
                             new_tx,

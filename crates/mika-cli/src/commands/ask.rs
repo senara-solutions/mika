@@ -29,6 +29,18 @@ pub async fn run(
     let session_id = session
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Validate session ownership if reusing an existing session
+    if session.is_some()
+        && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
+        && existing.agent_id != ctx.async_db.agent_id()
+    {
+        anyhow::bail!(
+            "Session '{}' belongs to agent '{}', not '{}'",
+            session_id,
+            existing.agent_id,
+            ctx.async_db.agent_id()
+        );
+    }
     if let Err(e) = ctx
         .async_db
         .create_session(&session_id, ctx.async_db.agent_id(), "cli")

@@ -133,9 +133,9 @@ async fn main() -> Result<()> {
             if !home::is_initialized(&home_dir) {
                 commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
-            commands::chat::run(&agent_name).await
+            commands::chat::run(&agent_name, cli.session.as_deref()).await
         }
-        Some(Commands::Chat) => commands::chat::run(&agent_name).await,
+        Some(Commands::Chat) => commands::chat::run(&agent_name, cli.session.as_deref()).await,
         Some(Commands::Setup { mode, api_key }) => {
             commands::setup::run(&agent_name, mode, api_key.as_deref()).await
         }
@@ -144,16 +144,12 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => commands::status::run(&agent_name).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
-        Some(Commands::Ask {
-            message,
-            task_id,
-            session,
-        }) => {
+        Some(Commands::Ask { message, task_id }) => {
             match commands::ask::run(
                 &message,
                 &agent_name,
                 task_id.as_deref(),
-                session.as_deref(),
+                cli.session.as_deref(),
             )
             .await
             {
