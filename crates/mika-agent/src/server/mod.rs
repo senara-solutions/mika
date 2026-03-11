@@ -118,6 +118,10 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/rewind/execute",
             post(rewind::handle_rewind_execute),
         )
+        .route(
+            "/api/v1/rewind/resolve",
+            post(rewind::handle_rewind_resolve),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,

@@ -6,6 +6,17 @@ use anyhow::{Result, bail};
 use crate::async_db::AsyncDatabase;
 use crate::db::{AuditEvent, SessionMessage, Task};
 
+/// Result of resolving recent exchanges — identifies the session and anchor point.
+#[derive(Debug, Clone)]
+pub struct ExchangeMatch {
+    /// The session where exchanges were found (may differ from the caller's current session).
+    pub session_id: String,
+    /// The message ID just before the rewind range (delete everything after this).
+    pub anchor_message_id: i64,
+    /// The distinct trace_ids of the matched exchanges.
+    pub trace_ids: Vec<String>,
+}
+
 /// Summary of a message that will be deleted.
 #[derive(Debug, Clone)]
 pub struct MessagePreview {
@@ -72,44 +83,75 @@ pub struct RewindResult {
 
 /// Find the N most recent exchanges (by distinct user-role trace_ids) in the session,
 /// then collect ALL messages that share those trace_ids.
-/// Returns `(anchor_message_id, trace_ids)` — the anchor is the message just before
-/// the rewind range (i.e., rewind deletes everything after anchor).
+/// Returns an [`ExchangeMatch`] — the session_id is where the exchanges were found
+/// (may differ from `session_id` param if cross-session fallback was used), and the
+/// anchor is the message just before the rewind range.
 pub async fn find_recent_exchanges(
     db: &AsyncDatabase,
     session_id: &str,
     count: usize,
-) -> Result<Option<(i64, Vec<String>)>> {
-    // Get all messages in this session, ordered newest first
+) -> Result<Option<ExchangeMatch>> {
+    // First try the current session
     let messages = db.get_messages_after_id(session_id, 0).await?;
-    if messages.is_empty() {
-        return Ok(None);
+    if let Some(result) = extract_exchanges(&messages, count) {
+        return Ok(Some(result));
     }
 
-    // Collect distinct trace_ids from user-role messages, newest first
+    // Fallback: search recent messages across ALL sessions for this agent
+    let all_messages = db.load_recent_messages(50).await?;
+    if let Some(result) = extract_exchanges(&all_messages, count) {
+        return Ok(Some(result));
+    }
+
+    Ok(None)
+}
+
+/// Extract exchanges from a set of messages (possibly spanning multiple sessions).
+/// Locks to the first session encountered and stops at session boundaries.
+fn extract_exchanges(messages: &[SessionMessage], count: usize) -> Option<ExchangeMatch> {
+    if messages.is_empty() {
+        return None;
+    }
+
+    // Scan newest-first for user messages with trace_ids
     let mut user_trace_ids: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut target_session: Option<String> = None;
+
     for msg in messages.iter().rev() {
         if msg.role == "user"
             && let Some(ref tid) = msg.trace_id
-            && seen.insert(tid.clone())
         {
-            user_trace_ids.push(tid.clone());
-            if user_trace_ids.len() >= count {
-                break;
+            // Lock to the first session we find exchanges in
+            if let Some(ref ts) = target_session {
+                if msg.session_id != *ts {
+                    break;
+                }
+            } else {
+                target_session = Some(msg.session_id.clone());
+            }
+
+            if seen.insert(tid.clone()) {
+                user_trace_ids.push(tid.clone());
+                if user_trace_ids.len() >= count {
+                    break;
+                }
             }
         }
     }
 
+    let target_session = target_session?;
     if user_trace_ids.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    // Find the earliest message with any of these trace_ids
+    // Find earliest message ID with matching trace_ids in the target session
     let trace_set: std::collections::HashSet<&str> =
         user_trace_ids.iter().map(|s| s.as_str()).collect();
     let mut earliest_id = i64::MAX;
-    for msg in &messages {
-        if let Some(ref tid) = msg.trace_id
+    for msg in messages {
+        if msg.session_id == target_session
+            && let Some(ref tid) = msg.trace_id
             && trace_set.contains(tid.as_str())
             && msg.id < earliest_id
         {
@@ -117,10 +159,11 @@ pub async fn find_recent_exchanges(
         }
     }
 
-    // Anchor = the message just before the earliest
-    let anchor_id = earliest_id - 1;
-
-    Ok(Some((anchor_id, user_trace_ids)))
+    Some(ExchangeMatch {
+        session_id: target_session,
+        anchor_message_id: earliest_id.saturating_sub(1),
+        trace_ids: user_trace_ids,
+    })
 }
 
 /// Preview a rewind operation without executing it.
@@ -260,6 +303,7 @@ pub async fn execute_rewind(
     db: &AsyncDatabase,
     session_id: &str,
     after_message_id: i64,
+    originating_session_id: Option<&str>,
 ) -> Result<RewindResult> {
     // Preview first to check for blockers
     let preview = preview_rewind(db, session_id, after_message_id).await?;
@@ -343,10 +387,20 @@ pub async fn execute_rewind(
 
     // Log the rewind itself as an audit event
     let target = format!("rewind:after_msg_{after_message_id}");
-    let after_val = format!(
-        "deleted {messages_deleted} messages, reversed {applied} mutations, \
-         {tasks_deleted} tasks deleted, {tasks_cancelled} tasks cancelled"
-    );
+    let after_val = if let Some(orig) = originating_session_id
+        && orig != session_id
+    {
+        format!(
+            "deleted {messages_deleted} messages, reversed {applied} mutations, \
+             {tasks_deleted} tasks deleted, {tasks_cancelled} tasks cancelled \
+             (initiated from session {orig})"
+        )
+    } else {
+        format!(
+            "deleted {messages_deleted} messages, reversed {applied} mutations, \
+             {tasks_deleted} tasks deleted, {tasks_cancelled} tasks cancelled"
+        )
+    };
     db.log_audit_event(
         session_id,
         "rewind",
@@ -742,7 +796,9 @@ mod tests {
         assert_eq!(preview.reversals[0].action, ReversalAction::Restore);
 
         // Execute
-        let result = execute_rewind(db, "test-session", anchor_id).await.unwrap();
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
         assert_eq!(result.messages_deleted, 2);
         assert_eq!(result.reversals_applied, 1);
 
@@ -791,7 +847,9 @@ mod tests {
         assert_eq!(preview.reversals[0].action, ReversalAction::Delete);
 
         // Execute
-        let result = execute_rewind(db, "test-session", anchor_id).await.unwrap();
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
         assert_eq!(result.reversals_applied, 1);
 
         // Verify person was deleted
@@ -854,7 +912,9 @@ mod tests {
         let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
         let anchor_id = messages[0].id - 1;
 
-        let result = execute_rewind(db, "test-session", anchor_id).await.unwrap();
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
         assert_eq!(result.messages_deleted, 4);
         assert_eq!(result.reversals_applied, 2);
 
@@ -912,7 +972,9 @@ mod tests {
         let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
         let anchor_id = messages[0].id - 1;
 
-        let result = execute_rewind(db, "test-session", anchor_id).await.unwrap();
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
 
         // Check that the rewind itself was logged
         let events = db.get_audit_events("test-session").await.unwrap();
@@ -954,7 +1016,9 @@ mod tests {
         let messages = db.get_messages_after_id("test-session", 0).await.unwrap();
         let anchor_id = messages[0].id - 1;
 
-        let result = execute_rewind(db, "test-session", anchor_id).await.unwrap();
+        let result = execute_rewind(db, "test-session", anchor_id, None)
+            .await
+            .unwrap();
 
         // The original audit event should be marked as rewound
         let all_events = db.get_audit_events("test-session").await.unwrap();
@@ -998,17 +1062,89 @@ mod tests {
         // Find last 2 exchanges
         let result = find_recent_exchanges(db, "test-session", 2).await.unwrap();
         assert!(result.is_some());
-        let (anchor_id, trace_ids) = result.unwrap();
-        assert_eq!(trace_ids.len(), 2);
-        assert!(trace_ids.contains(&"trace-3".to_string()));
-        assert!(trace_ids.contains(&"trace-2".to_string()));
+        let m = result.unwrap();
+        assert_eq!(m.session_id, "test-session");
+        assert_eq!(m.trace_ids.len(), 2);
+        assert!(m.trace_ids.contains(&"trace-3".to_string()));
+        assert!(m.trace_ids.contains(&"trace-2".to_string()));
 
         // Messages after anchor should be the last 2 exchanges (4 messages)
         let msgs = db
-            .get_messages_after_id("test-session", anchor_id)
+            .get_messages_after_id("test-session", m.anchor_message_id)
             .await
             .unwrap();
         assert_eq!(msgs.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_find_recent_exchanges_cross_session() {
+        let harness = TestHarness::new();
+        let db = &harness.db;
+
+        // Create exchanges in session A (the pre-existing "test-session")
+        for i in 1..=2 {
+            let trace = format!("trace-a{i}");
+            db.save_message("test-session", "user", &format!("User A{i}"), Some(&trace))
+                .await
+                .unwrap();
+            db.save_message(
+                "test-session",
+                "assistant",
+                &format!("Reply A{i}"),
+                Some(&trace),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Create a new empty session B (simulates a fresh TUI launch)
+        db.create_session("session-b", "mika", "cli").await.unwrap();
+
+        // Search from empty session B → should fall back to session A
+        let result = find_recent_exchanges(db, "session-b", 1).await.unwrap();
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.session_id, "test-session");
+        assert_eq!(m.trace_ids.len(), 1);
+        assert!(m.trace_ids.contains(&"trace-a2".to_string()));
+
+        // Verify anchor produces the correct message range (last exchange = 2 messages)
+        let msgs = db
+            .get_messages_after_id("test-session", m.anchor_message_id)
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_recent_exchanges_prefers_current_session() {
+        let harness = TestHarness::new();
+        let db = &harness.db;
+
+        // Create exchanges in session A
+        db.save_message("test-session", "user", "Old msg", Some("trace-old"))
+            .await
+            .unwrap();
+        db.save_message("test-session", "assistant", "Old reply", Some("trace-old"))
+            .await
+            .unwrap();
+
+        // Create session B with its own exchanges
+        db.create_session("session-b", "mika", "cli").await.unwrap();
+        db.save_message("session-b", "user", "New msg", Some("trace-new"))
+            .await
+            .unwrap();
+        db.save_message("session-b", "assistant", "New reply", Some("trace-new"))
+            .await
+            .unwrap();
+
+        // Search from session B → should use session B (current), not fall back
+        let result = find_recent_exchanges(db, "session-b", 1).await.unwrap();
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.session_id, "session-b");
+        assert_eq!(m.trace_ids.len(), 1);
+        assert!(m.trace_ids.contains(&"trace-new".to_string()));
     }
 
     #[test]

@@ -894,20 +894,20 @@ async fn handle_rewind_impl(
         return "Cannot rewind while agent is busy.".to_string();
     }
 
-    // Determine the anchor message ID
-    let anchor_id = if let Some(id) = after_message_id {
-        id
+    // Determine the anchor message ID and the session to rewind
+    let (rewind_session, anchor_id) = if let Some(id) = after_message_id {
+        (app.session_id.clone(), id)
     } else {
-        // Find N recent exchanges
+        // Find N recent exchanges (may fall back to a previous session)
         match rewind::find_recent_exchanges(&app.db, &app.session_id, exchange_count).await {
-            Ok(Some((anchor, _trace_ids))) => anchor,
+            Ok(Some(m)) => (m.session_id, m.anchor_message_id),
             Ok(None) => return "No exchanges found to rewind.".to_string(),
             Err(e) => return format!("Error finding exchanges: {e}"),
         }
     };
 
     // Preview
-    let preview = match rewind::preview_rewind(&app.db, &app.session_id, anchor_id).await {
+    let preview = match rewind::preview_rewind(&app.db, &rewind_session, anchor_id).await {
         Ok(p) => p,
         Err(e) => return format!("Error previewing rewind: {e}"),
     };
@@ -923,17 +923,45 @@ async fn handle_rewind_impl(
     let preview_text = rewind::format_preview(&preview);
 
     // Execute
-    match rewind::execute_rewind(&app.db, &app.session_id, anchor_id).await {
+    let originating = if rewind_session != app.session_id {
+        Some(app.session_id.as_str())
+    } else {
+        None
+    };
+    match rewind::execute_rewind(&app.db, &rewind_session, anchor_id, originating).await {
         Ok(result) => {
-            // Remove rewound messages from the TUI display.
-            // Count the user+assistant messages being deleted and remove from the end.
-            let display_msgs_to_remove = preview
-                .messages
-                .iter()
-                .filter(|m| m.role == "user" || m.role == "assistant")
-                .count();
-            let keep = app.messages.len().saturating_sub(display_msgs_to_remove);
-            app.messages.truncate(keep);
+            // Remove rewound messages from the TUI display — but only if we
+            // rewound the current session. Cross-session rewinds affect a prior
+            // session whose messages were loaded at startup; the TUI display
+            // should be fully refreshed instead.
+            if rewind_session == app.session_id {
+                let display_msgs_to_remove = preview
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == "user" || m.role == "assistant")
+                    .count();
+                let keep = app.messages.len().saturating_sub(display_msgs_to_remove);
+                app.messages.truncate(keep);
+            } else {
+                // Cross-session rewind: clear display and reload from DB
+                app.messages.clear();
+                if let Ok(recent) = app.db.load_recent_messages(20).await {
+                    for msg in &recent {
+                        if msg.role == "user" || msg.role == "assistant" {
+                            app.messages.push(ChatMessage {
+                                role: if msg.role == "user" {
+                                    ChatRole::User
+                                } else {
+                                    ChatRole::Assistant
+                                },
+                                content: msg.content.clone(),
+                                rendered: None,
+                                channel: None,
+                            });
+                        }
+                    }
+                }
+            }
 
             let mut output = preview_text;
             output.push_str(&format!(

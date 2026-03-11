@@ -59,6 +59,107 @@ pub struct RewindResultResponse {
     pub rewind_trace_id: String,
 }
 
+fn validate_rewind_request(req: &RewindRequest) -> Result<(), (StatusCode, String)> {
+    if req.session_id.is_empty() || req.session_id.len() > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid session_id: must be non-empty and under 1000 chars.".to_string(),
+        ));
+    }
+    if req.after_message_id < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid after_message_id: must be non-negative.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RewindResolveRequest {
+    pub session_id: String,
+    #[serde(default = "default_count")]
+    pub count: usize,
+    /// Target agent name (defaults to the server's default agent if absent).
+    #[serde(default)]
+    pub agent: String,
+}
+
+fn default_count() -> usize {
+    1
+}
+
+#[derive(Debug, Serialize)]
+pub struct RewindResolveResponse {
+    pub session_id: String,
+    pub after_message_id: i64,
+    pub trace_ids: Vec<String>,
+}
+
+pub async fn handle_rewind_resolve(
+    State(state): State<AppState>,
+    Json(req): Json<RewindResolveRequest>,
+) -> impl IntoResponse {
+    if req.session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not be empty"})),
+        )
+            .into_response();
+    }
+    if req.count == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "count must be at least 1"})),
+        )
+            .into_response();
+    }
+
+    let agent_state = match state.resolve_agent(&req.agent) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("agent '{}' not found", req.agent)})),
+            )
+                .into_response();
+        }
+    };
+
+    // Acquire agent lock (non-blocking)
+    let _lock = match agent_state.agent_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "Agent is busy. Try again when idle."})),
+            )
+                .into_response();
+        }
+    };
+
+    match rewind::find_recent_exchanges(&agent_state.db, &req.session_id, req.count).await {
+        Ok(Some(m)) => {
+            let resp = RewindResolveResponse {
+                session_id: m.session_id,
+                after_message_id: m.anchor_message_id,
+                trace_ids: m.trace_ids,
+            };
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No exchanges found in session"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Resolve failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn handle_rewind_preview(
     State(state): State<AppState>,
     Json(req): Json<RewindRequest>,
@@ -73,6 +174,10 @@ pub async fn handle_rewind_preview(
                 .into_response();
         }
     };
+
+    if let Err((status, msg)) = validate_rewind_request(&req) {
+        return (status, Json(serde_json::json!({"error": msg}))).into_response();
+    }
 
     // Acquire agent lock (non-blocking)
     let _lock = match agent_state.agent_lock.clone().try_lock_owned() {
@@ -156,6 +261,10 @@ pub async fn handle_rewind_execute(
         }
     };
 
+    if let Err((status, msg)) = validate_rewind_request(&req) {
+        return (status, Json(serde_json::json!({"error": msg}))).into_response();
+    }
+
     // Acquire agent lock (non-blocking)
     let _lock = match agent_state.agent_lock.clone().try_lock_owned() {
         Ok(guard) => guard,
@@ -168,7 +277,8 @@ pub async fn handle_rewind_execute(
         }
     };
 
-    match rewind::execute_rewind(&agent_state.db, &req.session_id, req.after_message_id).await {
+    match rewind::execute_rewind(&agent_state.db, &req.session_id, req.after_message_id, None).await
+    {
         Ok(result) => {
             let resp = RewindResultResponse {
                 messages_deleted: result.messages_deleted,
