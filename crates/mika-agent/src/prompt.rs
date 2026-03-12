@@ -231,6 +231,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // Instructions
     prompt.push_str("## Instructions\n");
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
+    prompt.push_str(
+        "- **Transparency rule:** If any tool call fails or returns a non-zero exit code, \
+         always disclose the failure, what you did to recover, any side effects, \
+         and the final confirmed state — never just say \"Done.\"\n",
+    );
     let section_names = core_memory_section_names();
     write!(
         prompt,
