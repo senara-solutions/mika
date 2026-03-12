@@ -121,12 +121,32 @@ existing shell environment variables. File permissions are set to `0600`.
 MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
 MIKA_OPENAI_API_KEY=sk-...
 MIKA_BRAVE_API_KEY=BSA...
+MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...
+MIKA_GITHUB_REPO=owner/repo
 ```
 
 Run `mika setup` to interactively configure secrets (API keys, tokens) and
 preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
 `~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
 server mode.
+
+### GitHub issue creation (dashboard investigation)
+
+The investigation panel can create GitHub issues when both `MIKA_INVESTIGATE_GITHUB_TOKEN`
+and `MIKA_GITHUB_REPO` are set. Steps:
+
+1. Create a GitHub Personal Access Token:
+   - **Fine-grained token** (recommended): Settings → Developer settings →
+     Fine-grained tokens → select your repo → Permissions → Issues: Read and Write
+   - **Classic token**: select `repo` scope (private repos) or `public_repo`
+     (public repos)
+2. Add to `~/.mika/.env`:
+   ```sh
+   MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_your_token_here
+   MIKA_GITHUB_REPO=owner/repo
+   ```
+3. Restart mika-server (tool registry is lazily initialized on first
+   investigation request)
 
 ### Example: Override model in home config
 
@@ -183,7 +203,7 @@ Behavior depends on the key's backend:
 | Backend | Behavior |
 |---------|----------|
 | `File` | Writes to `{agent_home}/config.toml` (preserves comments, atomic write). Validates value format. |
-| `Env` | Prompts for value interactively (never accepts secrets as CLI arguments). Writes to `~/.mika/.env`. |
+| `Env` | Writes to `~/.mika/.env`. Secret keys prompt interactively via masked input (never accepts CLI arguments). Non-secret keys accept a CLI value or prompt with visible input. |
 | `Database` | Writes to the `customer_config` table in SQLite. |
 | `ReadOnly` | Rejected with an error. |
 
@@ -223,7 +243,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
-| `github_token` | `Option<String>` | None | `MIKA_GITHUB_TOKEN` | GitHub Personal Access Token for the dashboard investigation agent's issue creation tool. Needs `repo` scope for private repos or `public_repo` for public. Both `github_token` and `github_repo` must be set to enable the tool. |
+| `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
 | `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
@@ -239,7 +259,7 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `github_token`, and `otlp_auth_header` are redacted in
+- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `investigate_github_token`, and `otlp_auth_header` are redacted in
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
@@ -390,7 +410,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
-| `MIKA_GITHUB_TOKEN` | No | GitHub token for dashboard investigation issue creation |
+| `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |

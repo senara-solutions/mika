@@ -128,7 +128,23 @@ fn run_cli_prompts(
         )?;
     }
 
-    // 3. Telemetry
+    // 3. GitHub integration (optional)
+    if interactive && !secret_is_set("MIKA_INVESTIGATE_GITHUB_TOKEN") {
+        *env_written |= prompt_optional_secret(
+            home_dir,
+            "MIKA_INVESTIGATE_GITHUB_TOKEN",
+            "  GitHub token for dashboard issue creation (optional, press Enter to skip)",
+        )?;
+    }
+    if interactive && !secret_is_set("MIKA_GITHUB_REPO") {
+        *env_written |= prompt_optional_value(
+            home_dir,
+            "MIKA_GITHUB_REPO",
+            "  GitHub repo for dashboard issues, e.g. owner/repo (optional, press Enter to skip)",
+        )?;
+    }
+
+    // 4. Telemetry
     if interactive && !config_key_is_set(home_dir, "telemetry_enabled") {
         let enable = Confirm::new()
             .with_prompt("  Enable telemetry?")
@@ -161,7 +177,7 @@ fn run_cli_prompts(
         }
     }
 
-    // 4. Internal token (auto-generate, no prompt)
+    // 5. Internal token (auto-generate, no prompt)
     if !secret_is_set("MIKA_INTERNAL_TOKEN") {
         let token = generate_token();
         mika_common::dotenv::set_env_var(home_dir, "MIKA_INTERNAL_TOKEN", &token)?;
@@ -272,6 +288,20 @@ fn run_compose_generation() -> Result<()> {
         .interact()?;
     let openai_key = openai_key.trim();
 
+    let github_token = Password::new()
+        .with_prompt("  GitHub token for dashboard issue creation (optional, press Enter to skip)")
+        .allow_empty_password(true)
+        .interact()?;
+    let github_token = github_token.trim();
+
+    let github_repo: String = Input::new()
+        .with_prompt(
+            "  GitHub repo for dashboard issues, e.g. owner/repo (optional, press Enter to skip)",
+        )
+        .allow_empty(true)
+        .interact_text()?;
+    let github_repo = github_repo.trim().to_string();
+
     // --- Auto-generate tokens ---
     let internal_token = generate_token();
     let webhook_secret = generate_token();
@@ -291,6 +321,12 @@ fn run_compose_generation() -> Result<()> {
     }
     if !openai_key.is_empty() {
         lines.push(format!("MIKA_OPENAI_API_KEY={openai_key}"));
+    }
+    if !github_token.is_empty() {
+        lines.push(format!("MIKA_INVESTIGATE_GITHUB_TOKEN={github_token}"));
+    }
+    if !github_repo.is_empty() {
+        lines.push(format!("MIKA_GITHUB_REPO={github_repo}"));
     }
     lines.push(String::new());
 
@@ -363,6 +399,20 @@ fn prompt_optional_secret(home_dir: &Path, env_key: &str, prompt: &str) -> Resul
         .with_prompt(prompt)
         .allow_empty_password(true)
         .interact()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(false);
+    }
+    mika_common::dotenv::set_env_var(home_dir, env_key, value)?;
+    Ok(true)
+}
+
+/// Prompt for an optional non-secret value with visible input. Returns true if a value was written.
+fn prompt_optional_value(home_dir: &Path, env_key: &str, prompt: &str) -> Result<bool> {
+    let value: String = Input::new()
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()?;
     let value = value.trim();
     if value.is_empty() {
         return Ok(false);

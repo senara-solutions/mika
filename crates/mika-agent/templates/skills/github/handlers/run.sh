@@ -12,7 +12,7 @@ set -f  # Disable globbing for safe word splitting
 export GH_PROMPT_DISABLED=1
 
 # Scrub sensitive env vars so gh subprocesses cannot leak them
-unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
+unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY MIKA_INVESTIGATE_GITHUB_TOKEN
 
 INPUT=$(cat)
 COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')

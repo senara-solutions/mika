@@ -6,7 +6,7 @@ category: architecture-patterns
 tags: [investigation, tools, conditional-registration, github-api, config-struct]
 modules:
   - mika-agent (server/investigate.rs — CreateGithubIssueTool, InvestigationToolsConfig, InvestigationParams)
-  - mika-common (config.rs — github_token, github_repo Settings fields)
+  - mika-common (config.rs — investigate_github_token, github_repo Settings fields)
 severity: low
 symptoms:
   - Investigation agent is purely read-only with no write actions
@@ -33,7 +33,7 @@ into `InvestigationToolsConfig`:
 ```rust
 struct InvestigationToolsConfig {
     http_client: reqwest::Client,
-    github_token: Option<String>,
+    investigate_github_token: Option<String>,
     github_repo: Option<String>,
 }
 ```
@@ -55,7 +55,7 @@ struct InvestigationParams<'a> {
 The GitHub issue tool is only registered when both env vars are set and valid:
 
 ```rust
-if let (Some(token), Some(repo)) = (config.github_token, config.github_repo)
+if let (Some(token), Some(repo)) = (config.investigate_github_token, config.github_repo)
     && !token.is_empty()
     && !repo.is_empty()
 {
