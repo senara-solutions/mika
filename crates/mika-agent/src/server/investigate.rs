@@ -468,8 +468,14 @@ impl Tool for CreateGithubIssueTool {
         if title.is_empty() {
             return Ok(ToolOutput::error("title is required"));
         }
+        if title.len() > 256 {
+            return Ok(ToolOutput::error("title exceeds 256 character limit"));
+        }
         if body_input.is_empty() {
             return Ok(ToolOutput::error("body is required"));
+        }
+        if body_input.len() > 10_000 {
+            return Ok(ToolOutput::error("body exceeds 10,000 character limit"));
         }
 
         // Append investigation context footer
@@ -561,11 +567,18 @@ fn build_investigation_tools(config: InvestigationToolsConfig) -> ToolRegistry {
         && !token.is_empty()
         && !repo.is_empty()
     {
-        registry.register(Box::new(CreateGithubIssueTool {
-            http_client: config.http_client,
-            github_token: token,
-            github_repo: repo,
-        }));
+        // Validate owner/repo format (exactly one slash, not at edges)
+        if repo.matches('/').count() == 1 && !repo.starts_with('/') && !repo.ends_with('/') {
+            registry.register(Box::new(CreateGithubIssueTool {
+                http_client: config.http_client,
+                github_token: token,
+                github_repo: repo,
+            }));
+        } else {
+            tracing::warn!(
+                "MIKA_GITHUB_REPO must be in 'owner/repo' format — GitHub issue tool not registered"
+            );
+        }
     }
 
     registry
@@ -981,6 +994,9 @@ pub async fn handle_investigate(
     })?;
 
     // --- Lazy-init investigation tools ---
+    // NOTE: Tool registry is immutable after first initialization. GitHub tool
+    // availability is determined at the first investigation request. Config changes
+    // (e.g., setting MIKA_GITHUB_TOKEN) require a server restart to take effect.
     let tools = state
         .investigation_tools
         .get_or_init(|| async {
