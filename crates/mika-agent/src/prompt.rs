@@ -232,10 +232,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str("## Instructions\n");
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
     prompt.push_str(
-        "- **Transparency rule:** If any tool call returns a non-zero exit code or fails during a task — \
-         even if you recover — your response must disclose it. Surface: what failed, what you did to fix it, \
-         any resources created as side effects (labels, branches, files, etc.), and the final confirmed state. \
-         Never collapse a multi-step recovery into a single word like \"Done.\"\n",
+        "- **Transparency rule:** If any tool call fails or returns a non-zero exit code, \
+         always disclose the failure, what you did to recover, any side effects, \
+         and the final confirmed state — never just say \"Done.\"\n",
     );
     let section_names = core_memory_section_names();
     write!(
