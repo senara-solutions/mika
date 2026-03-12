@@ -182,6 +182,7 @@ pub enum AgentRequest {
         task_id: String,
         label: String,
         result: String,
+        trace_id: Option<String>,
     },
     SetModel {
         model: String,
@@ -1270,6 +1271,7 @@ impl<'a> App<'a> {
                 task_id: task.id,
                 label: task.label,
                 result,
+                trace_id: task.created_trace_id,
             });
 
             self.status = AgentStatus::Thinking;

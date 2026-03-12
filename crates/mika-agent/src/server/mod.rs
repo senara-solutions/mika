@@ -1654,6 +1654,44 @@ mod tests {
         assert!(json.as_array().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn test_trace_messages_returns_matching_messages() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        let trace_id = "aabb0011ccddeeff0011223344556677";
+        db.save_message_with_metadata(
+            "test-session",
+            "user",
+            "traced message",
+            None,
+            Some(trace_id),
+        )
+        .await
+        .unwrap();
+
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/timeline/trace/{trace_id}/messages"))
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0]["content"], "traced message");
+        assert_eq!(json[0]["role"], "user");
+    }
+
     // ===== Auth split tests =====
 
     #[tokio::test]

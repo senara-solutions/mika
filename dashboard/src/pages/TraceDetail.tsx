@@ -429,7 +429,7 @@ function EventCard({ event }: { event: { event_type: string; event_subtype: stri
 export default function TraceDetail() {
   const { traceId } = useParams<{ traceId: string }>()
   const { data: events, isLoading: eventsLoading, error: eventsError } = useTraceDetail(traceId ?? '')
-  const { data: messages, isLoading: messagesLoading } = useTraceMessages(traceId ?? '')
+  const { data: messages, isLoading: messagesLoading, error: messagesError } = useTraceMessages(traceId ?? '')
   const [investigationCtx, setInvestigationCtx] = useState<InvestigationContext | null>(null)
 
   const openInvestigation = (
@@ -449,7 +449,7 @@ export default function TraceDetail() {
   }
 
   const isLoading = eventsLoading || messagesLoading
-  const error = eventsError
+  const error = eventsError || messagesError
 
   // Non-message events (audit, task)
   const nonMessageEvents = events?.filter((e) => e.event_type !== 'message') ?? []
