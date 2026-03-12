@@ -6,8 +6,10 @@
       "type": "object",
       "properties": {
         "command": {
-          "type": "string",
-          "description": "The gh subcommand and arguments to execute (e.g., 'pr list --state open', 'issue create --title \"Bug\" --body \"Details\"')"
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "The gh subcommand and arguments as an array of strings (e.g., [\"pr\", \"list\", \"--state\", \"open\"], [\"issue\", \"create\", \"--title\", \"Bug\", \"--body\", \"Details\"])"
         },
         "repo": {
           "type": "string",
@@ -17,8 +19,8 @@
       "required": ["command"]
     },
     "handler": {
-      "type": "exec",
-      "command": "handlers/run.sh"
+      "type": "builtin",
+      "function": "run_gh"
     }
   }
 ]

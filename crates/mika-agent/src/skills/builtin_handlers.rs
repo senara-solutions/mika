@@ -7,6 +7,8 @@
 use std::fmt::Write;
 use std::sync::LazyLock;
 
+use tokio::io::AsyncReadExt;
+
 use crate::tools::{ToolContext, ToolOutput};
 
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
@@ -28,7 +30,7 @@ static DOC_RUNTIME_STRUCTURE: &str =
 static DOC_SLASH_COMMANDS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/slash-commands.md"));
 
 /// Known builtin function names, used for startup validation.
-pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "web_search"];
+pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "run_gh", "web_search"];
 
 /// Maximum output size from a builtin handler (matches executor::MAX_OUTPUT_LEN).
 const MAX_OUTPUT_LEN: usize = 10_000;
@@ -55,6 +57,7 @@ pub async fn execute(
 ) -> ToolOutput {
     let mut output = match function {
         "get_documentation" => get_documentation(&input, ctx).await,
+        "run_gh" => run_gh(&input, ctx).await,
         "web_search" => web_search(&input, ctx).await,
         _ => ToolOutput::error(format!("Unknown builtin function: {function}")),
     };
@@ -216,6 +219,183 @@ fn format_brave_results(body: &serde_json::Value, query: &str) -> ToolOutput {
     }
 
     ToolOutput::success(out)
+}
+
+/// Allowed top-level `gh` subcommands.
+const GH_ALLOWED_SUBCOMMANDS: &[&str] = &[
+    "pr",
+    "issue",
+    "run",
+    "workflow",
+    "release",
+    "repo",
+    "search",
+    "label",
+    "milestone",
+    "project",
+];
+
+/// Validated `run_gh` input — command args and optional repo.
+struct GhArgs {
+    args: Vec<String>,
+    repo: Option<String>,
+}
+
+/// Validate and parse `run_gh` input into structured args.
+///
+/// Checks: string rejection, array parsing, empty/length/allowlist/repo-smuggling.
+fn validate_gh_input(input: &serde_json::Value) -> Result<GhArgs, ToolOutput> {
+    // Reject old string format with a migration hint
+    if input.get("command").is_some_and(|v| v.is_string()) {
+        return Err(ToolOutput::error(
+            "The 'command' parameter must be a JSON array of strings, not a single string. \
+             Example: [\"pr\", \"list\", \"--state\", \"open\"]"
+                .to_string(),
+        ));
+    }
+
+    let args: Vec<String> = match input.get("command").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut args = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item.as_str() {
+                    Some(s) => args.push(s.to_string()),
+                    None => {
+                        return Err(ToolOutput::error(
+                            "All elements in 'command' must be strings.".to_string(),
+                        ));
+                    }
+                }
+            }
+            args
+        }
+        None => {
+            return Err(ToolOutput::error(
+                "Missing or invalid 'command' parameter.".to_string(),
+            ));
+        }
+    };
+
+    if args.is_empty() {
+        return Err(ToolOutput::error(
+            "Command array must not be empty.".to_string(),
+        ));
+    }
+
+    // Enforce total input length limit
+    let total_len: usize = args.iter().map(|s| s.len()).sum();
+    if total_len > 10_000 {
+        return Err(ToolOutput::error(
+            "Command too long (max 10000 characters total).".to_string(),
+        ));
+    }
+
+    // Validate subcommand against allowlist
+    let subcommand = &args[0];
+    if !GH_ALLOWED_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        return Err(ToolOutput::error(format!(
+            "gh subcommand '{subcommand}' is not allowed. \
+             Permitted: {}.",
+            GH_ALLOWED_SUBCOMMANDS.join(", ")
+        )));
+    }
+
+    // Reject --repo / -R smuggling in the command array
+    if args.iter().any(|s| s == "--repo" || s == "-R") {
+        return Err(ToolOutput::error(
+            "Do not include --repo in the command array. Use the separate 'repo' parameter instead."
+                .to_string(),
+        ));
+    }
+
+    let repo = input
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    Ok(GhArgs { args, repo })
+}
+
+/// Execute a GitHub CLI (`gh`) command with safe argument passing.
+///
+/// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
+///
+/// Unlike the old shell-script handler, arguments are passed as an array to avoid
+/// shell word-splitting issues with quoted multi-word values.
+async fn run_gh(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput {
+    let gh_args = match validate_gh_input(input) {
+        Ok(args) => args,
+        Err(err) => return err,
+    };
+
+    // Build the command — each argument is a separate OS arg (no shell expansion)
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(&gh_args.args);
+
+    // Append --repo if provided
+    if let Some(ref repo) = gh_args.repo {
+        cmd.arg("--repo").arg(repo);
+    }
+
+    // Set environment
+    cmd.env("GH_PROMPT_DISABLED", "1");
+
+    // Scrub MIKA_* env vars from the child process
+    super::executor::scrub_mika_env_vars(&mut cmd);
+
+    cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "Failed to spawn gh: {e}. Is the GitHub CLI installed?"
+            ));
+        }
+    };
+
+    // Read stdout and stderr with bounded size to prevent memory exhaustion
+    let stdout_handle = child.stdout.take().expect("stdout piped");
+    let stderr_handle = child.stderr.take().expect("stderr piped");
+    let mut stdout_buf = Vec::with_capacity(MAX_OUTPUT_LEN);
+    let mut stderr_buf = Vec::with_capacity(MAX_OUTPUT_LEN);
+
+    let mut stdout_take = stdout_handle.take(MAX_OUTPUT_LEN as u64);
+    let mut stderr_take = stderr_handle.take(MAX_OUTPUT_LEN as u64);
+    let (stdout_res, stderr_res) = tokio::join!(
+        stdout_take.read_to_end(&mut stdout_buf),
+        stderr_take.read_to_end(&mut stderr_buf),
+    );
+    stdout_res.ok();
+    stderr_res.ok();
+
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            return ToolOutput::error(format!("Failed to execute gh: {e}"));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_buf);
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+
+    if status.success() {
+        ToolOutput::success(stdout.into_owned())
+    } else {
+        let code = status.code().unwrap_or(-1);
+        let mut result = format!("Exit code: {code}\n");
+        if !stderr.is_empty() {
+            result.push_str(&stderr);
+        }
+        if !stdout.is_empty() {
+            result.push_str(&stdout);
+        }
+        ToolOutput::success(result)
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +567,130 @@ mod tests {
     #[test]
     fn test_get_documentation_in_known_builtins() {
         assert!(KNOWN_BUILTINS.contains(&"get_documentation"));
+    }
+
+    #[test]
+    fn test_run_gh_in_known_builtins() {
+        assert!(KNOWN_BUILTINS.contains(&"run_gh"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_empty_command() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({"command": []});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_missing_command() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_disallowed_subcommand() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({"command": ["auth", "login"]});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("'auth' is not allowed"));
+        assert!(output.content.contains("Permitted:"));
+    }
+
+    #[test]
+    fn test_run_gh_allowlist_accepts_valid() {
+        for sub in &[
+            "pr",
+            "issue",
+            "run",
+            "workflow",
+            "release",
+            "repo",
+            "search",
+            "label",
+            "milestone",
+            "project",
+        ] {
+            let input = serde_json::json!({"command": [sub, "list"]});
+            let result = validate_gh_input(&input);
+            assert!(result.is_ok(), "subcommand '{sub}' should be allowed");
+        }
+    }
+
+    #[test]
+    fn test_run_gh_repo_flag_appended() {
+        let input = serde_json::json!({"command": ["pr", "list"], "repo": "owner/repo"});
+        let gh_args = validate_gh_input(&input).unwrap();
+        assert_eq!(gh_args.args, vec!["pr", "list"]);
+        assert_eq!(gh_args.repo.as_deref(), Some("owner/repo"));
+    }
+
+    #[test]
+    fn test_run_gh_repo_not_appended_when_empty() {
+        let input = serde_json::json!({"command": ["issue", "list"]});
+        let gh_args = validate_gh_input(&input).unwrap();
+        assert_eq!(gh_args.args, vec!["issue", "list"]);
+        assert!(gh_args.repo.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_string_command_rejected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({"command": "pr list --state open"});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("JSON array of strings"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_repo_flag_smuggling() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({"command": ["pr", "list", "--repo", "evil/repo"]});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Do not include --repo"));
+        assert!(output.content.contains("'repo' parameter"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_repo_shorthand_smuggling() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({"command": ["pr", "list", "-R", "evil/repo"]});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Do not include --repo"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_command_too_long() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let long_arg = "x".repeat(10_001);
+        let input = serde_json::json!({"command": ["pr", long_arg]});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Command too long"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_non_string_array_element() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({"command": ["pr", 42]});
+        let output = run_gh(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("must be strings"));
     }
 
     /// Verify crate-local fallback copies match workspace-root docs.

@@ -98,7 +98,6 @@ static GITHUB_SKILL: BundledSkill = skill!("github", [
     ("skill.toml" => "../templates/skills/github/skill.toml"),
     ("system_prompt.md" => "../templates/skills/github/system_prompt.md"),
     ("tools.json" => "../templates/skills/github/tools.json"),
-    ("handlers/run.sh" => "../templates/skills/github/handlers/run.sh", +x),
 ]);
 
 static MCP_SKILL: BundledSkill = skill!("mcp", [

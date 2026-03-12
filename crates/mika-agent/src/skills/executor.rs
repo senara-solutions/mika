@@ -21,7 +21,18 @@ const MAX_OUTPUT_LEN: usize = 10_000;
 ///
 /// Prevents leaking secrets like `MIKA_ANTHROPIC_API_KEY`, `MIKA_INTERNAL_TOKEN`,
 /// and `MIKA_OPENAI_API_KEY` to child processes.
-fn scrub_mika_env_vars(cmd: &mut tokio::process::Command) {
+pub(crate) fn scrub_mika_env_vars(cmd: &mut tokio::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MIKA_") {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+/// Scrub all `MIKA_*` environment variables from a std Command (defense-in-depth).
+///
+/// Same as [`scrub_mika_env_vars`] but for synchronous `std::process::Command`.
+pub(crate) fn scrub_mika_env_vars_std(cmd: &mut std::process::Command) {
     for (key, _) in std::env::vars() {
         if key.starts_with("MIKA_") {
             cmd.env_remove(&key);

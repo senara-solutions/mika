@@ -122,11 +122,7 @@ fn git_command() -> Command {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
 
     // Scrub MIKA_* env vars from the child process (defense-in-depth)
-    for (key, _) in std::env::vars() {
-        if key.starts_with("MIKA_") {
-            cmd.env_remove(&key);
-        }
-    }
+    super::executor::scrub_mika_env_vars_std(&mut cmd);
 
     cmd
 }
