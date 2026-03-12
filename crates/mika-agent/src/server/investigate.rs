@@ -429,16 +429,158 @@ impl Tool for GetAgentInfoTool {
     }
 }
 
+/// Tool: create a GitHub issue via the GitHub API.
+struct CreateGithubIssueTool {
+    http_client: reqwest::Client,
+    github_token: String,
+    github_repo: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for CreateGithubIssueTool {
+    fn name(&self) -> &str {
+        "create_github_issue"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "create_github_issue".to_string(),
+            description: "Create a GitHub issue to track a finding from this investigation. The issue will automatically include investigation context (session ID, agent ID, trace ID).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Issue title — concise summary of the finding" },
+                    "body": { "type": "string", "description": "Issue body in Markdown — detailed description, steps to reproduce, expected vs actual behavior" }
+                },
+                "required": ["title", "body"]
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        ctx: &crate::tools::ToolContext<'_>,
+    ) -> Result<ToolOutput> {
+        let title = input["title"].as_str().unwrap_or("").to_owned();
+        let body_input = input["body"].as_str().unwrap_or("").to_owned();
+
+        if title.is_empty() {
+            return Ok(ToolOutput::error("title is required"));
+        }
+        if title.len() > 256 {
+            return Ok(ToolOutput::error("title exceeds 256 character limit"));
+        }
+        if body_input.is_empty() {
+            return Ok(ToolOutput::error("body is required"));
+        }
+        if body_input.len() > 10_000 {
+            return Ok(ToolOutput::error("body exceeds 10,000 character limit"));
+        }
+
+        // Append investigation context footer
+        let body = format!(
+            "{body_input}\n\n---\n\
+             **Investigation Context**\n\
+             - Session: `{}`\n\
+             - Trace: `{}`\n\
+             \n_Created from the Mika observability dashboard_",
+            ctx.session_id, ctx.trace_id,
+        );
+
+        let url = format!("https://api.github.com/repos/{}/issues", self.github_repo);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.github_token))
+            .header("User-Agent", "mika-dashboard")
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "title": title,
+                "body": body,
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to reach GitHub API: {e}"))?;
+
+        let status = response.status();
+        if status.is_success() {
+            let resp_body: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse GitHub response: {e}"))?;
+            let number = resp_body["number"].as_u64().unwrap_or(0);
+            let html_url = resp_body["html_url"].as_str().unwrap_or("(unknown URL)");
+            Ok(ToolOutput::success(format!(
+                "Created issue #{number}: {html_url}"
+            )))
+        } else {
+            let error_body = response.text().await.unwrap_or_default();
+            let msg = match status.as_u16() {
+                401 => "GitHub token is invalid or expired".to_string(),
+                403 => "GitHub token lacks required permissions (needs 'repo' scope)".to_string(),
+                404 => format!(
+                    "Repository '{}' not found or not accessible",
+                    self.github_repo
+                ),
+                422 => {
+                    // Extract validation message from GitHub response
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&error_body).unwrap_or_default();
+                    let gh_msg = parsed["message"].as_str().unwrap_or("Validation failed");
+                    format!("GitHub validation error: {gh_msg}")
+                }
+                429 => "GitHub API rate limit exceeded, try again later".to_string(),
+                _ => format!("GitHub API error (HTTP {status}): {error_body}"),
+            };
+            Ok(ToolOutput::error(msg))
+        }
+    }
+
+    fn timeout_secs(&self) -> Option<u64> {
+        Some(10)
+    }
+}
+
+/// Configuration for building investigation tools.
+pub struct InvestigationToolsConfig {
+    pub agents: Arc<std::collections::HashMap<String, Arc<super::state::AgentState>>>,
+    pub http_client: reqwest::Client,
+    pub github_token: Option<String>,
+    pub github_repo: Option<String>,
+}
+
 /// Build the investigation tool registry.
-fn build_investigation_tools(
-    agents: Arc<std::collections::HashMap<String, Arc<super::state::AgentState>>>,
-) -> ToolRegistry {
+fn build_investigation_tools(config: InvestigationToolsConfig) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(QueryTimelineTool));
     registry.register(Box::new(QueryMessagesTool));
     registry.register(Box::new(QueryAuditEventsTool));
     registry.register(Box::new(SearchMemoryTool));
-    registry.register(Box::new(GetAgentInfoTool { agents }));
+    registry.register(Box::new(GetAgentInfoTool {
+        agents: config.agents,
+    }));
+
+    // Conditionally register GitHub issue creation tool
+    if let (Some(token), Some(repo)) = (config.github_token, config.github_repo)
+        && !token.is_empty()
+        && !repo.is_empty()
+    {
+        // Validate owner/repo format (exactly one slash, not at edges)
+        if repo.matches('/').count() == 1 && !repo.starts_with('/') && !repo.ends_with('/') {
+            registry.register(Box::new(CreateGithubIssueTool {
+                http_client: config.http_client,
+                github_token: token,
+                github_repo: repo,
+            }));
+        } else {
+            tracing::warn!(
+                "MIKA_GITHUB_REPO must be in 'owner/repo' format — GitHub issue tool not registered"
+            );
+        }
+    }
+
     registry
 }
 
@@ -460,6 +602,7 @@ async fn build_investigation_context(
     agents: &std::collections::HashMap<String, Arc<super::state::AgentState>>,
     message: &SessionMessage,
     tool_call_index: Option<usize>,
+    has_github_tool: bool,
 ) -> Result<String> {
     // Get agent_id from session
     let session = db
@@ -480,6 +623,13 @@ async fn build_investigation_context(
          Use your tools to dig deeper when needed — query the timeline, load messages, \
          check audit events, or search memory to provide thorough answers.\n\n",
     );
+
+    if has_github_tool {
+        prompt.push_str(
+            "You can also create GitHub issues to track findings using the `create_github_issue` tool. \
+             Use it when the user asks to create an issue or when you identify a significant bug worth tracking.\n\n",
+        );
+    }
 
     prompt.push_str(&format!(
         "## Agent Under Investigation\nAgent: {}\nSession: {}\n\n",
@@ -535,26 +685,40 @@ async fn build_investigation_context(
 
 // ===== Investigation Agent Loop =====
 
+/// Parameters for running an investigation agent loop.
+struct InvestigationParams {
+    system_prompt: String,
+    messages: Vec<Message>,
+    tx: mpsc::Sender<Result<sse::Event, Infallible>>,
+    db: AsyncDatabase,
+    session_id: String,
+    trace_id: String,
+}
+
 /// Run the investigation agent loop, sending SSE events via the channel.
 async fn run_investigation(
     claude: &ClaudeClient,
     tools: &ToolRegistry,
-    system_prompt: String,
-    mut messages: Vec<Message>,
-    tx: mpsc::Sender<Result<sse::Event, Infallible>>,
-    db: AsyncDatabase,
-    _agents: Arc<std::collections::HashMap<String, Arc<super::state::AgentState>>>,
+    params: InvestigationParams,
 ) {
+    let InvestigationParams {
+        system_prompt,
+        mut messages,
+        tx,
+        db,
+        session_id: investigation_session_id,
+        trace_id: investigation_trace_id,
+    } = params;
     let tool_defs = tools.definitions().to_vec();
-    let dummy_session = String::new();
     let edit_count = std::sync::atomic::AtomicU32::new(0);
     let skills_dirty = std::sync::atomic::AtomicBool::new(false);
     // Create a minimal ToolContext for investigation tools.
-    // The investigation tools only use `db` from the context.
+    // session_id and trace_id carry the investigation context for the
+    // create_github_issue tool to embed in issue bodies.
     let tool_ctx = crate::tools::ToolContext {
         db: &db,
-        session_id: &dummy_session,
-        trace_id: "",
+        session_id: &investigation_session_id,
+        trace_id: &investigation_trace_id,
         home_dir: std::path::Path::new("/tmp"),
         core_memory_edit_count: &edit_count,
         is_onboarding: false,
@@ -808,12 +972,16 @@ pub async fn handle_investigate(
             .into_response());
     }
 
+    // --- Check GitHub tool availability ---
+    let has_github = state.settings.github_token.is_some() && state.settings.github_repo.is_some();
+
     // --- Build context ---
     let system_prompt = build_investigation_context(
         &state.dashboard_db,
         &state.agents,
         &message,
         req.tool_call_index,
+        has_github,
     )
     .await
     .map_err(|e| {
@@ -826,9 +994,19 @@ pub async fn handle_investigate(
     })?;
 
     // --- Lazy-init investigation tools ---
+    // NOTE: Tool registry is immutable after first initialization. GitHub tool
+    // availability is determined at the first investigation request. Config changes
+    // (e.g., setting MIKA_GITHUB_TOKEN) require a server restart to take effect.
     let tools = state
         .investigation_tools
-        .get_or_init(|| async { Arc::new(build_investigation_tools(state.agents.clone())) })
+        .get_or_init(|| async {
+            Arc::new(build_investigation_tools(InvestigationToolsConfig {
+                agents: state.agents.clone(),
+                http_client: state.http_client.clone(),
+                github_token: state.settings.github_token.clone(),
+                github_repo: state.settings.github_repo.clone(),
+            }))
+        })
         .await
         .clone();
 
@@ -860,13 +1038,28 @@ pub async fn handle_investigate(
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
     let lock = state.investigation_lock.clone();
+    let investigation_session_id = message.session_id.clone();
+    let investigation_trace_id = message.trace_id.clone().unwrap_or_default();
 
     info!(message_id = req.message_id, "starting investigation");
 
     tokio::spawn(async move {
         // Hold the lock for the entire investigation duration
         let _guard = lock.lock().await;
-        run_investigation(&claude, &tools, system_prompt, messages, tx, db, agents).await;
+        let _agents = agents; // keep alive for the duration
+        run_investigation(
+            &claude,
+            &tools,
+            InvestigationParams {
+                system_prompt,
+                messages,
+                tx,
+                db,
+                session_id: investigation_session_id,
+                trace_id: investigation_trace_id,
+            },
+        )
+        .await;
     });
 
     let stream = ReceiverStream::new(rx);

@@ -183,6 +183,8 @@ pub mod test_helpers {
             embedding_model: "text-embedding-3-small".to_string(),
             embedding_dimensions: 512,
             brave_api_key: None,
+            github_token: None,
+            github_repo: None,
             home_dir: PathBuf::from("/tmp"),
             server_log_file: None,
             disable_bundled_skills: false,

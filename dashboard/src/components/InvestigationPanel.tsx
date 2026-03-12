@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { X, Search, Send, Loader2, Wrench } from 'lucide-react'
 import { streamInvestigation, type InvestigateEvent } from '../api/investigate.ts'
+import CopyButton from './CopyButton.tsx'
 
 export interface InvestigationContext {
   messageId: number
@@ -249,6 +250,11 @@ export default function InvestigationPanel({
                 <div className="text-sm text-muted/80 whitespace-pre-wrap break-words">
                   {msg.content}
                 </div>
+                {msg.role === 'assistant' && msg.content && (
+                  <div className="flex justify-end mt-1">
+                    <CopyButton text={msg.content} title="Copy response" />
+                  </div>
+                )}
               </div>
             </div>
           ))}
