@@ -30,11 +30,13 @@ export default function Sessions() {
   const filters: SessionsFilters = {
     agent_id: searchParams.get('agent_id') ?? undefined,
     channel_type: searchParams.get('channel_type') ?? undefined,
+    session_id: searchParams.get('session_id') ?? undefined,
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
 
   const [agentSearch, setAgentSearch] = useState(filters.agent_id ?? '')
+  const [sessionSearch, setSessionSearch] = useState(filters.session_id ?? '')
 
   const { data, isLoading, error } = useSessions(filters)
 
@@ -64,6 +66,18 @@ export default function Sessions() {
               className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40"
             />
           </div>
+          <div className="relative flex-1 min-w-[180px]">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" />
+            <input
+              type="text"
+              aria-label="Search session ID"
+              placeholder="Search session ID..."
+              value={sessionSearch}
+              onChange={(e) => setSessionSearch(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && updateFilter('session_id', sessionSearch.trim())}
+              className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm font-mono text-muted placeholder:text-muted/30 placeholder:font-sans focus:outline-none focus:border-accent/40"
+            />
+          </div>
           <select
             value={filters.channel_type ?? ''}
             onChange={(e) => updateFilter('channel_type', e.target.value)}
@@ -75,7 +89,7 @@ export default function Sessions() {
               </option>
             ))}
           </select>
-          {(filters.agent_id || filters.channel_type) && (
+          {(filters.agent_id || filters.channel_type || filters.session_id) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}
               className="text-xs text-muted/60 hover:text-muted transition-colors"

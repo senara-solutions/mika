@@ -218,7 +218,7 @@ pub async fn handle_agent_sessions(
 
     let (data, total) = match state
         .dashboard_db
-        .list_sessions_paginated_with_count(Some(agent_id.clone()), None, per_page, offset)
+        .list_sessions_paginated_with_count(Some(agent_id.clone()), None, None, per_page, offset)
         .await
     {
         Ok(result) => result,
@@ -266,6 +266,7 @@ pub async fn handle_agent_audit(
 pub struct SessionsQuery {
     pub agent_id: Option<String>,
     pub channel_type: Option<String>,
+    pub session_id: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -279,7 +280,13 @@ pub async fn handle_sessions_list(
 
     let (data, total) = match state
         .dashboard_db
-        .list_sessions_paginated_with_count(q.agent_id, q.channel_type, per_page, offset)
+        .list_sessions_paginated_with_count(
+            q.agent_id,
+            q.channel_type,
+            q.session_id,
+            per_page,
+            offset,
+        )
         .await
     {
         Ok(result) => result,

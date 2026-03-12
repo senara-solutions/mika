@@ -1274,11 +1274,18 @@ impl AsyncDatabase {
         &self,
         agent_id: Option<String>,
         channel_type: Option<String>,
+        session_id: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionWithStats>> {
         self.with_db(move |db| {
-            db.list_sessions_paginated(agent_id.as_deref(), channel_type.as_deref(), limit, offset)
+            db.list_sessions_paginated(
+                agent_id.as_deref(),
+                channel_type.as_deref(),
+                session_id.as_deref(),
+                limit,
+                offset,
+            )
         })
         .await
     }
@@ -1287,9 +1294,16 @@ impl AsyncDatabase {
         &self,
         agent_id: Option<String>,
         channel_type: Option<String>,
+        session_id: Option<String>,
     ) -> Result<u64> {
-        self.with_db(move |db| db.count_sessions(agent_id.as_deref(), channel_type.as_deref()))
-            .await
+        self.with_db(move |db| {
+            db.count_sessions(
+                agent_id.as_deref(),
+                channel_type.as_deref(),
+                session_id.as_deref(),
+            )
+        })
+        .await
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
@@ -1363,6 +1377,7 @@ impl AsyncDatabase {
         &self,
         agent_id: Option<String>,
         channel_type: Option<String>,
+        session_id: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SessionWithStats>, u64)> {
@@ -1370,6 +1385,7 @@ impl AsyncDatabase {
             db.list_sessions_paginated_with_count(
                 agent_id.as_deref(),
                 channel_type.as_deref(),
+                session_id.as_deref(),
                 limit,
                 offset,
             )

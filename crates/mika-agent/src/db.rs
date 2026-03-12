@@ -4098,6 +4098,7 @@ impl Database {
         &self,
         agent_id: Option<&str>,
         channel_type: Option<&str>,
+        session_id: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionWithStats>> {
@@ -4111,6 +4112,13 @@ impl Database {
         if let Some(ct) = channel_type {
             param_values.push(ct.to_string());
             conditions.push(format!("s.channel_type = ?{}", param_values.len()));
+        }
+        if let Some(sid) = session_id {
+            let sanitized: String = sid.chars().filter(|c| *c != '%' && *c != '_').collect();
+            if !sanitized.is_empty() {
+                param_values.push(format!("{}%", sanitized));
+                conditions.push(format!("s.id LIKE ?{}", param_values.len()));
+            }
         }
 
         let where_clause = if conditions.is_empty() {
@@ -4157,6 +4165,7 @@ impl Database {
         &self,
         agent_id: Option<&str>,
         channel_type: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<u64> {
         let mut conditions = Vec::new();
         let mut param_values: Vec<String> = Vec::new();
@@ -4168,6 +4177,13 @@ impl Database {
         if let Some(ct) = channel_type {
             param_values.push(ct.to_string());
             conditions.push(format!("channel_type = ?{}", param_values.len()));
+        }
+        if let Some(sid) = session_id {
+            let sanitized: String = sid.chars().filter(|c| *c != '%' && *c != '_').collect();
+            if !sanitized.is_empty() {
+                param_values.push(format!("{}%", sanitized));
+                conditions.push(format!("id LIKE ?{}", param_values.len()));
+            }
         }
 
         let where_clause = if conditions.is_empty() {
@@ -4289,11 +4305,13 @@ impl Database {
         &self,
         agent_id: Option<&str>,
         channel_type: Option<&str>,
+        session_id: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SessionWithStats>, u64)> {
-        let count = self.count_sessions(agent_id, channel_type)?;
-        let data = self.list_sessions_paginated(agent_id, channel_type, limit, offset)?;
+        let count = self.count_sessions(agent_id, channel_type, session_id)?;
+        let data =
+            self.list_sessions_paginated(agent_id, channel_type, session_id, limit, offset)?;
         Ok((data, count))
     }
 

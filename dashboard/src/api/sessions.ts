@@ -25,6 +25,7 @@ export interface Message {
 export interface SessionsFilters {
   agent_id?: string
   channel_type?: string
+  session_id?: string
   page?: number
   per_page?: number
 }
