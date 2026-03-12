@@ -281,6 +281,7 @@ async fn spawn_agent_worker(
                     task_id,
                     label,
                     result,
+                    trace_id,
                 } => {
                     // Save the callback result as a tool_result message
                     let metadata = serde_json::json!({
@@ -294,7 +295,7 @@ async fn spawn_agent_worker(
                             "tool_result",
                             &result,
                             Some(&metadata),
-                            None,
+                            trace_id.as_deref(),
                         )
                         .await;
 

@@ -120,6 +120,7 @@ pub struct Task {
     pub input_context: Option<String>,
     pub result: Option<String>,
     pub created_by_session: Option<String>,
+    pub created_trace_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub fired_at: Option<i64>,
@@ -1513,12 +1514,13 @@ impl Database {
             input_context: r.get(17)?,
             result: r.get(18)?,
             created_by_session: r.get(19)?,
-            created_at: r.get(20)?,
-            updated_at: r.get(21)?,
-            fired_at: r.get(22)?,
-            completed_at: r.get(23)?,
-            reference_url: r.get(24)?,
-            source: r.get(25)?,
+            created_trace_id: r.get(20)?,
+            created_at: r.get(21)?,
+            updated_at: r.get(22)?,
+            fired_at: r.get(23)?,
+            completed_at: r.get(24)?,
+            reference_url: r.get(25)?,
+            source: r.get(26)?,
         })
     }
 
@@ -1526,7 +1528,7 @@ impl Database {
          trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
-         created_at, updated_at, fired_at, completed_at,
+         created_trace_id, created_at, updated_at, fired_at, completed_at,
          reference_url, source";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
@@ -1666,7 +1668,7 @@ impl Database {
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
-    const TASK_COLUMN_COUNT: usize = 26;
+    const TASK_COLUMN_COUNT: usize = 27;
 
     /// List manual (work item) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
@@ -2117,6 +2119,8 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    const SESSION_MESSAGE_COLUMNS: &'static str = "m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at";
+
     fn row_to_session_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
         Ok(SessionMessage {
             id: r.get(0)?,
@@ -2136,12 +2140,13 @@ impl Database {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut messages = stmt
             .query_map(
                 params![agent_id, limit as i64],
@@ -2155,10 +2160,12 @@ impl Database {
     pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<SessionMessage>> {
         self.conn
             .query_row(
-                "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-                  FROM messages m JOIN sessions s ON m.session_id = s.id
-                  WHERE m.agent_id = ?1 AND m.role = 'summary'
-                  ORDER BY m.created_at DESC LIMIT 1",
+                &format!(
+                    "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
+                      WHERE m.agent_id = ?1 AND m.role = 'summary'
+                      ORDER BY m.created_at DESC LIMIT 1",
+                    Self::SESSION_MESSAGE_COLUMNS
+                ),
                 params![agent_id],
                 Self::row_to_session_message,
             )
@@ -2193,12 +2200,13 @@ impl Database {
             Some(id) => id,
             None => return Ok(vec![]),
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.role != 'summary' AND m.id <= ?2
               ORDER BY m.created_at ASC, m.id ASC",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![agent_id, cutoff_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
@@ -2224,7 +2232,7 @@ impl Database {
             "DELETE FROM messages WHERE agent_id = ?1 AND role = 'summary'",
             params![agent_id],
         )?;
-        // Insert new summary
+        // Insert new summary (no trace_id — summaries span multiple traces)
         self.conn.execute(
             "INSERT INTO messages (session_id, agent_id, role, content, compacted_through_id)
              VALUES (?1, ?2, 'summary', ?3, ?4)",
@@ -2240,12 +2248,13 @@ impl Database {
         agent_id: &str,
         after_id: i64,
     ) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.id > ?2
               ORDER BY m.created_at ASC, m.id ASC",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![agent_id, after_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
@@ -2263,11 +2272,12 @@ impl Database {
 
     /// Load a single message by its row ID.
     pub fn get_message_by_id(&self, message_id: i64) -> Result<Option<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.id = ?1",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt
             .query_map(params![message_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2283,14 +2293,15 @@ impl Database {
         before: u32,
         after: u32,
     ) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.session_id = ?1
                 AND (m.id >= (SELECT id FROM (SELECT id FROM messages WHERE session_id = ?1 AND id <= ?2 ORDER BY id DESC LIMIT ?3) sub ORDER BY id ASC LIMIT 1))
                 AND m.id <= (SELECT id FROM (SELECT id FROM messages WHERE session_id = ?1 AND id >= ?2 ORDER BY id ASC LIMIT ?4) sub ORDER BY id DESC LIMIT 1)
               ORDER BY m.created_at ASC, m.id ASC",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
                 params![session_id, target_id, before + 1, after + 1],
@@ -2305,12 +2316,13 @@ impl Database {
         agent_id: &str,
         since_unix: i64,
     ) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.created_at >= ?2 AND m.role != 'summary'
               ORDER BY m.created_at ASC",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![agent_id, since_unix], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
@@ -2920,12 +2932,13 @@ impl Database {
         session_id: &str,
         after_id: i64,
     ) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.session_id = ?2 AND m.id > ?3
               ORDER BY m.id ASC",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
                 params![agent_id, session_id, after_id],
@@ -4034,12 +4047,13 @@ impl Database {
 
     /// Get full messages for a specific trace_id (for rich trace detail rendering).
     pub fn get_messages_by_trace_id(&self, trace_id: &str) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.trace_id = ?1
               ORDER BY m.created_at ASC, m.id ASC",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![trace_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
@@ -4230,12 +4244,13 @@ impl Database {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at
-              FROM messages m JOIN sessions s ON m.session_id = s.id
+        let sql = format!(
+            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.session_id = ?1
               ORDER BY m.created_at ASC, m.id ASC LIMIT ?2 OFFSET ?3",
-        )?;
+            Self::SESSION_MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
                 params![session_id, limit as i64, offset as i64],
@@ -4582,6 +4597,24 @@ mod tests {
         let msgs = db.get_messages_since("mika", 1500).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "new");
+    }
+
+    #[test]
+    fn test_get_messages_by_trace_id() {
+        let (db, sid) = db_with_session();
+        let trace = "aaaa0000bbbb1111cccc2222dddd3333";
+        db.save_message_with_metadata("mika", &sid, "user", "traced msg", None, Some(trace))
+            .unwrap();
+        db.save_message("mika", &sid, "assistant", "no trace", None)
+            .unwrap();
+
+        let msgs = db.get_messages_by_trace_id(trace).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "traced msg");
+        assert_eq!(msgs[0].trace_id.as_deref(), Some(trace));
+
+        let empty = db.get_messages_by_trace_id("nonexistent").unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
