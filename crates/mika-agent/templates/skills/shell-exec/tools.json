@@ -1,7 +1,7 @@
 [
   {
     "name": "run_shell",
-    "description": "Execute a shell command and return its output",
+    "description": "Execute a shell command and return its output. On non-zero exit, output is prefixed with 'Exit code: N'. Non-zero does not always mean failure (e.g. grep returns 1 for no matches, diff returns 1 when files differ).",
     "input_schema": {
       "type": "object",
       "properties": {

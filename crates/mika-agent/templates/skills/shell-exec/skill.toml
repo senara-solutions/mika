@@ -1,6 +1,6 @@
 [skill]
 name = "shell-exec"
-description = "Execute shell commands"
+description = "Execute shell commands. Results include an 'Exit code: N' prefix when the command exits non-zero. Non-zero exit codes are not necessarily errors (e.g. grep returns 1 for no matches, diff returns 1 when files differ, linters may return non-zero for warnings). Interpret the exit code in context."
 version = "0.1.0"
 always_on = true
 timeout_secs = 30
