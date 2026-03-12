@@ -160,8 +160,10 @@ launches a guided wizard to configure secrets and preferences:
 The wizard prompts for:
 1. **Anthropic API key** (masked input)
 2. **Brave Search API key** (optional, masked)
-3. **Telemetry configuration** (OTLP endpoint and auth header if enabled)
-4. **Internal token** (auto-generated 64-char hex token for server mode)
+3. **GitHub token for investigation** (optional, masked — enables dashboard issue creation)
+4. **GitHub repo** (optional, visible — `owner/repo` format for issue creation)
+5. **Telemetry configuration** (OTLP endpoint and auth header if enabled)
+6. **Internal token** (auto-generated 64-char hex token for server mode)
 
 Each prompt is skipped if the value is already set (via environment variable or
 `~/.mika/.env`). Secrets are written to `~/.mika/.env` (0600 permissions);
@@ -182,7 +184,7 @@ configuration and only prompts for missing values.
 
 | Mode | Command | Purpose |
 |------|---------|---------|
-| `cli` (default) | `mika setup` | Configure API keys, telemetry, internal token |
+| `cli` (default) | `mika setup` | Configure API keys, GitHub config, telemetry, internal token |
 | `server` | `mika setup --mode server` | CLI config + routing URL, dashboard token |
 | `compose` | `mika setup --mode compose` | Generate a `.env` for docker-compose in CWD |
 

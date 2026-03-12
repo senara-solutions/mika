@@ -105,11 +105,11 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Server internal auth token",
     },
     ConfigKeyInfo {
-        key: "github_token",
+        key: "investigate_github_token",
         backend: ConfigBackend::Env,
-        env_var: Some("MIKA_GITHUB_TOKEN"),
+        env_var: Some("MIKA_INVESTIGATE_GITHUB_TOKEN"),
         secret: true,
-        description: "GitHub token for dashboard issue creation",
+        description: "GitHub token for investigation panel issue creation",
     },
     ConfigKeyInfo {
         key: "github_repo",
@@ -168,7 +168,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "anthropic_api_key" => settings.anthropic_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
-        "github_token" => settings.github_token.clone(),
+        "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
         "internal_token" => settings
             .internal_token
@@ -246,9 +246,9 @@ pub struct Settings {
     #[serde(default)]
     pub server_log_file: Option<PathBuf>,
 
-    /// GitHub Personal Access Token for dashboard investigation issue creation (optional)
+    /// GitHub Personal Access Token for investigation panel issue creation (optional)
     #[serde(default)]
-    pub github_token: Option<String>,
+    pub investigate_github_token: Option<String>,
 
     /// GitHub repository in owner/repo format for issue creation (optional)
     #[serde(default)]
@@ -418,8 +418,8 @@ impl std::fmt::Debug for Settings {
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
-                "github_token",
-                &self.github_token.as_ref().map(|_| "[REDACTED]"),
+                "investigate_github_token",
+                &self.investigate_github_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("github_repo", &self.github_repo)
             .field("server_log_file", &self.server_log_file)

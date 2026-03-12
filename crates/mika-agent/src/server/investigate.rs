@@ -547,7 +547,7 @@ impl Tool for CreateGithubIssueTool {
 pub struct InvestigationToolsConfig {
     pub agents: Arc<std::collections::HashMap<String, Arc<super::state::AgentState>>>,
     pub http_client: reqwest::Client,
-    pub github_token: Option<String>,
+    pub investigate_github_token: Option<String>,
     pub github_repo: Option<String>,
 }
 
@@ -563,7 +563,7 @@ fn build_investigation_tools(config: InvestigationToolsConfig) -> ToolRegistry {
     }));
 
     // Conditionally register GitHub issue creation tool
-    if let (Some(token), Some(repo)) = (config.github_token, config.github_repo)
+    if let (Some(token), Some(repo)) = (config.investigate_github_token, config.github_repo)
         && !token.is_empty()
         && !repo.is_empty()
     {
@@ -973,7 +973,8 @@ pub async fn handle_investigate(
     }
 
     // --- Check GitHub tool availability ---
-    let has_github = state.settings.github_token.is_some() && state.settings.github_repo.is_some();
+    let has_github =
+        state.settings.investigate_github_token.is_some() && state.settings.github_repo.is_some();
 
     // --- Build context ---
     let system_prompt = build_investigation_context(
@@ -996,14 +997,14 @@ pub async fn handle_investigate(
     // --- Lazy-init investigation tools ---
     // NOTE: Tool registry is immutable after first initialization. GitHub tool
     // availability is determined at the first investigation request. Config changes
-    // (e.g., setting MIKA_GITHUB_TOKEN) require a server restart to take effect.
+    // (e.g., setting MIKA_INVESTIGATE_GITHUB_TOKEN) require a server restart to take effect.
     let tools = state
         .investigation_tools
         .get_or_init(|| async {
             Arc::new(build_investigation_tools(InvestigationToolsConfig {
                 agents: state.agents.clone(),
                 http_client: state.http_client.clone(),
-                github_token: state.settings.github_token.clone(),
+                investigate_github_token: state.settings.investigate_github_token.clone(),
                 github_repo: state.settings.github_repo.clone(),
             }))
         })

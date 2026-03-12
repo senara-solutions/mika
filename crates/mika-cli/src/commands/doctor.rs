@@ -61,6 +61,18 @@ pub async fn run(args: DoctorArgs, agent_name: &str) -> Result<()> {
             &global_home,
             "web search disabled",
         ),
+        check_optional_key(
+            "GitHub token",
+            "MIKA_INVESTIGATE_GITHUB_TOKEN",
+            &global_home,
+            "dashboard issue creation disabled",
+        ),
+        check_optional_key(
+            "GitHub repo",
+            "MIKA_GITHUB_REPO",
+            &global_home,
+            "dashboard issue creation disabled",
+        ),
         check_jq(),
         check_mcp(&agent_home),
         check_skills(&agent_home),

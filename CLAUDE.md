@@ -105,8 +105,8 @@ Optional (Layer 3 vector search):
 Optional (web search):
 - `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
 
-Optional (dashboard investigation agent — GitHub issue creation):
-- `MIKA_GITHUB_TOKEN` — GitHub Personal Access Token (needs `repo` scope for private repos, `public_repo` for public)
+Optional (investigation panel — GitHub issue creation):
+- `MIKA_INVESTIGATE_GITHUB_TOKEN` — GitHub Personal Access Token for investigation panel issue creation (needs `repo` scope for private repos, `public_repo` for public)
 - `MIKA_GITHUB_REPO` — Target repository in `owner/repo` format (e.g. `senara-solutions/mika`). Both must be set to enable the `create_github_issue` investigation tool.
 
 Server mode additionally requires:

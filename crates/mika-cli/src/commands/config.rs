@@ -138,33 +138,59 @@ async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<(
             println!("Set {key} = {val}");
         }
         ConfigBackend::Env => {
-            // Secret keys: never accept value from CLI args
-            if value.is_some() {
-                eprintln!("Warning: secret keys should not be passed as CLI arguments.");
-                eprintln!("The value argument will be ignored. You will be prompted securely.");
-            }
-
-            // Require TTY for interactive prompt
-            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                anyhow::bail!(
-                    "Secret keys require an interactive terminal.\n\
-                     Set {} as an environment variable instead.",
-                    info.env_var.unwrap_or("the corresponding MIKA_* var")
-                );
-            }
-
-            let secret = dialoguer::Password::new()
-                .with_prompt(format!("Enter value for {key}"))
-                .interact()?;
-
-            if secret.trim().is_empty() {
-                anyhow::bail!("Value cannot be empty");
-            }
-
             let env_key = info
                 .env_var
                 .ok_or_else(|| anyhow::anyhow!("No env var mapping for {key}"))?;
-            mika_common::dotenv::set_env_var(&ctx.global_home, env_key, &secret)?;
+
+            if info.secret {
+                // Secret keys: never accept value from CLI args
+                if value.is_some() {
+                    eprintln!("Warning: secret keys should not be passed as CLI arguments.");
+                    eprintln!("The value argument will be ignored. You will be prompted securely.");
+                }
+
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    anyhow::bail!(
+                        "Secret keys require an interactive terminal.\n\
+                         Set {} as an environment variable instead.",
+                        env_key
+                    );
+                }
+
+                let secret = dialoguer::Password::new()
+                    .with_prompt(format!("Enter value for {key}"))
+                    .interact()?;
+
+                if secret.trim().is_empty() {
+                    anyhow::bail!("Value cannot be empty");
+                }
+
+                mika_common::dotenv::set_env_var(&ctx.global_home, env_key, &secret)?;
+            } else {
+                // Non-secret env keys: accept CLI value or prompt with visible input
+                let val = match value {
+                    Some(v) => v,
+                    None => {
+                        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                            anyhow::bail!(
+                                "Usage: mika config set {key} <value>\n\
+                                 Or set {} as an environment variable.",
+                                env_key
+                            );
+                        }
+                        dialoguer::Input::<String>::new()
+                            .with_prompt(format!("Enter value for {key}"))
+                            .interact_text()?
+                    }
+                };
+
+                if val.trim().is_empty() {
+                    anyhow::bail!("Value cannot be empty");
+                }
+
+                mika_common::dotenv::set_env_var(&ctx.global_home, env_key, val.trim())?;
+            }
+
             println!("Set {key} in ~/.mika/.env");
         }
         ConfigBackend::Database => {
