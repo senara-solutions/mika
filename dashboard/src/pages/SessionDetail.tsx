@@ -2,6 +2,7 @@ import { useState, Fragment, useMemo } from 'react'
 import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
+import CopyButton from '../components/CopyButton.tsx'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import InvestigationPanel, {
@@ -15,8 +16,6 @@ import {
   Bot,
   Settings,
   Wrench,
-  Copy,
-  Check,
   ChevronRight,
   ChevronDown,
   Search,
@@ -86,39 +85,6 @@ function extractQuickCopy(toolName: string, inputSummary: string): string | null
   } catch {
     return null
   }
-}
-
-function CopyButton({
-  text,
-  className,
-  title = 'Copy to clipboard',
-}: {
-  text: string
-  className?: string
-  title?: string
-}) {
-  const [copied, setCopied] = useState(false)
-
-  const handleCopy = async (e: React.MouseEvent) => {
-    e.stopPropagation()
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Silently fail — clipboard may be unavailable
-    }
-  }
-
-  return (
-    <button
-      onClick={handleCopy}
-      className={`opacity-40 hover:opacity-100 transition-opacity shrink-0 ${className ?? ''}`}
-      title={title}
-    >
-      {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-    </button>
-  )
 }
 
 function truncateText(text: string, maxLen = 80): string {
@@ -575,9 +541,10 @@ export default function SessionDetail() {
               <span className="text-[10px] text-muted/30 font-mono">
                 {formatTimestamp(msg.created_at)}
               </span>
+              <CopyButton text={msg.content} title="Copy response" className="ml-1" />
               <button
                 onClick={() => openInvestigation(msg.id)}
-                className="ml-1 p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
+                className="p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
                 title="Investigate this message"
               >
                 <Search size={12} />
@@ -617,13 +584,16 @@ export default function SessionDetail() {
                 : config.name}
             </span>
             {msg.role === 'assistant' && (
-              <button
-                onClick={() => openInvestigation(msg.id)}
-                className="ml-2 p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
-                title="Investigate this message"
-              >
-                <Search size={12} />
-              </button>
+              <>
+                <CopyButton text={msg.content} title="Copy response" className="ml-2" />
+                <button
+                  onClick={() => openInvestigation(msg.id)}
+                  className="p-1 rounded hover:bg-accent/10 text-muted/30 hover:text-accent transition-colors"
+                  title="Investigate this message"
+                >
+                  <Search size={12} />
+                </button>
+              </>
             )}
             <span className="text-[10px] text-muted/30 ml-auto font-mono">
               {formatTimestamp(msg.created_at)}

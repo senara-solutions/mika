@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { X, Search, Send, Loader2, Wrench } from 'lucide-react'
 import { streamInvestigation, type InvestigateEvent } from '../api/investigate.ts'
+import CopyButton from './CopyButton.tsx'
 
 export interface InvestigationContext {
   messageId: number
@@ -220,9 +221,14 @@ export default function InvestigationPanel({
                 className={
                   msg.role === 'user'
                     ? 'bg-accent/10 border border-accent/20 rounded-xl px-3 py-2 max-w-[85%]'
-                    : 'bg-white/[0.03] border border-white/[0.06] rounded-xl px-3 py-2'
+                    : 'bg-white/[0.03] border border-white/[0.06] rounded-xl px-3 py-2 relative group'
                 }
               >
+                {msg.role === 'assistant' && msg.content && (
+                  <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <CopyButton text={msg.content} title="Copy response" />
+                  </div>
+                )}
                 {/* Tool use badges */}
                 {msg.toolUses && msg.toolUses.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 mb-2">

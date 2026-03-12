@@ -104,6 +104,20 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: true,
         description: "Server internal auth token",
     },
+    ConfigKeyInfo {
+        key: "github_token",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_TOKEN"),
+        secret: true,
+        description: "GitHub token for dashboard issue creation",
+    },
+    ConfigKeyInfo {
+        key: "github_repo",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_REPO"),
+        secret: false,
+        description: "GitHub repo (owner/repo) for issue creation",
+    },
     // Database backend (customer_config table)
     ConfigKeyInfo {
         key: "timezone",
@@ -154,6 +168,8 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "anthropic_api_key" => settings.anthropic_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
+        "github_token" => settings.github_token.clone(),
+        "github_repo" => settings.github_repo.clone(),
         "internal_token" => settings
             .internal_token
             .as_ref()
@@ -229,6 +245,14 @@ pub struct Settings {
     /// Optional log file path for mika-server (maps to MIKA_SERVER_LOG_FILE)
     #[serde(default)]
     pub server_log_file: Option<PathBuf>,
+
+    /// GitHub Personal Access Token for dashboard investigation issue creation (optional)
+    #[serde(default)]
+    pub github_token: Option<String>,
+
+    /// GitHub repository in owner/repo format for issue creation (optional)
+    #[serde(default)]
+    pub github_repo: Option<String>,
 
     /// Disable bundled skill re-sync on startup (default: false)
     #[serde(default)]
@@ -393,6 +417,11 @@ impl std::fmt::Debug for Settings {
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("github_repo", &self.github_repo)
             .field("server_log_file", &self.server_log_file)
             .field("disable_bundled_skills", &self.disable_bundled_skills)
             .field("telemetry_enabled", &self.telemetry_enabled)
