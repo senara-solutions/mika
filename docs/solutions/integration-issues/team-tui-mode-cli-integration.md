@@ -30,7 +30,7 @@ interact with teams through the conversational TUI interface.
 
 ## Solution
 
-Added `--team <name>` global CLI flag (mutually exclusive with `--agent`) that
+Added `--team <name>` CLI flag (mutually exclusive with `--agent`, scoped to `chat` subcommand via `ChatArgs` — no longer global) that
 launches the TUI in "team mode." User messages become goals sent to `run_team()`,
 with progress streaming as system messages and deliverables displayed as assistant
 responses via progressive reveal.
