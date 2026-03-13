@@ -326,7 +326,7 @@ fn env_key_exists(path: &Path, key: &str) -> bool {
 
 /// Write a key-value pair to a TOML config file using toml_edit to preserve comments.
 /// Creates the file if it doesn't exist. Uses atomic write (temp + rename).
-fn write_config_toml(path: &Path, key: &str, value: &str) -> Result<()> {
+pub(crate) fn write_config_toml(path: &Path, key: &str, value: &str) -> Result<()> {
     let content = if path.exists() {
         std::fs::read_to_string(path)?
     } else {

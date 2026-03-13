@@ -45,7 +45,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         }
         "soul" => Some(handle_soul(app).await),
         "config" | "cfg" => Some(handle_config(app, args).await),
-        "model" => Some(handle_model(app, args)),
+        "model" => Some(handle_model(app, args).await),
         "export" => Some(handle_export(app).await),
         "skills" => Some(handle_skills(app)),
         "skill" => Some(handle_skill(app, args)),
@@ -394,7 +394,7 @@ fn resolve_model_name(input: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
-fn handle_model(app: &mut App<'_>, args: &str) -> String {
+async fn handle_model(app: &mut App<'_>, args: &str) -> String {
     let args = args.trim();
     if args.is_empty() {
         let mut out = format!("Current model: {}\n\nAvailable models:", app.model);
@@ -421,6 +421,15 @@ fn handle_model(app: &mut App<'_>, args: &str) -> String {
                 model: full_id.to_string(),
             });
             app.needs_redraw = true;
+
+            // Persist to config.toml so the choice survives restarts
+            let config_path = app.home_dir.join("config.toml");
+            if let Err(e) =
+                crate::commands::config::write_config_toml(&config_path, "claude_model", full_id)
+            {
+                tracing::warn!(error = %e, "failed to persist model to config.toml");
+            }
+
             format!("Switched to {display} ({full_id}).")
         }
         None => {
