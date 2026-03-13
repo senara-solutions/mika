@@ -9,7 +9,7 @@
           "type": "array",
           "items": { "type": "string" },
           "minItems": 1,
-          "description": "The gws subcommand and arguments as an array of strings (e.g., [\"gmail\", \"messages\", \"list\", \"--params\", \"{\\\"maxResults\\\": 5}\"])"
+          "description": "The gws service and arguments as an array of strings. First element must be one of: gmail, calendar, drive. Example: [\"gmail\", \"messages\", \"list\", \"--params\", \"{\\\"maxResults\\\": 5}\"]"
         }
       },
       "required": ["command"]
