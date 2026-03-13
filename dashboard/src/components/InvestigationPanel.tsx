@@ -30,7 +30,7 @@ export default function InvestigationPanel({
   const [error, setError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
 
   // Auto-scroll on new content
   useEffect(() => {
@@ -69,6 +69,9 @@ export default function InvestigationPanel({
       const userMsg: ChatMessage = { role: 'user', content: question }
       setMessages((prev) => [...prev, userMsg])
       setInput('')
+      if (inputRef.current) {
+        inputRef.current.style.height = 'auto'
+      }
 
       // Build history from previous messages
       const history = messages.map((m) => ({
@@ -276,16 +279,26 @@ export default function InvestigationPanel({
         {/* Input */}
         <form
           onSubmit={handleSubmit}
-          className="border-t border-white/[0.06] px-4 py-3 flex items-center gap-2"
+          className="border-t border-white/[0.06] px-4 py-3 flex items-end gap-2"
         >
-          <input
+          <textarea
             ref={inputRef}
-            type="text"
+            rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value)
+              e.target.style.height = 'auto'
+              e.target.style.height = e.target.scrollHeight + 'px'
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault()
+                if (input.trim()) sendQuestion(input)
+              }
+            }}
             placeholder="Ask a question..."
             disabled={streaming}
-            className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm text-heading placeholder:text-muted/30 focus:outline-none focus:border-accent/40 disabled:opacity-50"
+            className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm text-heading placeholder:text-muted/30 focus:outline-none focus:border-accent/40 disabled:opacity-50 resize-none overflow-y-auto max-h-[120px]"
           />
           <button
             type="submit"
