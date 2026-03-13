@@ -492,7 +492,7 @@ impl<'a> App<'a> {
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
-        textarea.set_placeholder_text("Type a message...");
+        textarea.set_placeholder_text("Type a message... (Shift+Enter or Alt+Enter for new line)");
 
         Self {
             messages: Vec::new(),
@@ -551,7 +551,9 @@ impl<'a> App<'a> {
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
-        textarea.set_placeholder_text("Type a goal for the team...");
+        textarea.set_placeholder_text(
+            "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)",
+        );
 
         // Use dummy agent channels — team mode does not use them.
         let (agent_tx, _) = mpsc::unbounded_channel::<AgentRequest>();
@@ -1084,7 +1086,8 @@ impl<'a> App<'a> {
             self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
             self.textarea
                 .set_cursor_line_style(ratatui::style::Style::default());
-            self.textarea.set_placeholder_text("Type a message...");
+            self.textarea
+                .set_placeholder_text("Type a message... (Shift+Enter or Alt+Enter for new line)");
         }
     }
 
@@ -1096,7 +1099,9 @@ impl<'a> App<'a> {
                 self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
                 self.textarea
                     .set_cursor_line_style(ratatui::style::Style::default());
-                self.textarea.set_placeholder_text("Type a message...");
+                self.textarea.set_placeholder_text(
+                    "Type a message... (Shift+Enter or Alt+Enter for new line)",
+                );
             }
         }
     }
@@ -1286,9 +1291,9 @@ impl<'a> App<'a> {
         self.textarea
             .set_cursor_line_style(ratatui::style::Style::default());
         let placeholder = if self.is_team_mode() {
-            "Type a goal for the team..."
+            "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)"
         } else {
-            "Type a message..."
+            "Type a message... (Shift+Enter or Alt+Enter for new line)"
         };
         self.textarea.set_placeholder_text(placeholder);
     }
