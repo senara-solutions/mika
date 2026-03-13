@@ -420,7 +420,7 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 | shell-exec     | No        | run command, execute, shell, terminal, bash                                                       | `shell_exec` | Yes            |
 | tmux           | No        | tmux, terminal, session, pane, window                                                             | `tmux`       | Yes            |
 | web-search     | Yes       | search, look up, find out, google, browse, web                                                    | `web_search` | Yes            |
-| github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status | `run_gh`     | Yes            |
+| github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status, label, labels, add label, create label, edit label, delete label, remove label | `run_gh`     | Yes            |
 
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
 
