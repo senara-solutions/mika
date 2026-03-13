@@ -10,11 +10,11 @@ dependencies: []
 
 ## Problem Statement
 
-`write_file.rs`, `write_workspace.rs`, and `read_workspace.rs` duplicate ~30 lines of identical path validation logic (empty check, length check, absolute path rejection, component traversal inspection, symlink checks, canonicalize containment). A shared `validate_path(path, base_dir)` helper would eliminate ~60 lines of duplication.
+`write_agent_file.rs`, `write_workspace.rs`, and `read_workspace.rs` duplicate ~30 lines of identical path validation logic (empty check, length check, absolute path rejection, component traversal inspection, symlink checks, canonicalize containment). A shared `validate_path(path, base_dir)` helper would eliminate ~60 lines of duplication.
 
 ## Findings
 
-- Pre-existing duplication — the new `write_file` correctly followed the pattern rather than introducing a refactor in a feature PR.
+- Pre-existing duplication — the new `write_agent_file` correctly followed the pattern rather than introducing a refactor in a feature PR.
 - Source: code-simplicity-reviewer
 
 ## Proposed Solutions

@@ -1,5 +1,5 @@
 ---
-title: "write_file tool reported success with wrong path due to missing home directory context"
+title: "write_agent_file tool reported success with wrong path due to missing home directory context"
 date: 2026-03-03
 category: logic-errors
 tags:
@@ -7,11 +7,11 @@ tags:
   - user-feedback
   - agent-context
   - tools
-  - write_file
+  - write_agent_file
   - prompt-engineering
 severity: high
 components:
-  - crates/mika-agent/src/tools/write_file.rs
+  - crates/mika-agent/src/tools/write_agent_file.rs
   - crates/mika-agent/src/tools/write_workspace.rs
   - crates/mika-agent/src/tools/read_workspace.rs
   - crates/mika-agent/src/prompt.rs
@@ -20,18 +20,18 @@ related_prs:
   - "PR #65 (feat/write-file-tool)"
 ---
 
-# write_file Tool Reported Success with Wrong Path Due to Missing Home Directory Context
+# write_agent_file Tool Reported Success with Wrong Path Due to Missing Home Directory Context
 
 ## Problem Symptom
 
-The agent called `write_file` to update `identity.toml` and received a success message, but the actual target file was unchanged. The agent had no way to detect the mistake.
+The agent called `write_agent_file` to update `identity.toml` and received a success message, but the actual target file was unchanged. The agent had no way to detect the mistake.
 
 **Observed in production (2026-03-03, conversation row 3025):**
 
 ```
 Agent wanted:     ~/.mika/agents/main/identity.toml
 Agent's home_dir: ~/.mika/agents/main/
-Agent called:     write_file(path=".mika/agents/main/identity.toml")
+Agent called:     write_agent_file(path=".mika/agents/main/identity.toml")
 Tool resolved:    ~/.mika/agents/main/.mika/agents/main/identity.toml  ← WRONG
 Tool reported:    "Wrote 86 bytes to '.mika/agents/main/identity.toml'"  ← MISLEADING
 ```
@@ -55,15 +55,15 @@ Neither issue alone would be sufficient — together they created a silent failu
 ## Investigation Steps
 
 1. **User report:** Agent said it updated identity.toml but the file content was unchanged.
-2. **Database inspection:** Queried `mika.db` conversation rows 3024-3027. Row 3025 metadata showed `write_file` called with path `.mika/agents/main/identity.toml`, reporting "Wrote 86 bytes".
+2. **Database inspection:** Queried `mika.db` conversation rows 3024-3027. Row 3025 metadata showed `write_agent_file` called with path `.mika/agents/main/identity.toml`, reporting "Wrote 86 bytes".
 3. **Log inspection:** `mika.log.2026-03-03` confirmed the tool execution and the relative path in the success message.
 4. **Disk inspection:** Found the wrongly-placed file at `~/.mika/agents/main/.mika/agents/main/identity.toml` with the intended content.
-5. **Code audit:** Traced `write_file.rs` — success message at line 120-121 used `{path}` (user input). All 5 message format strings had the same issue.
+5. **Code audit:** Traced `write_agent_file.rs` — success message at line 120-121 used `{path}` (user input). All 5 message format strings had the same issue.
 6. **Prompt audit:** `prompt.rs` line 309-311 — instruction said "relative to your home" but `PromptContext` had no `home_dir` field.
 
 ## Solution
 
-### Change 1: Absolute path reporting in write_file.rs
+### Change 1: Absolute path reporting in write_agent_file.rs
 
 Changed 5 message format strings from `{path}` (user-provided relative) to `full_path.display()` (resolved absolute):
 
@@ -92,7 +92,7 @@ Added `home_dir: Option<&'a Path>` to `PromptContext`. The system prompt now con
 if let Some(home) = ctx.home_dir {
     writeln!(
         prompt,
-        "- You can write files to your home directory with write_file. \
+        "- You can write files to your home directory with write_agent_file. \
          Your home directory is {} — all paths are relative to this directory. \
          For example, to write identity.toml at the root of your home, use path 'identity.toml'. \
          If the file exists, you must review the current content and call again with confirm: true to overwrite.",
@@ -113,9 +113,9 @@ Applied the same absolute-path reporting pattern to all workspace file tools for
 
 | Test | File | Verifies |
 |------|------|----------|
-| `test_success_message_contains_absolute_path` | write_file.rs | Success message includes resolved absolute path |
-| `test_confirmation_message_contains_absolute_path` | write_file.rs | Overwrite confirmation shows absolute path |
-| `test_prompt_includes_home_dir_in_write_file_instruction` | prompt.rs | System prompt contains home directory when set |
+| `test_success_message_contains_absolute_path` | write_agent_file.rs | Success message includes resolved absolute path |
+| `test_confirmation_message_contains_absolute_path` | write_agent_file.rs | Overwrite confirmation shows absolute path |
+| `test_prompt_includes_home_dir_in_write_agent_file_instruction` | prompt.rs | System prompt contains home directory when set |
 | `test_prompt_fallback_when_home_dir_none` | prompt.rs | Falls back to generic instruction when home_dir is None |
 | `test_write_success_message_contains_absolute_path` | write_workspace.rs | Workspace tool also reports absolute paths |
 
@@ -144,6 +144,6 @@ All 826 tests pass.
 ## Related Documentation
 
 - **Plan:** `docs/plans/2026-03-03-fix-write-file-silent-miswrite-plan.md` — detailed plan for this fix
-- **Prior solution:** `docs/solutions/integration-issues/write-file-tool-overwrite-confirmation-flow.md` — original write_file implementation and overwrite flow
+- **Prior solution:** `docs/solutions/integration-issues/write-file-tool-overwrite-confirmation-flow.md` — original write_agent_file implementation and overwrite flow
 - **Prior plan:** `docs/plans/2026-03-03-feat-write-file-tool-with-overwrite-confirmation-plan.md` — original feature plan
 - **Shared helper:** `crates/mika-agent/src/tools/mod.rs:196-277` — `validate_and_resolve_path()` implementation

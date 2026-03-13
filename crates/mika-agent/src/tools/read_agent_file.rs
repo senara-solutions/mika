@@ -8,17 +8,17 @@ use super::{Tool, ToolContext, ToolOutput, validate_and_resolve_path};
 /// Maximum file size that can be read from the agent home directory (100 KB).
 const MAX_READ_SIZE: u64 = 100 * 1024;
 
-pub struct ReadHomeFileTool;
+pub struct ReadAgentFileTool;
 
 #[async_trait]
-impl Tool for ReadHomeFileTool {
+impl Tool for ReadAgentFileTool {
     fn name(&self) -> &str {
-        "read_home_file"
+        "read_agent_file"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "read_home_file".to_string(),
+            name: "read_agent_file".to_string(),
             description: "Read a file from the agent's home directory. Returns the file contents as text. Files larger than 100 KB are rejected.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -102,7 +102,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("notes.md"), "hello world").unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "notes.md" });
@@ -119,7 +119,7 @@ mod tests {
         fs::create_dir_all(home.join("sub")).unwrap();
         fs::write(home.join("sub").join("notes.md"), "nested content").unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "sub/notes.md" });
@@ -135,7 +135,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "missing.md" });
@@ -151,7 +151,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "" });
@@ -167,7 +167,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "../../../etc/passwd" });
@@ -183,7 +183,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "/etc/passwd" });
@@ -203,7 +203,7 @@ mod tests {
         fs::write(&secret, "top secret").unwrap();
         std::os::unix::fs::symlink(&secret, home.join("link.md")).unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "link.md" });
@@ -219,7 +219,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let long_path = "a".repeat(MAX_INPUT_LEN + 1);
@@ -237,7 +237,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("file.md"), "data").unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "file.md" });
@@ -260,7 +260,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("file..v2.md"), "version 2 content").unwrap();
 
-        let tool = ReadHomeFileTool;
+        let tool = ReadAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "file..v2.md" });

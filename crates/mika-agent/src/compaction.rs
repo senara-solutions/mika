@@ -320,10 +320,10 @@ mod tests {
 
     #[test]
     fn extract_tool_names_shows_failure() {
-        let meta = r#"{"tool_calls":[{"name":"write_file","step":0,"success":true},{"name":"read_home_file","step":1,"success":false}]}"#;
+        let meta = r#"{"tool_calls":[{"name":"write_agent_file","step":0,"success":true},{"name":"read_agent_file","step":1,"success":false}]}"#;
         assert_eq!(
             extract_tool_names(&Some(meta.to_string())),
-            " [used: write_file, read_home_file(err)]"
+            " [used: write_agent_file, read_agent_file(err)]"
         );
     }
 

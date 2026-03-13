@@ -30,12 +30,12 @@ for images returned by tools — this instruction now silently fails for non-hom
 ## Proposed Solutions
 
 ### Option A: Rename builtins to home_dir-scoped names (Recommended)
-- `read_file` → `read_home_file`
-- `list_files` → `list_home_files`
-- `write_file` → `write_home_file` (for consistency)
+- `read_file` → `read_agent_file`
+- `list_files` → `list_agent_files`
+- `write_file` → `write_agent_file` (for consistency)
 Update prompt docs and tool descriptions. The skill retains `read_file` for broader access.
 - **Pros**: Eliminates collision, accurately describes scope, restores image-read capability
-- **Cons**: Breaking rename for write_file (already in use)
+- **Cons**: Breaking rename for write_agent_file (already in use)
 - **Effort**: Small | **Risk**: Low (no external API, internal tool names)
 
 ### Option B: Rename the skill's tool

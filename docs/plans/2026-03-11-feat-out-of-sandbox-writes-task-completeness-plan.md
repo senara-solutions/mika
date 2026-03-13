@@ -16,7 +16,7 @@ Prompt-level fix (+ one error message string change) for a class of agent failur
 - [ ] Shell-exec system prompt directs agent to `run_shell` for paths outside home/workspace
 - [ ] Shell-exec system prompt includes context-dependent confirmation heuristic (confirm overwrites, narrate new files)
 - [ ] Shell-exec system prompt includes reference-tracing technique (grep configs after rename/adapt)
-- [ ] Existing "prefer write_file" line is scoped to home directory only
+- [ ] Existing "prefer write_agent_file" line is scoped to home directory only
 - [ ] `validate_and_resolve_path` error message hints at `run_shell` for out-of-sandbox paths
 - [ ] Existing tests pass (`cargo test`)
 - [ ] Build succeeds (shell-exec templates are `include_str!` compiled)
@@ -41,15 +41,15 @@ This is a dispositional directive — it tells the agent *why* to trace referenc
 
 Three edits to the existing file:
 
-**a) Scope the existing write_file preference (line 21):**
+**a) Scope the existing write_agent_file preference (line 21):**
 
 Change:
 ```
-- Prefer the `write_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
+- Prefer the `write_agent_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
 ```
 To:
 ```
-- For files inside your home directory, prefer `write_file` over shell writes — it enforces read-before-overwrite automatically.
+- For files inside your home directory, prefer `write_agent_file` over shell writes — it enforces read-before-overwrite automatically.
 ```
 
 **b) Add out-of-sandbox write guidance (new section after "File writing"):**
@@ -57,7 +57,7 @@ To:
 ```
 ## Writing files outside your home directory
 
-Your `write_file` tool is sandboxed to your home directory — it cannot reach paths like `~/.local/bin/`, `~/.config/`, etc. For file operations outside your home directory (and outside any team workspace), use `run_shell`.
+Your `write_agent_file` tool is sandboxed to your home directory — it cannot reach paths like `~/.local/bin/`, `~/.config/`, etc. For file operations outside your home directory (and outside any team workspace), use `run_shell`.
 
 Before writing via shell, check whether the target already exists:
 - **Target exists:** Show the user the exact command you'll run and what it overwrites. Wait for explicit confirmation before executing. Example: "~/.config/hypr/hyprland.conf exists and contains a quickclaw keybinding. I'll replace it with quickmika. Here's the change: [show diff]. Shall I proceed?"
@@ -111,6 +111,6 @@ From the spec-flow analysis (see brainstorm for full context):
 ## Sources
 
 - **Origin brainstorm:** [docs/brainstorms/2026-03-11-out-of-sandbox-writes-brainstorm.md](docs/brainstorms/2026-03-11-out-of-sandbox-writes-brainstorm.md) — key decisions: prompt-only fix, two-layer guidance (soul + skill), context-dependent confirmation
-- **Existing pattern:** `write_file` overwrite confirmation flow (`docs/solutions/integration-issues/write-file-tool-overwrite-confirmation-flow.md`)
+- **Existing pattern:** `write_agent_file` overwrite confirmation flow (`docs/solutions/integration-issues/write-file-tool-overwrite-confirmation-flow.md`)
 - **Existing pattern:** Tool path reporting — resolved absolute paths (`docs/solutions/logic-errors/tool-path-reporting-misbehavior.md`)
 - **Current files:** `crates/mika-common/src/home.rs:252-275` (DEFAULT_SOUL), `crates/mika-agent/templates/skills/shell-exec/system_prompt.md` (full file), `crates/mika-agent/src/prompt.rs:390-420` (home_dir in system prompt)

@@ -43,6 +43,10 @@ function parseToolCalls(metadata: string | null): ToolCall[] {
 const QUICK_COPY_KEYS: Record<string, string> = {
   run_shell: 'command',
   read_workspace: 'path',
+  read_agent_file: 'path',
+  write_agent_file: 'path',
+  list_agent_files: 'path',
+  // backward compat: old tool names in historical data
   read_home_file: 'path',
   write_file: 'path',
   list_home_files: 'path',

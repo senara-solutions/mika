@@ -12,7 +12,7 @@ dependencies: []
 
 The `PromptContext.callback_context` field is added and the prompt builder has logic to render a "Callback Result Turn" section, but `run_agent_inner()` always sets it to `None`. The `AgentParams.is_callback_turn` controls the code guard (blocking `LongRunningContext`) but is never wired through to the prompt guard. The brainstorm explicitly designed dual-layer defense-in-depth (code + prompt), but only the code layer works.
 
-Without the prompt guard, the agent may attempt to call skills that fail at the executor level, producing confusing errors. A crafted callback result could also instruct the agent to call non-long-running tools (write_file, update_core_memory, etc.) since the prompt doesn't tell it to restrict behavior.
+Without the prompt guard, the agent may attempt to call skills that fail at the executor level, producing confusing errors. A crafted callback result could also instruct the agent to call non-long-running tools (write_agent_file, update_core_memory, etc.) since the prompt doesn't tell it to restrict behavior.
 
 ## Findings
 

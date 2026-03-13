@@ -385,7 +385,7 @@ mod tests {
             "shell-exec prompt missing reference-tracing section"
         );
         assert!(
-            content.contains("write_file` tool is sandboxed"),
+            content.contains("write_agent_file` tool is sandboxed"),
             "shell-exec prompt missing sandbox explanation"
         );
     }

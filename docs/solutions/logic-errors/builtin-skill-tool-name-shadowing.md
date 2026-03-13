@@ -74,10 +74,10 @@ builtin was given the same generic name as the skill, creating a silent collisio
 ### Core Fix: Rename Colliding Builtins
 
 Give builtins namespace-scoped names that are semantically distinct from skill-provided
-tool names. The `_home_` infix signals that these tools operate on the agent's home
+tool names. The `_agent_` infix signals that these tools operate on the agent's home
 directory specifically, not the general filesystem.
 
-**`crates/mika-agent/src/tools/read_home_file.rs`** (was `read_file.rs`):
+**`crates/mika-agent/src/tools/read_agent_file.rs`** (was `read_file.rs`):
 ```rust
 // Before:
 pub struct ReadFileTool;
@@ -86,13 +86,13 @@ impl Tool for ReadFileTool {
 }
 
 // After:
-pub struct ReadHomeFileTool;
-impl Tool for ReadHomeFileTool {
-    fn name(&self) -> &str { "read_home_file" }
+pub struct ReadAgentFileTool;
+impl Tool for ReadAgentFileTool {
+    fn name(&self) -> &str { "read_agent_file" }
 }
 ```
 
-**`crates/mika-agent/src/tools/list_home_files.rs`** (was `list_files.rs`):
+**`crates/mika-agent/src/tools/list_agent_files.rs`** (was `list_files.rs`):
 ```rust
 // Before:
 pub struct ListFilesTool;
@@ -101,9 +101,9 @@ impl Tool for ListFilesTool {
 }
 
 // After:
-pub struct ListHomeFilesTool;
-impl Tool for ListHomeFilesTool {
-    fn name(&self) -> &str { "list_home_files" }
+pub struct ListAgentFilesTool;
+impl Tool for ListAgentFilesTool {
+    fn name(&self) -> &str { "list_agent_files" }
 }
 ```
 
@@ -121,12 +121,12 @@ pub fn default_tools() -> Vec<Box<dyn Tool>> {
 }
 
 // After:
-mod read_home_file;
-mod list_home_files;
+mod read_agent_file;
+mod list_agent_files;
 pub fn default_tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(read_home_file::ReadHomeFileTool),
-        Box::new(list_home_files::ListHomeFilesTool),
+        Box::new(read_agent_file::ReadAgentFileTool),
+        Box::new(list_agent_files::ListAgentFilesTool),
         // ...
     ]
 }
@@ -161,7 +161,7 @@ let resolved = validate_and_resolve_path(path, home_dir, true)?;
 let resolved = validate_and_resolve_path(path, home_dir, false)?;
 ```
 
-**`list_home_files` blocking I/O** — `std::fs::read_dir` was called from `async fn`
+**`list_agent_files` blocking I/O** — `std::fs::read_dir` was called from `async fn`
 without `spawn_blocking`, blocking the Tokio executor:
 
 ```rust
@@ -226,7 +226,7 @@ format!("  {}: {} (due: {})", reminder.id, reminder.message, ...)
    ```
 
 2. **Apply domain prefix to new builtins.** Tools scoped to agent-private storage use
-   a qualifying infix: `read_home_file`, `list_home_files`, `write_home_file`. Generic
+   a qualifying infix: `read_agent_file`, `list_agent_files`, `write_agent_file`. Generic
    verb-noun names (`read_file`, `list_files`) are reserved for skill and MCP tools.
 
 3. **Rename the colliding builtin** — update the `.rs` filename, struct name (PascalCase),
@@ -242,7 +242,7 @@ format!("  {}: {} (due: {})", reminder.id, reminder.message, ...)
 
 | Scope | Convention | Example |
 |-------|-----------|---------|
-| Agent home directory | `_home_` infix | `read_home_file`, `list_home_files` |
+| Agent home directory | `_agent_` infix | `read_agent_file`, `list_agent_files` |
 | Core memory | `memory_` prefix already used | `update_core_memory`, `search_memory` |
 | Generic filesystem (skill/MCP) | plain name | `read_file` (skill only) |
 | MCP tools | auto-namespaced | `mcp__{server}__{tool}` |
