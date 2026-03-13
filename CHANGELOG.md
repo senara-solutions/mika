@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6](https://github.com/senara-solutions/mika/releases/tag/v0.1.6) — 2026-03-13
+
+### Added
+
+- *(dashboard)* add copy-to-clipboard and investigation GitHub issue creation
+- add Acceptance Criteria section to all issue creation channels
+- unified GitHub label taxonomy with auto-sync
+- *(skills)* add label operation docs and keywords to github skill
+- *(dashboard)* add session ID prefix search to sessions page
+- fill dev workflow gaps — dashboard CI, supply chain security, issue linking, smoke tests
+- *(tui)* persist /model slash command to config.toml
+- *(tui)* add Alt+Enter as fallback for multi-line input
+
+### Changed
+
+- [#115] simplify progressive truncation to single pass
+- *(agent)* resolve code review findings for skill dependencies
+- tighten transparency rule wording per code review
+- *(skills)* add non-zero exit signal to tool history and prompt guidance
+- *(tui)* extract placeholder constants, fix Esc handler and ui.rs renderer
+- *(cli)* use exhaustive match arms for compile-time safety
+
+### Documentation
+
+- advertise Alt+Enter as primary multi-line input method
+
+### Fixed
+
+- *(config)* rename github_token to investigate_github_token and improve setup
+- [#144] set success=false when non_zero_exit is true in tool call metadata
+- add tilde (~) home directory expansion to file tools ([#145](https://github.com/senara-solutions/mika/pull/145))
+- *(server)* add Rust context to investigation agent system prompt
+- [#115] truncate tool_calls metadata per-field instead of dropping tail entries
+- *(skills)* address review findings for label docs
+- *(agent)* add tool_history guardrail to prevent skipping actions ([#135](https://github.com/senara-solutions/mika/pull/135))
+- *(agent)* add skill dependency resolution and unsolicited action guard ([#134](https://github.com/senara-solutions/mika/pull/134))
+- *(agent)* migrate run_gh to Rust builtin handler with JSON array protocol ([#119](https://github.com/senara-solutions/mika/pull/119))
+- *(agent)* add transparency rule for non-zero exit codes in responses
+- *(trace)* fix broken trace messages endpoint and missing trace_id propagation
+- *(investigate)* address review findings — input limits, repo validation, UX consistency
+- *(skills)* return output on non-zero exit instead of discarding it
+- *(tui)* make history navigation team-mode-aware for placeholder text
+- *(cli)* scope --agent and --team flags to relevant subcommands only ([#102](https://github.com/senara-solutions/mika/pull/102))
+
 ## [0.1.5](https://github.com/senara-solutions/mika/releases/tag/v0.1.5) — 2026-03-11
 
 ### Added
