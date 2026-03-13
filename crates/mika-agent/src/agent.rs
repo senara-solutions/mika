@@ -160,6 +160,10 @@ fn has_non_zero_exit_prefix(content: &str) -> bool {
 
 /// Maximum total characters for serialized tool call metadata.
 const TOOL_METADATA_MAX: usize = 4000;
+/// Maximum characters for tool input summary in metadata.
+const INPUT_SUMMARY_MAX: usize = 200;
+/// Maximum characters for tool output summary in metadata.
+const OUTPUT_SUMMARY_MAX: usize = 300;
 /// Maximum characters of conversation/memory digest injected into the reflection prompt.
 /// ~12,500 tokens at 4 chars/token -- keeps total prompt well within Claude's context.
 const MAX_REFLECTION_DIGEST_CHARS: usize = 50_000;
@@ -182,8 +186,10 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
 
 /// Serialize tool call summaries to JSON metadata string, capped at [`TOOL_METADATA_MAX`].
 ///
-/// If the serialized result exceeds the cap, entries are dropped from the tail until
-/// the size fits.
+/// Strategy: preserve all entries by progressively truncating per-field content.
+/// 1. Try full serialization with the initial field lengths.
+/// 2. If over budget, re-truncate `input_summary` and `output_summary` to fit all entries.
+/// 3. Only as a last resort, drop tail entries (with a warning).
 pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String> {
     if summaries.is_empty() {
         return None;
@@ -193,15 +199,44 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
     if json.len() <= TOOL_METADATA_MAX {
         return Some(json);
     }
-    // Drop entries from the tail until under the cap
-    for count in (1..summaries.len()).rev() {
-        let wrapper = serde_json::json!({ "tool_calls": &summaries[..count] });
+
+    // Phase 1: Aggressively re-truncate fields to fit all entries.
+    let shrunk: Vec<ToolCallSummary> = summaries
+        .iter()
+        .map(|s| ToolCallSummary {
+            step: s.step,
+            name: s.name.clone(),
+            input_summary: truncate_summary(&s.input_summary, 30),
+            output_summary: truncate_summary(&s.output_summary, 50),
+            success: s.success,
+            non_zero_exit: s.non_zero_exit,
+        })
+        .collect();
+    let wrapper = serde_json::json!({ "tool_calls": shrunk });
+    if let Ok(json) = serde_json::to_string(&wrapper)
+        && json.len() <= TOOL_METADATA_MAX
+    {
+        return Some(json);
+    }
+
+    // Phase 2: Last resort — drop tail entries from the already-shrunk vector.
+    warn!(
+        total_entries = summaries.len(),
+        max = TOOL_METADATA_MAX,
+        "tool_calls metadata exceeds cap after field truncation, dropping tail entries"
+    );
+    for count in (1..shrunk.len()).rev() {
+        let wrapper = serde_json::json!({ "tool_calls": &shrunk[..count] });
         if let Ok(json) = serde_json::to_string(&wrapper)
             && json.len() <= TOOL_METADATA_MAX
         {
             return Some(json);
         }
     }
+    warn!(
+        total_entries = summaries.len(),
+        "tool_calls metadata: unable to fit even a single entry, returning None"
+    );
     None
 }
 
@@ -954,7 +989,7 @@ async fn process_tool_calls(
     for block in &response_content {
         if let ContentBlock::ToolUse { id, name, input } = block {
             debug!(tool = %name, "executing tool");
-            let input_summary = truncate_summary(&input.to_string(), 500);
+            let input_summary = truncate_summary(&input.to_string(), INPUT_SUMMARY_MAX);
             let dispatch = ToolDispatchCtx {
                 tools,
                 skill_tools,
@@ -968,10 +1003,10 @@ async fn process_tool_calls(
             let output_summary = if image_count > 0 {
                 truncate_summary(
                     &format!("{} [+{image_count} image(s)]", output.content),
-                    500,
+                    OUTPUT_SUMMARY_MAX,
                 )
             } else {
-                truncate_summary(&output.content, 500)
+                truncate_summary(&output.content, OUTPUT_SUMMARY_MAX)
             };
             let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
             summaries.push(ToolCallSummary {
@@ -2143,29 +2178,33 @@ mod tests {
         // Simulate what happens when building a ToolCallSummary with large content
         let large_input = "x".repeat(10_000);
         let large_output = "y".repeat(10_000);
-        let input_summary = truncate_summary(&large_input, 500);
-        let output_summary = truncate_summary(&large_output, 500);
+        let input_summary = truncate_summary(&large_input, INPUT_SUMMARY_MAX);
+        let output_summary = truncate_summary(&large_output, OUTPUT_SUMMARY_MAX);
 
         assert!(
-            input_summary.len() <= 503,
+            input_summary.len() <= INPUT_SUMMARY_MAX,
             "input_summary too long: {} chars",
             input_summary.len()
         );
         assert!(
-            output_summary.len() <= 503,
+            output_summary.len() <= OUTPUT_SUMMARY_MAX,
             "output_summary too long: {} chars",
             output_summary.len()
         );
         assert!(input_summary.ends_with("..."));
         assert!(output_summary.ends_with("..."));
+    }
 
-        // Verify that a full turn of 10 truncated summaries fits in metadata cap
+    #[test]
+    fn test_all_entries_preserved_at_max_steps() {
+        // With reduced per-field limits, 10 entries with typical tool names should
+        // all fit within TOOL_METADATA_MAX without tail-drop
         let summaries: Vec<ToolCallSummary> = (0..10)
             .map(|i| ToolCallSummary {
                 step: i,
-                name: format!("tool_{i}"),
-                input_summary: truncate_summary(&"x".repeat(10_000), 500),
-                output_summary: truncate_summary(&"y".repeat(10_000), 500),
+                name: "search_memory".to_string(),
+                input_summary: truncate_summary(&"x".repeat(10_000), INPUT_SUMMARY_MAX),
+                output_summary: truncate_summary(&"y".repeat(10_000), OUTPUT_SUMMARY_MAX),
                 success: true,
                 non_zero_exit: false,
             })
@@ -2173,12 +2212,41 @@ mod tests {
         let json = tool_calls_metadata_json(&summaries).unwrap();
         assert!(
             json.len() <= TOOL_METADATA_MAX,
-            "truncated summaries still exceed cap: {} chars",
+            "truncated summaries exceed cap: {} chars",
             json.len()
         );
-        // Should retain at least 3 entries (with tail-drop)
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["tool_calls"].as_array().unwrap().len() >= 3);
+        assert_eq!(
+            parsed["tool_calls"].as_array().unwrap().len(),
+            10,
+            "all 10 entries must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_safety_net_drops_tail_on_overflow() {
+        // With pathologically long tool names or extreme content, the safety net
+        // tail-drop should still produce valid JSON within the cap
+        let summaries: Vec<ToolCallSummary> = (0..20)
+            .map(|i| ToolCallSummary {
+                step: i,
+                name: format!("mcp__very_long_server_name__tool_with_long_name_{i}"),
+                input_summary: "x".repeat(INPUT_SUMMARY_MAX),
+                output_summary: "y".repeat(OUTPUT_SUMMARY_MAX),
+                success: true,
+                non_zero_exit: false,
+            })
+            .collect();
+        let json = tool_calls_metadata_json(&summaries).unwrap();
+        assert!(
+            json.len() <= TOOL_METADATA_MAX,
+            "safety net failed: {} chars",
+            json.len()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["tool_calls"].as_array().unwrap();
+        assert!(!entries.is_empty(), "must retain at least one entry");
+        assert!(entries.len() < 20, "some entries should have been dropped");
     }
 
     #[test]
