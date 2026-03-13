@@ -2245,14 +2245,8 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let entries = parsed["tool_calls"].as_array().unwrap();
-        assert!(
-            !entries.is_empty(),
-            "must retain at least one entry"
-        );
-        assert!(
-            entries.len() < 20,
-            "some entries should have been dropped"
-        );
+        assert!(!entries.is_empty(), "must retain at least one entry");
+        assert!(entries.len() < 20, "some entries should have been dropped");
     }
 
     #[test]
