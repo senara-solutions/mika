@@ -413,7 +413,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
         writeln!(
             prompt,
             "- You can write files to your home directory with write_agent_file. \
-             Your home directory is {} — all paths are relative to this directory. \
+             Your home directory is {} — all paths are relative to this directory (~ is accepted as a prefix, e.g. '~/notes.md'). \
              For example, to write identity.toml at the root of your home, use path 'identity.toml'. \
              If the file exists, you must review the current content and call again with confirm: true to overwrite.",
             home.display()
