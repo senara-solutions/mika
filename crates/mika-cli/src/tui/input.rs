@@ -598,10 +598,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
             app.clear_attachments();
             return;
         }
-        app.textarea = tui_textarea::TextArea::default();
-        app.textarea
-            .set_cursor_line_style(ratatui::style::Style::default());
-        app.textarea.set_placeholder_text("Type a message...");
+        app.reset_textarea();
         app.history.reset();
         return;
     }

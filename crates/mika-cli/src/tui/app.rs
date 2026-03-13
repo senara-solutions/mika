@@ -372,6 +372,12 @@ impl TeamDashboardState {
     }
 }
 
+/// Placeholder text for the message input field (normal mode).
+pub const PLACEHOLDER_MESSAGE: &str = "Type a message... (Shift+Enter or Alt+Enter for new line)";
+/// Placeholder text for the message input field (team mode).
+pub const PLACEHOLDER_TEAM_GOAL: &str =
+    "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)";
+
 /// Main application state.
 pub struct App<'a> {
     pub messages: Vec<ChatMessage>,
@@ -492,7 +498,7 @@ impl<'a> App<'a> {
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
-        textarea.set_placeholder_text("Type a message... (Shift+Enter or Alt+Enter for new line)");
+        textarea.set_placeholder_text(PLACEHOLDER_MESSAGE);
 
         Self {
             messages: Vec::new(),
@@ -551,9 +557,7 @@ impl<'a> App<'a> {
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
-        textarea.set_placeholder_text(
-            "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)",
-        );
+        textarea.set_placeholder_text(PLACEHOLDER_TEAM_GOAL);
 
         // Use dummy agent channels — team mode does not use them.
         let (agent_tx, _) = mpsc::unbounded_channel::<AgentRequest>();
@@ -1086,8 +1090,7 @@ impl<'a> App<'a> {
             self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
             self.textarea
                 .set_cursor_line_style(ratatui::style::Style::default());
-            self.textarea
-                .set_placeholder_text("Type a message... (Shift+Enter or Alt+Enter for new line)");
+            self.textarea.set_placeholder_text(PLACEHOLDER_MESSAGE);
         }
     }
 
@@ -1286,14 +1289,14 @@ impl<'a> App<'a> {
         }
     }
 
-    fn reset_textarea(&mut self) {
+    pub(crate) fn reset_textarea(&mut self) {
         self.textarea = TextArea::default();
         self.textarea
             .set_cursor_line_style(ratatui::style::Style::default());
         let placeholder = if self.is_team_mode() {
-            "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)"
+            PLACEHOLDER_TEAM_GOAL
         } else {
-            "Type a message... (Shift+Enter or Alt+Enter for new line)"
+            PLACEHOLDER_MESSAGE
         };
         self.textarea.set_placeholder_text(placeholder);
     }
