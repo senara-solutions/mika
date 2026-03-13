@@ -51,6 +51,7 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `version`      | String | No       | `""`    | Skill version. |
 | `always_on`    | bool   | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
 | `timeout_secs` | u64    | No       | `30`    | Per-tool execution timeout in seconds. |
+| `dependencies` | Array\<String\> | No | `[]` | Other skill names that should be loaded when this skill is active. One level only — no transitive resolution. |
 
 ### `[triggers]` section
 
@@ -290,7 +291,9 @@ On each user turn, the `SkillRegistry` determines which skills are active:
 
 2. **Keyword-matched skills** are included when at least one keyword from their `triggers.keywords` list appears as a substring of the user's message. Matching is case-insensitive: keywords are pre-lowercased at scan time, and the user message is lowercased before comparison.
 
-3. **Unmatched skills** are excluded from the turn entirely. Their tools are not sent to Claude and their prompt snippets are not injected.
+3. **Dependency resolution:** After direct matching, matched skills that declare `dependencies = ["foo"]` pull in the named skill "foo" (if it exists and is enabled). Resolution is one level only — dependencies of dependencies are not resolved. This ensures that an `always_on` skill can reference tools from another skill without requiring keyword overlap.
+
+4. **Unmatched skills** are excluded from the turn entirely. Their tools are not sent to Claude and their prompt snippets are not injected.
 
 The matching algorithm is intentionally simple and cheap. Claude still makes the final decision about which tools to actually call from the matched set. The keyword system acts as a coarse filter to avoid sending irrelevant tools on every turn.
 

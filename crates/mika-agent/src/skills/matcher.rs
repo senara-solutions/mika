@@ -1,23 +1,50 @@
+use std::collections::HashSet;
+
 use super::index::SkillEntry;
 
 /// Match skills against a user message.
 ///
 /// Returns all enabled `always_on` skills plus any enabled skill where at least
-/// one keyword is a substring of the lowercased message. Cheap and predictable —
-/// Claude still decides which tools to actually call.
+/// one keyword is a substring of the lowercased message. Then resolves one level
+/// of dependencies: if a matched skill declares `dependencies = ["foo"]`, the
+/// skill named "foo" is also included (if enabled and present).
 pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<&'a SkillEntry> {
     let message_lower = user_message.to_lowercase();
 
+    // First pass: direct matches (always_on or keyword hit)
+    let mut matched_indices: HashSet<usize> = HashSet::new();
+    for (i, entry) in skills.iter().enumerate() {
+        if entry.enabled
+            && (entry.manifest.skill.always_on
+                || entry
+                    .keywords_lower
+                    .iter()
+                    .any(|kw| message_lower.contains(kw)))
+        {
+            matched_indices.insert(i);
+        }
+    }
+
+    // Second pass: resolve one level of dependencies
+    let initial_indices: Vec<usize> = matched_indices.iter().copied().collect();
+    for i in initial_indices {
+        for dep_name in &skills[i].manifest.skill.dependencies {
+            if let Some(dep_idx) = skills
+                .iter()
+                .position(|e| e.manifest.skill.name.eq_ignore_ascii_case(dep_name))
+                && skills[dep_idx].enabled
+            {
+                matched_indices.insert(dep_idx);
+            }
+        }
+    }
+
+    // Collect in original order
     skills
         .iter()
-        .filter(|entry| {
-            entry.enabled
-                && (entry.manifest.skill.always_on
-                    || entry
-                        .keywords_lower
-                        .iter()
-                        .any(|kw| message_lower.contains(kw)))
-        })
+        .enumerate()
+        .filter(|(i, _)| matched_indices.contains(i))
+        .map(|(_, entry)| entry)
         .collect()
 }
 
@@ -28,6 +55,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_entry(name: &str, keywords: &[&str], always_on: bool) -> SkillEntry {
+        make_entry_with_deps(name, keywords, always_on, &[])
+    }
+
+    fn make_entry_with_deps(
+        name: &str,
+        keywords: &[&str],
+        always_on: bool,
+        deps: &[&str],
+    ) -> SkillEntry {
         SkillEntry {
             manifest: SkillManifest {
                 skill: SkillInfo {
@@ -36,6 +72,7 @@ mod tests {
                     version: String::new(),
                     always_on,
                     timeout_secs: 30,
+                    dependencies: deps.iter().map(|s| s.to_string()).collect(),
                 },
                 triggers: Triggers {
                     keywords: keywords.iter().map(|s| s.to_string()).collect(),
@@ -134,5 +171,101 @@ mod tests {
         let matched = match_skills(&skills, "hello");
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].manifest.skill.name, "enabled");
+    }
+
+    // --- Dependency resolution tests ---
+
+    #[test]
+    fn test_dependency_pulls_in_dependent_skill() {
+        let skills = vec![
+            make_entry_with_deps("self-dev", &[], true, &["tmux"]),
+            make_entry("tmux", &["tmux"], false),
+        ];
+        // "yes please" has no tmux keyword, but self-dev depends on tmux
+        let matched = match_skills(&skills, "yes please");
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[0].manifest.skill.name, "self-dev");
+        assert_eq!(matched[1].manifest.skill.name, "tmux");
+    }
+
+    #[test]
+    fn test_dependency_on_disabled_skill_skipped() {
+        let mut tmux = make_entry("tmux", &["tmux"], false);
+        tmux.enabled = false;
+        let skills = vec![make_entry_with_deps("self-dev", &[], true, &["tmux"]), tmux];
+        let matched = match_skills(&skills, "yes please");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].manifest.skill.name, "self-dev");
+    }
+
+    #[test]
+    fn test_dependency_on_nonexistent_skill_silently_skipped() {
+        let skills = vec![make_entry_with_deps(
+            "self-dev",
+            &[],
+            true,
+            &["nonexistent"],
+        )];
+        let matched = match_skills(&skills, "yes please");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].manifest.skill.name, "self-dev");
+    }
+
+    #[test]
+    fn test_circular_dependencies_no_infinite_loop() {
+        let skills = vec![
+            make_entry_with_deps("skill-a", &[], true, &["skill-b"]),
+            make_entry_with_deps("skill-b", &["something"], false, &["skill-a"]),
+        ];
+        // skill-a is always_on, depends on skill-b; skill-b depends on skill-a
+        let matched = match_skills(&skills, "yes please");
+        // skill-a matched directly, skill-b pulled in via dependency
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[0].manifest.skill.name, "skill-a");
+        assert_eq!(matched[1].manifest.skill.name, "skill-b");
+    }
+
+    #[test]
+    fn test_no_duplicates_from_repeated_dependencies() {
+        let skills = vec![
+            make_entry_with_deps("skill-a", &[], true, &["shared"]),
+            make_entry_with_deps("skill-b", &[], true, &["shared"]),
+            make_entry("shared", &[], false),
+        ];
+        let matched = match_skills(&skills, "hello");
+        assert_eq!(matched.len(), 3);
+        // Each skill appears exactly once
+        let names: Vec<&str> = matched
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["skill-a", "skill-b", "shared"]);
+    }
+
+    #[test]
+    fn test_dependency_case_insensitive_lookup() {
+        let skills = vec![
+            make_entry_with_deps("self-dev", &[], true, &["Tmux"]),
+            make_entry("tmux", &["tmux"], false),
+        ];
+        let matched = match_skills(&skills, "yes please");
+        assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn test_no_transitive_dependencies() {
+        // A depends on B, B depends on C. Only A+B should match, not C.
+        let skills = vec![
+            make_entry_with_deps("skill-a", &[], true, &["skill-b"]),
+            make_entry_with_deps("skill-b", &[], false, &["skill-c"]),
+            make_entry("skill-c", &[], false),
+        ];
+        let matched = match_skills(&skills, "hello");
+        assert_eq!(matched.len(), 2);
+        let names: Vec<&str> = matched
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["skill-a", "skill-b"]);
     }
 }

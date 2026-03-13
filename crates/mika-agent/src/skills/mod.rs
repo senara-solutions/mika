@@ -76,10 +76,14 @@ impl SkillRegistry {
             .collect()
     }
 
-    /// Apply database-backed overrides to skill entries.
+    /// Apply database-backed overrides to skill entries and validate dependencies.
     ///
     /// For each override, finds the matching skill by name (case-insensitive)
     /// and applies the `always_on` value, marking the entry as overridden.
+    ///
+    /// After applying overrides, logs warnings for any declared dependency that
+    /// doesn't match an installed skill name. Does not fail — only emits
+    /// `tracing::warn` for each unresolvable dependency.
     pub fn apply_overrides(&mut self, overrides: &[SkillOverride]) {
         for ov in overrides {
             if let Some(always_on) = ov.always_on
@@ -92,6 +96,23 @@ impl SkillRegistry {
                 entry.has_override = true;
             }
         }
+
+        // Validate dependencies after overrides are applied
+        for entry in &self.skills {
+            for dep in &entry.manifest.skill.dependencies {
+                if !self
+                    .skills
+                    .iter()
+                    .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(dep))
+                {
+                    tracing::warn!(
+                        skill = %entry.manifest.skill.name,
+                        dependency = %dep,
+                        "skill declares dependency on unknown skill"
+                    );
+                }
+            }
+        }
     }
 
     /// Return always-on skills that are safe for silent/background mode.
@@ -99,6 +120,10 @@ impl SkillRegistry {
     /// Filters out skills whose tools use `Exec` or `Http` handlers
     /// (e.g., tmux, shell-exec) since those should not run autonomously
     /// in heartbeat or reminder contexts without user interaction.
+    ///
+    /// Note: This method does NOT resolve skill dependencies (unlike `match_skills()`).
+    /// This is intentional — dependency resolution could pull in Exec/Http handler
+    /// skills that must not run in autonomous background contexts.
     pub fn safe_always_on_skills(&self) -> Vec<&SkillEntry> {
         use crate::skills::manifest::ToolHandler;
 
@@ -125,6 +150,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_entry(name: &str, always_on: bool, enabled: bool) -> SkillEntry {
+        make_entry_with_deps(name, always_on, enabled, &[])
+    }
+
+    fn make_entry_with_deps(
+        name: &str,
+        always_on: bool,
+        enabled: bool,
+        deps: &[&str],
+    ) -> SkillEntry {
         SkillEntry {
             manifest: SkillManifest {
                 skill: SkillInfo {
@@ -133,6 +167,7 @@ mod tests {
                     version: String::new(),
                     always_on,
                     timeout_secs: 30,
+                    dependencies: deps.iter().map(|s| s.to_string()).collect(),
                 },
                 triggers: Triggers { keywords: vec![] },
             },
@@ -265,6 +300,52 @@ mod tests {
     }
 
     #[test]
+    fn test_safe_always_on_skills_excludes_exec_dependency() {
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let dummy_def = ToolDefinition {
+            name: "dummy".to_string(),
+            description: "dummy".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        // A safe always-on skill with only builtin tools that depends on "tmux"
+        let mut safe_with_dep = make_entry_with_deps("self-knowledge", true, true, &["tmux"]);
+        safe_with_dep.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Builtin {
+                function: "get_documentation".to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/self-knowledge"),
+        }];
+
+        // An exec-handler skill that is a dependency (not always-on itself)
+        let mut exec_dep = make_entry("tmux", false, true);
+        exec_dep.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Exec {
+                command: "./run.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/skills/tmux"),
+        }];
+
+        let registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![safe_with_dep, exec_dep],
+        };
+
+        // safe_always_on_skills must NOT resolve dependencies — only the safe
+        // builtin-handler skill should be returned, not its exec-handler dependency.
+        let safe = registry.safe_always_on_skills();
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].manifest.skill.name, "self-knowledge");
+    }
+
+    #[test]
     fn test_apply_overrides_sets_always_on() {
         use crate::db::SkillOverride;
 
@@ -361,5 +442,59 @@ mod tests {
         }]);
 
         assert_eq!(registry.always_on_skills().len(), 2);
+    }
+
+    #[test]
+    fn test_apply_overrides_validates_dependencies_silent_on_valid() {
+        let mut registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![
+                make_entry_with_deps("self-dev", true, true, &["tmux"]),
+                make_entry("tmux", false, true),
+            ],
+        };
+        // Should not panic — valid dependency validated during apply_overrides
+        registry.apply_overrides(&[]);
+    }
+
+    #[test]
+    fn test_apply_overrides_validates_dependencies_warns_on_missing() {
+        let mut registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![make_entry_with_deps(
+                "self-dev",
+                true,
+                true,
+                &["nonexistent"],
+            )],
+        };
+        // Should not panic — logs warning but doesn't fail
+        registry.apply_overrides(&[]);
+    }
+
+    #[test]
+    fn test_apply_overrides_validates_dependencies_case_insensitive() {
+        let mut registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![
+                make_entry_with_deps("self-dev", true, true, &["TMUX"]),
+                make_entry("tmux", false, true),
+            ],
+        };
+        // Should not warn — case-insensitive match via eq_ignore_ascii_case
+        registry.apply_overrides(&[]);
+    }
+
+    #[test]
+    fn test_apply_overrides_validates_dependencies_no_deps_no_warn() {
+        let mut registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![
+                make_entry("web-search", true, true),
+                make_entry("tmux", false, true),
+            ],
+        };
+        // No dependencies declared — nothing to validate
+        registry.apply_overrides(&[]);
     }
 }
