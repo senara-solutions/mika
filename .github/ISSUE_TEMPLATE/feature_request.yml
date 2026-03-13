@@ -31,6 +31,17 @@ body:
       description: Any alternative solutions or workarounds you've considered.
 
   - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Concrete, testable conditions that define when this feature is complete.
+      placeholder: |
+        - [ ] User can do X
+        - [ ] Edge case Y is handled
+    validations:
+      required: false
+
+  - type: textarea
     id: context
     attributes:
       label: Additional Context

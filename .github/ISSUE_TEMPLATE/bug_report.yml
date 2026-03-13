@@ -44,6 +44,17 @@ body:
     validations:
       required: true
 
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Concrete, testable conditions that define when this bug is fixed. Include edge cases and equivalent input forms.
+      placeholder: |
+        - [ ] `~/temp/file.txt` resolves and reads successfully
+        - [ ] `/home/user/temp/file.txt` continues to work
+    validations:
+      required: false
+
   - type: input
     id: version
     attributes:

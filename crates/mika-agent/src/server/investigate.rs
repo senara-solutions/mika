@@ -643,10 +643,16 @@ async fn build_investigation_context(
         prompt.push_str(
             "You can also create GitHub issues to track findings using the `create_github_issue` tool. \
              Use it when the user asks to create an issue or when you identify a significant bug worth tracking.\n\n\
-             When creating issues, apply labels from the Mika taxonomy:\n\
-             - **Type** (pick one): `bug`, `enhancement`, `documentation`, `question`\n\
-             - **Priority** (pick one): `p0-critical`, `p1-important`, `p2-normal`, `p3-nice-to-have`\n\
-             - **Component** (pick one or more): `agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`, `dashboard`\n\n",
+             When creating issues:\n\
+             - Apply labels from the Mika taxonomy:\n\
+               - **Type** (pick one): `bug`, `enhancement`, `documentation`, `question`\n\
+               - **Priority** (pick one): `p0-critical`, `p1-important`, `p2-normal`, `p3-nice-to-have`\n\
+               - **Component** (pick one or more): `agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`, `dashboard`\n\
+             - Always include an **Acceptance Criteria** section at the end of the issue body. \
+               List concrete, testable conditions that define when the issue is resolved. \
+               Include both the failing case that triggered the issue and any equivalent forms \
+               (e.g. if `~/file.txt` fails, acceptance criteria should cover both `~/file.txt` \
+               and `/home/user/file.txt` working correctly).\n\n",
         );
     }
 
