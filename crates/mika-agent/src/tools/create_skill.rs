@@ -20,6 +20,12 @@ pub(super) const MAX_KEYWORDS: usize = 50;
 /// Maximum length of a single keyword.
 pub(super) const MAX_KEYWORD_LEN: usize = 100;
 
+/// Maximum number of dependencies per skill.
+pub(super) const MAX_DEPENDENCIES: usize = 20;
+
+/// Maximum length of a single dependency name.
+pub(super) const MAX_DEPENDENCY_LEN: usize = 128;
+
 /// Verify that a skill directory is actually inside the skills root.
 /// Guards against symlink attacks where a skill name resolves outside the expected directory.
 pub(crate) fn verify_skill_path(skills_dir: &Path, skill_dir: &Path) -> Result<(), String> {
@@ -71,6 +77,27 @@ pub(super) fn validate_keywords(keywords: &[String]) -> Result<(), String> {
     if let Some(long) = keywords.iter().find(|k| k.len() > MAX_KEYWORD_LEN) {
         return Err(format!(
             "Keyword too long ({} chars, max {MAX_KEYWORD_LEN}).",
+            long.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate dependencies: count, individual length, and non-empty entries.
+pub(super) fn validate_dependencies(deps: &[String]) -> Result<(), String> {
+    if deps.len() > MAX_DEPENDENCIES {
+        return Err(format!(
+            "Too many dependencies ({}, max {MAX_DEPENDENCIES}).",
+            deps.len()
+        ));
+    }
+    if let Some(empty) = deps.iter().find(|d| d.is_empty()) {
+        let _ = empty;
+        return Err("Dependency name cannot be empty.".to_string());
+    }
+    if let Some(long) = deps.iter().find(|d| d.len() > MAX_DEPENDENCY_LEN) {
+        return Err(format!(
+            "Dependency name too long ({} chars, max {MAX_DEPENDENCY_LEN}).",
             long.len()
         ));
     }
@@ -141,6 +168,11 @@ impl Tool for CreateSkillTool {
                     "always_on": {
                         "type": "boolean",
                         "description": "If true, this skill is always active regardless of keywords. Default: false"
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Other skill names this skill depends on (loaded when this skill is active, max 20)"
                     }
                 },
                 "required": ["name", "description", "keywords", "system_prompt"]
@@ -154,6 +186,15 @@ impl Tool for CreateSkillTool {
         let system_prompt = input["system_prompt"].as_str().unwrap_or("").trim();
         let always_on = input["always_on"].as_bool().unwrap_or(false);
         let keywords: Vec<String> = input["keywords"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dependencies: Vec<String> = input["dependencies"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -181,6 +222,9 @@ impl Tool for CreateSkillTool {
             ));
         }
         if let Err(e) = validate_keywords(&keywords) {
+            return Ok(ToolOutput::error(e));
+        }
+        if let Err(e) = validate_dependencies(&dependencies) {
             return Ok(ToolOutput::error(e));
         }
 
@@ -215,7 +259,7 @@ impl Tool for CreateSkillTool {
                 version: "0.1.0".to_string(),
                 always_on,
                 timeout_secs: 30,
-                dependencies: vec![],
+                dependencies,
             },
             triggers: Triggers { keywords },
         };
@@ -463,6 +507,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_create_skill_with_dependencies() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let input = json!({
+            "name": "dep-skill",
+            "description": "Skill with deps",
+            "keywords": ["test"],
+            "system_prompt": "Has dependencies.",
+            "dependencies": ["shell-exec", "web-search"]
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(
+            !output.is_error,
+            "Expected success, got: {}",
+            output.content
+        );
+
+        // Verify dependencies in manifest
+        let skill_dir = tmp.path().join("skills/dep-skill");
+        let toml_content = std::fs::read_to_string(skill_dir.join("skill.toml")).unwrap();
+        let manifest: SkillManifest = toml::from_str(&toml_content).unwrap();
+        assert_eq!(
+            manifest.skill.dependencies,
+            vec!["shell-exec", "web-search"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_without_dependencies_defaults_empty() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let output = tool.execute(valid_input(), &ctx).await.unwrap();
+        assert!(!output.is_error);
+
+        let skill_dir = tmp.path().join("skills/test-skill");
+        let toml_content = std::fs::read_to_string(skill_dir.join("skill.toml")).unwrap();
+        let manifest: SkillManifest = toml::from_str(&toml_content).unwrap();
+        assert!(manifest.skill.dependencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_too_many_dependencies() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let deps: Vec<String> = (0..21).map(|i| format!("dep-{i}")).collect();
+        let input = json!({
+            "name": "many-deps",
+            "description": "Too many deps",
+            "keywords": ["test"],
+            "system_prompt": "prompt",
+            "dependencies": deps
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Too many dependencies"));
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_dependency_name_too_long() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let long_dep = "a".repeat(129);
+        let input = json!({
+            "name": "long-dep",
+            "description": "Long dep name",
+            "keywords": ["test"],
+            "system_prompt": "prompt",
+            "dependencies": [long_dep]
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Dependency name too long"));
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_empty_dependency_name() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let input = json!({
+            "name": "empty-dep",
+            "description": "Empty dep",
+            "keywords": ["test"],
+            "system_prompt": "prompt",
+            "dependencies": ["valid", ""]
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Dependency name cannot be empty"));
+    }
+
     #[test]
     fn test_validate_skill_name() {
         assert!(validate_skill_name("web-search").is_ok());
@@ -474,5 +619,27 @@ mod tests {
         assert!(validate_skill_name("sp ace").is_err());
         assert!(validate_skill_name("sp!cial").is_err());
         assert!(validate_skill_name(&"a".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn test_validate_dependencies() {
+        // Valid
+        assert!(validate_dependencies(&[]).is_ok());
+        assert!(validate_dependencies(&["shell-exec".to_string()]).is_ok());
+
+        // Too many
+        let many: Vec<String> = (0..21).map(|i| format!("dep-{i}")).collect();
+        assert!(validate_dependencies(&many).is_err());
+
+        // Empty entry
+        assert!(validate_dependencies(&["".to_string()]).is_err());
+
+        // Too long entry
+        assert!(validate_dependencies(&["a".repeat(129)]).is_err());
+
+        // At limit (20 entries, 128 chars each)
+        let at_limit: Vec<String> = (0..20).map(|i| format!("dep-{i}")).collect();
+        assert!(validate_dependencies(&at_limit).is_ok());
+        assert!(validate_dependencies(&["a".repeat(128)]).is_ok());
     }
 }

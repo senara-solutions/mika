@@ -149,7 +149,6 @@ pub async fn run(
     {
         skill_registry.apply_overrides(&overrides);
     }
-    skill_registry.validate_dependencies();
     let skill_registry = Arc::new(skill_registry);
     let is_onboarding = check_onboarding(&ctx.async_db).await;
     let skills_dirty = AtomicBool::new(false);

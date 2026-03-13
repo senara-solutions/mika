@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 
 use super::create_skill::{
-    validate_description, validate_keywords, validate_skill_name, validate_system_prompt,
-    verify_skill_path,
+    validate_dependencies, validate_description, validate_keywords, validate_skill_name,
+    validate_system_prompt, verify_skill_path,
 };
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bundled_skills::is_bundled_skill;
@@ -50,6 +50,11 @@ impl Tool for UpdateSkillTool {
                     "always_on": {
                         "type": "boolean",
                         "description": "New always_on value (true = always active regardless of keywords)"
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "New list of skill names this skill depends on (max 20)"
                     }
                 },
                 "required": ["name"]
@@ -70,11 +75,17 @@ impl Tool for UpdateSkillTool {
         let has_keywords = input.get("keywords").is_some_and(|v| !v.is_null());
         let has_system_prompt = input.get("system_prompt").is_some_and(|v| !v.is_null());
         let has_always_on = input.get("always_on").is_some_and(|v| !v.is_null());
+        let has_dependencies = input.get("dependencies").is_some_and(|v| !v.is_null());
 
-        if !has_description && !has_keywords && !has_system_prompt && !has_always_on {
+        if !has_description
+            && !has_keywords
+            && !has_system_prompt
+            && !has_always_on
+            && !has_dependencies
+        {
             return Ok(ToolOutput::error(
                 "At least one field to update must be provided \
-                 (description, keywords, system_prompt, or always_on).",
+                 (description, keywords, system_prompt, always_on, or dependencies).",
             ));
         }
 
@@ -94,7 +105,7 @@ impl Tool for UpdateSkillTool {
         let mut updated = Vec::new();
 
         // Update skill.toml fields if any manifest fields changed
-        if has_description || has_keywords || has_always_on {
+        if has_description || has_keywords || has_always_on || has_dependencies {
             let toml_path = skill_dir.join("skill.toml");
             let toml_content = match std::fs::read_to_string(&toml_path) {
                 Ok(s) => s,
@@ -181,6 +192,26 @@ impl Tool for UpdateSkillTool {
                 }
             }
 
+            if has_dependencies {
+                let dependencies: Vec<String> = input["dependencies"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if let Err(e) = validate_dependencies(&dependencies) {
+                    return Ok(ToolOutput::error(e));
+                }
+
+                manifest.skill.dependencies = dependencies;
+                updated.push("dependencies");
+            }
+
             // Validate post-update state: must have trigger mechanism
             if manifest.triggers.keywords.is_empty() && !manifest.skill.always_on {
                 return Ok(ToolOutput::error(
@@ -191,8 +222,10 @@ impl Tool for UpdateSkillTool {
 
             // Only write skill.toml if non-always_on fields changed, OR if it's not a
             // built-in skill (built-in always_on is stored in DB, not the file).
-            let write_toml =
-                has_description || has_keywords || (has_always_on && !is_bundled_skill(name));
+            let write_toml = has_description
+                || has_keywords
+                || has_dependencies
+                || (has_always_on && !is_bundled_skill(name));
             if write_toml {
                 let new_toml = match toml::to_string_pretty(&manifest) {
                     Ok(s) => s,
@@ -741,5 +774,132 @@ keywords = ["test"]
             overrides.is_empty(),
             "custom skills should not use DB overrides"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_dependencies() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "dependencies": ["shell-exec", "web-search"]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+        assert!(output.content.contains("dependencies"));
+
+        let manifest = read_manifest(&tmp, "test-skill");
+        assert_eq!(
+            manifest.skill.dependencies,
+            vec!["shell-exec", "web-search"]
+        );
+        // Other fields unchanged
+        assert_eq!(manifest.skill.description, "Original description");
+        assert_eq!(manifest.triggers.keywords, vec!["original"]);
+    }
+
+    #[tokio::test]
+    async fn test_update_dependencies_to_empty() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        // First set some dependencies
+        tool.execute(
+            json!({
+                "name": "test-skill",
+                "dependencies": ["dep-a"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Clear them
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "dependencies": []
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+
+        let manifest = read_manifest(&tmp, "test-skill");
+        assert!(manifest.skill.dependencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_dependencies_too_many() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let deps: Vec<String> = (0..21).map(|i| format!("dep-{i}")).collect();
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "dependencies": deps
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Too many dependencies"));
+    }
+
+    #[tokio::test]
+    async fn test_update_dependencies_name_too_long() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let long_dep = "a".repeat(129);
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "dependencies": [long_dep]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Dependency name too long"));
+    }
+
+    #[tokio::test]
+    async fn test_update_dependencies_whitespace_filtered() {
+        let (tmp, harness) = setup_with_skill("test-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = UpdateSkillTool;
+
+        let output = tool
+            .execute(
+                json!({
+                    "name": "test-skill",
+                    "dependencies": ["valid-dep", "  ", ""]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "Got: {}", output.content);
+
+        let manifest = read_manifest(&tmp, "test-skill");
+        assert_eq!(manifest.skill.dependencies, vec!["valid-dep"]);
     }
 }

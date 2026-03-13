@@ -96,7 +96,6 @@ async fn spawn_agent_worker(
     {
         skill_registry.apply_overrides(&overrides);
     }
-    skill_registry.validate_dependencies();
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
@@ -196,7 +195,6 @@ async fn spawn_agent_worker(
                         {
                             registry.apply_overrides(&overrides);
                         }
-                        registry.validate_dependencies();
                         worker_skills = Arc::new(registry);
                         skills_reloaded = true;
                     }
@@ -249,7 +247,6 @@ async fn spawn_agent_worker(
                         {
                             registry.apply_overrides(&overrides);
                         }
-                        registry.validate_dependencies();
                         worker_skills = Arc::new(registry);
                         skills_reloaded = true;
                     }

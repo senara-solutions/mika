@@ -1,7 +1,7 @@
 ---
 title: Fix skill dependency resolution and unsolicited action guard
 type: fix
-status: active
+status: completed
 date: 2026-03-13
 ---
 
@@ -46,8 +46,8 @@ Two bugs: (1) always_on skills that reference tools from other skills fail when 
 - [x] ~~self-dev skill's `skill.toml` declares `dependencies = ["tmux"]`~~ N/A — user custom skill
 - [x] `validate_dependencies()` logs warning for nonexistent dependency targets
 - [x] System prompt contains unsolicited action guardrail
-- [ ] All existing tests pass
-- [ ] New tests for `validate_dependencies()`
+- [x] All existing tests pass
+- [x] New tests for `validate_dependencies()`
 
 ## Context
 
