@@ -8,6 +8,12 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed
 INPUT=$(cat)
 PATH_VALUE=$(echo "$INPUT" | jq -r '.path // empty')
 
+# Expand ~ to $HOME
+case "$PATH_VALUE" in
+    "~") PATH_VALUE="$HOME" ;;
+    "~/"*) PATH_VALUE="$HOME/${PATH_VALUE#\~/}" ;;
+esac
+
 if [ -z "$PATH_VALUE" ]; then
     echo "Error: no path provided" >&2
     exit 1

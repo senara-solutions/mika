@@ -27,7 +27,7 @@ impl Tool for WriteAgentFileTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path within the agent's home directory (e.g., 'notes/todo.md')"
+                        "description": "Relative path within the agent's home directory (e.g., 'notes/todo.md' or '~/notes/todo.md')"
                     },
                     "content": {
                         "type": "string",

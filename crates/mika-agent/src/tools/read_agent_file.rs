@@ -25,7 +25,7 @@ impl Tool for ReadAgentFileTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path within the agent's home directory (e.g., 'notes/todo.md')"
+                        "description": "Relative path within the agent's home directory (e.g., 'notes/todo.md' or '~/notes/todo.md')"
                     }
                 },
                 "required": ["path"]
@@ -251,6 +251,23 @@ mod tests {
             expected.display(),
             output.content
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_tilde_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("notes.md"), "tilde content").unwrap();
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "~/notes.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(output.content.contains("tilde content"));
     }
 
     #[tokio::test]

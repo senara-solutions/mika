@@ -273,6 +273,20 @@ pub(crate) async fn validate_and_resolve_path(
     base_dir: &Path,
     create_parents: bool,
 ) -> std::result::Result<PathBuf, ToolOutput> {
+    // Expand ~ to base_dir (the tool's sandboxed "home")
+    // Reject ~username syntax (e.g. ~root/file) — only bare ~ and ~/ are valid
+    let path = if path == "~" {
+        ""
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        rest
+    } else if path.starts_with('~') {
+        return Err(ToolOutput::error(
+            "Only '~/' (your home directory) is supported. '~username' paths are not allowed.",
+        ));
+    } else {
+        path
+    };
+
     if path.is_empty() {
         return Err(ToolOutput::error("'path' is required and cannot be empty."));
     }
@@ -494,4 +508,55 @@ pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<B
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_tilde_expansion_strips_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("notes")).unwrap();
+        std::fs::write(base.join("notes").join("todo.md"), "test").unwrap();
+
+        let result = validate_and_resolve_path("~/notes/todo.md", base, false).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), base.join("notes/todo.md"));
+    }
+
+    #[tokio::test]
+    async fn test_bare_tilde_returns_empty_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        // Bare ~ maps to empty path, which is an error for file-targeting tools
+        let result = validate_and_resolve_path("~", base, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("required"));
+    }
+
+    #[tokio::test]
+    async fn test_tilde_username_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let result = validate_and_resolve_path("~root/file.txt", base, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("~username"));
+    }
+
+    #[tokio::test]
+    async fn test_tilde_with_traversal_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let result = validate_and_resolve_path("~/../../../etc/passwd", base, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("traversal"));
+    }
 }

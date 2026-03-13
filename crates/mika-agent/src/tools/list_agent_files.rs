@@ -29,7 +29,7 @@ impl Tool for ListAgentFilesTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to a subdirectory within the agent's home directory. Omit or leave empty to list the home directory root."
+                        "description": "Relative path to a subdirectory within the agent's home directory. Omit, leave empty, or pass '~' to list the home directory root."
                     }
                 },
                 "required": []
@@ -39,6 +39,13 @@ impl Tool for ListAgentFilesTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("").trim();
+
+        // Treat bare ~ as home root (same as empty path)
+        let path = if path == "~" || path == "~/" {
+            ""
+        } else {
+            path
+        };
 
         let list_dir = if path.is_empty() {
             ctx.home_dir.to_path_buf()
