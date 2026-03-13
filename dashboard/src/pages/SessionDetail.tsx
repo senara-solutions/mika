@@ -423,7 +423,7 @@ export default function SessionDetail() {
   const openSessionInvestigation = () => {
     // Find the last assistant message as a proxy for full-session investigation
     const allMessages = messages?.data ?? []
-    const lastAssistant = allMessages.findLast((m) => m.role === 'assistant')
+    const lastAssistant = [...allMessages].reverse().find((m: Message) => m.role === 'assistant')
     if (!lastAssistant) return
     setInvestigationScope({
       type: 'session',
