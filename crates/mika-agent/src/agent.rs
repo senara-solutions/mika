@@ -200,36 +200,7 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
         return Some(json);
     }
 
-    // Phase 1: Re-truncate fields progressively to fit all entries.
-    // Try decreasing content budgets until the array fits.
-    for &(input_max, output_max) in &[(100, 150), (60, 80), (30, 50)] {
-        let shrunk: Vec<ToolCallSummary> = summaries
-            .iter()
-            .map(|s| ToolCallSummary {
-                step: s.step,
-                name: s.name.clone(),
-                input_summary: truncate_summary(&s.input_summary, input_max),
-                output_summary: truncate_summary(&s.output_summary, output_max),
-                success: s.success,
-                non_zero_exit: s.non_zero_exit,
-            })
-            .collect();
-        let wrapper = serde_json::json!({ "tool_calls": shrunk });
-        if let Ok(json) = serde_json::to_string(&wrapper)
-            && json.len() <= TOOL_METADATA_MAX
-        {
-            return Some(json);
-        }
-    }
-
-    // Phase 2: Last resort — drop tail entries.
-    tracing::warn!(
-        total_entries = summaries.len(),
-        serialized_len = json.len(),
-        max = TOOL_METADATA_MAX,
-        "tool_calls metadata exceeds cap after field truncation, dropping tail entries"
-    );
-    // Use the most aggressive field truncation when dropping entries
+    // Phase 1: Aggressively re-truncate fields to fit all entries.
     let shrunk: Vec<ToolCallSummary> = summaries
         .iter()
         .map(|s| ToolCallSummary {
@@ -241,6 +212,19 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
             non_zero_exit: s.non_zero_exit,
         })
         .collect();
+    let wrapper = serde_json::json!({ "tool_calls": shrunk });
+    if let Ok(json) = serde_json::to_string(&wrapper)
+        && json.len() <= TOOL_METADATA_MAX
+    {
+        return Some(json);
+    }
+
+    // Phase 2: Last resort — drop tail entries from the already-shrunk vector.
+    warn!(
+        total_entries = summaries.len(),
+        max = TOOL_METADATA_MAX,
+        "tool_calls metadata exceeds cap after field truncation, dropping tail entries"
+    );
     for count in (1..shrunk.len()).rev() {
         let wrapper = serde_json::json!({ "tool_calls": &shrunk[..count] });
         if let Ok(json) = serde_json::to_string(&wrapper)
@@ -249,6 +233,10 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
             return Some(json);
         }
     }
+    warn!(
+        total_entries = summaries.len(),
+        "tool_calls metadata: unable to fit even a single entry, returning None"
+    );
     None
 }
 
@@ -2214,7 +2202,7 @@ mod tests {
         let summaries: Vec<ToolCallSummary> = (0..10)
             .map(|i| ToolCallSummary {
                 step: i,
-                name: format!("search_memory"),
+                name: "search_memory".to_string(),
                 input_summary: truncate_summary(&"x".repeat(10_000), INPUT_SUMMARY_MAX),
                 output_summary: truncate_summary(&"y".repeat(10_000), OUTPUT_SUMMARY_MAX),
                 success: true,
