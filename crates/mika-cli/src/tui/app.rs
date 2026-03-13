@@ -1090,7 +1090,12 @@ impl<'a> App<'a> {
             self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
             self.textarea
                 .set_cursor_line_style(ratatui::style::Style::default());
-            self.textarea.set_placeholder_text(PLACEHOLDER_MESSAGE);
+            let placeholder = if self.is_team_mode() {
+                PLACEHOLDER_TEAM_GOAL
+            } else {
+                PLACEHOLDER_MESSAGE
+            };
+            self.textarea.set_placeholder_text(placeholder);
         }
     }
 
@@ -1102,9 +1107,12 @@ impl<'a> App<'a> {
                 self.textarea = TextArea::from(text.lines().map(String::from).collect::<Vec<_>>());
                 self.textarea
                     .set_cursor_line_style(ratatui::style::Style::default());
-                self.textarea.set_placeholder_text(
-                    "Type a message... (Shift+Enter or Alt+Enter for new line)",
-                );
+                let placeholder = if self.is_team_mode() {
+                    PLACEHOLDER_TEAM_GOAL
+                } else {
+                    PLACEHOLDER_MESSAGE
+                };
+                self.textarea.set_placeholder_text(placeholder);
             }
         }
     }
