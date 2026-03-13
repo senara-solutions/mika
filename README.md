@@ -99,7 +99,7 @@ The agent has 23 builtin tools and 6 conditional management tools:
 | Memory | `update_core_memory`, `store_fact`, `search_memory`, `update_fact` | Persistent memory management |
 | Reminders | `create_reminder`, `list_reminders`, `cancel_reminder` | Time-based reminders |
 | Tasks | `create_task`, `cancel_task`, `complete_task`, `get_task`, `list_tasks` | Scheduled task management (callback, time, recurring triggers) |
-| Files | `write_file`, `read_home_file`, `list_home_files` | Read/write files in the agent's home directory |
+| Files | `write_agent_file`, `read_agent_file`, `list_agent_files` | Read/write files in the agent's home directory |
 | Skills | `create_skill`, `delete_skill`, `list_skills`, `toggle_skill`, `update_skill` | Skill registry management |
 | Config | `get_config`, `set_config` | Customer configuration |
 | Messaging | `send_message` | Proactive outbound messages |

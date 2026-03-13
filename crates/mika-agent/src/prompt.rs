@@ -107,7 +107,7 @@ pub struct PromptContext<'a> {
     /// Whether Telegram integration is configured (chat_id exists in customer_config).
     pub telegram_configured: bool,
     /// Per-agent home directory (e.g. `~/.mika/agents/mika/`).
-    /// Surfaced in the Tool Usage section so the agent knows write_file's base path.
+    /// Surfaced in the Tool Usage section so the agent knows write_agent_file's base path.
     pub home_dir: Option<&'a Path>,
     /// When set, this is a callback result turn. Injects a guard section telling the agent
     /// to process the results directly and not spawn new long-running tasks.
@@ -359,7 +359,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
     );
     prompt.push_str(
         "- When asked about your own configuration, setup files, or how specific parts of you work, \
-         check your own files (list_home_files, read_home_file) and documentation (get_documentation) \
+         check your own files (list_agent_files, read_agent_file) and documentation (get_documentation) \
          before answering. Never guess about your own internals.\n",
     );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
@@ -388,7 +388,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- Tools may return images (screenshots, image files); you will see and can describe their contents.\n",
     );
     prompt.push_str(
-        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_home_file on that path to view the image contents.\n",
+        "- When a tool produces an image file path (e.g., screenshot saved to /path/to/image.png), use read_agent_file on that path to view the image contents.\n",
     );
     prompt.push_str(
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
@@ -412,7 +412,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
     if let Some(home) = ctx.home_dir {
         writeln!(
             prompt,
-            "- You can write files to your home directory with write_file. \
+            "- You can write files to your home directory with write_agent_file. \
              Your home directory is {} — all paths are relative to this directory. \
              For example, to write identity.toml at the root of your home, use path 'identity.toml'. \
              If the file exists, you must review the current content and call again with confirm: true to overwrite.",
@@ -421,23 +421,23 @@ Core memory tracks key people briefly — the people table is the full record.\n
         .unwrap();
         writeln!(
             prompt,
-            "- You can read files from your home directory with read_home_file (path relative to {}). \
+            "- You can read files from your home directory with read_agent_file (path relative to {}). \
              Files larger than 100 KB are rejected.",
             home.display()
         )
         .unwrap();
     } else {
         prompt.push_str(
-            "- You can write files to your home directory with write_file. Paths are relative to your home. \
+            "- You can write files to your home directory with write_agent_file. Paths are relative to your home. \
              If the file exists, you must review the current content and call again with confirm: true to overwrite.\n",
         );
         prompt.push_str(
-            "- You can read files from your home directory with read_home_file (relative paths only). \
+            "- You can read files from your home directory with read_agent_file (relative paths only). \
              Files larger than 100 KB are rejected.\n",
         );
     }
     prompt.push_str(
-        "- You can list files in your home directory with list_home_files. \
+        "- You can list files in your home directory with list_agent_files. \
          Omit path or pass an empty string to list the root. Pass a relative subdirectory path to list that directory.\n",
     );
 
@@ -525,15 +525,15 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     if let Some(home) = ctx.home_dir {
         writeln!(
             prompt,
-            "- read_home_file: Read a file from your home directory ({}). Paths are relative to that directory.\n\
-             - list_home_files: List files and directories in your home directory. Omit path to list the root.",
+            "- read_agent_file: Read a file from your home directory ({}). Paths are relative to that directory.\n\
+             - list_agent_files: List files and directories in your home directory. Omit path to list the root.",
             home.display()
         )
         .unwrap();
     } else {
         prompt.push_str(
-            "- read_home_file: Read a file from your home directory. Paths are relative to your home.\n\
-             - list_home_files: List files and directories in your home directory. Omit path to list the root.\n",
+            "- read_agent_file: Read a file from your home directory. Paths are relative to your home.\n\
+             - list_agent_files: List files and directories in your home directory. Omit path to list the root.\n",
         );
     }
     prompt.push('\n');
@@ -1246,7 +1246,7 @@ max_iterations = 3
     }
 
     #[test]
-    fn test_prompt_includes_home_dir_in_write_file_instruction() {
+    fn test_prompt_includes_home_dir_in_write_agent_file_instruction() {
         let identity = test_identity();
         let ctx = PromptContext {
             soul_content: "",
@@ -1269,7 +1269,7 @@ max_iterations = 3
         );
         assert!(
             prompt.contains("Your home directory is /home/user/.mika/agents/mika"),
-            "prompt should include the home directory in write_file instruction"
+            "prompt should include the home directory in write_agent_file instruction"
         );
     }
 

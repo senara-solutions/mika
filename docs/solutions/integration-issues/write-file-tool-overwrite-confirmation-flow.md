@@ -23,16 +23,16 @@ The agent had a `write_workspace` tool for shared workspace files, but no builti
 
 ## Root Cause Analysis
 
-No builtin `write_file` tool existed. The gap meant:
+No builtin `write_agent_file` tool existed. The gap meant:
 - No enforced read-before-overwrite for home directory files
 - Shell-based file writes had no guardrails
 - Agent couldn't safely manage its own files in all operating modes
 
 ## Working Solution
 
-### 1. Created `write_file.rs` Tool
+### 1. Created `write_agent_file.rs` Tool
 
-**File:** `crates/mika-agent/src/tools/write_file.rs`
+**File:** `crates/mika-agent/src/tools/write_agent_file.rs`
 
 Key design decisions:
 - **Confirmation flow:** If file exists and `confirm` is not `true`, return existing content as an error. Agent must explicitly acknowledge what it's replacing.
@@ -60,7 +60,7 @@ if file_exists && !confirm {
 
 **File:** `crates/mika-agent/src/tools/mod.rs`
 
-The `validate_and_resolve_path()` function consolidates ~60 lines of duplicated path security logic from `write_file`, `write_workspace`, and `read_workspace`:
+The `validate_and_resolve_path()` function consolidates ~60 lines of duplicated path security logic from `write_agent_file`, `write_workspace`, and `read_workspace`:
 
 ```rust
 pub(crate) async fn validate_and_resolve_path(
@@ -87,13 +87,13 @@ Added a "File writing" section as a soul-level instruction:
 ## File writing
 Before writing to any file via shell (cat >, tee, sed -i, echo >, heredoc, etc.):
 - ALWAYS read the file first if it exists, to understand what you're replacing.
-- Prefer the `write_file` tool over shell writes when the content fits.
+- Prefer the `write_agent_file` tool over shell writes when the content fits.
 - When shell writes are necessary, use `cat <file>` or `head <file>` first.
 ```
 
 ### 4. Registered in `default_tools()`
 
-Added `write_file::WriteFileTool` to the builtin tool registry, making it available to all agents in all modes (including silent/heartbeat).
+Added `write_agent_file::WriteAgentFileTool` to the builtin tool registry, making it available to all agents in all modes (including silent/heartbeat).
 
 ## Prevention Strategies
 
@@ -128,5 +128,5 @@ When building tools that modify existing state:
 
 1. **Defense-in-depth matters:** The initial implementation checked symlinks on parent directories but missed the target file. A symlink at the leaf node could escape the sandbox. Always check both.
 2. **Shared helpers reduce bugs:** Extracting `validate_and_resolve_path()` from 3 tools eliminated duplicated security logic and ensures future file tools inherit the same protections.
-3. **Soft guardrails complement hard enforcement:** The shell-exec system prompt instruction can't prevent shell-based overwrites at the tool level, but it sets behavioral expectations. Combined with the hard-enforced `write_file` confirmation flow, this creates layered protection.
-4. **Prompt documentation is agent-native parity:** Adding tool guidance to `prompt.rs` ensures the agent knows about `write_file` and its confirmation semantics. Tools without prompt documentation are effectively invisible to the agent.
+3. **Soft guardrails complement hard enforcement:** The shell-exec system prompt instruction can't prevent shell-based overwrites at the tool level, but it sets behavioral expectations. Combined with the hard-enforced `write_agent_file` confirmation flow, this creates layered protection.
+4. **Prompt documentation is agent-native parity:** Adding tool guidance to `prompt.rs` ensures the agent knows about `write_agent_file` and its confirmation semantics. Tools without prompt documentation are effectively invisible to the agent.

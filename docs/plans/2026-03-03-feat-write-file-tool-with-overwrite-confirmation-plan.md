@@ -1,21 +1,21 @@
 ---
-title: "feat: Add write_file tool with overwrite confirmation flow"
+title: "feat: Add write_agent_file tool with overwrite confirmation flow"
 type: feat
 status: completed
 date: 2026-03-03
 ---
 
-# feat: Add write_file tool with overwrite confirmation flow
+# feat: Add write_agent_file tool with overwrite confirmation flow
 
 ## Overview
 
-Add a built-in `write_file` tool that writes content to files within the agent's home directory, with a hard-enforced confirmation flow for overwrites. If the target file already exists, the tool returns the current content and requires a second call with `confirm: true` to proceed. Additionally, update the shell-exec skill's system prompt with a soft guardrail instructing the agent to read files before writing via shell commands.
+Add a built-in `write_agent_file` tool that writes content to files within the agent's home directory, with a hard-enforced confirmation flow for overwrites. If the target file already exists, the tool returns the current content and requires a second call with `confirm: true` to proceed. Additionally, update the shell-exec skill's system prompt with a soft guardrail instructing the agent to read files before writing via shell commands.
 
 ## Problem Statement / Motivation
 
 The agent currently relies on the `run_shell` skill (shell-exec) for all file writes. Shell commands like `cat >`, `tee`, `sed -i` are powerful but dangerous — they can silently overwrite files without the agent seeing what was there before. There's no structural enforcement that the agent reads before it writes.
 
-A dedicated `write_file` tool provides:
+A dedicated `write_agent_file` tool provides:
 1. **Hard enforcement:** The agent *must* see existing content before overwriting — the tool returns the content and refuses to write without `confirm: true`
 2. **Security:** Path traversal protection, symlink rejection, containment checks — all enforced at the Rust level
 3. **Auditability:** Structured tool calls are easier to trace than arbitrary shell commands
@@ -23,14 +23,14 @@ A dedicated `write_file` tool provides:
 
 ## Proposed Solution
 
-### Part 1: `write_file` built-in tool
+### Part 1: `write_agent_file` built-in tool
 
-New file: `crates/mika-agent/src/tools/write_file.rs`
+New file: `crates/mika-agent/src/tools/write_agent_file.rs`
 
 **Tool schema:**
 ```json
 {
-  "name": "write_file",
+  "name": "write_agent_file",
   "description": "Write content to a file in the agent's home directory. If the file already exists, the current content is returned and you MUST call again with confirm: true to overwrite.",
   "input_schema": {
     "type": "object",
@@ -84,7 +84,7 @@ Add a new section after the existing "Config file editing" section:
 
 Before writing to any file via shell (cat >, tee, sed -i, echo >, heredoc, etc.):
 - ALWAYS read the file first if it exists, to understand what you're replacing.
-- Prefer the `write_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
+- Prefer the `write_agent_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
 - When shell writes are necessary (e.g., binary data, piping, large files), use `cat <file>` or `head <file>` first.
 ```
 
@@ -92,8 +92,8 @@ Before writing to any file via shell (cat >, tee, sed -i, echo >, heredoc, etc.)
 
 Update: `crates/mika-agent/src/tools/mod.rs`
 
-- Add `mod write_file;` to the module declarations (line ~24)
-- Add `registry.register(Box::new(write_file::WriteFileTool));` to `default_tools()` (line ~261)
+- Add `mod write_agent_file;` to the module declarations (line ~24)
+- Add `registry.register(Box::new(write_agent_file::WriteAgentFileTool));` to `default_tools()` (line ~261)
 
 ## Technical Considerations
 
@@ -104,25 +104,25 @@ Update: `crates/mika-agent/src/tools/mod.rs`
 
 ## Acceptance Criteria
 
-- [x] `write_file` tool creates new files immediately without confirmation
-- [x] `write_file` returns existing content and requires `confirm: true` for overwrites
-- [x] `write_file` rejects absolute paths, path traversal, and symlinks
-- [x] `write_file` creates parent directories automatically
-- [x] `write_file` is registered in `default_tools()` and available to all agents
+- [x] `write_agent_file` tool creates new files immediately without confirmation
+- [x] `write_agent_file` returns existing content and requires `confirm: true` for overwrites
+- [x] `write_agent_file` rejects absolute paths, path traversal, and symlinks
+- [x] `write_agent_file` creates parent directories automatically
+- [x] `write_agent_file` is registered in `default_tools()` and available to all agents
 - [x] Shell-exec `system_prompt.md` includes read-before-write guidance
 - [x] Comprehensive tests covering: new file, overwrite flow (reject then confirm), path traversal, absolute path, empty inputs, symlink rejection, large existing file truncation
 - [x] `cargo test` passes, `cargo clippy` clean
 
 ## MVP
 
-### crates/mika-agent/src/tools/write_file.rs
+### crates/mika-agent/src/tools/write_agent_file.rs
 
 ```rust
-pub struct WriteFileTool;
+pub struct WriteAgentFileTool;
 
 #[async_trait]
-impl Tool for WriteFileTool {
-    fn name(&self) -> &str { "write_file" }
+impl Tool for WriteAgentFileTool {
+    fn name(&self) -> &str { "write_agent_file" }
     fn definition(&self) -> ToolDefinition { /* schema above */ }
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         // 1. Validate path + content
@@ -137,10 +137,10 @@ impl Tool for WriteFileTool {
 ### crates/mika-agent/src/tools/mod.rs (changes)
 
 ```rust
-mod write_file;  // add to module declarations
+mod write_agent_file;  // add to module declarations
 
 // In default_tools():
-registry.register(Box::new(write_file::WriteFileTool));
+registry.register(Box::new(write_agent_file::WriteAgentFileTool));
 ```
 
 ### crates/mika-agent/templates/skills/shell-exec/system_prompt.md (append)
@@ -150,7 +150,7 @@ registry.register(Box::new(write_file::WriteFileTool));
 
 Before writing to any file via shell (cat >, tee, sed -i, echo >, heredoc, etc.):
 - ALWAYS read the file first if it exists, to understand what you're replacing.
-- Prefer the `write_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
+- Prefer the `write_agent_file` tool over shell writes when the content fits — it enforces read-before-overwrite automatically.
 - When shell writes are necessary (e.g., binary data, piping, large files), use `cat <file>` or `head <file>` first.
 ```
 

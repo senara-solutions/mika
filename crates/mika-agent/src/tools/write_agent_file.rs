@@ -10,17 +10,17 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, validate_and_resolve_p
 /// Maximum file size for reading existing content during confirmation flow (100 KB).
 const MAX_EXISTING_SIZE: u64 = 100 * 1024;
 
-pub struct WriteFileTool;
+pub struct WriteAgentFileTool;
 
 #[async_trait]
-impl Tool for WriteFileTool {
+impl Tool for WriteAgentFileTool {
     fn name(&self) -> &str {
-        "write_file"
+        "write_agent_file"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "write_file".to_string(),
+            name: "write_agent_file".to_string(),
             description: "Write content to a file in the agent's home directory. If the file already exists, the current content is returned and you MUST call again with confirm: true to overwrite.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -155,7 +155,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "notes.md", "content": "hello world" });
@@ -174,7 +174,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "sub/dir/file.md", "content": "nested" });
@@ -193,7 +193,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("existing.md"), "old content").unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "existing.md", "content": "new content" });
@@ -216,7 +216,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("existing.md"), "old content").unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({
@@ -239,7 +239,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "../escape.txt", "content": "evil" });
@@ -255,7 +255,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "/tmp/evil.txt", "content": "data" });
@@ -271,7 +271,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "", "content": "data" });
@@ -287,7 +287,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "file.md", "content": "" });
@@ -308,7 +308,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, home.join("linked_dir")).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "linked_dir/file.md", "content": "data" });
@@ -329,7 +329,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("file.md"), "original").unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({
@@ -354,7 +354,7 @@ mod tests {
         fs::write(&outside, "secret data").unwrap();
         std::os::unix::fs::symlink(&outside, home.join("link.md")).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
 
@@ -376,7 +376,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "sub/file.md", "content": "data" });
@@ -403,7 +403,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("existing.md"), "old").unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "existing.md", "content": "new" });
@@ -429,7 +429,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "/tmp/outside.txt", "content": "data" });
@@ -449,7 +449,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "../escape.txt", "content": "data" });
@@ -469,7 +469,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteAgentFileTool;
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(&home);
         let input = serde_json::json!({ "path": "file..v2.md", "content": "version 2" });

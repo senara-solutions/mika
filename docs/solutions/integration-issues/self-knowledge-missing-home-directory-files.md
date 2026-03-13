@@ -26,7 +26,7 @@ issue: https://github.com/senara-solutions/mika/issues/95
 
 ## Problem
 
-When asked "what gets adjusted when I change your personality?", the agent answered "only core memory" without checking `soul.md` or `identity.toml`. The agent has tools to inspect its own state (`list_home_files`, `read_home_file`, `get_documentation`) but nothing told it to use them for questions about its configuration files.
+When asked "what gets adjusted when I change your personality?", the agent answered "only core memory" without checking `soul.md` or `identity.toml`. The agent has tools to inspect its own state (`list_agent_files`, `read_agent_file`, `get_documentation`) but nothing told it to use them for questions about its configuration files.
 
 The `self-knowledge` skill (`always_on = true`) only instructed the agent to use `get_documentation` for system documentation topics (architecture, CLI, API, etc.). It said nothing about checking home directory files. The base system prompt had "Never fabricate information" but no specific self-knowledge file-checking instruction.
 
@@ -44,7 +44,7 @@ Added a single instruction to `write_instructions_section()` in `prompt.rs`:
 
 ```
 When asked about your own configuration, setup files, or how specific parts of you work,
-check your own files (list_home_files, read_home_file) and documentation (get_documentation)
+check your own files (list_agent_files, read_agent_file) and documentation (get_documentation)
 before answering. Never guess about your own internals.
 ```
 
@@ -60,7 +60,7 @@ Expanded `system_prompt.md` with:
 
 1. **Layered reinforcement over single-point instruction.** The base prompt (~30 tokens) provides a broad catch-all. The skill prompt (~200 tokens) provides detailed behavioral guidance with examples. This ensures coverage even if the skill is disabled.
 
-2. **Scoped instruction with explicit exception.** Rule 3 prevents unnecessary tool calls by telling the agent that `soul.md` content is already in its system prompt. Only file-content questions ("what does your soul.md say?") need `read_home_file`.
+2. **Scoped instruction with explicit exception.** Rule 3 prevents unnecessary tool calls by telling the agent that `soul.md` content is already in its system prompt. Only file-content questions ("what does your soul.md say?") need `read_agent_file`.
 
 3. **Strong language pattern.** CRITICAL/NEVER markers with concrete bad/good examples, proven effective from the MCP hallucination fix where polite "never invent" instructions were treated as soft suggestions.
 

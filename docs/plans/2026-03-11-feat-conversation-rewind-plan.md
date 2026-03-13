@@ -331,7 +331,7 @@ Before preview or execute:
 
 The preview scans message content and metadata for:
 - **Outbound messages:** If `tool_name = 'send_message'` appears in audit events or message metadata, warn: "A message was sent to the user via Telegram during this turn. It cannot be unsent."
-- **File writes:** If `tool_name = 'write_file'` or `'write_workspace'` appears, warn: "Files were written during this turn. They will not be reverted."
+- **File writes:** If `tool_name = 'write_agent_file'` or `'write_workspace'` appears, warn: "Files were written during this turn. They will not be reverted."
 - **External API calls:** If exec handler tools ran, warn generically: "External actions were performed during this turn. They cannot be reversed."
 
 #### 2h. Explicit non-goals
@@ -407,7 +407,7 @@ File: `crates/mika-cli/src/tui/commands/handlers.rs`
 3. For `to <id>`: validate the message ID exists in the current session and is above the compaction boundary.
 4. Same preview → confirm → execute flow as `/undo`.
 
-**Confirmation UX:** Display the preview as a formatted system message. Set `app.status` to a new `AgentStatus::AwaitingConfirmation` state (or reuse input mode). The next Enter press with "y" or "Y" executes; anything else cancels. This is similar to how `write_file` overwrite confirmation works in the agent — but here it's in the TUI layer.
+**Confirmation UX:** Display the preview as a formatted system message. Set `app.status` to a new `AgentStatus::AwaitingConfirmation` state (or reuse input mode). The next Enter press with "y" or "Y" executes; anything else cancels. This is similar to how `write_agent_file` overwrite confirmation works in the agent — but here it's in the TUI layer.
 
 **Post-rewind display refresh:** After a successful rewind:
 1. Reload `app.messages` from `db.load_recent_messages(agent_id, limit)`.

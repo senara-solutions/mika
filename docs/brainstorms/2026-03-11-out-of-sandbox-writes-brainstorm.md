@@ -10,7 +10,7 @@
 
 Two prompt-level improvements (zero Rust code changes) that fix a class of agent failure where Mika:
 
-1. **Cannot write files outside `~/.mika/`** — `write_file` is sandboxed by design, but Mika defaults to it instead of using `run_shell` for user filesystem operations.
+1. **Cannot write files outside `~/.mika/`** — `write_agent_file` is sandboxed by design, but Mika defaults to it instead of using `run_shell` for user filesystem operations.
 2. **Stops short of completing multi-step tasks** — treats "adapt this script" as "draft a replacement" rather than "make the system work end-to-end."
 
 ## Why This Approach
@@ -19,14 +19,14 @@ Two prompt-level improvements (zero Rust code changes) that fix a class of agent
 
 - `run_shell` already solves out-of-sandbox writes — it just needs prompt guidance steering Mika toward it for the right cases.
 - A new `write_user_file` Rust tool adds maintenance surface for a problem the shell already handles.
-- Expanding `write_file` to accept absolute paths silently erodes the sandbox invariant — future features that should be restricted may accidentally inherit expanded permissions.
+- Expanding `write_agent_file` to accept absolute paths silently erodes the sandbox invariant — future features that should be restricted may accidentally inherit expanded permissions.
 - The confirmation step (not the filesystem restriction) is the real security boundary. This matches the industry pattern: Cursor, Claude Code, and Aider all use shell for out-of-sandbox writes with per-operation confirmation.
 
 ## Key Decisions
 
 ### Decision 1: Prompt-only, no new Rust code
 
-Keep `write_file` sandboxed to `~/.mika/`. Add system prompt guidance that explicitly directs Mika to use `run_shell` for file operations outside her home directory. The shell-exec skill's existing `system_prompt.md` is the right place for the technical guidance.
+Keep `write_agent_file` sandboxed to `~/.mika/`. Add system prompt guidance that explicitly directs Mika to use `run_shell` for file operations outside her home directory. The shell-exec skill's existing `system_prompt.md` is the right place for the technical guidance.
 
 ### Decision 2: Two-layer guidance (soul + skill)
 
@@ -71,7 +71,7 @@ Location: `crates/mika-agent/templates/skills/shell-exec/system_prompt.md`
 Two additions:
 
 **a) Out-of-sandbox write guidance:**
-> For file operations outside `~/.mika/` (the user's filesystem), use `run_shell`. The `write_file` tool is sandboxed to your home directory — it cannot reach paths like `~/.local/bin/`, `~/.config/`, etc.
+> For file operations outside `~/.mika/` (the user's filesystem), use `run_shell`. The `write_agent_file` tool is sandboxed to your home directory — it cannot reach paths like `~/.local/bin/`, `~/.config/`, etc.
 >
 > For out-of-sandbox writes, check if the target exists first. If it does, show the exact command and confirm before executing. If it doesn't, narrate what you're creating and proceed.
 
@@ -83,7 +83,7 @@ Two additions:
 
 ### 3. Existing shell-exec guidance update
 
-The current line *"Prefer the `write_file` tool over shell writes when the content fits"* needs to be scoped: it should only apply to writes within `~/.mika/`. For user filesystem paths, `run_shell` is the correct tool.
+The current line *"Prefer the `write_agent_file` tool over shell writes when the content fits"* needs to be scoped: it should only apply to writes within `~/.mika/`. For user filesystem paths, `run_shell` is the correct tool.
 
 ## What Success Looks Like
 

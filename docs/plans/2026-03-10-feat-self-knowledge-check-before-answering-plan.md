@@ -9,7 +9,7 @@ date: 2026-03-10
 
 ## Overview
 
-When asked "how do I work?" style questions about its own internals, the agent answers from incomplete knowledge instead of checking its own files first. The agent has tools to inspect its state (`list_home_files`, `read_home_file`, `get_documentation`) but nothing tells it to use them for self-knowledge questions beyond the narrow `get_documentation` topic list.
+When asked "how do I work?" style questions about its own internals, the agent answers from incomplete knowledge instead of checking its own files first. The agent has tools to inspect its state (`list_agent_files`, `read_agent_file`, `get_documentation`) but nothing tells it to use them for self-knowledge questions beyond the narrow `get_documentation` topic list.
 
 The fix is to expand the self-knowledge skill's `system_prompt.md` to also cover home directory files and add a targeted instruction in the base system prompt.
 
@@ -28,16 +28,16 @@ Two complementary changes, following the institutional learning that **layered r
 Add a new section after the existing `get_documentation` rules covering home directory file inspection. This is the primary change since the self-knowledge skill is `always_on` and already establishes the "check before answering" pattern.
 
 Add guidance for:
-- **Configuration questions** (identity, MCP servers, installed skills): Use `list_home_files` and `read_home_file`
-- **Personality/behavior questions** where the user asks about file contents: Use `read_home_file("soul.md")`
-- **Distinguish** between "what's your personality" (answerable from system prompt context — soul.md is already injected) and "what does your soul.md say" (needs `read_home_file` for literal content)
+- **Configuration questions** (identity, MCP servers, installed skills): Use `list_agent_files` and `read_agent_file`
+- **Personality/behavior questions** where the user asks about file contents: Use `read_agent_file("soul.md")`
+- **Distinguish** between "what's your personality" (answerable from system prompt context — soul.md is already injected) and "what does your soul.md say" (needs `read_agent_file` for literal content)
 - **Key files to mention by name**: `soul.md` (personality), `identity.toml` (name/emoji), `mcp.json` (MCP server config), `skills/` directory (installed skills)
 - **Fallback**: If the answer isn't in any file or documentation, say "I don't know" rather than guessing
 
 Follow the strong instruction pattern from the MCP hallucination fix:
 1. Explicit prohibition with CRITICAL/NEVER
 2. Concrete bad example (guessing about soul.md without checking)
-3. Concrete good example (calling read_home_file first)
+3. Concrete good example (calling read_agent_file first)
 
 ### Change 2: Add targeted base prompt instruction
 
@@ -45,7 +45,7 @@ Follow the strong instruction pattern from the MCP hallucination fix:
 
 Add a single bullet point after the existing "check before creating" instruction:
 
-> When asked about your own configuration, setup files, or how specific parts of you work, check your own files (`list_home_files`, `read_home_file`) and documentation (`get_documentation`) before answering. Never guess about your own internals.
+> When asked about your own configuration, setup files, or how specific parts of you work, check your own files (`list_agent_files`, `read_agent_file`) and documentation (`get_documentation`) before answering. Never guess about your own internals.
 
 This is a lightweight reinforcement — the detailed guidance lives in the skill prompt. The base prompt instruction is broad enough to catch self-knowledge questions even if the skill matcher somehow fails.
 
@@ -54,13 +54,13 @@ This is a lightweight reinforcement — the detailed guidance lives in the skill
 ## Technical Considerations
 
 - **Token budget:** The self-knowledge skill prompt addition is ~200 tokens. The base prompt addition is ~30 tokens. Both are modest given they fire on every turn (skill is `always_on`).
-- **Tool step budget:** In the worst case, a self-knowledge answer costs 2 tool steps (`list_home_files` + `read_home_file`). This is acceptable within the 10-step limit.
+- **Tool step budget:** In the worst case, a self-knowledge answer costs 2 tool steps (`list_agent_files` + `read_agent_file`). This is acceptable within the 10-step limit.
 - **No code changes beyond prompt text:** Both changes are pure prompt content — no Rust code, no schema changes, no new tools.
 - **Silent/team mode:** Silent prompt is built separately (`build_silent_prompt`). Self-knowledge skill prompt is injected via the skill matcher which runs per-user-message. Neither silent mode nor team agents are affected in a harmful way.
 
 ## Acceptance Criteria
 
-- [x] Self-knowledge skill `system_prompt.md` includes instructions about `list_home_files` / `read_home_file` for configuration questions
+- [x] Self-knowledge skill `system_prompt.md` includes instructions about `list_agent_files` / `read_agent_file` for configuration questions
 - [x] Self-knowledge skill prompt enumerates key home directory files (`soul.md`, `identity.toml`, `mcp.json`, `skills/`)
 - [x] Self-knowledge skill prompt includes bad/good examples for the home directory file pattern
 - [x] Base system prompt (`prompt.rs`) includes a "check own files before answering about yourself" instruction
@@ -88,13 +88,13 @@ Key files:
 - `skills/` — installed skill directories (each with `skill.toml` and optional `system_prompt.md`)
 
 **Rules for home directory questions:**
-1. When asked about your configuration files, MCP servers, installed skills, or identity settings, use `list_home_files` and `read_home_file` to check BEFORE answering.
-2. When asked "what does your soul.md say?" or similar file-content questions, use `read_home_file` — do NOT paraphrase from memory.
+1. When asked about your configuration files, MCP servers, installed skills, or identity settings, use `list_agent_files` and `read_agent_file` to check BEFORE answering.
+2. When asked "what does your soul.md say?" or similar file-content questions, use `read_agent_file` — do NOT paraphrase from memory.
 3. You do NOT need to re-read `soul.md` for general personality questions — its content is already in your system prompt.
 4. If you cannot find the answer in your files or documentation, say so. Never guess about your own internals.
 
 **Bad example (NEVER do this):** Being asked "what gets adjusted when I change your personality?" and answering "only core memory" without checking `soul.md` and `identity.toml`.
-**Good example:** Call `list_home_files` to see what config files exist, then `read_home_file("soul.md")` to check what personality settings are stored there, and answer accurately.
+**Good example:** Call `list_agent_files` to see what config files exist, then `read_agent_file("soul.md")` to check what personality settings are stored there, and answer accurately.
 ```
 
 ### `crates/mika-agent/src/prompt.rs`
@@ -104,7 +104,7 @@ Add after the "Before creating or storing anything" instruction (after line 337)
 ```rust
 prompt.push_str(
     "- When asked about your own configuration, setup files, or how specific parts of you work, \
-     check your own files (list_home_files, read_home_file) and documentation (get_documentation) \
+     check your own files (list_agent_files, read_agent_file) and documentation (get_documentation) \
      before answering. Never guess about your own internals.\n",
 );
 ```

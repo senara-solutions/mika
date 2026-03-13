@@ -668,10 +668,11 @@ fn check_irreversible_effects(
     }
 
     // Check for file writes
-    if audit_events
-        .iter()
-        .any(|e| e.tool_name == "write_file" || e.tool_name == "write_workspace")
-    {
+    if audit_events.iter().any(|e| {
+        e.tool_name == "write_agent_file"
+            || e.tool_name == "write_file"
+            || e.tool_name == "write_workspace"
+    }) {
         warnings
             .push("Files were written during these turns. They will not be reverted.".to_string());
     }
