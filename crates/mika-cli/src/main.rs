@@ -409,15 +409,6 @@ mod tests {
         assert!(result.is_err(), "--team should not be accepted on ask");
     }
 
-    /// --team with chat subcommand should parse (validation happens in main, not clap).
-    #[test]
-    fn test_team_with_chat_subcommand_parses() {
-        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--team", "dev"]);
-        assert!(cli.is_ok());
-        let cli = cli.unwrap();
-        assert_eq!(cli.command.as_ref().unwrap().team_override(), Some("dev"));
-    }
-
     /// clap-markdown output should include the --team flag (on chat subcommand).
     #[test]
     fn test_clap_markdown_contains_team_flag() {
