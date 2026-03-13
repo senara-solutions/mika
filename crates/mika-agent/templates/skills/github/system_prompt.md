@@ -35,7 +35,7 @@ You have access to the GitHub CLI (`gh`) via the `run_gh` tool. Use it to intera
 - List all labels: `["label", "list"]`
 - List labels (structured output): `["label", "list", "--json", "name,color,description"]`
 - Create a label: `["label", "create", "bug-triage", "--color", "d73a4a", "--description", "Needs triage"]` (color is 6-char hex WITHOUT the `#` prefix)
-- Edit a label: `["label", "edit", "old-name", "--name", "new-name", "--color", "0075ca", "--description", "Updated"]` (confirm with user first — renames propagate to all issues)
+- Edit a label: `["label", "edit", "old-name", "--name", "new-name", "--color", "0075ca", "--description", "Updated"]` (confirm with user first — renames propagate to all issues!)
 - Delete a label: `["label", "delete", "label-name", "--yes"]` (confirm with user first — removes label from all issues!)
 
 **Before applying a label** with `issue edit --add-label`, verify the label exists. Run `label list` once per conversation to check. If the label does not exist, create it first with `label create`, then apply it. Multiple labels can be applied at once: `["issue", "edit", "42", "--add-label", "bug,p1-important"]`.

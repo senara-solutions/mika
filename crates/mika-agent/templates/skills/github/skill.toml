@@ -6,4 +6,4 @@ always_on = false
 timeout_secs = 30
 
 [triggers]
-keywords = ["github", "pull request", "open pr", "my prs", "merge pr", "close pr", "check pr", "view pr", "pr status", "create issue", "file an issue", "github actions", "ci checks", "ci pipeline", "build status", "label", "labels", "add label", "create label", "remove label"]
+keywords = ["github", "pull request", "open pr", "my prs", "merge pr", "close pr", "check pr", "view pr", "pr status", "create issue", "file an issue", "github actions", "ci checks", "ci pipeline", "build status", "label", "labels", "add label", "create label", "edit label", "delete label", "remove label"]
