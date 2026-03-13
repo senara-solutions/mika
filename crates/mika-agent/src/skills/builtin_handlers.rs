@@ -30,7 +30,7 @@ static DOC_RUNTIME_STRUCTURE: &str =
 static DOC_SLASH_COMMANDS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/slash-commands.md"));
 
 /// Known builtin function names, used for startup validation.
-pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "run_gh", "web_search"];
+pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "run_gh", "run_gws", "web_search"];
 
 /// Maximum output size from a builtin handler (matches executor::MAX_OUTPUT_LEN).
 const MAX_OUTPUT_LEN: usize = 10_000;
@@ -58,6 +58,7 @@ pub async fn execute(
     let mut output = match function {
         "get_documentation" => get_documentation(&input, ctx).await,
         "run_gh" => run_gh(&input, ctx).await,
+        "run_gws" => run_gws(&input, ctx).await,
         "web_search" => web_search(&input, ctx).await,
         _ => ToolOutput::error(format!("Unknown builtin function: {function}")),
     };
@@ -398,6 +399,193 @@ async fn run_gh(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput
     }
 }
 
+/// Allowed top-level `gws` service subcommands.
+const GWS_ALLOWED_SUBCOMMANDS: &[&str] = &["gmail", "calendar", "drive"];
+
+/// Flags that must not appear in the `run_gws` command array (prevent credential smuggling).
+const GWS_BLOCKED_FLAGS: &[&str] = &["--token", "--credentials-file", "--config", "--config-dir"];
+
+/// Validated `run_gws` input — command args only (no repo equivalent).
+#[derive(Debug)]
+struct GwsArgs {
+    args: Vec<String>,
+}
+
+/// Validate and parse `run_gws` input into structured args.
+///
+/// Checks: string rejection, array parsing, empty/length/allowlist/flag-smuggling.
+fn validate_gws_input(input: &serde_json::Value) -> Result<GwsArgs, ToolOutput> {
+    // Reject string format
+    if input.get("command").is_some_and(|v| v.is_string()) {
+        return Err(ToolOutput::error(
+            "The 'command' parameter must be a JSON array of strings, not a single string. \
+             Example: [\"gmail\", \"messages\", \"list\", \"--params\", \"{\\\"maxResults\\\": 5}\"]"
+                .to_string(),
+        ));
+    }
+
+    let args: Vec<String> = match input.get("command").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut args = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item.as_str() {
+                    Some(s) => args.push(s.to_string()),
+                    None => {
+                        return Err(ToolOutput::error(
+                            "All elements in 'command' must be strings.".to_string(),
+                        ));
+                    }
+                }
+            }
+            args
+        }
+        None => {
+            return Err(ToolOutput::error(
+                "Missing or invalid 'command' parameter.".to_string(),
+            ));
+        }
+    };
+
+    if args.is_empty() {
+        return Err(ToolOutput::error(
+            "Command array must not be empty.".to_string(),
+        ));
+    }
+
+    // Enforce total input length limit
+    let total_len: usize = args.iter().map(|s| s.len()).sum();
+    if total_len > 10_000 {
+        return Err(ToolOutput::error(
+            "Command too long (max 10000 characters total).".to_string(),
+        ));
+    }
+
+    // Validate service subcommand against allowlist
+    let subcommand = &args[0];
+    if !GWS_ALLOWED_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        return Err(ToolOutput::error(format!(
+            "gws service '{subcommand}' is not allowed. \
+             Permitted: {}.",
+            GWS_ALLOWED_SUBCOMMANDS.join(", ")
+        )));
+    }
+
+    // Reject credential/config flag smuggling in the command array
+    for flag in GWS_BLOCKED_FLAGS {
+        if args.iter().any(|s| s == *flag) {
+            return Err(ToolOutput::error(format!(
+                "Do not include {flag} in the command array. \
+                 Authentication and configuration are handled automatically."
+            )));
+        }
+    }
+
+    Ok(GwsArgs { args })
+}
+
+/// Scrub all `GOOGLE_WORKSPACE_CLI_*` env vars from a child process command.
+///
+/// Prevents ambient credentials or configuration from the user's shell from
+/// leaking into the agent's gws calls. Only the explicitly configured token
+/// should be set after this scrub.
+fn scrub_gws_env_vars(cmd: &mut tokio::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("GOOGLE_WORKSPACE_CLI_") {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+/// Execute a Google Workspace CLI (`gws`) command with safe argument passing.
+///
+/// Input: `{"command": ["gmail", "messages", "list", "--params", "{\"maxResults\": 5}"]}`
+///
+/// Reads `MIKA_GOOGLE_TOKEN` from the environment and passes it as
+/// `GOOGLE_WORKSPACE_CLI_TOKEN` to the child process.
+async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput {
+    let gws_args = match validate_gws_input(input) {
+        Ok(args) => args,
+        Err(err) => return err,
+    };
+
+    // Read the Google token from Mika's environment
+    let token = match std::env::var("MIKA_GOOGLE_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            return ToolOutput::error(
+                "Google Workspace CLI token not configured. \
+                 Set MIKA_GOOGLE_TOKEN in ~/.mika/.env (get token via: gws auth login, then export)."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Build the command — each argument is a separate OS arg (no shell expansion)
+    let mut cmd = tokio::process::Command::new("gws");
+    cmd.args(&gws_args.args);
+
+    // Scrub all GOOGLE_WORKSPACE_CLI_* env vars first, then set only the token
+    scrub_gws_env_vars(&mut cmd);
+    cmd.env("GOOGLE_WORKSPACE_CLI_TOKEN", &token);
+
+    // Scrub MIKA_* env vars from the child process
+    super::executor::scrub_mika_env_vars(&mut cmd);
+
+    cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "Failed to spawn gws: {e}. Is the Google Workspace CLI installed? \
+                 Install via: cargo install --git https://github.com/googleworkspace/cli --locked"
+            ));
+        }
+    };
+
+    // Read stdout and stderr with bounded size to prevent memory exhaustion
+    let stdout_handle = child.stdout.take().expect("stdout piped");
+    let stderr_handle = child.stderr.take().expect("stderr piped");
+    let mut stdout_buf = Vec::with_capacity(MAX_OUTPUT_LEN);
+    let mut stderr_buf = Vec::with_capacity(MAX_OUTPUT_LEN);
+
+    let mut stdout_take = stdout_handle.take(MAX_OUTPUT_LEN as u64);
+    let mut stderr_take = stderr_handle.take(MAX_OUTPUT_LEN as u64);
+    let (stdout_res, stderr_res) = tokio::join!(
+        stdout_take.read_to_end(&mut stdout_buf),
+        stderr_take.read_to_end(&mut stderr_buf),
+    );
+    stdout_res.ok();
+    stderr_res.ok();
+
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            return ToolOutput::error(format!("Failed to execute gws: {e}"));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_buf);
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+
+    if status.success() {
+        ToolOutput::success(stdout.into_owned())
+    } else {
+        let code = status.code().unwrap_or(-1);
+        let mut result = format!("Exit code: {code}\n");
+        if !stderr.is_empty() {
+            result.push_str(&stderr);
+        }
+        if !stdout.is_empty() {
+            result.push_str(&stdout);
+        }
+        ToolOutput::success(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +879,136 @@ mod tests {
         let output = run_gh(&input, &ctx).await;
         assert!(output.is_error);
         assert!(output.content.contains("must be strings"));
+    }
+
+    // -- run_gws tests --
+
+    #[test]
+    fn test_run_gws_in_known_builtins() {
+        assert!(KNOWN_BUILTINS.contains(&"run_gws"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_string_rejected() {
+        let input = serde_json::json!({"command": "gmail messages list"});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("JSON array of strings"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_empty_array() {
+        let input = serde_json::json!({"command": []});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_missing_command() {
+        let input = serde_json::json!({});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_allowed_subcommands() {
+        for sub in &["gmail", "calendar", "drive"] {
+            let input = serde_json::json!({"command": [sub, "messages", "list"]});
+            let result = validate_gws_input(&input);
+            assert!(result.is_ok(), "service '{sub}' should be allowed");
+        }
+    }
+
+    #[test]
+    fn test_validate_gws_input_disallowed_subcommands() {
+        for sub in &[
+            "auth", "config", "admin", "chat", "docs", "sheets", "schema",
+        ] {
+            let input = serde_json::json!({"command": [sub, "list"]});
+            let result = validate_gws_input(&input);
+            assert!(result.is_err(), "service '{sub}' should be blocked");
+            let err = result.unwrap_err();
+            assert!(err.content.contains("is not allowed"));
+            assert!(err.content.contains("Permitted:"));
+        }
+    }
+
+    #[test]
+    fn test_validate_gws_input_token_smuggling() {
+        let input =
+            serde_json::json!({"command": ["gmail", "messages", "list", "--token", "evil"]});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("--token"));
+        assert!(err.content.contains("handled automatically"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_credentials_file_smuggling() {
+        let input =
+            serde_json::json!({"command": ["gmail", "+send", "--credentials-file", "/etc/creds"]});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("--credentials-file"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_config_smuggling() {
+        let input = serde_json::json!({"command": ["drive", "files", "list", "--config", "/tmp"]});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("--config"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_config_dir_smuggling() {
+        let input =
+            serde_json::json!({"command": ["calendar", "events", "list", "--config-dir", "/tmp"]});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("--config-dir"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_length_limit() {
+        let long_arg = "x".repeat(10_001);
+        let input = serde_json::json!({"command": ["gmail", long_arg]});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Command too long"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_non_string_elements() {
+        let input = serde_json::json!({"command": ["gmail", 42, true]});
+        let result = validate_gws_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must be strings"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gws_missing_token() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        // Ensure MIKA_GOOGLE_TOKEN is not set in test env
+        // Safety: test-only env var manipulation.
+        unsafe { std::env::remove_var("MIKA_GOOGLE_TOKEN") };
+        let input = serde_json::json!({"command": ["gmail", "messages", "list"]});
+        let output = run_gws(&input, &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not configured"));
+        assert!(output.content.contains("MIKA_GOOGLE_TOKEN"));
     }
 
     /// Verify crate-local fallback copies match workspace-root docs.

@@ -98,6 +98,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Brave Search API key",
     },
     ConfigKeyInfo {
+        key: "google_token",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GOOGLE_TOKEN"),
+        secret: true,
+        description: "Google Workspace CLI token (for google-workspace skill)",
+    },
+    ConfigKeyInfo {
         key: "internal_token",
         backend: ConfigBackend::Env,
         env_var: Some("MIKA_INTERNAL_TOKEN"),
@@ -168,6 +175,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "anthropic_api_key" => settings.anthropic_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
+        "google_token" => settings.google_token.clone(),
         "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
         "internal_token" => settings
@@ -241,6 +249,10 @@ pub struct Settings {
     /// Brave Search API key (optional; enables web_search builtin skill)
     #[serde(default)]
     pub brave_api_key: Option<String>,
+
+    /// Google Workspace CLI token (optional; enables google-workspace builtin skill)
+    #[serde(default)]
+    pub google_token: Option<String>,
 
     /// Optional log file path for mika-server (maps to MIKA_SERVER_LOG_FILE)
     #[serde(default)]
@@ -416,6 +428,10 @@ impl std::fmt::Debug for Settings {
             .field(
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "google_token",
+                &self.google_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "investigate_github_token",
