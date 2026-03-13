@@ -892,10 +892,12 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
 
     // Show placeholder when input is empty
     if lines.iter().all(|l| l.is_empty()) && !app.history.is_browsing() {
-        let placeholder = Paragraph::new(Span::styled(
-            "Type a message...",
-            Style::default().fg(Color::DarkGray),
-        ));
+        let hint = if app.is_team_mode() {
+            super::app::PLACEHOLDER_TEAM_GOAL
+        } else {
+            super::app::PLACEHOLDER_MESSAGE
+        };
+        let placeholder = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)));
         f.render_widget(placeholder, textarea_area);
         f.set_cursor_position(Position::new(textarea_area.x, textarea_area.y));
         return;

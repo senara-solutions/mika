@@ -384,9 +384,23 @@ fn handle_key_autocomplete(app: &mut App<'_>, key: KeyEvent) {
             handle_tab_completion(app);
         }
 
-        // Enter: accept selected completion
-        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+        // Enter: accept selected completion (only plain Enter, not Shift/Alt+Enter)
+        KeyCode::Enter
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
             handle_enter_completion(app);
+        }
+
+        // Shift+Enter or Alt+Enter: dismiss autocomplete and insert newline
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            app.autocomplete.dismiss();
+            app.textarea.input(key);
         }
 
         // Any other key: pass to textarea, then update autocomplete filter
@@ -584,10 +598,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
             app.clear_attachments();
             return;
         }
-        app.textarea = tui_textarea::TextArea::default();
-        app.textarea
-            .set_cursor_line_style(ratatui::style::Style::default());
-        app.textarea.set_placeholder_text("Type a message...");
+        app.reset_textarea();
         app.history.reset();
         return;
     }
@@ -602,8 +613,14 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
         return;
     }
 
-    // Enter sends message or executes slash command (only when idle and not shift-held)
-    if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+    // Enter sends message or executes slash command (only when idle and not shift/alt-held)
+    // Shift+Enter and Alt+Enter insert a newline instead (Alt+Enter as universal fallback
+    // for terminals where Shift+Enter is indistinguishable from Enter)
+    if key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+    {
         if app.status == AgentStatus::Idle {
             app.send_message();
         }
