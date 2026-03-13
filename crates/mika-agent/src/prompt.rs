@@ -236,6 +236,13 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          always disclose the failure, what you did to recover, any side effects, \
          and the final confirmed state — never just say \"Done.\"\n",
     );
+    prompt.push_str(
+        "- **Confirmation before action:** When the user asks an informational question \
+         (e.g., \"can you list...\", \"what are...\", \"show me...\"), answer the question \
+         and stop. Do not interpret questions as implicit requests to start multi-step \
+         workflows. If a follow-up action may be useful, suggest it and wait for \
+         confirmation before proceeding.\n",
+    );
     let section_names = core_memory_section_names();
     write!(
         prompt,
@@ -1614,5 +1621,27 @@ notify = true
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("first check existing state"));
         assert!(prompt.contains("rather than creating a duplicate"));
+    }
+
+    #[test]
+    fn test_prompt_includes_confirmation_before_action_guardrail() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            identity: &identity,
+            soul_content: "",
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("Confirmation before action"));
+        assert!(prompt.contains("Do not interpret questions as implicit requests"));
     }
 }

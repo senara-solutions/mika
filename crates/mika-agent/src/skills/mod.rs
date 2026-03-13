@@ -76,6 +76,31 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Log warnings for any declared dependency that doesn't match an installed skill.
+    ///
+    /// Call after `apply_overrides()` to catch misconfigured `dependencies` fields
+    /// in `skill.toml` files. Does not fail — only emits `tracing::warn` for each
+    /// unresolvable dependency.
+    pub fn validate_dependencies(&self) {
+        let names: std::collections::HashSet<String> = self
+            .skills
+            .iter()
+            .map(|e| e.manifest.skill.name.to_lowercase())
+            .collect();
+
+        for entry in &self.skills {
+            for dep in &entry.manifest.skill.dependencies {
+                if !names.contains(&dep.to_lowercase()) {
+                    tracing::warn!(
+                        skill = %entry.manifest.skill.name,
+                        dependency = %dep,
+                        "skill declares dependency on unknown skill"
+                    );
+                }
+            }
+        }
+    }
+
     /// Apply database-backed overrides to skill entries.
     ///
     /// For each override, finds the matching skill by name (case-insensitive)
@@ -125,6 +150,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_entry(name: &str, always_on: bool, enabled: bool) -> SkillEntry {
+        make_entry_with_deps(name, always_on, enabled, &[])
+    }
+
+    fn make_entry_with_deps(
+        name: &str,
+        always_on: bool,
+        enabled: bool,
+        deps: &[&str],
+    ) -> SkillEntry {
         SkillEntry {
             manifest: SkillManifest {
                 skill: SkillInfo {
@@ -133,6 +167,7 @@ mod tests {
                     version: String::new(),
                     always_on,
                     timeout_secs: 30,
+                    dependencies: deps.iter().map(|s| s.to_string()).collect(),
                 },
                 triggers: Triggers { keywords: vec![] },
             },
@@ -361,5 +396,59 @@ mod tests {
         }]);
 
         assert_eq!(registry.always_on_skills().len(), 2);
+    }
+
+    #[test]
+    fn test_validate_dependencies_silent_on_valid() {
+        let registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![
+                make_entry_with_deps("self-dev", true, true, &["tmux"]),
+                make_entry("tmux", false, true),
+            ],
+        };
+        // Should not panic — valid dependency
+        registry.validate_dependencies();
+    }
+
+    #[test]
+    fn test_validate_dependencies_warns_on_missing() {
+        let registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![make_entry_with_deps(
+                "self-dev",
+                true,
+                true,
+                &["nonexistent"],
+            )],
+        };
+        // Should not panic — logs warning but doesn't fail
+        registry.validate_dependencies();
+    }
+
+    #[test]
+    fn test_validate_dependencies_case_insensitive() {
+        let registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![
+                make_entry_with_deps("self-dev", true, true, &["TMUX"]),
+                make_entry("tmux", false, true),
+            ],
+        };
+        // Should not warn — case-insensitive match
+        registry.validate_dependencies();
+    }
+
+    #[test]
+    fn test_validate_dependencies_no_deps_no_warn() {
+        let registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![
+                make_entry("web-search", true, true),
+                make_entry("tmux", false, true),
+            ],
+        };
+        // No dependencies declared — nothing to validate
+        registry.validate_dependencies();
     }
 }

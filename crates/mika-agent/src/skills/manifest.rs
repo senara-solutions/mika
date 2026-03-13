@@ -31,6 +31,10 @@ pub struct SkillInfo {
     pub always_on: bool,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Other skills that should be loaded when this skill is active.
+    /// One level only — no transitive resolution.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 /// Keyword triggers that control when a skill is injected into a turn.
@@ -166,6 +170,33 @@ mod tests {
             always_on = true
         "#;
         assert!(toml::from_str::<SkillManifest>(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_parse_dependencies() {
+        let toml_str = r#"
+            [skill]
+            name = "self-dev"
+            description = "Self-development skill"
+            always_on = true
+            dependencies = ["tmux", "shell-exec"]
+
+            [triggers]
+            keywords = ["dev"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.skill.dependencies, vec!["tmux", "shell-exec"]);
+    }
+
+    #[test]
+    fn test_parse_no_dependencies_defaults_empty() {
+        let toml_str = r#"
+            [skill]
+            name = "minimal"
+            description = "No deps"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.skill.dependencies.is_empty());
     }
 
     #[test]

@@ -1907,6 +1907,7 @@ mod tests {
                     version: "0.1.0".to_string(),
                     always_on: false,
                     timeout_secs: timeout,
+                    dependencies: vec![],
                 },
                 triggers: Triggers {
                     keywords: vec![name.to_string()],

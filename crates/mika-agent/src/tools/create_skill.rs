@@ -215,6 +215,7 @@ impl Tool for CreateSkillTool {
                 version: "0.1.0".to_string(),
                 always_on,
                 timeout_secs: 30,
+                dependencies: vec![],
             },
             triggers: Triggers { keywords },
         };
