@@ -121,6 +121,7 @@ existing shell environment variables. File permissions are set to `0600`.
 MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
 MIKA_OPENAI_API_KEY=sk-...
 MIKA_BRAVE_API_KEY=BSA...
+MIKA_GOOGLE_TOKEN=ya29...
 MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...
 MIKA_GITHUB_REPO=owner/repo
 ```
@@ -243,6 +244,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
+| `google_token` | `Option<String>` | None | `MIKA_GOOGLE_TOKEN` | Google Workspace CLI token for `google-workspace` builtin skill (Gmail, Calendar, Drive). Get via `gws auth login` then export. |
 | `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
@@ -259,7 +261,7 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `investigate_github_token`, and `otlp_auth_header` are redacted in
+- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `google_token`, `investigate_github_token`, and `otlp_auth_header` are redacted in
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
@@ -410,6 +412,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
+| `MIKA_GOOGLE_TOKEN` | No | Google Workspace CLI token for google-workspace skill |
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |

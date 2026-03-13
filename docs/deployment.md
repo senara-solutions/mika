@@ -52,7 +52,7 @@ docker build -f Dockerfile.agent -t mika-agent:dev .
 
 Build details:
 - **Builder:** `rust:1.93-slim` with gcc, libc-dev, pkg-config (no OpenSSL — uses rustls)
-- **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, and gh (GitHub CLI v2.65.0 with SHA256 checksum verification)
+- **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, gh (GitHub CLI v2.65.0), and gws (Google Workspace CLI v0.13.3) — both with SHA256 checksum verification
 - **Binary:** `mika-server` (Axum HTTP server)
 - **User:** `mika` (UID 1000), non-root
 - **Port:** 8080
