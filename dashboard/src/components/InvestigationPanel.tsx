@@ -1,36 +1,45 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { X, Search, Send, Loader2, Wrench } from 'lucide-react'
+import { X, Search, Send, Loader2, Wrench, Trash2, MessageSquare, Cpu } from 'lucide-react'
 import { streamInvestigation, type InvestigateEvent } from '../api/investigate.ts'
 import CopyButton from './CopyButton.tsx'
+import {
+  type InvestigationScope,
+  type ChatMessage,
+  buildScopeKey,
+  loadInvestigation,
+  saveInvestigation,
+  clearInvestigation,
+  clearAllInvestigations,
+} from '../lib/investigationStorage.ts'
 
-export interface InvestigationContext {
-  messageId: number
-  toolCallIndex?: number
-  toolName?: string
-  sessionId: string
-  agentId: string
-}
-
-interface ChatMessage {
-  role: 'user' | 'assistant'
-  content: string
-  toolUses?: { name: string; status: string; summary?: string }[]
-}
+export type { InvestigationScope }
 
 export default function InvestigationPanel({
-  context,
+  scope,
   onClose,
 }: {
-  context: InvestigationContext
+  scope: InvestigationScope
   onClose: () => void
 }) {
+  const scopeKey = buildScopeKey(scope)
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [restored, setRestored] = useState(false)
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [showClearMenu, setShowClearMenu] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Load history from localStorage on mount
+  useEffect(() => {
+    const saved = loadInvestigation(scopeKey)
+    if (saved && saved.length > 0) {
+      setMessages(saved)
+      setRestored(true)
+    }
+  }, [scopeKey])
 
   // Auto-scroll on new content
   useEffect(() => {
@@ -45,7 +54,10 @@ export default function InvestigationPanel({
   // Escape to close
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        setShowClearMenu(false)
+        onClose()
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -58,16 +70,26 @@ export default function InvestigationPanel({
     }
   }, [])
 
+  // Close clear menu on click outside
+  useEffect(() => {
+    if (!showClearMenu) return
+    const handler = () => setShowClearMenu(false)
+    window.addEventListener('click', handler)
+    return () => window.removeEventListener('click', handler)
+  }, [showClearMenu])
+
   const sendQuestion = useCallback(
     async (question: string) => {
       if (!question.trim() || streaming) return
 
       setError(null)
       setStreaming(true)
+      setRestored(false)
 
       // Add user message
       const userMsg: ChatMessage = { role: 'user', content: question }
-      setMessages((prev) => [...prev, userMsg])
+      const updatedMessages = [...messages, userMsg]
+      setMessages(updatedMessages)
       setInput('')
       if (inputRef.current) {
         inputRef.current.style.height = 'auto'
@@ -121,7 +143,6 @@ export default function InvestigationPanel({
                 existing.summary = event.summary
               }
             }
-            // Update the assistant message with tool use info
             setMessages((prev) => {
               const updated = [...prev]
               const last = updated[updated.length - 1]
@@ -142,9 +163,18 @@ export default function InvestigationPanel({
             })
             break
           case 'error':
-            setError(event.message)
+            if (event.message.includes('429') || event.message.toLowerCase().includes('already running')) {
+              setError('Previous investigation is still winding down, please try again in a moment.')
+            } else {
+              setError(event.message)
+            }
             break
           case 'done':
+            // Persist to localStorage after complete response
+            setMessages((prev) => {
+              saveInvestigation(scope, prev)
+              return prev
+            })
             break
         }
       }
@@ -152,8 +182,8 @@ export default function InvestigationPanel({
       try {
         await streamInvestigation(
           {
-            message_id: context.messageId,
-            tool_call_index: context.toolCallIndex,
+            message_id: scope.messageId ?? 0,
+            tool_call_index: scope.toolCallIndex,
             question,
             history,
           },
@@ -162,13 +192,18 @@ export default function InvestigationPanel({
         )
       } catch (e) {
         if (e instanceof DOMException && e.name === 'AbortError') return
-        setError(e instanceof Error ? e.message : 'Investigation failed')
+        const msg = e instanceof Error ? e.message : 'Investigation failed'
+        if (msg.includes('429') || msg.toLowerCase().includes('busy')) {
+          setError('Previous investigation is still winding down, please try again in a moment.')
+        } else {
+          setError(msg)
+        }
       } finally {
         setStreaming(false)
         abortRef.current = null
       }
     },
-    [context, messages, streaming],
+    [scope, messages, streaming],
   )
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -176,9 +211,36 @@ export default function InvestigationPanel({
     sendQuestion(input)
   }
 
-  const contextLabel = context.toolName
-    ? `${context.toolName} (step ${(context.toolCallIndex ?? 0) + 1})`
-    : 'Message'
+  const handleClearCurrent = () => {
+    clearInvestigation(scopeKey)
+    setMessages([])
+    setRestored(false)
+    setShowClearMenu(false)
+  }
+
+  const handleClearAll = () => {
+    clearAllInvestigations()
+    setMessages([])
+    setRestored(false)
+    setShowClearMenu(false)
+  }
+
+  // Build scope label
+  const scopeLabel = (() => {
+    if (scope.type === 'session') return 'Full Session'
+    if (scope.type === 'tool_call' && scope.toolName) {
+      return `Tool: ${scope.toolName} (step ${(scope.toolCallIndex ?? 0) + 1})`
+    }
+    return `Message #${scope.messageId}`
+  })()
+
+  const scopeIcon = scope.type === 'session' ? (
+    <MessageSquare size={10} />
+  ) : scope.type === 'tool_call' ? (
+    <Wrench size={10} />
+  ) : (
+    <Cpu size={10} />
+  )
 
   return (
     <>
@@ -193,25 +255,70 @@ export default function InvestigationPanel({
             <Search size={14} className="text-accent" />
             <span className="text-sm font-semibold text-heading">Investigation</span>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded hover:bg-white/[0.05] text-muted/60 transition-colors"
-          >
-            <X size={16} />
-          </button>
+          <div className="flex items-center gap-1">
+            {/* Clear menu */}
+            <div className="relative">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setShowClearMenu((v) => !v)
+                }}
+                className="p-1 rounded hover:bg-white/[0.05] text-muted/40 hover:text-muted/70 transition-colors"
+                title="Clear history"
+              >
+                <Trash2 size={14} />
+              </button>
+              {showClearMenu && (
+                <div className="absolute right-0 top-full mt-1 bg-bg-card border border-white/[0.08] rounded-lg shadow-xl py-1 z-50 min-w-[180px]">
+                  <button
+                    onClick={handleClearCurrent}
+                    className="w-full text-left px-3 py-1.5 text-xs text-muted/70 hover:bg-white/[0.05] hover:text-heading transition-colors"
+                  >
+                    Clear this investigation
+                  </button>
+                  <button
+                    onClick={handleClearAll}
+                    className="w-full text-left px-3 py-1.5 text-xs text-red-400/70 hover:bg-red-400/5 hover:text-red-400 transition-colors"
+                  >
+                    Clear all investigations
+                  </button>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={onClose}
+              className="p-1 rounded hover:bg-white/[0.05] text-muted/60 transition-colors"
+            >
+              <X size={16} />
+            </button>
+          </div>
         </div>
 
-        {/* Context bar */}
+        {/* Scope badge */}
         <div className="px-4 py-2 border-b border-white/[0.04] bg-white/[0.02]">
-          <div className="text-[10px] text-muted/40 uppercase tracking-wider">Investigating</div>
-          <div className="text-xs text-muted/70 font-mono mt-0.5">{contextLabel}</div>
+          <div className="flex items-center gap-2">
+            <div className="text-[10px] text-muted/40 uppercase tracking-wider">Investigating</div>
+            <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent/80 font-medium">
+              {scopeIcon}
+              {scopeLabel}
+            </span>
+          </div>
           <div className="text-[10px] text-muted/30 mt-0.5">
-            Session: {context.sessionId.slice(0, 12)}... &middot; Agent: {context.agentId}
+            Session: {scope.sessionId.slice(0, 12)}... &middot; Agent: {scope.agentId}
           </div>
         </div>
 
         {/* Messages */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+          {/* Restored indicator */}
+          {restored && messages.length > 0 && (
+            <div className="flex items-center gap-2 text-[10px] text-muted/30">
+              <div className="flex-1 border-t border-white/[0.04]" />
+              <span>Restored from previous investigation</span>
+              <div className="flex-1 border-t border-white/[0.04]" />
+            </div>
+          )}
+
           {messages.length === 0 && !streaming && (
             <div className="text-center text-muted/30 text-sm py-12">
               Ask a question about this agent's behavior

@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
 import EmptyState from '../components/EmptyState.tsx'
 import InvestigationPanel, {
-  type InvestigationContext,
+  type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
 import { formatTimestamp } from '../utils/formatTime.ts'
 import { eventTypeBadge, eventTypeColor } from '../utils/badges.ts'
@@ -430,7 +430,7 @@ export default function TraceDetail() {
   const { traceId } = useParams<{ traceId: string }>()
   const { data: events, isLoading: eventsLoading, error: eventsError } = useTraceDetail(traceId ?? '')
   const { data: messages, isLoading: messagesLoading, error: messagesError } = useTraceMessages(traceId ?? '')
-  const [investigationCtx, setInvestigationCtx] = useState<InvestigationContext | null>(null)
+  const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
 
   const openInvestigation = (
     messageId: number,
@@ -439,7 +439,8 @@ export default function TraceDetail() {
   ) => {
     // Find the message to get session_id and agent_id
     const msg = messages?.find((m) => m.id === messageId)
-    setInvestigationCtx({
+    setInvestigationScope({
+      type: toolCallIndex != null ? 'tool_call' : 'message',
       messageId,
       toolCallIndex,
       toolName,
@@ -539,10 +540,10 @@ export default function TraceDetail() {
         </div>
       )}
 
-      {investigationCtx && (
+      {investigationScope && (
         <InvestigationPanel
-          context={investigationCtx}
-          onClose={() => setInvestigationCtx(null)}
+          scope={investigationScope}
+          onClose={() => setInvestigationScope(null)}
         />
       )}
     </div>
