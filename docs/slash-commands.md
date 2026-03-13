@@ -468,6 +468,7 @@ Complete key bindings for the Mika TUI. These apply regardless of slash commands
 |-------------|-------------------------------------------------------|
 | Enter       | Send message to agent, or execute slash command        |
 | Shift+Enter | Insert newline in input (multi-line editing)           |
+| Alt+Enter   | Insert newline (universal fallback for terminals where Shift+Enter is not detected) |
 | Esc         | Clear input field and reset input history index        |
 | Tab         | Open autocomplete popup (when input starts with `/`). In argument territory, triggers argument completion. |
 | PageUp      | Scroll message history up (5 lines)                    |
@@ -487,5 +488,6 @@ agent is busy processing a turn, Enter has no effect.
 | Down       | Next suggestion (wraps around)                  |
 | Up         | Previous suggestion (wraps around)              |
 | Enter      | Accept selection (execute argless commands, or transition to argument input for commands with args) |
+| Shift+Enter / Alt+Enter | Dismiss popup and insert newline (switches to multi-line editing) |
 | Esc        | Dismiss popup (keeps typed text)                 |
 | Any other  | Passes to input field; popup re-filters          |
