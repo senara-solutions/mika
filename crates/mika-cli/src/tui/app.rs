@@ -373,10 +373,9 @@ impl TeamDashboardState {
 }
 
 /// Placeholder text for the message input field (normal mode).
-pub const PLACEHOLDER_MESSAGE: &str = "Type a message... (Shift+Enter or Alt+Enter for new line)";
+pub const PLACEHOLDER_MESSAGE: &str = "Type a message... (Alt+Enter for new line)";
 /// Placeholder text for the message input field (team mode).
-pub const PLACEHOLDER_TEAM_GOAL: &str =
-    "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)";
+pub const PLACEHOLDER_TEAM_GOAL: &str = "Type a goal for the team... (Alt+Enter for new line)";
 
 /// Main application state.
 pub struct App<'a> {

@@ -86,9 +86,9 @@ Eliminated 7x duplication by introducing two constants in `app.rs`:
 
 ```rust
 pub const PLACEHOLDER_MESSAGE: &str =
-    "Type a message... (Shift+Enter or Alt+Enter for new line)";
+    "Type a message... (Alt+Enter for new line)";
 pub const PLACEHOLDER_TEAM_GOAL: &str =
-    "Type a goal for the team... (Shift+Enter or Alt+Enter for new line)";
+    "Type a goal for the team... (Alt+Enter for new line)";
 ```
 
 Used in: `App::new()`, `App::new_team()`, `reset_textarea()`, `history_previous()`, `history_next()`, and `ui.rs` custom renderer.
@@ -123,6 +123,21 @@ let placeholder = Paragraph::new(Span::styled(hint, Style::default().fg(Color::D
 ### 6. Make history navigation team-mode-aware
 
 Both `history_previous()` and `history_next()` now select the correct placeholder based on `is_team_mode()`.
+
+## Decision: Alt+Enter as primary multi-line input method
+
+**Chose Alt+Enter as the sole advertised method.** Shift+Enter remains in the code as best-effort but is no longer shown in placeholder text or documented as primary.
+
+**Alternative considered: Kitty keyboard protocol.** crossterm 0.28 supports `PushKeyboardEnhancementFlags` which would enable proper Shift+Enter detection on modern terminals (kitty, foot, WezTerm, recent alacritty). Rejected because:
+
+1. It changes how ALL key events are reported — high risk of breaking existing key handling across the TUI
+2. Still wouldn't work on non-supporting terminals (basic xterm, older GNOME Terminal)
+3. Would require extensive cross-terminal testing
+4. Not worth the complexity given Alt+Enter already works universally
+
+**Backslash line continuation** was a false report (see Root Cause above). Backslash passes through as a literal character — no change needed.
+
+Placeholder text updated from `"(Shift+Enter or Alt+Enter for new line)"` to `"(Alt+Enter for new line)"`. Documentation updated to list Alt+Enter as primary, Shift+Enter as secondary with terminal caveat.
 
 ## Prevention Strategies
 
