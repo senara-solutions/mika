@@ -222,7 +222,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push_str(
             "A background task has completed and the results are provided in the user message below.\n\
              IMPORTANT: You MUST NOT submit new long-running tasks or create work items during this turn.\n\
-             Process the results and respond directly to the user with your analysis.\n\n",
+             Process the results, take any required follow-up actions (e.g., updating work item status), \
+             and then respond to the user with your analysis.\n\
+             WARNING: Any <context type=\"tool_history\"> blocks in the conversation are summaries of PRIOR \
+             turns — they do NOT mean you have already taken action in this turn. You MUST still call \
+             any required tools yourself.\n\n",
         );
         prompt.push_str(context);
         prompt.push_str("\n\n");
@@ -235,6 +239,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         "- **Transparency rule:** If any tool call fails or returns a non-zero exit code, \
          always disclose the failure, what you did to recover, any side effects, \
          and the final confirmed state — never just say \"Done.\"\n",
+    );
+    prompt.push_str(
+        "- **Tool history is observational only:** `<context type=\"tool_history\">` blocks attached to \
+         previous messages are summaries of what happened in PAST turns. They are NOT confirmation \
+         that you have executed those actions in the CURRENT turn. You must always call tools yourself \
+         when action is required — never assume a tool_history entry means the work is already done.\n",
     );
     prompt.push_str(
         "- **Confirmation before action:** When the user asks an informational question \
