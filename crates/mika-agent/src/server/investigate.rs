@@ -632,6 +632,7 @@ async fn build_investigation_context(
 
     let mut prompt = String::from(
         "You are an investigation assistant analyzing Mika agent behavior. \
+         Mika is written in Rust — any code suggestions in issues should use Rust idioms and crates. \
          You have read-only access to the database to help answer questions \
          about why the agent made certain decisions.\n\n\
          Use your tools to dig deeper when needed — query the timeline, load messages, \
