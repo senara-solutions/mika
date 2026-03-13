@@ -32,7 +32,8 @@ interface InvestigationStore {
 export function buildScopeKey(scope: InvestigationScope): string {
   const base = `sess:${scope.sessionId}:agent:${scope.agentId}`
   if (scope.type === 'session') return `${base}:session`
-  if (scope.type === 'tool_call' && scope.messageId != null && scope.toolCallIndex != null) {
+  if (scope.messageId == null) return `${base}:session`
+  if (scope.type === 'tool_call' && scope.toolCallIndex != null) {
     return `${base}:msg:${scope.messageId}:tool:${scope.toolCallIndex}`
   }
   return `${base}:msg:${scope.messageId}`

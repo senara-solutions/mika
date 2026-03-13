@@ -29,8 +29,12 @@ export default function InvestigationPanel({
   const [error, setError] = useState<string | null>(null)
   const [showClearMenu, setShowClearMenu] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
+  const messagesRef = useRef<ChatMessage[]>([])
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Keep messagesRef in sync
+  useEffect(() => { messagesRef.current = messages }, [messages])
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -78,6 +82,13 @@ export default function InvestigationPanel({
     return () => window.removeEventListener('click', handler)
   }, [showClearMenu])
 
+  const friendlyError = (msg: string): string => {
+    if (msg.includes('429') || msg.toLowerCase().includes('already running') || msg.toLowerCase().includes('busy')) {
+      return 'Previous investigation is still winding down, please try again in a moment.'
+    }
+    return msg
+  }
+
   const sendQuestion = useCallback(
     async (question: string) => {
       if (!question.trim() || streaming) return
@@ -86,20 +97,18 @@ export default function InvestigationPanel({
       setStreaming(true)
       setRestored(false)
 
-      // Add user message
+      // Add user message using functional update to avoid stale closure
       const userMsg: ChatMessage = { role: 'user', content: question }
-      const updatedMessages = [...messages, userMsg]
-      setMessages(updatedMessages)
+      // Capture history from ref before state update
+      const history = messagesRef.current.map((m) => ({
+        role: m.role,
+        content: m.content,
+      }))
+      setMessages((prev) => [...prev, userMsg])
       setInput('')
       if (inputRef.current) {
         inputRef.current.style.height = 'auto'
       }
-
-      // Build history from previous messages
-      const history = messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      }))
 
       // Start streaming
       const controller = new AbortController()
@@ -163,26 +172,25 @@ export default function InvestigationPanel({
             })
             break
           case 'error':
-            if (event.message.includes('429') || event.message.toLowerCase().includes('already running')) {
-              setError('Previous investigation is still winding down, please try again in a moment.')
-            } else {
-              setError(event.message)
-            }
+            setError(friendlyError(event.message))
             break
           case 'done':
             // Persist to localStorage after complete response
-            setMessages((prev) => {
-              saveInvestigation(scope, prev)
-              return prev
-            })
+            saveInvestigation(scope, messagesRef.current)
             break
         }
+      }
+
+      if (scope.messageId == null) {
+        setError('No message available for investigation')
+        setStreaming(false)
+        return
       }
 
       try {
         await streamInvestigation(
           {
-            message_id: scope.messageId ?? 0,
+            message_id: scope.messageId,
             tool_call_index: scope.toolCallIndex,
             question,
             history,
@@ -192,18 +200,13 @@ export default function InvestigationPanel({
         )
       } catch (e) {
         if (e instanceof DOMException && e.name === 'AbortError') return
-        const msg = e instanceof Error ? e.message : 'Investigation failed'
-        if (msg.includes('429') || msg.toLowerCase().includes('busy')) {
-          setError('Previous investigation is still winding down, please try again in a moment.')
-        } else {
-          setError(msg)
-        }
+        setError(friendlyError(e instanceof Error ? e.message : 'Investigation failed'))
       } finally {
         setStreaming(false)
         abortRef.current = null
       }
     },
-    [scope, messages, streaming],
+    [scope, streaming],
   )
 
   const handleSubmit = (e: React.FormEvent) => {
