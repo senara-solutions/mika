@@ -79,8 +79,9 @@ impl Commands {
             Commands::Mcp(args) => args.agent_flag.agent.as_deref(),
             Commands::Tasks(args) => args.agent_flag.agent.as_deref(),
             Commands::Agents(args) => args.agent_flag.agent.as_deref(),
-            // Setup, Doctor, Teams — no agent override
-            _ => None,
+            // No agent override — listed explicitly so adding a new Commands variant
+            // produces a compile error, forcing a conscious scoping decision.
+            Commands::Setup { .. } | Commands::Doctor(_) | Commands::Teams(_) => None,
         }
     }
 
@@ -88,7 +89,19 @@ impl Commands {
     pub fn team_override(&self) -> Option<&str> {
         match self {
             Commands::Chat(args) => args.team.as_deref(),
-            _ => None,
+            // Listed explicitly for compile-time safety on new variants.
+            Commands::Setup { .. }
+            | Commands::Ask(_)
+            | Commands::Memory(_)
+            | Commands::Reminders(_)
+            | Commands::Status(_)
+            | Commands::Config(_)
+            | Commands::Skills(_)
+            | Commands::Mcp(_)
+            | Commands::Tasks(_)
+            | Commands::Agents(_)
+            | Commands::Doctor(_)
+            | Commands::Teams(_) => None,
         }
     }
 }
