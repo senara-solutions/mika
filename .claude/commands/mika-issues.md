@@ -17,7 +17,7 @@ $ARGUMENTS
    - Classify as `bug`, `enhancement`, `documentation`, or `question`
    - Write a clear, concise title
    - Write the body using the appropriate template (Bug, Enhancement, or Documentation/Question — see `/mika-issue` for formats)
-   - Select labels: type + priority (`p0-critical` / `p1-important` / `p2-normal` / `p3-nice-to-have`) + component (`agent-core` / `tui` / `team-engine` / `skill` / `gateway` / `infrastructure`)
+   - Select labels from `.github/labels.yml` (canonical source): type + priority (`p0-critical` / `p1-important` / `p2-normal` / `p3-nice-to-have`) + component (`agent-core` / `tui` / `team-engine` / `skill` / `gateway` / `infrastructure` / `dashboard`)
    - Assign a milestone if a matching open one exists
 3. **Present a numbered summary table** for review:
 

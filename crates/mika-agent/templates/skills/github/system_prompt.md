@@ -47,6 +47,14 @@ If `label create` fails because the label already exists, this is expected — s
 - List releases: `["release", "list", "--limit", "5"]`
 - View latest release: `["release", "view", "--latest"]`
 
+## Mika Label Taxonomy
+
+When creating or labelling issues, use these labels (defined in `.github/labels.yml`):
+
+**Type** (pick one): `bug`, `enhancement`, `documentation`, `question`
+**Priority** (pick one): `p0-critical`, `p1-important`, `p2-normal`, `p3-nice-to-have`
+**Component** (pick one or more): `agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`, `dashboard`
+
 ## Guidelines
 
 - Use `--json` and `--jq` for structured output when parsing results. Example: `["pr", "list", "--json", "number,title,state", "--jq", ".[] | \"\\(.number): \\(.title) [\\(.state)]\""]`

@@ -450,7 +450,12 @@ impl Tool for CreateGithubIssueTool {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Issue title — concise summary of the finding" },
-                    "body": { "type": "string", "description": "Issue body in Markdown — detailed description, steps to reproduce, expected vs actual behavior" }
+                    "body": { "type": "string", "description": "Issue body in Markdown — detailed description, steps to reproduce, expected vs actual behavior" },
+                    "labels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Labels to apply. Use: type (bug/enhancement/documentation/question), priority (p0-critical/p1-important/p2-normal/p3-nice-to-have), component (agent-core/tui/team-engine/skill/gateway/infrastructure/dashboard)"
+                    }
                 },
                 "required": ["title", "body"]
             }),
@@ -464,6 +469,14 @@ impl Tool for CreateGithubIssueTool {
     ) -> Result<ToolOutput> {
         let title = input["title"].as_str().unwrap_or("").to_owned();
         let body_input = input["body"].as_str().unwrap_or("").to_owned();
+        let labels: Vec<String> = input["labels"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if title.is_empty() {
             return Ok(ToolOutput::error("title is required"));
@@ -499,6 +512,7 @@ impl Tool for CreateGithubIssueTool {
             .json(&serde_json::json!({
                 "title": title,
                 "body": body,
+                "labels": labels,
             }))
             .send()
             .await
@@ -627,7 +641,11 @@ async fn build_investigation_context(
     if has_github_tool {
         prompt.push_str(
             "You can also create GitHub issues to track findings using the `create_github_issue` tool. \
-             Use it when the user asks to create an issue or when you identify a significant bug worth tracking.\n\n",
+             Use it when the user asks to create an issue or when you identify a significant bug worth tracking.\n\n\
+             When creating issues, apply labels from the Mika taxonomy:\n\
+             - **Type** (pick one): `bug`, `enhancement`, `documentation`, `question`\n\
+             - **Priority** (pick one): `p0-critical`, `p1-important`, `p2-normal`, `p3-nice-to-have`\n\
+             - **Component** (pick one or more): `agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`, `dashboard`\n\n",
         );
     }
 

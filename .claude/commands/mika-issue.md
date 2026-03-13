@@ -15,10 +15,10 @@ $ARGUMENTS
 1. **Classify** the issue as one of: `bug`, `enhancement`, `documentation`, `question`
 2. **Write a clear title** — concise, imperative mood (e.g. "Fix TUI crash on terminal resize below 40 cols")
 3. **Write the body** using the appropriate template format below
-4. **Select labels:**
-   - **Type label:** `bug`, `enhancement`, `documentation`, or `question`
-   - **Priority label** (pick one): `p0-critical`, `p1-important`, `p2-normal`, `p3-nice-to-have`
-   - **Component label** (pick one or more): `agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`
+4. **Select labels** from `.github/labels.yml` (canonical source):
+   - **Type label** (one): `bug`, `enhancement`, `documentation`, `question`
+   - **Priority label** (one): `p0-critical`, `p1-important`, `p2-normal`, `p3-nice-to-have`
+   - **Component label** (one or more): `agent-core`, `tui`, `team-engine`, `skill`, `gateway`, `infrastructure`, `dashboard`
 5. **Milestone:** assign one if a matching open milestone exists, otherwise omit
 6. **Show me the full `gh issue create` command** for review before executing
 

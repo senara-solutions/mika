@@ -1,0 +1,83 @@
+# Canonical label definitions for the Mika repository.
+# Synced to GitHub via .github/workflows/labels.yml (EndBug/label-sync).
+# All issue-creation paths (slash commands, investigation panel, agent skills,
+# ad-hoc Claude usage) should reference this file.
+
+# ── Type ──────────────────────────────────────────────────────────────────────
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or improvement to existing functionality
+
+- name: documentation
+  color: "0075ca"
+  description: Documentation additions or updates
+
+- name: question
+  color: "d876e3"
+  description: Needs clarification or discussion
+
+- name: duplicate
+  color: "cfd3d7"
+  description: This issue or pull request already exists
+
+- name: invalid
+  color: "e4e669"
+  description: This doesn't seem right
+
+- name: wontfix
+  color: "ffffff"
+  description: This will not be worked on
+
+- name: help wanted
+  color: "008672"
+  description: Extra attention is needed
+
+# ── Priority ──────────────────────────────────────────────────────────────────
+- name: p0-critical
+  color: "b60205"
+  description: Must fix immediately — system down or data loss
+
+- name: p1-important
+  color: "e99695"
+  description: Should fix soon — significant impact
+
+- name: p2-normal
+  color: "fbca04"
+  description: Normal priority — fix in regular cycle
+
+- name: p3-nice-to-have
+  color: "c5def5"
+  description: Low priority — nice to have
+
+# ── Component ─────────────────────────────────────────────────────────────────
+- name: agent-core
+  color: "1d76db"
+  description: Agent loop, tools, prompt assembly, memory
+
+- name: tui
+  color: "5319e7"
+  description: CLI and TUI (mika-cli)
+
+- name: team-engine
+  color: "0e8a16"
+  description: Multi-agent orchestration and team workflows
+
+- name: skill
+  color: "f9d0c4"
+  description: Skills system and marketplace
+
+- name: gateway
+  color: "006b75"
+  description: Telegram gateway (mika-gateway)
+
+- name: infrastructure
+  color: "bfdadc"
+  description: CI/CD, Docker, deployment, configuration
+
+- name: dashboard
+  color: "7057ff"
+  description: Observability dashboard (React SPA)
