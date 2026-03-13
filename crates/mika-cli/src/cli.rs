@@ -4,11 +4,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(name = "mika", version, about = "Mika — AI Executive Assistant")]
 pub struct Cli {
     /// Agent to use (overrides active agent)
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub agent: Option<String>,
 
     /// Team to use (launches TUI in team mode)
-    #[arg(long, global = true, conflicts_with = "agent")]
+    #[arg(long, conflicts_with = "agent")]
     pub team: Option<String>,
 
     /// Reuse an existing session instead of creating a new one.
@@ -20,10 +20,18 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+/// Shared `--agent` flag, flattened into subcommands that support agent override.
+#[derive(clap::Args, Clone, Debug)]
+pub struct AgentFlag {
+    /// Agent to use (overrides active agent)
+    #[arg(long)]
+    pub agent: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Open interactive chat (default)
-    Chat,
+    Chat(ChatArgs),
     /// First-run bootstrap
     Setup {
         /// Setup mode: cli (default), server, or compose
@@ -38,24 +46,13 @@ pub enum Commands {
     /// List or cancel reminders
     Reminders(ReminderArgs),
     /// Show health info
-    Status,
+    Status(StatusArgs),
     /// View or edit configuration
     Config(ConfigArgs),
     /// Manage skills
     Skills(SkillsArgs),
     /// Send a message and print the response (non-interactive)
-    Ask {
-        /// The message to send (use "-" to read from stdin)
-        message: String,
-        /// Mark a callback task complete with this message as the result before running the agent.
-        /// Used by background processes: mika ask --task-id <uuid> "findings..."
-        #[arg(long)]
-        task_id: Option<String>,
-        /// Link this message to a parent work item (metadata threading).
-        /// Used by claude-asked relay: mika ask --parent-task <uuid> "question"
-        #[arg(long)]
-        parent_task: Option<String>,
-    },
+    Ask(AskArgs),
     /// Manage agents
     Agents(AgentsArgs),
     /// Manage teams
@@ -66,6 +63,80 @@ pub enum Commands {
     Tasks(TaskArgs),
     /// Check installation health
     Doctor(DoctorArgs),
+}
+
+impl Commands {
+    /// Extract `--agent` override from whichever subcommand carries it.
+    pub fn agent_override(&self) -> Option<&str> {
+        match self {
+            Commands::Chat(args) => args.agent_flag.agent.as_deref(),
+            Commands::Ask(args) => args.agent_flag.agent.as_deref(),
+            Commands::Memory(args) => args.agent_flag.agent.as_deref(),
+            Commands::Reminders(args) => args.agent_flag.agent.as_deref(),
+            Commands::Status(args) => args.agent_flag.agent.as_deref(),
+            Commands::Config(args) => args.agent_flag.agent.as_deref(),
+            Commands::Skills(args) => args.agent_flag.agent.as_deref(),
+            Commands::Mcp(args) => args.agent_flag.agent.as_deref(),
+            Commands::Tasks(args) => args.agent_flag.agent.as_deref(),
+            Commands::Agents(args) => args.agent_flag.agent.as_deref(),
+            // No agent override — listed explicitly so adding a new Commands variant
+            // produces a compile error, forcing a conscious scoping decision.
+            Commands::Setup { .. } | Commands::Doctor(_) | Commands::Teams(_) => None,
+        }
+    }
+
+    /// Extract `--team` override (only available on `chat`).
+    pub fn team_override(&self) -> Option<&str> {
+        match self {
+            Commands::Chat(args) => args.team.as_deref(),
+            // Listed explicitly for compile-time safety on new variants.
+            Commands::Setup { .. }
+            | Commands::Ask(_)
+            | Commands::Memory(_)
+            | Commands::Reminders(_)
+            | Commands::Status(_)
+            | Commands::Config(_)
+            | Commands::Skills(_)
+            | Commands::Mcp(_)
+            | Commands::Tasks(_)
+            | Commands::Agents(_)
+            | Commands::Doctor(_)
+            | Commands::Teams(_) => None,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+pub struct ChatArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Team to use (launches TUI in team mode)
+    #[arg(long, conflicts_with = "agent")]
+    pub team: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct AskArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// The message to send (use "-" to read from stdin)
+    pub message: String,
+    /// Mark a callback task complete with this message as the result before running the agent.
+    /// Used by background processes: mika ask --task-id <uuid> "findings..."
+    #[arg(long)]
+    pub task_id: Option<String>,
+    /// Link this message to a parent work item (metadata threading).
+    /// Used by claude-asked relay: mika ask --parent-task <uuid> "question"
+    #[arg(long)]
+    pub parent_task: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -80,6 +151,9 @@ pub enum SetupMode {
 
 #[derive(clap::Args)]
 pub struct AgentsArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: AgentsCommand,
 }
@@ -159,6 +233,9 @@ pub enum TeamsCommand {
 
 #[derive(clap::Args)]
 pub struct SkillsArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: Option<SkillsCommand>,
 }
@@ -224,6 +301,9 @@ pub enum SkillsCommand {
 
 #[derive(clap::Args)]
 pub struct MemoryArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: Option<MemoryCommand>,
 }
@@ -250,6 +330,9 @@ pub enum MemoryCommand {
 
 #[derive(clap::Args)]
 pub struct ReminderArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: Option<ReminderCommand>,
 }
@@ -262,6 +345,9 @@ pub enum ReminderCommand {
 
 #[derive(clap::Args)]
 pub struct TaskArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: Option<TaskCommand>,
 }
@@ -274,6 +360,9 @@ pub enum TaskCommand {
 
 #[derive(clap::Args)]
 pub struct ConfigArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: Option<ConfigCommand>,
 }
@@ -309,6 +398,9 @@ pub enum ConfigCommand {
 
 #[derive(clap::Args)]
 pub struct McpArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
     #[command(subcommand)]
     pub command: Option<McpCommand>,
 }
