@@ -141,8 +141,8 @@ pub struct ToolCallSummary {
     pub output_summary: String,
     pub success: bool,
     /// True when the tool output starts with a non-zero exit code prefix
-    /// (e.g. "Exit code: 1" or "Killed by signal: 9"). These are not errors
-    /// (`success` is still true) but indicate the subprocess exited non-zero.
+    /// (e.g. "Exit code: 1" or "Killed by signal: 9"). When set, `success`
+    /// is `false`. This field provides additional detail about *why* it failed.
     #[serde(default)]
     pub non_zero_exit: bool,
 }
@@ -271,10 +271,10 @@ pub fn format_tool_summary_block(metadata_json: &str) -> Option<String> {
                 .get("non_zero_exit")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let status = if !success {
-                " [FAILED]"
-            } else if non_zero_exit {
+            let status = if non_zero_exit {
                 " [NON-ZERO]"
+            } else if !success {
+                " [FAILED]"
             } else {
                 ""
             };
@@ -302,10 +302,10 @@ fn format_step_exceeded_fallback(summaries: &[ToolCallSummary]) -> String {
     let mut msg = String::from("I ran out of steps working on that. Here's what I did:\n");
     let start = summaries.len().saturating_sub(5);
     for s in &summaries[start..] {
-        let status = if !s.success {
-            "failed"
-        } else if s.non_zero_exit {
+        let status = if s.non_zero_exit {
             "non-zero exit"
+        } else if !s.success {
+            "failed"
         } else {
             "done"
         };
@@ -1014,7 +1014,7 @@ async fn process_tool_calls(
                 name: name.clone(),
                 input_summary,
                 output_summary,
-                success: !output.is_error,
+                success: !output.is_error && !non_zero_exit,
                 non_zero_exit,
             });
 
@@ -2288,8 +2288,21 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tool_summary_block_non_zero_exit() {
+    fn test_format_tool_summary_block_non_zero_exit_old_format() {
+        // Backward compat: old metadata had success: true with non_zero_exit: true
         let json = r#"{"tool_calls":[{"step":0,"name":"shell_exec","input_summary":"grep foo","output_summary":"Exit code: 1\nno matches","success":true,"non_zero_exit":true}]}"#;
+        let block = format_tool_summary_block(json).unwrap();
+        assert!(
+            block.contains("[NON-ZERO]"),
+            "expected [NON-ZERO] tag in: {block}"
+        );
+        assert!(!block.contains("[FAILED]"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_block_non_zero_exit_new_format() {
+        // New format: success is false when non_zero_exit is true
+        let json = r#"{"tool_calls":[{"step":0,"name":"shell_exec","input_summary":"grep foo","output_summary":"Exit code: 1\nno matches","success":false,"non_zero_exit":true}]}"#;
         let block = format_tool_summary_block(json).unwrap();
         assert!(
             block.contains("[NON-ZERO]"),
@@ -2318,13 +2331,32 @@ mod tests {
     }
 
     #[test]
-    fn test_format_step_exceeded_fallback_non_zero_exit() {
+    fn test_format_step_exceeded_fallback_non_zero_exit_old_format() {
+        // Backward compat: old metadata had success: true with non_zero_exit: true
         let summaries = vec![ToolCallSummary {
             step: 0,
             name: "shell_exec".to_string(),
             input_summary: "grep foo".to_string(),
             output_summary: "Exit code: 1".to_string(),
             success: true,
+            non_zero_exit: true,
+        }];
+        let result = format_step_exceeded_fallback(&summaries);
+        assert!(
+            result.contains("- shell_exec (non-zero exit)"),
+            "expected non-zero exit status in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_format_step_exceeded_fallback_non_zero_exit_new_format() {
+        // New format: success is false when non_zero_exit is true
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "shell_exec".to_string(),
+            input_summary: "grep foo".to_string(),
+            output_summary: "Exit code: 1".to_string(),
+            success: false,
             non_zero_exit: true,
         }];
         let result = format_step_exceeded_fallback(&summaries);
