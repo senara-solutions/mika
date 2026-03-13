@@ -16,8 +16,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Team mode: branch early, before agent resolution.
-    // --team is mutually exclusive with --agent (enforced by clap).
-    if let Some(ref team_name) = cli.team {
+    // --team is mutually exclusive with --agent (enforced by clap on each level).
+    // Merge top-level and subcommand-level --team flag.
+    let team_override = cli
+        .command
+        .as_ref()
+        .and_then(|c| c.team_override())
+        .or(cli.team.as_deref());
+
+    if let Some(team_name) = team_override {
         let team_name = team::normalize_team_name(team_name);
         team::validate_team_name(&team_name)?;
         let global_home = home::resolve_home_dir()?;
@@ -27,9 +34,9 @@ async fn main() -> Result<()> {
             anyhow::bail!("Team '{team_name}' not found.");
         }
 
-        // Only allow bare `mika --team` or `mika --team chat`
+        // Only allow bare `mika --team` or `mika chat --team`
         match cli.command {
-            None | Some(Commands::Chat) => {
+            None | Some(Commands::Chat(_)) => {
                 let log_level = resolve_log_level(&[global_home.join("config.toml")]);
 
                 // Build optional OTel export layer (feature-gated, graceful degradation)
@@ -59,10 +66,16 @@ async fn main() -> Result<()> {
     }
 
     // Resolve agent name first — needed for correct log directory.
-    // Priority: --agent flag > active_agent file > "mika"
-    let agent_name = match cli.agent {
+    // Priority: subcommand --agent flag > top-level --agent flag > active_agent file > "mika"
+    let agent_override = cli
+        .command
+        .as_ref()
+        .and_then(|c| c.agent_override())
+        .or(cli.agent.as_deref());
+
+    let agent_name = match agent_override {
         Some(name) => {
-            let name = agent::normalize_agent_name(&name);
+            let name = agent::normalize_agent_name(name);
             agent::validate_agent_name(&name)?;
             name
         }
@@ -117,7 +130,7 @@ async fn main() -> Result<()> {
     // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
     // so stderr output would corrupt the TUI display.
     // The _log_guard MUST stay alive until the end of main — dropping it stops file logging.
-    let is_tui = matches!(cli.command, None | Some(Commands::Chat));
+    let is_tui = matches!(cli.command, None | Some(Commands::Chat(_)));
     let log_output = if is_tui {
         LogOutput::FileOnly
     } else {
@@ -135,26 +148,22 @@ async fn main() -> Result<()> {
             }
             commands::chat::run(&agent_name, cli.session.as_deref()).await
         }
-        Some(Commands::Chat) => commands::chat::run(&agent_name, cli.session.as_deref()).await,
+        Some(Commands::Chat(_)) => commands::chat::run(&agent_name, cli.session.as_deref()).await,
         Some(Commands::Setup { mode, api_key }) => {
             commands::setup::run(&agent_name, mode, api_key.as_deref()).await
         }
         Some(Commands::Memory(args)) => commands::memory::run(args, &agent_name).await,
         Some(Commands::Reminders(args)) => commands::reminders::run(args, &agent_name).await,
-        Some(Commands::Status) => commands::status::run(&agent_name).await,
+        Some(Commands::Status(_)) => commands::status::run(&agent_name).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
-        Some(Commands::Ask {
-            message,
-            task_id,
-            parent_task,
-        }) => {
+        Some(Commands::Ask(args)) => {
             match commands::ask::run(
-                &message,
+                &args.message,
                 &agent_name,
-                task_id.as_deref(),
+                args.task_id.as_deref(),
                 cli.session.as_deref(),
-                parent_task.as_deref(),
+                args.parent_task.as_deref(),
             )
             .await
             {
@@ -312,44 +321,104 @@ mod tests {
         }
     }
 
-    /// --agent and --team are mutually exclusive.
+    /// --agent and --team are mutually exclusive on the chat subcommand.
     #[test]
-    fn test_agent_and_team_mutually_exclusive() {
-        let result =
-            crate::cli::Cli::try_parse_from(["mika", "--agent", "work", "--team", "research"]);
-        assert!(result.is_err(), "--agent and --team should conflict");
+    fn test_agent_and_team_mutually_exclusive_on_chat() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "chat", "--agent", "work", "--team", "research",
+        ]);
+        assert!(
+            result.is_err(),
+            "--agent and --team should conflict on chat"
+        );
     }
 
-    /// --team alone should parse successfully.
+    /// --agent and --team are mutually exclusive at the top level.
     #[test]
-    fn test_team_flag_parses() {
+    fn test_agent_and_team_mutually_exclusive_top_level() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "--agent", "work", "--team", "research"]);
+        assert!(
+            result.is_err(),
+            "--agent and --team should conflict at top level"
+        );
+    }
+
+    /// --team alone on chat subcommand should parse successfully.
+    #[test]
+    fn test_team_flag_on_chat_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--team", "research"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(
+            cli.command.as_ref().unwrap().team_override(),
+            Some("research")
+        );
+    }
+
+    /// --team at top level (bare mika) should parse successfully.
+    #[test]
+    fn test_team_flag_top_level_parses() {
         let cli = crate::cli::Cli::try_parse_from(["mika", "--team", "research"]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         assert_eq!(cli.team.as_deref(), Some("research"));
-        assert!(cli.agent.is_none());
     }
 
-    /// --agent alone should still work.
+    /// --agent on chat subcommand should work.
     #[test]
-    fn test_agent_flag_still_works() {
+    fn test_agent_flag_on_chat() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--agent", "work"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
+    }
+
+    /// --agent at top level (bare mika) should work.
+    #[test]
+    fn test_agent_flag_top_level() {
         let cli = crate::cli::Cli::try_parse_from(["mika", "--agent", "work"]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         assert_eq!(cli.agent.as_deref(), Some("work"));
-        assert!(cli.team.is_none());
+        assert!(cli.command.is_none());
     }
 
-    /// --team with a subcommand should parse (validation happens in main, not clap).
+    /// --agent on ask subcommand should work.
     #[test]
-    fn test_team_with_subcommand_parses() {
-        let cli = crate::cli::Cli::try_parse_from(["mika", "--team", "dev", "chat"]);
+    fn test_agent_flag_on_ask() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--agent", "work", "hello world"]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
-        assert_eq!(cli.team.as_deref(), Some("dev"));
+        assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
     }
 
-    /// clap-markdown output should include the --team flag.
+    /// --agent should NOT be accepted on setup subcommand.
+    #[test]
+    fn test_agent_flag_rejected_on_setup() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "setup", "--agent", "work"]);
+        assert!(result.is_err(), "--agent should not be accepted on setup");
+    }
+
+    /// --team should NOT be accepted on ask subcommand.
+    #[test]
+    fn test_team_flag_rejected_on_ask() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--team", "research", "hello"]);
+        assert!(result.is_err(), "--team should not be accepted on ask");
+    }
+
+    /// --team with chat subcommand should parse (validation happens in main, not clap).
+    #[test]
+    fn test_team_with_chat_subcommand_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--team", "dev"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.command.as_ref().unwrap().team_override(), Some("dev"));
+    }
+
+    /// clap-markdown output should include the --team flag (on chat subcommand).
     #[test]
     fn test_clap_markdown_contains_team_flag() {
         use clap::CommandFactory;
@@ -366,5 +435,28 @@ mod tests {
     fn test_setup_accepts_api_key_flag() {
         let cli = crate::cli::Cli::try_parse_from(["mika", "setup", "--api-key", "sk-test"]);
         assert!(cli.is_ok());
+    }
+
+    /// --agent on memory subcommand should work.
+    #[test]
+    fn test_agent_flag_on_memory() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "memory", "--agent", "work"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
+    }
+
+    /// --agent should NOT be accepted on doctor subcommand.
+    #[test]
+    fn test_agent_flag_rejected_on_doctor() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "doctor", "--agent", "work"]);
+        assert!(result.is_err(), "--agent should not be accepted on doctor");
+    }
+
+    /// --agent should NOT be accepted on teams subcommand.
+    #[test]
+    fn test_agent_flag_rejected_on_teams() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "teams", "--agent", "work", "list"]);
+        assert!(result.is_err(), "--agent should not be accepted on teams");
     }
 }
