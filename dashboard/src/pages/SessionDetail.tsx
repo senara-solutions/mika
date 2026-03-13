@@ -6,7 +6,7 @@ import CopyButton from '../components/CopyButton.tsx'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import InvestigationPanel, {
-  type InvestigationContext,
+  type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
 import { formatTimestamp } from '../utils/formatTime.ts'
 import { getAgentColor } from '../utils/agentColors.ts'
@@ -346,7 +346,7 @@ function roleConfig(role: string) {
 export default function SessionDetail() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const [page, setPage] = useState(1)
-  const [investigationCtx, setInvestigationCtx] = useState<InvestigationContext | null>(null)
+  const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
 
   const { data: session, isLoading: sessionLoading } = useSessionDetail(sessionId ?? '')
   const { data: messages, isLoading: messagesLoading } = useSessionMessages(
@@ -410,10 +410,24 @@ export default function SessionDetail() {
     toolCallIndex?: number,
     toolName?: string,
   ) => {
-    setInvestigationCtx({
+    setInvestigationScope({
+      type: toolCallIndex != null ? 'tool_call' : 'message',
       messageId,
       toolCallIndex,
       toolName,
+      sessionId: sessionId ?? '',
+      agentId: session?.agent_id ?? '',
+    })
+  }
+
+  const openSessionInvestigation = () => {
+    // Find the last assistant message as a proxy for full-session investigation
+    const allMessages = messages?.data ?? []
+    const lastAssistant = [...allMessages].reverse().find((m: Message) => m.role === 'assistant')
+    if (!lastAssistant) return
+    setInvestigationScope({
+      type: 'session',
+      messageId: lastAssistant.id,
       sessionId: sessionId ?? '',
       agentId: session?.agent_id ?? '',
     })
@@ -710,6 +724,17 @@ export default function SessionDetail() {
             <span className="text-[10px] text-muted/40 uppercase tracking-wider">Messages</span>
             <span className="text-xs text-heading font-medium">{messages?.total ?? '...'}</span>
           </div>
+          <div className="ml-auto">
+            <button
+              onClick={openSessionInvestigation}
+              disabled={!messages?.data?.some((m) => m.role === 'assistant')}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs text-accent/70 hover:text-accent hover:bg-accent/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Investigate full session"
+            >
+              <Search size={12} />
+              Investigate
+            </button>
+          </div>
         </div>
       )}
 
@@ -754,10 +779,10 @@ export default function SessionDetail() {
         </>
       )}
 
-      {investigationCtx && (
+      {investigationScope && (
         <InvestigationPanel
-          context={investigationCtx}
-          onClose={() => setInvestigationCtx(null)}
+          scope={investigationScope}
+          onClose={() => setInvestigationScope(null)}
         />
       )}
     </div>
