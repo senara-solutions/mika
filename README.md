@@ -129,6 +129,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, commit
 | [Deployment](docs/deployment.md) | Operators | Docker images, container deployment |
 | [Contributing](CONTRIBUTING.md) | Contributors | Development workflow, conventions, quality gates |
 
+## Versioning
+
+Mika follows [Conventional Commits](https://www.conventionalcommits.org/) with automated releases via [release-plz](https://release-plz.ieni.dev/).
+
+**Pre-1.0 breaking changes policy:** Until v1.0, breaking changes do not trigger a major version bump. They are shipped as minor or patch releases. Each PR that introduces a breaking change must document the required manual migration steps in its description so users can act on them during upgrade.
+
 ## Current Status
 
 **Phase 4** -- Deployment infrastructure. Dockerfiles, CI/CD pipeline, and automated releases are complete. Gateway with Telegram integration is operational.
