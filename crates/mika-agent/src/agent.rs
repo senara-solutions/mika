@@ -486,7 +486,7 @@ async fn run_loop(
                     request.messages.push(LlmMessage {
                         role: LlmRole::Assistant,
                         content: LlmContent::Blocks(
-                            mika_common::llm::anthropic::response_content_to_blocks(
+                            mika_common::llm::response_content_to_blocks(
                                 &response.content,
                             ),
                         ),
@@ -1087,7 +1087,7 @@ async fn process_tool_calls(
 
     // Convert response content to assistant message blocks
     let assistant_blocks: Vec<LlmContentBlock> =
-        mika_common::llm::anthropic::response_content_to_blocks(&response_content);
+        mika_common::llm::response_content_to_blocks(&response_content);
     request.messages.push(LlmMessage {
         role: LlmRole::Assistant,
         content: LlmContent::Blocks(assistant_blocks),

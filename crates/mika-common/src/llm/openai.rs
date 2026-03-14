@@ -446,9 +446,10 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                         LlmContentBlock::ToolResult {
                             tool_call_id,
                             content,
+                            is_error,
                             ..
                         } => {
-                            let text = match content {
+                            let mut text = match content {
                                 LlmToolResultContent::Text(t) => t.clone(),
                                 LlmToolResultContent::Blocks(parts) => parts
                                     .iter()
@@ -459,6 +460,11 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                                     .collect::<Vec<_>>()
                                     .join("\n"),
                             };
+                            // OpenAI has no first-class is_error field; prefix the
+                            // content so the model knows the tool call failed.
+                            if *is_error {
+                                text = format!("[ERROR] {text}");
+                            }
                             Some(OpenAiMessage {
                                 role: "tool".into(),
                                 content: Some(OpenAiContent::Text(text)),

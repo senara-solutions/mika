@@ -238,27 +238,8 @@ fn from_anthropic_response(resp: crate::claude::MessagesResponse) -> LlmResponse
     }
 }
 
-// -- Translation: LlmResponse content back to LlmMessage (for building conversation history) --
-
-/// Convert an `LlmResponse`'s content into `LlmContentBlock`s suitable for
-/// pushing back as an assistant message in the conversation history.
-pub fn response_content_to_blocks(content: &[LlmResponseContent]) -> Vec<LlmContentBlock> {
-    content
-        .iter()
-        .map(|c| match c {
-            LlmResponseContent::Text(t) => LlmContentBlock::Text(t.clone()),
-            LlmResponseContent::ToolCall {
-                id,
-                name,
-                arguments,
-            } => LlmContentBlock::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-        })
-        .collect()
-}
+// Re-export from types for backward compatibility.
+pub use super::types::response_content_to_blocks;
 
 #[cfg(test)]
 mod tests {

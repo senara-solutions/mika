@@ -51,12 +51,23 @@ pub trait LlmProvider: Send + Sync {
 // -- Model spec parsing --
 
 /// Parsed model specification from a model string like `anthropic/claude-sonnet-4-6`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelSpec {
     pub provider: ProviderKind,
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ModelSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelSpec")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 /// Known LLM provider kinds.

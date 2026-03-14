@@ -230,6 +230,28 @@ impl From<crate::claude::StopReason> for LlmStopReason {
     }
 }
 
+// -- Helpers --
+
+/// Convert an `LlmResponse`'s content into `LlmContentBlock`s suitable for
+/// pushing back as an assistant message in the conversation history.
+pub fn response_content_to_blocks(content: &[LlmResponseContent]) -> Vec<LlmContentBlock> {
+    content
+        .iter()
+        .map(|c| match c {
+            LlmResponseContent::Text(t) => LlmContentBlock::Text(t.clone()),
+            LlmResponseContent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => LlmContentBlock::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
