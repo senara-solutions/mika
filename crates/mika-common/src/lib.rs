@@ -4,6 +4,7 @@ pub mod config;
 pub mod dotenv;
 pub mod embedding;
 pub mod home;
+pub mod llm;
 pub mod logging;
 pub mod team;
 pub mod telemetry;
