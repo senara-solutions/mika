@@ -34,7 +34,6 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 │       │   ├── web-search/
 │       │   ├── file-reader/
 │       │   ├── tmux/
-│       │   ├── calendar/
 │       │   ├── github/
 │       │   ├── mcp/
 │       │   ├── agents-teams/
@@ -55,7 +54,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 8
+**Current schema version:** 9
 
 ### Core Tables
 
@@ -69,7 +68,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Memory Tables
 
-**core_memory** — `(agent_id, key) PK`, `value TEXT`, `token_count INTEGER`, `updated_at INTEGER`. Sections: `user_summary`, `self_model`, `current_priorities`, `key_people`.
+**core_memory** — `(agent_id, key) PK`, `value TEXT`, `token_count INTEGER`, `updated_at INTEGER`. Sections: `user_summary`, `self_model`, `current_priorities`, `key_people`, `workflows`.
 
 **people** — `id INTEGER PK AUTO`, `agent_id TEXT FK→agents`, `canonical_name TEXT NOCASE`, `relationship TEXT`, `notes TEXT`, `first_mentioned INTEGER`, `last_mentioned INTEGER`, `mention_count INTEGER DEFAULT 1`. Unique: `(agent_id, canonical_name)`.
 
@@ -97,7 +96,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Audit Tables
 
-**audit_events** — `id INTEGER PK AUTO`, `agent_id FK`, `session_id TEXT`, `tool_name TEXT`, `target_key TEXT`, `before_value TEXT`, `after_value TEXT`, `reasoning TEXT`, `trace_id TEXT`, `created_at`
+**audit_events** — `id INTEGER PK AUTO`, `agent_id FK`, `session_id TEXT`, `tool_name TEXT`, `target_key TEXT`, `before_value TEXT`, `after_value TEXT` (nullable), `reasoning TEXT`, `trace_id TEXT`, `rewound_by_trace_id TEXT`, `created_at`
 
 **audit_event_summaries** — `id INTEGER PK AUTO`, `agent_id FK`, `year INTEGER`, `month INTEGER`, `summary TEXT`, `event_count INTEGER`, `created_at`. Unique: `(agent_id, year, month)`.
 

@@ -236,7 +236,7 @@ Each skill shows its name, handler type (`builtin`, `exec`, or `http`), descript
 ```
 Loaded skills:
   web_search (builtin) — Search the web for current information
-  calendar (exec) — Manage calendar events and scheduling [always on]
+  shell_exec (exec) — Execute shell commands [always on]
 ```
 
 ---
