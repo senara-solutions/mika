@@ -7,8 +7,8 @@ use std::time::Duration;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use mika_common::agent;
-use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
+use mika_common::llm::LlmProvider;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::team::TeamDefinition;
 
@@ -38,7 +38,7 @@ struct AgentResources {
 /// Shared initialization resources produced by [`TeamEngine::init_resources`].
 struct EngineResources {
     agents: HashMap<String, AgentResources>,
-    claude: ClaudeClient,
+    llm: Arc<dyn LlmProvider>,
     tool_registry: ToolRegistry,
     workspace_dir: PathBuf,
 }
@@ -49,7 +49,7 @@ pub struct TeamEngine {
     run: TeamRun,
     workspace_dir: PathBuf,
     agents: Arc<HashMap<String, AgentResources>>,
-    claude: ClaudeClient,
+    llm: Arc<dyn LlmProvider>,
     tool_registry: Arc<ToolRegistry>,
     callback: Option<Arc<TeamEventCallback>>,
     brave_api_key: Option<String>,
@@ -111,11 +111,7 @@ impl TeamEngine {
             );
         }
 
-        let claude = ClaudeClient::new(
-            settings.anthropic_api_key.clone(),
-            settings.claude_model.clone(),
-            settings.claude_max_tokens,
-        )?;
+        let llm = settings.make_llm_provider()?;
 
         // Build tool registry once with base tools + workspace tools (#255)
         let mut tool_registry = tools::default_tools();
@@ -125,7 +121,7 @@ impl TeamEngine {
 
         Ok(EngineResources {
             agents,
-            claude,
+            llm,
             tool_registry,
             workspace_dir,
         })
@@ -173,7 +169,7 @@ impl TeamEngine {
             run,
             workspace_dir: res.workspace_dir,
             agents: Arc::new(res.agents),
-            claude: res.claude,
+            llm: res.llm,
             tool_registry: Arc::new(res.tool_registry),
             callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
@@ -213,7 +209,7 @@ impl TeamEngine {
             run,
             workspace_dir: res.workspace_dir,
             agents: Arc::new(res.agents),
-            claude: res.claude,
+            llm: res.llm,
             tool_registry: Arc::new(res.tool_registry),
             callback: None, // No callback on resume — events go through task system
             brave_api_key: settings.brave_api_key.clone(),
@@ -757,7 +753,7 @@ impl TeamEngine {
     async fn execute_tasks(&mut self) -> Result<bool> {
         // Prepare shared resources that will be moved into spawned tasks.
         let agents = Arc::clone(&self.agents);
-        let claude = self.claude.clone();
+        let llm = self.llm.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let run_id = self.run.run_id.clone();
         let callback = self.callback.clone();
@@ -891,7 +887,7 @@ impl TeamEngine {
             });
 
             let agents = Arc::clone(&agents);
-            let claude = claude.clone();
+            let llm = llm.clone();
             let tool_registry = Arc::clone(&tool_registry);
             let run_id = run_id.clone();
             let callback = callback.clone();
@@ -941,7 +937,7 @@ impl TeamEngine {
                             let child_task_id_ref = input.child_task_id.as_deref();
                             let params = TeamAgentParams {
                                 db: &resources.db,
-                                claude: &claude,
+                                llm: llm.as_ref(),
                                 tools: &tool_registry,
                                 skills: &resources.skills,
                                 home_dir: &resources.home_dir,
@@ -1286,7 +1282,7 @@ impl TeamEngine {
         let skills_dirty = AtomicBool::new(false);
         let params = TeamAgentParams {
             db: &resources.db,
-            claude: &self.claude,
+            llm: self.llm.as_ref(),
             tools: &self.tool_registry,
             skills: &resources.skills,
             home_dir: &resources.home_dir,

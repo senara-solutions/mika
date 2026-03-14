@@ -192,6 +192,8 @@ pub mod test_helpers {
             telemetry_enabled: false,
             otlp_endpoint: None,
             otlp_auth_header: None,
+            llm_base_url: None,
+            llm_api_key: None,
         }
     }
 }

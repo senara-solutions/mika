@@ -3,17 +3,17 @@ use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
 use mika_agent::messaging::{GatewayMessageSender, MessageSender};
 use mika_agent::startup;
-use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::home;
+use mika_common::llm::LlmProvider;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Full application context for commands that need the Claude client.
+/// Full application context for commands that need an LLM provider.
 /// Dropping this shuts down the async database automatically.
 pub struct AppContext {
     pub db_ctx: DbContext,
-    pub claude: ClaudeClient,
+    pub llm: Arc<dyn LlmProvider>,
 }
 
 // Deref so callers can still use ctx.settings, ctx.async_db, ctx.home_dir.
@@ -71,14 +71,8 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
 /// Initialize full context for a named agent (for chat).
 pub fn init_for_agent(agent_name: &str) -> Result<AppContext> {
     let db_ctx = init_db_only_for_agent(agent_name)?;
-
-    let claude = ClaudeClient::new(
-        db_ctx.settings.anthropic_api_key.clone(),
-        db_ctx.settings.claude_model.clone(),
-        db_ctx.settings.claude_max_tokens,
-    )?;
-
-    Ok(AppContext { db_ctx, claude })
+    let llm = db_ctx.settings.make_llm_provider()?;
+    Ok(AppContext { db_ctx, llm })
 }
 
 /// Initialize database-only context for a named agent.

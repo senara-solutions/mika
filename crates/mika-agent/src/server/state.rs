@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mika_common::agent;
-use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::LlmProvider;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
@@ -42,7 +42,7 @@ pub struct AppState {
     pub agents: Arc<HashMap<String, Arc<AgentState>>>,
     /// Default agent name (resolved from active_agent file).
     pub default_agent: String,
-    pub claude: ClaudeClient,
+    pub llm: Arc<dyn LlmProvider>,
     pub tools: Arc<ToolRegistry>,
     pub ready: Arc<AtomicBool>,
     pub internal_token: SecretString,

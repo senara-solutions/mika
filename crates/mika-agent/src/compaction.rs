@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use mika_common::claude::{ClaudeClient, Message, MessageContent, MessagesRequest};
+use mika_common::llm::{LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole};
 use tracing::{debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
@@ -20,7 +20,7 @@ If there is an existing summary, merge it with the new information.";
 
 /// Check if compaction is needed and perform it if so.
 /// Called after each agent turn completes.
-pub async fn maybe_compact(db: &AsyncDatabase, claude: &ClaudeClient) -> Result<()> {
+pub async fn maybe_compact(db: &AsyncDatabase, llm: &dyn LlmProvider) -> Result<()> {
     let total = db.count_messages().await?;
     if total <= COMPACTION_THRESHOLD {
         debug!(
@@ -52,7 +52,7 @@ pub async fn maybe_compact(db: &AsyncDatabase, claude: &ClaudeClient) -> Result<
 
     info!(old_count = batch.len(), total, "compacting conversation");
 
-    let mut summary_text = summarize_messages(claude, batch, existing_summary.as_ref()).await?;
+    let mut summary_text = summarize_messages(llm, batch, existing_summary.as_ref()).await?;
 
     // Truncate summary if it exceeds the size guard
     if summary_text.len() > MAX_SUMMARY_CHARS {
@@ -78,7 +78,7 @@ pub async fn maybe_compact(db: &AsyncDatabase, claude: &ClaudeClient) -> Result<
 /// Call Claude to summarize a batch of old messages, optionally merging with
 /// an existing summary.
 async fn summarize_messages(
-    claude: &ClaudeClient,
+    llm: &dyn LlmProvider,
     messages: &[SessionMessage],
     existing_summary: Option<&SessionMessage>,
 ) -> Result<String> {
@@ -121,19 +121,19 @@ async fn summarize_messages(
 
     user_prompt.push_str("\nPlease produce a concise bullet-point summary.");
 
-    let request = MessagesRequest {
-        model: claude.model.clone(),
+    let request = LlmRequest {
+        model: llm.model_name().to_string(),
         max_tokens: 1024,
         system: Some(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(user_prompt),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(user_prompt),
         }],
         tools: None,
         thinking: None,
     };
 
-    let response = claude
+    let response = llm
         .send_message(&request)
         .await
         .context("summarization API call failed")?;

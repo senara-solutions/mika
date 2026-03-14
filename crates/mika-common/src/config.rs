@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use config::{Config, Environment, File};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -82,6 +84,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Embedding vector dimensions",
     },
+    ConfigKeyInfo {
+        key: "llm_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_LLM_BASE_URL"),
+        secret: false,
+        description: "LLM provider base URL override",
+    },
     // Env backend (.env secrets)
     ConfigKeyInfo {
         key: "anthropic_api_key",
@@ -96,6 +105,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         env_var: Some("MIKA_OPENAI_API_KEY"),
         secret: true,
         description: "OpenAI API key (for embeddings)",
+    },
+    ConfigKeyInfo {
+        key: "llm_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_LLM_API_KEY"),
+        secret: true,
+        description: "LLM provider API key override (for non-Anthropic providers)",
     },
     ConfigKeyInfo {
         key: "brave_api_key",
@@ -173,7 +189,9 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "server_port" => Some(settings.server_port.to_string()),
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
+        "llm_base_url" => settings.llm_base_url.clone(),
         "anthropic_api_key" => settings.anthropic_api_key.clone(),
+        "llm_api_key" => settings.llm_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
 
@@ -267,6 +285,16 @@ pub struct Settings {
     #[serde(default)]
     pub github_repo: Option<String>,
 
+    /// LLM provider base URL override (for OpenAI-compatible providers)
+    #[serde(default)]
+    pub llm_base_url: Option<String>,
+
+    /// LLM provider API key override (for non-Anthropic providers).
+    /// When using `openai/`, `ollama/`, `groq/`, or `openai-compatible/` prefixes,
+    /// this key is used instead of `anthropic_api_key`.
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+
     /// Disable bundled skill re-sync on startup (default: false)
     #[serde(default)]
     pub disable_bundled_skills: bool,
@@ -321,6 +349,31 @@ fn default_embedding_dimensions() -> u32 {
 }
 
 impl Settings {
+    /// Create an LLM provider from the current settings.
+    ///
+    /// Parses `claude_model` as a model spec (e.g. `anthropic/claude-sonnet-4-6`,
+    /// `openai/gpt-4o`, or just `claude-sonnet-4-6` which defaults to Anthropic).
+    /// Applies `llm_base_url` and `llm_api_key` overrides for non-Anthropic providers.
+    /// For Anthropic, uses `anthropic_api_key`.
+    pub fn make_llm_provider(&self) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
+        let spec = crate::llm::ModelSpec::parse(&self.claude_model)?;
+
+        // Resolve API key: for Anthropic, use anthropic_api_key; for others, prefer llm_api_key
+        let api_key = match spec.provider {
+            crate::llm::ProviderKind::Anthropic => self.anthropic_api_key.clone(),
+            _ => self
+                .llm_api_key
+                .clone()
+                .or_else(|| self.anthropic_api_key.clone()),
+        };
+
+        let spec = spec
+            .with_base_url(self.llm_base_url.clone())
+            .with_api_key(api_key);
+
+        crate::llm::create_provider(&spec, self.claude_max_tokens)
+    }
+
     /// Create an EmbeddingClient if OpenAI API key is configured.
     pub fn make_embedding_client(&self) -> Option<crate::embedding::EmbeddingClient> {
         self.openai_api_key
@@ -431,6 +484,11 @@ impl std::fmt::Debug for Settings {
             )
             .field("embedding_model", &self.embedding_model)
             .field("embedding_dimensions", &self.embedding_dimensions)
+            .field("llm_base_url", &self.llm_base_url)
+            .field(
+                "llm_api_key",
+                &self.llm_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field(
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),

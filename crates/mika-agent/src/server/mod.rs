@@ -23,10 +23,10 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use mika_common::agent;
-use mika_common::claude::ClaudeClient;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::home;
+use mika_common::llm::LlmProvider;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
@@ -150,7 +150,7 @@ async fn init_agent(
     agent_name: &str,
     agent_home: &std::path::Path,
     global_home: &std::path::Path,
-    claude: &ClaudeClient,
+    llm: &Arc<dyn LlmProvider>,
     tool_registry: &Arc<crate::tools::ToolRegistry>,
     gateway_url: &str,
     internal_token: &secrecy::SecretString,
@@ -194,7 +194,7 @@ async fn init_agent(
 
     let dispatcher = Arc::new(TaskDispatcher {
         db: async_db.clone(),
-        claude: claude.clone(),
+        llm: llm.clone(),
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
         home_dir: agent_home.to_path_buf(),
@@ -311,11 +311,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
 
-    let claude = ClaudeClient::new(
-        settings.anthropic_api_key.clone(),
-        settings.claude_model.clone(),
-        settings.claude_max_tokens,
-    )?;
+    let llm = settings.make_llm_provider()?;
     let http_client = reqwest::Client::new();
     let mut tool_registry = tools::default_tools();
     for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone()) {
@@ -369,7 +365,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 agent::DEFAULT_AGENT,
                 &default_home,
                 global_home,
-                &claude,
+                &llm,
                 &tool_registry,
                 &gateway_url,
                 &internal_token,
@@ -388,7 +384,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 name,
                 &agent_home,
                 global_home,
-                &claude,
+                &llm,
                 &tool_registry,
                 &gateway_url,
                 &internal_token,
@@ -444,7 +440,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,
-        claude,
+        llm,
         tools: tool_registry,
         ready: ready.clone(),
         internal_token,
@@ -577,15 +573,10 @@ mod tests {
     fn test_task_engine(
         db: AsyncDatabase,
     ) -> (Arc<tokio::sync::Mutex<TaskEngine>>, Arc<TaskDispatcher>) {
-        let claude = ClaudeClient::new(
-            Some("test-key".to_string()),
-            "claude-sonnet-4-6".to_string(),
-            4096,
-        )
-        .unwrap();
+        let llm = mika_common::llm::dummy_provider();
         let dispatcher = Arc::new(TaskDispatcher {
             db: db.clone(),
-            claude,
+            llm,
             tools: Arc::new(tools::default_tools()),
             skills: Arc::new(SkillRegistry::empty()),
             message_sender: None,
@@ -605,12 +596,7 @@ mod tests {
     fn test_state() -> AppState {
         let db = test_async_db();
         let dashboard_db = db.clone();
-        let claude = ClaudeClient::new(
-            Some("test-key".to_string()),
-            "claude-sonnet-4-6".to_string(),
-            4096,
-        )
-        .expect("test API key should be valid");
+        let llm = mika_common::llm::dummy_provider();
         let tools_reg = Arc::new(tools::default_tools());
         let skills_reg = Arc::new(SkillRegistry::empty());
         let skills_dirty = Arc::new(AtomicBool::new(false));
@@ -635,7 +621,7 @@ mod tests {
         AppState {
             agents: Arc::new(agents),
             default_agent: "mika".to_string(),
-            claude,
+            llm,
             tools: tools_reg,
             ready: Arc::new(AtomicBool::new(false)),
             internal_token: SecretString::from("test-token-secret"),
@@ -669,6 +655,8 @@ mod tests {
                 telemetry_enabled: false,
                 otlp_endpoint: None,
                 otlp_auth_header: None,
+                llm_base_url: None,
+                llm_api_key: None,
             },
             dashboard_db,
             investigation_lock: Arc::new(tokio::sync::Mutex::new(())),

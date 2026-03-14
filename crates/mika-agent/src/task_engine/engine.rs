@@ -510,7 +510,6 @@ mod tests {
     use super::*;
     use crate::db::{Database, NewTask};
     use crate::messaging::MessageSender;
-    use mika_common::claude::ClaudeClient;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -528,15 +527,9 @@ mod tests {
     }
 
     fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
-        let claude = ClaudeClient::new(
-            Some("sk-test".to_string()),
-            "claude-sonnet-4-6".to_string(),
-            8192,
-        )
-        .unwrap();
         Arc::new(TaskDispatcher {
             db,
-            claude,
+            llm: mika_common::llm::dummy_provider(),
             tools: Arc::new(crate::tools::default_tools()),
             skills: Arc::new(crate::skills::SkillRegistry::empty()),
             message_sender: Some(Arc::new(NoopSender)),

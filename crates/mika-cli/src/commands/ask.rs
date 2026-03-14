@@ -170,7 +170,7 @@ pub async fn run(
 
     let output = agent::run_agent(&AgentParams {
         db: &ctx.async_db,
-        claude: &ctx.claude,
+        llm: ctx.llm.as_ref(),
         tools: &tool_registry,
         skills: &skill_registry,
         user_message: &user_message,

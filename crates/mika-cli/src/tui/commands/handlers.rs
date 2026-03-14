@@ -105,7 +105,7 @@ async fn handle_compact(app: &mut App<'_>) -> String {
     if count <= 50 {
         return format!("Nothing to compact ({count}/50 messages).");
     }
-    match mika_agent::compaction::maybe_compact(&app.db, &app.claude).await {
+    match mika_agent::compaction::maybe_compact(&app.db, app.llm.as_ref()).await {
         Ok(()) => format!("Compacted conversation ({count} messages)."),
         Err(e) => format!("Compaction failed: {e}"),
     }
@@ -416,7 +416,6 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
                 return format!("Already using {display}.");
             }
             app.model = full_id.to_string();
-            app.claude.model = full_id.to_string();
             let _ = app.agent_tx.send(AgentRequest::SetModel {
                 model: full_id.to_string(),
             });
