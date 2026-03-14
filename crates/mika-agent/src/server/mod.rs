@@ -633,8 +633,8 @@ mod tests {
             global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             settings: Settings {
                 anthropic_api_key: Some("test-key".to_string()),
-                claude_model: "claude-sonnet-4-6".to_string(),
-                claude_max_tokens: 4096,
+                llm_model: "claude-sonnet-4-6".to_string(),
+                llm_max_tokens: 4096,
                 db_path: std::path::PathBuf::from("/tmp/mika-test/data/mika.db"),
                 log_level: "info".to_string(),
                 log_format: "json".to_string(),

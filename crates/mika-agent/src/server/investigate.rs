@@ -1064,7 +1064,7 @@ pub async fn handle_investigate(
     // Create a ClaudeClient from settings for investigation use.
     let claude = match ClaudeClient::new(
         state.settings.anthropic_api_key.clone(),
-        state.settings.claude_model.clone(),
+        state.settings.llm_model.clone(),
         4096,
     ) {
         Ok(c) => c,

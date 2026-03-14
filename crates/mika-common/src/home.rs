@@ -240,8 +240,8 @@ pub const DEFAULT_CONFIG: &str = r#"# Mika configuration (per-agent overrides).
 # Secrets go in ~/.mika/.env (auto-loaded, 0600 permissions).
 # Run `mika setup` to configure your API key.
 
-claude_model = "claude-sonnet-4-6"
-claude_max_tokens = 4096
+llm_model = "claude-sonnet-4-6"
+llm_max_tokens = 4096
 log_level = "info"
 "#;
 
@@ -346,7 +346,7 @@ mod tests {
 
         // Verify content
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        assert!(config.contains("claude_model"));
+        assert!(config.contains("llm_model"));
         assert!(config.contains("mika setup"));
 
         let soul = fs::read_to_string(home.join("soul.md")).unwrap();

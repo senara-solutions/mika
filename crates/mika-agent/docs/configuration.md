@@ -153,14 +153,14 @@ and `MIKA_GITHUB_REPO` are set. Steps:
 In `~/.mika/config.toml`:
 
 ```toml
-claude_model = "claude-opus-4-6"
+llm_model = "claude-opus-4-6"
 log_level = "debug"
 ```
 
 ### Example: Override model via environment variable
 
 ```sh
-export MIKA_CLAUDE_MODEL=claude-haiku-4-5
+export MIKA_LLM_MODEL=claude-haiku-4-5
 ```
 
 The environment variable takes precedence over all config files and `.env`.
@@ -181,8 +181,8 @@ Prints a summary of current settings (model, max tokens, log level, auth status)
 Read a single configuration value:
 
 ```sh
-mika config get claude_model          # prints: claude-sonnet-4-6
-mika config get claude_model --verbose # prints: claude_model = claude-sonnet-4-6 (source: default, backend: File)
+mika config get llm_model          # prints: claude-sonnet-4-6
+mika config get llm_model --verbose # prints: llm_model = claude-sonnet-4-6 (source: default, backend: File)
 ```
 
 The `--verbose` flag shows where the value comes from (env var, agent config.toml,
@@ -193,8 +193,8 @@ global config.toml, .env file, database, or default).
 Write a configuration value:
 
 ```sh
-mika config set claude_model claude-opus-4-6     # writes to agent config.toml
-mika config set claude_max_tokens 8192            # validated as integer
+mika config set llm_model claude-opus-4-6     # writes to agent config.toml
+mika config set llm_max_tokens 8192            # validated as integer
 mika config set anthropic_api_key                 # secret: prompts interactively, writes to .env
 ```
 
@@ -232,8 +232,8 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
 | `anthropic_api_key` | `Option<String>` | None | `MIKA_ANTHROPIC_API_KEY` | Anthropic API key or OAuth subscription token. Auto-detected from prefix (`sk-ant-oat` = OAuth, otherwise = API key). Required for any command that calls the Claude API. |
-| `claude_model` | `String` | `claude-sonnet-4-6` | `MIKA_CLAUDE_MODEL` | Claude model ID to use for inference. |
-| `claude_max_tokens` | `u32` | `4096` | `MIKA_CLAUDE_MAX_TOKENS` | Maximum tokens for Claude responses. |
+| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Claude model ID to use for inference. |
+| `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for Claude responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
 | `routing_url` | `Option<String>` | None | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery. Required in server mode. |
@@ -403,8 +403,8 @@ For running `mika` (the TUI chat client), only the API key is required:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key or OAuth subscription token |
-| `MIKA_CLAUDE_MODEL` | No | Override model (default: `claude-sonnet-4-6`) |
-| `MIKA_CLAUDE_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
+| `MIKA_LLM_MODEL` | No | Override model (default: `claude-sonnet-4-6`) |
+| `MIKA_LLM_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level (default: `info`) |
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
@@ -429,8 +429,8 @@ are required for inter-service communication:
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for gateway auth |
 | `MIKA_CUSTOMER_ID` | Yes | Customer identifier for this container |
 | `MIKA_SERVER_PORT` | No | Listen port (default: `8080`) |
-| `MIKA_CLAUDE_MODEL` | No | Override model |
-| `MIKA_CLAUDE_MAX_TOKENS` | No | Override max tokens |
+| `MIKA_LLM_MODEL` | No | Override model |
+| `MIKA_LLM_MAX_TOKENS` | No | Override max tokens |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
@@ -489,13 +489,13 @@ Mika works with any Claude model ID. The following models have been tested:
 **Via config file** (`~/.mika/config.toml`):
 
 ```toml
-claude_model = "claude-opus-4-6"
+llm_model = "claude-opus-4-6"
 ```
 
 **Via environment variable:**
 
 ```sh
-export MIKA_CLAUDE_MODEL=claude-opus-4-6
+export MIKA_LLM_MODEL=claude-opus-4-6
 ```
 
 The environment variable always wins if set, regardless of config file values.

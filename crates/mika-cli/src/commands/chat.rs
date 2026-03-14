@@ -372,7 +372,7 @@ async fn spawn_agent_worker(
                 AgentRequest::SetModel { model } => {
                     // Recreate the LLM provider with the new model
                     let mut updated_settings = worker_settings.clone();
-                    updated_settings.claude_model = model;
+                    updated_settings.llm_model = model;
                     if let Ok(new_llm) = updated_settings.make_llm_provider() {
                         worker_llm = new_llm;
                     }
@@ -386,7 +386,7 @@ async fn spawn_agent_worker(
         }
     });
 
-    let model = ctx.settings.claude_model.clone();
+    let model = ctx.settings.llm_model.clone();
     let identity_name = identity.name.clone();
 
     let worker = AgentWorker {

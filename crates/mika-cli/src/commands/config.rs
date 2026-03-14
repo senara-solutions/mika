@@ -27,8 +27,8 @@ async fn run_summary(agent_name: &str) -> Result<()> {
     println!();
     println!("  Mika Configuration");
     println!("  Home:       {}", ctx.home_dir.display());
-    println!("  Model:      {}", ctx.settings.claude_model);
-    println!("  Max tokens: {}", ctx.settings.claude_max_tokens);
+    println!("  Model:      {}", ctx.settings.llm_model);
+    println!("  Max tokens: {}", ctx.settings.llm_max_tokens);
     println!("  Log level:  {}", ctx.settings.log_level);
     println!("  DB path:    {}", ctx.settings.db_path.display());
     let auth_display = match &ctx.settings.anthropic_api_key {
@@ -339,7 +339,7 @@ pub(crate) fn write_config_toml(path: &Path, key: &str, value: &str) -> Result<(
 
     // Set the value with appropriate type
     let toml_value = match key {
-        "claude_max_tokens" | "server_port" | "embedding_dimensions" => {
+        "llm_max_tokens" | "server_port" | "embedding_dimensions" => {
             let n: i64 = value
                 .parse()
                 .map_err(|_| anyhow::anyhow!("{key} must be an integer"))?;
@@ -376,10 +376,10 @@ mod tests {
     fn test_write_config_toml_creates_new() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        write_config_toml(&path, "claude_model", "claude-opus-4-6").unwrap();
+        write_config_toml(&path, "llm_model", "claude-opus-4-6").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("claude_model = \"claude-opus-4-6\""));
+        assert!(content.contains("llm_model = \"claude-opus-4-6\""));
     }
 
     #[test]
@@ -388,24 +388,24 @@ mod tests {
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "# My comment\nlog_level = \"info\"\n").unwrap();
 
-        write_config_toml(&path, "claude_model", "claude-opus-4-6").unwrap();
+        write_config_toml(&path, "llm_model", "claude-opus-4-6").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("# My comment"));
         assert!(content.contains("log_level = \"info\""));
-        assert!(content.contains("claude_model = \"claude-opus-4-6\""));
+        assert!(content.contains("llm_model = \"claude-opus-4-6\""));
     }
 
     #[test]
     fn test_write_config_toml_updates_existing() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "claude_model = \"old-model\"\n").unwrap();
+        std::fs::write(&path, "llm_model = \"old-model\"\n").unwrap();
 
-        write_config_toml(&path, "claude_model", "new-model").unwrap();
+        write_config_toml(&path, "llm_model", "new-model").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("claude_model = \"new-model\""));
+        assert!(content.contains("llm_model = \"new-model\""));
         assert!(!content.contains("old-model"));
     }
 
@@ -414,19 +414,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
 
-        write_config_toml(&path, "claude_max_tokens", "8192").unwrap();
+        write_config_toml(&path, "llm_max_tokens", "8192").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("claude_max_tokens = 8192"));
+        assert!(content.contains("llm_max_tokens = 8192"));
     }
 
     #[test]
     fn test_toml_key_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "claude_model = \"test\"\n").unwrap();
+        std::fs::write(&path, "llm_model = \"test\"\n").unwrap();
 
-        assert!(toml_key_exists(&path, "claude_model"));
+        assert!(toml_key_exists(&path, "llm_model"));
         assert!(!toml_key_exists(&path, "log_level"));
     }
 

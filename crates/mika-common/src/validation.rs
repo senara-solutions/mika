@@ -65,12 +65,12 @@ pub fn check_binary_in_path(name: &str) -> Option<PathBuf> {
 /// Validate a value for a config.toml (File backend) key.
 pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
     match key {
-        "claude_model" | "embedding_model" => {
+        "llm_model" | "embedding_model" => {
             if value.trim().is_empty() {
                 return Err(format!("{key} cannot be empty"));
             }
         }
-        "claude_max_tokens" => {
+        "llm_max_tokens" => {
             let n: u32 = value
                 .parse()
                 .map_err(|_| format!("Invalid {key}: must be a positive integer"))?;
@@ -152,20 +152,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_key_claude_model() {
-        assert!(validate_file_key("claude_model", "claude-sonnet-4-6").is_ok());
-        assert!(validate_file_key("claude_model", "").is_err());
-        assert!(validate_file_key("claude_model", "  ").is_err());
+    fn test_validate_file_key_llm_model() {
+        assert!(validate_file_key("llm_model", "claude-sonnet-4-6").is_ok());
+        assert!(validate_file_key("llm_model", "").is_err());
+        assert!(validate_file_key("llm_model", "  ").is_err());
     }
 
     #[test]
     fn test_validate_file_key_max_tokens() {
-        assert!(validate_file_key("claude_max_tokens", "4096").is_ok());
-        assert!(validate_file_key("claude_max_tokens", "1").is_ok());
-        assert!(validate_file_key("claude_max_tokens", "131072").is_ok());
-        assert!(validate_file_key("claude_max_tokens", "0").is_err());
-        assert!(validate_file_key("claude_max_tokens", "131073").is_err());
-        assert!(validate_file_key("claude_max_tokens", "abc").is_err());
+        assert!(validate_file_key("llm_max_tokens", "4096").is_ok());
+        assert!(validate_file_key("llm_max_tokens", "1").is_ok());
+        assert!(validate_file_key("llm_max_tokens", "131072").is_ok());
+        assert!(validate_file_key("llm_max_tokens", "0").is_err());
+        assert!(validate_file_key("llm_max_tokens", "131073").is_err());
+        assert!(validate_file_key("llm_max_tokens", "abc").is_err());
     }
 
     #[test]

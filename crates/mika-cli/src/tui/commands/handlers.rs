@@ -424,7 +424,7 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             // Persist to config.toml so the choice survives restarts
             let config_path = app.home_dir.join("config.toml");
             if let Err(e) =
-                crate::commands::config::write_config_toml(&config_path, "claude_model", full_id)
+                crate::commands::config::write_config_toml(&config_path, "llm_model", full_id)
             {
                 tracing::warn!(error = %e, "failed to persist model to config.toml");
             }
