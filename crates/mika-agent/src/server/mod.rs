@@ -181,6 +181,7 @@ async fn init_agent(
         async_db.clone(),
         http_client.clone(),
         None,
+        Some(agent_name.to_string()),
     );
     let engine_sender: Arc<dyn MessageSender> = Arc::new(engine_sender);
 

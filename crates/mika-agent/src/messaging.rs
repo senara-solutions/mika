@@ -34,6 +34,7 @@ pub struct GatewayMessageSender {
     internal_token: SecretString,
     db: AsyncDatabase,
     request_id: Option<String>,
+    agent_name: Option<String>,
 }
 
 impl GatewayMessageSender {
@@ -43,6 +44,7 @@ impl GatewayMessageSender {
         db: AsyncDatabase,
         client: reqwest::Client,
         request_id: Option<String>,
+        agent_name: Option<String>,
     ) -> Self {
         Self {
             client,
@@ -50,6 +52,7 @@ impl GatewayMessageSender {
             internal_token,
             db,
             request_id,
+            agent_name,
         }
     }
 
@@ -86,6 +89,7 @@ impl MessageSender for GatewayMessageSender {
             "chat_id": chat_id,
             "text": text,
             "request_id": self.request_id,
+            "agent_name": self.agent_name,
         });
 
         // First attempt

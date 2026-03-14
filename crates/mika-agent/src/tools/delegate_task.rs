@@ -6,6 +6,7 @@ use mika_common::config::Settings;
 use mika_common::home;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
@@ -145,6 +146,28 @@ impl Tool for DelegateTaskTool {
         let session_id = uuid::Uuid::new_v4().to_string();
         let skills_dirty = AtomicBool::new(false);
 
+        // Create a sender with the delegate's agent_name (not the orchestrator's)
+        // so outbound messages are correctly attributed and reply routing works.
+        let delegate_sender: Option<Arc<dyn crate::messaging::MessageSender>> =
+            if ctx.message_sender.is_some() {
+                if let (Some(url), Some(token)) =
+                    (&self.settings.routing_url, &self.settings.internal_token)
+                {
+                    Some(Arc::new(crate::messaging::GatewayMessageSender::new(
+                        url.clone(),
+                        token.clone(),
+                        async_db.clone(),
+                        reqwest::Client::new(),
+                        None,
+                        Some(agent_name.to_string()),
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
             claude: &claude,
@@ -160,6 +183,7 @@ impl Tool for DelegateTaskTool {
             mcp_manager: None,
             agent_name,
             child_task_id: None,
+            message_sender: delegate_sender,
         };
 
         let result = crate::agent::run_team_agent(&params).await;

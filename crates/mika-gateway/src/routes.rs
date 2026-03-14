@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::{
@@ -38,6 +38,8 @@ pub struct AppState {
     pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
     /// Optional override for agent container base URL (local E2E testing).
     pub agent_base_url: Option<String>,
+    /// Counter for periodic outbound_messages cleanup (every ~100 webhook calls).
+    pub webhook_counter: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -46,6 +48,7 @@ impl std::fmt::Debug for AppState {
             .field("internal_token", &"[REDACTED]")
             .field("webhook_secret", &"[REDACTED]")
             .field("agent_base_url", &self.agent_base_url)
+            .field("webhook_counter", &self.webhook_counter)
             .finish_non_exhaustive()
     }
 }
@@ -124,6 +127,15 @@ pub(crate) async fn handle_webhook(
 
     let parsed = parse_update(&update);
 
+    // Periodic cleanup of old outbound message mappings (~every 100 webhooks)
+    let count = state.webhook_counter.fetch_add(1, Ordering::Relaxed);
+    if count % 100 == 0 {
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            cleanup_old_outbound_messages(&cleanup_state).await;
+        });
+    }
+
     // Dispatch asynchronously — always return 200 to Telegram
     let s = state.clone();
     tokio::spawn(async move {
@@ -139,16 +151,26 @@ pub(crate) async fn handle_webhook(
                 chat_id,
                 text,
                 update_id,
+                reply_to_message_id,
             } => {
-                handle_text_message(&s, chat_id, &text, update_id).await;
+                handle_text_message(&s, chat_id, &text, update_id, reply_to_message_id).await;
             }
             ParsedMessage::Photo {
                 chat_id,
                 file_id,
                 caption,
                 update_id,
+                reply_to_message_id,
             } => {
-                handle_photo_message(&s, chat_id, &file_id, caption.as_deref(), update_id).await;
+                handle_photo_message(
+                    &s,
+                    chat_id,
+                    &file_id,
+                    caption.as_deref(),
+                    update_id,
+                    reply_to_message_id,
+                )
+                .await;
             }
             ParsedMessage::Document {
                 chat_id,
@@ -156,9 +178,18 @@ pub(crate) async fn handle_webhook(
                 mime_type: _,
                 caption,
                 update_id,
+                reply_to_message_id,
             } => {
                 // Image documents use the same flow as photos
-                handle_photo_message(&s, chat_id, &file_id, caption.as_deref(), update_id).await;
+                handle_photo_message(
+                    &s,
+                    chat_id,
+                    &file_id,
+                    caption.as_deref(),
+                    update_id,
+                    reply_to_message_id,
+                )
+                .await;
             }
             ParsedMessage::BareStart { chat_id } => {
                 let _ = s
@@ -292,7 +323,13 @@ async fn handle_forward_result(
 // -- Text message routing --
 
 /// Route a text message to the correct customer container.
-async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_id: i64) {
+async fn handle_text_message(
+    state: &AppState,
+    chat_id: i64,
+    text: &str,
+    update_id: i64,
+    reply_to_message_id: Option<i64>,
+) {
     let row = match resolve_customer(state, chat_id).await {
         Some(r) => r,
         None => return,
@@ -309,20 +346,28 @@ async fn handle_text_message(state: &AppState, chat_id: i64, text: &str, update_
         return;
     }
 
+    // Look up target agent from reply context (if replying to an agent message)
+    let target_agent = resolve_reply_agent(state, chat_id, reply_to_message_id).await;
+
     let url = container_url(&row.id, &state.agent_base_url);
     let request_id = Uuid::new_v4().to_string();
 
     // Forward to container
+    let mut payload = serde_json::json!({
+        "text": text,
+        "chat_id": chat_id,
+        "channel": "telegram",
+        "request_id": request_id
+    });
+    if let Some(ref agent) = target_agent {
+        payload["agent"] = serde_json::Value::String(agent.clone());
+    }
+
     let result = state
         .http_client
         .post(format!("{url}/message"))
         .bearer_auth(state.internal_token.expose_secret())
-        .json(&serde_json::json!({
-            "text": text,
-            "chat_id": chat_id,
-            "channel": "telegram",
-            "request_id": request_id
-        }))
+        .json(&payload)
         .timeout(Duration::from_secs(2))
         .send()
         .await;
@@ -343,6 +388,7 @@ async fn handle_photo_message(
     file_id: &str,
     caption: Option<&str>,
     update_id: i64,
+    reply_to_message_id: Option<i64>,
 ) {
     let row = match resolve_customer(state, chat_id).await {
         Some(r) => r,
@@ -410,6 +456,9 @@ async fn handle_photo_message(
         return;
     }
 
+    // Look up target agent from reply context (if replying to an agent message)
+    let target_agent = resolve_reply_agent(state, chat_id, reply_to_message_id).await;
+
     // Use caption or synthetic text for captionless photos
     let text = caption.unwrap_or("[Photo]");
 
@@ -417,20 +466,25 @@ async fn handle_photo_message(
     let request_id = Uuid::new_v4().to_string();
 
     // Forward to container with images array (longer timeout for large payloads)
+    let mut payload = serde_json::json!({
+        "text": text,
+        "chat_id": chat_id,
+        "channel": "telegram",
+        "request_id": request_id,
+        "images": [{
+            "media_type": media_type,
+            "data": base64_data,
+        }]
+    });
+    if let Some(ref agent) = target_agent {
+        payload["agent"] = serde_json::Value::String(agent.clone());
+    }
+
     let result = state
         .http_client
         .post(format!("{url}/message"))
         .bearer_auth(state.internal_token.expose_secret())
-        .json(&serde_json::json!({
-            "text": text,
-            "chat_id": chat_id,
-            "channel": "telegram",
-            "request_id": request_id,
-            "images": [{
-                "media_type": media_type,
-                "data": base64_data,
-            }]
-        }))
+        .json(&payload)
         .timeout(Duration::from_secs(10))
         .send()
         .await;
@@ -576,14 +630,52 @@ pub(crate) async fn handle_send(
             .into_response();
     }
 
+    // Validate agent_name format (defense-in-depth at trust boundary)
+    if let Some(ref name) = payload.agent_name
+        && (name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid agent_name"})),
+        )
+            .into_response();
+    }
+
+    // Prepend agent name for identification in multi-agent setups
+    let owned_text;
+    let text_to_send = match &payload.agent_name {
+        Some(name) => {
+            owned_text = format!("[{name}] {}", payload.text);
+            &owned_text
+        }
+        None => &payload.text,
+    };
+
     // Send to Telegram (no message splitting — send as-is)
     match state
         .telegram
-        .send_message(payload.chat_id, &payload.text)
+        .send_message(payload.chat_id, text_to_send)
         .await
     {
-        Ok(()) => {
-            info!(chat_id = payload.chat_id, request_id = ?payload.request_id, "sent to telegram");
+        Ok(message_id) => {
+            info!(chat_id = payload.chat_id, request_id = ?payload.request_id, telegram_message_id = message_id, "sent to telegram");
+
+            // Store outbound message mapping for reply routing (best-effort)
+            if let Some(ref name) = payload.agent_name {
+                let _ = sqlx::query(
+                    "INSERT INTO outbound_messages (telegram_message_id, chat_id, agent_name) VALUES ($1, $2, $3)",
+                )
+                .bind(message_id)
+                .bind(payload.chat_id)
+                .bind(name)
+                .execute(&state.pool)
+                .await;
+            }
+
             StatusCode::OK.into_response()
         }
         Err(TelegramApiError::BotBlocked) => {
@@ -610,6 +702,10 @@ pub(crate) struct SendPayload {
     text: String,
     #[serde(default)]
     request_id: Option<String>,
+    /// Agent name for identification in multi-agent setups.
+    /// When present, outbound messages are prefixed with `[agent_name]`.
+    #[serde(default)]
+    agent_name: Option<String>,
 }
 
 // -- Health handlers --
@@ -649,6 +745,42 @@ pub(crate) async fn handle_readiness(State(state): State<AppState>) -> StatusCod
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
+}
+
+// -- Reply routing --
+
+/// Look up the agent that sent a specific outbound message, for reply routing.
+/// Returns `None` if no reply context, or if the lookup fails (best-effort).
+async fn resolve_reply_agent(
+    state: &AppState,
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
+) -> Option<String> {
+    let msg_id = reply_to_message_id?;
+    match sqlx::query_scalar::<_, String>(
+        "SELECT agent_name FROM outbound_messages WHERE telegram_message_id = $1 AND chat_id = $2",
+    )
+    .bind(msg_id)
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(opt) => opt,
+        Err(e) => {
+            warn!(error = %e, chat_id, telegram_message_id = msg_id, "reply agent lookup failed");
+            None
+        }
+    }
+}
+
+/// Purge outbound message mappings older than 7 days.
+/// Called periodically from webhook handler to avoid unbounded table growth.
+async fn cleanup_old_outbound_messages(state: &AppState) {
+    let _ = sqlx::query(
+        "DELETE FROM outbound_messages WHERE ctid IN (SELECT ctid FROM outbound_messages WHERE created_at < now() - interval '7 days' LIMIT 1000)",
+    )
+    .execute(&state.pool)
+    .await;
 }
 
 // -- Helpers --
@@ -742,5 +874,28 @@ mod tests {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let url = container_url(&id, &Some("http://localhost:8080".to_string()));
         assert_eq!(url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_send_payload_without_agent_name() {
+        let json = r#"{"chat_id": 42, "text": "hello"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.chat_id, 42);
+        assert_eq!(payload.text, "hello");
+        assert!(payload.agent_name.is_none());
+    }
+
+    #[test]
+    fn test_send_payload_with_agent_name() {
+        let json = r#"{"chat_id": 42, "text": "hello", "agent_name": "mika-dev"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.agent_name.as_deref(), Some("mika-dev"));
+    }
+
+    #[test]
+    fn test_send_payload_with_underscore_agent_name() {
+        let json = r#"{"chat_id": 42, "text": "hello", "agent_name": "my_agent"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.agent_name.as_deref(), Some("my_agent"));
     }
 }

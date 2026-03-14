@@ -4,7 +4,7 @@ mod settings;
 mod telegram;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::path::Path;
 
@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         // Pool of 20 connections provides sufficient headroom.
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
         agent_base_url: settings.agent_base_url.clone(),
+        webhook_counter: Arc::new(AtomicU64::new(0)),
     };
 
     let app = build_router(state);
