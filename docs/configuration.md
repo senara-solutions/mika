@@ -232,7 +232,9 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
 | `anthropic_api_key` | `Option<String>` | None | `MIKA_ANTHROPIC_API_KEY` | Anthropic API key or OAuth subscription token. Auto-detected from prefix (`sk-ant-oat` = OAuth, otherwise = API key). Required for any command that calls the Claude API. |
-| `claude_model` | `String` | `claude-sonnet-4-6` | `MIKA_CLAUDE_MODEL` | Claude model ID to use for inference. |
+| `claude_model` | `String` | `claude-sonnet-4-6` | `MIKA_CLAUDE_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`. No prefix defaults to Anthropic. |
+| `llm_base_url` | `Option<String>` | None | `MIKA_LLM_BASE_URL` | Override base URL for OpenAI-compatible providers (e.g., `http://localhost:11434/v1` for Ollama). Each known provider has a default; only needed for `openai-compatible` or custom endpoints. |
+| `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | Generic API key for non-Anthropic providers. Falls back to `MIKA_ANTHROPIC_API_KEY` if unset. |
 | `claude_max_tokens` | `u32` | `4096` | `MIKA_CLAUDE_MAX_TOKENS` | Maximum tokens for Claude responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
@@ -260,7 +262,7 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `investigate_github_token`, and `otlp_auth_header` are redacted in
+- `anthropic_api_key`, `llm_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `investigate_github_token`, and `otlp_auth_header` are redacted in
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
@@ -410,6 +412,8 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_LOG_LEVEL` | No | Override log level (default: `info`) |
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
+| `MIKA_LLM_BASE_URL` | No | Override base URL for OpenAI-compatible providers |
+| `MIKA_LLM_API_KEY` | No | Generic API key for non-Anthropic providers (falls back to `MIKA_ANTHROPIC_API_KEY`) |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
@@ -479,7 +483,21 @@ hexadecimal characters (32 bytes hex-encoded). Generate with `openssl rand -hex 
 
 ## Model Configuration
 
-Mika works with any Claude model ID. The following models have been tested:
+Mika supports multiple LLM providers via the `LlmProvider` trait. The provider is
+selected by a `provider/model` prefix in the `claude_model` setting. If no prefix
+is present, Anthropic is used by default.
+
+### Supported providers
+
+| Provider | Prefix | Default Base URL | API Key Required |
+|----------|--------|------------------|------------------|
+| Anthropic (default) | `anthropic/` or none | `https://api.anthropic.com` | `MIKA_ANTHROPIC_API_KEY` |
+| OpenAI | `openai/` | `https://api.openai.com/v1` | `MIKA_LLM_API_KEY` or `MIKA_ANTHROPIC_API_KEY` |
+| Ollama | `ollama/` | `http://localhost:11434/v1` | Optional |
+| Groq | `groq/` | `https://api.groq.com/openai/v1` | `MIKA_LLM_API_KEY` |
+| OpenAI-compatible | `openai-compatible/` | None (requires `MIKA_LLM_BASE_URL`) | `MIKA_LLM_API_KEY` |
+
+### Anthropic models
 
 | Model ID | Description |
 |----------|-------------|
@@ -489,19 +507,75 @@ Mika works with any Claude model ID. The following models have been tested:
 
 ### Switching models
 
-**Via config file** (`~/.mika/config.toml`):
+**Anthropic (default)** — no prefix needed:
 
 ```toml
+# ~/.mika/config.toml
 claude_model = "claude-opus-4-6"
 ```
 
-**Via environment variable:**
+**OpenAI:**
 
 ```sh
-export MIKA_CLAUDE_MODEL=claude-opus-4-6
+export MIKA_CLAUDE_MODEL=openai/gpt-4o
+export MIKA_LLM_API_KEY=sk-...
+```
+
+**Ollama (local):**
+
+```sh
+export MIKA_CLAUDE_MODEL=ollama/llama3
+# No API key needed for local Ollama
+```
+
+**Groq:**
+
+```sh
+export MIKA_CLAUDE_MODEL=groq/llama-3.1-70b
+export MIKA_LLM_API_KEY=gsk_...
+```
+
+**Custom OpenAI-compatible endpoint:**
+
+```sh
+export MIKA_CLAUDE_MODEL=openai-compatible/my-model
+export MIKA_LLM_BASE_URL=http://my-server:8000/v1
+export MIKA_LLM_API_KEY=my-key
+```
+
+**Via environment variable (any provider):**
+
+```sh
+export MIKA_CLAUDE_MODEL=openai/gpt-4o
 ```
 
 The environment variable always wins if set, regardless of config file values.
+
+### Runtime model switching
+
+In the TUI chat, use the `/model` slash command to switch models at runtime:
+
+```
+/model ollama/llama3
+/model claude-opus-4-6
+```
+
+This recreates the provider with the new model. The switch takes effect for the
+next message.
+
+### Provider capabilities
+
+Not all providers support all features. The `LlmProvider` trait reports capabilities:
+
+| Feature | Anthropic | OpenAI | Ollama | Groq |
+|---------|-----------|--------|--------|------|
+| Tool calling | Yes | Yes | Varies by model | Varies by model |
+| Vision/images | Yes | Yes | Varies by model | No |
+| Extended thinking | Yes | No | No | No |
+
+When using a provider that doesn't support tool calling, Mika's agent tools
+(memory, reminders, etc.) will not be available. The agent will operate in
+text-only mode.
 
 ---
 

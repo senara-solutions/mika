@@ -368,8 +368,8 @@ mika doctor
 
 This checks home directory permissions, API key format, database integrity,
 `config.toml` parsing, optional keys (OpenAI, Brave), `jq` availability, MCP
-configuration, and installed skills. Add `--verify-api` to make a live Claude
-API call to confirm credentials work end-to-end. Use `--json` for
+configuration, and installed skills. Add `--verify-api` to make a live API
+call to the configured LLM provider to confirm credentials work end-to-end. Use `--json` for
 machine-readable output (e.g., in CI scripts).
 
 Exit code is non-zero if any check fails.
