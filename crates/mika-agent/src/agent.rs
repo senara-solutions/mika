@@ -485,11 +485,9 @@ async fn run_loop(
                     );
                     request.messages.push(LlmMessage {
                         role: LlmRole::Assistant,
-                        content: LlmContent::Blocks(
-                            mika_common::llm::response_content_to_blocks(
-                                &response.content,
-                            ),
-                        ),
+                        content: LlmContent::Blocks(mika_common::llm::response_content_to_blocks(
+                            &response.content,
+                        )),
                     });
                     request.messages.push(LlmMessage {
                         role: LlmRole::User,
