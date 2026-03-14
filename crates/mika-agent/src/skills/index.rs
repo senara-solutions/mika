@@ -847,12 +847,12 @@ mod tests {
         // Legacy exec handler (also detected now)
         assert!(is_legacy_format(
             r#"
-            name = "calendar"
-            description = "Calendar"
+            name = "weather"
+            description = "Weather"
             [handler]
             type = "exec"
             command = "./handler.sh"
-            tools = ["get_events"]
+            tools = ["get_forecast"]
             "#
         ));
 

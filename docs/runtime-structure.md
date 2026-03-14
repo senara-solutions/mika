@@ -34,7 +34,6 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 │       │   ├── web-search/
 │       │   ├── file-reader/
 │       │   ├── tmux/
-│       │   ├── calendar/
 │       │   ├── github/
 │       │   ├── mcp/
 │       │   ├── agents-teams/

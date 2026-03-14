@@ -294,7 +294,7 @@ cat meeting-notes.txt | mika ask "-"
 
 ```sh
 #!/bin/sh
-response=$(mika ask "What's on my calendar today?")
+response=$(mika ask "What are my top priorities today?")
 echo "Mika says: $response"
 ```
 

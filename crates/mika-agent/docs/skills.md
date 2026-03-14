@@ -51,6 +51,7 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `version`      | String | No       | `""`    | Skill version. |
 | `always_on`    | bool   | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
 | `timeout_secs` | u64    | No       | `30`    | Per-tool execution timeout in seconds. |
+| `dependencies` | Array\<String\> | No | `[]` | Other skill names that should be loaded when this skill is active. One level only — no transitive resolution. |
 
 ### `[triggers]` section
 
@@ -290,7 +291,9 @@ On each user turn, the `SkillRegistry` determines which skills are active:
 
 2. **Keyword-matched skills** are included when at least one keyword from their `triggers.keywords` list appears as a substring of the user's message. Matching is case-insensitive: keywords are pre-lowercased at scan time, and the user message is lowercased before comparison.
 
-3. **Unmatched skills** are excluded from the turn entirely. Their tools are not sent to Claude and their prompt snippets are not injected.
+3. **Dependency resolution:** After direct matching, matched skills that declare `dependencies = ["foo"]` pull in the named skill "foo" (if it exists and is enabled). Resolution is one level only — dependencies of dependencies are not resolved. This ensures that an `always_on` skill can reference tools from another skill without requiring keyword overlap.
+
+4. **Unmatched skills** are excluded from the turn entirely. Their tools are not sent to Claude and their prompt snippets are not injected.
 
 The matching algorithm is intentionally simple and cheap. Claude still makes the final decision about which tools to actually call from the matched set. The keyword system acts as a coarse filter to avoid sending irrelevant tools on every turn.
 
@@ -378,6 +381,8 @@ The file contains a JSON array of `SkillToolDef` objects:
 ```
 Optional fields: `long_running` (bool), `estimated_duration_secs` (u64).
 
+Exec handlers always capture and return stdout regardless of exit code. Non-zero exits are **not** treated as tool errors — the output includes an `Exit code: N` prefix and the agent interprets the exit code contextually. Only OS-level failures (command not found, timeout) produce tool errors. The `__mika_v1` image envelope protocol is only parsed on exit 0.
+
 **Http** — POSTs to a URL:
 ```json
 {"type": "http", "url": "http://localhost:8080/tools", "method": "POST"}
@@ -415,7 +420,15 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 | shell-exec     | No        | run command, execute, shell, terminal, bash                                                       | `shell_exec` | Yes            |
 | tmux           | No        | tmux, terminal, session, pane, window                                                             | `tmux`       | Yes            |
 | web-search     | Yes       | search, look up, find out, google, browse, web                                                    | `web_search` | Yes            |
-| github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status | `run_gh`     | Yes            |
+| github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status, label, labels, add label, create label, edit label, delete label, remove label | `run_gh`     | Yes            |
+
+### Builtin-handler skills (keyword-triggered)
+
+| Skill              | Keywords                                              | Tools     | Prompt Snippet |
+|--------------------|-------------------------------------------------------|-----------|----------------|
+| google-workspace   | google, gmail, google calendar, google drive, gdrive  | `run_gws` | Yes            |
+
+The **google-workspace** skill provides `run_gws` for interacting with Google Workspace (Gmail, Calendar, Drive) via the `gws` CLI. It uses a service allowlist (`gmail`, `calendar`, `drive`) and blocks credential/config-smuggling flags (`--token`, `--credentials-file`, `--config`, `--config-dir` including `--flag=value` forms). Scrubs `MIKA_*` env vars from child processes. Uses `gws`'s native keyring-based authentication (set up via `gws auth login`). Requires `gws` CLI installed (included in Docker image). `timeout_secs = 45` to accommodate first-call API schema discovery.
 
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
 
@@ -428,7 +441,6 @@ All bundled exec-handler scripts require `jq` for JSON input parsing and will fa
 | Skill           | Keywords                                                      | Prompt Snippet |
 |-----------------|---------------------------------------------------------------|----------------|
 | self-knowledge  | help, what can you do, capabilities, commands, how to use     | Yes            |
-| calendar        | calendar, meeting, schedule, event                             | Yes            |
 | mcp             | mcp, model context protocol, mcp server, mcp tool              | Yes            |
 | agents-teams    | delegate, delegate task, run team, list agents, list teams, team workflow, team status, team history, multi-agent | Yes |
 

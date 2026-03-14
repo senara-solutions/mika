@@ -441,7 +441,6 @@ All bundled exec-handler scripts require `jq` for JSON input parsing and will fa
 | Skill           | Keywords                                                      | Prompt Snippet |
 |-----------------|---------------------------------------------------------------|----------------|
 | self-knowledge  | help, what can you do, capabilities, commands, how to use     | Yes            |
-| calendar        | calendar, meeting, schedule, event                             | Yes            |
 | mcp             | mcp, model context protocol, mcp server, mcp tool              | Yes            |
 | agents-teams    | delegate, delegate task, run team, list agents, list teams, team workflow, team status, team history, multi-agent | Yes |
 
