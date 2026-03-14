@@ -632,7 +632,6 @@ mod tests {
                 embedding_model: "text-embedding-3-small".to_string(),
                 embedding_dimensions: 512,
                 brave_api_key: None,
-                google_token: None,
                 investigate_github_token: None,
                 github_repo: None,
                 home_dir: std::path::PathBuf::from("/tmp/mika-test"),

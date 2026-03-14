@@ -21,6 +21,13 @@ if [ -z "$COMMAND" ]; then
     exit 1
 fi
 
+# Block commands that have dedicated skill handlers (security: force use of controlled wrappers)
+FIRST_WORD=$(printf '%s\n' "$COMMAND" | awk '{print $1}')
+case "$FIRST_WORD" in
+    gws)  echo "Error: Use the dedicated run_gws skill instead of run_shell for security." >&2; exit 1 ;;
+    gh)   echo "Error: Use the dedicated run_gh skill instead of run_shell for security." >&2; exit 1 ;;
+esac
+
 if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     cd "$WORKDIR" || exit 1
 fi

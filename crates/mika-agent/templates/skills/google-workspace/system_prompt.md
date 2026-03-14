@@ -4,7 +4,7 @@ You have access to the Google Workspace CLI (`gws`) via the `run_gws` tool. Use 
 
 - The `command` parameter is a JSON array where each argument is a separate element. Do NOT pass a single string — each flag, value, and subcommand must be its own array element.
 - Only these top-level services are allowed: `gmail`, `calendar`, `drive`. Other services and subcommands (including `auth`, `config`) are blocked for security.
-- Do not include `--token` or `--credentials-file` in the command array — authentication is handled automatically.
+- Do not include `--token`, `--credentials-file`, or `--config`/`--config-dir` in the command array — authentication and configuration are handled automatically.
 - The first call after startup may be slow (fetching API schema from Google). This is normal.
 - If the first call times out, retry once — the API schema may still be downloading.
 
@@ -60,7 +60,7 @@ Helper commands (prefixed with `+`) provide shortcuts for common operations:
 
 - 0: Success
 - 1: API error (check the error message for details)
-- 2: Authentication error — token may be expired or invalid. Ask the user to refresh `MIKA_GOOGLE_TOKEN`.
+- 2: Authentication error — credentials may be expired or invalid. Ask the user to run `gws auth login` to re-authenticate.
 - 3: Validation error (bad input or missing parameters)
 - 4: Discovery service error (cannot reach Google APIs — check network connectivity)
 - 5: Internal error
@@ -71,5 +71,5 @@ When a command fails, the output starts with `Exit code: N` followed by the erro
 
 - ALWAYS confirm destructive or state-changing operations with the user before executing: sending emails, deleting files/events, modifying permissions, creating calendar events.
 - Use `--dry-run` when available to preview destructive operations before executing.
-- If `run_gws` reports an authentication error (exit code 2), tell the user their Google token may be expired and suggest refreshing `MIKA_GOOGLE_TOKEN` in `~/.mika/.env`.
+- If `run_gws` reports an authentication error (exit code 2), tell the user their credentials may be expired and suggest running `gws auth login` to re-authenticate.
 - Keep pagination small to avoid output truncation. Prefer `--params "{\"maxResults\": 10}"` over fetching all results.

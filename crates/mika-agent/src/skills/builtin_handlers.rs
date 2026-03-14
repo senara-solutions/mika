@@ -425,7 +425,7 @@ async fn run_gh(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput
 /// Allowed top-level `gws` service subcommands.
 const GWS_ALLOWED_SUBCOMMANDS: &[&str] = &["gmail", "calendar", "drive"];
 
-/// Flags that must not appear in the `run_gws` command array (prevent credential smuggling).
+/// Flags that must not appear in the `run_gws` command array (prevent credential/config smuggling).
 const GWS_BLOCKED_FLAGS: &[&str] = &["--token", "--credentials-file", "--config", "--config-dir"];
 
 /// Validate and parse `run_gws` input into structured args.
@@ -460,49 +460,20 @@ fn validate_gws_input(input: &serde_json::Value) -> Result<Vec<String>, ToolOutp
     Ok(args)
 }
 
-/// Scrub all `GOOGLE_WORKSPACE_CLI_*` env vars from a child process command.
-///
-/// Prevents ambient credentials or configuration from the user's shell from
-/// leaking into the agent's gws calls. Only the explicitly configured token
-/// should be set after this scrub.
-fn scrub_gws_env_vars(cmd: &mut tokio::process::Command) {
-    for (key, _) in std::env::vars() {
-        if key.starts_with("GOOGLE_WORKSPACE_CLI_") {
-            cmd.env_remove(&key);
-        }
-    }
-}
-
 /// Execute a Google Workspace CLI (`gws`) command with safe argument passing.
 ///
 /// Input: `{"command": ["gmail", "messages", "list", "--params", "{\"maxResults\": 5}"]}`
 ///
-/// Reads `MIKA_GOOGLE_TOKEN` from the environment and passes it as
-/// `GOOGLE_WORKSPACE_CLI_TOKEN` to the child process.
+/// Uses `gws`'s native keyring-based authentication (set up via `gws auth login`).
 async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput {
     let args = match validate_gws_input(input) {
         Ok(args) => args,
         Err(err) => return err,
     };
 
-    // Read the Google token from Mika's environment
-    let token = match std::env::var("MIKA_GOOGLE_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t,
-        _ => {
-            return ToolOutput::error(
-                "Google Workspace CLI token not configured. \
-                 Set MIKA_GOOGLE_TOKEN in ~/.mika/.env (get token via: gws auth login, then export)."
-                    .to_string(),
-            );
-        }
-    };
-
     let mut cmd = tokio::process::Command::new("gws");
     cmd.args(&args);
 
-    // Scrub all GOOGLE_WORKSPACE_CLI_* env vars first, then set only the token
-    scrub_gws_env_vars(&mut cmd);
-    cmd.env("GOOGLE_WORKSPACE_CLI_TOKEN", &token);
     super::executor::scrub_mika_env_vars(&mut cmd);
 
     spawn_and_collect(
@@ -952,20 +923,6 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.content.contains("Do not include --repo"));
-    }
-
-    #[tokio::test]
-    async fn test_run_gws_missing_token() {
-        let harness = TestHarness::new();
-        let ctx = harness.ctx();
-        // Ensure MIKA_GOOGLE_TOKEN is not set in test env
-        // Safety: test-only env var manipulation.
-        unsafe { std::env::remove_var("MIKA_GOOGLE_TOKEN") };
-        let input = serde_json::json!({"command": ["gmail", "messages", "list"]});
-        let output = run_gws(&input, &ctx).await;
-        assert!(output.is_error);
-        assert!(output.content.contains("not configured"));
-        assert!(output.content.contains("MIKA_GOOGLE_TOKEN"));
     }
 
     /// Verify crate-local fallback copies match workspace-root docs.
