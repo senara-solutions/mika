@@ -1,8 +1,7 @@
 use anyhow::Result;
 use mika_common::llm::{
-    LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest,
-    LlmResponseContent, LlmRole, LlmStopReason, LlmToolDefinition, LlmToolResultBlock,
-    LlmToolResultContent, LlmUsage,
+    LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent,
+    LlmRole, LlmStopReason, LlmToolDefinition, LlmToolResultBlock, LlmToolResultContent, LlmUsage,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -487,7 +486,9 @@ async fn run_loop(
                     request.messages.push(LlmMessage {
                         role: LlmRole::Assistant,
                         content: LlmContent::Blocks(
-                            mika_common::llm::anthropic::response_content_to_blocks(&response.content),
+                            mika_common::llm::anthropic::response_content_to_blocks(
+                                &response.content,
+                            ),
                         ),
                     });
                     request.messages.push(LlmMessage {
@@ -2610,9 +2611,7 @@ mod tests {
             // Prior turn: user message with only text blocks
             LlmMessage {
                 role: LlmRole::User,
-                content: LlmContent::Blocks(vec![LlmContentBlock::Text(
-                    "Hello".to_string(),
-                )]),
+                content: LlmContent::Blocks(vec![LlmContentBlock::Text("Hello".to_string())]),
             },
             // Current turn
             LlmMessage {

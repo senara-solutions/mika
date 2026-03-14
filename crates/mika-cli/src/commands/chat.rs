@@ -29,8 +29,8 @@ use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::tools;
 use mika_common::claude::ThinkingConfig;
-use mika_common::llm::LlmImage;
 use mika_common::config::Settings;
+use mika_common::llm::LlmImage;
 use mika_common::team;
 use std::path::Path;
 

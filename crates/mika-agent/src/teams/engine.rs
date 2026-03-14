@@ -8,8 +8,8 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use mika_common::agent;
 use mika_common::config::Settings;
-use mika_common::llm::LlmProvider;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::LlmProvider;
 use mika_common::team::TeamDefinition;
 
 use crate::agent::TeamAgentParams;

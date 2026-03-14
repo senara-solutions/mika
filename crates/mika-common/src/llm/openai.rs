@@ -491,8 +491,7 @@ fn to_openai_content(content: &LlmContent) -> OpenAiContent {
                 .filter_map(|b| match b {
                     LlmContentBlock::Text(t) => Some(OpenAiContentPart::Text { text: t.clone() }),
                     LlmContentBlock::Image(img) => {
-                        let data_uri =
-                            format!("data:{};base64,{}", img.media_type, img.data);
+                        let data_uri = format!("data:{};base64,{}", img.media_type, img.data);
                         Some(OpenAiContentPart::ImageUrl {
                             image_url: OpenAiImageUrl { url: data_uri },
                         })
@@ -502,10 +501,10 @@ fn to_openai_content(content: &LlmContent) -> OpenAiContent {
                 })
                 .collect();
 
-            if parts.len() == 1 {
-                if let OpenAiContentPart::Text { ref text } = parts[0] {
-                    return OpenAiContent::Text(text.clone());
-                }
+            if parts.len() == 1
+                && let OpenAiContentPart::Text { ref text } = parts[0]
+            {
+                return OpenAiContent::Text(text.clone());
             }
             OpenAiContent::Parts(parts)
         }
@@ -531,10 +530,10 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
             }
             OpenAiContent::Parts(parts) => {
                 for part in parts {
-                    if let OpenAiContentPart::Text { text } = part {
-                        if !text.is_empty() {
-                            content.push(LlmResponseContent::Text(text));
-                        }
+                    if let OpenAiContentPart::Text { text } = part
+                        && !text.is_empty()
+                    {
+                        content.push(LlmResponseContent::Text(text));
                     }
                 }
             }
@@ -545,8 +544,8 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
     // Extract tool calls
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
-            let arguments = serde_json::from_str::<Value>(&tc.function.arguments).unwrap_or_else(
-                |e| {
+            let arguments =
+                serde_json::from_str::<Value>(&tc.function.arguments).unwrap_or_else(|e| {
                     warn!(
                         tool = %tc.function.name,
                         error = %e,
@@ -554,8 +553,7 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
                         "failed to parse tool call arguments as JSON, wrapping as string"
                     );
                     Value::String(tc.function.arguments.clone())
-                },
-            );
+                });
             content.push(LlmResponseContent::ToolCall {
                 id: tc.id,
                 name: tc.function.name,
@@ -684,10 +682,7 @@ mod tests {
         assert_eq!(tool_calls[0].id, "call_1");
         assert_eq!(tool_calls[0].function.name, "search");
         // Arguments are serialized as JSON string
-        assert_eq!(
-            tool_calls[0].function.arguments,
-            r#"{"query":"test"}"#
-        );
+        assert_eq!(tool_calls[0].function.arguments, r#"{"query":"test"}"#);
     }
 
     #[test]

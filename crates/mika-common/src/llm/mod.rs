@@ -275,10 +275,7 @@ mod tests {
     #[test]
     fn test_default_base_urls() {
         let spec = ModelSpec::parse("ollama/llama3").unwrap();
-        assert_eq!(
-            spec.default_base_url(),
-            Some("http://localhost:11434/v1")
-        );
+        assert_eq!(spec.default_base_url(), Some("http://localhost:11434/v1"));
 
         let spec = ModelSpec::parse("openai-compatible/model").unwrap();
         assert_eq!(spec.default_base_url(), None);
@@ -300,6 +297,9 @@ mod tests {
         assert_eq!(ProviderKind::Anthropic.to_string(), "anthropic");
         assert_eq!(ProviderKind::OpenAi.to_string(), "openai");
         assert_eq!(ProviderKind::Ollama.to_string(), "ollama");
-        assert_eq!(ProviderKind::OpenAiCompatible.to_string(), "openai-compatible");
+        assert_eq!(
+            ProviderKind::OpenAiCompatible.to_string(),
+            "openai-compatible"
+        );
     }
 }

@@ -7,9 +7,9 @@ use crate::claude::{
     ToolDefinition, ToolResultBlock, ToolResultBody,
 };
 
+use super::LlmProvider;
 use super::error::LlmError;
 use super::types::*;
-use super::LlmProvider;
 
 /// Anthropic provider wrapping the existing `ClaudeClient`.
 pub struct AnthropicProvider {
