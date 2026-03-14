@@ -59,7 +59,7 @@ from the `mika-agent` crate.
 | Crate | Path | Responsibility |
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum for key metadata), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`, `doctor`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
 
@@ -146,6 +146,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 | `self_model` | "I am {agent_id}. No interaction history yet." |
 | `current_priorities` | "No priorities set yet." |
 | `key_people` | "No people tracked yet." |
+| `workflows` | "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a corresponding work item created first (via create_work_item). No exceptions." |
 
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
@@ -223,7 +224,7 @@ remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_em
 | `create_agent` | Create a new agent with name, display name, soul (personality), and optional model override. | default (30s) | Yes |
 | `list_agents` | List all configured agents with their identities and role hints. | default (30s) | Yes |
 | `create_team` | Create a new team definition with specified agents and flow. All referenced agents must exist. | default (30s) | Yes |
-| `delegate_task` | Delegate a task to another agent and get their response. Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
+| `delegate_task` | Delegate a task to another agent and get their response. Requires `work_item_id` (must create a work item first). Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
 | `list_teams` | List all configured teams with full configuration (roles, mandates, max_iterations). | default (30s) | No |
 | `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s | No |
 | `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) | No |
@@ -636,6 +637,9 @@ This separation lets you give dashboard users a read-only token that cannot muta
 | `/health` | GET | None | Liveness/readiness probe |
 | `/message` | POST | Internal token | Receives messages (202 async processing, 10MB body limit) |
 | `/tasks/{id}/complete` | POST | Internal token | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
+| `/api/v1/rewind/resolve` | POST | Internal token | Resolve recent exchanges for a session (returns anchor point and trace IDs) |
+| `/api/v1/rewind/preview` | POST | Internal token | Preview a rewind operation (messages to delete, reversals, task cancellations, warnings) |
+| `/api/v1/rewind/execute` | POST | Internal token | Execute a rewind (delete messages, reverse mutations, cancel tasks, inject context marker) |
 
 ### Dashboard API (read-only)
 
@@ -740,10 +744,14 @@ sends in a background task (does not block message processing).
 ### Agent Delegation
 
 When multiple agents are configured, the primary agent can delegate tasks to other
-agents via the `delegate_task` tool. The delegate runs with its own personality,
-memory, and skills but receives only `default_tools()` (no management tools, no MCP)
-to prevent infinite delegation chains. The system prompt includes an "Agents & Teams"
-section listing available agents with their identities (emoji + name).
+agents via the `delegate_task` tool. **Work item guard:** `delegate_task` requires a
+`work_item_id` parameter — the agent must create a work item first using
+`create_work_item`, then pass its ID. Calls without a valid, active work item are
+rejected at code level. Long-running skill executions enforce the same guard via
+schema injection (`inject_work_item_id_field`). The delegate runs with its own
+personality, memory, and skills but receives only `default_tools()` (no management
+tools, no MCP) to prevent infinite delegation chains. The system prompt includes an
+"Agents & Teams" section listing available agents with their identities (emoji + name).
 
 ### Team Workflows
 
@@ -820,7 +828,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 8 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index)
+**Schema version:** 9 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index)
 
 ### Tables
 
@@ -836,7 +844,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `commitments` | Layer 2 tasks/promises with status tracking (`agent_id` FK) |
 | `preferences` | Layer 2 user preferences (`agent_id` FK) |
 | `events` | Layer 2 notable events (`agent_id` FK) |
-| `audit_events` | Audit log for all memory mutations (`agent_id` FK, `trace_id`) |
+| `audit_events` | Audit log for all memory mutations (`agent_id` FK, `trace_id`, `rewound_by_trace_id`) |
 | `customer_config` | Key-value store (timezone, chat_id) |
 | `failed_sends` | Durable outbox for failed outbound messages |
 | `audit_event_summaries` | Tiered retention summaries (monthly) |
