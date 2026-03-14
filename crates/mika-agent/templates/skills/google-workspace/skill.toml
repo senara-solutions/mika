@@ -1,0 +1,9 @@
+[skill]
+name = "google-workspace"
+description = "Interact with Google Workspace (Gmail, Calendar, Drive) using the gws CLI"
+version = "0.1.0"
+always_on = false
+timeout_secs = 45
+
+[triggers]
+keywords = ["google", "gmail", "google calendar", "google drive", "gdrive"]

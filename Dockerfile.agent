@@ -38,6 +38,18 @@ RUN ARCH=$(dpkg --print-architecture) && \
     mv /tmp/gh_${GH_VERSION}_linux_${ARCH}/bin/gh /usr/local/bin/gh && \
     rm -rf /tmp/gh*
 
+# Install Google Workspace CLI (for google-workspace builtin skill) with checksum verification
+RUN ARCH_MAP="amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu" && \
+    DEB_ARCH=$(dpkg --print-architecture) && \
+    GWS_ARCH=$(echo "$ARCH_MAP" | tr ' ' '\n' | grep "^${DEB_ARCH}:" | cut -d: -f2) && \
+    GWS_VERSION="0.13.3" && \
+    wget -qO /tmp/gws.tar.gz "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/gws-${GWS_ARCH}.tar.gz" && \
+    wget -qO /tmp/gws.tar.gz.sha256 "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/gws-${GWS_ARCH}.tar.gz.sha256" && \
+    cd /tmp && echo "$(cat gws.tar.gz.sha256)  gws.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/gws.tar.gz -C /tmp && \
+    find /tmp -name gws -type f -executable -exec mv {} /usr/local/bin/gws \; && \
+    rm -rf /tmp/gws*
+
 # Create non-root user with home directory
 RUN useradd -m -u 1000 -s /bin/false mika
 

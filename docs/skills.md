@@ -422,6 +422,14 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 | web-search     | Yes       | search, look up, find out, google, browse, web                                                    | `web_search` | Yes            |
 | github         | No        | github, pull request, open pr, my prs, merge pr, close pr, check pr, view pr, pr status, create issue, file an issue, github actions, ci checks, ci pipeline, build status, label, labels, add label, create label, edit label, delete label, remove label | `run_gh`     | Yes            |
 
+### Builtin-handler skills (keyword-triggered)
+
+| Skill              | Keywords                                              | Tools     | Prompt Snippet |
+|--------------------|-------------------------------------------------------|-----------|----------------|
+| google-workspace   | google, gmail, google calendar, google drive, gdrive  | `run_gws` | Yes            |
+
+The **google-workspace** skill provides `run_gws` for interacting with Google Workspace (Gmail, Calendar, Drive) via the `gws` CLI. It uses a service allowlist (`gmail`, `calendar`, `drive`) and blocks credential/config-smuggling flags (`--token`, `--credentials-file`, `--config`, `--config-dir` including `--flag=value` forms). Scrubs `MIKA_*` env vars from child processes. Uses `gws`'s native keyring-based authentication (set up via `gws auth login`). Requires `gws` CLI installed (included in Docker image). `timeout_secs = 45` to accommodate first-call API schema discovery.
+
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
 
 The **github** skill provides `run_gh` for interacting with GitHub via the `gh` CLI. It uses an allowlist of safe subcommands (pr, issue, run, workflow, release, repo, search, label, milestone, project) and scrubs sensitive `MIKA_*` environment variables before execution. Requires `gh` CLI to be installed (included in Docker image).

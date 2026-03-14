@@ -1,0 +1,22 @@
+[
+  {
+    "name": "run_gws",
+    "description": "Execute a Google Workspace CLI (gws) command for Gmail, Calendar, or Drive operations.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "The gws service and arguments as an array of strings. First element must be one of: gmail, calendar, drive. Example: [\"gmail\", \"messages\", \"list\", \"--params\", \"{\\\"maxResults\\\": 5}\"]"
+        }
+      },
+      "required": ["command"]
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "run_gws"
+    }
+  }
+]

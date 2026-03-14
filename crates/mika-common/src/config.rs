@@ -168,6 +168,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "anthropic_api_key" => settings.anthropic_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
+
         "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
         "internal_token" => settings
