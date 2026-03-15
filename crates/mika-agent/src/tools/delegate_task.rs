@@ -146,8 +146,21 @@ impl Tool for DelegateTaskTool {
         let session_id = uuid::Uuid::new_v4().to_string();
         let skills_dirty = AtomicBool::new(false);
 
+        // Look up chat_id from the orchestrator's DB context. The delegate's
+        // agent-scoped customer_config won't have it (chat_id is stored under
+        // the orchestrator's agent_id).
+        let chat_id: Option<i64> = ctx
+            .db
+            .get_customer_config("chat_id")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok());
+
         // Create a sender with the delegate's agent_name (not the orchestrator's)
         // so outbound messages are correctly attributed and reply routing works.
+        // Pass the explicit chat_id so the sender doesn't need to look it up
+        // from the delegate's agent-scoped DB (where it doesn't exist).
         let delegate_sender: Option<Arc<dyn crate::messaging::MessageSender>> =
             if ctx.message_sender.is_some() {
                 if let (Some(url), Some(token)) =
@@ -160,6 +173,7 @@ impl Tool for DelegateTaskTool {
                         reqwest::Client::new(),
                         None,
                         Some(agent_name.to_string()),
+                        chat_id,
                     )))
                 } else {
                     None
@@ -184,6 +198,7 @@ impl Tool for DelegateTaskTool {
             agent_name,
             child_task_id: None,
             message_sender: delegate_sender,
+            telegram_chat_id: chat_id,
         };
 
         let result = crate::agent::run_team_agent(&params).await;

@@ -181,6 +181,7 @@ pub fn make_message_sender(
         http_client.clone(),
         None,
         None, // CLI doesn't send to Telegram gateway
+        None,
     );
     Some(Arc::new(sender))
 }

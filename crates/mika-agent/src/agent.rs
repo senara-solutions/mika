@@ -1539,6 +1539,10 @@ pub struct TeamAgentParams<'a> {
     /// Optional message sender for outbound Telegram delivery.
     /// When set, delegated agents can use `send_message` to reach the user directly.
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    /// Explicit Telegram chat_id from the orchestrator's context.
+    /// Delegates can't look this up from their agent-scoped `customer_config`,
+    /// so the orchestrator passes it directly to set `telegram_configured` correctly.
+    pub telegram_chat_id: Option<i64>,
 }
 
 /// Run an agent within a team execution context.
@@ -1583,12 +1587,20 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     let ctx = load_agent_context(params.db, params.home_dir).await?;
 
-    let chat_id = params
-        .db
-        .get_customer_config("chat_id")
-        .await
-        .ok()
-        .flatten();
+    // Use explicit chat_id from orchestrator if provided (delegates can't look
+    // it up from their agent-scoped customer_config). Fall back to DB lookup
+    // for non-delegated team agents.
+    let has_chat_id = if params.telegram_chat_id.is_some() {
+        true
+    } else {
+        params
+            .db
+            .get_customer_config("chat_id")
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    };
 
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
@@ -1599,7 +1611,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         timezone: ctx.timezone,
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
-        telegram_configured: chat_id.is_some() && params.message_sender.is_some(),
+        telegram_configured: has_chat_id && params.message_sender.is_some(),
         home_dir: Some(params.home_dir),
         callback_context: None,
     };

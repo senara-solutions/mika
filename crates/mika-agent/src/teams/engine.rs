@@ -892,6 +892,7 @@ impl TeamEngine {
                                 // (workspace entries, deliverables, critic feedback), not
                                 // directly to users via Telegram.
                                 message_sender: None,
+                                telegram_chat_id: None,
                             };
                             crate::agent::run_team_agent(&params)
                                 .await
@@ -1220,6 +1221,7 @@ impl TeamEngine {
             // (workspace entries, deliverables, critic feedback), not
             // directly to users via Telegram.
             message_sender: None,
+            telegram_chat_id: None,
         };
 
         Ok(crate::agent::run_team_agent(&params)

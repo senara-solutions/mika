@@ -216,6 +216,7 @@ pub async fn handle_message(
                 s.http_client.clone(),
                 Some(req.request_id.clone()),
                 Some(a.db.agent_id().to_string()),
+                None,
             );
             let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
@@ -542,6 +543,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         state.http_client.clone(),
         None,
         Some(agent_state.db.agent_id().to_string()),
+        None,
     );
 
     for send in sends {
