@@ -172,7 +172,7 @@ mod tests {
         // Seed team run data in the shared DB
         harness
             .db
-            .insert_team_run("run-0000", "dev-team", "Goal 0", 3, 1_740_000_000)
+            .insert_team_run("run-0000", "dev-team", "Goal 0", 3, 1_740_000_000, None)
             .await
             .unwrap();
         harness

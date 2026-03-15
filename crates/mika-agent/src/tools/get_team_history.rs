@@ -133,7 +133,7 @@ mod tests {
             let ts = 1_740_000_000 + (i as i64 * 300);
             harness
                 .db
-                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts)
+                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts, None)
                 .await
                 .unwrap();
             harness
@@ -164,7 +164,7 @@ mod tests {
             let ts = 1_740_000_000 + (i as i64 * 300);
             harness
                 .db
-                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts)
+                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts, None)
                 .await
                 .unwrap();
             harness

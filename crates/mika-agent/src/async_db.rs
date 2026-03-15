@@ -1094,10 +1094,18 @@ impl AsyncDatabase {
         goal: &str,
         max_iterations: u32,
         started_at: i64,
+        trace_id: Option<&str>,
     ) -> Result<()> {
-        let (ri, tn, g) = (run_id.to_owned(), team_name.to_owned(), goal.to_owned());
-        self.with_db(move |db| db.insert_team_run(&ri, &tn, &g, max_iterations, started_at))
-            .await
+        let (ri, tn, g, ti) = (
+            run_id.to_owned(),
+            team_name.to_owned(),
+            goal.to_owned(),
+            trace_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.insert_team_run(&ri, &tn, &g, max_iterations, started_at, ti.as_deref())
+        })
+        .await
     }
 
     pub async fn update_team_run(
@@ -1135,6 +1143,11 @@ impl AsyncDatabase {
     pub async fn resume_team_run_status(&self, run_id: &str) -> Result<()> {
         let r = run_id.to_owned();
         self.with_db(move |db| db.resume_team_run_status(&r)).await
+    }
+
+    pub async fn load_team_run_trace_id(&self, run_id: &str) -> Result<Option<String>> {
+        let r = run_id.to_owned();
+        self.with_db(move |db| db.load_team_run_trace_id(&r)).await
     }
 
     pub async fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
