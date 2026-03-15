@@ -17,6 +17,30 @@ pub enum LogOutput {
     FileOnly,
 }
 
+/// Controls the stdout log format for server/gateway binaries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    /// Structured JSON output (default for server/gateway)
+    #[default]
+    Json,
+    /// Human-readable pretty output (convenient for local development)
+    Pretty,
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(Self::Json),
+            "pretty" => Ok(Self::Pretty),
+            _ => Err(format!(
+                "MIKA_LOG_FORMAT must be 'json' or 'pretty', got '{s}'"
+            )),
+        }
+    }
+}
+
 /// Initialize structured JSON logging (for server/production).
 /// Respects RUST_LOG env var, falls back to the provided default level.
 ///
@@ -29,6 +53,7 @@ pub enum LogOutput {
 pub fn init<OL>(
     default_level: &str,
     log_file: Option<&Path>,
+    log_format: LogFormat,
     otel_layer: Option<OL>,
 ) -> Option<WorkerGuard>
 where
@@ -37,9 +62,11 @@ where
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
-    match log_file {
-        Some(path) => {
-            // Create parent directories for the log file
+    // Note: the match arms look duplicative, but tracing_subscriber's type-level layer
+    // composition creates distinct types for each combination, preventing shared setup.
+    match (log_file, log_format) {
+        (Some(path), LogFormat::Json) => {
+            // JSON stdout + JSON file
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -65,11 +92,49 @@ where
 
             Some(guard)
         }
-        None => {
+        (Some(path), LogFormat::Pretty) => {
+            // Pretty stdout + JSON file
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let file_appender = tracing_appender::rolling::never(
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                path.file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("mika.log")),
+            );
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+            tracing_subscriber::registry()
+                .with(otel_layer)
+                .with(filter)
+                .with(fmt::layer().pretty())
+                .with(
+                    fmt::layer()
+                        .json()
+                        .flatten_event(true)
+                        .with_writer(non_blocking),
+                )
+                .init();
+
+            Some(guard)
+        }
+        (None, LogFormat::Json) => {
+            // JSON stdout only
             tracing_subscriber::registry()
                 .with(otel_layer)
                 .with(filter)
                 .with(fmt::layer().json().flatten_event(true))
+                .init();
+
+            None
+        }
+        (None, LogFormat::Pretty) => {
+            // Pretty stdout only
+            tracing_subscriber::registry()
+                .with(otel_layer)
+                .with(filter)
+                .with(fmt::layer().pretty())
                 .init();
 
             None

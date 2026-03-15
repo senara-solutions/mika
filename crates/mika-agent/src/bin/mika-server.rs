@@ -15,10 +15,15 @@ async fn main() -> Result<()> {
     // Build optional OTel export layer (feature-gated, graceful degradation)
     let (otel_layer, _telemetry_guard) = mika_common::telemetry::try_init_otel(&settings);
 
-    // Server mode uses structured JSON logging (+ optional file output + optional OTel export)
+    // Server mode uses structured logging (+ optional file output + optional OTel export)
+    let log_format: mika_common::logging::LogFormat = settings
+        .log_format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
     let _log_guard = mika_common::logging::init(
         &settings.log_level,
         settings.server_log_file.as_deref(),
+        log_format,
         otel_layer,
     );
 

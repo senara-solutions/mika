@@ -24,10 +24,15 @@ async fn main() -> Result<()> {
 
     let settings = GatewaySettings::load()?;
 
-    // Initialize tracing (JSON structured logging for production, + optional file output)
+    // Initialize tracing (structured logging, + optional file output)
+    let log_format: mika_common::logging::LogFormat = settings
+        .log_format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
     let _log_guard = mika_common::logging::init(
         &settings.log_level,
         settings.gateway_log_file.as_deref().map(Path::new),
+        log_format,
         None::<mika_common::logging::NoopLayer>,
     );
     info!(settings = ?settings, "starting mika-gateway");

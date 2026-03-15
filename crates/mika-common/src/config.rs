@@ -55,6 +55,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Log level (trace/debug/info/warn/error/off)",
     },
     ConfigKeyInfo {
+        key: "log_format",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_LOG_FORMAT"),
+        secret: false,
+        description: "Stdout log format for mika-server and mika-gateway (json or pretty). CLI always uses pretty.",
+    },
+    ConfigKeyInfo {
         key: "server_port",
         backend: ConfigBackend::File,
         env_var: Some("MIKA_SERVER_PORT"),
@@ -162,6 +169,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "claude_model" => Some(settings.claude_model.clone()),
         "claude_max_tokens" => Some(settings.claude_max_tokens.to_string()),
         "log_level" => Some(settings.log_level.clone()),
+        "log_format" => Some(settings.log_format.clone()),
         "server_port" => Some(settings.server_port.to_string()),
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
@@ -203,6 +211,10 @@ pub struct Settings {
     /// Log level
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Stdout log format for server/gateway: "json" (default) or "pretty"
+    #[serde(default = "default_log_format")]
+    pub log_format: String,
 
     /// Routing layer URL (for outbound messages from agent container)
     #[serde(default)]
@@ -290,6 +302,10 @@ fn default_db_path() -> PathBuf {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "json".to_string()
 }
 
 fn default_server_port() -> u16 {
@@ -397,6 +413,7 @@ impl std::fmt::Debug for Settings {
             .field("claude_max_tokens", &self.claude_max_tokens)
             .field("db_path", &self.db_path)
             .field("log_level", &self.log_level)
+            .field("log_format", &self.log_format)
             .field("routing_url", &self.routing_url)
             .field("customer_id", &self.customer_id)
             .field("server_port", &self.server_port)

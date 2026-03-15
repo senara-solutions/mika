@@ -174,6 +174,7 @@ pub mod test_helpers {
             claude_max_tokens: 4096,
             db_path: PathBuf::from("test.db"),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
             routing_url: None,
             customer_id: None,
             server_port: 8080,
