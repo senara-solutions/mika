@@ -79,6 +79,28 @@ Team engine agents intentionally get `message_sender: None` — they communicate
 
 5. **Periodic cleanup:** Every ~100 webhooks, purges records older than 7 days (batched DELETE with LIMIT 1000).
 
+### Part 4: Explicit chat_id for Delegate Senders (Follow-up Fix)
+
+The initial implementation had a subtle bug: the `customer_config` table uses `(agent_id, key)` as its primary key. When the handler stores `chat_id`, it stores it under the orchestrator's `agent_id` (e.g., `"mika"`). But `delegate_task` creates a new `AsyncDatabase` with the delegate's `agent_id` (e.g., `"mika-dev"`), so `GatewayMessageSender.send()` failed with "chat_id not configured" and `telegram_configured` was `false`.
+
+Fix: added `chat_id: Option<i64>` override to `GatewayMessageSender` and `telegram_chat_id: Option<i64>` to `TeamAgentParams`. The orchestrator looks up chat_id from its own DB context and passes it explicitly:
+
+```rust
+// delegate_task.rs — look up from orchestrator's context
+let chat_id: Option<i64> = ctx.db
+    .get_customer_config("chat_id").await
+    .ok().flatten()
+    .and_then(|s| s.parse().ok());
+
+// GatewayMessageSender.resolve_chat_id() — use override or fall back to DB
+async fn resolve_chat_id(&self) -> Result<i64> {
+    match self.chat_id {
+        Some(id) => Ok(id),
+        None => /* DB lookup */,
+    }
+}
+```
+
 ## Key Design Decisions
 
 1. **Fresh sender per delegation, not clone:** Cloning the orchestrator's sender would propagate the orchestrator's `agent_name`, breaking attribution and reply routing. Creating a new sender with the delegate's name is essential.
@@ -89,11 +111,14 @@ Team engine agents intentionally get `message_sender: None` — they communicate
 
 4. **Validation at trust boundary:** `agent_name` is validated at the gateway `/send` endpoint (alphanumeric + `-` + `_`, max 64 chars) for defense-in-depth.
 
+5. **Explicit chat_id override:** Agent-scoped `customer_config` means delegates can't look up chat_id from their own DB context. Passing it explicitly avoids cross-agent DB coupling.
+
 ## Prevention
 
 - New `TeamAgentParams` fields that carry `Option<Arc<dyn T>>` should consider whether cloning propagates the wrong identity. Document the intent.
 - Gateway fields that are rendered to users should be validated at the `/send` boundary.
 - Postgres tables that grow with message volume need cleanup strategies.
+- **Agent-scoped DB lookups in delegated contexts:** When creating `AsyncDatabase` for a delegate agent, any shared config (like `chat_id`) must be passed explicitly — the delegate's agent-scoped queries won't find config stored under the orchestrator's agent_id.
 
 ## Related
 
