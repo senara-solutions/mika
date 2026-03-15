@@ -219,6 +219,11 @@ impl Tool for DelegateTaskTool {
             None
         };
 
+        // Clone the sender before moving it into params — we need it after
+        // run_team_agent returns to send the delegate's text response with
+        // correct [agent_name] attribution.
+        let delegate_sender_for_relay = delegate_sender.clone();
+
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
             claude: &claude,
@@ -243,9 +248,22 @@ impl Tool for DelegateTaskTool {
         async_db.shutdown();
 
         match result {
-            Ok(Some(text)) => Ok(ToolOutput::success(format!(
-                "Response from {agent_name}:\n\n{text}"
-            ))),
+            Ok(Some(text)) => {
+                // Send delegate's response via its own sender for correct
+                // [agent_name] attribution and outbound_messages tracking.
+                if let Some(ref sender) = delegate_sender_for_relay
+                    && let Err(e) = sender.send(&text).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        delegate = agent_name,
+                        "failed to send delegate response via sender"
+                    );
+                }
+                Ok(ToolOutput::success(format!(
+                    "Response from {agent_name}:\n\n{text}"
+                )))
+            }
             Ok(None) => Ok(ToolOutput::success(format!(
                 "Agent '{agent_name}' completed the task but produced no text response."
             ))),

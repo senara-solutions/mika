@@ -50,8 +50,12 @@ pub async fn run(
         tracing::warn!(error = %e, "failed to create session");
     }
     let http_client = reqwest::Client::new();
-    let message_sender =
-        crate::init::make_message_sender(&ctx.settings, &ctx.async_db, &http_client);
+    let message_sender = crate::init::make_message_sender(
+        &ctx.settings,
+        &ctx.async_db,
+        &http_client,
+        ctx.async_db.agent_id(),
+    );
     let embedding_client = ctx.settings.make_embedding_client();
 
     // Read message from arg, or from stdin if "-"

@@ -154,6 +154,7 @@ pub fn make_message_sender(
     settings: &Settings,
     db: &AsyncDatabase,
     http_client: &reqwest::Client,
+    agent_name: &str,
 ) -> Option<Arc<dyn MessageSender>> {
     let url = settings.routing_url.as_deref()?;
     let token = settings.internal_token.clone()?;
@@ -180,7 +181,7 @@ pub fn make_message_sender(
         db.clone(),
         http_client.clone(),
         None,
-        None, // CLI doesn't send to Telegram gateway
+        Some(agent_name.to_string()),
         None,
     );
     Some(Arc::new(sender))

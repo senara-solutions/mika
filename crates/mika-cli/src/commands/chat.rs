@@ -99,8 +99,12 @@ async fn spawn_agent_worker(
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
-    let message_sender =
-        crate::init::make_message_sender(&ctx.settings, &ctx.async_db, http_client);
+    let message_sender = crate::init::make_message_sender(
+        &ctx.settings,
+        &ctx.async_db,
+        http_client,
+        ctx.async_db.agent_id(),
+    );
 
     let brave_api_key = ctx.settings.brave_api_key.clone();
 
