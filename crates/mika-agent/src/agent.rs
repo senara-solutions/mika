@@ -1211,6 +1211,10 @@ pub struct SilentAgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
+    /// Optional trace_id to propagate from the dispatcher.
+    /// When `Some`, the agent reuses this trace_id instead of generating a fresh one,
+    /// enabling correlation of silent agent execution with the triggering task.
+    pub trace_id: Option<String>,
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -1422,7 +1426,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     }];
 
     let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
-    let trace_id = mika_common::trace::generate_trace_id();
+    let trace_id = params
+        .trace_id
+        .clone()
+        .unwrap_or_else(mika_common::trace::generate_trace_id);
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
@@ -1541,6 +1548,10 @@ pub struct TeamAgentParams<'a> {
     /// The sender already carries the chat_id internally (explicit override for delegates),
     /// so `telegram_configured` is derived from `message_sender.is_some()`.
     pub message_sender: Option<Arc<dyn MessageSender>>,
+    /// Optional trace_id to propagate from the parent (team engine or delegate_task).
+    /// When `Some`, the agent reuses this trace_id instead of generating a fresh one,
+    /// enabling correlation of delegate agent events with the parent team run.
+    pub trace_id: Option<String>,
 }
 
 /// Run an agent within a team execution context.
@@ -1624,7 +1635,10 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         content: MessageContent::Text(params.task_message.to_string()),
     }];
 
-    let trace_id = mika_common::trace::generate_trace_id();
+    let trace_id = params
+        .trace_id
+        .clone()
+        .unwrap_or_else(mika_common::trace::generate_trace_id);
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db: params.db,

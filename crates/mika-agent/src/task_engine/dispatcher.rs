@@ -193,15 +193,17 @@ impl TaskDispatcher {
         };
 
         let session_id = format!("skill-{}-{}", skill_name, uuid::Uuid::new_v4());
-        info!(task_id = %task.id, skill = skill_name, session_id = %session_id, "running skill task");
+        let trace_id = mika_common::trace::generate_trace_id();
+        info!(task_id = %task.id, skill = skill_name, session_id = %session_id, trace_id = %trace_id, "running skill task");
 
         if let Err(e) = self
             .db
-            .create_session_with_metadata(
+            .create_session_with_parent(
                 &session_id,
                 &task.agent_id,
                 "system",
                 Some(r#"{"trigger": "skill_run"}"#),
+                task.created_by_session.as_deref(),
             )
             .await
         {
@@ -222,10 +224,20 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            trace_id: Some(trace_id.clone()),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
             warn!(task_id = %task.id, skill = skill_name, error = %e, "skill task agent run failed");
+        }
+
+        // Write execution trace_id back to the task
+        if let Err(e) = self
+            .db
+            .update_task_execution_trace_id(&task.id, &trace_id)
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
         }
 
         Ok(())
@@ -262,15 +274,17 @@ impl TaskDispatcher {
         };
 
         let session_id = format!("callback-{}", uuid::Uuid::new_v4());
-        info!(task_id = %task.id, session_id = %session_id, label = %task.label, "resuming agent for callback task");
+        let trace_id = mika_common::trace::generate_trace_id();
+        info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, label = %task.label, "resuming agent for callback task");
 
         if let Err(e) = self
             .db
-            .create_session_with_metadata(
+            .create_session_with_parent(
                 &session_id,
                 &task.agent_id,
                 "system",
                 Some(r#"{"trigger": "callback"}"#),
+                task.created_by_session.as_deref(),
             )
             .await
         {
@@ -293,6 +307,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            trace_id: Some(trace_id.clone()),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -302,6 +317,15 @@ impl TaskDispatcher {
             if let Err(e) = self.db.mark_task_delivered(&task.id).await {
                 warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
             }
+        }
+
+        // Write execution trace_id back to the task
+        if let Err(e) = self
+            .db
+            .update_task_execution_trace_id(&task.id, &trace_id)
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
         }
 
         Ok(())
@@ -434,7 +458,8 @@ impl TaskDispatcher {
         };
 
         let session_id = format!("heartbeat-{}", uuid::Uuid::new_v4());
-        info!(task_id = %task.id, session_id = %session_id, "running heartbeat");
+        let trace_id = mika_common::trace::generate_trace_id();
+        info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, "running heartbeat");
 
         if let Err(e) = self
             .db
@@ -461,10 +486,20 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            trace_id: Some(trace_id.clone()),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
             warn!(task_id = %task.id, error = %e, "heartbeat agent run failed");
+        }
+
+        // Write execution trace_id back to the task
+        if let Err(e) = self
+            .db
+            .update_task_execution_trace_id(&task.id, &trace_id)
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
         }
 
         // Record send for rate-limit tracking
@@ -555,7 +590,8 @@ impl TaskDispatcher {
             .format("%Y-%m-%d")
             .to_string();
         let session_id = format!("reflection-{today_str}");
-        info!(task_id = %task.id, session_id = %session_id, "running daily reflection");
+        let trace_id = mika_common::trace::generate_trace_id();
+        info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, "running daily reflection");
 
         if let Err(e) = self
             .db
@@ -582,6 +618,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            trace_id: Some(trace_id.clone()),
         };
 
         match run_silent_agent(&params).await {
@@ -600,6 +637,15 @@ impl TaskDispatcher {
                     warn!(task_id = %task.id, error = %db_err, "failed to record reflection run failure in DB");
                 }
             }
+        }
+
+        // Write execution trace_id back to the task
+        if let Err(e) = self
+            .db
+            .update_task_execution_trace_id(&task.id, &trace_id)
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
         }
 
         Ok(())

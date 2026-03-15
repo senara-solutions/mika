@@ -241,6 +241,14 @@ impl AsyncDatabase {
         self.with_db(move |db| db.update_task_status(&i, &s)).await
     }
 
+    /// Record the trace_id of the execution that ran this task.
+    /// Does NOT scope by agent_id — safe for cross-agent team tasks.
+    pub async fn update_task_execution_trace_id(&self, id: &str, trace_id: &str) -> Result<()> {
+        let (i, t) = (id.to_owned(), trace_id.to_owned());
+        self.with_db(move |db| db.update_task_execution_trace_id(&i, &t))
+            .await
+    }
+
     pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<bool> {
         let (i, r) = (id.to_owned(), result.map(|s| s.to_owned()));
         let a = self.agent_id.clone();
@@ -444,6 +452,28 @@ impl AsyncDatabase {
         );
         self.with_db(move |db| db.create_session_with_metadata(&i, &a, &ct, m.as_deref()))
             .await
+    }
+
+    /// Create a session with metadata and a parent session reference.
+    pub async fn create_session_with_parent(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+        parent_session_id: Option<&str>,
+    ) -> Result<()> {
+        let (i, a, ct, m, p) = (
+            id.to_owned(),
+            agent_id.to_owned(),
+            channel_type.to_owned(),
+            metadata.map(|s| s.to_owned()),
+            parent_session_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.create_session_with_parent(&i, &a, &ct, m.as_deref(), p.as_deref())
+        })
+        .await
     }
 
     pub async fn end_session(&self, id: &str) -> Result<()> {
