@@ -8,7 +8,14 @@ use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools;
 
+use crate::cli::OutputFormat;
 use crate::init;
+
+#[derive(serde::Serialize)]
+struct AskJsonResponse {
+    role: &'static str,
+    content: Option<String>,
+}
 
 pub async fn run(
     message: &str,
@@ -16,6 +23,7 @@ pub async fn run(
     task_id: Option<&str>,
     session: Option<&str>,
     parent_task: Option<&str>,
+    format: &OutputFormat,
 ) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
 
@@ -177,9 +185,18 @@ pub async fn run(
     })
     .await?;
 
-    match output.text {
-        Some(text) => println!("{text}"),
-        None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
+    match format {
+        OutputFormat::Text => match output.text {
+            Some(text) => println!("{text}"),
+            None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
+        },
+        OutputFormat::Json => {
+            let response = AskJsonResponse {
+                role: "assistant",
+                content: output.text,
+            };
+            println!("{}", serde_json::to_string(&response)?);
+        }
     }
 
     // Gracefully shut down MCP server connections
@@ -189,4 +206,41 @@ pub async fn run(
 
     // Database shutdown happens automatically via Drop on ctx
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_response_with_content() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Hello, world!".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"role":"assistant","content":"Hello, world!"}"#);
+    }
+
+    #[test]
+    fn test_json_response_with_null_content() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"role":"assistant","content":null}"#);
+    }
+
+    #[test]
+    fn test_json_response_with_special_characters() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Line 1\nLine 2\t\"quoted\"".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["role"], "assistant");
+        assert_eq!(parsed["content"], "Line 1\nLine 2\t\"quoted\"");
+    }
 }

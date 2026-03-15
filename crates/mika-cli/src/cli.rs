@@ -131,12 +131,24 @@ pub struct AskArgs {
     /// Used by claude-asked relay: mika ask --parent-task <uuid> "question"
     #[arg(long)]
     pub parent_task: Option<String>,
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
 }
 
 #[derive(clap::Args)]
 pub struct StatusArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
+}
+
+#[derive(Clone, Default, ValueEnum)]
+pub enum OutputFormat {
+    /// Plain text (default)
+    #[default]
+    Text,
+    /// JSON: {"role": "assistant", "content": "..."}
+    Json,
 }
 
 #[derive(Clone, ValueEnum)]
