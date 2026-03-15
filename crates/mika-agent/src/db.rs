@@ -3028,6 +3028,25 @@ impl Database {
         Ok(n)
     }
 
+    /// Count `update_core_memory` audit events in the most recent non-system session.
+    pub fn count_core_memory_edits_latest_session(&self, agent_id: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE agent_id = ?1
+               AND tool_name = 'update_core_memory'
+               AND session_id = (
+                   SELECT id FROM sessions
+                   WHERE agent_id = ?1
+                     AND id NOT LIKE 'system-%'
+                   ORDER BY started_at DESC
+                   LIMIT 1
+               )",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     pub fn compact_old_audit_events(&self, agent_id: &str, days: u32) -> Result<usize> {
         let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
         let mut stmt = self.conn.prepare(

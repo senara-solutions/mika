@@ -1069,6 +1069,12 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn count_core_memory_edits_latest_session(&self) -> Result<i64> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_core_memory_edits_latest_session(&a))
+            .await
+    }
+
     // -- Layer 3: Search Indexing --
 
     pub async fn index_content(

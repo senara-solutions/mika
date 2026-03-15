@@ -19,6 +19,7 @@ export interface CoreMemory {
 
 export interface AgentDetail extends Agent {
   core_memory: CoreMemory[]
+  core_memory_edits_this_session: number
   soul_md: string
 }
 
