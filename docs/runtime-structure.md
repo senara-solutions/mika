@@ -61,7 +61,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 9
+**Current schema version:** 10
 
 ### Core Tables
 
@@ -97,7 +97,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **teams** — `id TEXT PK`, `name TEXT NOCASE`, `config_path TEXT`, `created_at INTEGER`
 
-**team_runs** — `id TEXT PK`, `team_id FK→teams`, `goal TEXT`, `status TEXT CHECK(running|completed|failed|cancelled|suspended)`, `failure_reason TEXT`, `iteration INTEGER DEFAULT 1`, `max_iterations INTEGER DEFAULT 3`, `deliverable TEXT`, `checkpoint TEXT`, `started_at INTEGER`, `ended_at INTEGER`
+**team_runs** — `id TEXT PK`, `team_id FK→teams`, `goal TEXT`, `status TEXT CHECK(running|completed|failed|cancelled|suspended)`, `failure_reason TEXT`, `iteration INTEGER DEFAULT 1`, `max_iterations INTEGER DEFAULT 3`, `deliverable TEXT`, `checkpoint TEXT`, `trace_id TEXT`, `started_at INTEGER`, `ended_at INTEGER`
 
 **team_workspace** — `id INTEGER PK AUTO`, `run_id FK→team_runs`, `parent_id FK→self`, `agent_name TEXT`, `entry_type TEXT`, `content TEXT`, `trace_id TEXT`, `iteration INTEGER DEFAULT 1`, `created_at`
 
@@ -121,7 +121,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### View
 
-**unified_timeline** — `UNION ALL` across `messages`, `audit_events`, `tasks`. Columns: `trace_id`, `session_id`, `agent_id`, `event_type`, `event_subtype`, `summary` (truncated to 200 chars), `created_at`.
+**unified_timeline** — `UNION ALL` across `messages`, `audit_events`, `tasks`, `team_workspace`. Columns: `trace_id`, `session_id`, `agent_id`, `event_type`, `event_subtype`, `summary` (truncated to 200 chars), `created_at`. Team workspace entries use `event_type='team_workspace'`, synthetic `session_id='team-{run_id}'`, and `agent_id=NULL`.
 
 ### Notable Indexes
 
@@ -133,7 +133,7 @@ Unique partial indexes (duplicate prevention):
 
 Performance indexes: `idx_tasks_schedulable` (pending/recurring by next_fire_at), `idx_msg_session` (messages by session+time), `idx_msg_agent_created`, `idx_sessions_agent`.
 
-Partial trace indexes: `idx_msg_trace`, `idx_audit_trace`, `idx_tasks_trace` (WHERE NOT NULL).
+Partial trace indexes: `idx_msg_trace`, `idx_audit_trace`, `idx_tasks_trace`, `idx_team_ws_trace` (WHERE NOT NULL).
 
 Callback delivery: `idx_tasks_callback_delivery` (partial, for TUI polling).
 

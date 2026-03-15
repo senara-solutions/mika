@@ -182,7 +182,7 @@ impl TeamEngine {
     }
 
     /// Create an engine for resuming a suspended team run.
-    pub fn new_for_resume(
+    pub async fn new_for_resume(
         team: TeamDefinition,
         run: TeamRun,
         global_home: &Path,
@@ -190,6 +190,20 @@ impl TeamEngine {
         team_db: AsyncDatabase,
     ) -> Result<Self> {
         let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
+
+        // Restore trace_id from DB to maintain correlation across suspend/resume.
+        // Fall back to generating fresh if not persisted (backward compat with pre-v10 runs).
+        let trace_id = match team_db.load_team_run_trace_id(&run.run_id).await {
+            Ok(Some(tid)) => tid,
+            Ok(None) => {
+                debug!(run_id = %run.run_id, "no trace_id in team_run (pre-v10), generating fresh");
+                mika_common::trace::generate_trace_id()
+            }
+            Err(e) => {
+                warn!(error = %e, run_id = %run.run_id, "failed to load trace_id, generating fresh");
+                mika_common::trace::generate_trace_id()
+            }
+        };
 
         Ok(Self {
             team,
@@ -202,7 +216,7 @@ impl TeamEngine {
             brave_api_key: settings.brave_api_key.clone(),
             team_db,
             goal_msg_id: None,
-            trace_id: mika_common::trace::generate_trace_id(),
+            trace_id,
         })
     }
 
@@ -344,6 +358,7 @@ impl TeamEngine {
                 &self.run.goal,
                 self.run.max_iterations,
                 self.run.started_at,
+                Some(&self.trace_id),
             )
             .await
         {

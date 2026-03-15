@@ -802,9 +802,9 @@ correlation axes:
 - **`session_id` / `agent_id`** (system-level): Identifies the conversation session and
   owning agent.
 
-The `unified_timeline` VIEW (`UNION ALL` across messages, audit_events, tasks) enables
-cross-subsystem queries by trace_id — e.g., "show all messages, audit events, and tasks
-from a single agent turn."
+The `unified_timeline` VIEW (`UNION ALL` across messages, audit_events, tasks,
+team_workspace) enables cross-subsystem queries by trace_id — e.g., "show all messages,
+audit events, tasks, and team orchestration entries from a single agent turn."
 
 Tracing spans are compiled unconditionally into the binary — no feature flags needed.
 Spans cover the agent loop (`agent_turn`), Claude API calls, per-tool execution, team
@@ -845,7 +845,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 9 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index)
+**Schema version:** 10 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index; v10: adds `trace_id TEXT` to `team_runs` for resume continuity, extends `unified_timeline` VIEW with `team_workspace` UNION ALL, adds `idx_team_ws_trace` partial index)
 
 ### Tables
 
@@ -871,10 +871,10 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `fts_search` | FTS5 virtual table for full-text search |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
 | `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
-| `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint) |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint, trace_id) |
 | `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
 | `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
-| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks for cross-subsystem correlation by trace_id |
+| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks, team_workspace for cross-subsystem correlation by trace_id |
 
 ### SQLite Pragmas
 

@@ -20,7 +20,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -43,7 +43,14 @@ const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
         'task' AS event_type, action_type AS event_subtype, \
         label || ' [' || status || ']' AS summary, \
         created_at \
-    FROM tasks";
+    FROM tasks \
+    UNION ALL \
+    SELECT trace_id, 'team-' || run_id AS session_id, NULL AS agent_id, \
+        'team_workspace' AS event_type, entry_type AS event_subtype, \
+        CASE WHEN length(content) > 200 THEN substr(content, 1, 200) || '...' \
+             ELSE content END AS summary, \
+        created_at \
+    FROM team_workspace";
 
 /// Check if an anyhow error is a SQLite UNIQUE constraint violation.
 pub fn is_unique_violation(err: &anyhow::Error) -> bool {
@@ -526,6 +533,10 @@ impl Database {
             self.migrate_v8_to_v9()?;
             info!(version = 9, "database migrated to v9");
         }
+        if (3..=9).contains(&version) {
+            self.migrate_v9_to_v10()?;
+            info!(version = 10, "database migrated to v10");
+        }
         Ok(())
     }
 
@@ -575,7 +586,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (9);
+            INSERT INTO schema_version (version) VALUES (10);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -604,6 +615,7 @@ impl Database {
                 max_iterations INTEGER NOT NULL DEFAULT 3,
                 deliverable TEXT,
                 checkpoint TEXT,
+                trace_id TEXT,
                 started_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 ended_at INTEGER
             );
@@ -795,6 +807,8 @@ impl Database {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX idx_team_ws_run ON team_workspace(run_id, created_at);
+            CREATE INDEX idx_team_ws_trace ON team_workspace(trace_id)
+                WHERE trace_id IS NOT NULL;
 
             CREATE TABLE heartbeat_sends (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1247,6 +1261,49 @@ impl Database {
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK;");
                 let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate_v9_to_v10(&self) -> Result<()> {
+        info!(
+            "migrating database schema v9 → v10 (team_runs.trace_id, unified_timeline + team_workspace)"
+        );
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            // Add trace_id column to team_runs (idempotent guard for crash recovery)
+            if !self.column_exists("team_runs", "trace_id")? {
+                self.conn
+                    .execute_batch("ALTER TABLE team_runs ADD COLUMN trace_id TEXT;")?;
+            }
+
+            // Recreate unified_timeline VIEW with team_workspace union
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+            // Add partial index on team_workspace.trace_id (matches other timeline tables)
+            self.conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_team_ws_trace ON team_workspace(trace_id)
+                     WHERE trace_id IS NOT NULL;",
+            )?;
+
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (10)", [])?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
                 Err(e)
             }
         }
@@ -3360,6 +3417,7 @@ impl Database {
         goal: &str,
         max_iterations: u32,
         started_at: i64,
+        trace_id: Option<&str>,
     ) -> Result<()> {
         // Auto-register team (team_id = team_name)
         self.conn.execute(
@@ -3367,9 +3425,16 @@ impl Database {
             params![team_name],
         )?;
         self.conn.execute(
-            "INSERT INTO team_runs (id, team_id, goal, max_iterations, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id, team_name, goal, max_iterations, started_at],
+            "INSERT INTO team_runs (id, team_id, goal, max_iterations, started_at, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_id,
+                team_name,
+                goal,
+                max_iterations,
+                started_at,
+                trace_id
+            ],
         )?;
         Ok(())
     }
@@ -3428,6 +3493,19 @@ impl Database {
             params![run_id],
         )?;
         Ok(())
+    }
+
+    /// Load the trace_id from a team run (for resume continuity).
+    pub fn load_team_run_trace_id(&self, run_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT trace_id FROM team_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
+            .map_err(Into::into)
     }
 
     fn row_to_team_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRunRow> {
@@ -4844,6 +4922,7 @@ mod tests {
             "Build feature X",
             3,
             1_700_000_000,
+            None,
         )
         .unwrap();
         db.update_team_run(
@@ -4864,7 +4943,8 @@ mod tests {
     #[test]
     fn test_team_workspace_insert_and_load() {
         let db = db();
-        db.insert_team_run("run-001", "eng", "Goal", 3, 0).unwrap();
+        db.insert_team_run("run-001", "eng", "Goal", 3, 0, None)
+            .unwrap();
         let id = db
             .insert_team_workspace_entry("run-001", None, Some("mika"), "plan", "Do this", 1, None)
             .unwrap();
@@ -5721,9 +5801,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_9() {
+    fn test_schema_version_is_10() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
     }
 
     #[test]
@@ -5737,7 +5817,7 @@ mod tests {
     fn test_get_last_completed_team_run_filters_running() {
         let db = db();
         let run_id = "run-filter-1";
-        db.insert_team_run(run_id, "filter-team", "test goal", 3, 1000)
+        db.insert_team_run(run_id, "filter-team", "test goal", 3, 1000, None)
             .unwrap();
 
         // Run is in "running" status — should not be returned
@@ -5764,8 +5844,15 @@ mod tests {
     fn test_get_team_run_summary_basic() {
         let db = db();
         let run_id = "run-summary-1";
-        db.insert_team_run(run_id, "summary-team", "test goal for summary", 3, 1000)
-            .unwrap();
+        db.insert_team_run(
+            run_id,
+            "summary-team",
+            "test goal for summary",
+            3,
+            1000,
+            None,
+        )
+        .unwrap();
         db.update_team_run(
             run_id,
             "completed",
@@ -5790,7 +5877,7 @@ mod tests {
     fn test_get_team_run_summary_with_critic() {
         let db = db();
         let run_id = "run-critic-1";
-        db.insert_team_run(run_id, "critic-team", "critic test", 3, 1000)
+        db.insert_team_run(run_id, "critic-team", "critic test", 3, 1000, None)
             .unwrap();
 
         // Add critic feedback
