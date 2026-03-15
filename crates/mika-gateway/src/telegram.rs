@@ -39,6 +39,14 @@ pub struct TelegramMessage {
     pub caption: Option<String>,
     #[serde(default)]
     pub document: Option<TelegramDocument>,
+    #[serde(default)]
+    pub reply_to_message: Option<ReplyToMessage>,
+}
+
+/// Minimal representation of a replied-to message (only message_id needed for routing).
+#[derive(Debug, Clone, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct ReplyToMessage {
+    pub message_id: i64,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -82,12 +90,14 @@ pub enum ParsedMessage {
         chat_id: i64,
         text: String,
         update_id: i64,
+        reply_to_message_id: Option<i64>,
     },
     Photo {
         chat_id: i64,
         file_id: String,
         caption: Option<String>,
         update_id: i64,
+        reply_to_message_id: Option<i64>,
     },
     Document {
         chat_id: i64,
@@ -95,6 +105,7 @@ pub enum ParsedMessage {
         mime_type: String,
         caption: Option<String>,
         update_id: i64,
+        reply_to_message_id: Option<i64>,
     },
     BareStart {
         chat_id: i64,
@@ -116,6 +127,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
     };
 
     let chat_id = message.chat.id;
+    let reply_to_message_id = message.reply_to_message.as_ref().map(|r| r.message_id);
 
     // Text messages (including /start commands) take priority
     if let Some(text) = &message.text {
@@ -136,6 +148,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             chat_id,
             text: text.clone(),
             update_id: update.update_id,
+            reply_to_message_id,
         };
     }
 
@@ -148,6 +161,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             file_id: largest.file_id.clone(),
             caption: message.caption.clone(),
             update_id: update.update_id,
+            reply_to_message_id,
         };
     }
 
@@ -162,6 +176,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             mime_type: mime.clone(),
             caption: message.caption.clone(),
             update_id: update.update_id,
+            reply_to_message_id,
         };
     }
 
@@ -180,6 +195,17 @@ struct TelegramResponse {
 #[derive(Debug, Deserialize)]
 struct TelegramResponseParameters {
     retry_after: Option<u64>,
+}
+
+/// Response from Telegram `sendMessage` API (success path).
+#[derive(Debug, Deserialize)]
+struct TelegramSendResponse {
+    result: Option<TelegramSendResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSendResult {
+    message_id: i64,
 }
 
 /// Response from Telegram `getFile` API.
@@ -264,8 +290,8 @@ impl TelegramClient {
         )
     }
 
-    /// Send a text message to a chat. Returns Ok(()) on success.
-    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), TelegramApiError> {
+    /// Send a text message to a chat. Returns the Telegram message_id on success.
+    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, TelegramApiError> {
         let payload = SendMessagePayload {
             chat_id,
             text: text.to_string(),
@@ -280,7 +306,13 @@ impl TelegramClient {
 
         let status = resp.status().as_u16();
         if status == 200 {
-            return Ok(());
+            // Parse the message_id from the successful response
+            let send_resp: TelegramSendResponse =
+                resp.json().await.map_err(|e| TelegramApiError::Other {
+                    status: 200,
+                    body: format!("failed to parse sendMessage response: {e}"),
+                })?;
+            return Ok(send_resp.result.map(|r| r.message_id).unwrap_or(0));
         }
 
         let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
@@ -501,6 +533,7 @@ mod tests {
             photo: None,
             caption: None,
             document: None,
+            reply_to_message: None,
         }
     }
 
@@ -512,6 +545,7 @@ mod tests {
             photo: Some(photos),
             caption: caption.map(|s| s.to_string()),
             document: None,
+            reply_to_message: None,
         }
     }
 
@@ -534,6 +568,7 @@ mod tests {
                 mime_type: mime_type.map(|s| s.to_string()),
                 file_size: None,
             }),
+            reply_to_message: None,
         }
     }
 
@@ -559,6 +594,7 @@ mod tests {
                 chat_id: 42,
                 text: "Hello Mika!".to_string(),
                 update_id: 100,
+                reply_to_message_id: None,
             }
         );
     }
@@ -667,6 +703,7 @@ mod tests {
                 file_id: "large".to_string(),
                 caption: None,
                 update_id: 200,
+                reply_to_message_id: None,
             }
         );
     }
@@ -685,6 +722,7 @@ mod tests {
                 file_id: "pic1".to_string(),
                 caption: Some("Look at this!".to_string()),
                 update_id: 201,
+                reply_to_message_id: None,
             }
         );
     }
@@ -703,6 +741,7 @@ mod tests {
                 file_id: "only".to_string(),
                 caption: None,
                 update_id: 202,
+                reply_to_message_id: None,
             }
         );
     }
@@ -723,6 +762,7 @@ mod tests {
                 mime_type: "image/jpeg".to_string(),
                 caption: None,
                 update_id: 300,
+                reply_to_message_id: None,
             }
         );
     }
@@ -746,6 +786,7 @@ mod tests {
                 mime_type: "image/png".to_string(),
                 caption: Some("A diagram".to_string()),
                 update_id: 301,
+                reply_to_message_id: None,
             }
         );
     }
@@ -788,6 +829,7 @@ mod tests {
                 mime_type: "image/webp".to_string(),
                 caption: None,
                 update_id: 304,
+                reply_to_message_id: None,
             }
         );
     }
@@ -806,6 +848,7 @@ mod tests {
                 mime_type: "image/gif".to_string(),
                 caption: None,
                 update_id: 305,
+                reply_to_message_id: None,
             }
         );
     }
@@ -873,6 +916,7 @@ mod tests {
                 file_id: "lg".to_string(),
                 caption: Some("Check this out".to_string()),
                 update_id: 500,
+                reply_to_message_id: None,
             }
         );
     }
@@ -901,6 +945,7 @@ mod tests {
                 mime_type: "image/jpeg".to_string(),
                 caption: None,
                 update_id: 501,
+                reply_to_message_id: None,
             }
         );
     }
@@ -922,6 +967,67 @@ mod tests {
                 chat_id: 42,
                 text: "Hello".to_string(),
                 update_id: 502,
+                reply_to_message_id: None,
+            }
+        );
+    }
+
+    // -- Reply-to-message tests --
+
+    #[test]
+    fn test_parse_reply_message_extracts_id() {
+        let mut msg = text_msg(42, Some("replying"));
+        msg.reply_to_message = Some(ReplyToMessage { message_id: 999 });
+        let update = TelegramUpdate {
+            update_id: 600,
+            message: Some(msg),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Text {
+                chat_id: 42,
+                text: "replying".to_string(),
+                update_id: 600,
+                reply_to_message_id: Some(999),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_no_reply_returns_none() {
+        let update = TelegramUpdate {
+            update_id: 601,
+            message: Some(text_msg(42, Some("no reply"))),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Text {
+                chat_id: 42,
+                text: "no reply".to_string(),
+                update_id: 601,
+                reply_to_message_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_reply_to_message() {
+        let json = r#"{
+            "update_id": 602,
+            "message": {
+                "chat": {"id": 42},
+                "text": "reply text",
+                "reply_to_message": {"message_id": 555, "chat": {"id": 42}, "text": "original"}
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Text {
+                chat_id: 42,
+                text: "reply text".to_string(),
+                update_id: 602,
+                reply_to_message_id: Some(555),
             }
         );
     }

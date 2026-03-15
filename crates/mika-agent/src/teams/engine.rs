@@ -888,6 +888,10 @@ impl TeamEngine {
                                 mcp_manager: None,
                                 agent_name,
                                 child_task_id: child_task_id_ref,
+                                // Team agents communicate through the orchestrator pipeline
+                                // (workspace entries, deliverables, critic feedback), not
+                                // directly to users via Telegram.
+                                message_sender: None,
                             };
                             crate::agent::run_team_agent(&params)
                                 .await
@@ -1212,6 +1216,10 @@ impl TeamEngine {
             mcp_manager: None,
             agent_name,
             child_task_id: None,
+            // Team agents communicate through the orchestrator pipeline
+            // (workspace entries, deliverables, critic feedback), not
+            // directly to users via Telegram.
+            message_sender: None,
         };
 
         Ok(crate::agent::run_team_agent(&params)

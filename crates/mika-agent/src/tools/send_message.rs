@@ -17,8 +17,11 @@ impl Tool for SendMessageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".to_string(),
-            description: "Send a message to the user. Use this in heartbeat and reminder mode \
-                to deliver proactive messages. In conversation mode, prefer responding directly."
+            description: "Send a message to the user via Telegram. Use this when you need to \
+                deliver a message directly to the user — especially in heartbeat, reminder, \
+                and delegation mode. When delegated a task that involves sending a message, \
+                you MUST use this tool to deliver it. In conversation mode, prefer responding \
+                directly unless the task specifically requires sending a separate message."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -52,8 +55,9 @@ impl Tool for SendMessageTool {
 
         match &ctx.message_sender {
             Some(sender) => {
+                debug!("send_message: delivering via configured sender");
                 sender.send(text).await?;
-                debug!("send_message delivered via sender");
+                debug!("send_message: delivered successfully");
                 Ok(ToolOutput::success("Message sent."))
             }
             // Intentionally returns success, not error. The message was persisted to the

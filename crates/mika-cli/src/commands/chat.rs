@@ -84,7 +84,9 @@ async fn spawn_agent_worker(
         tracing::warn!(error = %e, "failed to create session");
     }
     let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
+    for tool in
+        tools::management_tools_if_needed(&ctx.global_home, &ctx.settings, reqwest::Client::new())
+    {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
@@ -99,8 +101,12 @@ async fn spawn_agent_worker(
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
-    let message_sender =
-        crate::init::make_message_sender(&ctx.settings, &ctx.async_db, http_client);
+    let message_sender = crate::init::make_message_sender(
+        &ctx.settings,
+        &ctx.async_db,
+        http_client,
+        ctx.async_db.agent_id(),
+    );
 
     let brave_api_key = ctx.settings.brave_api_key.clone();
 

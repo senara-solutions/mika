@@ -110,12 +110,28 @@ components:
           type: integer
           format: int32
           minimum: 0
+    ReplyToMessage:
+      type: object
+      description: Minimal representation of a replied-to message (only message_id needed for routing).
+      required:
+      - message_id
+      properties:
+        message_id:
+          type: integer
+          format: int64
     SendPayload:
       type: object
       required:
       - chat_id
       - text
       properties:
+        agent_name:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Agent name for identification in multi-agent setups.
+            When present, outbound messages are prefixed with `[agent_name]`.
         chat_id:
           type: integer
           format: int64
@@ -178,6 +194,10 @@ components:
           - 'null'
           items:
             $ref: '#/components/schemas/PhotoSize'
+        reply_to_message:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ReplyToMessage'
         text:
           type:
           - string

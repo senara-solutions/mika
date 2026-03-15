@@ -50,8 +50,12 @@ pub async fn run(
         tracing::warn!(error = %e, "failed to create session");
     }
     let http_client = reqwest::Client::new();
-    let message_sender =
-        crate::init::make_message_sender(&ctx.settings, &ctx.async_db, &http_client);
+    let message_sender = crate::init::make_message_sender(
+        &ctx.settings,
+        &ctx.async_db,
+        &http_client,
+        ctx.async_db.agent_id(),
+    );
     let embedding_client = ctx.settings.make_embedding_client();
 
     // Read message from arg, or from stdin if "-"
@@ -137,7 +141,9 @@ pub async fn run(
 
     // Normal ask mode — full conversation agent
     let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(&ctx.global_home, &ctx.settings) {
+    for tool in
+        tools::management_tools_if_needed(&ctx.global_home, &ctx.settings, reqwest::Client::new())
+    {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);

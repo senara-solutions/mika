@@ -6,6 +6,7 @@ use mika_common::config::Settings;
 use mika_common::home;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
@@ -14,6 +15,7 @@ pub struct DelegateTaskTool {
     /// The global Mika home directory (e.g. `~/.mika/`).
     pub home_dir: PathBuf,
     pub settings: Settings,
+    pub http_client: reqwest::Client,
 }
 
 #[async_trait]
@@ -145,6 +147,79 @@ impl Tool for DelegateTaskTool {
         let session_id = uuid::Uuid::new_v4().to_string();
         let skills_dirty = AtomicBool::new(false);
 
+        // Look up chat_id from the orchestrator's DB context. The delegate's
+        // agent-scoped customer_config won't have it (chat_id is stored under
+        // the orchestrator's agent_id).
+        let chat_id: Option<i64> = match ctx.db.get_customer_config("chat_id").await {
+            Ok(Some(s)) => match s.parse::<i64>() {
+                Ok(id) => {
+                    tracing::debug!(
+                        delegate = agent_name,
+                        orchestrator = ctx.db.agent_id(),
+                        chat_id = id,
+                        "delegate_task: resolved chat_id from orchestrator context"
+                    );
+                    Some(id)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, raw = %s, "corrupt chat_id in customer_config, delegate will lack outbound messaging");
+                    None
+                }
+            },
+            Ok(None) => {
+                tracing::debug!(
+                    delegate = agent_name,
+                    orchestrator = ctx.db.agent_id(),
+                    "delegate_task: no chat_id in orchestrator's customer_config"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "delegate_task: failed to read chat_id from orchestrator DB");
+                None
+            }
+        };
+
+        // Create a sender with the delegate's agent_name (not the orchestrator's)
+        // so outbound messages are correctly attributed and reply routing works.
+        // Pass the explicit chat_id so the sender doesn't need to look it up
+        // from the delegate's agent-scoped DB (where it doesn't exist).
+        let delegate_sender: Option<Arc<dyn crate::messaging::MessageSender>> = if ctx
+            .message_sender
+            .is_some()
+        {
+            if let (Some(url), Some(token)) =
+                (&self.settings.routing_url, &self.settings.internal_token)
+            {
+                tracing::debug!(
+                    delegate = agent_name,
+                    has_chat_id = chat_id.is_some(),
+                    "delegate_task: creating delegate sender with agent_name and chat_id override"
+                );
+                Some(Arc::new(crate::messaging::GatewayMessageSender::new(
+                    url.clone(),
+                    token.clone(),
+                    async_db.clone(),
+                    self.http_client.clone(),
+                    None,
+                    Some(agent_name.to_string()),
+                    chat_id,
+                )))
+            } else {
+                tracing::warn!(
+                    delegate = agent_name,
+                    "delegate_task: no routing_url/internal_token, delegate will lack outbound messaging"
+                );
+                None
+            }
+        } else {
+            tracing::debug!(
+                delegate = agent_name,
+                "delegate_task: orchestrator has no message_sender, delegate will also lack one"
+            );
+            None
+        };
+
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
             claude: &claude,
@@ -160,6 +235,7 @@ impl Tool for DelegateTaskTool {
             mcp_manager: None,
             agent_name,
             child_task_id: None,
+            message_sender: delegate_sender,
         };
 
         let result = crate::agent::run_team_agent(&params).await;
@@ -193,6 +269,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -210,6 +287,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -234,6 +312,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -268,6 +347,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -297,6 +377,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -319,6 +400,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -343,6 +425,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -364,6 +447,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool
@@ -386,6 +470,7 @@ mod tests {
         let tool = DelegateTaskTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
         };
 
         let result = tool

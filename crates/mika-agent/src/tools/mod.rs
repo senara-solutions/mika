@@ -470,7 +470,11 @@ pub fn default_tools() -> ToolRegistry {
 /// create new agents even from a single-agent setup. Delegation and team
 /// tools (`delegate_task`, `run_team`, etc.) are only added when multiple
 /// agents or teams exist.
-pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<Box<dyn Tool>> {
+pub fn management_tools_if_needed(
+    home_dir: &Path,
+    settings: &Settings,
+    http_client: reqwest::Client,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(create_agent::CreateAgentTool {
             home_dir: home_dir.to_path_buf(),
@@ -496,6 +500,7 @@ pub fn management_tools_if_needed(home_dir: &Path, settings: &Settings) -> Vec<B
         tools.push(Box::new(delegate_task::DelegateTaskTool {
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
+            http_client,
         }));
         tools.push(Box::new(get_team_status::GetTeamStatusTool));
         tools.push(Box::new(get_team_history::GetTeamHistoryTool));

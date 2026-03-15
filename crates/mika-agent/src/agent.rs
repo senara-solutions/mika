@@ -1536,6 +1536,11 @@ pub struct TeamAgentParams<'a> {
     /// Optional task ID to auto-complete when the agent turn ends.
     /// Used by team engine to mark child tasks as completed with the agent's response.
     pub child_task_id: Option<&'a str>,
+    /// Optional message sender for outbound Telegram delivery.
+    /// When set, delegated agents can use `send_message` to reach the user directly.
+    /// The sender already carries the chat_id internally (explicit override for delegates),
+    /// so `telegram_configured` is derived from `message_sender.is_some()`.
+    pub message_sender: Option<Arc<dyn MessageSender>>,
 }
 
 /// Run an agent within a team execution context.
@@ -1589,7 +1594,9 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         timezone: ctx.timezone,
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
-        telegram_configured: false,
+        // The sender already carries a valid chat_id (explicit override for delegates,
+        // DB lookup for others). If a sender exists, Telegram is configured.
+        telegram_configured: params.message_sender.is_some(),
         home_dir: Some(params.home_dir),
         callback_context: None,
     };
@@ -1626,7 +1633,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         home_dir: params.home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
-        message_sender: None,
+        message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         skills_dirty: params.skills_dirty,
