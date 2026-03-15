@@ -46,6 +46,18 @@ pub struct TaskDispatcher {
 }
 
 impl TaskDispatcher {
+    /// Write `execution_trace_id` back to a task after a silent agent run completes.
+    /// Best-effort: logs a warning on failure but does not propagate the error.
+    async fn write_execution_trace(&self, task_id: &str, trace_id: &str) {
+        if let Err(e) = self
+            .db
+            .update_task_execution_trace_id(task_id, trace_id)
+            .await
+        {
+            warn!(task_id = %task_id, error = %e, "failed to write execution_trace_id");
+        }
+    }
+
     /// Check if all sibling tasks of the given task are done, and if so,
     /// dispatch the parent task.
     ///
@@ -231,14 +243,7 @@ impl TaskDispatcher {
             warn!(task_id = %task.id, skill = skill_name, error = %e, "skill task agent run failed");
         }
 
-        // Write execution trace_id back to the task
-        if let Err(e) = self
-            .db
-            .update_task_execution_trace_id(&task.id, &trace_id)
-            .await
-        {
-            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
-        }
+        self.write_execution_trace(&task.id, &trace_id).await;
 
         Ok(())
     }
@@ -319,14 +324,7 @@ impl TaskDispatcher {
             }
         }
 
-        // Write execution trace_id back to the task
-        if let Err(e) = self
-            .db
-            .update_task_execution_trace_id(&task.id, &trace_id)
-            .await
-        {
-            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
-        }
+        self.write_execution_trace(&task.id, &trace_id).await;
 
         Ok(())
     }
@@ -461,6 +459,8 @@ impl TaskDispatcher {
         let trace_id = mika_common::trace::generate_trace_id();
         info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, "running heartbeat");
 
+        // Heartbeat sessions are autonomous (not triggered by a user conversation),
+        // so they intentionally use create_session_with_metadata (no parent_session_id).
         if let Err(e) = self
             .db
             .create_session_with_metadata(
@@ -493,14 +493,7 @@ impl TaskDispatcher {
             warn!(task_id = %task.id, error = %e, "heartbeat agent run failed");
         }
 
-        // Write execution trace_id back to the task
-        if let Err(e) = self
-            .db
-            .update_task_execution_trace_id(&task.id, &trace_id)
-            .await
-        {
-            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
-        }
+        self.write_execution_trace(&task.id, &trace_id).await;
 
         // Record send for rate-limit tracking
         if let Err(e) = self.db.record_heartbeat_send().await {
@@ -593,6 +586,8 @@ impl TaskDispatcher {
         let trace_id = mika_common::trace::generate_trace_id();
         info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, "running daily reflection");
 
+        // Reflection sessions are autonomous (not triggered by a user conversation),
+        // so they intentionally use create_session_with_metadata (no parent_session_id).
         if let Err(e) = self
             .db
             .create_session_with_metadata(
@@ -639,14 +634,7 @@ impl TaskDispatcher {
             }
         }
 
-        // Write execution trace_id back to the task
-        if let Err(e) = self
-            .db
-            .update_task_execution_trace_id(&task.id, &trace_id)
-            .await
-        {
-            warn!(task_id = %task.id, error = %e, "failed to write execution_trace_id");
-        }
+        self.write_execution_trace(&task.id, &trace_id).await;
 
         Ok(())
     }
