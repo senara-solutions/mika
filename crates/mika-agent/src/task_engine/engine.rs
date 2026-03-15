@@ -115,6 +115,14 @@ impl TaskEngine {
             );
         }
 
+        // 4. Prune ended system/silent sessions older than 7 days
+        const SEVEN_DAYS_SECS: i64 = 7 * 24 * 60 * 60;
+        match self.db.prune_old_sessions(SEVEN_DAYS_SECS).await {
+            Ok(n) if n > 0 => info!(count = n, "pruned old ended sessions on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to prune old sessions"),
+        }
+
         info!(
             loaded = count,
             queue_len = self.queue.len(),

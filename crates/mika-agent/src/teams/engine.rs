@@ -918,6 +918,25 @@ impl TeamEngine {
                     let result: Result<String> = match resources {
                         Ok(resources) => {
                             let session_id = format!("team-{}-{}", run_id, agent_name);
+                            // Create per-agent session before running (idempotent for resumed runs)
+                            let agent_id = resources.db.agent_id.clone();
+                            let metadata = serde_json::json!({
+                                "trigger": "team",
+                                "team_run_id": run_id,
+                            })
+                            .to_string();
+                            if let Err(e) = resources
+                                .db
+                                .create_session_if_not_exists(
+                                    &session_id,
+                                    &agent_id,
+                                    "team",
+                                    Some(&metadata),
+                                )
+                                .await
+                            {
+                                warn!(agent = %agent_name, error = %e, "failed to create per-agent team session");
+                            }
                             let skills_dirty = AtomicBool::new(false);
                             let child_task_id_ref = input.child_task_id.as_deref();
                             let params = TeamAgentParams {
@@ -1011,6 +1030,12 @@ impl TeamEngine {
                                 warn!(error = %e, "failed to persist agent error message");
                             }
                         }
+                    }
+
+                    // End the per-agent session now that the agent task is done
+                    let end_session_id = format!("team-{}-{}", run_id, &input.agent_name);
+                    if let Err(e) = team_db.end_session(&end_session_id).await {
+                        warn!(agent = %input.agent_name, error = %e, "failed to end per-agent team session");
                     }
 
                     (input.index, input.agent_name, result)

@@ -2214,6 +2214,22 @@ impl Database {
         Ok(())
     }
 
+    /// Create a session with metadata if it doesn't already exist (INSERT OR IGNORE).
+    /// Used by team engine for per-agent sessions that may already exist on resumed runs.
+    pub fn create_session_if_not_exists(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent_id, channel_type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![id, agent_id, channel_type, metadata],
+        )?;
+        Ok(())
+    }
+
     pub fn end_session(&self, id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET ended_at = unixepoch() WHERE id = ?1",
@@ -2229,6 +2245,19 @@ impl Database {
             params![&id, agent_id],
         )?;
         Ok(id)
+    }
+
+    /// Prune ended system/silent sessions older than `retention_secs`.
+    /// Targets heartbeat, callback, skill, and reflection sessions.
+    /// Messages are cascade-deleted via FK ON DELETE CASCADE.
+    pub fn prune_old_sessions(&self, retention_secs: i64) -> Result<usize> {
+        let cutoff = Utc::now().timestamp() - retention_secs;
+        let n = self.conn.execute(
+            "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1
+             AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%' OR id LIKE 'reflection-%' OR id LIKE 'team-%')",
+            params![cutoff],
+        )?;
+        Ok(n)
     }
 
     // ===== Messages =====
@@ -6193,5 +6222,184 @@ mod tests {
     #[test]
     fn test_truncate_chars_long() {
         assert_eq!(super::truncate_chars("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_create_session_if_not_exists() {
+        let db = db();
+        // First call creates the session
+        db.create_session_if_not_exists(
+            "test-idempotent",
+            "mika",
+            "team",
+            Some(r#"{"trigger":"team"}"#),
+        )
+        .unwrap();
+        // Second call should not error (INSERT OR IGNORE)
+        db.create_session_if_not_exists(
+            "test-idempotent",
+            "mika",
+            "team",
+            Some(r#"{"trigger":"team"}"#),
+        )
+        .unwrap();
+        // Verify session exists
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'test-idempotent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_end_session_sets_ended_at() {
+        let db = db();
+        db.create_session("end-test", "mika", "system").unwrap();
+        // ended_at should be NULL initially
+        let ended: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = 'end-test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_none());
+        // End the session
+        db.end_session("end-test").unwrap();
+        let ended: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = 'end-test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_prune_old_sessions() {
+        let db = db();
+        // Create two ended sessions and one active (not ended)
+        db.create_session("heartbeat-old", "mika", "system")
+            .unwrap();
+        db.create_session("heartbeat-new", "mika", "system")
+            .unwrap();
+        db.create_session("heartbeat-active", "mika", "system")
+            .unwrap();
+        // Save a message to heartbeat-old to verify cascade delete
+        db.save_message("mika", "heartbeat-old", "user", "test msg", None)
+            .unwrap();
+
+        // End two sessions, but make one "old" by backdating ended_at
+        db.end_session("heartbeat-old").unwrap();
+        db.end_session("heartbeat-new").unwrap();
+        // Backdate heartbeat-old to 10 days ago
+        db.conn
+            .execute(
+                "UPDATE sessions SET ended_at = unixepoch() - 864000 WHERE id = 'heartbeat-old'",
+                [],
+            )
+            .unwrap();
+
+        // Prune with 7-day retention
+        let pruned = db.prune_old_sessions(7 * 24 * 60 * 60).unwrap();
+        assert_eq!(pruned, 1); // Only heartbeat-old should be pruned
+
+        // Verify heartbeat-old is gone (and its message cascaded)
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'heartbeat-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let msg_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'heartbeat-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 0);
+
+        // Verify heartbeat-new still exists (ended recently)
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'heartbeat-new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Verify heartbeat-active still exists (not ended)
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'heartbeat-active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_prune_targets_correct_prefixes() {
+        let db = db();
+        // Create sessions with various prefixes
+        for prefix in &[
+            "heartbeat-1",
+            "callback-1",
+            "skill-test-1",
+            "reflection-2026-01-01",
+            "team-run1-agent1",
+        ] {
+            db.create_session(prefix, "mika", "system").unwrap();
+            db.end_session(prefix).unwrap();
+            // Backdate to 10 days ago
+            db.conn
+                .execute(
+                    &format!(
+                        "UPDATE sessions SET ended_at = unixepoch() - 864000 WHERE id = '{prefix}'"
+                    ),
+                    [],
+                )
+                .unwrap();
+        }
+        // Also create a regular CLI session that should NOT be pruned
+        db.create_session("cli-session", "mika", "cli").unwrap();
+        db.end_session("cli-session").unwrap();
+        db.conn
+            .execute(
+                "UPDATE sessions SET ended_at = unixepoch() - 864000 WHERE id = 'cli-session'",
+                [],
+            )
+            .unwrap();
+
+        let pruned = db.prune_old_sessions(7 * 24 * 60 * 60).unwrap();
+        assert_eq!(pruned, 5); // All prefixed sessions pruned, CLI session preserved
+
+        // CLI session should still exist
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'cli-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
