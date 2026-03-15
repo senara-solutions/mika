@@ -243,6 +243,10 @@ impl TaskDispatcher {
             warn!(task_id = %task.id, skill = skill_name, error = %e, "skill task agent run failed");
         }
 
+        if let Err(e) = self.db.end_session(&session_id).await {
+            warn!(session_id = %session_id, error = %e, "failed to end skill session");
+        }
+
         self.write_execution_trace(&task.id, &trace_id).await;
 
         Ok(())
@@ -322,6 +326,10 @@ impl TaskDispatcher {
             if let Err(e) = self.db.mark_task_delivered(&task.id).await {
                 warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
             }
+        }
+
+        if let Err(e) = self.db.end_session(&session_id).await {
+            warn!(session_id = %session_id, error = %e, "failed to end callback session");
         }
 
         self.write_execution_trace(&task.id, &trace_id).await;
@@ -493,6 +501,10 @@ impl TaskDispatcher {
             warn!(task_id = %task.id, error = %e, "heartbeat agent run failed");
         }
 
+        if let Err(e) = self.db.end_session(&session_id).await {
+            warn!(session_id = %session_id, error = %e, "failed to end heartbeat session");
+        }
+
         self.write_execution_trace(&task.id, &trace_id).await;
 
         // Record send for rate-limit tracking
@@ -632,6 +644,10 @@ impl TaskDispatcher {
                     warn!(task_id = %task.id, error = %db_err, "failed to record reflection run failure in DB");
                 }
             }
+        }
+
+        if let Err(e) = self.db.end_session(&session_id).await {
+            warn!(session_id = %session_id, error = %e, "failed to end reflection session");
         }
 
         self.write_execution_trace(&task.id, &trace_id).await;

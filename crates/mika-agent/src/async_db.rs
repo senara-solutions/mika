@@ -476,6 +476,24 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Create a session with metadata if it doesn't already exist (INSERT OR IGNORE).
+    pub async fn create_session_if_not_exists(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        let (i, a, ct, m) = (
+            id.to_owned(),
+            agent_id.to_owned(),
+            channel_type.to_owned(),
+            metadata.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.create_session_if_not_exists(&i, &a, &ct, m.as_deref()))
+            .await
+    }
+
     pub async fn end_session(&self, id: &str) -> Result<()> {
         let i = id.to_owned();
         self.with_db(move |db| db.end_session(&i)).await
@@ -484,6 +502,12 @@ impl AsyncDatabase {
     pub async fn get_or_create_system_session(&self) -> Result<String> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.get_or_create_system_session(&a))
+            .await
+    }
+
+    /// Prune ended system/silent sessions older than `retention_secs`.
+    pub async fn prune_old_sessions(&self, retention_secs: i64) -> Result<usize> {
+        self.with_db(move |db| db.prune_old_sessions(retention_secs))
             .await
     }
 

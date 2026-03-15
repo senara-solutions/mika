@@ -240,6 +240,7 @@ async fn spawn_agent_worker(
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),
                         is_callback_turn: false,
+                        trace_id: None,
                     })
                     .await;
 
@@ -329,6 +330,7 @@ async fn spawn_agent_worker(
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),
                         is_callback_turn: true,
+                        trace_id: trace_id.clone(),
                     })
                     .await;
 

@@ -636,12 +636,17 @@ pub struct AgentParams<'a> {
     pub global_home_dir: Option<&'a Path>,
     /// When true, this is a callback result turn — long-running tasks are blocked.
     pub is_callback_turn: bool,
+    /// Optional external trace_id (e.g. from HTTP request_id). If None, a new one is generated.
+    pub trace_id: Option<String>,
 }
 
 /// Run the agent loop for a single inbound message.
 /// Returns `AgentOutput` with text response, thinking, and usage info.
 pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
-    let trace_id = mika_common::trace::generate_trace_id();
+    let trace_id = params
+        .trace_id
+        .clone()
+        .unwrap_or_else(mika_common::trace::generate_trace_id);
 
     // Save the user message (with image annotation if images attached).
     // Skip for callback turns — the raw result is already persisted as role='tool_result'
