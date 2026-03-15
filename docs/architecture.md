@@ -61,7 +61,7 @@ from the `mika-agent` crate.
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum for key metadata), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
 | `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`, `doctor`) |
-| `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
+| `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay with agent identification and reply routing. Env-var-only config. |
 
 
 ## 4. Agent Loop
@@ -752,6 +752,23 @@ schema injection (`inject_work_item_id_field`). The delegate runs with its own
 personality, memory, and skills but receives only `default_tools()` (no management
 tools, no MCP) to prevent infinite delegation chains. The system prompt includes an
 "Agents & Teams" section listing available agents with their identities (emoji + name).
+
+**Telegram delivery for delegates:** `delegate_task` creates a fresh
+`GatewayMessageSender` with the delegate's `agent_name` (not the orchestrator's) and
+an explicit `chat_id` override looked up from the orchestrator's `customer_config`.
+This avoids cross-agent DB coupling (the delegate's agent-scoped queries would not
+find `chat_id` stored under the orchestrator's `agent_id`). The delegate's
+`telegram_configured` flag is derived from `message_sender.is_some()`. Team engine
+agents intentionally get `message_sender: None` — they communicate through the
+orchestrator pipeline, not directly to users.
+
+**Agent identification and reply routing:** Outbound messages carry `agent_name` in
+the gateway `/send` payload. The gateway prepends `[agent_name]` to Telegram text,
+validates the name at the trust boundary (alphanumeric + `-`/`_`, max 64 chars), and
+stores `(telegram_message_id, chat_id, agent_name)` in the `outbound_messages`
+Postgres table. When users reply to a specific message, the gateway looks up the
+originating agent and routes the reply to that agent in the container. Records older
+than 7 days are purged periodically (batched, every ~100 webhooks).
 
 ### Team Workflows
 
