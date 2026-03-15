@@ -6,6 +6,9 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 /// Re-export for callers that need a type hint for `None` OTel layers.
 pub use tracing_subscriber::layer::Identity as NoopLayer;
 
+/// Re-export so callers can name the log guard type returned by `init_pretty`.
+pub use tracing_appender::non_blocking::WorkerGuard as LogGuard;
+
 /// Controls where log output is sent.
 pub enum LogOutput {
     /// Pretty stderr + file (non-TUI CLI commands)

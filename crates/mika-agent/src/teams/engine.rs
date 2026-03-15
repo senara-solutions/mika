@@ -1272,6 +1272,10 @@ impl TeamEngine {
 
     /// Write a metadata file to the `.meta/` subdirectory of the run workspace.
     fn write_metadata_file(&self, name: &str, content: &str) {
+        debug_assert!(
+            !name.contains('/') && !name.contains('\\') && !name.contains(".."),
+            "metadata file name must be a simple filename: {name}"
+        );
         let path = self.workspace_dir.join(".meta").join(name);
         if let Err(e) = std::fs::write(&path, content) {
             warn!(file = name, error = %e, "failed to write metadata file");

@@ -256,8 +256,13 @@ pub async fn run_team_ask(
         anyhow::bail!("Empty message. Provide a goal for the team.");
     }
 
-    // Validate --run-id if provided
+    // Validate --run-id format before any filesystem/DB use (defense-in-depth)
     if let Some(ref_id) = run_id {
+        if uuid::Uuid::parse_str(ref_id).is_err() {
+            anyhow::bail!(
+                "Invalid --run-id format. Expected a UUID (e.g., from a previous team run)."
+            );
+        }
         let db_path = mika_common::home::container_db_path(global_home);
         if db_path.exists() {
             let db = mika_agent::db::Database::open(&db_path)?;

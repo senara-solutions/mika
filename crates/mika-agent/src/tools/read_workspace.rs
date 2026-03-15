@@ -118,15 +118,33 @@ impl Tool for ReadWorkspaceTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
 
+        // Reject paths whose first component is a dotfile/dotdir (e.g. .meta/)
+        if path
+            .split('/')
+            .next()
+            .is_some_and(|first| first.starts_with('.') && !first.starts_with(".."))
+        {
+            return Ok(ToolOutput::error(
+                "Cannot access hidden files in workspace.",
+            ));
+        }
+
         // Try current workspace first, then fall back to reference workspace
         match self.read_from_dir(path, &self.workspace_dir).await {
             Ok(output) if !output.is_error => Ok(output),
             Ok(not_found) => {
-                // If we have a reference dir and the file wasn't found in current, try there
-                if let Some(ref ref_dir) = self.reference_dir {
-                    match self.read_from_dir(path, ref_dir).await {
-                        Ok(output) if !output.is_error => Ok(output),
-                        _ => Ok(not_found), // Return original error from current workspace
+                // Only fall back to reference workspace for genuine "not found" errors.
+                // Security errors (symlinks, traversal) should not be masked.
+                let is_not_found = not_found.content.contains("not found")
+                    || not_found.content.contains("does not exist");
+                if is_not_found {
+                    if let Some(ref ref_dir) = self.reference_dir {
+                        match self.read_from_dir(path, ref_dir).await {
+                            Ok(output) if !output.is_error => Ok(output),
+                            _ => Ok(not_found), // Return original error from current workspace
+                        }
+                    } else {
+                        Ok(not_found)
                     }
                 } else {
                     Ok(not_found)
@@ -305,6 +323,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_dotdir_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join(".meta")).unwrap();
+        fs::write(workspace.join(".meta").join("goal.md"), "secret goal").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: None,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        // .meta/goal.md should be rejected
+        let input = serde_json::json!({ "path": ".meta/goal.md" });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("hidden"));
+
+        // .meta alone should be rejected
+        let input = serde_json::json!({ "path": ".meta" });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("hidden"));
+
+        // .hidden file should be rejected
+        let input = serde_json::json!({ "path": ".hidden" });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("hidden"));
+    }
+
+    #[tokio::test]
     async fn test_read_double_dot_in_filename_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
@@ -322,5 +373,145 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(!output.is_error);
         assert_eq!(output.content, "version 2 content");
+    }
+
+    #[tokio::test]
+    async fn test_reference_fallback_on_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+        fs::write(reference.join("notes.md"), "from reference").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "notes.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, "from reference");
+    }
+
+    #[tokio::test]
+    async fn test_reference_fallback_file_in_current_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+        fs::write(workspace.join("current_only.md"), "from current").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "current_only.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, "from current");
+    }
+
+    #[tokio::test]
+    async fn test_reference_fallback_file_in_reference_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+        fs::write(reference.join("ref_only.md"), "from reference").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "ref_only.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, "from reference");
+    }
+
+    #[tokio::test]
+    async fn test_reference_fallback_current_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+        fs::write(workspace.join("shared.md"), "current version").unwrap();
+        fs::write(reference.join("shared.md"), "reference version").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "shared.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, "current version");
+    }
+
+    #[tokio::test]
+    async fn test_reference_fallback_traversal_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "../../etc/passwd" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_no_reference_fallback_on_symlink_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+
+        // Create a symlink in the current workspace
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&secret, "top secret").unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.join("link.md")).unwrap();
+
+        // Put a legitimate file in reference with the same name
+        fs::write(reference.join("link.md"), "from reference").unwrap();
+
+        let tool = ReadWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let input = serde_json::json!({ "path": "link.md" });
+
+        // Should return the symlink error, NOT fall back to reference
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("Symbolic links are not allowed"));
     }
 }

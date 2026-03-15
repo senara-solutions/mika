@@ -42,42 +42,22 @@ async fn main() -> Result<()> {
                     _ => None,
                 };
 
-                let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+                // Validate --run-id format before any filesystem/DB use (defense-in-depth)
+                if let Some(ref_id) = run_id
+                    && uuid::Uuid::parse_str(ref_id).is_err()
+                {
+                    anyhow::bail!(
+                        "Invalid --run-id format. Expected a UUID (e.g., from a previous team run)."
+                    );
+                }
 
-                // Build optional OTel export layer (feature-gated, graceful degradation)
-                let (otel_layer, _telemetry_guard) =
-                    mika_common::config::Settings::load(&global_home)
-                        .ok()
-                        .map(|s| mika_common::telemetry::try_init_otel(&s))
-                        .unwrap_or((None, None));
-
-                let log_dir = team::team_dir(&global_home, &team_name).join("logs");
-                let _log_guard = mika_common::logging::init_pretty(
-                    &log_level,
-                    Some(&log_dir),
-                    LogOutput::FileOnly,
-                    otel_layer,
-                );
+                let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
                 return commands::chat::run_team(&team_name, &global_home, run_id).await;
             }
             // `mika ask --team`
             Some(Commands::Ask(ref args)) => {
-                let log_level = resolve_log_level(&[global_home.join("config.toml")]);
-
-                let (otel_layer, _telemetry_guard) =
-                    mika_common::config::Settings::load(&global_home)
-                        .ok()
-                        .map(|s| mika_common::telemetry::try_init_otel(&s))
-                        .unwrap_or((None, None));
-
-                let log_dir = team::team_dir(&global_home, &team_name).join("logs");
-                let _log_guard = mika_common::logging::init_pretty(
-                    &log_level,
-                    Some(&log_dir),
-                    LogOutput::FileOnly,
-                    otel_layer,
-                );
+                let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
                 return commands::ask::run_team_ask(
                     &team_name,
@@ -236,6 +216,57 @@ fn resolve_log_level(config_paths: &[std::path::PathBuf]) -> String {
             })
         })
         .unwrap_or_else(|| "warn".to_string())
+}
+
+/// Initialize logging and optional telemetry for team-mode branches (chat and ask).
+///
+/// Returns guards that must be held alive for the duration of the team run.
+/// Dropping the log guard stops file logging; dropping the telemetry guard flushes OTel spans.
+#[cfg(feature = "telemetry")]
+fn init_team_logging(
+    global_home: &std::path::Path,
+    team_name: &str,
+) -> (
+    Option<mika_common::logging::LogGuard>,
+    Option<mika_common::telemetry::TelemetryGuard>,
+) {
+    let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+    let (otel_layer, telemetry_guard) = mika_common::config::Settings::load(global_home)
+        .ok()
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+    let log_dir = team::team_dir(global_home, team_name).join("logs");
+    let log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        Some(&log_dir),
+        LogOutput::FileOnly,
+        otel_layer,
+    );
+    (log_guard, telemetry_guard)
+}
+
+/// Initialize logging and optional telemetry for team-mode branches (chat and ask).
+///
+/// Returns guards that must be held alive for the duration of the team run.
+/// Dropping the log guard stops file logging.
+#[cfg(not(feature = "telemetry"))]
+fn init_team_logging(
+    global_home: &std::path::Path,
+    team_name: &str,
+) -> (Option<mika_common::logging::LogGuard>, Option<()>) {
+    let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+    let (otel_layer, telemetry_guard) = mika_common::config::Settings::load(global_home)
+        .ok()
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+    let log_dir = team::team_dir(global_home, team_name).join("logs");
+    let log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        Some(&log_dir),
+        LogOutput::FileOnly,
+        otel_layer,
+    );
+    (log_guard, telemetry_guard)
 }
 
 /// Extract `log_level` value from a TOML config string.
