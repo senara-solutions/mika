@@ -149,13 +149,16 @@ impl Tool for DelegateTaskTool {
         // Look up chat_id from the orchestrator's DB context. The delegate's
         // agent-scoped customer_config won't have it (chat_id is stored under
         // the orchestrator's agent_id).
-        let chat_id: Option<i64> = ctx
-            .db
-            .get_customer_config("chat_id")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse().ok());
+        let chat_id: Option<i64> = match ctx.db.get_customer_config("chat_id").await {
+            Ok(Some(s)) => match s.parse::<i64>() {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(error = %e, raw = %s, "corrupt chat_id in customer_config, delegate will lack outbound messaging");
+                    None
+                }
+            },
+            _ => None,
+        };
 
         // Create a sender with the delegate's agent_name (not the orchestrator's)
         // so outbound messages are correctly attributed and reply routing works.
@@ -198,7 +201,6 @@ impl Tool for DelegateTaskTool {
             agent_name,
             child_task_id: None,
             message_sender: delegate_sender,
-            telegram_chat_id: chat_id,
         };
 
         let result = crate::agent::run_team_agent(&params).await;
