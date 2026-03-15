@@ -1,7 +1,7 @@
 ---
 title: "feat: Team Workspace Restructure & CLI Unification"
 type: feat
-status: active
+status: completed
 date: 2026-03-15
 origin: docs/brainstorms/2026-03-15-team-workspace-restructure-brainstorm.md
 ---

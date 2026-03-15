@@ -37,6 +37,11 @@ async fn main() -> Result<()> {
         match cli.command {
             // `mika --team` or `mika chat --team`
             None | Some(Commands::Chat(_)) => {
+                let run_id = match cli.command {
+                    Some(Commands::Chat(ref args)) => args.run_id.as_deref(),
+                    _ => None,
+                };
+
                 let log_level = resolve_log_level(&[global_home.join("config.toml")]);
 
                 // Build optional OTel export layer (feature-gated, graceful degradation)
@@ -54,7 +59,7 @@ async fn main() -> Result<()> {
                     otel_layer,
                 );
 
-                return commands::chat::run_team(&team_name, &global_home).await;
+                return commands::chat::run_team(&team_name, &global_home, run_id).await;
             }
             // `mika ask --team`
             Some(Commands::Ask(ref args)) => {
