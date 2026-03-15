@@ -254,7 +254,7 @@ The most commonly used commands:
 | `mika --team <name>`         | Launch TUI in team mode (mutually exclusive with `--agent`) |
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
-| `mika ask "<message>"`       | Send a message non-interactively                  |
+| `mika ask "<message>"`       | Send a message non-interactively (`--format json` for structured output) |
 | `mika ask --task-id <uuid> "<result>"` | Complete a callback task (TUI delivers result to conversation) |
 | `mika tasks`                 | List scheduled tasks for the active agent         |
 | `mika skills`                | List, install, validate, and manage skills          |
@@ -288,6 +288,22 @@ echo "Summarize my pending tasks" | mika ask "-"
 
 ```sh
 cat meeting-notes.txt | mika ask "-"
+```
+
+**JSON output for scripting:**
+
+Use `--format json` to get structured output compatible with the OpenAI message
+format. The response is a single JSON object on stdout:
+
+```sh
+mika ask --format json "What are my top priorities today?"
+# Output: {"role":"assistant","content":"Your top priorities are..."}
+```
+
+This is useful for piping into `jq` or consuming from other tools:
+
+```sh
+mika ask --format json "Summarize my day" | jq -r '.content'
 ```
 
 **In scripts:**

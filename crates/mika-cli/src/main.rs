@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
                 args.task_id.as_deref(),
                 cli.session.as_deref(),
                 args.parent_task.as_deref(),
+                &args.format,
             )
             .await
             {
@@ -435,6 +436,55 @@ mod tests {
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
+    }
+
+    /// --format json on ask subcommand should parse successfully.
+    #[test]
+    fn test_format_json_on_ask_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--format", "json", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert!(matches!(args.format, crate::cli::OutputFormat::Json));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --format text on ask subcommand should parse successfully (explicit default).
+    #[test]
+    fn test_format_text_on_ask_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--format", "text", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert!(matches!(args.format, crate::cli::OutputFormat::Text));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// ask without --format should default to text.
+    #[test]
+    fn test_format_defaults_to_text_on_ask() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "ask", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert!(matches!(args.format, crate::cli::OutputFormat::Text));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --format with invalid value should fail.
+    #[test]
+    fn test_format_invalid_value_rejected() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--format", "xml", "hello world"]);
+        assert!(result.is_err());
     }
 
     /// --agent should NOT be accepted on doctor subcommand.
