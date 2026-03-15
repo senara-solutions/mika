@@ -130,8 +130,11 @@ async fn main() -> Result<()> {
     // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
     // so stderr output would corrupt the TUI display.
     // The _log_guard MUST stay alive until the end of main — dropping it stops file logging.
-    let is_tui = matches!(cli.command, None | Some(Commands::Chat(_)));
-    let log_output = if is_tui {
+    let suppress_stderr = matches!(
+        cli.command,
+        None | Some(Commands::Chat(_)) | Some(Commands::Ask(_))
+    );
+    let log_output = if suppress_stderr {
         LogOutput::FileOnly
     } else {
         LogOutput::PrettyAndFile
