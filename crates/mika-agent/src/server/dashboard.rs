@@ -131,6 +131,7 @@ pub struct AgentDetailResponse {
     pub created_at: i64,
     pub message_count: i64,
     pub core_memory: Vec<CoreMemoryEntry>,
+    pub core_memory_edits_this_session: i64,
     pub soul_md: String,
 }
 
@@ -181,6 +182,13 @@ pub async fn handle_agent_detail(
         }
     };
 
+    // Count core memory edits in the latest session
+    let core_memory_edits_this_session = agent_state
+        .db
+        .count_core_memory_edits_latest_session()
+        .await
+        .unwrap_or(0);
+
     // Read soul.md from agent's home directory
     let soul_path = agent_state.home_dir.join("soul.md");
     let soul_md = tokio::fs::read_to_string(&soul_path)
@@ -195,6 +203,7 @@ pub async fn handle_agent_detail(
         created_at: agent.created_at,
         message_count: agent.message_count,
         core_memory,
+        core_memory_edits_this_session,
         soul_md,
     })
     .into_response()

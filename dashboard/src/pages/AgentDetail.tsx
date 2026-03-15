@@ -1,19 +1,61 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router'
-import { useAgentDetail, useAgentSessions, useAgentAudit } from '../api/agents.ts'
+import { useAgentDetail, useAgentSessions, useAgentAudit, type CoreMemory } from '../api/agents.ts'
 import StatusBadge from '../components/StatusBadge.tsx'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
 import { formatRelativeTime } from '../utils/formatTime.ts'
-import { ArrowLeft, Eye, Code } from 'lucide-react'
+import { ArrowLeft, User, Brain, Target, Users, GitBranch, Pencil } from 'lucide-react'
 
-type MemoryView = 'raw' | 'view'
+const BLOCK_TOKEN_CAP = 500
+const EDIT_BUDGET = 3
+
+const BLOCK_ICONS: Record<string, typeof User> = {
+  user_summary: User,
+  self_model: Brain,
+  current_priorities: Target,
+  key_people: Users,
+  workflows: GitBranch,
+}
+
+function TokenBar({ tokenCount }: { tokenCount: number }) {
+  const pct = Math.min(100, Math.round((tokenCount / BLOCK_TOKEN_CAP) * 100))
+  return (
+    <div className="flex items-center gap-2 mt-2">
+      <span className="text-[10px] text-muted/50 uppercase tracking-wider">Tokens</span>
+      <div className="flex-1 h-1 bg-white/[0.06] rounded-full overflow-hidden">
+        <div
+          className="h-full bg-accent rounded-full transition-all"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className="text-[10px] text-muted/50 font-mono">{tokenCount}/{BLOCK_TOKEN_CAP}</span>
+    </div>
+  )
+}
+
+function MemoryBlock({ mem }: { mem: CoreMemory }) {
+  const Icon = BLOCK_ICONS[mem.key] ?? Brain
+  return (
+    <div className="bg-bg rounded-lg p-3 border border-white/[0.04]">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <Icon size={12} className="text-accent shrink-0" />
+        <span className="text-[11px] text-heading font-semibold uppercase tracking-wider truncate">
+          {mem.key}
+        </span>
+      </div>
+      <p className="text-xs text-muted/70 font-mono leading-relaxed line-clamp-3 min-h-[3lh]">
+        {mem.value || '\u00A0'}
+      </p>
+      <TokenBar tokenCount={mem.token_count} />
+    </div>
+  )
+}
 
 export default function AgentDetail() {
   const { agentId } = useParams<{ agentId: string }>()
   const [sessionsPage, setSessionsPage] = useState(1)
   const [auditPage] = useState(1)
-  const [memoryView, setMemoryView] = useState<MemoryView>('view')
 
   const { data: agent, isLoading, error } = useAgentDetail(agentId ?? '')
   const { data: sessions } = useAgentSessions(agentId ?? '', sessionsPage)
@@ -30,10 +72,7 @@ export default function AgentDetail() {
     )
   }
 
-  // Calculate total core memory usage
-  const totalTokens = agent.core_memory.reduce((sum, m) => sum + m.token_count, 0)
-  const maxTokens = 2000
-  const usagePercent = Math.min(100, Math.round((totalTokens / maxTokens) * 100))
+  const editsUsed = agent.core_memory_edits_this_session
 
   return (
     <div>
@@ -69,57 +108,33 @@ export default function AgentDetail() {
         <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-heading text-sm font-semibold">Core Memory</h3>
-            <div className="flex items-center gap-1 bg-white/[0.04] rounded-lg p-0.5">
-              <button
-                onClick={() => setMemoryView('view')}
-                className={`p-1 rounded text-xs ${memoryView === 'view' ? 'bg-accent/20 text-accent' : 'text-muted/50 hover:text-muted'}`}
-              >
-                <Eye size={14} />
-              </button>
-              <button
-                onClick={() => setMemoryView('raw')}
-                className={`p-1 rounded text-xs ${memoryView === 'raw' ? 'bg-accent/20 text-accent' : 'text-muted/50 hover:text-muted'}`}
-              >
-                <Code size={14} />
-              </button>
+            <div className="flex items-center gap-1.5 text-muted/50">
+              <Pencil size={12} />
+              <span className="text-[11px] font-mono">
+                Edits: {editsUsed} / {EDIT_BUDGET} used this session
+              </span>
             </div>
           </div>
           {agent.core_memory.length === 0 ? (
             <EmptyState message="No core memory blocks" />
-          ) : memoryView === 'raw' ? (
-            <pre className="bg-bg rounded-xl p-4 text-xs font-mono text-muted/80 overflow-auto max-h-80 border border-white/[0.04]">
-              {agent.core_memory.map((m) => `${m.key}: ${JSON.stringify(m.value)}`).join('\n')}
-            </pre>
           ) : (
-            <div className="space-y-2">
-              {agent.core_memory.map((mem) => (
-                <div
-                  key={mem.key}
-                  className="flex items-start gap-3 py-2 border-b border-white/[0.03] last:border-0"
-                >
-                  <span className="text-xs text-accent font-mono font-medium min-w-[120px] shrink-0 pt-0.5">
-                    {mem.key}:
-                  </span>
-                  <span className="text-xs text-muted/80 font-mono break-words">
-                    {mem.value.length > 100 ? `"${mem.value.slice(0, 100)}..."` : `"${mem.value}"`}
-                  </span>
-                </div>
-              ))}
-            </div>
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                {agent.core_memory
+                  .filter((m) => m.key !== 'workflows')
+                  .map((mem) => (
+                    <MemoryBlock key={mem.key} mem={mem} />
+                  ))}
+              </div>
+              {agent.core_memory
+                .filter((m) => m.key === 'workflows')
+                .map((mem) => (
+                  <div key={mem.key} className="mt-2">
+                    <MemoryBlock mem={mem} />
+                  </div>
+                ))}
+            </>
           )}
-          {/* Memory usage bar */}
-          <div className="mt-4 pt-3 border-t border-white/[0.04]">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="text-[10px] text-muted/50 uppercase tracking-wider">Memory Usage</span>
-              <span className="text-[10px] text-muted/60 font-mono">{usagePercent}%</span>
-            </div>
-            <div className="h-1.5 bg-white/[0.04] rounded-full overflow-hidden">
-              <div
-                className="h-full bg-accent rounded-full transition-all"
-                style={{ width: `${usagePercent}%` }}
-              />
-            </div>
-          </div>
         </div>
 
         {/* Soul.md */}
