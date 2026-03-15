@@ -108,7 +108,13 @@ where
             tracing_subscriber::registry()
                 .with(otel_layer)
                 .with(filter)
-                .with(fmt::layer().pretty())
+                .with(
+                    fmt::layer()
+                        .pretty()
+                        .with_file(false)
+                        .with_line_number(false)
+                        .with_target(false),
+                )
                 .with(
                     fmt::layer()
                         .json()
@@ -134,7 +140,13 @@ where
             tracing_subscriber::registry()
                 .with(otel_layer)
                 .with(filter)
-                .with(fmt::layer().pretty())
+                .with(
+                    fmt::layer()
+                        .pretty()
+                        .with_file(false)
+                        .with_line_number(false)
+                        .with_target(false),
+                )
                 .init();
 
             None
@@ -174,7 +186,14 @@ where
             tracing_subscriber::registry()
                 .with(otel_layer)
                 .with(filter)
-                .with(fmt::layer().pretty().with_writer(std::io::stderr))
+                .with(
+                    fmt::layer()
+                        .pretty()
+                        .with_file(false)
+                        .with_line_number(false)
+                        .with_target(false)
+                        .with_writer(std::io::stderr),
+                )
                 .with(
                     fmt::layer()
                         .json()
@@ -209,7 +228,13 @@ where
             tracing_subscriber::registry()
                 .with(otel_layer)
                 .with(filter)
-                .with(fmt::layer().pretty())
+                .with(
+                    fmt::layer()
+                        .pretty()
+                        .with_file(false)
+                        .with_line_number(false)
+                        .with_target(false),
+                )
                 .init();
 
             None
