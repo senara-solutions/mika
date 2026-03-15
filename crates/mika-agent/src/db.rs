@@ -20,7 +20,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -39,7 +39,7 @@ const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
         created_at \
     FROM audit_events \
     UNION ALL \
-    SELECT created_trace_id AS trace_id, created_by_session AS session_id, agent_id, \
+    SELECT COALESCE(execution_trace_id, created_trace_id) AS trace_id, created_by_session AS session_id, agent_id, \
         'task' AS event_type, action_type AS event_subtype, \
         label || ' [' || status || ']' AS summary, \
         created_at \
@@ -128,6 +128,7 @@ pub struct Task {
     pub result: Option<String>,
     pub created_by_session: Option<String>,
     pub created_trace_id: Option<String>,
+    pub execution_trace_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub fired_at: Option<i64>,
@@ -167,6 +168,7 @@ pub struct Session {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub metadata: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -537,6 +539,10 @@ impl Database {
             self.migrate_v9_to_v10()?;
             info!(version = 10, "database migrated to v10");
         }
+        if (3..=10).contains(&version) {
+            self.migrate_v10_to_v11()?;
+            info!(version = 11, "database migrated to v11");
+        }
         Ok(())
     }
 
@@ -586,7 +592,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
-            INSERT INTO schema_version (version) VALUES (10);
+            INSERT INTO schema_version (version) VALUES (11);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -655,6 +661,7 @@ impl Database {
                 source TEXT,
                 created_by_session TEXT,
                 created_trace_id TEXT,
+                execution_trace_id TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 fired_at INTEGER,
@@ -669,6 +676,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
             CREATE INDEX idx_tasks_manual_active
                 ON tasks(agent_id, created_at DESC)
                 WHERE trigger_type = 'manual'
@@ -680,9 +688,11 @@ impl Database {
                 channel_type TEXT NOT NULL DEFAULT 'cli',
                 started_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 ended_at INTEGER,
-                metadata TEXT
+                metadata TEXT,
+                parent_session_id TEXT
             );
             CREATE INDEX idx_sessions_agent ON sessions(agent_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;
 
             CREATE TABLE messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1309,6 +1319,57 @@ impl Database {
         }
     }
 
+    fn migrate_v10_to_v11(&self) -> Result<()> {
+        info!(
+            "migrating database schema v10 → v11 (tasks.execution_trace_id, sessions.parent_session_id)"
+        );
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            // Add execution_trace_id column to tasks (idempotent guard)
+            if !self.column_exists("tasks", "execution_trace_id")? {
+                self.conn
+                    .execute_batch("ALTER TABLE tasks ADD COLUMN execution_trace_id TEXT;")?;
+            }
+
+            // Add parent_session_id column to sessions (idempotent guard)
+            if !self.column_exists("sessions", "parent_session_id")? {
+                self.conn
+                    .execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;")?;
+            }
+
+            // Partial indexes for new columns
+            self.conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;",
+            )?;
+            self.conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;",
+            )?;
+
+            // Recreate unified_timeline VIEW with COALESCE for execution_trace_id
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (11)", [])?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -1572,12 +1633,13 @@ impl Database {
             result: r.get(18)?,
             created_by_session: r.get(19)?,
             created_trace_id: r.get(20)?,
-            created_at: r.get(21)?,
-            updated_at: r.get(22)?,
-            fired_at: r.get(23)?,
-            completed_at: r.get(24)?,
-            reference_url: r.get(25)?,
-            source: r.get(26)?,
+            execution_trace_id: r.get(21)?,
+            created_at: r.get(22)?,
+            updated_at: r.get(23)?,
+            fired_at: r.get(24)?,
+            completed_at: r.get(25)?,
+            reference_url: r.get(26)?,
+            source: r.get(27)?,
         })
     }
 
@@ -1585,7 +1647,7 @@ impl Database {
          trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
-         created_trace_id, created_at, updated_at, fired_at, completed_at,
+         created_trace_id, execution_trace_id, created_at, updated_at, fired_at, completed_at,
          reference_url, source";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
@@ -1618,6 +1680,17 @@ impl Database {
         self.conn.execute(
             "UPDATE tasks SET status = ?1, updated_at = unixepoch() WHERE id = ?2",
             params![status, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the trace_id of the execution that ran this task.
+    /// Deliberately does NOT scope by agent_id — the dispatcher may write
+    /// execution_trace_id for tasks owned by different agents (cross-agent team tasks).
+    pub fn update_task_execution_trace_id(&self, id: &str, trace_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET execution_trace_id = ?1, updated_at = unixepoch() WHERE id = ?2",
+            params![trace_id, id],
         )?;
         Ok(())
     }
@@ -1725,7 +1798,7 @@ impl Database {
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
-    const TASK_COLUMN_COUNT: usize = 27;
+    const TASK_COLUMN_COUNT: usize = 28;
 
     /// List manual (work item) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
@@ -2120,6 +2193,23 @@ impl Database {
         self.conn.execute(
             "INSERT INTO sessions (id, agent_id, channel_type, metadata) VALUES (?1, ?2, ?3, ?4)",
             params![id, agent_id, channel_type, metadata],
+        )?;
+        Ok(())
+    }
+
+    /// Create a session with metadata and a parent session reference.
+    /// Used by callback and skill_run dispatchers to link back to the originating session.
+    pub fn create_session_with_parent(
+        &self,
+        id: &str,
+        agent_id: &str,
+        channel_type: &str,
+        metadata: Option<&str>,
+        parent_session_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (id, agent_id, channel_type, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, agent_id, channel_type, metadata, parent_session_id],
         )?;
         Ok(())
     }
@@ -4297,7 +4387,7 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, agent_id, channel_type, started_at, ended_at, metadata
+                "SELECT id, agent_id, channel_type, started_at, ended_at, metadata, parent_session_id
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 |r| {
@@ -4308,6 +4398,7 @@ impl Database {
                         started_at: r.get(3)?,
                         ended_at: r.get(4)?,
                         metadata: r.get(5)?,
+                        parent_session_id: r.get(6)?,
                     })
                 },
             )
@@ -5801,9 +5892,192 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_10() {
+    fn test_schema_version_is_11() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
+    }
+
+    #[test]
+    fn test_execution_trace_id_column_exists() {
+        let db = db();
+        assert!(db.column_exists("tasks", "execution_trace_id").unwrap());
+    }
+
+    #[test]
+    fn test_parent_session_id_column_exists() {
+        let db = db();
+        assert!(db.column_exists("sessions", "parent_session_id").unwrap());
+    }
+
+    #[test]
+    fn test_update_task_execution_trace_id() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test-exec-trace".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: Some("created-trace-aaa".to_string()),
+            reference_url: None,
+            source: None,
+        };
+        let id = db.create_task(&task).unwrap();
+
+        // Initially execution_trace_id is None
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
+        assert!(t.execution_trace_id.is_none());
+
+        // Write execution trace_id
+        db.update_task_execution_trace_id(&id, "exec-trace-bbb")
+            .unwrap();
+
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(t.execution_trace_id.as_deref(), Some("exec-trace-bbb"));
+        // created_trace_id should be unchanged
+        assert_eq!(t.created_trace_id.as_deref(), Some("created-trace-aaa"));
+    }
+
+    #[test]
+    fn test_update_task_execution_trace_id_cross_agent() {
+        // Verify execution_trace_id update does NOT scope by agent_id
+        let db = db();
+        db.register_agent("other", "Other", "").unwrap();
+
+        let task = NewTask {
+            agent_id: "other".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "cross-agent-test".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+        };
+        let id = db.create_task(&task).unwrap();
+
+        // The "mika" agent can write execution_trace_id on a task owned by "other"
+        db.update_task_execution_trace_id(&id, "cross-trace-123")
+            .unwrap();
+
+        let t = db.get_task(&id, "other").unwrap().unwrap();
+        assert_eq!(t.execution_trace_id.as_deref(), Some("cross-trace-123"));
+    }
+
+    #[test]
+    fn test_create_session_with_parent() {
+        let db = db();
+        // Create a parent session first
+        db.create_session("parent-sess", "mika", "cli").unwrap();
+
+        // Create a child session with parent reference
+        db.create_session_with_parent(
+            "child-sess",
+            "mika",
+            "system",
+            Some(r#"{"trigger": "callback"}"#),
+            Some("parent-sess"),
+        )
+        .unwrap();
+
+        let session = db.get_session("child-sess").unwrap().unwrap();
+        assert_eq!(session.parent_session_id.as_deref(), Some("parent-sess"));
+        assert_eq!(
+            session.metadata.as_deref(),
+            Some(r#"{"trigger": "callback"}"#)
+        );
+    }
+
+    #[test]
+    fn test_create_session_with_parent_none() {
+        let db = db();
+        db.create_session_with_parent(
+            "no-parent-sess",
+            "mika",
+            "system",
+            Some(r#"{"trigger": "heartbeat"}"#),
+            None,
+        )
+        .unwrap();
+
+        let session = db.get_session("no-parent-sess").unwrap().unwrap();
+        assert!(session.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn test_unified_timeline_uses_execution_trace_id() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "timeline-test".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(9_999_999_999),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: Some("created-trace-111".to_string()),
+            reference_url: None,
+            source: None,
+        };
+        let id = db.create_task(&task).unwrap();
+
+        // Before execution: unified_timeline should show created_trace_id
+        let rows: Vec<(Option<String>,)> = db
+            .conn
+            .prepare("SELECT trace_id FROM unified_timeline WHERE event_type = 'task' AND summary LIKE 'timeline-test%'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?,)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.as_deref(), Some("created-trace-111"));
+
+        // After execution: unified_timeline should prefer execution_trace_id
+        db.update_task_execution_trace_id(&id, "exec-trace-222")
+            .unwrap();
+
+        let rows: Vec<(Option<String>,)> = db
+            .conn
+            .prepare("SELECT trace_id FROM unified_timeline WHERE event_type = 'task' AND summary LIKE 'timeline-test%'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?,)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.as_deref(), Some("exec-trace-222"));
     }
 
     #[test]

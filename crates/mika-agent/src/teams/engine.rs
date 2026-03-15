@@ -931,6 +931,9 @@ impl TeamEngine {
                                 // (workspace entries, deliverables, critic feedback), not
                                 // directly to users via Telegram.
                                 message_sender: None,
+                                // Propagate the team engine's trace_id so delegate agent
+                                // events correlate with the parent team run.
+                                trace_id: Some(trace_id.clone()),
                             };
                             crate::agent::run_team_agent(&params)
                                 .await
@@ -1267,6 +1270,8 @@ impl TeamEngine {
             // (workspace entries, deliverables, critic feedback), not
             // directly to users via Telegram.
             message_sender: None,
+            // Propagate the team engine's trace_id for correlation.
+            trace_id: Some(self.trace_id.clone()),
         };
 
         Ok(crate::agent::run_team_agent(&params)

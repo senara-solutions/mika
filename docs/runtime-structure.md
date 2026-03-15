@@ -61,7 +61,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 10
+**Current schema version:** 11
 
 ### Core Tables
 
@@ -69,7 +69,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **agents** — `id TEXT PK`, `name TEXT NOCASE`, `home_dir TEXT`, `active BOOLEAN DEFAULT 1`, `last_seen INTEGER`, `created_at INTEGER`
 
-**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `started_at INTEGER`, `ended_at INTEGER`, `metadata TEXT`
+**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `started_at INTEGER`, `ended_at INTEGER`, `metadata TEXT`
 
 **messages** — `id INTEGER PK AUTO`, `session_id TEXT FK→sessions`, `agent_id TEXT FK→agents`, `role TEXT CHECK(user|assistant|system|summary|tool_result)`, `content TEXT`, `metadata TEXT`, `trace_id TEXT`, `compacted_through_id INTEGER`, `created_at INTEGER`
 
@@ -91,7 +91,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Task Engine
 
-**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at INTEGER`, `timeout_at INTEGER`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at`, `updated_at`, `fired_at`, `completed_at`
+**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at INTEGER`, `timeout_at INTEGER`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `execution_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at`, `updated_at`, `fired_at`, `completed_at`
 
 ### Team Tables
 
@@ -121,7 +121,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### View
 
-**unified_timeline** — `UNION ALL` across `messages`, `audit_events`, `tasks`, `team_workspace`. Columns: `trace_id`, `session_id`, `agent_id`, `event_type`, `event_subtype`, `summary` (truncated to 200 chars), `created_at`. Team workspace entries use `event_type='team_workspace'`, synthetic `session_id='team-{run_id}'`, and `agent_id=NULL`.
+**unified_timeline** — `UNION ALL` across `messages`, `audit_events`, `tasks`, `team_workspace`. Columns: `trace_id`, `session_id`, `agent_id`, `event_type`, `event_subtype`, `summary` (truncated to 200 chars), `created_at`. Task leg uses `COALESCE(execution_trace_id, created_trace_id)` as `trace_id` for accurate correlation. Team workspace entries use `event_type='team_workspace'`, synthetic `session_id='team-{run_id}'`, and `agent_id=NULL`.
 
 ### Notable Indexes
 
@@ -133,7 +133,9 @@ Unique partial indexes (duplicate prevention):
 
 Performance indexes: `idx_tasks_schedulable` (pending/recurring by next_fire_at), `idx_msg_session` (messages by session+time), `idx_msg_agent_created`, `idx_sessions_agent`.
 
-Partial trace indexes: `idx_msg_trace`, `idx_audit_trace`, `idx_tasks_trace`, `idx_team_ws_trace` (WHERE NOT NULL).
+Partial trace indexes: `idx_msg_trace`, `idx_audit_trace`, `idx_tasks_trace`, `idx_team_ws_trace`, `idx_tasks_execution_trace` (WHERE NOT NULL).
+
+Session hierarchy: `idx_sessions_parent` (partial, WHERE `parent_session_id` IS NOT NULL).
 
 Callback delivery: `idx_tasks_callback_delivery` (partial, for TUI polling).
 

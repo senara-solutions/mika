@@ -236,6 +236,8 @@ impl Tool for DelegateTaskTool {
             agent_name,
             child_task_id: None,
             message_sender: delegate_sender,
+            // Propagate the orchestrator's trace_id so delegate events correlate.
+            trace_id: Some(ctx.trace_id.to_string()),
         };
 
         let result = crate::agent::run_team_agent(&params).await;

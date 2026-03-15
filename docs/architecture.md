@@ -845,7 +845,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 10 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index; v10: adds `trace_id TEXT` to `team_runs` for resume continuity, extends `unified_timeline` VIEW with `team_workspace` UNION ALL, adds `idx_team_ws_trace` partial index)
+**Schema version:** 11 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index; v10: adds `trace_id TEXT` to `team_runs` for resume continuity, extends `unified_timeline` VIEW with `team_workspace` UNION ALL, adds `idx_team_ws_trace` partial index; v11: adds `execution_trace_id TEXT` to `tasks` with `idx_tasks_execution_trace` partial index, adds `parent_session_id TEXT` to `sessions` with `idx_sessions_parent` partial index, recreates `unified_timeline` VIEW with `COALESCE(execution_trace_id, created_trace_id)` for the task leg)
 
 ### Tables
 
@@ -854,7 +854,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `schema_version` | Migration tracking |
 | `agents` | Agent registry (name, display_name, model, active flag) |
 | `teams` | Team registry (name, display_name, orchestrator) |
-| `sessions` | Conversation sessions (`agent_id` FK, `channel_type`, timestamps) |
+| `sessions` | Conversation sessions (`agent_id` FK, `channel_type`, `parent_session_id`, timestamps) |
 | `messages` | Message history (`session_id` FK, `role`, `content`, `trace_id`, `metadata`) |
 | `core_memory` | Layer 1 persistent memory blocks (`agent_id` FK) |
 | `people` | Layer 2 people/contacts (`agent_id` FK) |
@@ -870,11 +870,11 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `search_content` | Unified search content for Layer 3 hybrid search |
 | `fts_search` | FTS5 virtual table for full-text search |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
-| `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
+| `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`, `execution_trace_id`) |
 | `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint, trace_id) |
 | `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
 | `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
-| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks, team_workspace for cross-subsystem correlation by trace_id |
+| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks, team_workspace for cross-subsystem correlation by trace_id (task leg uses `COALESCE(execution_trace_id, created_trace_id)`) |
 
 ### SQLite Pragmas
 
