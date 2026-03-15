@@ -308,13 +308,13 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         settings.claude_model.clone(),
         settings.claude_max_tokens,
     )?;
+    let http_client = reqwest::Client::new();
     let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(global_home, settings) {
+    for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone()) {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
     let ready = Arc::new(AtomicBool::new(false));
-    let http_client = reqwest::Client::new();
 
     // Validate required settings for server mode
     let gateway_url = settings.routing_url.clone().ok_or_else(|| {

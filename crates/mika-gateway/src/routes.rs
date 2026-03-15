@@ -631,16 +631,21 @@ pub(crate) async fn handle_send(
     }
 
     // Validate agent_name format (defense-in-depth at trust boundary)
+    // Mirrors mika-common validate_agent_name: lowercase alphanumeric + hyphens, max 32 chars,
+    // no leading/trailing hyphens, no consecutive hyphens.
     if let Some(ref name) = payload.agent_name
         && (name.is_empty()
-            || name.len() > 64
+            || name.len() > 32
             || !name
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || name.starts_with('-')
+            || name.ends_with('-')
+            || name.contains("--"))
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid agent_name"})),
+            Json(serde_json::json!({"error": "invalid agent_name: must be 1-32 lowercase alphanumeric chars or hyphens, no leading/trailing/consecutive hyphens"})),
         )
             .into_response();
     }
@@ -894,8 +899,57 @@ mod tests {
 
     #[test]
     fn test_send_payload_with_underscore_agent_name() {
+        // Underscores are accepted by serde deserialization but will be rejected
+        // by handle_send validation (only lowercase alphanumeric + hyphens allowed)
         let json = r#"{"chat_id": 42, "text": "hello", "agent_name": "my_agent"}"#;
         let payload: SendPayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload.agent_name.as_deref(), Some("my_agent"));
+    }
+
+    #[test]
+    fn test_agent_name_validation_rules() {
+        // Helper to check if a name passes validation (mirrors handle_send logic)
+        fn is_valid_agent_name(name: &str) -> bool {
+            !name.is_empty()
+                && name.len() <= 32
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("--")
+        }
+
+        // Valid names
+        assert!(is_valid_agent_name("mika"));
+        assert!(is_valid_agent_name("mika-dev"));
+        assert!(is_valid_agent_name("agent1"));
+        assert!(is_valid_agent_name("my-agent-42"));
+
+        // Invalid: uppercase
+        assert!(!is_valid_agent_name("Mika"));
+        assert!(!is_valid_agent_name("MIKA"));
+        assert!(!is_valid_agent_name("mikaA"));
+
+        // Invalid: underscore
+        assert!(!is_valid_agent_name("my_agent"));
+
+        // Invalid: leading/trailing hyphen
+        assert!(!is_valid_agent_name("-mika"));
+        assert!(!is_valid_agent_name("mika-"));
+
+        // Invalid: consecutive hyphens
+        assert!(!is_valid_agent_name("mika--dev"));
+
+        // Invalid: empty
+        assert!(!is_valid_agent_name(""));
+
+        // Invalid: too long (> 32 chars)
+        assert!(!is_valid_agent_name("a]234567890123456789012345678901234"));
+        assert!(is_valid_agent_name("a2345678901234567890123456789012")); // exactly 32
+
+        // Invalid: special characters
+        assert!(!is_valid_agent_name("agent!"));
+        assert!(!is_valid_agent_name("agent name"));
     }
 }
