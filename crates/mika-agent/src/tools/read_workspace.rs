@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{Tool, ToolContext, ToolOutput, validate_and_resolve_path};
 
@@ -11,40 +11,19 @@ const MAX_READ_SIZE: u64 = 100 * 1024;
 
 pub struct ReadWorkspaceTool {
     pub workspace_dir: PathBuf,
+    /// Optional read-only workspace from a previous run (via `--run-id`).
+    pub reference_dir: Option<PathBuf>,
 }
 
-#[async_trait]
-impl Tool for ReadWorkspaceTool {
-    fn name(&self) -> &str {
-        "read_workspace"
-    }
-
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_workspace".to_string(),
-            description: "Read a file from the team workspace. Use this to access shared context and outputs from other team members.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path to the file in the workspace (e.g., 'research.md')"
-                    }
-                },
-                "required": ["path"]
-            }),
-        }
-    }
-
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        let path = input["path"].as_str().unwrap_or("");
-
-        let full_path = match validate_and_resolve_path(path, &self.workspace_dir, false).await {
+impl ReadWorkspaceTool {
+    /// Read a file from a specific workspace directory with full security checks.
+    async fn read_from_dir(&self, path: &str, base_dir: &Path) -> Result<ToolOutput> {
+        let full_path = match validate_and_resolve_path(path, base_dir, false).await {
             Ok(p) => p,
             Err(e) => return Ok(e),
         };
 
-        // Reject symlinks at the target file (check before canonicalize to prevent TOCTOU via symlink)
+        // Reject symlinks at the target file
         match tokio::fs::symlink_metadata(&full_path).await {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -64,7 +43,7 @@ impl Tool for ReadWorkspaceTool {
         // Verify the resolved path is still within the workspace
         match full_path.canonicalize() {
             Ok(canonical) => {
-                let workspace_canonical = match self.workspace_dir.canonicalize() {
+                let workspace_canonical = match base_dir.canonicalize() {
                     Ok(c) => c,
                     Err(_) => {
                         return Ok(ToolOutput::error("Workspace directory does not exist."));
@@ -113,6 +92,51 @@ impl Tool for ReadWorkspaceTool {
     }
 }
 
+#[async_trait]
+impl Tool for ReadWorkspaceTool {
+    fn name(&self) -> &str {
+        "read_workspace"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "read_workspace".to_string(),
+            description: "Read a file from the team workspace. Use this to access shared context and outputs from other team members.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file in the workspace (e.g., 'research.md')"
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+        let path = input["path"].as_str().unwrap_or("");
+
+        // Try current workspace first, then fall back to reference workspace
+        match self.read_from_dir(path, &self.workspace_dir).await {
+            Ok(output) if !output.is_error => Ok(output),
+            Ok(not_found) => {
+                // If we have a reference dir and the file wasn't found in current, try there
+                if let Some(ref ref_dir) = self.reference_dir {
+                    match self.read_from_dir(path, ref_dir).await {
+                        Ok(output) if !output.is_error => Ok(output),
+                        _ => Ok(not_found), // Return original error from current workspace
+                    }
+                } else {
+                    Ok(not_found)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +153,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -147,6 +172,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -165,6 +191,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -183,6 +210,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -202,6 +230,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -220,6 +249,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -243,6 +273,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -261,6 +292,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -281,6 +313,7 @@ mod tests {
 
         let tool = ReadWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();

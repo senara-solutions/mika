@@ -34,8 +34,8 @@ async fn main() -> Result<()> {
             anyhow::bail!("Team '{team_name}' not found.");
         }
 
-        // Only allow bare `mika --team` or `mika chat --team`
         match cli.command {
+            // `mika --team` or `mika chat --team`
             None | Some(Commands::Chat(_)) => {
                 let log_level = resolve_log_level(&[global_home.join("config.toml")]);
 
@@ -56,10 +56,37 @@ async fn main() -> Result<()> {
 
                 return commands::chat::run_team(&team_name, &global_home).await;
             }
+            // `mika ask --team`
+            Some(Commands::Ask(ref args)) => {
+                let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+
+                let (otel_layer, _telemetry_guard) =
+                    mika_common::config::Settings::load(&global_home)
+                        .ok()
+                        .map(|s| mika_common::telemetry::try_init_otel(&s))
+                        .unwrap_or((None, None));
+
+                let log_dir = team::team_dir(&global_home, &team_name).join("logs");
+                let _log_guard = mika_common::logging::init_pretty(
+                    &log_level,
+                    Some(&log_dir),
+                    LogOutput::FileOnly,
+                    otel_layer,
+                );
+
+                return commands::ask::run_team_ask(
+                    &team_name,
+                    &args.message,
+                    args.run_id.as_deref(),
+                    &args.format,
+                    &global_home,
+                )
+                .await;
+            }
             Some(_) => {
                 anyhow::bail!(
-                    "--team cannot be used with subcommands other than 'chat'. \
-                     Use 'mika teams run {team_name} \"goal\"' for non-interactive team runs."
+                    "--team is only supported with 'chat' and 'ask'. \
+                     Use 'mika ask --team {team_name} \"goal\"' for non-interactive team runs."
                 );
             }
         }
@@ -405,12 +432,29 @@ mod tests {
         assert!(result.is_err(), "--agent should not be accepted on setup");
     }
 
-    /// --team should NOT be accepted on ask subcommand.
+    /// --team should be accepted on ask subcommand.
     #[test]
-    fn test_team_flag_rejected_on_ask() {
+    fn test_team_flag_accepted_on_ask() {
         let result =
             crate::cli::Cli::try_parse_from(["mika", "ask", "--team", "research", "hello"]);
-        assert!(result.is_err(), "--team should not be accepted on ask");
+        assert!(result.is_ok(), "--team should be accepted on ask");
+    }
+
+    /// --team and --agent should conflict on ask subcommand.
+    #[test]
+    fn test_team_conflicts_with_agent_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "ask", "--team", "research", "--agent", "mika", "hello",
+        ]);
+        assert!(result.is_err(), "--team and --agent should conflict on ask");
+    }
+
+    /// --run-id requires --team on ask subcommand.
+    #[test]
+    fn test_run_id_requires_team_on_ask() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--run-id", "abc-123", "hello"]);
+        assert!(result.is_err(), "--run-id should require --team");
     }
 
     /// clap-markdown output should include the --team flag (on chat subcommand).

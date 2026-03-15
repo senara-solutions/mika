@@ -214,6 +214,162 @@ pub async fn run(
     Ok(())
 }
 
+/// Extended JSON response for team runs.
+#[derive(serde::Serialize)]
+struct AskTeamJsonResponse {
+    role: &'static str,
+    content: Option<String>,
+    team_run: TeamRunMeta,
+}
+
+#[derive(serde::Serialize)]
+struct TeamRunMeta {
+    run_id: String,
+    status: String,
+    iterations: u32,
+}
+
+/// Run a team workflow in non-interactive mode (mika ask --team).
+///
+/// Runs the full team cycle (decompose → execute → review → deliver),
+/// prints progress to stderr and the deliverable to stdout.
+pub async fn run_team_ask(
+    team_name: &str,
+    message: &str,
+    run_id: Option<&str>,
+    format: &OutputFormat,
+    global_home: &std::path::Path,
+) -> Result<()> {
+    use mika_agent::teams::types::{RunStatus, TeamEvent};
+    use mika_common::config::Settings;
+
+    // Read message from stdin if "-"
+    let goal = if message == "-" {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf.trim().to_string()
+    } else {
+        message.to_string()
+    };
+
+    if goal.is_empty() {
+        anyhow::bail!("Empty message. Provide a goal for the team.");
+    }
+
+    // Validate --run-id if provided
+    if let Some(ref_id) = run_id {
+        let db_path = mika_common::home::container_db_path(global_home);
+        if db_path.exists() {
+            let db = mika_agent::db::Database::open(&db_path)?;
+            match db.load_team_run_by_id(ref_id) {
+                Ok(Some(run)) => {
+                    if run.team_name != team_name {
+                        anyhow::bail!(
+                            "Run '{}' belongs to team '{}', not '{}'.",
+                            ref_id,
+                            run.team_name,
+                            team_name
+                        );
+                    }
+                    if run.status == "running" {
+                        anyhow::bail!(
+                            "Run '{}' is still running. Cannot reference a running run.",
+                            ref_id
+                        );
+                    }
+                }
+                Ok(None) => {
+                    anyhow::bail!("Run '{}' not found.", ref_id);
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to look up run '{}': {}", ref_id, e);
+                }
+            }
+        } else {
+            anyhow::bail!("No database found. Run `mika` first to initialize.");
+        }
+    }
+
+    let settings = Settings::load(global_home)?;
+
+    let callback = |event: TeamEvent| match event {
+        TeamEvent::Progress(msg) => {
+            eprintln!("  > {msg}");
+        }
+        TeamEvent::PhaseChanged { phase, iteration } => {
+            eprintln!("  > Phase: {phase} (iteration {iteration})");
+        }
+        TeamEvent::AgentStarted { agent, role } => {
+            eprintln!("  > Agent {agent} ({role}) started");
+        }
+        TeamEvent::AgentCompleted { agent, .. } => eprintln!("  > {agent} completed"),
+        TeamEvent::AgentFailed { agent, error } => {
+            eprintln!("  > {agent} failed: {error}");
+        }
+        TeamEvent::TasksAssigned { tasks, iteration } => {
+            let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
+            eprintln!(
+                "  > Iteration {iteration}: assigned tasks to {}",
+                names.join(", ")
+            );
+        }
+        TeamEvent::CriticReview {
+            approved,
+            feedback,
+            iteration,
+        } => {
+            let verdict = if approved { "approved" } else { "rejected" };
+            eprintln!("  > Critic (iteration {iteration}): {verdict}. {feedback}");
+        }
+        TeamEvent::Deliverable(_) => {} // handled below
+        TeamEvent::RunFailed(_) => {}   // handled below
+    };
+
+    let team_db = crate::commands::teams::open_container_db_async(global_home)?;
+
+    let run = mika_agent::teams::run_team(
+        team_name,
+        &goal,
+        global_home,
+        &settings,
+        Some(Box::new(callback)),
+        team_db.clone(),
+        run_id,
+    )
+    .await?;
+    team_db.shutdown();
+
+    let is_failure = matches!(&run.status, RunStatus::Failed(_));
+
+    match format {
+        OutputFormat::Text => {
+            if let Some(ref deliverable) = run.deliverable {
+                println!("{deliverable}");
+            } else if let RunStatus::Failed(ref msg) = run.status {
+                eprintln!("Error: {msg}");
+            }
+        }
+        OutputFormat::Json => {
+            let response = AskTeamJsonResponse {
+                role: "assistant",
+                content: run.deliverable.clone(),
+                team_run: TeamRunMeta {
+                    run_id: run.run_id.clone(),
+                    status: format!("{}", run.status),
+                    iterations: run.iteration,
+                },
+            };
+            println!("{}", serde_json::to_string(&response)?);
+        }
+    }
+
+    if is_failure {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

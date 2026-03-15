@@ -657,6 +657,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                         &settings,
                         Some(Box::new(callback)),
                         worker_team_db.clone(),
+                        None, // TODO: pass --run-id for continuity
                     )
                     .await
                     {

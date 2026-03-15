@@ -236,7 +236,7 @@ impl Tool for CreateTeamTool {
             )));
         }
 
-        let workspace_dir = team::workspace_dir(&self.home_dir, &name);
+        let workspace_dir = team::workspace_base_dir(&self.home_dir, &name);
         if let Err(e) = std::fs::create_dir_all(&workspace_dir) {
             return Ok(ToolOutput::error(format!(
                 "Failed to create workspace directory: {e}"
@@ -644,7 +644,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(team::workspace_dir(tmp.path(), "ws-team").exists());
+        assert!(team::workspace_base_dir(tmp.path(), "ws-team").exists());
     }
 
     #[tokio::test]

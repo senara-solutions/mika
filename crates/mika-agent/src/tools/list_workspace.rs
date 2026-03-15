@@ -9,6 +9,8 @@ use super::{Tool, ToolContext, ToolOutput};
 
 pub struct ListWorkspaceTool {
     pub workspace_dir: PathBuf,
+    /// Optional read-only workspace from a previous run (via `--run-id`).
+    pub reference_dir: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -30,24 +32,54 @@ impl Tool for ListWorkspaceTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        if !self.workspace_dir.exists() {
+        let mut current_files = Vec::new();
+        if self.workspace_dir.exists() {
+            collect_files(
+                &self.workspace_dir,
+                &self.workspace_dir,
+                &mut current_files,
+                0,
+            );
+        }
+
+        let mut ref_files = Vec::new();
+        if let Some(ref ref_dir) = self.reference_dir
+            && ref_dir.exists()
+        {
+            collect_files(ref_dir, ref_dir, &mut ref_files, 0);
+        }
+
+        if current_files.is_empty() && ref_files.is_empty() {
             return Ok(ToolOutput::success("Workspace is empty (no files yet)."));
         }
 
-        let mut files = Vec::new();
-        collect_files(&self.workspace_dir, &self.workspace_dir, &mut files, 0);
-
-        if files.is_empty() {
-            return Ok(ToolOutput::success("Workspace is empty (no files yet)."));
-        }
-
-        files.sort_by(|a, b| a.0.cmp(&b.0));
+        current_files.sort_by(|a, b| a.0.cmp(&b.0));
+        ref_files.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut output = String::new();
-        writeln!(output, "Workspace files:").unwrap();
-        for (path, size) in &files {
-            writeln!(output, "  {path} ({size})").unwrap();
+
+        if !current_files.is_empty() {
+            let label = if self.reference_dir.is_some() {
+                "Current run files:"
+            } else {
+                "Workspace files:"
+            };
+            writeln!(output, "{label}").unwrap();
+            for (path, size) in &current_files {
+                writeln!(output, "  {path} ({size})").unwrap();
+            }
         }
+
+        if !ref_files.is_empty() {
+            if !current_files.is_empty() {
+                writeln!(output).unwrap();
+            }
+            writeln!(output, "Previous run files (read-only):").unwrap();
+            for (path, size) in &ref_files {
+                writeln!(output, "  {path} ({size})").unwrap();
+            }
+        }
+
         Ok(ToolOutput::success(output))
     }
 }
@@ -128,6 +160,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -147,6 +180,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -167,6 +201,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -200,6 +235,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();

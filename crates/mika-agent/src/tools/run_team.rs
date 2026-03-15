@@ -130,6 +130,7 @@ impl Tool for RunTeamTool {
             &self.settings,
             callback,
             team_db.clone(),
+            None,
         )
         .await;
         team_db.shutdown();
