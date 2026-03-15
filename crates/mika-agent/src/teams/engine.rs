@@ -59,6 +59,8 @@ pub struct TeamEngine {
     goal_msg_id: Option<i64>,
     /// Trace ID for correlating all events within this team run.
     trace_id: String,
+    /// If set, use this specific run's summary instead of auto-detecting the last completed run.
+    reference_run_id: Option<String>,
 }
 
 impl TeamEngine {
@@ -178,6 +180,7 @@ impl TeamEngine {
             team_db,
             goal_msg_id: None,
             trace_id: mika_common::trace::generate_trace_id(),
+            reference_run_id: reference_run_id.map(|s| s.to_string()),
         })
     }
 
@@ -217,6 +220,7 @@ impl TeamEngine {
             team_db,
             goal_msg_id: None,
             trace_id,
+            reference_run_id: None,
         })
     }
 
@@ -522,15 +526,19 @@ impl TeamEngine {
             .await
             .unwrap_or_default();
 
-        // Load enriched summary for the most recent previous run
-        let previous_run_summary = self
-            .team_db
-            .get_last_completed_team_run_summary(&self.run.team_name)
-            .await
-            .unwrap_or_else(|e| {
-                debug!("Failed to load previous team run summary: {e}");
-                None
-            });
+        // Load enriched summary — prefer explicitly referenced run, fall back to last completed
+        let previous_run_summary = match &self.reference_run_id {
+            Some(ref_id) => self.team_db.get_team_run_summary(ref_id).await,
+            None => {
+                self.team_db
+                    .get_last_completed_team_run_summary(&self.run.team_name)
+                    .await
+            }
+        }
+        .unwrap_or_else(|e| {
+            debug!("Failed to load previous team run summary: {e}");
+            None
+        });
         if let Some(ref summary) = previous_run_summary {
             info!(
                 previous_run_id = %summary.run.id,
