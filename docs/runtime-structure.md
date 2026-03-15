@@ -43,6 +43,13 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
     └── <team-name>/
         ├── team.toml                 # Team definition
         ├── workspace/
+        │   └── <run-uuid>/           # Per-run workspace (isolated)
+        │       ├── .meta/            # Engine-written metadata
+        │       │   ├── goal.md
+        │       │   ├── assignments.md
+        │       │   ├── critic_feedback.md
+        │       │   └── deliverable.md
+        │       └── <agent-output>    # Agent-written files
         └── logs/                     # Team-mode logs
 ```
 
