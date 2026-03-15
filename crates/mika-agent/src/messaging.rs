@@ -98,6 +98,14 @@ impl MessageSender for GatewayMessageSender {
     async fn send(&self, text: &str) -> Result<()> {
         let chat_id = self.resolve_chat_id().await?;
 
+        tracing::info!(
+            agent_name = ?self.agent_name,
+            chat_id,
+            explicit_override = self.chat_id.is_some(),
+            text_len = text.len(),
+            "GatewayMessageSender: sending outbound message"
+        );
+
         let payload = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
