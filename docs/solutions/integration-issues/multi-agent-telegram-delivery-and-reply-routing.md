@@ -115,15 +115,21 @@ async fn resolve_chat_id(&self) -> Result<i64> {
 
 ## Prevention
 
-- New `TeamAgentParams` fields that carry `Option<Arc<dyn T>>` should consider whether cloning propagates the wrong identity. Document the intent.
+- New `TeamAgentParams` fields that carry `Option<Arc<dyn T>>` should consider whether cloning propagates the wrong identity. Document the intent. Create a fresh instance per delegate when the trait implementation carries agent-specific state (like `agent_name`).
+- **Treat `None` as deliberate:** Every `None` assignment on an `Option` field that controls user-visible behavior (message delivery, attribution) should have an inline `// Intentional: <reason>` comment. The original bug was silent because `message_sender: None` compiled without explanation.
+- **Enumerate all construction sites before merging.** When adding fields to `TeamAgentParams`, search for `TeamAgentParams {` and visit every match. Current sites: `delegate_task.rs`, `teams/engine.rs` (two sites), and test utils.
 - Gateway fields that are rendered to users should be validated at the `/send` boundary.
 - Postgres tables that grow with message volume need cleanup strategies.
-- **Agent-scoped DB lookups in delegated contexts:** When creating `AsyncDatabase` for a delegate agent, any shared config (like `chat_id`) must be passed explicitly — the delegate's agent-scoped queries won't find config stored under the orchestrator's agent_id.
+- **Agent-scoped DB lookups in delegated contexts:** When creating `AsyncDatabase` for a delegate agent, any shared config (like `chat_id`) must be passed explicitly — the delegate's agent-scoped queries won't find config stored under the orchestrator's agent_id. This is the same class of bug as [team-task-child-wrong-agent-id](../database-issues/team-task-child-wrong-agent-id.md).
 
 ## Related
 
 - [Brainstorm: Delegated Agent Telegram Delivery](../../brainstorms/2026-03-14-delegated-agent-telegram-delivery-brainstorm.md)
+- [Brainstorm: Telegram Prefix Attribution](../../brainstorms/2026-03-15-telegram-prefix-attribution-brainstorm.md)
+- [Plan: Delegate Agent Telegram Chat ID Fix](../../plans/2026-03-15-001-fix-delegate-agent-telegram-chat-id-plan.md)
+- [Plan: Delegate Send Message Tracing](../../plans/2026-03-15-002-fix-delegate-send-message-tracing-plan.md)
 - [Agent Team Management Tools Integration](agent-team-management-tools-integration.md)
+- [Team Task Child Wrong Agent ID](../database-issues/team-task-child-wrong-agent-id.md)
 - [Delegation Work Item Guard Enforcement](../architecture-patterns/delegation-work-item-guard-enforcement.md)
 - [Callback/Resume Agent Lifecycle](../architecture/callback-resume-agent-lifecycle.md)
 - GitHub Issue: [#149](https://github.com/senara-solutions/mika/issues/149)
