@@ -416,16 +416,23 @@ impl ToolRegistry {
 }
 
 /// Create a registry with workspace tools for team execution.
-pub fn team_tools(workspace_dir: &Path) -> Vec<Box<dyn Tool>> {
+///
+/// `reference_dir` is an optional read-only workspace from a previous run
+/// (provided when `--run-id` is used). When set, `read_workspace` can fall
+/// back to reading from it, and `list_workspace` shows files from both.
+pub fn team_tools(workspace_dir: &Path, reference_dir: Option<&Path>) -> Vec<Box<dyn Tool>> {
+    let ref_dir = reference_dir.map(|p| p.to_path_buf());
     vec![
         Box::new(read_workspace::ReadWorkspaceTool {
             workspace_dir: workspace_dir.to_path_buf(),
+            reference_dir: ref_dir.clone(),
         }),
         Box::new(write_workspace::WriteWorkspaceTool {
             workspace_dir: workspace_dir.to_path_buf(),
         }),
         Box::new(list_workspace::ListWorkspaceTool {
             workspace_dir: workspace_dir.to_path_buf(),
+            reference_dir: ref_dir,
         }),
     ]
 }

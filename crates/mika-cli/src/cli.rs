@@ -85,13 +85,13 @@ impl Commands {
         }
     }
 
-    /// Extract `--team` override (only available on `chat`).
+    /// Extract `--team` override (available on `chat` and `ask`).
     pub fn team_override(&self) -> Option<&str> {
         match self {
             Commands::Chat(args) => args.team.as_deref(),
+            Commands::Ask(args) => args.team.as_deref(),
             // Listed explicitly for compile-time safety on new variants.
             Commands::Setup { .. }
-            | Commands::Ask(_)
             | Commands::Memory(_)
             | Commands::Reminders(_)
             | Commands::Status(_)
@@ -114,6 +114,10 @@ pub struct ChatArgs {
     /// Team to use (launches TUI in team mode)
     #[arg(long, conflicts_with = "agent")]
     pub team: Option<String>,
+
+    /// Continue from a previous team run (requires --team)
+    #[arg(long, requires = "team")]
+    pub run_id: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -125,7 +129,7 @@ pub struct AskArgs {
     pub message: String,
     /// Mark a callback task complete with this message as the result before running the agent.
     /// Used by background processes: mika ask --task-id <uuid> "findings..."
-    #[arg(long)]
+    #[arg(long, conflicts_with = "team")]
     pub task_id: Option<String>,
     /// Link this message to a parent work item (metadata threading).
     /// Used by claude-asked relay: mika ask --parent-task <uuid> "question"
@@ -134,6 +138,12 @@ pub struct AskArgs {
     /// Output format: text (default) or json
     #[arg(long, value_enum, default_value = "text")]
     pub format: OutputFormat,
+    /// Team to run (runs full team cycle, prints deliverable)
+    #[arg(long, conflicts_with = "agent")]
+    pub team: Option<String>,
+    /// Continue from a previous team run (requires --team)
+    #[arg(long, requires = "team")]
+    pub run_id: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -215,13 +225,6 @@ pub enum TeamsCommand {
     Create {
         /// Name for the new team (lowercase, alphanumeric, hyphens)
         name: String,
-    },
-    /// Run a team workflow
-    Run {
-        /// Name of the team to run
-        name: String,
-        /// The goal or task for the team
-        goal: String,
     },
     /// Show team definition and latest run status
     Status {

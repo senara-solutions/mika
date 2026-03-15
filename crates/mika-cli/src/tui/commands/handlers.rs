@@ -767,7 +767,7 @@ fn handle_team(args: &str) -> String {
 
     format!(
         "Team runs are long-running operations. Use the CLI instead: \
-         mika teams run {name} \"{goal}\""
+         mika ask --team {name} \"{goal}\""
     )
 }
 

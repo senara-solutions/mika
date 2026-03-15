@@ -616,7 +616,7 @@ pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
 }
 
 /// Run the TUI in team mode. Each user message is sent as a goal to `run_team()`.
-pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
+pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>) -> Result<()> {
     let team_dir = team::team_dir(global_home, team_name);
 
     let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
@@ -631,6 +631,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
     let worker_home = global_home.to_path_buf();
     let worker_name = team_name.to_string();
     let worker_team_db = team_db.clone();
+    let worker_run_id = run_id.map(|s| s.to_string());
     let team_worker_handle = tokio::spawn(async move {
         let settings = match Settings::load(&worker_home) {
             Ok(s) => s,
@@ -657,6 +658,7 @@ pub async fn run_team(team_name: &str, global_home: &Path) -> Result<()> {
                         &settings,
                         Some(Box::new(callback)),
                         worker_team_db.clone(),
+                        worker_run_id.as_deref(),
                     )
                     .await
                     {

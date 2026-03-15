@@ -255,6 +255,7 @@ The most commonly used commands:
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
 | `mika ask "<message>"`       | Send a message non-interactively (`--format json` for structured output) |
+| `mika ask --team <name> "goal"` | Run a team workflow non-interactively (deliverable to stdout) |
 | `mika ask --task-id <uuid> "<result>"` | Complete a callback task (TUI delivers result to conversation) |
 | `mika tasks`                 | List scheduled tasks for the active agent         |
 | `mika skills`                | List, install, validate, and manage skills          |
@@ -332,6 +333,28 @@ mika ask --agent main --task-id "550e8400-e29b-41d4-a716-446655440000" "Analysis
 This is the entry point for background scripts that perform long-running work
 and need to resume an agent with their findings. The referenced task must have
 `trigger_type=callback` and be in `pending` or `in_progress` status.
+
+**Running a team workflow:**
+
+Use `--team <name>` to run a full team cycle (decompose → execute → review → deliver).
+Progress is printed to stderr; the deliverable is printed to stdout.
+
+```sh
+mika ask --team research "Analyze Q1 customer churn patterns"
+```
+
+Use `--run-id <uuid>` to reference a previous run's workspace and context:
+
+```sh
+mika ask --team research --run-id "550e8400-..." "Refine the analysis with regional data"
+```
+
+With `--format json`, the response includes team run metadata:
+
+```sh
+mika ask --team research --format json "Summarize findings"
+# Output: {"role":"assistant","content":"...","team_run":{"run_id":"...","status":"completed","iterations":2}}
+```
 
 ---
 

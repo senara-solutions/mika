@@ -9,6 +9,8 @@ use super::{Tool, ToolContext, ToolOutput};
 
 pub struct ListWorkspaceTool {
     pub workspace_dir: PathBuf,
+    /// Optional read-only workspace from a previous run (via `--run-id`).
+    pub reference_dir: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -30,24 +32,54 @@ impl Tool for ListWorkspaceTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        if !self.workspace_dir.exists() {
+        let mut current_files = Vec::new();
+        if self.workspace_dir.exists() {
+            collect_files(
+                &self.workspace_dir,
+                &self.workspace_dir,
+                &mut current_files,
+                0,
+            );
+        }
+
+        let mut ref_files = Vec::new();
+        if let Some(ref ref_dir) = self.reference_dir
+            && ref_dir.exists()
+        {
+            collect_files(ref_dir, ref_dir, &mut ref_files, 0);
+        }
+
+        if current_files.is_empty() && ref_files.is_empty() {
             return Ok(ToolOutput::success("Workspace is empty (no files yet)."));
         }
 
-        let mut files = Vec::new();
-        collect_files(&self.workspace_dir, &self.workspace_dir, &mut files, 0);
-
-        if files.is_empty() {
-            return Ok(ToolOutput::success("Workspace is empty (no files yet)."));
-        }
-
-        files.sort_by(|a, b| a.0.cmp(&b.0));
+        current_files.sort_by(|a, b| a.0.cmp(&b.0));
+        ref_files.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut output = String::new();
-        writeln!(output, "Workspace files:").unwrap();
-        for (path, size) in &files {
-            writeln!(output, "  {path} ({size})").unwrap();
+
+        if !current_files.is_empty() {
+            let label = if self.reference_dir.is_some() {
+                "Current run files:"
+            } else {
+                "Workspace files:"
+            };
+            writeln!(output, "{label}").unwrap();
+            for (path, size) in &current_files {
+                writeln!(output, "  {path} ({size})").unwrap();
+            }
         }
+
+        if !ref_files.is_empty() {
+            if !current_files.is_empty() {
+                writeln!(output).unwrap();
+            }
+            writeln!(output, "Previous run files (read-only):").unwrap();
+            for (path, size) in &ref_files {
+                writeln!(output, "  {path} ({size})").unwrap();
+            }
+        }
+
         Ok(ToolOutput::success(output))
     }
 }
@@ -76,6 +108,13 @@ fn collect_files(
     for entry in entries.flatten() {
         if out.len() >= MAX_FILES {
             return;
+        }
+
+        // Skip dotfiles and dotdirs (e.g. .meta/)
+        if let Some(name) = entry.file_name().to_str()
+            && name.starts_with('.')
+        {
+            continue;
         }
 
         let ft = match entry.file_type() {
@@ -128,6 +167,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -147,6 +187,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -167,6 +208,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -200,6 +242,7 @@ mod tests {
 
         let tool = ListWorkspaceTool {
             workspace_dir: workspace,
+            reference_dir: None,
         };
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -233,6 +276,60 @@ mod tests {
         assert!(files.iter().any(|(p, _)| p == "shallow.md"));
         // Deep file beyond MAX_DEPTH should NOT be found
         assert!(!files.iter().any(|(p, _)| p.contains("deep_file.md")));
+    }
+
+    #[tokio::test]
+    async fn test_list_skips_dotfiles_and_dotdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("visible.md"), "visible").unwrap();
+
+        // Create a dotdir with files inside
+        fs::create_dir_all(workspace.join(".meta")).unwrap();
+        fs::write(workspace.join(".meta").join("goal.md"), "hidden goal").unwrap();
+
+        // Create a dotfile at root
+        fs::write(workspace.join(".hidden"), "hidden file").unwrap();
+
+        let tool = ListWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: None,
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let output = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("visible.md"));
+        assert!(!output.content.contains(".meta"));
+        assert!(!output.content.contains("goal.md"));
+        assert!(!output.content.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn test_list_with_reference_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let reference = tmp.path().join("reference");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&reference).unwrap();
+        fs::write(workspace.join("current.md"), "current content").unwrap();
+        fs::write(reference.join("previous.md"), "previous content").unwrap();
+
+        let tool = ListWorkspaceTool {
+            workspace_dir: workspace,
+            reference_dir: Some(reference),
+        };
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let output = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("Current run files:"));
+        assert!(output.content.contains("current.md"));
+        assert!(output.content.contains("Previous run files (read-only):"));
+        assert!(output.content.contains("previous.md"));
     }
 
     #[test]

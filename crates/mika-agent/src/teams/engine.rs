@@ -68,9 +68,11 @@ impl TeamEngine {
         team: &TeamDefinition,
         global_home: &Path,
         settings: &Settings,
+        run_id: &str,
+        reference_workspace: Option<PathBuf>,
     ) -> Result<EngineResources> {
         let team_name = &team.team.name;
-        let workspace_dir = mika_common::team::workspace_dir(global_home, team_name);
+        let workspace_dir = mika_common::team::workspace_run_dir(global_home, team_name, run_id);
 
         // Initialize agent resources
         let mut agents = HashMap::new();
@@ -115,7 +117,7 @@ impl TeamEngine {
 
         // Build tool registry once with base tools + workspace tools (#255)
         let mut tool_registry = tools::default_tools();
-        for tool in tools::team_tools(&workspace_dir) {
+        for tool in tools::team_tools(&workspace_dir, reference_workspace.as_deref()) {
             tool_registry.register(tool);
         }
 
@@ -135,16 +137,24 @@ impl TeamEngine {
         settings: &Settings,
         callback: Option<TeamEventCallback>,
         team_db: AsyncDatabase,
+        reference_run_id: Option<&str>,
     ) -> Result<Self> {
-        let res = Self::init_resources(&team, global_home, settings)?;
+        let run_id = uuid::Uuid::new_v4().to_string();
 
-        // Ensure workspace exists
-        std::fs::create_dir_all(&res.workspace_dir).with_context(|| {
+        // Resolve reference workspace from a previous run
+        let reference_workspace = reference_run_id.map(|ref_id| {
+            mika_common::team::workspace_run_dir(global_home, &team.team.name, ref_id)
+        });
+
+        let res = Self::init_resources(&team, global_home, settings, &run_id, reference_workspace)?;
+
+        // Ensure run-scoped workspace and .meta directory exist
+        std::fs::create_dir_all(res.workspace_dir.join(".meta")).with_context(|| {
             format!("failed to create workspace {}", res.workspace_dir.display())
         })?;
 
         let run = TeamRun {
-            run_id: uuid::Uuid::new_v4().to_string(),
+            run_id,
             team_name: team.team.name.clone(),
             goal: goal.to_string(),
             status: RunStatus::Running,
@@ -179,7 +189,7 @@ impl TeamEngine {
         settings: &Settings,
         team_db: AsyncDatabase,
     ) -> Result<Self> {
-        let res = Self::init_resources(&team, global_home, settings)?;
+        let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
 
         Ok(Self {
             team,
@@ -438,6 +448,10 @@ impl TeamEngine {
         ));
         let deliverable = self.deliver().await?;
         self.run.deliverable = Some(deliverable.clone());
+
+        // Write deliverable metadata
+        self.write_metadata_file("deliverable.md", &deliverable);
+
         self.emit_event(TeamEvent::Deliverable(deliverable));
         Ok(())
     }
@@ -515,12 +529,19 @@ impl TeamEngine {
         self.run.iteration = 1;
         self.transition_phase(TeamPhase::Decompose);
         self.emit_event(TeamEvent::Progress("Decomposing goal...".to_string()));
+
+        // Write goal metadata (once, at first decompose)
+        self.write_metadata_file("goal.md", &self.run.goal);
+
         match self
             .decompose(None, &history, previous_run_summary.as_ref())
             .await?
         {
             DecomposeResult::Tasks(tasks) => {
                 self.run.tasks = tasks;
+                // Write assignments metadata
+                let assignments = self.format_assignments();
+                self.write_metadata_file("assignments.md", &assignments);
             }
             DecomposeResult::Conversational(reply) => {
                 self.run.deliverable = Some(reply.clone());
@@ -573,6 +594,9 @@ impl TeamEngine {
             {
                 DecomposeResult::Tasks(tasks) => {
                     self.run.tasks = tasks;
+                    // Update assignments metadata on re-decompose
+                    let assignments = self.format_assignments();
+                    self.write_metadata_file("assignments.md", &assignments);
                 }
                 DecomposeResult::Conversational(reply) => {
                     self.run.deliverable = Some(reply.clone());
@@ -1137,6 +1161,14 @@ impl TeamEngine {
             iteration: self.run.iteration,
         });
 
+        // Write critic feedback metadata (overwritten each iteration)
+        let verdict = if approved { "APPROVED" } else { "REJECTED" };
+        let meta = format!(
+            "# Critic Feedback (Iteration {})\n\nVerdict: {}\n\n{}\n",
+            self.run.iteration, verdict, feedback
+        );
+        self.write_metadata_file("critic_feedback.md", &meta);
+
         Ok((approved, feedback))
     }
 
@@ -1225,6 +1257,29 @@ impl TeamEngine {
         Ok(crate::agent::run_team_agent(&params)
             .await?
             .unwrap_or_default())
+    }
+
+    /// Format task assignments as markdown for the metadata file.
+    fn format_assignments(&self) -> String {
+        use std::fmt::Write;
+        let mut buf = String::from("# Task Assignments\n\n");
+        for task in &self.run.tasks {
+            let _ = writeln!(buf, "- **{}** ({}): {}", task.agent, task.role, task.task);
+            let _ = writeln!(buf, "  Output: `{}`\n", task.output_file);
+        }
+        buf
+    }
+
+    /// Write a metadata file to the `.meta/` subdirectory of the run workspace.
+    fn write_metadata_file(&self, name: &str, content: &str) {
+        debug_assert!(
+            !name.contains('/') && !name.contains('\\') && !name.contains(".."),
+            "metadata file name must be a simple filename: {name}"
+        );
+        let path = self.workspace_dir.join(".meta").join(name);
+        if let Err(e) = std::fs::write(&path, content) {
+            warn!(file = name, error = %e, "failed to write metadata file");
+        }
     }
 
     /// Log and emit a phase transition event.

@@ -17,6 +17,10 @@ use self::types::{TeamEventCallback, TeamRun};
 ///
 /// Loads the team definition, validates all agents exist, creates the
 /// orchestration engine, and executes the full decompose -> execute -> review -> deliver flow.
+///
+/// If `reference_run_id` is provided, the referenced run's workspace is made available
+/// as read-only context to workspace tools, and the referenced run's summary overrides
+/// the auto-detected "last completed run" in the orchestrator prompt.
 pub async fn run_team(
     team_name: &str,
     goal: &str,
@@ -24,11 +28,20 @@ pub async fn run_team(
     settings: &Settings,
     callback: Option<TeamEventCallback>,
     team_db: AsyncDatabase,
+    reference_run_id: Option<&str>,
 ) -> Result<TeamRun> {
     let def = team::load_team(global_home, team_name)?;
     team::validate_team(global_home, &def)?;
 
-    let engine = TeamEngine::new(def, goal, global_home, settings, callback, team_db)?;
+    let engine = TeamEngine::new(
+        def,
+        goal,
+        global_home,
+        settings,
+        callback,
+        team_db,
+        reference_run_id,
+    )?;
     engine.execute().await
 }
 

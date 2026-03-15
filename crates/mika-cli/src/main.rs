@@ -34,32 +34,44 @@ async fn main() -> Result<()> {
             anyhow::bail!("Team '{team_name}' not found.");
         }
 
-        // Only allow bare `mika --team` or `mika chat --team`
         match cli.command {
+            // `mika --team` or `mika chat --team`
             None | Some(Commands::Chat(_)) => {
-                let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+                let run_id = match cli.command {
+                    Some(Commands::Chat(ref args)) => args.run_id.as_deref(),
+                    _ => None,
+                };
 
-                // Build optional OTel export layer (feature-gated, graceful degradation)
-                let (otel_layer, _telemetry_guard) =
-                    mika_common::config::Settings::load(&global_home)
-                        .ok()
-                        .map(|s| mika_common::telemetry::try_init_otel(&s))
-                        .unwrap_or((None, None));
+                // Validate --run-id format before any filesystem/DB use (defense-in-depth)
+                if let Some(ref_id) = run_id
+                    && uuid::Uuid::parse_str(ref_id).is_err()
+                {
+                    anyhow::bail!(
+                        "Invalid --run-id format. Expected a UUID (e.g., from a previous team run)."
+                    );
+                }
 
-                let log_dir = team::team_dir(&global_home, &team_name).join("logs");
-                let _log_guard = mika_common::logging::init_pretty(
-                    &log_level,
-                    Some(&log_dir),
-                    LogOutput::FileOnly,
-                    otel_layer,
-                );
+                let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
-                return commands::chat::run_team(&team_name, &global_home).await;
+                return commands::chat::run_team(&team_name, &global_home, run_id).await;
+            }
+            // `mika ask --team`
+            Some(Commands::Ask(ref args)) => {
+                let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
+
+                return commands::ask::run_team_ask(
+                    &team_name,
+                    &args.message,
+                    args.run_id.as_deref(),
+                    &args.format,
+                    &global_home,
+                )
+                .await;
             }
             Some(_) => {
                 anyhow::bail!(
-                    "--team cannot be used with subcommands other than 'chat'. \
-                     Use 'mika teams run {team_name} \"goal\"' for non-interactive team runs."
+                    "--team is only supported with 'chat' and 'ask'. \
+                     Use 'mika ask --team {team_name} \"goal\"' for non-interactive team runs."
                 );
             }
         }
@@ -204,6 +216,57 @@ fn resolve_log_level(config_paths: &[std::path::PathBuf]) -> String {
             })
         })
         .unwrap_or_else(|| "warn".to_string())
+}
+
+/// Initialize logging and optional telemetry for team-mode branches (chat and ask).
+///
+/// Returns guards that must be held alive for the duration of the team run.
+/// Dropping the log guard stops file logging; dropping the telemetry guard flushes OTel spans.
+#[cfg(feature = "telemetry")]
+fn init_team_logging(
+    global_home: &std::path::Path,
+    team_name: &str,
+) -> (
+    Option<mika_common::logging::LogGuard>,
+    Option<mika_common::telemetry::TelemetryGuard>,
+) {
+    let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+    let (otel_layer, telemetry_guard) = mika_common::config::Settings::load(global_home)
+        .ok()
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+    let log_dir = team::team_dir(global_home, team_name).join("logs");
+    let log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        Some(&log_dir),
+        LogOutput::FileOnly,
+        otel_layer,
+    );
+    (log_guard, telemetry_guard)
+}
+
+/// Initialize logging and optional telemetry for team-mode branches (chat and ask).
+///
+/// Returns guards that must be held alive for the duration of the team run.
+/// Dropping the log guard stops file logging.
+#[cfg(not(feature = "telemetry"))]
+fn init_team_logging(
+    global_home: &std::path::Path,
+    team_name: &str,
+) -> (Option<mika_common::logging::LogGuard>, Option<()>) {
+    let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+    let (otel_layer, telemetry_guard) = mika_common::config::Settings::load(global_home)
+        .ok()
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+    let log_dir = team::team_dir(global_home, team_name).join("logs");
+    let log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        Some(&log_dir),
+        LogOutput::FileOnly,
+        otel_layer,
+    );
+    (log_guard, telemetry_guard)
 }
 
 /// Extract `log_level` value from a TOML config string.
@@ -405,12 +468,29 @@ mod tests {
         assert!(result.is_err(), "--agent should not be accepted on setup");
     }
 
-    /// --team should NOT be accepted on ask subcommand.
+    /// --team should be accepted on ask subcommand.
     #[test]
-    fn test_team_flag_rejected_on_ask() {
+    fn test_team_flag_accepted_on_ask() {
         let result =
             crate::cli::Cli::try_parse_from(["mika", "ask", "--team", "research", "hello"]);
-        assert!(result.is_err(), "--team should not be accepted on ask");
+        assert!(result.is_ok(), "--team should be accepted on ask");
+    }
+
+    /// --team and --agent should conflict on ask subcommand.
+    #[test]
+    fn test_team_conflicts_with_agent_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "ask", "--team", "research", "--agent", "mika", "hello",
+        ]);
+        assert!(result.is_err(), "--team and --agent should conflict on ask");
+    }
+
+    /// --run-id requires --team on ask subcommand.
+    #[test]
+    fn test_run_id_requires_team_on_ask() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--run-id", "abc-123", "hello"]);
+        assert!(result.is_err(), "--run-id should require --team");
     }
 
     /// clap-markdown output should include the --team flag (on chat subcommand).

@@ -153,9 +153,15 @@ pub fn validate_team(home_dir: &Path, def: &TeamDefinition) -> Result<()> {
     Ok(())
 }
 
-/// Returns the workspace directory for a team: `{team_dir}/workspace/`
-pub fn workspace_dir(home_dir: &Path, team_name: &str) -> PathBuf {
+/// Returns the base workspace directory for a team (contains per-run subdirectories):
+/// `{team_dir}/workspace/`
+pub fn workspace_base_dir(home_dir: &Path, team_name: &str) -> PathBuf {
     team_dir(home_dir, team_name).join("workspace")
+}
+
+/// Returns the run-scoped workspace directory: `{team_dir}/workspace/{run_id}/`
+pub fn workspace_run_dir(home_dir: &Path, team_name: &str, run_id: &str) -> PathBuf {
+    workspace_base_dir(home_dir, team_name).join(run_id)
 }
 
 #[cfg(test)]
@@ -224,11 +230,20 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_dir() {
+    fn test_workspace_base_dir() {
         let home = Path::new("/home/user/.mika");
         assert_eq!(
-            workspace_dir(home, "dev-team"),
+            workspace_base_dir(home, "dev-team"),
             PathBuf::from("/home/user/.mika/teams/dev-team/workspace")
+        );
+    }
+
+    #[test]
+    fn test_workspace_run_dir() {
+        let home = Path::new("/home/user/.mika");
+        assert_eq!(
+            workspace_run_dir(home, "dev-team", "abc-123"),
+            PathBuf::from("/home/user/.mika/teams/dev-team/workspace/abc-123")
         );
     }
 

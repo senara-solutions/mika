@@ -3,8 +3,6 @@ use std::io::{self, Write};
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, format_unix_ts};
-use mika_agent::teams::types::TeamEvent;
-use mika_common::config::Settings;
 use mika_common::home;
 use mika_common::team;
 
@@ -17,7 +15,6 @@ pub async fn run(args: TeamsArgs) -> Result<()> {
     match args.command {
         TeamsCommand::List => list(&global_home),
         TeamsCommand::Create { name } => create(&global_home, &name),
-        TeamsCommand::Run { name, goal } => run_team_cmd(&global_home, &name, &goal).await,
         TeamsCommand::Status { name } => status(&global_home, &name),
         TeamsCommand::Log { name } => log(&global_home, &name),
         TeamsCommand::Delete { name, force } => delete(&global_home, &name, force),
@@ -34,7 +31,7 @@ fn open_container_db(global_home: &std::path::Path) -> Result<Database> {
 }
 
 /// Open the shared container database (async, for team run command).
-fn open_container_db_async(global_home: &std::path::Path) -> Result<AsyncDatabase> {
+pub(crate) fn open_container_db_async(global_home: &std::path::Path) -> Result<AsyncDatabase> {
     let db_path = home::container_db_path(global_home);
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let db = Database::open(&db_path)?;
@@ -159,7 +156,7 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
     // Write team.toml
     let dir = team::team_dir(global_home, &name);
     std::fs::create_dir_all(&dir)?;
-    std::fs::create_dir_all(team::workspace_dir(global_home, &name))?;
+    std::fs::create_dir_all(team::workspace_base_dir(global_home, &name))?;
 
     let toml_content = toml::to_string_pretty(&def)?;
     std::fs::write(dir.join("team.toml"), toml_content)?;
@@ -168,90 +165,7 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
         "\n  Created team '{name}' with {} agents.",
         def.agents.len()
     );
-    println!("  Run it with: mika teams run {name} \"<goal>\"\n");
-    Ok(())
-}
-
-async fn run_team_cmd(global_home: &std::path::Path, name: &str, goal: &str) -> Result<()> {
-    let name = team::normalize_team_name(name);
-
-    if !team::team_exists(global_home, &name) {
-        bail!("Team '{name}' not found.");
-    }
-
-    let settings = Settings::load(global_home)?;
-
-    println!("\n  Running team '{name}'...");
-    println!("  Goal: {goal}\n");
-
-    let callback = |event: TeamEvent| match event {
-        TeamEvent::Progress(msg) => println!("  > {msg}"),
-        TeamEvent::PhaseChanged { phase, iteration } => {
-            println!("  > Phase: {phase} (iteration {iteration})");
-        }
-        TeamEvent::AgentStarted { agent, role } => {
-            println!("  > Agent {agent} ({role}) started");
-        }
-        TeamEvent::AgentCompleted { agent, .. } => println!("  > {agent} completed"),
-        TeamEvent::AgentFailed { agent, error } => {
-            eprintln!("  > {agent} failed: {error}");
-        }
-        TeamEvent::TasksAssigned { tasks, iteration } => {
-            let names: Vec<_> = tasks.iter().map(|t| t.agent.as_str()).collect();
-            println!(
-                "  > Iteration {iteration}: assigned tasks to {}",
-                names.join(", ")
-            );
-        }
-        TeamEvent::CriticReview {
-            approved,
-            feedback,
-            iteration,
-        } => {
-            let verdict = if approved { "approved" } else { "rejected" };
-            println!("  > Critic (iteration {iteration}): {verdict}. {feedback}");
-        }
-        TeamEvent::Deliverable(_) => {} // handled by run result
-        TeamEvent::RunFailed(_) => {}   // handled by run result
-    };
-
-    // Use the shared container DB
-    let team_db = open_container_db_async(global_home)?;
-
-    let run = mika_agent::teams::run_team(
-        &name,
-        goal,
-        global_home,
-        &settings,
-        Some(Box::new(callback)),
-        team_db.clone(),
-    )
-    .await?;
-    team_db.shutdown();
-
-    println!();
-    match &run.status {
-        mika_agent::teams::types::RunStatus::Completed => {
-            println!("  Status: completed");
-        }
-        mika_agent::teams::types::RunStatus::Failed(msg) => {
-            println!("  Status: failed - {msg}");
-        }
-        mika_agent::teams::types::RunStatus::Suspended => {
-            println!("  Status: suspended (waiting for background tasks)");
-        }
-        mika_agent::teams::types::RunStatus::Running => {
-            println!("  Status: running (unexpected)");
-        }
-    }
-
-    if let Some(deliverable) = &run.deliverable {
-        println!("\n  --- Deliverable ---\n");
-        println!("{deliverable}");
-    }
-
-    println!("\n  Run ID: {}", run.run_id);
-
+    println!("  Run it with: mika ask --team {name} \"<goal>\"\n");
     Ok(())
 }
 
