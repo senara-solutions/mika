@@ -659,6 +659,12 @@ Auth: accepts `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN`.
 | `/api/v1/sessions` | GET | Paginated sessions with optional agent_id/channel_type filters |
 | `/api/v1/sessions/{id}` | GET | Session detail |
 | `/api/v1/sessions/{id}/messages` | GET | Paginated messages for a session (base64 images stripped) |
+| `/api/v1/tasks` | GET | Paginated task list with filters (status, trigger_type, action_type, agent_id, team_run_id, source) |
+| `/api/v1/tasks/{id}` | GET | Single task detail (TaskResponse DTO with truncated previews) |
+| `/api/v1/team-runs` | GET | Paginated team run list with filters (team_name, status, from/to timestamps) |
+| `/api/v1/team-runs/{run_id}` | GET | Team run metadata |
+| `/api/v1/team-runs/{run_id}/workspace` | GET | Team workspace entries for a run |
+| `/api/v1/team-runs/{run_id}/summary` | GET | Enriched summary: run + agent results + task statuses + critic feedback |
 | `/api/v1/investigate` | POST | SSE streaming investigation endpoint — lightweight read-only agent loop (max 5 steps, 120s timeout, 64KB body limit) for analyzing agent behavior from the dashboard |
 
 Pagination: `?page=1&per_page=50` (max 200 per page, page clamped to 1–100,000).
@@ -689,6 +695,9 @@ Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
 | `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling, tool call summaries, and investigation side panel (SSE-powered agent analysis) |
 | `/traces` | Traces | Trace ID search |
 | `/traces/:id` | Trace Detail | All events for a trace |
+| `/tasks` | Tasks | Four-section view: Work Items, Team Run Tasks, Standalone Callbacks, Scheduled |
+| `/team-runs` | Team Runs | Filterable team run list with status and team name filters |
+| `/team-runs/:id` | Team Run Detail | Run summary, iteration timeline, workspace entries, cross-links to sessions |
 
 ### Development
 
