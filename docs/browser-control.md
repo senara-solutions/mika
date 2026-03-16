@@ -104,10 +104,13 @@ SSH sessions), pass the `--headless` flag:
 ## 6. Security Considerations
 
 - **Credentials:** Never ask Mika to type passwords into web forms. Passwords
-  entered as tool parameters are stored in conversation history. Authenticate
-  manually in the browser first, or use session cookies.
-- **Local files:** Mika will not navigate to `file://` URLs to avoid exposing
-  local filesystem contents.
+  entered as tool parameters are stored in conversation history. In headed mode,
+  authenticate directly in the visible browser window. In headless mode, use
+  pre-existing session cookies or API tokens.
+- **Local files:** Mika will not navigate to `file://` or `data:` URLs to avoid
+  exposing local filesystem contents.
+- **Internal networks:** Mika avoids navigating to `localhost`, cloud metadata
+  endpoints (`169.254.x.x`), and private IP ranges unless explicitly asked.
 - **Untrusted content:** All page content is treated as untrusted. Web pages
   could contain prompt injection attempts.
 
