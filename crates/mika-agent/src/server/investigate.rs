@@ -136,7 +136,7 @@ impl Tool for QueryTimelineTool {
                 row.created_at,
                 row.event_type,
                 row.event_subtype,
-                row.agent_id,
+                row.agent_id.as_deref().unwrap_or("-"),
                 row.summary.as_deref().unwrap_or("(no summary)"),
             ));
         }

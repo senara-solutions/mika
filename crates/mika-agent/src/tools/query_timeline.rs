@@ -92,7 +92,12 @@ impl Tool for QueryTimelineTool {
             let summary = row.summary.as_deref().unwrap_or("");
             output.push_str(&format!(
                 "- [{}] {} {}/{} agent={} {}\n",
-                ts, trace, row.event_type, row.event_subtype, row.agent_id, summary
+                ts,
+                trace,
+                row.event_type,
+                row.event_subtype,
+                row.agent_id.as_deref().unwrap_or("-"),
+                summary
             ));
         }
 

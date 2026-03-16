@@ -388,7 +388,7 @@ function MessageCard({
 
 // ===== Non-message event card (audit, task) =====
 
-function EventCard({ event }: { event: { event_type: string; event_subtype: string; agent_id: string; session_id: string | null; summary: string | null; created_at: number } }) {
+function EventCard({ event }: { event: { event_type: string; event_subtype: string; agent_id: string | null; session_id: string | null; summary: string | null; created_at: number } }) {
   const badge = eventTypeBadge(event.event_type)
   return (
     <div className={`border rounded-xl p-4 ${eventTypeColor(event.event_type)}`}>
@@ -405,7 +405,7 @@ function EventCard({ event }: { event: { event_type: string; event_subtype: stri
       </div>
       <div className="flex items-center gap-2 mb-2">
         <span className="text-[10px] text-muted/40 uppercase tracking-wider">Agent</span>
-        <span className="text-xs text-heading font-medium">{event.agent_id}</span>
+        <span className="text-xs text-heading font-medium">{event.agent_id ?? '—'}</span>
         {event.session_id && (
           <>
             <span className="text-white/[0.06] mx-1">|</span>

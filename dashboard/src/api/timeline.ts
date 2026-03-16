@@ -4,7 +4,7 @@ import { apiFetch, type PaginatedResponse } from './client.ts'
 export interface TimelineRow {
   trace_id: string | null
   session_id: string | null
-  agent_id: string
+  agent_id: string | null
   event_type: string
   event_subtype: string
   summary: string | null

@@ -366,7 +366,7 @@ pub struct SkillOverride {
 pub struct TimelineRow {
     pub trace_id: Option<String>,
     pub session_id: Option<String>,
-    pub agent_id: String,
+    pub agent_id: Option<String>,
     pub event_type: String,
     pub event_subtype: String,
     pub summary: Option<String>,

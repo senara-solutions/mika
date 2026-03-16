@@ -160,7 +160,7 @@ export default function Timeline() {
                         {formatTimestamp(row.created_at)}
                       </td>
                       <td className="px-4 py-3 text-heading text-xs font-medium">
-                        {row.agent_id}
+                        {row.agent_id ?? '—'}
                       </td>
                       <td className="px-4 py-3">
                         <span
