@@ -1,4 +1,5 @@
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 export default function MarkdownContent({
   content,
@@ -10,6 +11,7 @@ export default function MarkdownContent({
   return (
     <div className={`text-sm text-muted space-y-3 ${className}`}>
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         components={{
           h1: ({ children }) => (
             <h1 className="text-heading text-lg font-semibold mt-4 mb-2">{children}</h1>
