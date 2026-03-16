@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use chrono::Timelike;
-use mika_common::claude::ClaudeClient;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::LlmProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -32,7 +32,7 @@ use super::types::action_type;
 /// `run_skill` is implemented for "heartbeat" and "reflection" triggers.
 pub struct TaskDispatcher {
     pub db: AsyncDatabase,
-    pub claude: ClaudeClient,
+    pub llm: Arc<dyn LlmProvider>,
     pub tools: Arc<ToolRegistry>,
     pub skills: Arc<SkillRegistry>,
     pub message_sender: Option<Arc<dyn MessageSender>>,
@@ -224,7 +224,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
-            claude: &self.claude,
+            llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
             trigger: SilentTrigger::SkillRun {
@@ -302,7 +302,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
-            claude: &self.claude,
+            llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
             trigger: SilentTrigger::Callback {
@@ -484,7 +484,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
-            claude: &self.claude,
+            llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
             trigger: SilentTrigger::Heartbeat,
@@ -615,7 +615,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
-            claude: &self.claude,
+            llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
             trigger: SilentTrigger::Reflection,
@@ -709,7 +709,6 @@ mod tests {
     use crate::async_db::AsyncDatabase;
     use crate::db::{Database, NewTask};
     use crate::messaging::MessageSender;
-    use mika_common::claude::ClaudeClient;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -727,15 +726,9 @@ mod tests {
     }
 
     fn test_dispatcher(db: AsyncDatabase) -> TaskDispatcher {
-        let claude = ClaudeClient::new(
-            Some("sk-test".to_string()),
-            "claude-sonnet-4-6".to_string(),
-            8192,
-        )
-        .unwrap();
         TaskDispatcher {
             db,
-            claude,
+            llm: mika_common::llm::dummy_provider(),
             tools: Arc::new(crate::tools::default_tools()),
             skills: Arc::new(crate::skills::SkillRegistry::empty()),
             message_sender: Some(Arc::new(NoopSender)),

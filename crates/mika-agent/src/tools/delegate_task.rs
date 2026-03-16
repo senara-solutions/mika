@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::agent;
-use mika_common::claude::{ClaudeClient, ToolDefinition};
+use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
 use mika_common::home;
 use serde_json::Value;
@@ -128,17 +128,13 @@ impl Tool for DelegateTaskTool {
         // Build tools: default_tools only — NO management tools (prevents recursion)
         let tool_registry = crate::tools::default_tools();
 
-        // Create a Claude client for the delegate
-        let claude = match ClaudeClient::new(
-            self.settings.anthropic_api_key.clone(),
-            self.settings.claude_model.clone(),
-            self.settings.claude_max_tokens,
-        ) {
-            Ok(c) => c,
+        // Create an LLM provider for the delegate
+        let llm = match self.settings.make_llm_provider() {
+            Ok(p) => p,
             Err(e) => {
                 async_db.shutdown();
                 return Ok(ToolOutput::error(format!(
-                    "Failed to create Claude client: {e}"
+                    "Failed to create LLM provider: {e}"
                 )));
             }
         };
@@ -222,7 +218,7 @@ impl Tool for DelegateTaskTool {
 
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
-            claude: &claude,
+            llm: llm.as_ref(),
             tools: &tool_registry,
             skills: &skills,
             home_dir: &agent_home,

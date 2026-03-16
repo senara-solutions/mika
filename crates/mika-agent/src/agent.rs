@@ -1,7 +1,7 @@
 use anyhow::Result;
-use mika_common::claude::{
-    ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, StopReason,
-    ToolResultBlock, ToolResultBody,
+use mika_common::llm::{
+    LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent,
+    LlmRole, LlmStopReason, LlmToolDefinition, LlmToolResultBlock, LlmToolResultContent, LlmUsage,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -65,7 +65,7 @@ pub fn format_callback_framing(label: &str, task_id: &str, result: &str) -> Stri
 pub struct AgentOutput {
     pub text: Option<String>,
     pub thinking: Option<String>,
-    pub usage: Option<mika_common::claude::Usage>,
+    pub usage: Option<LlmUsage>,
 }
 
 // -- Shared helpers --
@@ -319,7 +319,7 @@ fn format_step_exceeded_fallback(summaries: &[ToolCallSummary]) -> String {
 struct LoopResult {
     text: Option<String>,
     thinking: Option<String>,
-    usage: Option<mika_common::claude::Usage>,
+    usage: Option<LlmUsage>,
     max_steps_exceeded: bool,
     /// Accumulated tool call summaries from all loop steps.
     /// Used by the `max_steps_exceeded` fallback path to persist metadata.
@@ -332,7 +332,7 @@ struct LoopResult {
 /// Remove image blocks from prior tool results to prevent unbounded memory
 /// growth across agent loop turns. Only the most recent user message's images
 /// are preserved (those are the current turn's tool results or user-attached images).
-fn strip_prior_images(messages: &mut [Message]) {
+fn strip_prior_images(messages: &mut [LlmMessage]) {
     // Keep the last user message intact — it contains the current turn's tool results
     let len = messages.len();
     if len < 2 {
@@ -340,32 +340,32 @@ fn strip_prior_images(messages: &mut [Message]) {
     }
     // Process all messages except the last one
     for msg in &mut messages[..len - 1] {
-        if let MessageContent::Blocks(blocks) = &mut msg.content {
+        if let LlmContent::Blocks(blocks) = &mut msg.content {
             for block in blocks.iter_mut() {
                 match block {
                     // Strip images from tool result blocks (Blocks variant only
                     // exists when images were present at construction time)
-                    ContentBlock::ToolResult { content, .. }
-                        if matches!(content, ToolResultBody::Blocks(_)) =>
+                    LlmContentBlock::ToolResult { content, .. }
+                        if matches!(content, LlmToolResultContent::Blocks(_)) =>
                     {
-                        if let ToolResultBody::Blocks(inner_blocks) = content {
+                        if let LlmToolResultContent::Blocks(inner_blocks) = content {
                             let mut combined: String = inner_blocks
                                 .iter()
                                 .filter_map(|b| match b {
-                                    ToolResultBlock::Text { text } => Some(text.as_str()),
+                                    LlmToolResultBlock::Text(text) => Some(text.as_str()),
                                     _ => None,
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             combined.push_str("\n[image(s) from previous turn omitted]");
-                            *content = ToolResultBody::Text(combined);
+                            *content = LlmToolResultContent::Text(combined);
                         }
                     }
                     // Replace user-attached images with placeholder text
-                    ContentBlock::Image { .. } => {
-                        *block = ContentBlock::Text {
-                            text: "[user image from previous turn omitted]".to_string(),
-                        };
+                    LlmContentBlock::Image(_) => {
+                        *block = LlmContentBlock::Text(
+                            "[user image from previous turn omitted]".to_string(),
+                        );
                     }
                     _ => {}
                 }
@@ -380,12 +380,12 @@ fn strip_prior_images(messages: &mut [Message]) {
 /// final text response. Behavior is parameterized by `LoopMode`.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
-    claude: &ClaudeClient,
+    llm: &dyn LlmProvider,
     tools: &ToolRegistry,
     skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
     skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
-    request: &mut MessagesRequest,
+    request: &mut LlmRequest,
     mode: &LoopMode,
     session_id: &str,
     db: &AsyncDatabase,
@@ -425,18 +425,18 @@ async fn run_loop(
             );
         }
 
-        let response = claude.send_message(request).await?;
+        let response = llm.send_message(request).await?;
 
         if mode.is_conversation() {
             last_usage = Some(response.usage.clone());
         }
 
         if mode.is_conversation() && step == 0 {
-            thinking_text = response.thinking();
+            thinking_text = response.reasoning.clone();
         }
 
         match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+            LlmStopReason::EndTurn | LlmStopReason::MaxTokens | LlmStopReason::ContentFilter => {
                 let text = response.text();
 
                 if !text.is_empty() {
@@ -483,13 +483,15 @@ async fn run_loop(
                         label = mode.label(),
                         "injecting follow-up after empty tool response"
                     );
-                    request.messages.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::Blocks(response.content),
+                    request.messages.push(LlmMessage {
+                        role: LlmRole::Assistant,
+                        content: LlmContent::Blocks(mika_common::llm::response_content_to_blocks(
+                            &response.content,
+                        )),
                     });
-                    request.messages.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Text(
+                    request.messages.push(LlmMessage {
+                        role: LlmRole::User,
+                        content: LlmContent::Text(
                             "[Briefly confirm what you just did.]".to_string(),
                         ),
                     });
@@ -513,7 +515,7 @@ async fn run_loop(
                     system_prompt_original_len: system_prompt_len,
                 });
             }
-            StopReason::ToolUse => {
+            LlmStopReason::ToolUse => {
                 tool_use_occurred = true;
                 let step_summaries = process_tool_calls(
                     response.content,
@@ -608,7 +610,7 @@ async fn seed_user_person(db: &AsyncDatabase) -> Result<()> {
 /// Parameters for running the agent loop.
 pub struct AgentParams<'a> {
     pub db: &'a AsyncDatabase,
-    pub claude: &'a ClaudeClient,
+    pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
     pub skills: &'a SkillRegistry,
     pub user_message: &'a str,
@@ -624,7 +626,7 @@ pub struct AgentParams<'a> {
     /// Extended thinking configuration (None = disabled).
     pub thinking: Option<mika_common::claude::ThinkingConfig>,
     /// User-attached images to include with the message.
-    pub user_images: &'a [mika_common::claude::ImageSource],
+    pub user_images: &'a [LlmImage],
     /// Brave Search API key (optional; enables web_search builtin skill).
     pub brave_api_key: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
@@ -692,7 +694,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
             // Runs inline (not spawned) — acceptable latency for CLI mode.
             // Server mode sets skip_compaction=true and spawns compaction outside the agent lock.
             if !params.skip_compaction
-                && let Err(e) = compaction::maybe_compact(params.db, params.claude).await
+                && let Err(e) = compaction::maybe_compact(params.db, params.llm).await
             {
                 warn!(error = %e, "post-turn compaction failed");
             }
@@ -728,7 +730,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
 /// Inner agent loop, separated so the outer function can wrap it in a timeout.
 async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<AgentOutput> {
     let db = params.db;
-    let claude = params.claude;
+    let llm = params.llm;
     let tools = params.tools;
     let session_id = params.session_id;
 
@@ -780,7 +782,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     // If user_images is non-empty, replace the last message with a multi-block version.
     // For assistant messages with tool call metadata, append a summary block so the agent
     // can introspect what tools it used in previous turns.
-    let mut messages: Vec<Message> = history
+    let mut messages: Vec<LlmMessage> = history
         .iter()
         .map(|msg| {
             let content = if msg.role == "assistant" {
@@ -796,38 +798,37 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             } else {
                 msg.content.clone()
             };
-            Message {
+            LlmMessage {
                 // DB stores "tool_result" for callback results and "system" for
-                // context markers (e.g., rewind notices). Claude API expects
-                // these as "user" role messages.
+                // context markers (e.g., rewind notices). LLM providers expect
+                // these as user role messages.
                 role: if msg.role == "tool_result" || msg.role == "system" {
-                    "user".to_string()
+                    LlmRole::User
+                } else if msg.role == "assistant" {
+                    LlmRole::Assistant
                 } else {
-                    msg.role.clone()
+                    LlmRole::User
                 },
-                content: MessageContent::Text(content),
+                content: LlmContent::Text(content),
             }
         })
         .collect();
 
-    // Attach images to the last user message if present
-    if let Some(last) = messages
-        .last_mut()
-        .filter(|m| m.role == "user" && !params.user_images.is_empty())
-    {
+    // Attach images to the last user message if present and provider supports vision
+    if let Some(last) = messages.last_mut().filter(|m| {
+        m.role == LlmRole::User && !params.user_images.is_empty() && llm.supports_vision()
+    }) {
         let text = match &last.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Blocks(_) => String::new(),
+            LlmContent::Text(t) => t.clone(),
+            LlmContent::Blocks(_) => String::new(),
         };
-        let mut blocks: Vec<ContentBlock> = params
+        let mut blocks: Vec<LlmContentBlock> = params
             .user_images
             .iter()
-            .map(|img| ContentBlock::Image {
-                source: img.clone(),
-            })
+            .map(|img| LlmContentBlock::Image(img.clone()))
             .collect();
-        blocks.push(ContentBlock::Text { text });
-        last.content = MessageContent::Blocks(blocks);
+        blocks.push(LlmContentBlock::Text(text));
+        last.content = LlmContent::Blocks(blocks);
     }
 
     let core_memory_edit_count = AtomicU32::new(0);
@@ -851,22 +852,58 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     let max_tokens = if let Some(mika_common::claude::ThinkingConfig::Enabled { budget_tokens }) =
         &params.thinking
     {
-        claude.max_tokens.max(budget_tokens.saturating_add(4096))
+        llm.max_tokens().max(budget_tokens.saturating_add(4096))
     } else {
-        claude.max_tokens
+        llm.max_tokens()
     };
 
-    let mut request = MessagesRequest {
-        model: claude.model.clone(),
+    // Gate features on provider capabilities
+    let tools_for_request = if llm.supports_tool_calling() {
+        let llm_tool_defs: Vec<LlmToolDefinition> =
+            skill_tool_defs.into_iter().map(Into::into).collect();
+        if llm_tool_defs.is_empty() {
+            None
+        } else {
+            Some(llm_tool_defs)
+        }
+    } else {
+        if !skill_tool_defs.is_empty() {
+            warn!(
+                provider = llm.provider_name(),
+                model = llm.model_name(),
+                "provider does not support tool calling; tools will not be available"
+            );
+        }
+        None
+    };
+
+    let thinking = if llm.supports_extended_thinking() {
+        params.thinking.clone()
+    } else {
+        if params.thinking.is_some() {
+            debug!(
+                provider = llm.provider_name(),
+                "provider does not support extended thinking; ignoring thinking config"
+            );
+        }
+        None
+    };
+
+    if !params.user_images.is_empty() && !llm.supports_vision() {
+        warn!(
+            provider = llm.provider_name(),
+            model = llm.model_name(),
+            "provider does not support vision; images will be ignored"
+        );
+    }
+
+    let mut request = LlmRequest {
+        model: llm.model_name().to_string(),
         max_tokens,
         system: Some(system),
         messages,
-        tools: if skill_tool_defs.is_empty() {
-            None
-        } else {
-            Some(skill_tool_defs)
-        },
-        thinking: params.thinking.clone(),
+        tools: tools_for_request,
+        thinking,
     };
 
     let mode = LoopMode::Conversation;
@@ -881,7 +918,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         })
     };
     let result = run_loop(
-        claude,
+        llm,
         tools,
         &skill_tool_map,
         skill_timeout,
@@ -904,16 +941,16 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         }
         request.tools = None;
         request.thinking = None;
-        request.messages.push(Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(
+        request.messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(
                 "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
             ),
         });
 
         let continuation = tokio::time::timeout(
             Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
-            claude.send_message(&request),
+            llm.send_message(&request),
         )
         .await;
 
@@ -978,23 +1015,28 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 /// for persistence in conversation metadata.
 #[allow(clippy::too_many_arguments)]
 async fn process_tool_calls(
-    response_content: Vec<ContentBlock>,
+    response_content: Vec<LlmResponseContent>,
     tools: &ToolRegistry,
     skill_tools: &HashMap<String, &ResolvedSkillTool>,
     skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
-    request: &mut MessagesRequest,
+    request: &mut LlmRequest,
     step: u32,
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
 ) -> Vec<ToolCallSummary> {
-    let mut tool_results = Vec::new();
+    let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
     let mut image_bytes_budget = MAX_IMAGE_BYTES_PER_STEP;
     for block in &response_content {
-        if let ContentBlock::ToolUse { id, name, input } = block {
+        if let LlmResponseContent::ToolCall {
+            id,
+            name,
+            arguments,
+        } = block
+        {
             debug!(tool = %name, "executing tool");
-            let input_summary = truncate_summary(&input.to_string(), INPUT_SUMMARY_MAX);
+            let input_summary = truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
             let dispatch = ToolDispatchCtx {
                 tools,
                 skill_tools,
@@ -1003,7 +1045,7 @@ async fn process_tool_calls(
                 mcp_manager,
                 long_running_ctx,
             };
-            let output = execute_tool(&dispatch, name, input.clone()).await;
+            let output = execute_tool(&dispatch, name, arguments.clone()).await;
             let image_count = output.images.len();
             let output_summary = if image_count > 0 {
                 truncate_summary(
@@ -1024,11 +1066,9 @@ async fn process_tool_calls(
             });
 
             let content = if output.images.is_empty() {
-                ToolResultBody::Text(output.content)
+                LlmToolResultContent::Text(output.content)
             } else {
-                let mut blocks = vec![ToolResultBlock::Text {
-                    text: output.content,
-                }];
+                let mut blocks = vec![LlmToolResultBlock::Text(output.content)];
                 let mut included = 0;
                 for img in output.images {
                     let img_bytes = img.data.len();
@@ -1037,19 +1077,16 @@ async fn process_tool_calls(
                     }
                     image_bytes_budget -= img_bytes;
                     included += 1;
-                    blocks.push(ToolResultBlock::Image {
-                        source: ImageSource {
-                            source_type: "base64".to_string(),
-                            media_type: img.media_type,
-                            data: img.data,
-                        },
-                    });
+                    blocks.push(LlmToolResultBlock::Image(LlmImage {
+                        media_type: img.media_type,
+                        data: img.data,
+                    }));
                 }
                 if included < image_count {
                     let skipped = image_count - included;
-                    blocks.push(ToolResultBlock::Text {
-                        text: format!("[{skipped} image(s) skipped: step memory budget exceeded]"),
-                    });
+                    blocks.push(LlmToolResultBlock::Text(format!(
+                        "[{skipped} image(s) skipped: step memory budget exceeded]"
+                    )));
                     warn!(
                         included,
                         skipped, "image budget exceeded, skipped images in tool result"
@@ -1057,35 +1094,38 @@ async fn process_tool_calls(
                 }
                 if included == 0 {
                     // All images skipped — fall back to text-only
-                    ToolResultBody::Text(
+                    LlmToolResultContent::Text(
                         blocks
                             .into_iter()
                             .filter_map(|b| match b {
-                                ToolResultBlock::Text { text } => Some(text),
+                                LlmToolResultBlock::Text(text) => Some(text),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()
                             .join("\n"),
                     )
                 } else {
-                    ToolResultBody::Blocks(blocks)
+                    LlmToolResultContent::Blocks(blocks)
                 }
             };
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id: id.clone(),
+            tool_results.push(LlmContentBlock::ToolResult {
+                tool_call_id: id.clone(),
                 content,
-                is_error: if output.is_error { Some(true) } else { None },
+                is_error: output.is_error,
             });
         }
     }
 
-    request.messages.push(Message {
-        role: "assistant".to_string(),
-        content: MessageContent::Blocks(response_content),
+    // Convert response content to assistant message blocks
+    let assistant_blocks: Vec<LlmContentBlock> =
+        mika_common::llm::response_content_to_blocks(&response_content);
+    request.messages.push(LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::Blocks(assistant_blocks),
     });
-    request.messages.push(Message {
-        role: "user".to_string(),
-        content: MessageContent::Blocks(tool_results),
+    request.messages.push(LlmMessage {
+        role: LlmRole::Tool,
+        content: LlmContent::Blocks(tool_results),
     });
     summaries
 }
@@ -1205,7 +1245,7 @@ pub enum SilentTrigger {
 /// Parameters for running the silent agent loop (heartbeat/reminders).
 pub struct SilentAgentParams<'a> {
     pub db: &'a AsyncDatabase,
-    pub claude: &'a ClaudeClient,
+    pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
     pub skills: &'a SkillRegistry,
     pub trigger: SilentTrigger,
@@ -1269,7 +1309,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
 
 async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let db = params.db;
-    let claude = params.claude;
+    let llm = params.llm;
     let tools = params.tools;
 
     let ctx = load_agent_context(db, params.home_dir).await?;
@@ -1425,9 +1465,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::SkillRun { skill_name } => format!("[skill_run: {skill_name}]"),
     };
 
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: MessageContent::Text(user_msg),
+    let messages = vec![LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Text(user_msg),
     }];
 
     let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
@@ -1452,22 +1492,24 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         is_callback_turn: false,
     };
 
-    let mut request = MessagesRequest {
-        model: claude.model.clone(),
-        max_tokens: claude.max_tokens,
+    let llm_tool_defs: Vec<LlmToolDefinition> =
+        skill_tool_defs.into_iter().map(Into::into).collect();
+    let mut request = LlmRequest {
+        model: llm.model_name().to_string(),
+        max_tokens: llm.max_tokens(),
         system: Some(system),
         messages,
-        tools: if skill_tool_defs.is_empty() {
+        tools: if llm_tool_defs.is_empty() {
             None
         } else {
-            Some(skill_tool_defs)
+            Some(llm_tool_defs)
         },
         thinking: None,
     };
 
     let mode = LoopMode::Silent;
     run_loop(
-        claude,
+        llm,
         tools,
         &skill_tool_map,
         skill_timeout,
@@ -1530,7 +1572,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
 /// Parameters for running an agent within a team execution context.
 pub struct TeamAgentParams<'a> {
     pub db: &'a AsyncDatabase,
-    pub claude: &'a ClaudeClient,
+    pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
     pub skills: &'a SkillRegistry,
     pub home_dir: &'a Path,
@@ -1596,7 +1638,7 @@ async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<Str
 }
 
 async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
-    let claude = params.claude;
+    let llm = params.llm;
     let tools = params.tools;
 
     let ctx = load_agent_context(params.db, params.home_dir).await?;
@@ -1635,9 +1677,9 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     }
 
     // Single-turn: just the task message, no history
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: MessageContent::Text(params.task_message.to_string()),
+    let messages = vec![LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Text(params.task_message.to_string()),
     }];
 
     let trace_id = params
@@ -1661,22 +1703,24 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         is_callback_turn: false,
     };
 
-    let mut request = MessagesRequest {
-        model: claude.model.clone(),
-        max_tokens: claude.max_tokens,
+    let llm_tool_defs: Vec<LlmToolDefinition> =
+        skill_tool_defs.into_iter().map(Into::into).collect();
+    let mut request = LlmRequest {
+        model: llm.model_name().to_string(),
+        max_tokens: llm.max_tokens(),
         system: Some(system),
         messages,
-        tools: if skill_tool_defs.is_empty() {
+        tools: if llm_tool_defs.is_empty() {
             None
         } else {
-            Some(skill_tool_defs)
+            Some(llm_tool_defs)
         },
         thinking: None,
     };
 
     let mode = LoopMode::Team;
     let result = run_loop(
-        claude,
+        llm,
         tools,
         &skill_tool_map,
         skill_timeout,
@@ -1698,16 +1742,16 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         }
         request.tools = None;
         request.thinking = None;
-        request.messages.push(Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(
+        request.messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(
                 "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
             ),
         });
 
         let continuation = tokio::time::timeout(
             Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
-            claude.send_message(&request),
+            llm.send_message(&request),
         )
         .await;
 
@@ -2443,52 +2487,40 @@ mod tests {
 
     #[test]
     fn test_strip_prior_images_removes_image_blocks() {
-        use mika_common::claude::*;
-
         let mut messages = vec![
             // Prior turn: user message with tool results containing images
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu_1".to_string(),
-                    content: ToolResultBody::Blocks(vec![
-                        ToolResultBlock::Text {
-                            text: "Screenshot taken.".to_string(),
-                        },
-                        ToolResultBlock::Image {
-                            source: ImageSource {
-                                source_type: "base64".to_string(),
-                                media_type: "image/png".to_string(),
-                                data: "iVBORw0KGgo=".to_string(),
-                            },
-                        },
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
+                    tool_call_id: "tu_1".to_string(),
+                    content: LlmToolResultContent::Blocks(vec![
+                        LlmToolResultBlock::Text("Screenshot taken.".to_string()),
+                        LlmToolResultBlock::Image(LlmImage {
+                            media_type: "image/png".to_string(),
+                            data: "iVBORw0KGgo=".to_string(),
+                        }),
                     ]),
-                    is_error: None,
+                    is_error: false,
                 }]),
             },
             // Prior turn: assistant response
-            Message {
-                role: "assistant".to_string(),
-                content: MessageContent::Text("I see a desktop.".to_string()),
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: LlmContent::Text("I see a desktop.".to_string()),
             },
             // Current turn: new tool results (should be preserved)
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu_2".to_string(),
-                    content: ToolResultBody::Blocks(vec![
-                        ToolResultBlock::Text {
-                            text: "New screenshot.".to_string(),
-                        },
-                        ToolResultBlock::Image {
-                            source: ImageSource {
-                                source_type: "base64".to_string(),
-                                media_type: "image/png".to_string(),
-                                data: "iVBORw0KGgo=".to_string(),
-                            },
-                        },
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
+                    tool_call_id: "tu_2".to_string(),
+                    content: LlmToolResultContent::Blocks(vec![
+                        LlmToolResultBlock::Text("New screenshot.".to_string()),
+                        LlmToolResultBlock::Image(LlmImage {
+                            media_type: "image/png".to_string(),
+                            data: "iVBORw0KGgo=".to_string(),
+                        }),
                     ]),
-                    is_error: None,
+                    is_error: false,
                 }]),
             },
         ];
@@ -2496,10 +2528,10 @@ mod tests {
         strip_prior_images(&mut messages);
 
         // First message should have images stripped
-        if let MessageContent::Blocks(blocks) = &messages[0].content {
-            if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
+        if let LlmContent::Blocks(blocks) = &messages[0].content {
+            if let LlmContentBlock::ToolResult { content, .. } = &blocks[0] {
                 assert!(
-                    matches!(content, ToolResultBody::Text(t) if t.contains("Screenshot taken.") && t.contains("omitted"))
+                    matches!(content, LlmToolResultContent::Text(t) if t.contains("Screenshot taken.") && t.contains("omitted"))
                 );
             } else {
                 panic!("expected ToolResult");
@@ -2509,9 +2541,9 @@ mod tests {
         }
 
         // Last message should still have images
-        if let MessageContent::Blocks(blocks) = &messages[2].content {
-            if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
-                assert!(matches!(content, ToolResultBody::Blocks(_)));
+        if let LlmContent::Blocks(blocks) = &messages[2].content {
+            if let LlmContentBlock::ToolResult { content, .. } = &blocks[0] {
+                assert!(matches!(content, LlmToolResultContent::Blocks(_)));
             } else {
                 panic!("expected ToolResult");
             }
@@ -2522,73 +2554,59 @@ mod tests {
 
     #[test]
     fn test_strip_prior_images_preserves_text_only() {
-        use mika_common::claude::*;
-
         let mut messages = vec![
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tu_1".to_string(),
-                    content: ToolResultBody::Text("just text".to_string()),
-                    is_error: None,
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
+                    tool_call_id: "tu_1".to_string(),
+                    content: LlmToolResultContent::Text("just text".to_string()),
+                    is_error: false,
                 }]),
             },
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("current turn".to_string()),
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Text("current turn".to_string()),
             },
         ];
 
         strip_prior_images(&mut messages);
 
         // Text-only tool result should be unchanged
-        if let MessageContent::Blocks(blocks) = &messages[0].content
-            && let ContentBlock::ToolResult { content, .. } = &blocks[0]
+        if let LlmContent::Blocks(blocks) = &messages[0].content
+            && let LlmContentBlock::ToolResult { content, .. } = &blocks[0]
         {
-            assert!(matches!(content, ToolResultBody::Text(t) if t == "just text"));
+            assert!(matches!(content, LlmToolResultContent::Text(t) if t == "just text"));
         }
     }
 
     #[test]
     fn test_strip_prior_images_removes_user_attached_images() {
-        use mika_common::claude::*;
-
         let mut messages = vec![
             // Prior turn: user message with text and an attached image
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(vec![
-                    ContentBlock::Text {
-                        text: "What is in this picture?".to_string(),
-                    },
-                    ContentBlock::Image {
-                        source: ImageSource {
-                            source_type: "base64".to_string(),
-                            media_type: "image/png".to_string(),
-                            data: "iVBORw0KGgo=".to_string(),
-                        },
-                    },
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![
+                    LlmContentBlock::Text("What is in this picture?".to_string()),
+                    LlmContentBlock::Image(LlmImage {
+                        media_type: "image/png".to_string(),
+                        data: "iVBORw0KGgo=".to_string(),
+                    }),
                 ]),
             },
             // Assistant response
-            Message {
-                role: "assistant".to_string(),
-                content: MessageContent::Text("I see a cat.".to_string()),
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: LlmContent::Text("I see a cat.".to_string()),
             },
             // Current turn: user message with a new image (should be preserved)
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(vec![
-                    ContentBlock::Text {
-                        text: "And this one?".to_string(),
-                    },
-                    ContentBlock::Image {
-                        source: ImageSource {
-                            source_type: "base64".to_string(),
-                            media_type: "image/jpeg".to_string(),
-                            data: "/9j/4AAQ=".to_string(),
-                        },
-                    },
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![
+                    LlmContentBlock::Text("And this one?".to_string()),
+                    LlmContentBlock::Image(LlmImage {
+                        media_type: "image/jpeg".to_string(),
+                        data: "/9j/4AAQ=".to_string(),
+                    }),
                 ]),
             },
         ];
@@ -2596,23 +2614,23 @@ mod tests {
         strip_prior_images(&mut messages);
 
         // First message: image should be replaced with placeholder text
-        if let MessageContent::Blocks(blocks) = &messages[0].content {
+        if let LlmContent::Blocks(blocks) = &messages[0].content {
             assert_eq!(blocks.len(), 2);
             assert!(
-                matches!(&blocks[0], ContentBlock::Text { text } if text == "What is in this picture?")
+                matches!(&blocks[0], LlmContentBlock::Text(text) if text == "What is in this picture?")
             );
             assert!(
-                matches!(&blocks[1], ContentBlock::Text { text } if text == "[user image from previous turn omitted]")
+                matches!(&blocks[1], LlmContentBlock::Text(text) if text == "[user image from previous turn omitted]")
             );
         } else {
             panic!("expected Blocks for first message");
         }
 
         // Last message: image should still be intact
-        if let MessageContent::Blocks(blocks) = &messages[2].content {
+        if let LlmContent::Blocks(blocks) = &messages[2].content {
             assert_eq!(blocks.len(), 2);
-            assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
-            assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+            assert!(matches!(&blocks[0], LlmContentBlock::Text(_)));
+            assert!(matches!(&blocks[1], LlmContentBlock::Image(_)));
         } else {
             panic!("expected Blocks for last message");
         }
@@ -2620,29 +2638,25 @@ mod tests {
 
     #[test]
     fn test_strip_prior_images_no_mutation_without_images() {
-        use mika_common::claude::*;
-
         let mut messages = vec![
             // Prior turn: user message with only text blocks
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(vec![ContentBlock::Text {
-                    text: "Hello".to_string(),
-                }]),
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![LlmContentBlock::Text("Hello".to_string())]),
             },
             // Current turn
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("Current".to_string()),
+            LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Text("Current".to_string()),
             },
         ];
 
         strip_prior_images(&mut messages);
 
         // Text-only blocks should remain unchanged
-        if let MessageContent::Blocks(blocks) = &messages[0].content {
+        if let LlmContent::Blocks(blocks) = &messages[0].content {
             assert_eq!(blocks.len(), 1);
-            assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello"));
+            assert!(matches!(&blocks[0], LlmContentBlock::Text(text) if text == "Hello"));
         } else {
             panic!("expected Blocks");
         }

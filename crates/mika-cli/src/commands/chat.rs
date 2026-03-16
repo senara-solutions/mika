@@ -28,8 +28,9 @@ use mika_agent::skills::SkillRegistry;
 use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
 use mika_agent::teams::types::{RunStatus, TeamEvent};
 use mika_agent::tools;
-use mika_common::claude::{ImageSource, ThinkingConfig};
+use mika_common::claude::ThinkingConfig;
 use mika_common::config::Settings;
+use mika_common::llm::LlmImage;
 use mika_common::team;
 use std::path::Path;
 
@@ -116,7 +117,7 @@ async fn spawn_agent_worker(
     // Set up task engine for background tasks (reminders, reflection)
     let dispatcher = Arc::new(TaskDispatcher {
         db: ctx.async_db.clone(),
-        claude: ctx.claude.clone(),
+        llm: ctx.llm.clone(),
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
         home_dir: ctx.home_dir.clone(),
@@ -172,7 +173,8 @@ async fn spawn_agent_worker(
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
 
     let worker_db = ctx.async_db.clone();
-    let mut worker_claude = ctx.claude.clone();
+    let mut worker_llm = ctx.llm.clone();
+    let worker_settings = ctx.settings.clone();
     let worker_tools = tool_registry.clone();
     let mut worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
@@ -209,11 +211,10 @@ async fn spawn_agent_worker(
                         budget_tokens: budget,
                     });
 
-                    // Convert ImageAttachments to ImageSources
-                    let image_sources: Vec<ImageSource> = images
+                    // Convert ImageAttachments to provider-agnostic LlmImage
+                    let image_sources: Vec<LlmImage> = images
                         .into_iter()
-                        .map(|img| ImageSource {
-                            source_type: "base64".to_string(),
+                        .map(|img| LlmImage {
                             media_type: img.media_type,
                             data: img.base64_data,
                         })
@@ -222,7 +223,7 @@ async fn spawn_agent_worker(
                     let is_onboarding = check_onboarding(&worker_db).await;
                     let result = agent::run_agent(&AgentParams {
                         db: &worker_db,
-                        claude: &worker_claude,
+                        llm: worker_llm.as_ref(),
                         tools: &worker_tools,
                         skills: &worker_skills,
                         user_message: &text,
@@ -269,7 +270,7 @@ async fn spawn_agent_worker(
                             content: output.text.unwrap_or_default(),
                             is_error: false,
                             thinking: output.thinking,
-                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens),
+                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens as u32),
                             updated_skills,
                         },
                         Err(e) => AgentResponse {
@@ -312,7 +313,7 @@ async fn spawn_agent_worker(
                     let is_onboarding = check_onboarding(&worker_db).await;
                     let callback_result = agent::run_agent(&AgentParams {
                         db: &worker_db,
-                        claude: &worker_claude,
+                        llm: worker_llm.as_ref(),
                         tools: &worker_tools,
                         skills: &worker_skills,
                         user_message: &framing,
@@ -339,7 +340,7 @@ async fn spawn_agent_worker(
                             content: output.text.unwrap_or_default(),
                             is_error: false,
                             thinking: output.thinking,
-                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens),
+                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens as u32),
                             updated_skills: None,
                         },
                         Err(e) => {
@@ -369,7 +370,12 @@ async fn spawn_agent_worker(
                     }
                 }
                 AgentRequest::SetModel { model } => {
-                    worker_claude.model = model;
+                    // Recreate the LLM provider with the new model
+                    let mut updated_settings = worker_settings.clone();
+                    updated_settings.llm_model = model;
+                    if let Ok(new_llm) = updated_settings.make_llm_provider() {
+                        worker_llm = new_llm;
+                    }
                 }
                 AgentRequest::Quit => break,
             }
@@ -380,7 +386,7 @@ async fn spawn_agent_worker(
         }
     });
 
-    let model = ctx.settings.claude_model.clone();
+    let model = ctx.settings.llm_model.clone();
     let identity_name = identity.name.clone();
 
     let worker = AgentWorker {
@@ -414,7 +420,7 @@ pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
         model,
         identity_name,
         worker._ctx.async_db.clone(),
-        worker._ctx.claude.clone(),
+        worker._ctx.llm.clone(),
         worker._ctx.home_dir.clone(),
         skill_registry,
         agent_name.to_string(),
@@ -546,7 +552,7 @@ pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
                             app.model = new_model.clone();
                             app.identity_name = new_identity;
                             app.db = new_worker._ctx.async_db.clone();
-                            app.claude = new_worker._ctx.claude.clone();
+                            app.llm = new_worker._ctx.llm.clone();
                             app.home_dir = new_worker._ctx.home_dir.clone();
                             app.skills = new_skills;
                             app.agent_name = target_name.clone();

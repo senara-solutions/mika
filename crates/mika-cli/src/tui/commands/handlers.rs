@@ -105,7 +105,7 @@ async fn handle_compact(app: &mut App<'_>) -> String {
     if count <= 50 {
         return format!("Nothing to compact ({count}/50 messages).");
     }
-    match mika_agent::compaction::maybe_compact(&app.db, &app.claude).await {
+    match mika_agent::compaction::maybe_compact(&app.db, app.llm.as_ref()).await {
         Ok(()) => format!("Compacted conversation ({count} messages)."),
         Err(e) => format!("Compaction failed: {e}"),
     }
@@ -416,7 +416,6 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
                 return format!("Already using {display}.");
             }
             app.model = full_id.to_string();
-            app.claude.model = full_id.to_string();
             let _ = app.agent_tx.send(AgentRequest::SetModel {
                 model: full_id.to_string(),
             });
@@ -425,7 +424,7 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             // Persist to config.toml so the choice survives restarts
             let config_path = app.home_dir.join("config.toml");
             if let Err(e) =
-                crate::commands::config::write_config_toml(&config_path, "claude_model", full_id)
+                crate::commands::config::write_config_toml(&config_path, "llm_model", full_id)
             {
                 tracing::warn!(error = %e, "failed to persist model to config.toml");
             }

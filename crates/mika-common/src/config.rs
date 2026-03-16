@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use config::{Config, Environment, File};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -34,16 +36,16 @@ pub struct ConfigKeyInfo {
 pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
     // File backend (config.toml)
     ConfigKeyInfo {
-        key: "claude_model",
+        key: "llm_model",
         backend: ConfigBackend::File,
-        env_var: Some("MIKA_CLAUDE_MODEL"),
+        env_var: Some("MIKA_LLM_MODEL"),
         secret: false,
-        description: "Claude model ID",
+        description: "LLM model ID (supports provider/model prefix)",
     },
     ConfigKeyInfo {
-        key: "claude_max_tokens",
+        key: "llm_max_tokens",
         backend: ConfigBackend::File,
-        env_var: Some("MIKA_CLAUDE_MAX_TOKENS"),
+        env_var: Some("MIKA_LLM_MAX_TOKENS"),
         secret: false,
         description: "Max response tokens",
     },
@@ -82,6 +84,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Embedding vector dimensions",
     },
+    ConfigKeyInfo {
+        key: "llm_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_LLM_BASE_URL"),
+        secret: false,
+        description: "LLM provider base URL override",
+    },
     // Env backend (.env secrets)
     ConfigKeyInfo {
         key: "anthropic_api_key",
@@ -96,6 +105,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         env_var: Some("MIKA_OPENAI_API_KEY"),
         secret: true,
         description: "OpenAI API key (for embeddings)",
+    },
+    ConfigKeyInfo {
+        key: "llm_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_LLM_API_KEY"),
+        secret: true,
+        description: "LLM provider API key override (for non-Anthropic providers)",
     },
     ConfigKeyInfo {
         key: "brave_api_key",
@@ -166,14 +182,16 @@ pub fn lookup_config_key(key: &str) -> Option<&'static ConfigKeyInfo> {
 /// For DB keys, returns None (caller must query the database).
 pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
     match key {
-        "claude_model" => Some(settings.claude_model.clone()),
-        "claude_max_tokens" => Some(settings.claude_max_tokens.to_string()),
+        "llm_model" => Some(settings.llm_model.clone()),
+        "llm_max_tokens" => Some(settings.llm_max_tokens.to_string()),
         "log_level" => Some(settings.log_level.clone()),
         "log_format" => Some(settings.log_format.clone()),
         "server_port" => Some(settings.server_port.to_string()),
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
+        "llm_base_url" => settings.llm_base_url.clone(),
         "anthropic_api_key" => settings.anthropic_api_key.clone(),
+        "llm_api_key" => settings.llm_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
 
@@ -196,13 +214,15 @@ pub struct Settings {
     #[serde(default)]
     pub anthropic_api_key: Option<String>,
 
-    /// Claude model ID (default: claude-sonnet-4-6)
-    #[serde(default = "default_claude_model")]
-    pub claude_model: String,
+    /// LLM model ID (default: claude-sonnet-4-6). Supports provider prefix:
+    /// `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`.
+    /// No prefix defaults to Anthropic.
+    #[serde(default = "default_llm_model")]
+    pub llm_model: String,
 
-    /// Max tokens for Claude responses
+    /// Max tokens for LLM responses
     #[serde(default = "default_max_tokens")]
-    pub claude_max_tokens: u32,
+    pub llm_max_tokens: u32,
 
     /// SQLite database path
     #[serde(default = "default_db_path")]
@@ -267,6 +287,16 @@ pub struct Settings {
     #[serde(default)]
     pub github_repo: Option<String>,
 
+    /// LLM provider base URL override (for OpenAI-compatible providers)
+    #[serde(default)]
+    pub llm_base_url: Option<String>,
+
+    /// LLM provider API key override (for non-Anthropic providers).
+    /// When using `openai/`, `ollama/`, `groq/`, or `openai-compatible/` prefixes,
+    /// this key is used instead of `anthropic_api_key`.
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+
     /// Disable bundled skill re-sync on startup (default: false)
     #[serde(default)]
     pub disable_bundled_skills: bool,
@@ -288,7 +318,7 @@ pub struct Settings {
     pub home_dir: PathBuf,
 }
 
-fn default_claude_model() -> String {
+fn default_llm_model() -> String {
     "claude-sonnet-4-6".to_string()
 }
 
@@ -321,6 +351,34 @@ fn default_embedding_dimensions() -> u32 {
 }
 
 impl Settings {
+    /// Create an LLM provider from the current settings.
+    ///
+    /// Parses `llm_model` as a model spec (e.g. `anthropic/claude-sonnet-4-6`,
+    /// `openai/gpt-4o`, or just `claude-sonnet-4-6` which defaults to Anthropic).
+    /// Applies `llm_base_url` and `llm_api_key` overrides for non-Anthropic providers.
+    /// For Anthropic, uses `anthropic_api_key`.
+    pub fn make_llm_provider(&self) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
+        let spec = crate::llm::ModelSpec::parse(&self.llm_model)?;
+
+        // Resolve API key: for Anthropic, use anthropic_api_key; for others, prefer llm_api_key.
+        // For openai-compatible (user-specified endpoints), do NOT fall back to anthropic_api_key
+        // to prevent accidentally sending the Anthropic key to untrusted third-party endpoints.
+        let api_key = match spec.provider {
+            crate::llm::ProviderKind::Anthropic => self.anthropic_api_key.clone(),
+            crate::llm::ProviderKind::OpenAiCompatible => self.llm_api_key.clone(),
+            _ => self
+                .llm_api_key
+                .clone()
+                .or_else(|| self.anthropic_api_key.clone()),
+        };
+
+        let spec = spec
+            .with_base_url(self.llm_base_url.clone())
+            .with_api_key(api_key);
+
+        crate::llm::create_provider(&spec, self.llm_max_tokens)
+    }
+
     /// Create an EmbeddingClient if OpenAI API key is configured.
     pub fn make_embedding_client(&self) -> Option<crate::embedding::EmbeddingClient> {
         self.openai_api_key
@@ -409,8 +467,8 @@ impl std::fmt::Debug for Settings {
                 "anthropic_api_key",
                 &self.anthropic_api_key.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("claude_model", &self.claude_model)
-            .field("claude_max_tokens", &self.claude_max_tokens)
+            .field("llm_model", &self.llm_model)
+            .field("llm_max_tokens", &self.llm_max_tokens)
             .field("db_path", &self.db_path)
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
@@ -431,6 +489,11 @@ impl std::fmt::Debug for Settings {
             )
             .field("embedding_model", &self.embedding_model)
             .field("embedding_dimensions", &self.embedding_dimensions)
+            .field("llm_base_url", &self.llm_base_url)
+            .field(
+                "llm_api_key",
+                &self.llm_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field(
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -463,7 +526,7 @@ mod tests {
         // Safety: tests set env vars; no production thread reads these.
         unsafe {
             std::env::set_var("MIKA_ANTHROPIC_API_KEY", "test-key");
-            std::env::remove_var("MIKA_CLAUDE_MODEL");
+            std::env::remove_var("MIKA_LLM_MODEL");
             std::env::remove_var("MIKA_DB_PATH");
             std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
         }
@@ -476,8 +539,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::load(tmp.path()).unwrap();
-        assert_eq!(settings.claude_model, "claude-sonnet-4-6");
-        assert_eq!(settings.claude_max_tokens, 4096);
+        assert_eq!(settings.llm_model, "claude-sonnet-4-6");
+        assert_eq!(settings.llm_max_tokens, 4096);
         assert_eq!(settings.log_level, "info");
         // db_path should resolve to home_dir/data/mika.db
         let expected_db = tmp.path().join("data").join("mika.db");
@@ -494,12 +557,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),
-            "claude_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
+            "llm_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
         )
         .unwrap();
 
         let settings = Settings::load(tmp.path()).unwrap();
-        assert_eq!(settings.claude_model, "claude-opus-4-6");
+        assert_eq!(settings.llm_model, "claude-opus-4-6");
         assert_eq!(settings.log_level, "debug");
     }
 
@@ -508,20 +571,20 @@ mod tests {
     fn test_env_overrides_home_config() {
         clean_env();
         // Safety: test-only env var.
-        unsafe { std::env::set_var("MIKA_CLAUDE_MODEL", "claude-haiku-4-5") };
+        unsafe { std::env::set_var("MIKA_LLM_MODEL", "claude-haiku-4-5") };
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),
-            "claude_model = \"claude-opus-4-6\"\n",
+            "llm_model = \"claude-opus-4-6\"\n",
         )
         .unwrap();
 
         let settings = Settings::load(tmp.path()).unwrap();
         // Env var should win over home config
-        assert_eq!(settings.claude_model, "claude-haiku-4-5");
+        assert_eq!(settings.llm_model, "claude-haiku-4-5");
 
-        unsafe { std::env::remove_var("MIKA_CLAUDE_MODEL") };
+        unsafe { std::env::remove_var("MIKA_LLM_MODEL") };
     }
 
     #[test]
@@ -552,20 +615,20 @@ mod tests {
         // Global config sets model
         std::fs::write(
             global_home.join("config.toml"),
-            "claude_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
+            "llm_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
         )
         .unwrap();
 
         // Agent config overrides model but not log_level
         std::fs::write(
             agent_home.join("config.toml"),
-            "claude_model = \"claude-haiku-4-5\"\n",
+            "llm_model = \"claude-haiku-4-5\"\n",
         )
         .unwrap();
 
         let settings = Settings::load_for_agent(&global_home, &agent_home).unwrap();
         // Agent config should override global config
-        assert_eq!(settings.claude_model, "claude-haiku-4-5");
+        assert_eq!(settings.llm_model, "claude-haiku-4-5");
         // log_level should come from global config
         assert_eq!(settings.log_level, "debug");
         // home_dir should be agent_home
@@ -582,13 +645,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),
-            "claude_model = \"claude-opus-4-6\"\n",
+            "llm_model = \"claude-opus-4-6\"\n",
         )
         .unwrap();
 
         let via_load = Settings::load(tmp.path()).unwrap();
         let via_load_for_agent = Settings::load_for_agent(tmp.path(), tmp.path()).unwrap();
-        assert_eq!(via_load.claude_model, via_load_for_agent.claude_model);
+        assert_eq!(via_load.llm_model, via_load_for_agent.llm_model);
         assert_eq!(via_load.home_dir, via_load_for_agent.home_dir);
     }
 

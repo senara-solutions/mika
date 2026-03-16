@@ -564,52 +564,27 @@ async fn check_api_live(global_home: &Path, agent_home: &Path) -> CheckResult {
         }
     };
 
-    let api_key = match settings.anthropic_api_key {
-        Some(ref k) if !k.trim().is_empty() => k.clone(),
-        _ => {
-            return CheckResult {
-                name: "api_live".into(),
-                status: CheckStatus::Fail,
-                message: "API verify — no API key configured".into(),
-                details: None,
-            };
-        }
-    };
-
-    // Make a minimal API call
-    let client = match mika_common::claude::ClaudeClient::new(
-        Some(api_key),
-        settings.claude_model.clone(),
-        1, // max_tokens: 1
-    ) {
-        Ok(c) => c,
+    let provider = match settings.make_llm_provider() {
+        Ok(p) => p,
         Err(e) => {
             return CheckResult {
                 name: "api_live".into(),
                 status: CheckStatus::Fail,
-                message: format!("API verify — client error: {e}"),
+                message: format!("API verify — provider error: {e}"),
                 details: None,
             };
         }
     };
 
-    let request = mika_common::claude::MessagesRequest {
-        model: settings.claude_model.clone(),
-        max_tokens: 1,
-        system: None,
-        messages: vec![mika_common::claude::Message {
-            role: "user".to_string(),
-            content: mika_common::claude::MessageContent::Text("Hi".to_string()),
-        }],
-        tools: None,
-        thinking: None,
-    };
-
-    match client.send_message(&request).await {
-        Ok(_) => CheckResult {
+    match provider.check_health().await {
+        Ok(()) => CheckResult {
             name: "api_live".into(),
             status: CheckStatus::Ok,
-            message: format!("API verify — successful (model: {})", settings.claude_model),
+            message: format!(
+                "API verify — successful (provider: {}, model: {})",
+                provider.provider_name(),
+                provider.model_name()
+            ),
             details: None,
         },
         Err(e) => CheckResult {
@@ -691,7 +666,7 @@ mod tests {
     #[test]
     fn test_check_config_toml_valid() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("config.toml"), "claude_model = \"test\"\n").unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "llm_model = \"test\"\n").unwrap();
         let result = check_config_toml(tmp.path(), tmp.path());
         assert_eq!(result.status, CheckStatus::Ok);
     }

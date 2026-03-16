@@ -1060,7 +1060,23 @@ pub async fn handle_investigate(
 
     // --- Start SSE stream ---
     let (tx, rx) = mpsc::channel::<Result<sse::Event, Infallible>>(64);
-    let claude = state.claude.clone();
+    // Investigation panel uses Anthropic-specific types (its own mini agent loop).
+    // Create a ClaudeClient from settings for investigation use.
+    let claude = match ClaudeClient::new(
+        state.settings.anthropic_api_key.clone(),
+        state.settings.llm_model.clone(),
+        4096,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "failed to create investigation client");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to initialize investigation client"})),
+            )
+                .into_response());
+        }
+    };
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
     let lock = state.investigation_lock.clone();

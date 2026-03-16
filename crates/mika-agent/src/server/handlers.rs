@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use tracing::Instrument;
 use tracing::{debug, error, info, warn};
 
-use mika_common::claude::ImageSource;
+use mika_common::llm::LlmImage;
 
 use crate::agent::{self, AgentParams, check_onboarding};
 use crate::compaction;
@@ -154,14 +154,13 @@ pub async fn handle_message(
 
     let request_id = req.request_id.clone();
 
-    // Convert gateway image payloads to Claude API ImageSource (move, not clone)
-    let user_images: Vec<ImageSource> = req
+    // Convert gateway image payloads to provider-agnostic LlmImage
+    let user_images: Vec<LlmImage> = req
         .images
         .take()
         .unwrap_or_default()
         .into_iter()
-        .map(|img| ImageSource {
-            source_type: "base64".to_string(),
+        .map(|img| LlmImage {
             media_type: img.media_type,
             data: img.data,
         })
@@ -222,7 +221,7 @@ pub async fn handle_message(
 
             let params = AgentParams {
                 db: &a.db,
-                claude: &s.claude,
+                llm: s.llm.as_ref(),
                 tools: &s.tools,
                 skills: &skills,
                 user_message: &req.text,
@@ -268,10 +267,10 @@ pub async fn handle_message(
             // Spawn compaction outside the lock
             drop(_lock);
             let db = a.db.clone();
-            let claude = s.claude.clone();
+            let llm = s.llm.clone();
             tokio::spawn(
                 async move {
-                    if let Err(e) = compaction::maybe_compact(&db, &claude).await {
+                    if let Err(e) = compaction::maybe_compact(&db, llm.as_ref()).await {
                         warn!(error = %e, "post-turn compaction failed");
                     }
                 }

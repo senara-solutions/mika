@@ -170,8 +170,8 @@ pub mod test_helpers {
     pub fn dummy_settings() -> Settings {
         Settings {
             anthropic_api_key: None,
-            claude_model: "claude-sonnet-4-6".to_string(),
-            claude_max_tokens: 4096,
+            llm_model: "claude-sonnet-4-6".to_string(),
+            llm_max_tokens: 4096,
             db_path: PathBuf::from("test.db"),
             log_level: "info".to_string(),
             log_format: "json".to_string(),
@@ -192,6 +192,8 @@ pub mod test_helpers {
             telemetry_enabled: false,
             otlp_endpoint: None,
             otlp_auth_header: None,
+            llm_base_url: None,
+            llm_api_key: None,
         }
     }
 }
