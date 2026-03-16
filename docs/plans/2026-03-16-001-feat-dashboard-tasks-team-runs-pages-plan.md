@@ -1,7 +1,7 @@
 ---
 title: "feat: Add Tasks and Team Runs dashboard pages with cross-linking"
 type: feat
-status: active
+status: completed
 date: 2026-03-16
 origin: docs/brainstorms/2026-03-16-dashboard-tasks-teams-brainstorm.md
 ---
