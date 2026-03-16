@@ -106,6 +106,12 @@ static MCP_SKILL: BundledSkill = skill!("mcp", [
     ("tools.json" => "../templates/skills/mcp/tools.json"),
 ]);
 
+static BROWSER_CONTROL_SKILL: BundledSkill = skill!("browser-control", [
+    ("skill.toml" => "../templates/skills/browser-control/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/browser-control/system_prompt.md"),
+    ("tools.json" => "../templates/skills/browser-control/tools.json"),
+]);
+
 static AGENTS_TEAMS_SKILL: BundledSkill = skill!("agents-teams", [
     ("skill.toml" => "../templates/skills/agents-teams/skill.toml"),
     ("system_prompt.md" => "../templates/skills/agents-teams/system_prompt.md"),
@@ -122,6 +128,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &GOOGLE_WORKSPACE_SKILL,
     &GITHUB_SKILL,
     &MCP_SKILL,
+    &BROWSER_CONTROL_SKILL,
     &AGENTS_TEAMS_SKILL,
 ];
 
