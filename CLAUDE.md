@@ -131,8 +131,9 @@ Optional (dashboard):
 - `MIKA_CORS_ORIGIN` — Allowed origin for dashboard CORS (default: `http://localhost:5173`). Only applies to `/api/v1/*` dashboard routes.
 - `MIKA_DASHBOARD_TOKEN` — Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN` (backwards compatible). `MIKA_INTERNAL_TOKEN` is always accepted on all routes (superuser). Dashboard frontend uses `VITE_MIKA_DASHBOARD_TOKEN` env var.
 
-Optional (log files — logs go to stdout + file when set):
-- `MIKA_SERVER_LOG_FILE` — File path for mika-server log output
+Optional (log format and files):
+- `MIKA_LOG_FORMAT` — Stdout log format for mika-server and mika-gateway: `json` (default) or `pretty` (human-readable, for local dev). CLI always uses pretty.
+- `MIKA_SERVER_LOG_FILE` — File path for mika-server log output (always JSON regardless of `MIKA_LOG_FORMAT`)
 
 Gateway mode (`mika-gateway` binary) additionally requires:
 - `MIKA_DATABASE_URL` — Postgres connection string

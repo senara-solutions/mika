@@ -28,6 +28,10 @@ pub struct GatewaySettings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
+    /// Stdout log format: "json" (default) or "pretty"
+    #[serde(default = "default_log_format")]
+    pub log_format: String,
+
     /// Optional override for agent container base URL (for local E2E testing).
     /// When set, all messages route to this URL instead of internal DNS.
     /// Example: "http://localhost:8080"
@@ -45,6 +49,10 @@ fn default_port() -> u16 {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "json".to_string()
 }
 
 impl GatewaySettings {
@@ -130,6 +138,7 @@ impl std::fmt::Debug for GatewaySettings {
             .field("internal_token", &"[REDACTED]")
             .field("gateway_port", &self.gateway_port)
             .field("log_level", &self.log_level)
+            .field("log_format", &self.log_format)
             .field("agent_base_url", &self.agent_base_url)
             .field("gateway_log_file", &self.gateway_log_file)
             .finish()
@@ -193,6 +202,7 @@ mod tests {
                 internal_token: SecretString::from("b".repeat(64)),
                 gateway_port: 8080,
                 log_level: "info".to_string(),
+                log_format: "json".to_string(),
                 agent_base_url: None,
                 gateway_log_file: None,
             }

@@ -24,12 +24,23 @@ async fn main() -> Result<()> {
 
     let settings = GatewaySettings::load()?;
 
-    // Initialize tracing (JSON structured logging for production, + optional file output)
+    // Initialize tracing (structured logging, + optional file output)
+    let log_format: mika_common::logging::LogFormat = settings
+        .log_format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let is_pretty = log_format == mika_common::logging::LogFormat::Pretty;
     let _log_guard = mika_common::logging::init(
         &settings.log_level,
         settings.gateway_log_file.as_deref().map(Path::new),
+        log_format,
         None::<mika_common::logging::NoopLayer>,
     );
+
+    if is_pretty {
+        mika_common::logging::print_banner("mika-gateway", env!("CARGO_PKG_VERSION"));
+    }
+
     info!(settings = ?settings, "starting mika-gateway");
 
     let ready = Arc::new(AtomicBool::new(false));
@@ -92,6 +103,10 @@ async fn main() -> Result<()> {
     // Mark ready — health endpoint starts returning 200
     ready.store(true, Ordering::Release);
     info!(port, "mika-gateway listening, ready");
+
+    if is_pretty {
+        mika_common::logging::print_ready();
+    }
 
     // Serve with graceful shutdown
     axum::serve(listener, app)

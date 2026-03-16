@@ -236,6 +236,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `claude_max_tokens` | `u32` | `4096` | `MIKA_CLAUDE_MAX_TOKENS` | Maximum tokens for Claude responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
+| `log_format` | `String` | `json` | `MIKA_LOG_FORMAT` | Stdout log format for mika-server and mika-gateway: `json` (default) or `pretty` (human-readable). CLI always uses pretty format regardless of this setting. File output always uses JSON. |
 | `routing_url` | `Option<String>` | None | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery. Required in server mode. |
 | `customer_id` | `Option<String>` | None | `MIKA_CUSTOMER_ID` | Customer identifier. Set per container in hosted deployments. |
 | `server_port` | `u16` | `8080` | `MIKA_SERVER_PORT` | HTTP server listen port. Only used in server mode (`mika-server`). |
@@ -433,6 +434,7 @@ are required for inter-service communication:
 | `MIKA_CLAUDE_MAX_TOKENS` | No | Override max tokens |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level |
+| `MIKA_LOG_FORMAT` | No | Stdout log format: `json` (default) or `pretty` |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
@@ -466,6 +468,7 @@ variables are required:
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for container auth |
 | `MIKA_GATEWAY_PORT` | No | Listen port (default: `8080`) |
 | `MIKA_LOG_LEVEL` | No | Log level (default: `info`) |
+| `MIKA_LOG_FORMAT` | No | Stdout log format: `json` (default) or `pretty` |
 | `MIKA_AGENT_BASE_URL` | No | Override agent container URL for local E2E testing |
 | `MIKA_GATEWAY_LOG_FILE` | No | Optional log file path |
 

@@ -64,7 +64,9 @@ impl TaskEngine {
     /// 1. Expires tasks past their `timeout_at`.
     /// 2. Marks orphaned `in_progress` tasks as `failed` (no process survived restart).
     /// 3. Loads `pending` and `recurring_active` tasks into the `BinaryHeap`.
-    pub async fn startup_recovery(&mut self) -> Result<()> {
+    ///
+    /// Returns `(loaded_count, queue_len)` for the caller to aggregate across agents.
+    pub async fn startup_recovery(&mut self) -> Result<(usize, usize)> {
         let now = chrono::Utc::now().timestamp();
 
         // 1. Expire timed-out tasks
@@ -123,12 +125,12 @@ impl TaskEngine {
             Err(e) => warn!(error = %e, "failed to prune old sessions"),
         }
 
-        info!(
+        debug!(
             loaded = count,
             queue_len = self.queue.len(),
             "task engine startup recovery complete"
         );
-        Ok(())
+        Ok((count, self.queue.len()))
     }
 
     /// Insert a new task into the DB and enqueue it in the BinaryHeap.

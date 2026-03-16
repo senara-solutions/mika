@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use mika_common::agent;
 use mika_common::claude::ClaudeClient;
@@ -232,7 +232,7 @@ async fn init_agent(
         mcp_manager,
     };
 
-    info!(agent = agent_name, home = %agent_home.display(), "initialized agent");
+    debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
 
     Ok(agent_state)
 }
@@ -299,6 +299,11 @@ async fn startup_cleanup(db: AsyncDatabase) {
 /// then binds to the configured port and serves until SIGTERM/Ctrl-C.
 pub async fn run_server(settings: &Settings) -> Result<()> {
     let global_home = &settings.home_dir;
+    let is_pretty = settings.log_format == "pretty";
+
+    if is_pretty {
+        mika_common::logging::print_banner("mika-server", env!("CARGO_PKG_VERSION"));
+    }
 
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
@@ -459,7 +464,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     info!(port, "mika-server listening");
 
     ready.store(true, Ordering::Release);
-    info!("server ready");
 
     // Start task engines for all agents:
     // 1. Register recurring tasks (heartbeat, reflection) if missing
@@ -467,6 +471,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // 3. Spawn 1-second tick loop — collect JoinHandle for shutdown abort
     // 4. Spawn background cleanup (pruning, vacuum, backfill) as a fire-and-forget task
     let mut tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut total_tasks_loaded: usize = 0;
 
     for (name, agent_state) in state.agents.iter() {
         let engine = agent_state.task_engine.clone();
@@ -497,8 +502,13 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // Startup recovery (expire timed-out tasks, mark orphaned in_progress as failed, load heap)
         {
             let mut eng = engine.lock().await;
-            if let Err(e) = eng.startup_recovery().await {
-                warn!(agent = %agent_name, error = %e, "task engine startup recovery failed");
+            match eng.startup_recovery().await {
+                Ok((loaded, _queue_len)) => {
+                    total_tasks_loaded += loaded;
+                }
+                Err(e) => {
+                    warn!(agent = %agent_name, error = %e, "task engine startup recovery failed");
+                }
             }
         }
 
@@ -511,6 +521,19 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
         // Background cleanup runs concurrently — fire and forget
         tokio::spawn(startup_cleanup(db));
+    }
+
+    let agent_count = state.agents.len();
+    info!(
+        total = total_tasks_loaded,
+        agents = agent_count,
+        "tasks loaded"
+    );
+
+    if is_pretty {
+        mika_common::logging::print_ready();
+    } else {
+        info!("server ready");
     }
 
     // Serve with graceful shutdown; abort all tick loops once the signal fires
@@ -625,6 +648,7 @@ mod tests {
                 claude_max_tokens: 4096,
                 db_path: std::path::PathBuf::from("/tmp/mika-test/data/mika.db"),
                 log_level: "info".to_string(),
+                log_format: "json".to_string(),
                 routing_url: None,
                 customer_id: None,
                 server_port: 8080,
