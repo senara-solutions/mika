@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from './client.ts'
+import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface TeamRun {
   id: string
@@ -12,6 +12,7 @@ export interface TeamRun {
   deliverable: string | null
   started_at: number
   ended_at: number | null
+  trace_id: string | null
 }
 
 export interface TeamWorkspaceEntry {
@@ -25,10 +26,55 @@ export interface TeamWorkspaceEntry {
   created_at: number
 }
 
+export interface AgentResultSummary {
+  agent_name: string
+  response_preview: string
+}
+
+export interface TaskStatusSummary {
+  agent_id: string
+  label: string
+  status: string
+  task_id: string
+}
+
+export interface TeamRunSummary {
+  run: TeamRun
+  agent_results: AgentResultSummary[]
+  task_statuses: TaskStatusSummary[]
+  pending_tasks: TaskStatusSummary[]
+  critic_feedback: string | null
+}
+
+export interface TeamRunsFilters {
+  team_name?: string
+  status?: string
+  from?: number
+  to?: number
+  page?: number
+  per_page?: number
+}
+
+export function useTeamRuns(filters: TeamRunsFilters) {
+  return useQuery<PaginatedResponse<TeamRun>>({
+    queryKey: ['team-runs', filters],
+    queryFn: () =>
+      apiFetch('/team-runs', filters as Record<string, string | number | undefined>),
+  })
+}
+
 export function useTeamRun(runId: string | undefined) {
   return useQuery<TeamRun>({
     queryKey: ['team-run', runId],
     queryFn: () => apiFetch(`/team-runs/${runId}`),
+    enabled: !!runId,
+  })
+}
+
+export function useTeamRunSummary(runId: string | undefined) {
+  return useQuery<TeamRunSummary>({
+    queryKey: ['team-run-summary', runId],
+    queryFn: () => apiFetch(`/team-runs/${runId}/summary`),
     enabled: !!runId,
   })
 }

@@ -1,11 +1,13 @@
 import { NavLink } from 'react-router'
-import { Activity, Bot, MessageSquare, Search } from 'lucide-react'
+import { Activity, Bot, MessageSquare, Search, CheckSquare, Users } from 'lucide-react'
 
 const navItems = [
   { to: '/', label: 'Event Timeline', icon: Activity },
   { to: '/agents', label: 'Agents', icon: Bot },
   { to: '/sessions', label: 'Sessions', icon: MessageSquare },
   { to: '/traces', label: 'Traces', icon: Search },
+  { to: '/tasks', label: 'Tasks', icon: CheckSquare },
+  { to: '/team-runs', label: 'Team Runs', icon: Users },
 ]
 
 export default function Sidebar() {

@@ -10,8 +10,8 @@ use tokio::sync::oneshot;
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
     NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats,
-    SkillOverride, Task, TeamRow, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters,
-    TimelineRow,
+    SkillOverride, Task, TaskFilters, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
+    TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -1485,6 +1485,35 @@ impl AsyncDatabase {
     ) -> Result<(Vec<AuditEvent>, u64)> {
         let aid = agent_id.to_owned();
         self.with_db(move |db| db.list_audit_events_paginated_with_count(&aid, limit, offset))
+            .await
+    }
+
+    // -- Dashboard: Tasks --
+
+    pub async fn get_task_unscoped(&self, id: &str) -> Result<Option<Task>> {
+        let id = id.to_owned();
+        self.with_db(move |db| db.get_task_unscoped(&id)).await
+    }
+
+    pub async fn list_tasks_paginated_with_count(
+        &self,
+        filters: TaskFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Task>, u64)> {
+        self.with_db(move |db| db.list_tasks_paginated_with_count(&filters, limit, offset))
+            .await
+    }
+
+    // -- Dashboard: Team Runs --
+
+    pub async fn list_team_runs_paginated_with_count(
+        &self,
+        filters: TeamRunFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<TeamRunRow>, u64)> {
+        self.with_db(move |db| db.list_team_runs_paginated_with_count(&filters, limit, offset))
             .await
     }
 }

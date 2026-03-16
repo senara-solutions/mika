@@ -82,6 +82,9 @@ fn build_router(state: AppState) -> Router {
             "/sessions/{id}/messages",
             get(dashboard::handle_session_messages),
         )
+        .route("/tasks", get(dashboard::handle_tasks_list))
+        .route("/tasks/{task_id}", get(dashboard::handle_task_detail))
+        .route("/team-runs", get(dashboard::handle_team_runs_list))
         .route(
             "/team-runs/{run_id}",
             get(dashboard::handle_team_run_detail),

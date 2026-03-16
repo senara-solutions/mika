@@ -402,6 +402,7 @@ mod tests {
                 deliverable: Some("The team is ready!".to_string()),
                 started_at: 1000,
                 ended_at: Some(1001),
+                trace_id: None,
             },
             TeamRunRow {
                 id: "run-2".to_string(),
@@ -414,6 +415,7 @@ mod tests {
                 deliverable: Some("Done, pinged all agents.".to_string()),
                 started_at: 1002,
                 ended_at: Some(1003),
+                trace_id: None,
             },
         ];
         let ctx = build_orchestrator_context(&def, "", None, &history, None);
@@ -519,6 +521,7 @@ mod tests {
             deliverable: Some("result".to_string()),
             started_at: 1000,
             ended_at: Some(1001),
+            trace_id: None,
         }];
         let ctx = build_orchestrator_context(&def, "", None, &history, None);
         assert!(ctx.contains(&goal));
@@ -540,6 +543,7 @@ mod tests {
                 deliverable: Some("Found 5 key patterns for async Rust".to_string()),
                 started_at: 1741000000,
                 ended_at: Some(1741003600),
+                trace_id: None,
             },
             agent_results: vec![
                 AgentResultSummary {
@@ -590,6 +594,7 @@ mod tests {
                 deliverable: None,
                 started_at: 1741000000,
                 ended_at: Some(1741003600),
+                trace_id: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -625,6 +630,7 @@ mod tests {
                 deliverable: None,
                 started_at: 1741000000,
                 ended_at: Some(1741003600),
+                trace_id: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -658,6 +664,7 @@ mod tests {
                 deliverable: Some("Previous deliverable".to_string()),
                 started_at: 1741000000,
                 ended_at: Some(1741003600),
+                trace_id: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -688,6 +695,7 @@ mod tests {
                 deliverable: Some("Latest deliverable".to_string()),
                 started_at: 1002,
                 ended_at: Some(1003),
+                trace_id: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -707,6 +715,7 @@ mod tests {
                 deliverable: Some("Latest deliverable".to_string()),
                 started_at: 1002,
                 ended_at: Some(1003),
+                trace_id: None,
             },
             TeamRunRow {
                 id: "run-1".to_string(),
@@ -719,6 +728,7 @@ mod tests {
                 deliverable: Some("Older deliverable".to_string()),
                 started_at: 1000,
                 ended_at: Some(1001),
+                trace_id: None,
             },
         ];
 
