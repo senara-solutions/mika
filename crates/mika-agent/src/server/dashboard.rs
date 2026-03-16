@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::db::{CoreMemoryEntry, SessionMessage, TimelineFilters};
+use crate::db::{
+    CoreMemoryEntry, SessionMessage, Task, TaskFilters, TeamRunFilters, TeamRunIdFilter,
+    TimelineFilters,
+};
 
 use super::state::AppState;
 
@@ -449,6 +452,191 @@ pub async fn handle_team_run_summary(
             .into_response(),
         Err(e) => internal_error(e).into_response(),
     }
+}
+
+// ===== Tasks =====
+
+/// Response DTO for tasks — omits sensitive/large fields, truncates previews.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskResponse {
+    pub id: String,
+    pub agent_id: String,
+    pub label: String,
+    pub trigger_type: String,
+    pub action_type: String,
+    pub status: String,
+    pub team_run_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: i64,
+    pub source: Option<String>,
+    pub reference_url: Option<String>,
+    pub cron_expr: Option<String>,
+    pub next_fire_at: Option<i64>,
+    pub fired_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub created_by_session: Option<String>,
+    pub created_trace_id: Option<String>,
+    pub execution_trace_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub action_config_preview: Option<String>,
+    pub result_preview: Option<String>,
+}
+
+fn truncate_preview(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
+
+impl From<Task> for TaskResponse {
+    fn from(t: Task) -> Self {
+        let action_config_preview = if t.action_config.is_empty() {
+            None
+        } else {
+            Some(truncate_preview(&t.action_config, 200))
+        };
+        let result_preview = t.result.as_deref().map(|r| truncate_preview(r, 200));
+
+        Self {
+            id: t.id,
+            agent_id: t.agent_id,
+            label: t.label,
+            trigger_type: t.trigger_type,
+            action_type: t.action_type,
+            status: t.status,
+            team_run_id: t.team_run_id,
+            parent_task_id: t.parent_task_id,
+            depth: t.depth,
+            source: t.source,
+            reference_url: t.reference_url,
+            cron_expr: t.cron_expr,
+            next_fire_at: t.next_fire_at,
+            fired_at: t.fired_at,
+            completed_at: t.completed_at,
+            created_by_session: t.created_by_session,
+            created_trace_id: t.created_trace_id,
+            execution_trace_id: t.execution_trace_id,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+            action_config_preview,
+            result_preview,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TasksQuery {
+    pub status: Option<String>,
+    pub trigger_type: Option<String>,
+    pub action_type: Option<String>,
+    pub agent_id: Option<String>,
+    pub team_run_id: Option<String>,
+    pub source: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// GET /api/v1/tasks — paginated task list with filters.
+pub async fn handle_tasks_list(
+    State(state): State<AppState>,
+    Query(q): Query<TasksQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
+
+    let team_run_id_filter = q.team_run_id.as_deref().map(|v| match v {
+        "null" => TeamRunIdFilter::Null,
+        "notnull" => TeamRunIdFilter::NotNull,
+        specific => TeamRunIdFilter::Specific(specific.to_string()),
+    });
+
+    let filters = TaskFilters {
+        status: q.status,
+        trigger_type: q.trigger_type,
+        action_type: q.action_type,
+        agent_id: q.agent_id,
+        team_run_id_filter,
+        source: q.source,
+    };
+
+    let (data, total) = match state
+        .dashboard_db
+        .list_tasks_paginated_with_count(filters, per_page, offset)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data: data.into_iter().map(TaskResponse::from).collect(),
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+/// GET /api/v1/tasks/:id — single task detail.
+pub async fn handle_task_detail(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_task_unscoped(&task_id).await {
+        Ok(Some(task)) => Json(TaskResponse::from(task)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("task '{}' not found", task_id)})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
+// ===== Team Runs List =====
+
+#[derive(Debug, Deserialize)]
+pub struct TeamRunsQuery {
+    pub team_name: Option<String>,
+    pub status: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// GET /api/v1/team-runs — paginated team run list with filters.
+pub async fn handle_team_runs_list(
+    State(state): State<AppState>,
+    Query(q): Query<TeamRunsQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
+
+    let filters = TeamRunFilters {
+        team_name: q.team_name,
+        status: q.status,
+        from: q.from,
+        to: q.to,
+    };
+
+    let (data, total) = match state
+        .dashboard_db
+        .list_team_runs_paginated_with_count(filters, per_page, offset)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data,
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
 }
 
 #[cfg(test)]

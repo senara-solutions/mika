@@ -275,6 +275,40 @@ pub struct TeamRunRow {
     pub deliverable: Option<String>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
+    pub trace_id: Option<String>,
+}
+
+// ===== Dashboard Filter Types =====
+
+/// Filters for paginated task listing (dashboard API).
+#[derive(Debug, Clone, Default)]
+pub struct TaskFilters {
+    pub status: Option<String>,
+    pub trigger_type: Option<String>,
+    pub action_type: Option<String>,
+    pub agent_id: Option<String>,
+    pub team_run_id_filter: Option<TeamRunIdFilter>,
+    pub source: Option<String>,
+}
+
+/// How to filter tasks by team_run_id.
+#[derive(Debug, Clone)]
+pub enum TeamRunIdFilter {
+    /// team_run_id IS NULL
+    Null,
+    /// team_run_id IS NOT NULL
+    NotNull,
+    /// team_run_id = specific value
+    Specific(String),
+}
+
+/// Filters for paginated team run listing (dashboard API).
+#[derive(Debug, Clone, Default)]
+pub struct TeamRunFilters {
+    pub team_name: Option<String>,
+    pub status: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3646,6 +3680,9 @@ impl Database {
             .map_err(Into::into)
     }
 
+    const TEAM_RUN_COLUMNS: &'static str = "r.id, t.name, r.goal, r.status, r.failure_reason,
+         r.iteration, r.max_iterations, r.deliverable, r.started_at, r.ended_at, r.trace_id";
+
     fn row_to_team_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRunRow> {
         Ok(TeamRunRow {
             id: r.get(0)?,
@@ -3658,17 +3695,18 @@ impl Database {
             deliverable: r.get(7)?,
             started_at: r.get(8)?,
             ended_at: r.get(9)?,
+            trace_id: r.get(10)?,
         })
     }
 
     pub fn load_team_runs(&self, team_name: &str, limit: usize) -> Result<Vec<TeamRunRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
-                     r.max_iterations, r.deliverable, r.started_at, r.ended_at
-              FROM team_runs r JOIN teams t ON r.team_id = t.id
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
               WHERE t.name = ?1
               ORDER BY r.started_at DESC LIMIT ?2",
-        )?;
+            Self::TEAM_RUN_COLUMNS,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![team_name, limit as i64], Self::row_to_team_run)?
             .collect::<rusqlite::Result<_>>()?;
@@ -3693,30 +3731,26 @@ impl Database {
     }
 
     pub fn load_latest_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
+              WHERE t.name = ?1
+              ORDER BY r.started_at DESC LIMIT 1",
+            Self::TEAM_RUN_COLUMNS,
+        );
         self.conn
-            .query_row(
-                "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
-                         r.max_iterations, r.deliverable, r.started_at, r.ended_at
-                  FROM team_runs r JOIN teams t ON r.team_id = t.id
-                  WHERE t.name = ?1
-                  ORDER BY r.started_at DESC LIMIT 1",
-                params![team_name],
-                Self::row_to_team_run,
-            )
+            .query_row(&sql, params![team_name], Self::row_to_team_run)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn load_team_run_by_id(&self, run_id: &str) -> Result<Option<TeamRunRow>> {
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
+              WHERE r.id = ?1",
+            Self::TEAM_RUN_COLUMNS,
+        );
         self.conn
-            .query_row(
-                "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
-                         r.max_iterations, r.deliverable, r.started_at, r.ended_at
-                  FROM team_runs r JOIN teams t ON r.team_id = t.id
-                  WHERE r.id = ?1",
-                params![run_id],
-                Self::row_to_team_run,
-            )
+            .query_row(&sql, params![run_id], Self::row_to_team_run)
             .optional()
             .map_err(Into::into)
     }
@@ -3724,17 +3758,15 @@ impl Database {
     /// Load the most recent team run that is not running or cancelled.
     /// Returns completed, failed, or suspended runs only.
     pub fn get_last_completed_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
+              WHERE t.name = ?1 COLLATE NOCASE
+                AND r.status IN ('completed', 'failed', 'suspended')
+              ORDER BY r.started_at DESC LIMIT 1",
+            Self::TEAM_RUN_COLUMNS,
+        );
         self.conn
-            .query_row(
-                "SELECT r.id, t.name, r.goal, r.status, r.failure_reason, r.iteration,
-                         r.max_iterations, r.deliverable, r.started_at, r.ended_at
-                  FROM team_runs r JOIN teams t ON r.team_id = t.id
-                  WHERE t.name = ?1 COLLATE NOCASE
-                    AND r.status IN ('completed', 'failed', 'suspended')
-                  ORDER BY r.started_at DESC LIMIT 1",
-                params![team_name],
-                Self::row_to_team_run,
-            )
+            .query_row(&sql, params![team_name], Self::row_to_team_run)
             .optional()
             .map_err(Into::into)
     }
@@ -4518,6 +4550,234 @@ impl Database {
         Ok(n as u64)
     }
 
+    // ===== Dashboard: Paginated Task Listing =====
+
+    /// Get a single task by ID without agent_id scoping (for dashboard).
+    pub fn get_task_unscoped(&self, id: &str) -> Result<Option<Task>> {
+        let sql = format!("SELECT {} FROM tasks WHERE id = ?1", Self::TASK_COLUMNS);
+        self.conn
+            .query_row(&sql, params![id], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Count tasks matching filters (dashboard).
+    pub fn count_tasks_filtered(&self, filters: &TaskFilters) -> Result<u64> {
+        let (where_clause, param_values) = Self::build_task_filter_sql(filters);
+        let sql = format!("SELECT COUNT(*) FROM tasks {where_clause}");
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = param_values
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        self.conn
+            .query_row(&sql, params.as_slice(), |r| r.get::<_, i64>(0))
+            .map(|c| c as u64)
+            .map_err(Into::into)
+    }
+
+    /// List tasks matching filters with pagination (dashboard).
+    pub fn list_tasks_paginated(
+        &self,
+        filters: &TaskFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Task>> {
+        let (where_clause, param_values) = Self::build_task_filter_sql(filters);
+        let sql = format!(
+            "SELECT {} FROM tasks {where_clause} ORDER BY updated_at DESC LIMIT ?{} OFFSET ?{}",
+            Self::TASK_COLUMNS,
+            param_values.len() + 1,
+            param_values.len() + 2,
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = param_values
+            .into_iter()
+            .map(|v| -> Box<dyn rusqlite::types::ToSql> { Box::new(v) })
+            .collect();
+        params.push(Box::new(limit as i64));
+        params.push(Box::new(offset as i64));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Build WHERE clause and params for task filters.
+    fn build_task_filter_sql(filters: &TaskFilters) -> (String, Vec<String>) {
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+
+        if let Some(ref status) = filters.status {
+            let values: Vec<&str> = status.split(',').map(|s| s.trim()).collect();
+            let placeholders: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                .collect();
+            conditions.push(format!("status IN ({})", placeholders.join(",")));
+            for v in values {
+                params.push(v.to_string());
+            }
+        }
+
+        if let Some(ref trigger_type) = filters.trigger_type {
+            let values: Vec<&str> = trigger_type.split(',').map(|s| s.trim()).collect();
+            let placeholders: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                .collect();
+            conditions.push(format!("trigger_type IN ({})", placeholders.join(",")));
+            for v in values {
+                params.push(v.to_string());
+            }
+        }
+
+        if let Some(ref action_type) = filters.action_type {
+            let values: Vec<&str> = action_type.split(',').map(|s| s.trim()).collect();
+            let placeholders: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                .collect();
+            conditions.push(format!("action_type IN ({})", placeholders.join(",")));
+            for v in values {
+                params.push(v.to_string());
+            }
+        }
+
+        if let Some(ref agent_id) = filters.agent_id {
+            params.push(agent_id.clone());
+            conditions.push(format!("agent_id = ?{}", params.len()));
+        }
+
+        if let Some(ref filter) = filters.team_run_id_filter {
+            match filter {
+                TeamRunIdFilter::Null => conditions.push("team_run_id IS NULL".to_string()),
+                TeamRunIdFilter::NotNull => conditions.push("team_run_id IS NOT NULL".to_string()),
+                TeamRunIdFilter::Specific(id) => {
+                    params.push(id.clone());
+                    conditions.push(format!("team_run_id = ?{}", params.len()));
+                }
+            }
+        }
+
+        if let Some(ref source) = filters.source {
+            params.push(source.clone());
+            conditions.push(format!("source = ?{}", params.len()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        (where_clause, params)
+    }
+
+    // ===== Dashboard: Paginated Team Run Listing =====
+
+    /// Count team runs matching filters (dashboard).
+    pub fn count_team_runs_filtered(&self, filters: &TeamRunFilters) -> Result<u64> {
+        let (where_clause, param_values) = Self::build_team_run_filter_sql(filters);
+        let sql = format!(
+            "SELECT COUNT(*) FROM team_runs r JOIN teams t ON r.team_id = t.id {where_clause}"
+        );
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = param_values
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        self.conn
+            .query_row(&sql, params.as_slice(), |r| r.get::<_, i64>(0))
+            .map(|c| c as u64)
+            .map_err(Into::into)
+    }
+
+    /// List team runs matching filters with pagination (dashboard).
+    pub fn list_team_runs_paginated(
+        &self,
+        filters: &TeamRunFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TeamRunRow>> {
+        let (where_clause, param_values) = Self::build_team_run_filter_sql(filters);
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
+             {where_clause} ORDER BY r.started_at DESC LIMIT ?{} OFFSET ?{}",
+            Self::TEAM_RUN_COLUMNS,
+            param_values.len() + 1,
+            param_values.len() + 2,
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = param_values
+            .into_iter()
+            .map(|v| -> Box<dyn rusqlite::types::ToSql> { Box::new(v) })
+            .collect();
+        params.push(Box::new(limit as i64));
+        params.push(Box::new(offset as i64));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), Self::row_to_team_run)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Build WHERE clause and params for team run filters.
+    fn build_team_run_filter_sql(filters: &TeamRunFilters) -> (String, Vec<String>) {
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+
+        if let Some(ref team_name) = filters.team_name {
+            params.push(team_name.clone());
+            conditions.push(format!("t.name = ?{}", params.len()));
+        }
+
+        if let Some(ref status) = filters.status {
+            let values: Vec<&str> = status.split(',').map(|s| s.trim()).collect();
+            let placeholders: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                .collect();
+            conditions.push(format!("r.status IN ({})", placeholders.join(",")));
+            for v in values {
+                params.push(v.to_string());
+            }
+        }
+
+        if let Some(from) = filters.from {
+            params.push(from.to_string());
+            conditions.push(format!("r.started_at >= ?{}", params.len()));
+        }
+
+        if let Some(to) = filters.to {
+            params.push(to.to_string());
+            conditions.push(format!("r.started_at <= ?{}", params.len()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        (where_clause, params)
+    }
+
     // ===== Combined data+count queries (single DB round-trip) =====
 
     /// Query timeline data and count in a single closure (avoids TOCTOU race).
@@ -4568,6 +4828,30 @@ impl Database {
     ) -> Result<(Vec<AuditEvent>, u64)> {
         let count = self.count_audit_events(agent_id)?;
         let data = self.list_audit_events_paginated(agent_id, limit, offset)?;
+        Ok((data, count))
+    }
+
+    /// List tasks and count in a single closure.
+    pub fn list_tasks_paginated_with_count(
+        &self,
+        filters: &TaskFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Task>, u64)> {
+        let count = self.count_tasks_filtered(filters)?;
+        let data = self.list_tasks_paginated(filters, limit, offset)?;
+        Ok((data, count))
+    }
+
+    /// List team runs and count in a single closure.
+    pub fn list_team_runs_paginated_with_count(
+        &self,
+        filters: &TeamRunFilters,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<TeamRunRow>, u64)> {
+        let count = self.count_team_runs_filtered(filters)?;
+        let data = self.list_team_runs_paginated(filters, limit, offset)?;
         Ok((data, count))
     }
 }
