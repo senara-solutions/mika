@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod init;
 mod tui;
+mod wizard;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
