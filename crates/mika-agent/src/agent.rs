@@ -814,11 +814,10 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         })
         .collect();
 
-    // Attach images to the last user message if present
-    if let Some(last) = messages
-        .last_mut()
-        .filter(|m| m.role == LlmRole::User && !params.user_images.is_empty())
-    {
+    // Attach images to the last user message if present and provider supports vision
+    if let Some(last) = messages.last_mut().filter(|m| {
+        m.role == LlmRole::User && !params.user_images.is_empty() && llm.supports_vision()
+    }) {
         let text = match &last.content {
             LlmContent::Text(t) => t.clone(),
             LlmContent::Blocks(_) => String::new(),
@@ -858,19 +857,53 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         llm.max_tokens()
     };
 
-    let llm_tool_defs: Vec<LlmToolDefinition> =
-        skill_tool_defs.into_iter().map(Into::into).collect();
+    // Gate features on provider capabilities
+    let tools_for_request = if llm.supports_tool_calling() {
+        let llm_tool_defs: Vec<LlmToolDefinition> =
+            skill_tool_defs.into_iter().map(Into::into).collect();
+        if llm_tool_defs.is_empty() {
+            None
+        } else {
+            Some(llm_tool_defs)
+        }
+    } else {
+        if !skill_tool_defs.is_empty() {
+            warn!(
+                provider = llm.provider_name(),
+                model = llm.model_name(),
+                "provider does not support tool calling; tools will not be available"
+            );
+        }
+        None
+    };
+
+    let thinking = if llm.supports_extended_thinking() {
+        params.thinking.clone()
+    } else {
+        if params.thinking.is_some() {
+            debug!(
+                provider = llm.provider_name(),
+                "provider does not support extended thinking; ignoring thinking config"
+            );
+        }
+        None
+    };
+
+    if !params.user_images.is_empty() && !llm.supports_vision() {
+        warn!(
+            provider = llm.provider_name(),
+            model = llm.model_name(),
+            "provider does not support vision; images will be ignored"
+        );
+    }
+
     let mut request = LlmRequest {
         model: llm.model_name().to_string(),
         max_tokens,
         system: Some(system),
         messages,
-        tools: if llm_tool_defs.is_empty() {
-            None
-        } else {
-            Some(llm_tool_defs)
-        },
-        thinking: params.thinking.clone(),
+        tools: tools_for_request,
+        thinking,
     };
 
     let mode = LoopMode::Conversation;

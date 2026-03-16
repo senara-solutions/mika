@@ -360,9 +360,12 @@ impl Settings {
     pub fn make_llm_provider(&self) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
         let spec = crate::llm::ModelSpec::parse(&self.llm_model)?;
 
-        // Resolve API key: for Anthropic, use anthropic_api_key; for others, prefer llm_api_key
+        // Resolve API key: for Anthropic, use anthropic_api_key; for others, prefer llm_api_key.
+        // For openai-compatible (user-specified endpoints), do NOT fall back to anthropic_api_key
+        // to prevent accidentally sending the Anthropic key to untrusted third-party endpoints.
         let api_key = match spec.provider {
             crate::llm::ProviderKind::Anthropic => self.anthropic_api_key.clone(),
+            crate::llm::ProviderKind::OpenAiCompatible => self.llm_api_key.clone(),
             _ => self
                 .llm_api_key
                 .clone()

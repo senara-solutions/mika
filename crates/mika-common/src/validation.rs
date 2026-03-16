@@ -101,6 +101,19 @@ pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
                 return Err(format!("Invalid {key}: must be between 1 and 4096"));
             }
         }
+        "llm_base_url" => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("{key} cannot be empty"));
+            }
+            let parsed = reqwest::Url::parse(value).map_err(|e| format!("Invalid {key}: {e}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(format!(
+                    "Invalid {key}: must use http or https scheme, got '{}'",
+                    parsed.scheme()
+                ));
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -190,6 +203,17 @@ mod tests {
         assert!(validate_file_key("embedding_dimensions", "512").is_ok());
         assert!(validate_file_key("embedding_dimensions", "0").is_err());
         assert!(validate_file_key("embedding_dimensions", "4097").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_key_llm_base_url() {
+        assert!(validate_file_key("llm_base_url", "http://localhost:11434/v1").is_ok());
+        assert!(validate_file_key("llm_base_url", "https://api.openai.com/v1").is_ok());
+        assert!(validate_file_key("llm_base_url", "").is_err());
+        assert!(validate_file_key("llm_base_url", "  ").is_err());
+        assert!(validate_file_key("llm_base_url", "file:///etc/passwd").is_err());
+        assert!(validate_file_key("llm_base_url", "gopher://evil.com").is_err());
+        assert!(validate_file_key("llm_base_url", "not-a-url").is_err());
     }
 
     #[cfg(unix)]
