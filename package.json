@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "scripts": {
+    "build-site": "cd site && npm ci && npm run build",
+    "build-docs-site": "cd docs-site && npm ci && npm run build"
+  }
+}
