@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, format_unix_ts};
@@ -7,6 +7,7 @@ use mika_common::home;
 use mika_common::team;
 
 use crate::cli::{TeamsArgs, TeamsCommand};
+use crate::wizard;
 
 pub async fn run(args: TeamsArgs) -> Result<()> {
     let global_home = home::resolve_home_dir()?;
@@ -14,7 +15,10 @@ pub async fn run(args: TeamsArgs) -> Result<()> {
 
     match args.command {
         TeamsCommand::List => list(&global_home),
-        TeamsCommand::Create { name } => create(&global_home, &name),
+        TeamsCommand::Create {
+            name,
+            no_interactive,
+        } => create(&global_home, &name, no_interactive),
         TeamsCommand::Status { name } => status(&global_home, &name),
         TeamsCommand::Log { name } => log(&global_home, &name),
         TeamsCommand::Delete { name, force } => delete(&global_home, &name, force),
@@ -61,7 +65,7 @@ fn list(global_home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
+fn create(global_home: &std::path::Path, name: &str, no_interactive: bool) -> Result<()> {
     let name = team::normalize_team_name(name);
     team::validate_team_name(&name)?;
 
@@ -70,87 +74,42 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
     }
 
     let agents = mika_common::agent::list_agents(global_home);
-    if agents.is_empty() {
-        bail!("No agents found. Create agents first with `mika agents create <name>`.");
+    if agents.len() < 2 {
+        bail!(
+            "At least 2 agents are needed to create a team. \
+             Create agents first with `mika agents create <name>`."
+        );
     }
 
-    println!("\n  Creating team '{name}'");
-    println!("  Available agents: {}", agents.join(", "));
+    let interactive = !no_interactive && std::io::stdin().is_terminal();
 
-    // Prompt for orchestrator
-    println!();
-    print!("  Orchestrator agent: ");
-    io::stdout().flush()?;
-    let mut orchestrator = String::new();
-    io::stdin().read_line(&mut orchestrator)?;
-    let orchestrator = orchestrator.trim().to_string();
-    if orchestrator.is_empty() {
-        bail!("Orchestrator name cannot be empty.");
-    }
-    if !mika_common::agent::agent_exists(global_home, &orchestrator) {
-        bail!("Agent '{orchestrator}' not found.");
+    if !interactive {
+        bail!(
+            "Team creation requires an interactive terminal.\n  \
+             Use `mika teams create {name}` in a terminal, \
+             or create teams/{name}/team.toml manually."
+        );
     }
 
-    // Collect team members
+    let result = wizard::run_team_wizard(&name, &agents)?;
+
+    // Build orchestrator agent entry
     let mut team_agents = vec![mika_common::team::TeamAgent {
-        name: orchestrator.clone(),
+        name: result.orchestrator.clone(),
         role: "orchestrator".to_string(),
         mandate: "Decompose goals into tasks and coordinate the team".to_string(),
     }];
-
-    println!("\n  Add team members (empty name to finish):");
-    loop {
-        print!("  Agent name: ");
-        io::stdout().flush()?;
-        let mut agent_name = String::new();
-        io::stdin().read_line(&mut agent_name)?;
-        let agent_name = agent_name.trim().to_string();
-        if agent_name.is_empty() {
-            break;
-        }
-        if !mika_common::agent::agent_exists(global_home, &agent_name) {
-            println!("    Agent '{agent_name}' not found, skipping.");
-            continue;
-        }
-
-        print!("  Role (e.g., specialist, qa, writer): ");
-        io::stdout().flush()?;
-        let mut role = String::new();
-        io::stdin().read_line(&mut role)?;
-        let role = role.trim().to_string();
-
-        print!("  Mandate (what this agent does): ");
-        io::stdout().flush()?;
-        let mut mandate = String::new();
-        io::stdin().read_line(&mut mandate)?;
-        let mandate = mandate.trim().to_string();
-
-        team_agents.push(mika_common::team::TeamAgent {
-            name: agent_name,
-            role: if role.is_empty() {
-                "specialist".to_string()
-            } else {
-                role
-            },
-            mandate: if mandate.is_empty() {
-                "Complete assigned tasks".to_string()
-            } else {
-                mandate
-            },
-        });
-    }
-
-    if team_agents.len() < 2 {
-        bail!("A team needs at least 2 agents (orchestrator + one member).");
-    }
+    team_agents.extend(result.agents);
 
     let def = mika_common::team::TeamDefinition {
         team: mika_common::team::TeamMeta {
             name: name.clone(),
-            orchestrator,
+            orchestrator: result.orchestrator,
         },
         agents: team_agents,
-        flow: mika_common::team::TeamFlow { max_iterations: 3 },
+        flow: mika_common::team::TeamFlow {
+            max_iterations: result.max_iterations,
+        },
     };
 
     // Write team.toml

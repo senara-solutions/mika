@@ -1,10 +1,11 @@
 use anyhow::{Result, bail};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use mika_common::agent::{self, DEFAULT_AGENT};
 use mika_common::home;
 
 use crate::cli::{AgentsArgs, AgentsCommand};
+use crate::wizard;
 
 pub async fn run(args: AgentsArgs) -> Result<()> {
     let global_home = home::resolve_home_dir()?;
@@ -14,7 +15,10 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
 
     match args.command {
         AgentsCommand::List => list(&global_home),
-        AgentsCommand::Create { name } => create(&global_home, &name),
+        AgentsCommand::Create {
+            name,
+            no_interactive,
+        } => create(&global_home, &name, no_interactive).await,
         AgentsCommand::Delete { name, force } => delete(&global_home, &name, force),
         AgentsCommand::Switch { name } => switch(&global_home, &name),
         AgentsCommand::Clone { source, name } => clone(&global_home, &source, &name),
@@ -39,7 +43,7 @@ fn list(global_home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
+async fn create(global_home: &std::path::Path, name: &str, no_interactive: bool) -> Result<()> {
     let name = agent::normalize_agent_name(name);
     agent::validate_agent_name(&name)?;
 
@@ -52,6 +56,33 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
 
     home::bootstrap_agent(global_home, &name)?;
 
+    let interactive = !no_interactive && std::io::stdin().is_terminal();
+
+    if interactive {
+        let result = wizard::run_agent_wizard(&name)?;
+        let agent_home = mika_common::agent::agent_dir(global_home, &name);
+
+        // Overwrite identity.toml with wizard answers
+        let identity = format!(
+            "name = \"{}\"\nemoji = \"{}\"\n",
+            result.display_name, result.emoji
+        );
+        std::fs::write(agent_home.join("identity.toml"), identity)?;
+
+        // Generate or template soul.md if specialization was provided
+        if !result.specialization.is_empty() {
+            let soul = match try_generate_soul(global_home, &name, &result).await {
+                Some(generated) => generated,
+                None => wizard::template_soul_md(
+                    &result.display_name,
+                    &result.specialization,
+                    &result.communication_style,
+                ),
+            };
+            std::fs::write(agent_home.join("soul.md"), soul)?;
+        }
+    }
+
     // Always seed on explicit creation, regardless of disable_bundled_skills config
     let agent_home = mika_common::agent::agent_dir(global_home, &name);
     mika_agent::startup::seed_bundled_skills_if_needed(&agent_home, false);
@@ -59,6 +90,32 @@ fn create(global_home: &std::path::Path, name: &str) -> Result<()> {
     println!("\n  Created agent '{name}'.");
     println!("  Use `mika --agent {name}` or `mika agents switch {name}` to use it.\n");
     Ok(())
+}
+
+/// Try to generate soul.md via LLM. Returns None on any failure.
+async fn try_generate_soul(
+    global_home: &std::path::Path,
+    name: &str,
+    result: &wizard::AgentWizardResult,
+) -> Option<String> {
+    let settings = mika_common::config::Settings::load(global_home).ok()?;
+    let provider = settings.make_llm_provider().ok()?;
+
+    println!("  Generating personality...");
+    match wizard::generate_soul_md(
+        provider.as_ref(),
+        name,
+        &result.specialization,
+        &result.communication_style,
+    )
+    .await
+    {
+        Some(soul) => Some(soul),
+        None => {
+            println!("  Could not generate personality, using template.");
+            None
+        }
+    }
 }
 
 fn delete(global_home: &std::path::Path, name: &str, force: bool) -> Result<()> {

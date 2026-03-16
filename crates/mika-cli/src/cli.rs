@@ -188,6 +188,9 @@ pub enum AgentsCommand {
     Create {
         /// Name for the new agent (lowercase, alphanumeric, hyphens)
         name: String,
+        /// Skip interactive wizard (use defaults)
+        #[arg(long)]
+        no_interactive: bool,
     },
     /// Delete an agent (cannot delete "mika")
     Delete {
@@ -225,6 +228,9 @@ pub enum TeamsCommand {
     Create {
         /// Name for the new team (lowercase, alphanumeric, hyphens)
         name: String,
+        /// Skip interactive wizard (requires team.toml to be created manually)
+        #[arg(long)]
+        no_interactive: bool,
     },
     /// Show team definition and latest run status
     Status {
