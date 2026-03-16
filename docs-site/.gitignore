@@ -4,3 +4,4 @@ dist/
 
 # Content is generated at build time from docs/
 src/content/docs/
+!src/content/docs/index.mdx
