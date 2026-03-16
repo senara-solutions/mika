@@ -1,3 +1,8 @@
+---
+title: Slash Commands
+description: TUI slash commands for navigation, memory, and agent control
+---
+
 # Slash Commands Reference
 
 ## Overview

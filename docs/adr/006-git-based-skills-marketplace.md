@@ -1,3 +1,7 @@
+---
+title: "ADR-006: Git-Based Skills Marketplace"
+---
+
 # ADR-006: Git-Based Skills Marketplace
 
 **Date:** 2026-03-02

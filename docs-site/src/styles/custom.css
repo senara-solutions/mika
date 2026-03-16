@@ -1,0 +1,21 @@
+/* Mika documentation site — dark theme customization */
+
+:root {
+  /* Accent colors — purple/indigo to match Mika branding */
+  --sl-color-accent-low: #1e1b4b;
+  --sl-color-accent: #7c3aed;
+  --sl-color-accent-high: #c4b5fd;
+
+  /* Typography */
+  --sl-font: "Inter", system-ui, -apple-system, sans-serif;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  /* Layout */
+  --sl-content-width: 75ch;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #2e1065;
+  --sl-color-accent: #8b5cf6;
+  --sl-color-accent-high: #ddd6fe;
+}

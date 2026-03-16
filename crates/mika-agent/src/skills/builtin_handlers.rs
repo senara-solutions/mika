@@ -74,6 +74,34 @@ fn truncate_output(output: &mut ToolOutput) {
     }
 }
 
+/// Strip YAML frontmatter from a markdown document.
+///
+/// If the content starts with `---\n`, everything up to and including the next
+/// `---\n` (or `---\r\n`) line is removed. Leading whitespace after the
+/// frontmatter block is also trimmed.
+fn strip_frontmatter(content: &str) -> &str {
+    let after_open = if let Some(rest) = content.strip_prefix("---\r\n") {
+        rest
+    } else if let Some(rest) = content.strip_prefix("---\n") {
+        rest
+    } else {
+        return content;
+    };
+    // Find the closing `---` on its own line
+    if let Some(rest) = after_open.strip_prefix("---\n") {
+        rest.trim_start()
+    } else if let Some(rest) = after_open.strip_prefix("---\r\n") {
+        rest.trim_start()
+    } else if let Some(close) = after_open.find("\n---\n") {
+        after_open[close + 5..].trim_start()
+    } else if let Some(close) = after_open.find("\n---\r\n") {
+        after_open[close + 6..].trim_start()
+    } else {
+        // No closing delimiter — return content unchanged
+        content
+    }
+}
+
 /// Unified documentation handler — returns docs for any supported topic.
 ///
 /// Input: `{"topic": "architecture" | "api-spec" | "cli-reference" | "configuration" | ...}`
@@ -83,12 +111,12 @@ fn truncate_output(output: &mut ToolOutput) {
 async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
     let topic = input.get("topic").and_then(|v| v.as_str()).unwrap_or("");
     match topic {
-        "architecture" => ToolOutput::success(ARCHITECTURE_OVERVIEW.to_string()),
+        "architecture" => ToolOutput::success(strip_frontmatter(ARCHITECTURE_OVERVIEW).to_string()),
         "api-spec" => ToolOutput::success(AGENT_API_SPEC.to_string()),
         "cli-reference" => {
             let path = ctx.home_dir.join("cli-reference.md");
             match tokio::fs::read_to_string(&path).await {
-                Ok(content) => ToolOutput::success(content),
+                Ok(content) => ToolOutput::success(strip_frontmatter(&content).to_string()),
                 Err(e) => {
                     tracing::warn!(error = %e, path = %path.display(), "failed to read CLI reference");
                     ToolOutput::error(
@@ -98,12 +126,18 @@ async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> 
                 }
             }
         }
-        "configuration" => ToolOutput::success(DOC_CONFIGURATION.to_string()),
-        "deployment" => ToolOutput::success(DOC_DEPLOYMENT.to_string()),
-        "getting-started" => ToolOutput::success(DOC_GETTING_STARTED.to_string()),
-        "runtime-structure" => ToolOutput::success(DOC_RUNTIME_STRUCTURE.to_string()),
-        "skills" => ToolOutput::success(DOC_SKILLS.to_string()),
-        "slash-commands" => ToolOutput::success(DOC_SLASH_COMMANDS.to_string()),
+        "configuration" => ToolOutput::success(strip_frontmatter(DOC_CONFIGURATION).to_string()),
+        "deployment" => ToolOutput::success(strip_frontmatter(DOC_DEPLOYMENT).to_string()),
+        "getting-started" => {
+            ToolOutput::success(strip_frontmatter(DOC_GETTING_STARTED).to_string())
+        }
+        "runtime-structure" => {
+            ToolOutput::success(strip_frontmatter(DOC_RUNTIME_STRUCTURE).to_string())
+        }
+        "skills" => ToolOutput::success(strip_frontmatter(DOC_SKILLS).to_string()),
+        "slash-commands" => {
+            ToolOutput::success(strip_frontmatter(DOC_SLASH_COMMANDS).to_string())
+        }
         _ => ToolOutput::error(
             "Invalid topic. Use one of: architecture, api-spec, cli-reference, configuration, deployment, getting-started, runtime-structure, skills, slash-commands."
                 .to_string(),
@@ -923,6 +957,30 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.content.contains("Do not include --repo"));
+    }
+
+    #[test]
+    fn test_strip_frontmatter_with_frontmatter() {
+        let content = "---\ntitle: Test\ndescription: A test doc\n---\n\n# Hello World\n";
+        assert_eq!(strip_frontmatter(content), "# Hello World\n");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_without_frontmatter() {
+        let content = "# Hello World\n\nSome content here.";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_no_closing_delimiter() {
+        let content = "---\ntitle: Test\nno closing delimiter";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_empty_frontmatter() {
+        let content = "---\n---\n\n# Doc\n";
+        assert_eq!(strip_frontmatter(content), "# Doc\n");
     }
 
     /// Verify crate-local fallback copies match workspace-root docs.

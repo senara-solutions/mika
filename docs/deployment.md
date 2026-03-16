@@ -1,3 +1,8 @@
+---
+title: Deployment
+description: Operator guide for deploying Mika in hosted mode with Docker
+---
+
 # Mika Deployment Guide
 
 Operator-focused documentation for deploying Mika in hosted mode.

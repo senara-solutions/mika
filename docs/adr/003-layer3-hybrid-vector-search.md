@@ -1,3 +1,7 @@
+---
+title: "ADR-003: Hybrid Vector Search"
+---
+
 # ADR-003: Layer 3 Hybrid Vector Search with FTS5 and sqlite-vec
 
 **Date:** 2026-02-25
