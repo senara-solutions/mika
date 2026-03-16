@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7](https://github.com/senara-solutions/mika/releases/tag/v0.1.7) — 2026-03-16
+
+### Added
+
+- [#71] refactor all consumers to use LlmProvider trait
+- add LlmProvider trait and multi-provider abstractions
+- custom compact log formatter with startup banner for pretty mode
+- strip file paths, line numbers, and targets from pretty log output
+- add MIKA_LOG_FORMAT env var for human-readable server/gateway logs
+- team workspace restructure and CLI unification
+- *(skill)* add Google Workspace builtin skill via gws CLI ([#75](https://github.com/senara-solutions/mika/pull/75))
+- add public documentation site with Starlight
+- *(server)* add paginated tasks and team-runs dashboard API endpoints
+- strengthen trace_id structural linkage (schema v11)
+- delegated agent Telegram delivery, agent identification, and reply routing
+- [#178] dashboard markdown rendering & session lifecycle fixes
+- add --format text|json flag to mika ask
+
+### Changed
+
+- [#71] rename claude_model/claude_max_tokens to llm_model/llm_max_tokens
+- remove MIKA_GOOGLE_TOKEN, use native gws keyring auth
+- address review findings — docs, dispatcher helper, comments
+- resolve code review findings (670-673)
+- remove redundant telegram_chat_id from TeamAgentParams
+- remove builtin calendar skill
+- extract shared CLI helpers and fix flag=value bypass
+
+### Documentation
+
+- add pre-1.0 breaking changes policy
+- sync crate-local docs for v0.1.7 publish
+- update documentation for team workspace restructure
+
+### Fixed
+
+- [#71] address review findings for multi-provider LLM
+- [#71] address review findings for multi-provider LLM
+- address code review findings for team workspace restructure
+- address review findings — UTF-8 safe truncation, DRY filter builders
+- observability polish — request_id linkage, session cleanup ([#162](https://github.com/senara-solutions/mika/pull/162))
+- inject referenced run context into orchestrator prompt via --run-id
+- wire trace_id through callbacks and team resume, add team_workspace to unified_timeline
+- pass agent_name in CLI sender and auto-relay delegate text responses
+- add diagnostic tracing to delegate send_message flow and improve tool description
+- pass explicit chat_id to delegate agent sender for correct Telegram prefixing
+- [#178] address review findings — session lifecycle and iteration numbering
+- plumb --run-id through chat --team path
+- suppress stderr logs for mika ask command
+
 ## [0.1.6](https://github.com/senara-solutions/mika/releases/tag/v0.1.6) — 2026-03-13
 
 ### Added
