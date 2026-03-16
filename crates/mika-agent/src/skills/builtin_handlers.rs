@@ -1000,6 +1000,7 @@ mod tests {
 
         let files = [
             "architecture.md",
+            "browser-control.md",
             "configuration.md",
             "deployment.md",
             "getting-started.md",

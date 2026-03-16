@@ -7,7 +7,7 @@ description: Set up browser automation via Playwright MCP
 
 Mika can automate a web browser -- navigating pages, clicking elements, filling
 forms, taking screenshots, and extracting content. This is powered by
-[Playwright MCP](https://github.com/anthropics/mcp-playwright), an MCP server
+[Playwright MCP](https://github.com/microsoft/playwright-mcp), an MCP server
 that exposes browser automation tools.
 
 ---
