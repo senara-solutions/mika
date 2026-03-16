@@ -194,7 +194,14 @@ pub async fn run(
         is_callback_turn: false,
         trace_id: None,
     })
-    .await?;
+    .await;
+
+    // End the session regardless of agent result so the dashboard shows duration
+    if let Err(e) = ctx.async_db.end_session(&session_id).await {
+        tracing::warn!(error = %e, "failed to end session");
+    }
+
+    let output = output?;
 
     match format {
         OutputFormat::Text => match output.text {
@@ -213,11 +220,6 @@ pub async fn run(
     // Gracefully shut down MCP server connections
     if let Some(mcp) = mcp_manager {
         mcp.shutdown().await;
-    }
-
-    // End the session so the dashboard shows duration instead of "ongoing"
-    if let Err(e) = ctx.async_db.end_session(&session_id).await {
-        tracing::warn!(error = %e, "failed to end session");
     }
 
     // Database shutdown happens automatically via Drop on ctx

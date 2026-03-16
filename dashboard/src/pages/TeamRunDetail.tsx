@@ -45,14 +45,14 @@ function IterationSection({
         className="flex items-center gap-2 mb-2 group w-full text-left"
       >
         <span className="w-6 h-6 rounded-full bg-accent/20 text-accent text-xs font-bold flex items-center justify-center -ml-7">
-          {iteration + 1}
+          {iteration}
         </span>
         {open ? (
           <ChevronDown size={14} className="text-muted/60" />
         ) : (
           <ChevronRight size={14} className="text-muted/60" />
         )}
-        <span className="text-heading text-sm font-medium">Iteration {iteration + 1}</span>
+        <span className="text-heading text-sm font-medium">Iteration {iteration}</span>
         {criticEntries.length > 0 && (
           <span className="text-xs text-muted/60">
             — {criticEntries[0].content.includes('approved') ? 'Approved' : 'Reviewed'}
@@ -322,10 +322,10 @@ export default function TeamRunDetail() {
       {displayIterations.length > 0 && (
         <div className="bg-bg-card border border-white/[0.05] rounded-xl p-5 mb-5">
           <h3 className="text-heading text-base font-semibold mb-4">Iteration Timeline</h3>
-          {displayIterations.map(([, entries], idx) => (
+          {displayIterations.map(([iterNum, entries], idx) => (
             <IterationSection
-              key={idx}
-              iteration={idx}
+              key={iterNum}
+              iteration={iterNum}
               entries={entries}
               runId={run.id}
               defaultOpen={idx === displayIterations.length - 1}
