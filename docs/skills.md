@@ -1,3 +1,8 @@
+---
+title: Skills
+description: Skills extensibility mechanism, skill.toml format, and handler types
+---
+
 # Skills System
 
 Skills are Mika's extensibility mechanism. Each skill is a filesystem-based bundle that packages related tools, prompt instructions, and dispatch configuration into a single directory. Skills control which tools are available to the agent on each turn, how those tools are executed, and what additional system prompt context the agent receives.

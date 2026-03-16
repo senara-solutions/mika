@@ -1,3 +1,8 @@
+---
+title: Configuration
+description: Configuration files, environment variables, and config cascade
+---
+
 # Configuration Reference
 
 This document covers all configuration options for Mika, including the agent

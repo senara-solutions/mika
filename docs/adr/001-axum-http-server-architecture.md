@@ -1,3 +1,7 @@
+---
+title: "ADR-001: Axum HTTP Server Architecture"
+---
+
 # ADR-001: Axum HTTP Server Architecture for Per-Customer Containers
 
 **Date:** 2026-02-24

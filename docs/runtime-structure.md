@@ -1,3 +1,8 @@
+---
+title: Runtime Structure
+description: Runtime directory layout, SQLite database schema, and log paths
+---
+
 # Runtime Structure Reference
 
 This document describes the `~/.mika` runtime directory layout, SQLite database schema, and log file locations. For config file formats, environment variables, and config cascade, see [configuration.md](configuration.md). For skill.toml format, see [skills.md](skills.md).

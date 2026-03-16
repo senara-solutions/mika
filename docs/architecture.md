@@ -1,3 +1,8 @@
+---
+title: Architecture
+description: System architecture, memory model, agent loop, and component design
+---
+
 # Mika Architecture
 
 ## 1. Overview

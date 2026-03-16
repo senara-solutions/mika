@@ -1,3 +1,7 @@
+---
+title: "ADR-005: Skill Management CRUD"
+---
+
 # ADR-005: Complete Skill Management CRUD with delete_skill Tool
 
 **Date:** 2026-02-27

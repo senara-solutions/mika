@@ -1,3 +1,7 @@
+---
+title: "ADR-004: Multi-Agent Teams Orchestration"
+---
+
 # ADR-004: Multi-Agent Teams Orchestration (Hub-and-Spoke)
 
 **Date:** 2026-02-25

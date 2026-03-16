@@ -1,3 +1,7 @@
+---
+title: "ADR-002: Filesystem-Based Skill Registry"
+---
+
 # ADR-002: Filesystem-Based Skill Registry
 
 **Date:** 2026-02-25

@@ -1,3 +1,8 @@
+---
+title: Getting Started
+description: Install Mika and run your first conversation
+---
+
 # Getting Started with Mika
 
 Mika is a conversation-first AI executive assistant that runs as a local CLI.
