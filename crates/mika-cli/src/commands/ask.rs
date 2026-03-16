@@ -137,6 +137,10 @@ pub async fn run(
             );
         }
 
+        // End the session so the dashboard doesn't show it as "ongoing"
+        if let Err(e) = ctx.async_db.end_session(&session_id).await {
+            tracing::warn!(error = %e, "failed to end session");
+        }
         return Ok(());
     }
 
@@ -190,7 +194,14 @@ pub async fn run(
         is_callback_turn: false,
         trace_id: None,
     })
-    .await?;
+    .await;
+
+    // End the session regardless of agent result so the dashboard shows duration
+    if let Err(e) = ctx.async_db.end_session(&session_id).await {
+        tracing::warn!(error = %e, "failed to end session");
+    }
+
+    let output = output?;
 
     match format {
         OutputFormat::Text => match output.text {

@@ -11,6 +11,7 @@ import InvestigationPanel, {
 import { formatTimestamp } from '../utils/formatTime.ts'
 import { getAgentColor } from '../utils/agentColors.ts'
 import {
+  AlertTriangle,
   ArrowLeft,
   User,
   Bot,
@@ -352,8 +353,8 @@ export default function SessionDetail() {
   const [page, setPage] = useState(1)
   const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
 
-  const { data: session, isLoading: sessionLoading } = useSessionDetail(sessionId ?? '')
-  const { data: messages, isLoading: messagesLoading } = useSessionMessages(
+  const { data: session, isLoading: sessionLoading, isError: sessionError, error: sessionErr } = useSessionDetail(sessionId ?? '')
+  const { data: messages, isLoading: messagesLoading, isError: messagesError, error: messagesErr } = useSessionMessages(
     sessionId ?? '',
     page,
   )
@@ -408,6 +409,8 @@ export default function SessionDetail() {
   }, [isTeamSession, workspaceEntries, messages])
 
   const isLoading = sessionLoading || messagesLoading
+  const isError = sessionError || messagesError
+  const errorMessage = sessionErr?.message ?? messagesErr?.message ?? 'Failed to load session'
 
   const openInvestigation = (
     messageId: number,
@@ -745,6 +748,12 @@ export default function SessionDetail() {
       {/* Content area — single column for both team and regular */}
       {isLoading ? (
         <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+      ) : isError ? (
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <AlertTriangle size={32} className="text-red-400 mb-3" />
+          <p className="text-heading text-sm font-medium mb-1">Failed to load session</p>
+          <p className="text-muted/60 text-xs">{errorMessage}</p>
+        </div>
       ) : isTeamSession ? (
         teamTimeline.length === 0 ? (
           <EmptyState message="No messages in this session" />

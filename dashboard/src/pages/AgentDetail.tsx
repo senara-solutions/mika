@@ -4,6 +4,7 @@ import { useAgentDetail, useAgentSessions, useAgentAudit, type CoreMemory } from
 import StatusBadge from '../components/StatusBadge.tsx'
 import Pagination from '../components/Pagination.tsx'
 import EmptyState from '../components/EmptyState.tsx'
+import MarkdownContent from '../components/MarkdownContent.tsx'
 import { formatRelativeTime } from '../utils/formatTime.ts'
 import { ArrowLeft, User, Brain, Target, Users, GitBranch, Pencil } from 'lucide-react'
 
@@ -142,9 +143,7 @@ export default function AgentDetail() {
           <h3 className="text-heading text-sm font-semibold mb-4">soul.md</h3>
           {agent.soul_md ? (
             <div className="bg-bg rounded-xl p-4 border border-white/[0.04] max-h-96 overflow-y-auto">
-              <pre className="text-xs text-muted/80 whitespace-pre-wrap font-mono leading-relaxed">
-                {agent.soul_md}
-              </pre>
+              <MarkdownContent content={agent.soul_md} />
             </div>
           ) : (
             <EmptyState message="No soul.md defined" />
