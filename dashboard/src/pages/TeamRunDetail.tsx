@@ -9,8 +9,17 @@ import {
 import TaskStatusBadge from '../components/TaskStatusBadge.tsx'
 import CopyButton from '../components/CopyButton.tsx'
 import EmptyState from '../components/EmptyState.tsx'
+import MarkdownContent from '../components/MarkdownContent.tsx'
 import { formatRelativeTime } from '../utils/formatTime.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
+
+function DarkContainer({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={`bg-bg rounded-xl p-4 border border-white/[0.04] ${className}`}>
+      {children}
+    </div>
+  )
+}
 
 function IterationSection({
   iteration,
@@ -36,14 +45,14 @@ function IterationSection({
         className="flex items-center gap-2 mb-2 group w-full text-left"
       >
         <span className="w-6 h-6 rounded-full bg-accent/20 text-accent text-xs font-bold flex items-center justify-center -ml-7">
-          {iteration}
+          {iteration + 1}
         </span>
         {open ? (
           <ChevronDown size={14} className="text-muted/60" />
         ) : (
           <ChevronRight size={14} className="text-muted/60" />
         )}
-        <span className="text-heading text-sm font-medium">Iteration {iteration}</span>
+        <span className="text-heading text-sm font-medium">Iteration {iteration + 1}</span>
         {criticEntries.length > 0 && (
           <span className="text-xs text-muted/60">
             — {criticEntries[0].content.includes('approved') ? 'Approved' : 'Reviewed'}
@@ -59,15 +68,16 @@ function IterationSection({
               <h5 className="text-xs text-muted/60 uppercase tracking-wider mb-2">
                 Phase: Assign
               </h5>
-              <div className="space-y-1">
+              <div className="space-y-2">
                 {assignments.map((a) => (
                   <div
                     key={a.id}
-                    className="bg-white/[0.02] rounded-lg px-3 py-2 text-xs text-muted"
+                    className="bg-bg rounded-lg px-3 py-2 border border-white/[0.04]"
                   >
-                    <span className="text-heading font-medium">{a.agent_name ?? 'unknown'}</span>
-                    {' — '}
-                    <span>{a.content.slice(0, 200)}</span>
+                    <div className="text-xs text-muted break-words">
+                      <span className="text-heading font-medium">@{a.agent_name ?? 'unknown'}</span>
+                      <MarkdownContent content={a.content} />
+                    </div>
                   </div>
                 ))}
               </div>
@@ -91,7 +101,7 @@ function IterationSection({
                         to={`/agents/${ar.agent_name}`}
                         className="text-accent text-xs font-medium hover:text-accent-light transition-colors"
                       >
-                        {ar.agent_name}
+                        @{ar.agent_name}
                       </Link>
                       <Link
                         to={`/sessions/team-${runId}-${ar.agent_name}`}
@@ -118,7 +128,7 @@ function IterationSection({
                   key={c.id}
                   className="bg-orange-500/5 border border-orange-500/10 rounded-lg px-3 py-2 text-xs text-muted"
                 >
-                  {c.content}
+                  <MarkdownContent content={c.content} />
                 </div>
               ))}
             </div>
@@ -161,6 +171,9 @@ export default function TeamRunDetail() {
     }
   }
   const iterations = Array.from(iterationMap.entries()).sort(([a], [b]) => a - b)
+  const displayIterations = iterations.filter(([, entries]) =>
+    entries.some((e) => ['assignment', 'agent_response', 'critic'].includes(e.entry_type))
+  )
 
   return (
     <div>
@@ -196,28 +209,38 @@ export default function TeamRunDetail() {
         </div>
 
         {/* Links */}
-        <div className="flex items-center gap-4 mt-3 pt-3 border-t border-white/[0.05]">
-          {run.trace_id && (
+        {run.trace_id && (
+          <div className="flex items-center gap-4 mt-3 pt-3 border-t border-white/[0.05]">
             <Link
               to={`/traces/${run.trace_id}`}
               className="text-accent text-xs hover:text-accent-light transition-colors"
             >
               View Trace &rarr;
             </Link>
-          )}
-        </div>
+          </div>
+        )}
 
         {/* Goal */}
         <div className="mt-3 pt-3 border-t border-white/[0.05]">
-          <h4 className="text-xs text-muted/60 uppercase tracking-wider mb-1">Goal</h4>
-          <p className="text-sm text-muted">{run.goal}</p>
+          <div className="flex items-center gap-2 mb-1">
+            <h4 className="text-xs text-muted/60 uppercase tracking-wider">Goal</h4>
+            <CopyButton text={run.goal} />
+          </div>
+          <DarkContainer className="max-h-48 overflow-y-auto">
+            <p className="text-sm text-muted whitespace-pre-wrap break-words">{run.goal}</p>
+          </DarkContainer>
         </div>
 
         {/* Deliverable */}
         {run.deliverable && (
           <div className="mt-3 pt-3 border-t border-white/[0.05]">
-            <h4 className="text-xs text-muted/60 uppercase tracking-wider mb-1">Deliverable</h4>
-            <p className="text-sm text-muted whitespace-pre-wrap">{run.deliverable}</p>
+            <div className="flex items-center gap-2 mb-1">
+              <h4 className="text-xs text-muted/60 uppercase tracking-wider">Deliverable</h4>
+              <CopyButton text={run.deliverable} />
+            </div>
+            <DarkContainer className="max-h-96 overflow-y-auto">
+              <MarkdownContent content={run.deliverable} />
+            </DarkContainer>
           </div>
         )}
 
@@ -296,16 +319,16 @@ export default function TeamRunDetail() {
       )}
 
       {/* Iteration Timeline */}
-      {iterations.length > 0 && (
+      {displayIterations.length > 0 && (
         <div className="bg-bg-card border border-white/[0.05] rounded-xl p-5 mb-5">
           <h3 className="text-heading text-base font-semibold mb-4">Iteration Timeline</h3>
-          {iterations.map(([iteration, entries], idx) => (
+          {displayIterations.map(([, entries], idx) => (
             <IterationSection
-              key={iteration}
-              iteration={iteration}
+              key={idx}
+              iteration={idx}
               entries={entries}
               runId={run.id}
-              defaultOpen={idx === iterations.length - 1}
+              defaultOpen={idx === displayIterations.length - 1}
             />
           ))}
         </div>

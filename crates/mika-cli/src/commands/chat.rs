@@ -524,6 +524,11 @@ pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
 
         // Handle agent switch
         if let Some(target_name) = app.pending_switch.take() {
+            // End the old session before switching agents
+            if let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await {
+                tracing::warn!(error = %e, "failed to end session on agent switch");
+            }
+
             // Abort the old poller and wait for the worker to stop (with timeout)
             worker.poller_handle.abort();
             let old_handle = std::mem::replace(
@@ -606,6 +611,11 @@ pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
 
     // Shut down event reader thread
     events.shutdown();
+
+    // End the session so the dashboard shows duration instead of "ongoing"
+    if let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await {
+        tracing::warn!(error = %e, "failed to end session");
+    }
 
     // Stop the reminder poller
     worker.poller_handle.abort();
