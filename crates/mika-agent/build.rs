@@ -3,6 +3,7 @@ use std::path::Path;
 
 const DOCS: &[&str] = &[
     "architecture.md",
+    "browser-control.md",
     "configuration.md",
     "deployment.md",
     "getting-started.md",

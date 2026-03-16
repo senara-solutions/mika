@@ -20,6 +20,8 @@ static ARCHITECTURE_OVERVIEW: &str =
     include_str!(concat!(env!("OUT_DIR"), "/docs/architecture.md"));
 
 /// Embedded documentation files (topic → content).
+static DOC_BROWSER_CONTROL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/docs/browser-control.md"));
 static DOC_CONFIGURATION: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/configuration.md"));
 static DOC_DEPLOYMENT: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/deployment.md"));
 static DOC_GETTING_STARTED: &str =
@@ -113,6 +115,9 @@ async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> 
     match topic {
         "architecture" => ToolOutput::success(strip_frontmatter(ARCHITECTURE_OVERVIEW).to_string()),
         "api-spec" => ToolOutput::success(AGENT_API_SPEC.to_string()),
+        "browser-control" => {
+            ToolOutput::success(strip_frontmatter(DOC_BROWSER_CONTROL).to_string())
+        }
         "cli-reference" => {
             let path = ctx.home_dir.join("cli-reference.md");
             match tokio::fs::read_to_string(&path).await {
@@ -139,7 +144,7 @@ async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> 
             ToolOutput::success(strip_frontmatter(DOC_SLASH_COMMANDS).to_string())
         }
         _ => ToolOutput::error(
-            "Invalid topic. Use one of: architecture, api-spec, cli-reference, configuration, deployment, getting-started, runtime-structure, skills, slash-commands."
+            "Invalid topic. Use one of: architecture, api-spec, browser-control, cli-reference, configuration, deployment, getting-started, runtime-structure, skills, slash-commands."
                 .to_string(),
         ),
     }
@@ -531,6 +536,7 @@ mod tests {
         for topic in &[
             "architecture",
             "api-spec",
+            "browser-control",
             "configuration",
             "deployment",
             "getting-started",
@@ -994,6 +1000,7 @@ mod tests {
 
         let files = [
             "architecture.md",
+            "browser-control.md",
             "configuration.md",
             "deployment.md",
             "getting-started.md",
