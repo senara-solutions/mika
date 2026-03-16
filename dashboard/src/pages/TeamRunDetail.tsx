@@ -12,25 +12,6 @@ import EmptyState from '../components/EmptyState.tsx'
 import { formatRelativeTime } from '../utils/formatTime.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
-const ENTRY_TYPE_STYLES: Record<string, string> = {
-  goal: 'bg-purple-500/10 text-purple-400',
-  orchestrator: 'bg-blue-500/10 text-blue-400',
-  assignment: 'bg-teal-500/10 text-teal-400',
-  agent_response: 'bg-green-500/10 text-green-400',
-  critic: 'bg-orange-500/10 text-orange-400',
-  deliverable: 'bg-emerald-500/10 text-emerald-400',
-  error: 'bg-red-500/10 text-red-400',
-}
-
-function EntryTypeBadge({ type }: { type: string }) {
-  const style = ENTRY_TYPE_STYLES[type] ?? 'bg-gray-500/10 text-gray-400'
-  return (
-    <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${style}`}>
-      {type}
-    </span>
-  )
-}
-
 function IterationSection({
   iteration,
   entries,
@@ -330,49 +311,6 @@ export default function TeamRunDetail() {
         </div>
       )}
 
-      {/* Workspace Entries */}
-      {workspace && workspace.length > 0 && (
-        <div className="bg-bg-card border border-white/[0.05] rounded-xl p-5 mb-5">
-          <h3 className="text-heading text-base font-semibold mb-3">
-            Workspace Entries
-            <span className="ml-2 text-xs bg-accent/10 text-accent px-2 py-0.5 rounded-full font-medium">
-              {workspace.length}
-            </span>
-          </h3>
-          <div className="overflow-hidden rounded-lg border border-white/[0.05]">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
-                  <th className="text-left px-4 py-2 font-medium">Type</th>
-                  <th className="text-left px-4 py-2 font-medium">Agent</th>
-                  <th className="text-left px-4 py-2 font-medium">Iter</th>
-                  <th className="text-left px-4 py-2 font-medium">Content</th>
-                  <th className="text-left px-4 py-2 font-medium">Time</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/[0.03]">
-                {workspace.map((entry) => (
-                  <tr key={entry.id} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="px-4 py-2">
-                      <EntryTypeBadge type={entry.entry_type} />
-                    </td>
-                    <td className="px-4 py-2 text-xs text-muted">
-                      {entry.agent_name ?? '\u2014'}
-                    </td>
-                    <td className="px-4 py-2 text-xs text-muted">{entry.iteration}</td>
-                    <td className="px-4 py-2 text-xs text-muted max-w-[400px] truncate">
-                      {entry.content.slice(0, 100)}
-                    </td>
-                    <td className="px-4 py-2 text-xs text-muted/70 font-mono">
-                      {formatRelativeTime(entry.created_at)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

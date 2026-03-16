@@ -4610,47 +4610,39 @@ impl Database {
     }
 
     /// Build WHERE clause and params for task filters.
+    /// Push a comma-separated filter value as an `IN (?,?,...?)` clause.
+    fn push_csv_in_clause(
+        field: &str,
+        csv: &str,
+        conditions: &mut Vec<String>,
+        params: &mut Vec<String>,
+    ) {
+        let values: Vec<&str> = csv.split(',').map(|s| s.trim()).take(20).collect();
+        let placeholders: Vec<String> = values
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", params.len() + i + 1))
+            .collect();
+        conditions.push(format!("{field} IN ({})", placeholders.join(",")));
+        for v in values {
+            params.push(v.to_string());
+        }
+    }
+
     fn build_task_filter_sql(filters: &TaskFilters) -> (String, Vec<String>) {
         let mut conditions = Vec::new();
         let mut params = Vec::new();
 
         if let Some(ref status) = filters.status {
-            let values: Vec<&str> = status.split(',').map(|s| s.trim()).collect();
-            let placeholders: Vec<String> = values
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", params.len() + i + 1))
-                .collect();
-            conditions.push(format!("status IN ({})", placeholders.join(",")));
-            for v in values {
-                params.push(v.to_string());
-            }
+            Self::push_csv_in_clause("status", status, &mut conditions, &mut params);
         }
 
         if let Some(ref trigger_type) = filters.trigger_type {
-            let values: Vec<&str> = trigger_type.split(',').map(|s| s.trim()).collect();
-            let placeholders: Vec<String> = values
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", params.len() + i + 1))
-                .collect();
-            conditions.push(format!("trigger_type IN ({})", placeholders.join(",")));
-            for v in values {
-                params.push(v.to_string());
-            }
+            Self::push_csv_in_clause("trigger_type", trigger_type, &mut conditions, &mut params);
         }
 
         if let Some(ref action_type) = filters.action_type {
-            let values: Vec<&str> = action_type.split(',').map(|s| s.trim()).collect();
-            let placeholders: Vec<String> = values
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", params.len() + i + 1))
-                .collect();
-            conditions.push(format!("action_type IN ({})", placeholders.join(",")));
-            for v in values {
-                params.push(v.to_string());
-            }
+            Self::push_csv_in_clause("action_type", action_type, &mut conditions, &mut params);
         }
 
         if let Some(ref agent_id) = filters.agent_id {
@@ -4747,16 +4739,7 @@ impl Database {
         }
 
         if let Some(ref status) = filters.status {
-            let values: Vec<&str> = status.split(',').map(|s| s.trim()).collect();
-            let placeholders: Vec<String> = values
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", params.len() + i + 1))
-                .collect();
-            conditions.push(format!("r.status IN ({})", placeholders.join(",")));
-            for v in values {
-                params.push(v.to_string());
-            }
+            Self::push_csv_in_clause("r.status", status, &mut conditions, &mut params);
         }
 
         if let Some(from) = filters.from {

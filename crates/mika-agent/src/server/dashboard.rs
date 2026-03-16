@@ -16,7 +16,7 @@ use tracing::error;
 use utoipa::ToSchema;
 
 use crate::db::{
-    CoreMemoryEntry, SessionMessage, Task, TaskFilters, TeamRunFilters, TeamRunIdFilter,
+    self, CoreMemoryEntry, SessionMessage, Task, TaskFilters, TeamRunFilters, TeamRunIdFilter,
     TimelineFilters,
 };
 
@@ -483,22 +483,14 @@ pub struct TaskResponse {
     pub result_preview: Option<String>,
 }
 
-fn truncate_preview(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
-    }
-}
-
 impl From<Task> for TaskResponse {
     fn from(t: Task) -> Self {
         let action_config_preview = if t.action_config.is_empty() {
             None
         } else {
-            Some(truncate_preview(&t.action_config, 200))
+            Some(db::truncate_chars(&t.action_config, 200))
         };
-        let result_preview = t.result.as_deref().map(|r| truncate_preview(r, 200));
+        let result_preview = t.result.as_deref().map(|r| db::truncate_chars(r, 200));
 
         Self {
             id: t.id,
