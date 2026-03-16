@@ -7,6 +7,9 @@ import Agents from './pages/Agents.tsx'
 import AgentDetail from './pages/AgentDetail.tsx'
 import Sessions from './pages/Sessions.tsx'
 import SessionDetail from './pages/SessionDetail.tsx'
+import Tasks from './pages/Tasks.tsx'
+import TeamRuns from './pages/TeamRuns.tsx'
+import TeamRunDetail from './pages/TeamRunDetail.tsx'
 import NotFound from './pages/NotFound.tsx'
 
 export default function App() {
@@ -20,6 +23,9 @@ export default function App() {
         <Route path="agents/:agentId" element={<AgentDetail />} />
         <Route path="sessions" element={<Sessions />} />
         <Route path="sessions/:sessionId" element={<SessionDetail />} />
+        <Route path="tasks" element={<Tasks />} />
+        <Route path="team-runs" element={<TeamRuns />} />
+        <Route path="team-runs/:runId" element={<TeamRunDetail />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
