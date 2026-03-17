@@ -46,7 +46,7 @@ async fn spawn_agent_worker(
     ctx: AppContext,
     _agent_name: &str,
     http_client: &reqwest::Client,
-    session: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<(
     AgentWorker,
     mpsc::UnboundedSender<AgentRequest>,
@@ -57,16 +57,17 @@ async fn spawn_agent_worker(
     Arc<SkillRegistry>,
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
-    if let Some(s) = session
+    if let Some(s) = session_id
         && s.is_empty()
     {
-        anyhow::bail!("--session value must not be empty");
+        anyhow::bail!("--session-id value must not be empty");
     }
-    let session_id = session
+    let reusing_session = session_id.is_some();
+    let session_id = session_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     // Validate session ownership if reusing an existing session
-    if session.is_some()
+    if reusing_session
         && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
         && existing.agent_id != ctx.async_db.agent_id()
     {

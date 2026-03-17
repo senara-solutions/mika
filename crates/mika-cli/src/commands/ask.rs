@@ -21,25 +21,26 @@ pub async fn run(
     message: &str,
     agent_name: &str,
     task_id: Option<&str>,
-    session: Option<&str>,
-    parent_task: Option<&str>,
+    session_id: Option<&str>,
+    parent_task_id: Option<&str>,
     format: &OutputFormat,
 ) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
 
     // Use provided session ID or generate a new one.
-    // When --session is passed (e.g., from claude-asked-relay), messages from the
+    // When --session-id is passed (e.g., from claude-asked-relay), messages from the
     // same Claude Code run share a session for grouping and introspection.
-    if let Some(s) = session
+    if let Some(s) = session_id
         && s.is_empty()
     {
-        anyhow::bail!("--session value must not be empty");
+        anyhow::bail!("--session-id value must not be empty");
     }
-    let session_id = session
+    let reusing_session = session_id.is_some();
+    let session_id = session_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     // Validate session ownership if reusing an existing session
-    if session.is_some()
+    if reusing_session
         && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
         && existing.agent_id != ctx.async_db.agent_id()
     {
@@ -144,8 +145,8 @@ pub async fn run(
         return Ok(());
     }
 
-    // Prepend work item context if --parent-task is provided
-    let user_message = if let Some(pt) = parent_task {
+    // Prepend work item context if --parent-task-id is provided
+    let user_message = if let Some(pt) = parent_task_id {
         format!("[work-item:{pt}] {user_message}")
     } else {
         user_message

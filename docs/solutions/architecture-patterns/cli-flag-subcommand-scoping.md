@@ -73,7 +73,7 @@ Commands::Setup { .. } | Commands::Doctor(_) | Commands::Teams(_) => None,
 ## Key Decisions
 
 - **Kept flags on `Cli` struct (non-global)** for backward compatibility with `mika --agent work` syntax. The alternative was removing them entirely, but that would break existing scripts.
-- **`--session` left as `global = true`** — same pattern applies but was out of scope for issue #102.
+- **`--session-id` left as `global = true`** — same pattern applies but was out of scope for issue #102.
 - **Cross-level conflict not enforced** — `mika --agent work chat --agent research` silently uses the subcommand value. Clap cannot detect conflicts across argument scopes. The merge logic handles this correctly (subcommand wins).
 
 ## Prevention

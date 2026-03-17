@@ -162,9 +162,11 @@ async fn main() -> Result<()> {
             if !home::is_initialized(&home_dir) {
                 commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
-            commands::chat::run(&agent_name, cli.session.as_deref()).await
+            commands::chat::run(&agent_name, cli.session_id.as_deref()).await
         }
-        Some(Commands::Chat(_)) => commands::chat::run(&agent_name, cli.session.as_deref()).await,
+        Some(Commands::Chat(_)) => {
+            commands::chat::run(&agent_name, cli.session_id.as_deref()).await
+        }
         Some(Commands::Setup { mode, api_key }) => {
             commands::setup::run(&agent_name, mode, api_key.as_deref()).await
         }
@@ -178,8 +180,8 @@ async fn main() -> Result<()> {
                 &args.message,
                 &agent_name,
                 args.task_id.as_deref(),
-                cli.session.as_deref(),
-                args.parent_task.as_deref(),
+                cli.session_id.as_deref(),
+                args.parent_task_id.as_deref(),
                 &args.format,
             )
             .await

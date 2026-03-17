@@ -14,7 +14,7 @@ pub struct Cli {
     /// Reuse an existing session instead of creating a new one.
     /// If the session does not exist yet, it will be created with this ID.
     #[arg(long, global = true)]
-    pub session: Option<String>,
+    pub session_id: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -132,9 +132,9 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "team")]
     pub task_id: Option<String>,
     /// Link this message to a parent work item (metadata threading).
-    /// Used by claude-asked relay: mika ask --parent-task <uuid> "question"
+    /// Used by claude-asked relay: mika ask --parent-task-id <uuid> "question"
     #[arg(long)]
-    pub parent_task: Option<String>,
+    pub parent_task_id: Option<String>,
     /// Output format: text (default) or json
     #[arg(long, value_enum, default_value = "text")]
     pub format: OutputFormat,
