@@ -259,7 +259,7 @@ The most commonly used commands:
 | `mika --team <name>`         | Launch TUI in team mode (mutually exclusive with `--agent`) |
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
-| `mika ask "<message>"`       | Send a message non-interactively (`--format json` for structured output) |
+| `mika ask "<message>"`       | Send a message non-interactively (`--format json` for structured output, `--model <model>` to override LLM) |
 | `mika ask --team <name> "goal"` | Run a team workflow non-interactively (deliverable to stdout) |
 | `mika ask --task-id <uuid> "<result>"` | Complete a callback task (TUI delivers result to conversation) |
 | `mika tasks`                 | List scheduled tasks for the active agent         |
@@ -319,6 +319,21 @@ mika ask --format json "Summarize my day" | jq -r '.content'
 response=$(mika ask "What are my top priorities today?")
 echo "Mika says: $response"
 ```
+
+**Model override:**
+
+Use `--model <model>` to override the LLM model for a single invocation without
+changing the persistent config. Accepts aliases (`sonnet`, `opus`, `haiku`) or
+full model IDs (`claude-sonnet-4-6`) or provider-prefixed names (`openai/gpt-4o`):
+
+```sh
+mika ask --model sonnet "Quick question"
+mika ask --model openai/gpt-4o "Translate this to French"
+mika chat --model opus  # start an interactive session with Opus
+```
+
+The `--model` flag is mutually exclusive with `--team` (team runs use the
+configured model for all agents).
 
 Each `mika ask` invocation creates a fresh session. Mika still has access to all
 stored memory (people, commitments, preferences, events) but does not carry over

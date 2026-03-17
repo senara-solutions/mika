@@ -377,12 +377,7 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
     }
 }
 
-/// Known model shorthands: (shorthand, full_model_id, display_name).
-const MODEL_ALIASES: &[(&str, &str, &str)] = &[
-    ("sonnet", "claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("opus", "claude-opus-4-6", "Claude Opus 4.6"),
-    ("haiku", "claude-haiku-4-5", "Claude Haiku 4.5"),
-];
+use crate::cli::MODEL_ALIASES;
 
 fn resolve_model_name(input: &str) -> Option<(&'static str, &'static str)> {
     let lower = input.to_lowercase();

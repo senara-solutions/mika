@@ -407,8 +407,13 @@ async fn spawn_agent_worker(
     ))
 }
 
-pub async fn run(agent_name: &str, session: Option<&str>) -> Result<()> {
-    let ctx = init::init_for_agent(agent_name)?;
+pub async fn run(agent_name: &str, session: Option<&str>, model_override: Option<&str>) -> Result<()> {
+    let mut ctx = init::init_for_agent(agent_name)?;
+
+    if let Some(model) = model_override {
+        ctx.override_model(model)?;
+    }
+
     let http_client = reqwest::Client::new();
     let (mut worker, user_tx, agent_rx, session_id, model, identity_name, skill_registry) =
         spawn_agent_worker(ctx, agent_name, &http_client, session).await?;
