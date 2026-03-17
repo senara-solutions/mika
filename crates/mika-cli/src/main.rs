@@ -165,7 +165,12 @@ async fn main() -> Result<()> {
             commands::chat::run(&agent_name, cli.session_id.as_deref(), None).await
         }
         Some(Commands::Chat(ref args)) => {
-            commands::chat::run(&agent_name, cli.session_id.as_deref(), args.model.as_deref()).await
+            commands::chat::run(
+                &agent_name,
+                cli.session_id.as_deref(),
+                args.model.as_deref(),
+            )
+            .await
         }
         Some(Commands::Setup { mode, api_key }) => {
             commands::setup::run(&agent_name, mode, api_key.as_deref()).await
@@ -615,13 +620,8 @@ mod tests {
     /// --model with provider-prefixed value should parse.
     #[test]
     fn test_model_flag_provider_prefixed() {
-        let cli = crate::cli::Cli::try_parse_from([
-            "mika",
-            "ask",
-            "--model",
-            "openai/gpt-4o",
-            "hello",
-        ]);
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--model", "openai/gpt-4o", "hello"]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         if let Some(Commands::Ask(args)) = cli.command {
@@ -637,22 +637,14 @@ mod tests {
         let result = crate::cli::Cli::try_parse_from([
             "mika", "ask", "--model", "sonnet", "--team", "research", "hello",
         ]);
-        assert!(
-            result.is_err(),
-            "--model and --team should conflict on ask"
-        );
+        assert!(result.is_err(), "--model and --team should conflict on ask");
     }
 
     /// --model and --team should conflict on chat subcommand.
     #[test]
     fn test_model_conflicts_with_team_on_chat() {
         let result = crate::cli::Cli::try_parse_from([
-            "mika",
-            "chat",
-            "--model",
-            "sonnet",
-            "--team",
-            "research",
+            "mika", "chat", "--model", "sonnet", "--team", "research",
         ]);
         assert!(
             result.is_err(),
@@ -668,10 +660,7 @@ mod tests {
             "claude-sonnet-4-6"
         );
         assert_eq!(crate::cli::resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(
-            crate::cli::resolve_model_alias("haiku"),
-            "claude-haiku-4-5"
-        );
+        assert_eq!(crate::cli::resolve_model_alias("haiku"), "claude-haiku-4-5");
         assert_eq!(
             crate::cli::resolve_model_alias("Sonnet"),
             "claude-sonnet-4-6"

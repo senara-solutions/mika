@@ -407,7 +407,11 @@ async fn spawn_agent_worker(
     ))
 }
 
-pub async fn run(agent_name: &str, session: Option<&str>, model_override: Option<&str>) -> Result<()> {
+pub async fn run(
+    agent_name: &str,
+    session: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
 
     if let Some(model) = model_override {
