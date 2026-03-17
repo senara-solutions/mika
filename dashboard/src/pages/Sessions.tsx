@@ -1,9 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
-import Pagination from '../components/Pagination.tsx'
-import EmptyState from '../components/EmptyState.tsx'
-import { formatRelativeTime } from '../utils/formatTime.ts'
+import { Pagination, EmptyState, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, Terminal, MessageSquare, Users, Settings } from 'lucide-react'
 

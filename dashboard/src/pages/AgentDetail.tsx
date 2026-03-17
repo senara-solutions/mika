@@ -1,11 +1,7 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router'
 import { useAgentDetail, useAgentSessions, useAgentAudit, type CoreMemory } from '../api/agents.ts'
-import StatusBadge from '../components/StatusBadge.tsx'
-import Pagination from '../components/Pagination.tsx'
-import EmptyState from '../components/EmptyState.tsx'
-import MarkdownContent from '../components/MarkdownContent.tsx'
-import { formatRelativeTime } from '../utils/formatTime.ts'
+import { StatusBadge, Pagination, EmptyState, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
 import { ArrowLeft, User, Brain, Target, Users, GitBranch, Pencil } from 'lucide-react'
 
 const BLOCK_TOKEN_CAP = 500

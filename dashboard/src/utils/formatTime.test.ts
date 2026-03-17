@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { formatTimestamp, formatRelativeTime } from './formatTime'
+import { formatTimestamp, formatRelativeTime } from '@senara-solutions/ui'
 
 describe('formatTimestamp', () => {
   it('formats a unix timestamp', () => {

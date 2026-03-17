@@ -14,7 +14,7 @@ export default function Pagination({ page, perPage, total, onPageChange }: Pagin
   return (
     <div className="flex items-center justify-between mt-4 text-sm text-muted">
       <span>
-        {total} total &middot; page {page} of {totalPages}
+        {total} total · page {page} of {totalPages}
       </span>
       <div className="flex gap-1">
         <button

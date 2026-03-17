@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { eventTypeBadge, eventTypeColor } from './badges'
+import { eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 
 describe('eventTypeBadge', () => {
   it('returns blue badge for message type', () => {
