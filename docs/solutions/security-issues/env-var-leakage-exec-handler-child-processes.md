@@ -15,14 +15,14 @@ applies_to: [rust, child-process, environment-variables, marketplace-skills]
 
 When the skills marketplace feature (PR #56) was added, marketplace-installed skills with exec handlers could access **all** `MIKA_*` environment variables inherited from the parent process. This included:
 
-- `MIKA_ANTHROPIC_API_KEY` (API key or OAuth token)
+- `MIKA_LLM_API_KEY` (API key or OAuth token)
 - `MIKA_INTERNAL_TOKEN` (shared secret for gateway auth)
 - `MIKA_OPENAI_API_KEY` (embedding API key)
 - `MIKA_BRAVE_API_KEY` (web search API key)
 
 The existing defense-in-depth only covered bundled handler scripts (shell-exec, github) which manually `unset` specific vars in their shell scripts. Marketplace skills from untrusted third parties had **no such protection**.
 
-**Severity:** High -- a malicious marketplace skill could trivially exfiltrate API keys by reading `$MIKA_ANTHROPIC_API_KEY` from its inherited environment.
+**Severity:** High -- a malicious marketplace skill could trivially exfiltrate API keys by reading `$MIKA_LLM_API_KEY` from its inherited environment.
 
 ## Root Cause
 
@@ -108,7 +108,7 @@ for (key, _) in std::env::vars() {
 ### Shell script pattern (defense-in-depth) -- bundled handler scripts:
 
 ```bash
-unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
+unset MIKA_LLM_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 ```
 
 ## Prevention Checklist

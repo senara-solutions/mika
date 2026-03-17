@@ -39,7 +39,7 @@ When `--api-key` is provided, skip the interactive prompt and call `set_env_var`
 - Pro: Unblocks CI/CD; uses existing primitives
 
 ### Option B: Document manual .env creation as the non-interactive path
-Add docs showing: `echo "MIKA_ANTHROPIC_API_KEY=sk-..." > ~/.mika/.env && chmod 600 ~/.mika/.env`
+Add docs showing: `echo "MIKA_LLM_API_KEY=sk-..." > ~/.mika/.env && chmod 600 ~/.mika/.env`
 - Effort: Small
 - Risk: Low
 - Con: Fragile; users must remember all required vars

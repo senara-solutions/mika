@@ -159,7 +159,7 @@ for item in &result.content {
 
 ### Environment Variable Leaking
 
-Initial implementation passed through all parent env vars to child processes. Code review identified this as a security risk — sensitive vars like `MIKA_ANTHROPIC_API_KEY` would be visible to MCP server processes. Fixed with `env_clear()` + allowlist pattern.
+Initial implementation passed through all parent env vars to child processes. Code review identified this as a security risk — sensitive vars like `MIKA_LLM_API_KEY` would be visible to MCP server processes. Fixed with `env_clear()` + allowlist pattern.
 
 ### Sequential Startup
 

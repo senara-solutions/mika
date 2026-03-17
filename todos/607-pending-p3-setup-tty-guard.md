@@ -29,7 +29,7 @@ if !std::io::stdin().is_terminal() {
     // Otherwise, bail with guidance
     anyhow::bail!(
         "mika setup requires an interactive terminal. \
-         Pre-set MIKA_ANTHROPIC_API_KEY and other env vars, \
+         Pre-set MIKA_LLM_API_KEY and other env vars, \
          or run `mika setup` in a terminal."
     );
 }

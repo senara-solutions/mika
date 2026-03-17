@@ -6,11 +6,6 @@ export { default as CopyButton } from './components/CopyButton.tsx'
 export { default as MarkdownContent } from './components/MarkdownContent.tsx'
 export { default as TaskStatusBadge } from './components/TaskStatusBadge.tsx'
 
-// Layout
-export { default as AppShell } from './layout/AppShell.tsx'
-export { default as Sidebar } from './layout/Sidebar.tsx'
-export type { NavItem, SidebarBrand } from './layout/Sidebar.tsx'
-
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'
 export type { EventTypeBadge } from './utils/badges.ts'

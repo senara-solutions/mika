@@ -14,9 +14,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
         with:
           node-version: 22
           registry-url: https://npm.pkg.github.com
@@ -27,7 +27,19 @@ jobs:
       - name: Build
         run: npm run build -w packages/ui
 
+      - name: Check if version changed
+        id: version
+        run: |
+          PUBLISHED=$(npm view @senara-solutions/ui version --registry https://npm.pkg.github.com 2>/dev/null || echo "0.0.0")
+          CURRENT=$(node -p "require('./packages/ui/package.json').version")
+          if [ "$PUBLISHED" = "$CURRENT" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish
+        if: steps.version.outputs.skip != 'true'
         run: npm publish -w packages/ui
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

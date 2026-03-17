@@ -93,7 +93,7 @@ Four findings were critical (security leak, data mismatch, race condition, missi
 
 ### P1-522: MIKA_* Env Vars Leaked to Long-Running Subprocess
 
-`spawn_long_running_exec` did not scrub MIKA_* environment variables before launching subprocesses. The existing `execute_exec` function had scrubbing logic but it was not shared with the new long-running path. Background scripts could access `MIKA_ANTHROPIC_API_KEY` and other secrets.
+`spawn_long_running_exec` did not scrub MIKA_* environment variables before launching subprocesses. The existing `execute_exec` function had scrubbing logic but it was not shared with the new long-running path. Background scripts could access `MIKA_LLM_API_KEY` and other secrets.
 
 ### P1-523: Label Mismatch in Team Resume
 

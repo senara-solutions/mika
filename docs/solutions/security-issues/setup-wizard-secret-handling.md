@@ -94,7 +94,7 @@ let interactive = std::io::stdin().is_terminal();
 if !interactive && !already_initialized {
     bail!(
         "mika setup requires an interactive terminal for first-time configuration. \
-         Pre-set MIKA_ANTHROPIC_API_KEY and other env vars, or run `mika setup` in a terminal."
+         Pre-set MIKA_LLM_API_KEY and other env vars, or run `mika setup` in a terminal."
     );
 }
 ```
