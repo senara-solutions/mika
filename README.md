@@ -59,8 +59,8 @@ Pre-built binaries are also available on the [Releases page](https://github.com/
 ### Run
 
 ```bash
-# Set your Anthropic credential (API key or Claude subscription token)
-export MIKA_ANTHROPIC_API_KEY=sk-ant-...
+# Set your LLM API key (Anthropic API key, Claude subscription token, or third-party provider key)
+export MIKA_LLM_API_KEY=sk-ant-...
 
 # Run (auto-setup on first launch)
 mika

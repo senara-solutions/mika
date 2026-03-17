@@ -31,7 +31,7 @@ async fn run_summary(agent_name: &str) -> Result<()> {
     println!("  Max tokens: {}", ctx.settings.llm_max_tokens);
     println!("  Log level:  {}", ctx.settings.log_level);
     println!("  DB path:    {}", ctx.settings.db_path.display());
-    let auth_display = match &ctx.settings.anthropic_api_key {
+    let auth_display = match &ctx.settings.llm_api_key {
         Some(key) => {
             if is_oauth_token(key.trim()) {
                 "OAuth token [REDACTED]"
@@ -434,9 +434,9 @@ mod tests {
     fn test_env_key_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".env");
-        std::fs::write(&path, "# comment\nMIKA_ANTHROPIC_API_KEY=\"test\"\n").unwrap();
+        std::fs::write(&path, "# comment\nMIKA_LLM_API_KEY=\"test\"\n").unwrap();
 
-        assert!(env_key_exists(&path, "MIKA_ANTHROPIC_API_KEY"));
+        assert!(env_key_exists(&path, "MIKA_LLM_API_KEY"));
         assert!(!env_key_exists(&path, "MIKA_OPENAI_API_KEY"));
     }
 

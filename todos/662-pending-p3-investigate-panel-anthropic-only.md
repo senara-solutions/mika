@@ -14,7 +14,7 @@ dependencies: []
 
 ## Findings
 
-- `investigate.rs` creates `ClaudeClient::new()` from `state.settings.anthropic_api_key`
+- `investigate.rs` creates `ClaudeClient::new()` from `state.settings.llm_api_key`
 - Uses Anthropic-specific types: `ContentBlock`, `Message`, `MessagesRequest`
 - Would need to be converted to use `LlmProvider` trait for full multi-provider support
 - Low priority — investigation panel is a read-only diagnostic feature

@@ -1063,7 +1063,7 @@ pub async fn handle_investigate(
     // Investigation panel uses Anthropic-specific types (its own mini agent loop).
     // Create a ClaudeClient from settings for investigation use.
     let claude = match ClaudeClient::new(
-        state.settings.anthropic_api_key.clone(),
+        state.settings.llm_api_key.clone(),
         state.settings.llm_model.clone(),
         4096,
     ) {

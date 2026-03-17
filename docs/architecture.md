@@ -438,7 +438,7 @@ Dispatch chain: builtins → skills → MCP → unknown error.
 
 ### Security
 
-- **Environment isolation:** Child processes cannot access `MIKA_ANTHROPIC_API_KEY`,
+- **Environment isolation:** Child processes cannot access `MIKA_LLM_API_KEY`,
   `MIKA_INTERNAL_TOKEN`, or any other Mika secrets.
 - **Header redaction:** Custom `Debug` impl on `McpServerConfig` redacts both header
   and env variable values in logs.
@@ -710,7 +710,7 @@ Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
 
 ```bash
 # Terminal 1: Start mika-server
-MIKA_ANTHROPIC_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
+MIKA_LLM_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
   MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-server
 
 # Terminal 2: Start dashboard dev server

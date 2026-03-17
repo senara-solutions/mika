@@ -25,8 +25,10 @@ This guide walks you through installation, first run, and everyday usage.
   The repository includes a `rust-toolchain.toml` that pins the channel to `1.93`,
   so `cargo` will use it automatically.
 
-- **Anthropic credential:** You need either an API key from [Anthropic](https://console.anthropic.com/)
-  or a Claude subscription OAuth token (see [Setting up your credentials](#3-setting-up-your-credentials) below).
+- **LLM API key:** You need an API key from your LLM provider. Anthropic (default) requires
+  an API key from [console.anthropic.com](https://console.anthropic.com/) or a Claude subscription
+  OAuth token. Other providers (OpenAI, Groq, Ollama) use their own keys.
+  See [Setting up your credentials](#3-setting-up-your-credentials) below.
 
 - **Platform:** Linux or macOS. File permissions (0700 dirs, 0600 files) are
   applied automatically on Unix systems.
@@ -86,7 +88,7 @@ Get an API key from [console.anthropic.com](https://console.anthropic.com/). Usa
 is billed to your Anthropic account.
 
 ```sh
-export MIKA_ANTHROPIC_API_KEY="sk-ant-api03-..."
+export MIKA_LLM_API_KEY="sk-ant-api03-..."
 ```
 
 ### Option B: Claude subscription OAuth token
@@ -103,11 +105,24 @@ quota instead of a paid API key. This requires the [Claude Code CLI](https://doc
 2. Set the token (it starts with `sk-ant-oat`):
 
    ```sh
-   export MIKA_ANTHROPIC_API_KEY="sk-ant-oat01-..."
+   export MIKA_LLM_API_KEY="sk-ant-oat01-..."
    ```
 
 OAuth tokens expire periodically. When Mika reports an authentication error,
 re-run `claude setup-token` to get a fresh token.
+
+### Option C: Non-Anthropic provider
+
+Mika supports OpenAI, Groq, Ollama, and other OpenAI-compatible providers.
+Set both the model and key:
+
+```sh
+export MIKA_LLM_MODEL=openai/gpt-4o
+export MIKA_LLM_API_KEY="sk-..."
+```
+
+See [Model Configuration](configuration.md#model-configuration) for all supported
+providers and their configuration options.
 
 ### Persisting your credential
 
@@ -118,7 +133,7 @@ Alternatively, set it as an environment variable in your shell profile
 (`~/.bashrc`, `~/.zshrc`, etc.):
 
 ```sh
-echo 'export MIKA_ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
+echo 'export MIKA_LLM_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -129,8 +144,8 @@ Do NOT put credentials in `config.toml` -- use `~/.mika/.env` or shell environme
 Run `mika config` to confirm Mika sees your credential:
 
 ```
-anthropic_api_key: OAuth token [REDACTED]   # subscription token
-anthropic_api_key: API key [REDACTED]       # API key
+llm_api_key: OAuth token [REDACTED]   # subscription token
+llm_api_key: API key [REDACTED]       # API key
 ```
 
 For a more thorough check, run `mika doctor` to validate the entire
@@ -153,7 +168,7 @@ launches a guided wizard to configure secrets and preferences:
 ```
   Mika Setup
 
-  Anthropic API key: ••••••••••••
+  LLM API key: ••••••••••••
   Brave Search API key (optional, press Enter to skip):
   Enable telemetry? [y/N]: n
   Generated internal token for server mode.
@@ -163,7 +178,7 @@ launches a guided wizard to configure secrets and preferences:
 ```
 
 The wizard prompts for:
-1. **Anthropic API key** (masked input)
+1. **LLM API key** (masked input)
 2. **Brave Search API key** (optional, masked)
 3. **GitHub token for investigation** (optional, masked — enables dashboard issue creation)
 4. **GitHub repo** (optional, visible — `owner/repo` format for issue creation)

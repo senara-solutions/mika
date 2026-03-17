@@ -261,7 +261,7 @@ impl ClaudeClient {
             .filter(|k| !k.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "MIKA_ANTHROPIC_API_KEY is required but not set. \
+                    "MIKA_LLM_API_KEY is required but not set. \
                      Set it to an API key (sk-ant-api03-...) or OAuth token (sk-ant-oat01-...)."
                 )
             })?;
@@ -345,9 +345,9 @@ impl ClaudeClient {
                         ClaudeApiError::HttpError { status: 401, .. } => {
                             let hint = if self.auth.is_oauth() {
                                 "Authentication failed. Your OAuth token may have expired. \
-                                 Run `claude setup-token` to get a new one, then update MIKA_ANTHROPIC_API_KEY."
+                                 Run `claude setup-token` to get a new one, then update MIKA_LLM_API_KEY."
                             } else {
-                                "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key."
+                                "Authentication failed. Check that MIKA_LLM_API_KEY is set to a valid Anthropic API key."
                             };
                             anyhow::Error::from(e).context(hint)
                         }

@@ -33,7 +33,7 @@ pub async fn run(agent_name: &str, mode: SetupMode, api_key: Option<&str>) -> Re
     if let Some(key) = api_key {
         let key = key.trim();
         if !key.is_empty() {
-            mika_common::dotenv::set_env_var(&home_dir, "MIKA_ANTHROPIC_API_KEY", key)?;
+            mika_common::dotenv::set_env_var(&home_dir, "MIKA_LLM_API_KEY", key)?;
             println!("  API key saved to {}", home_dir.join(".env").display());
         }
         // If non-interactive and --api-key provided, skip the interactive wizard
@@ -54,7 +54,7 @@ pub async fn run(agent_name: &str, mode: SetupMode, api_key: Option<&str>) -> Re
         bail!(
             "mika setup requires an interactive terminal for first-time configuration. \
              Use `mika setup --api-key <key>` for non-interactive setup, \
-             or pre-set MIKA_ANTHROPIC_API_KEY and other env vars."
+             or pre-set MIKA_LLM_API_KEY and other env vars."
         );
     }
 
@@ -113,10 +113,9 @@ fn run_cli_prompts(
     env_written: &mut bool,
     config_written: &mut bool,
 ) -> Result<()> {
-    // 1. Anthropic API key
-    if interactive && !secret_is_set("MIKA_ANTHROPIC_API_KEY") {
-        *env_written |=
-            prompt_optional_secret(home_dir, "MIKA_ANTHROPIC_API_KEY", "  Anthropic API key")?;
+    // 1. LLM API key
+    if interactive && !secret_is_set("MIKA_LLM_API_KEY") {
+        *env_written |= prompt_optional_secret(home_dir, "MIKA_LLM_API_KEY", "  LLM API key")?;
     }
 
     // 2. Brave Search API key (optional)
@@ -250,12 +249,10 @@ fn run_compose_generation() -> Result<()> {
     println!("  This will generate a .env file for docker-compose in the current directory.\n");
 
     // --- Required secrets ---
-    let api_key = Password::new()
-        .with_prompt("  Anthropic API key")
-        .interact()?;
+    let api_key = Password::new().with_prompt("  LLM API key").interact()?;
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        bail!("Anthropic API key is required");
+        bail!("LLM API key is required");
     }
 
     let telegram_token = Password::new()
@@ -315,7 +312,7 @@ fn run_compose_generation() -> Result<()> {
     // Shared
     lines.push("# ── Shared ──".to_string());
     lines.push(format!("MIKA_INTERNAL_TOKEN={internal_token}"));
-    lines.push(format!("MIKA_ANTHROPIC_API_KEY={api_key}"));
+    lines.push(format!("MIKA_LLM_API_KEY={api_key}"));
     if !brave_key.is_empty() {
         lines.push(format!("MIKA_BRAVE_API_KEY={brave_key}"));
     }

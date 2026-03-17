@@ -9,12 +9,14 @@ pub enum ApiKeyFormat {
     ApiKey,
     /// OAuth subscription token (sk-ant-oat*)
     OAuthToken,
+    /// Non-Anthropic provider key (OpenAI, Groq, etc.)
+    ThirdParty,
 }
 
-/// Validate the format of an Anthropic API key.
+/// Validate the format of an LLM API key.
 ///
-/// Returns the detected format, or an error if the key is empty or has
-/// an unrecognized prefix.
+/// Returns the detected format, or an error if the key is empty.
+/// Recognizes Anthropic API keys, OAuth tokens, and third-party provider keys.
 pub fn validate_api_key_format(key: &str) -> Result<ApiKeyFormat, String> {
     let key = key.trim();
     if key.is_empty() {
@@ -25,7 +27,7 @@ pub fn validate_api_key_format(key: &str) -> Result<ApiKeyFormat, String> {
     } else if key.starts_with("sk-ant-") {
         Ok(ApiKeyFormat::ApiKey)
     } else {
-        Err("Unrecognized API key format (expected sk-ant-* or sk-ant-oat* prefix)".to_string())
+        Ok(ApiKeyFormat::ThirdParty)
     }
 }
 
@@ -146,9 +148,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_api_key_format_bad_prefix() {
-        let err = validate_api_key_format("bad-key-here").unwrap_err();
-        assert!(err.contains("Unrecognized"));
+    fn test_validate_api_key_format_third_party() {
+        // OpenAI key
+        assert_eq!(
+            validate_api_key_format("sk-proj-something"),
+            Ok(ApiKeyFormat::ThirdParty)
+        );
+        // Groq key
+        assert_eq!(
+            validate_api_key_format("gsk_something"),
+            Ok(ApiKeyFormat::ThirdParty)
+        );
+        // Any non-empty non-Anthropic key
+        assert_eq!(
+            validate_api_key_format("some-key"),
+            Ok(ApiKeyFormat::ThirdParty)
+        );
     }
 
     #[test]

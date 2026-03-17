@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
     }
 
     let settings = mika_common::config::Settings::load(&home_dir)
-        .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY (API key or OAuth token) and MIKA_INTERNAL_TOKEN.")?;
+        .context("Failed to load config. Set MIKA_LLM_API_KEY (API key or OAuth token) and MIKA_INTERNAL_TOKEN.")?;
 
     // Build optional OTel export layer (feature-gated, graceful degradation)
     let (otel_layer, _telemetry_guard) = mika_common::telemetry::try_init_otel(&settings);

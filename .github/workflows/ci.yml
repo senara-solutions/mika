@@ -38,7 +38,7 @@ jobs:
       - name: Smoke tests
         run: cargo test --test smoke -- --ignored
         env:
-          MIKA_ANTHROPIC_API_KEY: "sk-ant-test-dummy-key-for-smoke"
+          MIKA_LLM_API_KEY: "sk-ant-test-dummy-key-for-smoke"
           MIKA_INTERNAL_TOKEN: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
           MIKA_ROUTING_URL: "http://localhost:19999"
 

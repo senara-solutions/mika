@@ -93,13 +93,6 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     // Env backend (.env secrets)
     ConfigKeyInfo {
-        key: "anthropic_api_key",
-        backend: ConfigBackend::Env,
-        env_var: Some("MIKA_ANTHROPIC_API_KEY"),
-        secret: true,
-        description: "Anthropic API key",
-    },
-    ConfigKeyInfo {
         key: "openai_api_key",
         backend: ConfigBackend::Env,
         env_var: Some("MIKA_OPENAI_API_KEY"),
@@ -111,7 +104,7 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         backend: ConfigBackend::Env,
         env_var: Some("MIKA_LLM_API_KEY"),
         secret: true,
-        description: "LLM provider API key override (for non-Anthropic providers)",
+        description: "LLM API key",
     },
     ConfigKeyInfo {
         key: "brave_api_key",
@@ -190,7 +183,6 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
         "llm_base_url" => settings.llm_base_url.clone(),
-        "anthropic_api_key" => settings.anthropic_api_key.clone(),
         "llm_api_key" => settings.llm_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
@@ -210,10 +202,6 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
 
 #[derive(Deserialize, Clone)]
 pub struct Settings {
-    /// Anthropic API key (optional; only required for commands that call the Claude API)
-    #[serde(default)]
-    pub anthropic_api_key: Option<String>,
-
     /// LLM model ID (default: claude-sonnet-4-6). Supports provider prefix:
     /// `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`.
     /// No prefix defaults to Anthropic.
@@ -291,9 +279,8 @@ pub struct Settings {
     #[serde(default)]
     pub llm_base_url: Option<String>,
 
-    /// LLM provider API key override (for non-Anthropic providers).
-    /// When using `openai/`, `ollama/`, `groq/`, or `openai-compatible/` prefixes,
-    /// this key is used instead of `anthropic_api_key`.
+    /// LLM API key (required for any command that calls an LLM).
+    /// Supports Anthropic API keys, OAuth tokens, and third-party provider keys.
     #[serde(default)]
     pub llm_api_key: Option<String>,
 
@@ -355,26 +342,13 @@ impl Settings {
     ///
     /// Parses `llm_model` as a model spec (e.g. `anthropic/claude-sonnet-4-6`,
     /// `openai/gpt-4o`, or just `claude-sonnet-4-6` which defaults to Anthropic).
-    /// Applies `llm_base_url` and `llm_api_key` overrides for non-Anthropic providers.
-    /// For Anthropic, uses `anthropic_api_key`.
+    /// Uses `llm_api_key` for all providers.
     pub fn make_llm_provider(&self) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
         let spec = crate::llm::ModelSpec::parse(&self.llm_model)?;
 
-        // Resolve API key: for Anthropic, use anthropic_api_key; for others, prefer llm_api_key.
-        // For openai-compatible (user-specified endpoints), do NOT fall back to anthropic_api_key
-        // to prevent accidentally sending the Anthropic key to untrusted third-party endpoints.
-        let api_key = match spec.provider {
-            crate::llm::ProviderKind::Anthropic => self.anthropic_api_key.clone(),
-            crate::llm::ProviderKind::OpenAiCompatible => self.llm_api_key.clone(),
-            _ => self
-                .llm_api_key
-                .clone()
-                .or_else(|| self.anthropic_api_key.clone()),
-        };
-
         let spec = spec
             .with_base_url(self.llm_base_url.clone())
-            .with_api_key(api_key);
+            .with_api_key(self.llm_api_key.clone());
 
         crate::llm::create_provider(&spec, self.llm_max_tokens)
     }
@@ -463,10 +437,6 @@ impl Settings {
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Settings")
-            .field(
-                "anthropic_api_key",
-                &self.anthropic_api_key.as_ref().map(|_| "[REDACTED]"),
-            )
             .field("llm_model", &self.llm_model)
             .field("llm_max_tokens", &self.llm_max_tokens)
             .field("db_path", &self.db_path)
@@ -525,7 +495,6 @@ mod tests {
     fn clean_env() {
         // Safety: tests set env vars; no production thread reads these.
         unsafe {
-            std::env::set_var("MIKA_ANTHROPIC_API_KEY", "test-key");
             std::env::remove_var("MIKA_LLM_MODEL");
             std::env::remove_var("MIKA_DB_PATH");
             std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
