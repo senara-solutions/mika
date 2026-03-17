@@ -67,7 +67,7 @@ The existing `execute_from_phase()` / task engine path handles true resume autom
 ### 3. CLI unification
 
 **Add to `AskArgs`:**
-- `--team <name>` (conflicts with `--agent`, `--task-id`, `--session`)
+- `--team <name>` (conflicts with `--agent`, `--task-id`, `--session-id`)
 - `--run-id <uuid>` (requires `--team`)
 
 **Add to `ChatArgs`:**
