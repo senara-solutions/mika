@@ -508,10 +508,17 @@ async fn execute_long_running(
     let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
     let now = chrono::Utc::now().timestamp();
 
+    // Link callback task to work item via parent_task_id for task tree correlation
+    let parent_task_id = input
+        .get("work_item_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
     let task = NewTask {
         agent_id: ctx.db.agent_id.clone(),
         team_run_id: None,
-        parent_task_id: None,
+        parent_task_id,
         depth: 0,
         label: format!("long_running:{}", skill_tool.definition.name),
         trigger_type: trigger_type::CALLBACK.to_string(),
@@ -1352,6 +1359,11 @@ mod tests {
         assert_eq!(callback_tasks[0].action_type, "resume_agent");
         assert!(callback_tasks[0].label.starts_with("long_running:"));
         assert!(callback_tasks[0].timeout_at.is_some());
+        assert_eq!(
+            callback_tasks[0].parent_task_id.as_deref(),
+            Some(wi_id.as_str()),
+            "callback task should link to work item via parent_task_id"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
