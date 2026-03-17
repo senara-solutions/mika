@@ -189,9 +189,12 @@ export default function AgentDetail() {
             ))}
             {audit.total > 5 && (
               <div className="text-center pt-2">
-                <span className="text-xs text-accent hover:text-accent-light cursor-pointer">
+                <Link
+                  to={`/?event_type=audit&agent_id=${agentId}`}
+                  className="text-xs text-accent hover:text-accent-light transition-colors"
+                >
                   View Full Logs ({audit.total} total)
-                </span>
+                </Link>
               </div>
             )}
           </div>
