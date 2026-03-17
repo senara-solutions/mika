@@ -247,11 +247,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          when action is required — never assume a tool_history entry means the work is already done.\n",
     );
     prompt.push_str(
-        "- **Confirmation before action:** When the user asks an informational question \
-         (e.g., \"can you list...\", \"what are...\", \"show me...\"), answer the question \
+        "- **Confirmation before action:** When the user asks an informational or status question \
+         (e.g., \"can you list...\", \"what are...\", \"show me...\", \"did you...\", \
+         \"what happened with...\", \"is X done?\", \"what's the status?\"), answer the question \
          and stop. Do not interpret questions as implicit requests to start multi-step \
-         workflows. If a follow-up action may be useful, suggest it and wait for \
-         confirmation before proceeding.\n",
+         workflows, retry failed operations, or relaunch tasks. If a follow-up action may be \
+         useful, suggest it and wait for explicit confirmation before proceeding.\n",
     );
     let section_names = core_memory_section_names();
     write!(
@@ -1653,5 +1654,7 @@ notify = true
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("Confirmation before action"));
         assert!(prompt.contains("Do not interpret questions as implicit requests"));
+        assert!(prompt.contains("retry failed operations"));
+        assert!(prompt.contains("relaunch tasks"));
     }
 }
