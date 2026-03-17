@@ -24,8 +24,13 @@ pub async fn run(
     session_id: Option<&str>,
     parent_task_id: Option<&str>,
     format: &OutputFormat,
+    model_override: Option<&str>,
 ) -> Result<()> {
-    let ctx = init::init_for_agent(agent_name)?;
+    let mut ctx = init::init_for_agent(agent_name)?;
+
+    if let Some(model) = model_override {
+        ctx.override_model(model)?;
+    }
 
     // Use provided session ID or generate a new one.
     // When --session-id is passed (e.g., from claude-asked-relay), messages from the

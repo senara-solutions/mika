@@ -237,7 +237,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
 | `anthropic_api_key` | `Option<String>` | None | `MIKA_ANTHROPIC_API_KEY` | Anthropic API key or OAuth subscription token. Auto-detected from prefix (`sk-ant-oat` = OAuth, otherwise = API key). Required for any command that calls the Claude API. |
-| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`. No prefix defaults to Anthropic. |
+| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`. No prefix defaults to Anthropic. CLI: `--model <model>` on `mika ask` / `mika chat` overrides for a single invocation without persisting. Aliases: `sonnet`, `opus`, `haiku`. |
 | `llm_base_url` | `Option<String>` | None | `MIKA_LLM_BASE_URL` | Override base URL for OpenAI-compatible providers (e.g., `http://localhost:11434/v1` for Ollama). Each known provider has a default; only needed for `openai-compatible` or custom endpoints. |
 | `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | Generic API key for non-Anthropic providers. Falls back to `MIKA_ANTHROPIC_API_KEY` if unset. |
 | `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for Claude responses. |

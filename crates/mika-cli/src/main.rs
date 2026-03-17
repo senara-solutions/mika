@@ -162,10 +162,15 @@ async fn main() -> Result<()> {
             if !home::is_initialized(&home_dir) {
                 commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
-            commands::chat::run(&agent_name, cli.session_id.as_deref()).await
+            commands::chat::run(&agent_name, cli.session_id.as_deref(), None).await
         }
-        Some(Commands::Chat(_)) => {
-            commands::chat::run(&agent_name, cli.session_id.as_deref()).await
+        Some(Commands::Chat(ref args)) => {
+            commands::chat::run(
+                &agent_name,
+                cli.session_id.as_deref(),
+                args.model.as_deref(),
+            )
+            .await
         }
         Some(Commands::Setup { mode, api_key }) => {
             commands::setup::run(&agent_name, mode, api_key.as_deref()).await
@@ -183,6 +188,7 @@ async fn main() -> Result<()> {
                 cli.session_id.as_deref(),
                 args.parent_task_id.as_deref(),
                 &args.format,
+                args.model.as_deref(),
             )
             .await
             {
@@ -582,5 +588,90 @@ mod tests {
     fn test_agent_flag_rejected_on_teams() {
         let result = crate::cli::Cli::try_parse_from(["mika", "teams", "--agent", "work", "list"]);
         assert!(result.is_err(), "--agent should not be accepted on teams");
+    }
+
+    /// --model on ask subcommand should parse successfully.
+    #[test]
+    fn test_model_flag_on_ask_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--model", "sonnet", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert_eq!(args.model.as_deref(), Some("sonnet"));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --model on chat subcommand should parse successfully.
+    #[test]
+    fn test_model_flag_on_chat_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--model", "opus"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Chat(args)) = cli.command {
+            assert_eq!(args.model.as_deref(), Some("opus"));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    /// --model with provider-prefixed value should parse.
+    #[test]
+    fn test_model_flag_provider_prefixed() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--model", "openai/gpt-4o", "hello"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert_eq!(args.model.as_deref(), Some("openai/gpt-4o"));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --model and --team should conflict on ask subcommand.
+    #[test]
+    fn test_model_conflicts_with_team_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "ask", "--model", "sonnet", "--team", "research", "hello",
+        ]);
+        assert!(result.is_err(), "--model and --team should conflict on ask");
+    }
+
+    /// --model and --team should conflict on chat subcommand.
+    #[test]
+    fn test_model_conflicts_with_team_on_chat() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "chat", "--model", "sonnet", "--team", "research",
+        ]);
+        assert!(
+            result.is_err(),
+            "--model and --team should conflict on chat"
+        );
+    }
+
+    /// resolve_model_alias resolves known aliases and passes through unknown values.
+    #[test]
+    fn test_resolve_model_alias() {
+        assert_eq!(
+            crate::cli::resolve_model_alias("sonnet"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(crate::cli::resolve_model_alias("opus"), "claude-opus-4-6");
+        assert_eq!(crate::cli::resolve_model_alias("haiku"), "claude-haiku-4-5");
+        assert_eq!(
+            crate::cli::resolve_model_alias("Sonnet"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            crate::cli::resolve_model_alias("openai/gpt-4o"),
+            "openai/gpt-4o"
+        );
+        assert_eq!(
+            crate::cli::resolve_model_alias("claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
     }
 }

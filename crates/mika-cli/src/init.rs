@@ -68,6 +68,17 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
     Ok((settings, async_db, agent_home, global_home))
 }
 
+impl AppContext {
+    /// Apply a one-shot model override (not persisted to config).
+    /// Resolves aliases (e.g., "sonnet" → "claude-sonnet-4-6") and rebuilds the LLM provider.
+    pub fn override_model(&mut self, model: &str) -> Result<()> {
+        let resolved = crate::cli::resolve_model_alias(model);
+        self.db_ctx.settings.llm_model = resolved;
+        self.llm = self.db_ctx.settings.make_llm_provider()?;
+        Ok(())
+    }
+}
+
 /// Initialize full context for a named agent (for chat).
 pub fn init_for_agent(agent_name: &str) -> Result<AppContext> {
     let db_ctx = init_db_only_for_agent(agent_name)?;

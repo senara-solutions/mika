@@ -111,6 +111,11 @@ pub struct ChatArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
 
+    /// LLM model override for this session (e.g., sonnet, opus, haiku, openai/gpt-4o).
+    /// One-shot override, not persisted to config.
+    #[arg(long, conflicts_with = "team")]
+    pub model: Option<String>,
+
     /// Team to use (launches TUI in team mode)
     #[arg(long, conflicts_with = "agent")]
     pub team: Option<String>,
@@ -124,6 +129,11 @@ pub struct ChatArgs {
 pub struct AskArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
+
+    /// LLM model override for this invocation (e.g., sonnet, opus, haiku, openai/gpt-4o).
+    /// One-shot override, not persisted to config.
+    #[arg(long, conflicts_with = "team")]
+    pub model: Option<String>,
 
     /// The message to send (use "-" to read from stdin)
     pub message: String,
@@ -475,4 +485,24 @@ pub enum McpCommand {
         /// Name of the server to disable
         name: String,
     },
+}
+
+/// Known model shorthands: (shorthand, full_model_id, display_name).
+/// Single source of truth — used by both CLI `--model` flag and TUI `/model` command.
+pub const MODEL_ALIASES: &[(&str, &str, &str)] = &[
+    ("sonnet", "claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("opus", "claude-opus-4-6", "Claude Opus 4.6"),
+    ("haiku", "claude-haiku-4-5", "Claude Haiku 4.5"),
+];
+
+/// Resolve a model alias (e.g., "sonnet") to its full model ID (e.g., "claude-sonnet-4-6").
+/// Returns the input unchanged if it's not a known alias (allows provider-prefixed names like "openai/gpt-4o").
+pub fn resolve_model_alias(input: &str) -> String {
+    let lower = input.to_lowercase();
+    for &(alias, full_id, _display) in MODEL_ALIASES {
+        if lower == alias || lower == full_id {
+            return full_id.to_string();
+        }
+    }
+    input.to_string()
 }
