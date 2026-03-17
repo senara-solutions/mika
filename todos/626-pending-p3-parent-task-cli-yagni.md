@@ -6,11 +6,11 @@ tags: [code-review, yagni, simplification]
 dependencies: []
 ---
 
-# --parent-task CLI flag is YAGNI (no relay consumer exists)
+# --parent-task-id CLI flag is YAGNI (no relay consumer exists)
 
 ## Problem Statement
 
-The `--parent-task` flag prepends `[work-item:{uuid}]` to user messages with no parsing, no validation, and no consumer. The claude-asked relay that would use this does not exist yet. The flag also lacks UUID format validation.
+The `--parent-task-id` flag prepends `[work-item:{uuid}]` to user messages with no parsing, no validation, and no consumer. The claude-asked relay that would use this does not exist yet. The flag also lacks UUID format validation.
 
 ## Findings
 
