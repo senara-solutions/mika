@@ -168,7 +168,7 @@ Each customer gets an agent container with a persistent volume for SQLite storag
 
 | Variable | Description |
 |----------|-------------|
-| `MIKA_ANTHROPIC_API_KEY` | Anthropic API key or OAuth subscription token |
+| `MIKA_LLM_API_KEY` | LLM API key (Anthropic, OpenAI, Groq, etc.) |
 | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery |
 | `MIKA_INTERNAL_TOKEN` | Shared 64-char hex bearer token |
 
@@ -247,7 +247,7 @@ docker logs mika-<uuid> --tail 100
 **Symptom:** Customer container restarts repeatedly.
 
 **Common causes:**
-- Missing or invalid `MIKA_ANTHROPIC_API_KEY`
+- Missing or invalid `MIKA_LLM_API_KEY`
 - Corrupted SQLite database
 - Missing persistent volume mount
 

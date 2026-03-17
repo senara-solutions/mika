@@ -168,7 +168,7 @@ pub const DEFAULT_GLOBAL_CONFIG: &str = r#"# Mika global configuration (shared a
 # Override with MIKA_* environment variables (highest priority).
 #
 # Secrets go in ~/.mika/.env (auto-loaded, 0600 permissions):
-#   MIKA_ANTHROPIC_API_KEY — Anthropic API key or OAuth token
+#   MIKA_LLM_API_KEY       — LLM API key (Anthropic, OpenAI, etc.)
 #   MIKA_OPENAI_API_KEY   — OpenAI API key (optional, for vector search)
 #   MIKA_BRAVE_API_KEY    — Brave Search API key (optional, for web search)
 

@@ -58,7 +58,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~963 tests)
+- `cargo test` — Run all tests (~1372 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev --prefix dashboard` — Run dashboard dev server (requires mika-server on :8080)
@@ -103,7 +103,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Environment Variables
 
 See `.env.example` for the full list. Required:
-- `MIKA_ANTHROPIC_API_KEY` — Anthropic API key or OAuth subscription token. Auto-detected from prefix: `sk-ant-oat*` → OAuth bearer auth, otherwise → standard API key auth.
+- `MIKA_LLM_API_KEY` — LLM API key (Anthropic, OpenAI, Groq, etc.). For Anthropic keys, auto-detected from prefix: `sk-ant-oat*` → OAuth bearer auth, otherwise → standard API key auth.
 
 Optional (Layer 3 vector search):
 - `MIKA_OPENAI_API_KEY` — OpenAI API key for embedding generation (enables vector similarity in hybrid search)

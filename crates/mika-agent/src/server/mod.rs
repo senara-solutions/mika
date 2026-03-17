@@ -632,7 +632,6 @@ mod tests {
             brave_api_key: None,
             global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             settings: Settings {
-                anthropic_api_key: Some("test-key".to_string()),
                 llm_model: "claude-sonnet-4-6".to_string(),
                 llm_max_tokens: 4096,
                 db_path: std::path::PathBuf::from("/tmp/mika-test/data/mika.db"),
@@ -656,7 +655,7 @@ mod tests {
                 otlp_endpoint: None,
                 otlp_auth_header: None,
                 llm_base_url: None,
-                llm_api_key: None,
+                llm_api_key: Some("test-key".to_string()),
             },
             dashboard_db,
             investigation_lock: Arc::new(tokio::sync::Mutex::new(())),

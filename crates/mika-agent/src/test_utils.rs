@@ -169,7 +169,6 @@ pub mod test_helpers {
     /// Minimal Settings for validation-only tests (no API key needed).
     pub fn dummy_settings() -> Settings {
         Settings {
-            anthropic_api_key: None,
             llm_model: "claude-sonnet-4-6".to_string(),
             llm_max_tokens: 4096,
             db_path: PathBuf::from("test.db"),

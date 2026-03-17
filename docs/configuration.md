@@ -123,7 +123,7 @@ existing shell environment variables. File permissions are set to `0600`.
 
 ```sh
 # ~/.mika/.env
-MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
+MIKA_LLM_API_KEY=sk-ant-api03-...
 MIKA_OPENAI_API_KEY=sk-...
 MIKA_BRAVE_API_KEY=BSA...
 MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...
@@ -200,7 +200,7 @@ Write a configuration value:
 ```sh
 mika config set llm_model claude-opus-4-6     # writes to agent config.toml
 mika config set llm_max_tokens 8192            # validated as integer
-mika config set anthropic_api_key                 # secret: prompts interactively, writes to .env
+mika config set llm_api_key                 # secret: prompts interactively, writes to .env
 ```
 
 Behavior depends on the key's backend:
@@ -236,10 +236,9 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
-| `anthropic_api_key` | `Option<String>` | None | `MIKA_ANTHROPIC_API_KEY` | Anthropic API key or OAuth subscription token. Auto-detected from prefix (`sk-ant-oat` = OAuth, otherwise = API key). Required for any command that calls the Claude API. |
+| `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | LLM API key. Supports Anthropic API keys (`sk-ant-api03-...`), OAuth subscription tokens (`sk-ant-oat01-...`), and third-party provider keys. Auto-detected from prefix for auth scheme selection. Required for any command that calls an LLM. |
 | `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`. No prefix defaults to Anthropic. CLI: `--model <model>` on `mika ask` / `mika chat` overrides for a single invocation without persisting. Aliases: `sonnet`, `opus`, `haiku`. |
 | `llm_base_url` | `Option<String>` | None | `MIKA_LLM_BASE_URL` | Override base URL for OpenAI-compatible providers (e.g., `http://localhost:11434/v1` for Ollama). Each known provider has a default; only needed for `openai-compatible` or custom endpoints. |
-| `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | Generic API key for non-Anthropic providers. Falls back to `MIKA_ANTHROPIC_API_KEY` if unset. |
 | `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for Claude responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
@@ -267,14 +266,14 @@ defaults to `~/.mika/`.
 
 ### Security notes
 
-- `anthropic_api_key`, `llm_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `investigate_github_token`, and `otlp_auth_header` are redacted in
+- `llm_api_key`, `internal_token`, `dashboard_token`, `brave_api_key`, `investigate_github_token`, and `otlp_auth_header` are redacted in
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
-- `anthropic_api_key` accepts both standard API keys and OAuth subscription
-  tokens. Mika detects the type from the `sk-ant-oat` prefix and adjusts the
-  HTTP auth scheme automatically (Bearer + `anthropic-beta` header for OAuth,
-  `x-api-key` header for standard keys).
+- When `llm_api_key` contains an Anthropic credential, Mika detects the type
+  from the `sk-ant-oat` prefix and adjusts the HTTP auth scheme automatically
+  (Bearer + `anthropic-beta` header for OAuth, `x-api-key` header for standard
+  keys). For non-Anthropic providers, the key is sent as a Bearer token.
 - Secrets should be set in `~/.mika/.env` or via shell environment variables, never committed to config files.
 - `internal_token` is validated on load: if present, it must be exactly 64
   hex characters. Invalid values cause an immediate startup error.
@@ -410,7 +409,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key or OAuth subscription token |
+| `MIKA_LLM_API_KEY` | Yes | LLM API key (Anthropic, OpenAI, Groq, etc.) |
 | `MIKA_LLM_MODEL` | No | Override model (default: `claude-sonnet-4-6`) |
 | `MIKA_LLM_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
 | `MIKA_DB_PATH` | No | Override database path |
@@ -418,7 +417,6 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
 | `MIKA_LLM_BASE_URL` | No | Override base URL for OpenAI-compatible providers |
-| `MIKA_LLM_API_KEY` | No | Generic API key for non-Anthropic providers (falls back to `MIKA_ANTHROPIC_API_KEY`) |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
@@ -434,7 +432,7 @@ are required for inter-service communication:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key or OAuth subscription token |
+| `MIKA_LLM_API_KEY` | Yes | LLM API key (Anthropic, OpenAI, Groq, etc.) |
 | `MIKA_ROUTING_URL` | Yes | Gateway URL for outbound message delivery |
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for gateway auth |
 | `MIKA_CUSTOMER_ID` | Yes | Customer identifier for this container |
@@ -496,8 +494,8 @@ is present, Anthropic is used by default.
 
 | Provider | Prefix | Default Base URL | API Key Required |
 |----------|--------|------------------|------------------|
-| Anthropic (default) | `anthropic/` or none | `https://api.anthropic.com` | `MIKA_ANTHROPIC_API_KEY` |
-| OpenAI | `openai/` | `https://api.openai.com/v1` | `MIKA_LLM_API_KEY` or `MIKA_ANTHROPIC_API_KEY` |
+| Anthropic (default) | `anthropic/` or none | `https://api.anthropic.com` | `MIKA_LLM_API_KEY` |
+| OpenAI | `openai/` | `https://api.openai.com/v1` | `MIKA_LLM_API_KEY` |
 | Ollama | `ollama/` | `http://localhost:11434/v1` | Optional |
 | Groq | `groq/` | `https://api.groq.com/openai/v1` | `MIKA_LLM_API_KEY` |
 | OpenAI-compatible | `openai-compatible/` | None (requires `MIKA_LLM_BASE_URL`) | `MIKA_LLM_API_KEY` |
