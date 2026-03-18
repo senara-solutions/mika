@@ -1131,11 +1131,7 @@ mod tests {
         )
         .unwrap();
         // 17KB — over 16KB default
-        fs::write(
-            skill_dir.join("system_prompt.md"),
-            "x".repeat(17 * 1024),
-        )
-        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "x".repeat(17 * 1024)).unwrap();
 
         let diags = validate_skill(&skill_dir);
         let fail_diag = diags
@@ -1159,11 +1155,7 @@ mod tests {
         )
         .unwrap();
         // 13KB — above 75% of 16KB (12288) but under 16KB
-        fs::write(
-            skill_dir.join("system_prompt.md"),
-            "x".repeat(13 * 1024),
-        )
-        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "x".repeat(13 * 1024)).unwrap();
 
         let diags = validate_skill(&skill_dir);
         let warn_diag = diags
@@ -1188,17 +1180,11 @@ mod tests {
         )
         .unwrap();
         // 20KB — over 16KB default but under 32KB override
-        fs::write(
-            skill_dir.join("system_prompt.md"),
-            "x".repeat(20 * 1024),
-        )
-        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "x".repeat(20 * 1024)).unwrap();
 
         let diags = validate_skill(&skill_dir);
         // Should NOT have a fail diagnostic — 20KB is under 32KB override
-        let fail_diag = diags
-            .iter()
-            .find(|d| d.message.contains("exceeds limit"));
+        let fail_diag = diags.iter().find(|d| d.message.contains("exceeds limit"));
         assert!(fail_diag.is_none());
         // Should have an OK diagnostic
         let ok_diag = diags
