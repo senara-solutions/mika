@@ -9,8 +9,12 @@ use super::manifest::{SkillManifest, SkillToolDef, ToolHandler};
 /// Maximum size for skill.toml files (64 KB).
 const MAX_SKILL_TOML_SIZE: u64 = 64 * 1024;
 
-/// Maximum size for system_prompt.md snippets (8 KB).
-const MAX_PROMPT_SNIPPET_SIZE: u64 = 8 * 1024;
+/// Default maximum size for system_prompt.md snippets (16 KB).
+const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
+
+/// Hard ceiling for per-skill `max_prompt_size` override (64 KB).
+/// Prevents marketplace skills from loading arbitrarily large prompts.
+const MAX_PROMPT_SIZE_CEILING: u64 = 64 * 1024;
 
 /// Maximum size for tools.json files (256 KB).
 const MAX_TOOLS_JSON_SIZE: u64 = 256 * 1024;
@@ -133,7 +137,22 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
 
         // Load prompt snippet eagerly at startup (cached in SkillEntry)
         let snippet_path = path.join("system_prompt.md");
-        let prompt_snippet = load_snippet_with_limit(&snippet_path);
+        let max_size = manifest
+            .skill
+            .max_prompt_size
+            .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+            .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+        if let Some(requested) = manifest.skill.max_prompt_size
+            && requested > MAX_PROMPT_SIZE_CEILING
+        {
+            warn!(
+                skill = %manifest.skill.name,
+                requested = requested,
+                ceiling = MAX_PROMPT_SIZE_CEILING,
+                "max_prompt_size exceeds ceiling, clamping"
+            );
+        }
+        let prompt_snippet = load_snippet_with_limit(&snippet_path, max_size);
 
         // Check for .disabled marker file
         let enabled = !path.join(".disabled").exists();
@@ -340,9 +359,48 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
-    // 6. Warnings for no-op or never-activates skills
+    // 6. Check prompt snippet size against effective limit
+    let snippet_path = skill_dir.join("system_prompt.md");
+    if snippet_path.exists() {
+        let effective_limit = manifest
+            .skill
+            .max_prompt_size
+            .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+            .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+
+        if let Ok(meta) = std::fs::metadata(&snippet_path) {
+            let size = meta.len();
+            if size > effective_limit {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "system_prompt.md ({} bytes) exceeds limit ({} bytes) — snippet will be skipped at startup",
+                    size, effective_limit
+                )));
+            } else if effective_limit > 0 && size > effective_limit * 3 / 4 {
+                diags.push(SkillDiagnostic::warn(format!(
+                    "system_prompt.md ({} bytes) is above 75% of limit ({} bytes)",
+                    size, effective_limit
+                )));
+            } else {
+                diags.push(SkillDiagnostic::ok(format!(
+                    "system_prompt.md size OK ({} bytes, limit {} bytes)",
+                    size, effective_limit
+                )));
+            }
+        }
+
+        if let Some(requested) = manifest.skill.max_prompt_size
+            && requested > MAX_PROMPT_SIZE_CEILING
+        {
+            diags.push(SkillDiagnostic::warn(format!(
+                "max_prompt_size ({} bytes) exceeds ceiling ({} bytes), will be clamped",
+                requested, MAX_PROMPT_SIZE_CEILING
+            )));
+        }
+    }
+
+    // 7. Warnings for no-op or never-activates skills
     let has_tools = tools_path.exists();
-    let has_snippet = skill_dir.join("system_prompt.md").exists();
+    let has_snippet = snippet_path.exists();
     if !has_tools && !has_snippet {
         diags.push(SkillDiagnostic::warn(
             "no-op skill: no tools.json and no system_prompt.md",
@@ -470,14 +528,15 @@ fn load_tools_json(skill_dir: &Path) -> Vec<ResolvedSkillTool> {
 }
 
 /// Load a prompt snippet file with size limit enforcement.
-fn load_snippet_with_limit(path: &Path) -> String {
+fn load_snippet_with_limit(path: &Path, max_size: u64) -> String {
     if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > MAX_PROMPT_SNIPPET_SIZE
+        && meta.len() > max_size
     {
         warn!(
             path = %path.display(),
             size = meta.len(),
-            "prompt snippet exceeds 8KB, skipping"
+            limit = max_size,
+            "prompt snippet exceeds size limit, skipping"
         );
         return String::new();
     }
@@ -670,15 +729,120 @@ mod tests {
     }
 
     #[test]
-    fn test_snippet_size_limit() {
+    fn test_snippet_size_limit_default() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("system_prompt.md");
-        // Write a file larger than 8KB
-        let big_content = "x".repeat(9 * 1024);
+        // Write a file larger than 16KB default
+        let big_content = "x".repeat(17 * 1024);
         fs::write(&path, &big_content).unwrap();
 
-        let snippet = load_snippet_with_limit(&path);
+        let snippet = load_snippet_with_limit(&path, MAX_PROMPT_SNIPPET_SIZE);
         assert_eq!(snippet, "");
+    }
+
+    #[test]
+    fn test_snippet_size_limit_custom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("system_prompt.md");
+        // 10KB file — under 16KB default, tested with explicit 32KB limit
+        let content = "x".repeat(10 * 1024);
+        fs::write(&path, &content).unwrap();
+
+        let snippet = load_snippet_with_limit(&path, 32 * 1024);
+        assert_eq!(snippet.len(), 10 * 1024);
+    }
+
+    #[test]
+    fn test_snippet_size_limit_zero_always_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("system_prompt.md");
+        fs::write(&path, "tiny").unwrap();
+
+        let snippet = load_snippet_with_limit(&path, 0);
+        assert_eq!(snippet, "");
+    }
+
+    #[test]
+    fn test_snippet_under_default_limit_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("system_prompt.md");
+        let content = "x".repeat(15 * 1024); // 15KB, under 16KB default
+        fs::write(&path, &content).unwrap();
+
+        let snippet = load_snippet_with_limit(&path, MAX_PROMPT_SNIPPET_SIZE);
+        assert_eq!(snippet.len(), 15 * 1024);
+    }
+
+    #[test]
+    fn test_scan_loads_large_snippet_with_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("big-prompt");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "big-prompt"
+            description = "Skill with large prompt"
+            max_prompt_size = 32768
+            "#,
+        )
+        .unwrap();
+        // 20KB prompt — over 16KB default but under 32KB override
+        let content = "x".repeat(20 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet.len(), 20 * 1024);
+    }
+
+    #[test]
+    fn test_scan_clamps_override_to_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("huge-prompt");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "huge-prompt"
+            description = "Skill requesting too much"
+            max_prompt_size = 1048576
+            "#,
+        )
+        .unwrap();
+        // 100KB prompt — over 64KB ceiling
+        let content = "x".repeat(100 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        // Should be empty because 100KB > 64KB ceiling
+        assert_eq!(scan.entries[0].prompt_snippet, "");
+    }
+
+    #[test]
+    fn test_scan_skips_snippet_over_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("too-big");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "too-big"
+            description = "Prompt over default limit"
+            "#,
+        )
+        .unwrap();
+        // 17KB prompt — over 16KB default
+        let content = "x".repeat(17 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "");
     }
 
     #[test]
@@ -927,6 +1091,106 @@ mod tests {
             required.contains(&serde_json::Value::String("work_item_id".to_string())),
             "work_item_id should be in required fields"
         );
+    }
+
+    #[test]
+    fn test_validate_skill_prompt_size_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("small-prompt");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "small-prompt"
+            description = "Small prompt skill"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Small prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let prompt_diag = diags
+            .iter()
+            .find(|d| d.message.contains("system_prompt.md size OK"));
+        assert!(prompt_diag.is_some());
+    }
+
+    #[test]
+    fn test_validate_skill_prompt_oversized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("big-prompt");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "big-prompt"
+            description = "Big prompt skill"
+            "#,
+        )
+        .unwrap();
+        // 17KB — over 16KB default
+        fs::write(skill_dir.join("system_prompt.md"), "x".repeat(17 * 1024)).unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail_diag = diags
+            .iter()
+            .find(|d| d.message.contains("exceeds limit") && d.level == DiagnosticLevel::Fail);
+        assert!(fail_diag.is_some());
+    }
+
+    #[test]
+    fn test_validate_skill_prompt_near_limit_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("near-limit");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "near-limit"
+            description = "Near limit prompt"
+            "#,
+        )
+        .unwrap();
+        // 13KB — above 75% of 16KB (12288) but under 16KB
+        fs::write(skill_dir.join("system_prompt.md"), "x".repeat(13 * 1024)).unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let warn_diag = diags
+            .iter()
+            .find(|d| d.message.contains("above 75%") && d.level == DiagnosticLevel::Warn);
+        assert!(warn_diag.is_some());
+    }
+
+    #[test]
+    fn test_validate_skill_prompt_with_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("override-prompt");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "override-prompt"
+            description = "Skill with override"
+            max_prompt_size = 32768
+            "#,
+        )
+        .unwrap();
+        // 20KB — over 16KB default but under 32KB override
+        fs::write(skill_dir.join("system_prompt.md"), "x".repeat(20 * 1024)).unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        // Should NOT have a fail diagnostic — 20KB is under 32KB override
+        let fail_diag = diags.iter().find(|d| d.message.contains("exceeds limit"));
+        assert!(fail_diag.is_none());
+        // Should have an OK diagnostic
+        let ok_diag = diags
+            .iter()
+            .find(|d| d.message.contains("system_prompt.md size OK"));
+        assert!(ok_diag.is_some());
     }
 
     #[test]

@@ -35,6 +35,9 @@ pub struct SkillInfo {
     /// One level only — no transitive resolution.
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Optional max prompt snippet size in bytes. Overrides the global 16KB default.
+    #[serde(default)]
+    pub max_prompt_size: Option<u64>,
 }
 
 /// Keyword triggers that control when a skill is injected into a turn.
@@ -197,6 +200,29 @@ mod tests {
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert!(manifest.skill.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_max_prompt_size() {
+        let toml_str = r#"
+            [skill]
+            name = "big-prompt"
+            description = "Skill with custom prompt size"
+            max_prompt_size = 32768
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.skill.max_prompt_size, Some(32768));
+    }
+
+    #[test]
+    fn test_parse_no_max_prompt_size_defaults_none() {
+        let toml_str = r#"
+            [skill]
+            name = "normal"
+            description = "Normal skill"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.skill.max_prompt_size, None);
     }
 
     #[test]

@@ -57,6 +57,7 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `always_on`    | bool   | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
 | `timeout_secs` | u64    | No       | `30`    | Per-tool execution timeout in seconds. |
 | `dependencies` | Array\<String\> | No | `[]` | Other skill names that should be loaded when this skill is active. One level only — no transitive resolution. |
+| `max_prompt_size` | u64 | No | `None` | Override the default 16KB size limit for `system_prompt.md`. Clamped to a 64KB ceiling to prevent abuse. |
 
 ### `[triggers]` section
 
@@ -337,6 +338,19 @@ This is injected as:
 ```
 
 If the file is missing or empty, no snippet is injected for that skill. Snippets are loaded asynchronously (`tokio::fs::read_to_string`) on each turn, so changes to the file take effect immediately without restarting Mika.
+
+### Size limit
+
+Prompt snippets are subject to a size limit to prevent excessive token usage. The default limit is **16KB**. Snippets that exceed the limit are silently skipped (with a warning in the log). To allow a larger prompt, set `max_prompt_size` in `skill.toml`:
+
+```toml
+[skill]
+name = "large-prompt-skill"
+description = "Skill with a large system prompt"
+max_prompt_size = 32768  # 32KB
+```
+
+The `max_prompt_size` value is clamped to a hard ceiling of **64KB** regardless of what is specified. Use `mika skills validate` to check whether a skill's prompt exceeds its effective limit.
 
 ---
 

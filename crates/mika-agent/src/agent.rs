@@ -2013,6 +2013,7 @@ mod tests {
                     always_on: false,
                     timeout_secs: timeout,
                     dependencies: vec![],
+                    max_prompt_size: None,
                 },
                 triggers: Triggers {
                     keywords: vec![name.to_string()],

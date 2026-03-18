@@ -260,6 +260,7 @@ impl Tool for CreateSkillTool {
                 always_on,
                 timeout_secs: 30,
                 dependencies,
+                max_prompt_size: None,
             },
             triggers: Triggers { keywords },
         };
