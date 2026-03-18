@@ -1213,7 +1213,7 @@ impl Database {
                 AND action_type = 'send_message';
              CREATE INDEX IF NOT EXISTS idx_tasks_callback_delivery
                 ON tasks(agent_id, completed_at)
-                WHERE trigger_type='callback' AND action_type='resume_agent' AND status='completed';
+                WHERE trigger_type='callback' AND action_type='resume_agent' AND status IN ('completed','failed');
              CREATE INDEX IF NOT EXISTS idx_tasks_manual_active
                 ON tasks(agent_id, created_at DESC)
                 WHERE trigger_type = 'manual'
@@ -1568,7 +1568,7 @@ impl Database {
                  CREATE INDEX idx_tasks_manual_active ON tasks(agent_id, created_at DESC) WHERE trigger_type = 'manual' AND status IN ('pending', 'in_progress', 'blocked');
                  CREATE UNIQUE INDEX idx_tasks_unique_recurring ON tasks(agent_id, label COLLATE NOCASE) WHERE trigger_type = 'recurring' AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
                  CREATE UNIQUE INDEX idx_tasks_unique_reminder ON tasks(agent_id, label COLLATE NOCASE) WHERE status IN ('pending', 'in_progress', 'recurring_active') AND action_type = 'send_message';
-                 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at) WHERE trigger_type='callback' AND action_type='resume_agent' AND status='completed';")?;
+                 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at) WHERE trigger_type='callback' AND action_type='resume_agent' AND status IN ('completed','failed');")?;
 
             // --- messages ---
             self.conn.execute_batch(
@@ -2466,7 +2466,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Get callback tasks that completed but have not yet been delivered to the user.
+    /// Get callback tasks that completed or failed but have not yet been delivered to the user.
     /// Bounded by `since` (ISO 8601) to avoid processing stale callbacks.
     pub fn get_undelivered_callback_tasks(&self, agent_id: &str, since: &str) -> Result<Vec<Task>> {
         let sql = format!(
@@ -2474,7 +2474,7 @@ impl Database {
              WHERE agent_id = ?1
                AND trigger_type = 'callback'
                AND action_type = 'resume_agent'
-               AND status = 'completed'
+               AND status IN ('completed', 'failed')
                AND completed_at IS NOT NULL
                AND completed_at > ?2
              ORDER BY completed_at ASC",
@@ -2487,7 +2487,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Get callback tasks that completed but have not yet been delivered,
+    /// Get callback tasks that completed or failed but have not yet been delivered,
     /// scoped to a specific session. Used by TUI to avoid cross-session leakage.
     pub fn get_undelivered_callback_tasks_for_session(
         &self,
@@ -2500,7 +2500,7 @@ impl Database {
              WHERE agent_id = ?1
                AND trigger_type = 'callback'
                AND action_type = 'resume_agent'
-               AND status = 'completed'
+               AND status IN ('completed', 'failed')
                AND completed_at IS NOT NULL
                AND completed_at > ?2
                AND created_by_session = ?3
@@ -2514,12 +2514,12 @@ impl Database {
         Ok(rows)
     }
 
-    /// Atomically mark a completed callback task as delivered.
-    /// Returns `false` if the task was already claimed (not in 'completed' status).
+    /// Atomically mark a completed or failed callback task as delivered.
+    /// Returns `false` if the task was already claimed (not in 'completed'/'failed' status).
     pub fn mark_task_delivered(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             WHERE id = ?1 AND status = 'completed'",
+             WHERE id = ?1 AND status IN ('completed', 'failed')",
             params![id],
         )?;
         Ok(n > 0)
@@ -6380,7 +6380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_undelivered_callback_tasks_returns_completed_only() {
+    fn test_get_undelivered_callback_tasks_returns_completed() {
         let db = db();
         let id = db.create_task(&callback_task("mika")).unwrap();
 
@@ -6515,6 +6515,100 @@ mod tests {
         let id = db.create_task(&callback_task("mika")).unwrap();
 
         // Task is still pending, should not be claimable
+        assert!(!db.mark_task_delivered(&id).unwrap());
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_returns_failed_tasks() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+
+        // Mark it as failed (simulates background monitor detecting non-zero exit)
+        db.update_task_failed(&id, "mika", "Process exited with code 1: error output")
+            .unwrap();
+
+        // Failed task should appear in undelivered callbacks
+        let results = db
+            .get_undelivered_callback_tasks("mika", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+        assert_eq!(results[0].status, "failed");
+        assert_eq!(
+            results[0].result.as_deref(),
+            Some("Process exited with code 1: error output")
+        );
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_returns_both_completed_and_failed() {
+        let db = db();
+        let id1 = db.create_task(&callback_task("mika")).unwrap();
+        let id2 = db.create_task(&callback_task("mika")).unwrap();
+
+        // Complete one, fail the other
+        assert!(
+            db.update_task_completed(&id1, "mika", Some("success"))
+                .unwrap()
+        );
+        db.update_task_failed(&id2, "mika", "Process exited with code 128: fatal error")
+            .unwrap();
+
+        // Both should appear, ordered by completed_at
+        let results = db
+            .get_undelivered_callback_tasks("mika", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        // Both tasks present (order depends on completed_at which is set to 'now' for both)
+        let statuses: Vec<&str> = results.iter().map(|t| t.status.as_str()).collect();
+        assert!(statuses.contains(&"completed"));
+        assert!(statuses.contains(&"failed"));
+    }
+
+    #[test]
+    fn test_get_undelivered_callback_tasks_for_session_returns_failed() {
+        let db = db();
+        let mut task = callback_task("mika");
+        task.created_by_session = Some("session_a".to_string());
+        let id = db.create_task(&task).unwrap();
+        db.update_task_failed(&id, "mika", "crash").unwrap();
+
+        // Session A should see the failed task
+        let results = db
+            .get_undelivered_callback_tasks_for_session("mika", "1970-01-01T00:00:00Z", "session_a")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "failed");
+
+        // Session B should not
+        let results = db
+            .get_undelivered_callback_tasks_for_session("mika", "1970-01-01T00:00:00Z", "session_b")
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_mark_task_delivered_claims_failed_task() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        db.update_task_failed(&id, "mika", "exit code 1").unwrap();
+
+        // Claim the failed task
+        assert!(db.mark_task_delivered(&id).unwrap());
+
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "delivered");
+    }
+
+    #[test]
+    fn test_mark_task_delivered_failed_double_claim_rejected() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        db.update_task_failed(&id, "mika", "exit code 1").unwrap();
+
+        // First claim
+        assert!(db.mark_task_delivered(&id).unwrap());
+        // Second claim returns false (already delivered)
         assert!(!db.mark_task_delivered(&id).unwrap());
     }
 

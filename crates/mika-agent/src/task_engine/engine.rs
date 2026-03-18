@@ -198,6 +198,7 @@ impl TaskEngine {
             self.expire_timed_out_tasks().await;
             self.kill_orphan_processes().await;
             self.scan_db_for_new_tasks().await;
+            self.dispatch_undelivered_callbacks().await;
         }
 
         let now = crate::timestamp::now();
@@ -307,6 +308,36 @@ impl TaskEngine {
         }
         if added > 0 {
             debug!(added, "periodic scan added new tasks to engine queue");
+        }
+    }
+
+    /// Dispatch undelivered callback tasks (both completed and failed) directly
+    /// to the agent. In server mode, failed callbacks from the background monitor
+    /// have no external trigger — this periodic scan ensures they are delivered.
+    ///
+    /// Unlike schedulable tasks, callbacks bypass the heap and dispatch immediately
+    /// because they are already in a terminal state waiting for delivery.
+    /// `dispatch_resume_agent` handles the atomic `mark_task_delivered` call internally.
+    async fn dispatch_undelivered_callbacks(&self) {
+        let since = crate::timestamp::now_minus(chrono::Duration::days(7));
+        let tasks = match self.db.get_undelivered_callback_tasks(&since).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "failed to scan for undelivered callback tasks");
+                return;
+            }
+        };
+
+        for task in tasks {
+            let dispatcher = self.dispatcher.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dispatcher.dispatch_resume_agent(&task).await {
+                    // AgentBusy is expected — next scan cycle will retry
+                    if !matches!(e, super::dispatcher::DispatchError::AgentBusy(_)) {
+                        warn!(task_id = %task.id, error = %e, "failed to dispatch undelivered callback");
+                    }
+                }
+            });
         }
     }
 

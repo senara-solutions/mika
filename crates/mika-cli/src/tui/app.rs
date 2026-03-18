@@ -239,12 +239,15 @@ pub enum AgentRequest {
         images: Vec<ImageAttachment>,
         thinking_budget: Option<u32>,
     },
-    /// A background callback task has completed — inject into the conversation.
+    /// A background callback task has completed or failed — inject into the conversation.
     CallbackResult {
         task_id: String,
         label: String,
         result: String,
         trace_id: Option<String>,
+        /// Original task status before delivery ("completed" or "failed").
+        /// Used by error-recovery to reset to the correct pre-delivery status.
+        original_status: String,
     },
     SetModel {
         model: String,
@@ -1342,18 +1345,23 @@ impl<'a> App<'a> {
                 }
             }
 
-            let result = task.result.unwrap_or_default();
-            if result.is_empty() {
-                continue;
-            }
+            let is_failed = task.status == "failed";
+            let result = match task.result {
+                Some(r) if !r.is_empty() => r,
+                _ if is_failed => mika_agent::agent::FAILED_TASK_FALLBACK.to_string(),
+                _ => continue, // skip completed tasks with no result
+            };
 
             // Show a system message that a callback arrived
+            let status_label = if is_failed { "failed" } else { "completed" };
             self.messages.push(ChatMessage {
                 role: ChatRole::System,
-                content: format!("[{}] completed", task.label),
+                content: format!("[{}] {}", task.label, status_label),
                 rendered: None,
                 channel: None,
             });
+
+            let original_status = task.status.clone();
 
             // Send to agent worker for processing
             let _ = self.agent_tx.send(AgentRequest::CallbackResult {
@@ -1361,6 +1369,7 @@ impl<'a> App<'a> {
                 label: task.label,
                 result,
                 trace_id: task.created_trace_id,
+                original_status,
             });
 
             self.status = AgentStatus::Thinking;

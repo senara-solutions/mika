@@ -252,7 +252,7 @@ impl TaskDispatcher {
         Ok(())
     }
 
-    /// Resume the agent after a callback task completes.
+    /// Resume the agent after a callback task completes or fails.
     ///
     /// Reads `task.result` (set by the callback) and runs a silent agent turn with
     /// the result injected as context. Uses `send_message` to deliver the response.
@@ -260,14 +260,18 @@ impl TaskDispatcher {
     /// Returns `Err` with a specific message when the agent is busy so the caller
     /// can re-queue the task instead of losing the callback result.
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
-        let result = task.result.clone().unwrap_or_default();
-        if result.is_empty() {
-            return Err(anyhow!(
-                "resume_agent task {} has no result — callback may not have completed yet",
-                task.id
-            )
-            .into());
-        }
+        let is_failed = task.status == "failed";
+        let result = match task.result.clone() {
+            Some(r) if !r.is_empty() => r,
+            _ if is_failed => crate::agent::FAILED_TASK_FALLBACK.to_string(),
+            _ => {
+                return Err(anyhow!(
+                    "resume_agent task {} has no result — callback may not have completed yet",
+                    task.id
+                )
+                .into());
+            }
+        };
 
         // Acquire agent lock — return error if busy so caller can re-queue
         let _guard = if let Some(ref lock) = self.agent_lock {
@@ -309,6 +313,7 @@ impl TaskDispatcher {
                 task_id: task.id.clone(),
                 label: task.label.clone(),
                 result,
+                failed: is_failed,
             },
             home_dir: &self.home_dir,
             session_id: &session_id,
