@@ -1,5 +1,6 @@
 mod auth;
 pub mod dashboard;
+pub mod embedded_dashboard;
 mod handlers;
 pub mod investigate;
 pub mod json_extractor;
@@ -136,6 +137,8 @@ fn build_router(state: AppState) -> Router {
 
     mutation_routes
         .nest("/api/v1", dashboard_routes)
+        // Embedded dashboard SPA (no auth — static assets; SPA authenticates its own API calls)
+        .nest("/dashboard", embedded_dashboard::dashboard_routes())
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
         .layer(TraceLayer::new_for_http())
@@ -650,6 +653,7 @@ mod tests {
                 github_repo: None,
                 home_dir: std::path::PathBuf::from("/tmp/mika-test"),
                 server_log_file: None,
+                dashboard_enabled: false,
                 disable_bundled_skills: false,
                 telemetry_enabled: false,
                 otlp_endpoint: None,

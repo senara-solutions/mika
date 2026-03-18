@@ -46,6 +46,7 @@ base64.workspace = true
 rmcp.workspace = true
 http.workspace = true
 tempfile.workspace = true
+rust-embed.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

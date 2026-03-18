@@ -240,6 +240,12 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
 fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let now = chrono::Utc::now().format("%H:%M UTC");
 
+    let dashboard_dot_color = if app.dashboard_running {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
     let header = if app.is_team_mode() {
         Line::from(vec![
             Span::styled(
@@ -248,6 +254,9 @@ fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::raw("   "),
+            Span::styled("\u{25CF}", Style::default().fg(dashboard_dot_color)),
+            Span::styled(" Dashboard", Style::default().fg(Color::DarkGray)),
             Span::raw("   "),
             Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
         ])
@@ -264,6 +273,9 @@ fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                 format!("\u{2014} session {short_session}"),
                 Style::default().fg(Color::DarkGray),
             ),
+            Span::raw("   "),
+            Span::styled("\u{25CF}", Style::default().fg(dashboard_dot_color)),
+            Span::styled(" Dashboard", Style::default().fg(Color::DarkGray)),
             Span::raw("   "),
             Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
         ])

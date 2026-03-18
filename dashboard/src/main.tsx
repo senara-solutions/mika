@@ -5,6 +5,9 @@ import { BrowserRouter } from 'react-router'
 import App from './App.tsx'
 import './index.css'
 
+// Resolve base path: server-injected config (embedded mode) or default '/'
+const basePath = window.__MIKA_CONFIG__?.basePath || '/'
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -17,7 +20,7 @@ const queryClient = new QueryClient({
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      <BrowserRouter basename={basePath}>
         <App />
       </BrowserRouter>
     </QueryClientProvider>

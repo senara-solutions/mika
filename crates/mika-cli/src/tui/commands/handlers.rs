@@ -11,8 +11,22 @@ use crate::tui::input;
 
 /// Commands allowed in team mode. New commands are blocked by default (safe failure mode).
 const TEAM_MODE_ALLOWED_COMMANDS: &[&str] = &[
-    "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team", "status",
-    "stat", "verbose", "v",
+    "help",
+    "h",
+    "?",
+    "clear",
+    "exit",
+    "quit",
+    "q",
+    "export",
+    "agents",
+    "teams",
+    "team",
+    "status",
+    "stat",
+    "verbose",
+    "v",
+    "dashboard",
 ];
 
 /// Dispatch a slash command string to the appropriate handler.
@@ -64,6 +78,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "attach" | "img" => Some(handle_attach(app, args)),
         "undo" => Some(handle_undo(app).await),
         "rewind" => Some(handle_rewind(app, args).await),
+        "dashboard" => Some(handle_dashboard(app, args)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -988,6 +1003,91 @@ async fn handle_rewind_impl(
             output
         }
         Err(e) => format!("Rewind failed: {e}"),
+    }
+}
+
+fn handle_dashboard(app: &mut App<'_>, args: &str) -> String {
+    let sub = args.trim().to_lowercase();
+    match sub.as_str() {
+        "start" => {
+            if crate::commands::dashboard::is_dashboard_running() {
+                app.dashboard_running = true;
+                "Dashboard is already running.".to_string()
+            } else {
+                match std::process::Command::new("npm").arg("--version").output() {
+                    Ok(output) if output.status.success() => {}
+                    _ => {
+                        return "npm is not installed or not in PATH.".to_string();
+                    }
+                }
+                // Attempt to find project root and start
+                match crate::commands::dashboard::find_project_root_pub() {
+                    Some(root) => {
+                        let home = home::resolve_home_dir();
+                        let mut cmd = std::process::Command::new("npm");
+                        cmd.arg("run")
+                            .arg("dev:dashboard")
+                            .current_dir(&root)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .stdin(std::process::Stdio::null());
+
+                        // Pass dashboard token if available
+                        if let Ok(ref h) = home {
+                            mika_common::dotenv::load_dotenv(h);
+                        }
+                        if let Ok(token) = std::env::var("MIKA_DASHBOARD_TOKEN")
+                            .or_else(|_| std::env::var("MIKA_INTERNAL_TOKEN"))
+                        {
+                            cmd.env("VITE_MIKA_DASHBOARD_TOKEN", token);
+                        }
+
+                        match cmd.spawn() {
+                            Ok(child) => {
+                                let pid = child.id();
+                                if let Ok(pid_path) = crate::commands::dashboard::pid_file_path_pub()
+                                {
+                                    let _ = std::fs::write(&pid_path, pid.to_string());
+                                }
+                                app.dashboard_running = true;
+                                format!(
+                                    "Dashboard started (PID {pid}).\n  URL: http://localhost:5173"
+                                )
+                            }
+                            Err(e) => format!("Failed to start dashboard: {e}"),
+                        }
+                    }
+                    None => {
+                        "Could not find the Mika project root.\nRun from within the Mika source tree.".to_string()
+                    }
+                }
+            }
+        }
+        "stop" => {
+            if let Some(pid) = crate::commands::dashboard::read_pid_pub() {
+                crate::commands::dashboard::stop_dashboard(pid);
+                app.dashboard_running = false;
+                "Dashboard stopped.".to_string()
+            } else {
+                "Dashboard is not running.".to_string()
+            }
+        }
+        "status" => {
+            if crate::commands::dashboard::is_dashboard_running() {
+                "Dashboard is running.\n  URL: http://localhost:5173".to_string()
+            } else {
+                "Dashboard is not running.\n  Start with: /dashboard start".to_string()
+            }
+        }
+        "" => {
+            // Toggle: start if stopped, stop if running
+            if app.dashboard_running {
+                handle_dashboard(app, "stop")
+            } else {
+                handle_dashboard(app, "start")
+            }
+        }
+        _ => format!("Unknown dashboard command: {sub}\n  Usage: /dashboard [start|stop|status]"),
     }
 }
 

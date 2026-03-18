@@ -91,6 +91,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "LLM provider base URL override",
     },
+    ConfigKeyInfo {
+        key: "dashboard_enabled",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_DASHBOARD_ENABLED"),
+        secret: false,
+        description: "Enable embedded dashboard SPA at /dashboard/ (default: false)",
+    },
     // Env backend (.env secrets)
     ConfigKeyInfo {
         key: "openai_api_key",
@@ -186,6 +193,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "llm_api_key" => settings.llm_api_key.clone(),
         "openai_api_key" => settings.openai_api_key.clone(),
         "brave_api_key" => settings.brave_api_key.clone(),
+        "dashboard_enabled" => Some(settings.dashboard_enabled.to_string()),
 
         "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
@@ -283,6 +291,10 @@ pub struct Settings {
     /// Supports Anthropic API keys, OAuth tokens, and third-party provider keys.
     #[serde(default)]
     pub llm_api_key: Option<String>,
+
+    /// Enable embedded dashboard SPA at /dashboard/ (default: false)
+    #[serde(default)]
+    pub dashboard_enabled: bool,
 
     /// Disable bundled skill re-sync on startup (default: false)
     #[serde(default)]
@@ -474,6 +486,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("github_repo", &self.github_repo)
             .field("server_log_file", &self.server_log_file)
+            .field("dashboard_enabled", &self.dashboard_enabled)
             .field("disable_bundled_skills", &self.disable_bundled_skills)
             .field("telemetry_enabled", &self.telemetry_enabled)
             .field("otlp_endpoint", &self.otlp_endpoint)
