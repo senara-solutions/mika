@@ -100,11 +100,11 @@ The builder now starts directly with the global TOML config.
 `mika setup` now writes the API key to `~/.mika/.env`:
 
 ```rust
-if std::env::var("MIKA_ANTHROPIC_API_KEY").ok().filter(|v| !v.is_empty()).is_none()
-    && mika_common::dotenv::get_env_var(&home_dir, "MIKA_ANTHROPIC_API_KEY").is_none()
+if std::env::var("MIKA_LLM_API_KEY").ok().filter(|v| !v.is_empty()).is_none()
+    && mika_common::dotenv::get_env_var(&home_dir, "MIKA_LLM_API_KEY").is_none()
 {
     // Prompt and write to .env
-    mika_common::dotenv::set_env_var(&home_dir, "MIKA_ANTHROPIC_API_KEY", key)?;
+    mika_common::dotenv::set_env_var(&home_dir, "MIKA_LLM_API_KEY", key)?;
 }
 ```
 

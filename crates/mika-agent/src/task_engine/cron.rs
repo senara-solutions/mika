@@ -37,7 +37,7 @@ mod tests {
     fn test_next_fire_strict_after() {
         let base = "2023-11-14T22:13:20Z"; // some fixed timestamp
         let next = next_fire_from_cron("0 * * * * *", base).unwrap();
-        assert!(next > base.to_string());
+        assert!(next.as_str() > base);
         // Should be at most 60 seconds later (next minute boundary)
         let base_dt = crate::timestamp::parse(base).unwrap();
         let next_dt = crate::timestamp::parse(&next).unwrap();

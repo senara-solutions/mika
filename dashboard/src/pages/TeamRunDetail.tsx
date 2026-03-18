@@ -6,11 +6,7 @@ import {
   useTeamWorkspace,
   type TeamWorkspaceEntry,
 } from '../api/teams.ts'
-import TaskStatusBadge from '../components/TaskStatusBadge.tsx'
-import CopyButton from '../components/CopyButton.tsx'
-import EmptyState from '../components/EmptyState.tsx'
-import MarkdownContent from '../components/MarkdownContent.tsx'
-import { formatRelativeTime } from '../utils/formatTime.ts'
+import { TaskStatusBadge, CopyButton, EmptyState, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function DarkContainer({ children, className = '' }: { children: React.ReactNode; className?: string }) {

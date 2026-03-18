@@ -1,9 +1,6 @@
 import { Link } from 'react-router'
 import { useTeamRuns, type TeamRunsFilters } from '../api/teams.ts'
-import Pagination from '../components/Pagination.tsx'
-import EmptyState from '../components/EmptyState.tsx'
-import TaskStatusBadge from '../components/TaskStatusBadge.tsx'
-import { formatRelativeTime } from '../utils/formatTime.ts'
+import { Pagination, EmptyState, TaskStatusBadge, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUSES = ['', 'running', 'completed', 'failed', 'suspended', 'cancelled']

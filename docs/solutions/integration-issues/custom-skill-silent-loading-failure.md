@@ -117,7 +117,7 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq required" >&2; exit 1; }
 command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI required" >&2; exit 1; }
 
 INPUT=$(cat)
-unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
+unset MIKA_LLM_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 
 TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.__mika_task_id // empty')
 AGENT=$(printf '%s\n' "$INPUT" | jq -r '.__mika_agent // empty')
@@ -176,7 +176,7 @@ When creating a custom skill with a long-running exec handler:
 - [ ] Handler script checks `jq` and `mika` are in PATH
 - [ ] Handler reads stdin: `INPUT=$(cat)`
 - [ ] Handler parses `__mika_task_id` and `__mika_agent` from stdin JSON via `jq`
-- [ ] Handler scrubs `MIKA_*` env vars: `unset MIKA_ANTHROPIC_API_KEY ...`
+- [ ] Handler scrubs `MIKA_*` env vars: `unset MIKA_LLM_API_KEY ...`
 - [ ] Handler captures work output to variable (stdout is /dev/null in long-running mode)
 - [ ] Handler delivers results via `mika ask --task-id <id> --agent <name> -- <result>`
 - [ ] Handler uses `--` before positional args containing untrusted data

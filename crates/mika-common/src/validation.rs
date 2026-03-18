@@ -26,6 +26,8 @@ pub fn validate_api_key_format(key: &str) -> Result<ApiKeyFormat, String> {
         Ok(ApiKeyFormat::OAuthToken)
     } else if key.starts_with("sk-ant-") {
         Ok(ApiKeyFormat::ApiKey)
+    } else if key.len() < 20 {
+        Err("API key appears too short — verify you copied the full key".to_string())
     } else {
         Ok(ApiKeyFormat::ThirdParty)
     }
@@ -149,21 +151,34 @@ mod tests {
 
     #[test]
     fn test_validate_api_key_format_third_party() {
-        // OpenAI key
+        // OpenAI key (>= 20 chars)
         assert_eq!(
-            validate_api_key_format("sk-proj-something"),
+            validate_api_key_format("sk-proj-something-long-enough"),
             Ok(ApiKeyFormat::ThirdParty)
         );
-        // Groq key
+        // Groq key (>= 20 chars)
         assert_eq!(
-            validate_api_key_format("gsk_something"),
+            validate_api_key_format("gsk_something_long_enough"),
             Ok(ApiKeyFormat::ThirdParty)
         );
-        // Any non-empty non-Anthropic key
+        // Exactly 20 characters should pass
         assert_eq!(
-            validate_api_key_format("some-key"),
+            validate_api_key_format("12345678901234567890"),
             Ok(ApiKeyFormat::ThirdParty)
         );
+    }
+
+    #[test]
+    fn test_validate_api_key_format_third_party_too_short() {
+        // Keys shorter than 20 characters should be rejected
+        assert!(validate_api_key_format("some-key").is_err());
+        assert!(validate_api_key_format("short").is_err());
+        assert_eq!(
+            validate_api_key_format("tooshort"),
+            Err("API key appears too short — verify you copied the full key".to_string())
+        );
+        // 19 characters — still too short
+        assert!(validate_api_key_format("1234567890123456789").is_err());
     }
 
     #[test]

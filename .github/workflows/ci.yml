@@ -45,20 +45,18 @@ jobs:
   dashboard:
     name: Dashboard
     runs-on: ubuntu-22.04
-    defaults:
-      run:
-        working-directory: dashboard
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: dashboard/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npm run lint
-      - run: npm run build
-      - run: npm test
+      - run: npm run build -w packages/ui
+      - run: npm run lint -w dashboard
+      - run: npm run build -w dashboard
+      - run: npm test -w dashboard
 
   docs-site:
     name: Docs Site

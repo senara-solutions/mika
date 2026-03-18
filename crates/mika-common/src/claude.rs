@@ -262,7 +262,9 @@ impl ClaudeClient {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "MIKA_LLM_API_KEY is required but not set. \
-                     Set it to an API key (sk-ant-api03-...) or OAuth token (sk-ant-oat01-...)."
+                     Set it to your LLM provider's API key \
+                     (e.g., sk-ant-api03-... for Anthropic, sk-ant-oat01-... for OAuth, \
+                     or your provider's key)."
                 )
             })?;
 

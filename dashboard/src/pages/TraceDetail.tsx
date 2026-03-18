@@ -1,12 +1,10 @@
 import { useState, Fragment } from 'react'
 import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
-import EmptyState from '../components/EmptyState.tsx'
+import { EmptyState, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
-import { formatTimestamp } from '../utils/formatTime.ts'
-import { eventTypeBadge, eventTypeColor } from '../utils/badges.ts'
 import {
   ArrowLeft,
   User,

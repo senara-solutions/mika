@@ -2,14 +2,10 @@ import { useState, Fragment, useMemo } from 'react'
 import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
-import CopyButton from '../components/CopyButton.tsx'
-import Pagination from '../components/Pagination.tsx'
-import EmptyState from '../components/EmptyState.tsx'
+import { CopyButton, Pagination, EmptyState, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
-import { formatTimestamp } from '../utils/formatTime.ts'
-import { getAgentColor } from '../utils/agentColors.ts'
 import {
   AlertTriangle,
   ArrowLeft,

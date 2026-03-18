@@ -1,10 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, type TasksFilters } from '../api/tasks.ts'
-import Pagination from '../components/Pagination.tsx'
-import EmptyState from '../components/EmptyState.tsx'
-import TaskStatusBadge from '../components/TaskStatusBadge.tsx'
-import { formatRelativeTime } from '../utils/formatTime.ts'
+import { Pagination, EmptyState, TaskStatusBadge, formatRelativeTime } from '@senara-solutions/ui'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function TaskRow({ task }: { task: import('../api/tasks.ts').TaskItem }) {

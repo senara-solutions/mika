@@ -188,6 +188,12 @@ pub fn create_provider(spec: &ModelSpec, max_tokens: u32) -> Result<Arc<dyn LlmP
         | ProviderKind::Ollama
         | ProviderKind::Groq
         | ProviderKind::OpenAiCompatible => {
+            if matches!(spec.provider, ProviderKind::OpenAiCompatible) {
+                tracing::warn!(
+                    base_url = ?spec.base_url,
+                    "MIKA_LLM_API_KEY will be sent to custom endpoint; ensure you trust this URL"
+                );
+            }
             let base_url = spec.effective_base_url().ok_or_else(|| {
                 anyhow::anyhow!(
                     "base URL is required for provider '{}'. Set MIKA_LLM_BASE_URL.",

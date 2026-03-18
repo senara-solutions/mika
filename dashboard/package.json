@@ -11,13 +11,12 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@senara-solutions/ui": "*",
     "@tanstack/react-query": "^5.80.7",
     "lucide-react": "^0.575.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-markdown": "^10.1.0",
-    "react-router": "^7.6.3",
-    "remark-gfm": "^4.0.1"
+    "react-router": "^7.6.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
