@@ -252,7 +252,7 @@ impl TaskDispatcher {
         Ok(())
     }
 
-    /// Resume the agent after a callback task completes.
+    /// Resume the agent after a callback task completes or fails.
     ///
     /// Reads `task.result` (set by the callback) and runs a silent agent turn with
     /// the result injected as context. Uses `send_message` to deliver the response.
@@ -263,7 +263,7 @@ impl TaskDispatcher {
         let is_failed = task.status == "failed";
         let result = match task.result.clone() {
             Some(r) if !r.is_empty() => r,
-            _ if is_failed => "Task failed with no error details.".to_string(),
+            _ if is_failed => crate::agent::FAILED_TASK_FALLBACK.to_string(),
             _ => {
                 return Err(anyhow!(
                     "resume_agent task {} has no result — callback may not have completed yet",
@@ -313,7 +313,7 @@ impl TaskDispatcher {
                 task_id: task.id.clone(),
                 label: task.label.clone(),
                 result,
-                failed: task.status == "failed",
+                failed: is_failed,
             },
             home_dir: &self.home_dir,
             session_id: &session_id,

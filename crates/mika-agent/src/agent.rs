@@ -45,6 +45,9 @@ const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024;
 /// (e.g., all work done via tool calls).
 pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 
+/// Fallback message used when a failed callback task has no error details in its result.
+pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
+
 /// Wraps a callback task result in untrusted-framing XML tags.
 ///
 /// Both the CLI (interactive callback handling) and the silent agent loop

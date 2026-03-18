@@ -1348,7 +1348,7 @@ impl<'a> App<'a> {
             let is_failed = task.status == "failed";
             let result = match task.result {
                 Some(r) if !r.is_empty() => r,
-                _ if is_failed => "Task failed with no error details.".to_string(),
+                _ if is_failed => mika_agent::agent::FAILED_TASK_FALLBACK.to_string(),
                 _ => continue, // skip completed tasks with no result
             };
 
