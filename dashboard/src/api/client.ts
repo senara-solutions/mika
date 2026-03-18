@@ -1,5 +1,16 @@
 export const API_BASE = '/api/v1'
-export const TOKEN = import.meta.env.VITE_MIKA_DASHBOARD_TOKEN ?? ''
+
+/** Resolve the auth token at runtime.
+ *  Priority: server-injected window.__MIKA_CONFIG__ (embedded mode) > Vite env var (dev mode).
+ */
+function getToken(): string {
+  if (window.__MIKA_CONFIG__?.token) {
+    return window.__MIKA_CONFIG__.token
+  }
+  return import.meta.env.VITE_MIKA_DASHBOARD_TOKEN ?? ''
+}
+
+export const TOKEN = getToken()
 
 export interface PaginatedResponse<T> {
   data: T[]

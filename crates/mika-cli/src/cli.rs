@@ -63,6 +63,8 @@ pub enum Commands {
     Tasks(TaskArgs),
     /// Check installation health
     Doctor(DoctorArgs),
+    /// Manage the dashboard dev server
+    Dashboard(DashboardArgs),
 }
 
 impl Commands {
@@ -81,7 +83,10 @@ impl Commands {
             Commands::Agents(args) => args.agent_flag.agent.as_deref(),
             // No agent override — listed explicitly so adding a new Commands variant
             // produces a compile error, forcing a conscious scoping decision.
-            Commands::Setup { .. } | Commands::Doctor(_) | Commands::Teams(_) => None,
+            Commands::Setup { .. }
+            | Commands::Doctor(_)
+            | Commands::Teams(_)
+            | Commands::Dashboard(_) => None,
         }
     }
 
@@ -101,7 +106,8 @@ impl Commands {
             | Commands::Tasks(_)
             | Commands::Agents(_)
             | Commands::Doctor(_)
-            | Commands::Teams(_) => None,
+            | Commands::Teams(_)
+            | Commands::Dashboard(_) => None,
         }
     }
 }
@@ -458,6 +464,24 @@ pub struct DoctorArgs {
     /// Output machine-readable JSON instead of colored text
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args)]
+pub struct DashboardArgs {
+    #[command(subcommand)]
+    pub command: DashboardCommand,
+}
+
+#[derive(Subcommand)]
+pub enum DashboardCommand {
+    /// Start the dashboard dev server
+    Start,
+    /// Stop the dashboard dev server
+    Stop,
+    /// Show dashboard status
+    Status,
+    /// Open dashboard in browser
+    Open,
 }
 
 #[derive(Subcommand)]

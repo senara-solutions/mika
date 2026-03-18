@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
         Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
+        Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
     }
 }
 
@@ -410,6 +411,7 @@ mod tests {
             "agents",
             "teams",
             "doctor",
+            "dashboard",
         ] {
             assert!(
                 markdown.contains(name),

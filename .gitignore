@@ -19,6 +19,8 @@ Thumbs.db
 
 # Node
 node_modules/
+dashboard/dist/
+!dashboard/dist/.gitkeep
 
 # Data
 data/

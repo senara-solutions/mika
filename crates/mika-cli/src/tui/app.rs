@@ -534,6 +534,9 @@ pub struct App<'a> {
     pub verbose_mode: bool,
     /// Live dashboard state during team runs (created on first PhaseChanged event).
     pub team_dashboard: Option<TeamDashboardState>,
+
+    /// Whether the dashboard dev server is running (polled periodically).
+    pub dashboard_running: bool,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -607,6 +610,7 @@ impl<'a> App<'a> {
             team_dir: None,
             verbose_mode: false,
             team_dashboard: None,
+            dashboard_running: crate::commands::dashboard::is_dashboard_running(),
         }
     }
 
@@ -685,6 +689,7 @@ impl<'a> App<'a> {
             team_dir: Some(team_dir),
             verbose_mode: false,
             team_dashboard: None,
+            dashboard_running: crate::commands::dashboard::is_dashboard_running(),
         }
     }
 
@@ -893,6 +898,15 @@ impl<'a> App<'a> {
             && self.status == AgentStatus::Idle
         {
             self.poll_callback_tasks().await;
+        }
+
+        // Dashboard status polling: check PID file liveness.
+        if self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) {
+            let running = crate::commands::dashboard::is_dashboard_running();
+            if running != self.dashboard_running {
+                self.dashboard_running = running;
+                self.needs_redraw = true;
+            }
         }
 
         // Thinking animation needs redraw every tick while active

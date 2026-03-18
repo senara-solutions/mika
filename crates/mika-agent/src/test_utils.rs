@@ -187,6 +187,7 @@ pub mod test_helpers {
             github_repo: None,
             home_dir: PathBuf::from("/tmp"),
             server_log_file: None,
+            dashboard_enabled: false,
             disable_bundled_skills: false,
             telemetry_enabled: false,
             otlp_endpoint: None,

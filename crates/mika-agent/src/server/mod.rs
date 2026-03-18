@@ -1,5 +1,6 @@
 mod auth;
 pub mod dashboard;
+pub mod embedded_dashboard;
 mod handlers;
 pub mod investigate;
 pub mod json_extractor;
@@ -136,6 +137,8 @@ fn build_router(state: AppState) -> Router {
 
     mutation_routes
         .nest("/api/v1", dashboard_routes)
+        // Embedded dashboard SPA (no auth — static assets; SPA authenticates its own API calls)
+        .nest("/dashboard", embedded_dashboard::dashboard_routes())
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
         .layer(TraceLayer::new_for_http())
@@ -310,6 +313,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
+
+    // Warn if embedded dashboard is enabled but no assets were compiled in
+    if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
+        warn!(
+            "MIKA_DASHBOARD_ENABLED=true but no dashboard assets are embedded in the binary. \
+             Build the dashboard first: npm run build --prefix dashboard && cargo build"
+        );
+    }
 
     let llm = settings.make_llm_provider()?;
     let http_client = reqwest::Client::new();
@@ -650,6 +661,7 @@ mod tests {
                 github_repo: None,
                 home_dir: std::path::PathBuf::from("/tmp/mika-test"),
                 server_log_file: None,
+                dashboard_enabled: false,
                 disable_bundled_skills: false,
                 telemetry_enabled: false,
                 otlp_endpoint: None,
