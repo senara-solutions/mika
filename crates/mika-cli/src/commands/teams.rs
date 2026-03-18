@@ -20,13 +20,17 @@ pub async fn run(args: TeamsArgs) -> Result<()> {
             no_interactive,
         } => create(&global_home, &name, no_interactive),
         TeamsCommand::Status { name } => status(&global_home, &name),
-        TeamsCommand::Log { name } => log(&global_home, &name),
+        TeamsCommand::Log {
+            name,
+            format,
+            limit,
+        } => log(&global_home, &name, &format, limit),
         TeamsCommand::Delete { name, force } => delete(&global_home, &name, force),
     }
 }
 
 /// Open the shared container database (sync, for read-only CLI commands).
-fn open_container_db(global_home: &std::path::Path) -> Result<Database> {
+pub(crate) fn open_container_db(global_home: &std::path::Path) -> Result<Database> {
     let db_path = home::container_db_path(global_home);
     if !db_path.exists() {
         bail!("No database found. Run `mika` first to initialize.");
@@ -166,7 +170,12 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
+fn log(
+    global_home: &std::path::Path,
+    name: &str,
+    format: &crate::cli::OutputFormat,
+    limit: usize,
+) -> Result<()> {
     let name = team::normalize_team_name(name);
 
     if !team::team_exists(global_home, &name) {
@@ -176,35 +185,59 @@ fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
     let db = match open_container_db(global_home) {
         Ok(db) => db,
         Err(_) => {
-            println!("\n  No runs found for team '{name}'.\n");
+            match format {
+                crate::cli::OutputFormat::Json => println!("[]"),
+                crate::cli::OutputFormat::Text => {
+                    println!("\n  No runs found for team '{name}'.\n");
+                }
+            }
             return Ok(());
         }
     };
-    let runs = db.load_team_runs(&name, 50)?;
+    let runs = db.load_team_runs(&name, limit)?;
 
     if runs.is_empty() {
-        println!("\n  No runs found for team '{name}'.\n");
+        match format {
+            crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Text => {
+                println!("\n  No runs found for team '{name}'.\n");
+            }
+        }
         return Ok(());
     }
 
-    println!("\n  Run history for team '{name}':");
-    for run in &runs {
-        let started = format_ts(&run.started_at);
-        let ended = run
-            .ended_at
-            .as_ref()
-            .map(|s| format_ts(s))
-            .unwrap_or_else(|| "in progress".to_string());
-        println!(
-            "    [{}] {} | {} -> {}",
-            run.id.get(..8).unwrap_or(&run.id),
-            started.get(..10).unwrap_or(&started),
-            run.status,
-            ended.get(..10).unwrap_or(&ended)
-        );
-        println!("      Goal: {}", run.goal);
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = runs
+                .iter()
+                .map(|run| {
+                    serde_json::json!({
+                        "id": run.id,
+                        "team_name": run.team_name,
+                        "goal": run.goal,
+                        "status": run.status,
+                        "started_at": run.started_at,
+                        "ended_at": run.ended_at,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!("\n  Run history for team '{name}':");
+            for run in &runs {
+                let started = format_ts(&run.started_at);
+                let ended = run
+                    .ended_at
+                    .as_ref()
+                    .map(|s| format_ts(s))
+                    .unwrap_or_else(|| "in progress".to_string());
+                println!("    [{}] {} | {} -> {}", run.id, started, run.status, ended);
+                println!("      Goal: {}", run.goal);
+            }
+            println!();
+        }
     }
-    println!();
 
     Ok(())
 }

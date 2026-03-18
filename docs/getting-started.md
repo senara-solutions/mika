@@ -384,6 +384,20 @@ Use `--run-id <uuid>` to reference a previous run's workspace and context:
 mika ask --team research --run-id "550e8400-..." "Refine the analysis with regional data"
 ```
 
+Or use `--last-run` to automatically continue from the most recent finished run:
+
+```sh
+mika ask --team research --last-run "Refine the analysis with regional data"
+```
+
+To find run UUIDs, use `mika teams log`:
+
+```sh
+mika teams log research           # text output with full UUIDs (default: 10 runs)
+mika teams log research -n 3      # show last 3 runs
+mika teams log research --format json  # machine-readable JSON output
+```
+
 With `--format json`, the response includes team run metadata:
 
 ```sh
