@@ -709,32 +709,42 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
     });
 
     // Load previous run context if a reference run was provided
-    let previous_run = if let Some(ref_id) = run_id {
+    let (previous_run, run_warning) = if let Some(ref_id) = run_id {
         match team_db.get_team_run_summary(ref_id).await {
             Ok(Some(summary)) => {
-                if summary.run.team_name != team_name {
+                let warning = if summary.run.team_name != team_name {
                     tracing::warn!(
                         run_id = ref_id,
                         expected_team = team_name,
                         actual_team = summary.run.team_name,
                         "Referenced run belongs to a different team"
                     );
-                    Some(summary)
+                    Some(format!(
+                        "Warning: Referenced run belongs to team '{}', not '{}'",
+                        summary.run.team_name, team_name
+                    ))
                 } else {
-                    Some(summary)
-                }
+                    None
+                };
+                (Some(summary), warning)
             }
             Ok(None) => {
                 tracing::warn!(run_id = ref_id, "Referenced team run not found in database");
-                None
+                (
+                    None,
+                    Some(format!(
+                        "Warning: Referenced run {} not found. Starting without previous run context.",
+                        ref_id
+                    )),
+                )
             }
             Err(e) => {
                 tracing::warn!(run_id = ref_id, error = %e, "Failed to load previous run summary");
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     // Build app in team mode
@@ -747,6 +757,16 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
         team_db,
         previous_run,
     );
+
+    // Inject warning message if there was a run reference issue
+    if let Some(warning) = run_warning {
+        app.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: warning,
+            rendered: None,
+            channel: None,
+        });
+    }
 
     // Team mode: skip history loading. Team conversations are goal-driven —
     // each goal triggers a full team run. The shared container DB contains

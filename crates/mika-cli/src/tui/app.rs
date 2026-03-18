@@ -173,16 +173,12 @@ pub fn callback_label_from_metadata(metadata: &Option<String>) -> String {
 
 /// Format a previous team run summary as a human-readable context block.
 fn format_previous_run_context(summary: &TeamRunSummary) -> String {
-    fn truncate(s: &str, max: usize) -> String {
-        if s.len() <= max {
+    fn truncate(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
             s.to_string()
         } else {
-            // Find a safe char boundary
-            let mut end = max;
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}...", &s[..end])
+            let truncated: String = s.chars().take(max_chars).collect();
+            format!("{truncated}...")
         }
     }
 
