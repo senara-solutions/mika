@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
 use mika_agent::async_db::AsyncDatabase;
+use mika_agent::db::TeamRunSummary;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::teams::types::{TeamEvent, TeamPhase};
 use mika_common::llm::LlmProvider;
@@ -168,6 +169,71 @@ pub fn callback_label_from_metadata(metadata: &Option<String>) -> String {
         .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
         .and_then(|v| v.get("label")?.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "background task".to_string())
+}
+
+/// Format a previous team run summary as a human-readable context block.
+fn format_previous_run_context(summary: &TeamRunSummary) -> String {
+    fn truncate(s: &str, max: usize) -> String {
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            // Find a safe char boundary
+            let mut end = max;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &s[..end])
+        }
+    }
+
+    let run = &summary.run;
+    let status_note = match run.status.as_str() {
+        "running" => " (still in progress — context may be incomplete)",
+        "suspended" => " (suspended — has pending callbacks)",
+        _ => "",
+    };
+
+    let mut lines = Vec::new();
+    lines.push("━━━ Previous Run Context ━━━".to_string());
+    lines.push(format!(
+        "Run:    {} ({}{})",
+        &run.id[..8.min(run.id.len())],
+        run.status,
+        status_note,
+    ));
+    lines.push(format!("Goal:   {}", truncate(&run.goal, 200)));
+
+    if let Some(ended) = &run.ended_at {
+        lines.push(format!("Time:   {} → {}", run.started_at, ended));
+    } else {
+        lines.push(format!("Time:   {}", run.started_at));
+    }
+
+    if !summary.agent_results.is_empty() {
+        let agents: Vec<String> = summary
+            .agent_results
+            .iter()
+            .map(|a| a.agent_name.clone())
+            .collect();
+        lines.push(format!("Agents: {}", agents.join(", ")));
+    }
+
+    if let Some(critic) = &summary.critic_feedback {
+        lines.push(format!("Critic: {}", truncate(critic, 300)));
+    }
+
+    if let Some(deliverable) = &run.deliverable {
+        lines.push(String::new());
+        lines.push("Deliverable:".to_string());
+        for line in truncate(deliverable, 500).lines() {
+            lines.push(format!("  {line}"));
+        }
+    } else {
+        lines.push("Deliverable: (none)".to_string());
+    }
+
+    lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+    lines.join("\n")
 }
 
 /// Messages flowing between the TUI and the agent worker.
@@ -553,6 +619,7 @@ impl<'a> App<'a> {
         team_dir: PathBuf,
         global_home: PathBuf,
         db: AsyncDatabase,
+        previous_run: Option<TeamRunSummary>,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -562,8 +629,19 @@ impl<'a> App<'a> {
         let (agent_tx, _) = mpsc::unbounded_channel::<AgentRequest>();
         let (_, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
 
+        let messages = if let Some(summary) = previous_run {
+            vec![ChatMessage {
+                role: ChatRole::System,
+                content: format_previous_run_context(&summary),
+                rendered: None,
+                channel: None,
+            }]
+        } else {
+            Vec::new()
+        };
+
         Self {
-            messages: Vec::new(),
+            messages,
             scroll_offset: 0,
             status: AgentStatus::Idle,
             should_quit: false,
@@ -1544,5 +1622,150 @@ mod tests {
     fn test_callback_label_with_invalid_json() {
         let meta = Some("not json".to_string());
         assert_eq!(callback_label_from_metadata(&meta), "background task");
+    }
+
+    // === format_previous_run_context tests ===
+
+    fn make_test_summary(
+        status: &str,
+        deliverable: Option<&str>,
+        critic: Option<&str>,
+    ) -> TeamRunSummary {
+        use mika_agent::db::{AgentResultSummary, TeamRunRow};
+        TeamRunSummary {
+            run: TeamRunRow {
+                id: "abcd1234-5678-9abc-def0-1234567890ab".to_string(),
+                team_name: "test-team".to_string(),
+                goal: "Build a REST API".to_string(),
+                status: status.to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 3,
+                deliverable: deliverable.map(|s| s.to_string()),
+                started_at: "2026-03-17T14:30:00Z".to_string(),
+                ended_at: Some("2026-03-17T14:45:00Z".to_string()),
+                trace_id: None,
+            },
+            agent_results: vec![
+                AgentResultSummary {
+                    agent_name: "alice".to_string(),
+                    response_preview: "Done".to_string(),
+                },
+                AgentResultSummary {
+                    agent_name: "bob".to_string(),
+                    response_preview: "Done".to_string(),
+                },
+            ],
+            task_statuses: vec![],
+            pending_tasks: vec![],
+            critic_feedback: critic.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_format_previous_run_context_completed() {
+        let summary = make_test_summary(
+            "completed",
+            Some("REST endpoints created"),
+            Some("Approved"),
+        );
+        let output = format_previous_run_context(&summary);
+
+        assert!(output.contains("Previous Run Context"));
+        assert!(output.contains("abcd1234"));
+        assert!(output.contains("completed"));
+        assert!(output.contains("Build a REST API"));
+        assert!(output.contains("2026-03-17T14:30:00Z → 2026-03-17T14:45:00Z"));
+        assert!(output.contains("alice, bob"));
+        assert!(output.contains("Approved"));
+        assert!(output.contains("REST endpoints created"));
+    }
+
+    #[test]
+    fn test_format_previous_run_context_no_deliverable() {
+        let summary = make_test_summary("failed", None, None);
+        let output = format_previous_run_context(&summary);
+
+        assert!(output.contains("failed"));
+        assert!(output.contains("Deliverable: (none)"));
+        assert!(!output.contains("Critic:"));
+    }
+
+    #[test]
+    fn test_format_previous_run_context_suspended_status() {
+        let summary = make_test_summary("suspended", None, None);
+        let output = format_previous_run_context(&summary);
+
+        assert!(output.contains("suspended — has pending callbacks"));
+    }
+
+    #[test]
+    fn test_format_previous_run_context_running_status() {
+        let summary = make_test_summary("running", None, None);
+        let output = format_previous_run_context(&summary);
+
+        assert!(output.contains("still in progress"));
+    }
+
+    #[test]
+    fn test_format_previous_run_context_truncates_long_goal() {
+        use mika_agent::db::TeamRunRow;
+        let long_goal = "x".repeat(300);
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "abcd1234-5678-9abc-def0-1234567890ab".to_string(),
+                team_name: "t".to_string(),
+                goal: long_goal,
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 1,
+                deliverable: None,
+                started_at: "2026-03-17T14:30:00Z".to_string(),
+                ended_at: None,
+                trace_id: None,
+            },
+            agent_results: vec![],
+            task_statuses: vec![],
+            pending_tasks: vec![],
+            critic_feedback: None,
+        };
+        let output = format_previous_run_context(&summary);
+
+        // Goal should be truncated to 200 chars + "..."
+        assert!(output.contains("..."));
+        // No ended_at means only started_at shown
+        assert!(output.contains("Time:   2026-03-17T14:30:00Z"));
+        assert!(!output.contains("→"));
+        // No agents listed
+        assert!(!output.contains("Agents:"));
+    }
+
+    #[test]
+    fn test_format_previous_run_context_no_agents() {
+        use mika_agent::db::TeamRunRow;
+        let summary = TeamRunSummary {
+            run: TeamRunRow {
+                id: "abcd1234-0000-0000-0000-000000000000".to_string(),
+                team_name: "t".to_string(),
+                goal: "Test".to_string(),
+                status: "completed".to_string(),
+                failure_reason: None,
+                iteration: 1,
+                max_iterations: 1,
+                deliverable: Some("Done".to_string()),
+                started_at: "2026-03-17T14:30:00Z".to_string(),
+                ended_at: Some("2026-03-17T14:35:00Z".to_string()),
+                trace_id: None,
+            },
+            agent_results: vec![],
+            task_statuses: vec![],
+            pending_tasks: vec![],
+            critic_feedback: None,
+        };
+        let output = format_previous_run_context(&summary);
+
+        assert!(!output.contains("Agents:"));
+        assert!(output.contains("Done"));
     }
 }

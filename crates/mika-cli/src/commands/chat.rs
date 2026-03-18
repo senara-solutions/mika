@@ -708,6 +708,35 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
         }
     });
 
+    // Load previous run context if a reference run was provided
+    let previous_run = if let Some(ref_id) = run_id {
+        match team_db.get_team_run_summary(ref_id).await {
+            Ok(Some(summary)) => {
+                if summary.run.team_name != team_name {
+                    tracing::warn!(
+                        run_id = ref_id,
+                        expected_team = team_name,
+                        actual_team = summary.run.team_name,
+                        "Referenced run belongs to a different team"
+                    );
+                    Some(summary)
+                } else {
+                    Some(summary)
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(run_id = ref_id, "Referenced team run not found in database");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(run_id = ref_id, error = %e, "Failed to load previous run summary");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build app in team mode
     let mut app = App::new_team(
         team_tx,
@@ -716,6 +745,7 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
         team_dir.clone(),
         global_home.to_path_buf(),
         team_db,
+        previous_run,
     );
 
     // Team mode: skip history loading. Team conversations are goal-driven —
