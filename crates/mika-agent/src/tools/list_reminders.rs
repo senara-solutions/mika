@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::db::format_unix_ts;
+use crate::db::format_ts;
 
 pub struct ListRemindersTool;
 
@@ -37,7 +37,8 @@ impl Tool for ListRemindersTool {
         for t in &tasks {
             let fire_at = t
                 .next_fire_at
-                .map(format_unix_ts)
+                .as_ref()
+                .map(|s| format_ts(s))
                 .unwrap_or_else(|| "unknown".to_string());
             if let Some(ref cron) = t.cron_expr {
                 output.push_str(&format!(
@@ -59,7 +60,7 @@ mod tests {
     use crate::db::NewTask;
     use crate::test_utils::test_helpers::TestHarness;
 
-    async fn add_reminder(harness: &TestHarness, fire_at_unix: i64, message: &str) -> String {
+    async fn add_reminder(harness: &TestHarness, fire_at: &str, message: &str) -> String {
         harness
             .db
             .create_task(NewTask {
@@ -73,7 +74,7 @@ mod tests {
                 event_source: None,
                 event_offset_secs: None,
                 condition_expr: None,
-                next_fire_at: Some(fire_at_unix),
+                next_fire_at: Some(fire_at.to_string()),
                 timeout_at: None,
                 action_type: "send_message".to_string(),
                 action_config: serde_json::json!({"text": message}).to_string(),
@@ -102,9 +103,9 @@ mod tests {
     async fn test_list_reminders_shows_active() {
         let harness = TestHarness::new();
         // 2099-01-01T00:00:00Z
-        add_reminder(&harness, 4_070_908_800, "Meeting prep").await;
+        add_reminder(&harness, "2099-01-01T00:00:00Z", "Meeting prep").await;
         // 2099-06-15T12:00:00Z
-        add_reminder(&harness, 4_085_380_800, "Birthday party").await;
+        add_reminder(&harness, "2099-06-15T12:00:00Z", "Birthday party").await;
 
         let ctx = harness.ctx();
         let tool = ListRemindersTool;
@@ -131,7 +132,7 @@ mod tests {
                 event_source: None,
                 event_offset_secs: None,
                 condition_expr: None,
-                next_fire_at: Some(4_070_908_800),
+                next_fire_at: Some("2099-01-01T00:00:00Z".to_string()),
                 timeout_at: None,
                 action_type: "send_message".to_string(),
                 action_config: serde_json::json!({"text": "Daily standup"}).to_string(),
@@ -156,9 +157,9 @@ mod tests {
     #[tokio::test]
     async fn test_list_reminders_excludes_cancelled() {
         let harness = TestHarness::new();
-        let id = add_reminder(&harness, 4_070_908_800, "Cancelled one").await;
+        let id = add_reminder(&harness, "2099-01-01T00:00:00Z", "Cancelled one").await;
         harness.db.cancel_task(&id).await.unwrap();
-        add_reminder(&harness, 4_085_380_800, "Active one").await;
+        add_reminder(&harness, "2099-06-15T12:00:00Z", "Active one").await;
 
         let ctx = harness.ctx();
         let tool = ListRemindersTool;

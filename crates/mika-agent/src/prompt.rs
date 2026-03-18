@@ -544,7 +544,8 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         prompt.push_str("## Pending Work Items\n");
         prompt.push_str("<pending-work-items>\n");
         for item in ctx.pending_work_items {
-            let age_days = (ctx.current_utc.timestamp() - item.created_at) / 86400;
+            let created_dt = crate::timestamp::parse(&item.created_at).unwrap_or(ctx.current_utc);
+            let age_days = ctx.current_utc.signed_duration_since(created_dt).num_days();
             // Sanitize label: truncate to 200 chars and strip angle brackets
             let label = item.label.chars().take(200).collect::<String>();
             let label = label.replace(['<', '>'], "");

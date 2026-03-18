@@ -1,6 +1,5 @@
-export function formatTimestamp(unix: number): string {
-  const date = new Date(unix * 1000)
-  return date.toLocaleString(undefined, {
+export function formatTimestamp(iso: string): string {
+  return new Date(iso).toLocaleString(undefined, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -9,9 +8,10 @@ export function formatTimestamp(unix: number): string {
   })
 }
 
-export function formatRelativeTime(unix: number): string {
-  const now = Date.now() / 1000
-  const diff = now - unix
+export function formatRelativeTime(iso: string): string {
+  const now = Date.now()
+  const then = new Date(iso).getTime()
+  const diff = Math.floor((now - then) / 1000)
 
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`

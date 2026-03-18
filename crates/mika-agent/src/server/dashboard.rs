@@ -58,8 +58,8 @@ pub struct TimelineQuery {
     pub event_type: Option<String>,
     pub trace_id: Option<String>,
     pub session_id: Option<String>,
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -130,8 +130,8 @@ pub struct AgentDetailResponse {
     pub id: String,
     pub name: String,
     pub active: bool,
-    pub last_seen: Option<i64>,
-    pub created_at: i64,
+    pub last_seen: Option<String>,
+    pub created_at: String,
     pub message_count: i64,
     pub core_memory: Vec<CoreMemoryEntry>,
     pub core_memory_edits_this_session: i64,
@@ -341,7 +341,7 @@ pub struct MessageResponse {
     pub content: String,
     pub channel_type: String,
     pub metadata: Option<String>,
-    pub created_at: i64,
+    pub created_at: String,
 }
 
 impl From<SessionMessage> for MessageResponse {
@@ -471,14 +471,14 @@ pub struct TaskResponse {
     pub source: Option<String>,
     pub reference_url: Option<String>,
     pub cron_expr: Option<String>,
-    pub next_fire_at: Option<i64>,
-    pub fired_at: Option<i64>,
-    pub completed_at: Option<i64>,
+    pub next_fire_at: Option<String>,
+    pub fired_at: Option<String>,
+    pub completed_at: Option<String>,
     pub created_by_session: Option<String>,
     pub created_trace_id: Option<String>,
     pub execution_trace_id: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: String,
+    pub updated_at: String,
     pub action_config_preview: Option<String>,
     pub result_preview: Option<String>,
 }
@@ -593,8 +593,8 @@ pub async fn handle_task_detail(
 pub struct TeamRunsQuery {
     pub team_name: Option<String>,
     pub status: Option<String>,
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -774,8 +774,8 @@ mod tests {
         let f = TimelineFilters {
             agent_id: Some("mika".to_string()),
             event_type: Some("message".to_string()),
-            from: Some(1000),
-            to: Some(2000),
+            from: Some("2026-01-01T00:00:00Z".to_string()),
+            to: Some("2026-12-31T23:59:59Z".to_string()),
             ..Default::default()
         };
         let (clause, params) = f.to_sql();
@@ -794,8 +794,8 @@ mod tests {
             event_type: Some("audit".to_string()),
             trace_id: Some("abc123".to_string()),
             session_id: Some("sess-1".to_string()),
-            from: Some(100),
-            to: Some(200),
+            from: Some("2026-01-01T00:00:00Z".to_string()),
+            to: Some("2026-01-02T00:00:00Z".to_string()),
         };
         let (clause, params) = f.to_sql();
         assert_eq!(params.len(), 6);
@@ -810,8 +810,8 @@ mod tests {
     #[test]
     fn timeline_filters_only_time_range() {
         let f = TimelineFilters {
-            from: Some(500),
-            to: Some(600),
+            from: Some("2026-06-01T00:00:00Z".to_string()),
+            to: Some("2026-06-02T00:00:00Z".to_string()),
             ..Default::default()
         };
         let (clause, params) = f.to_sql();

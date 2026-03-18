@@ -130,10 +130,10 @@ pub fn build_orchestrator_context(
 pub fn build_previous_run_context(summary: &TeamRunSummary) -> String {
     let run = &summary.run;
 
-    // Format date from unix timestamp
-    let date = chrono::DateTime::from_timestamp(run.started_at, 0)
+    // Format date from ISO 8601 timestamp
+    let date = crate::timestamp::parse(&run.started_at)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|_| "unknown".to_string());
 
     let status_label = if run.status == "completed" {
         format!(
@@ -400,8 +400,8 @@ mod tests {
                 iteration: 0,
                 max_iterations: 3,
                 deliverable: Some("The team is ready!".to_string()),
-                started_at: 1000,
-                ended_at: Some(1001),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                ended_at: Some("2026-01-01T00:00:01Z".to_string()),
                 trace_id: None,
             },
             TeamRunRow {
@@ -413,8 +413,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: Some("Done, pinged all agents.".to_string()),
-                started_at: 1002,
-                ended_at: Some(1003),
+                started_at: "2026-01-01T00:00:02Z".to_string(),
+                ended_at: Some("2026-01-01T00:00:03Z".to_string()),
                 trace_id: None,
             },
         ];
@@ -470,7 +470,7 @@ mod tests {
                 output_file: "research.md".to_string(),
                 status: TaskStatus::Completed,
             }],
-            started_at: 1740474000,
+            started_at: "2025-02-25T11:00:00Z".to_string(),
             ended_at: None,
             deliverable: None,
         };
@@ -493,7 +493,7 @@ mod tests {
             iteration: 1,
             max_iterations: 3,
             tasks: vec![],
-            started_at: 1740474000,
+            started_at: "2025-02-25T11:00:00Z".to_string(),
             ended_at: None,
             deliverable: None,
         };
@@ -519,8 +519,8 @@ mod tests {
             iteration: 0,
             max_iterations: 3,
             deliverable: Some("result".to_string()),
-            started_at: 1000,
-            ended_at: Some(1001),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            ended_at: Some("2026-01-01T00:00:01Z".to_string()),
             trace_id: None,
         }];
         let ctx = build_orchestrator_context(&def, "", None, &history, None);
@@ -541,8 +541,8 @@ mod tests {
                 iteration: 2,
                 max_iterations: 3,
                 deliverable: Some("Found 5 key patterns for async Rust".to_string()),
-                started_at: 1741000000,
-                ended_at: Some(1741003600),
+                started_at: "2025-03-03T14:26:40Z".to_string(),
+                ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
             },
             agent_results: vec![
@@ -592,8 +592,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: None,
-                started_at: 1741000000,
-                ended_at: Some(1741003600),
+                started_at: "2025-03-03T14:26:40Z".to_string(),
+                ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
             },
             agent_results: vec![],
@@ -628,8 +628,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: None,
-                started_at: 1741000000,
-                ended_at: Some(1741003600),
+                started_at: "2025-03-03T14:26:40Z".to_string(),
+                ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
             },
             agent_results: vec![],
@@ -662,8 +662,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: Some("Previous deliverable".to_string()),
-                started_at: 1741000000,
-                ended_at: Some(1741003600),
+                started_at: "2025-03-03T14:26:40Z".to_string(),
+                ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
             },
             agent_results: vec![],
@@ -693,8 +693,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: Some("Latest deliverable".to_string()),
-                started_at: 1002,
-                ended_at: Some(1003),
+                started_at: "2026-01-01T00:00:02Z".to_string(),
+                ended_at: Some("2026-01-01T00:00:03Z".to_string()),
                 trace_id: None,
             },
             agent_results: vec![],
@@ -713,8 +713,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: Some("Latest deliverable".to_string()),
-                started_at: 1002,
-                ended_at: Some(1003),
+                started_at: "2026-01-01T00:00:02Z".to_string(),
+                ended_at: Some("2026-01-01T00:00:03Z".to_string()),
                 trace_id: None,
             },
             TeamRunRow {
@@ -726,8 +726,8 @@ mod tests {
                 iteration: 1,
                 max_iterations: 3,
                 deliverable: Some("Older deliverable".to_string()),
-                started_at: 1000,
-                ended_at: Some(1001),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                ended_at: Some("2026-01-01T00:00:01Z".to_string()),
                 trace_id: None,
             },
         ];

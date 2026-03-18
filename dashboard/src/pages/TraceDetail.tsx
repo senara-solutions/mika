@@ -388,7 +388,7 @@ function MessageCard({
 
 // ===== Non-message event card (audit, task) =====
 
-function EventCard({ event }: { event: { event_type: string; event_subtype: string; agent_id: string | null; session_id: string | null; summary: string | null; created_at: number } }) {
+function EventCard({ event }: { event: { event_type: string; event_subtype: string; agent_id: string | null; session_id: string | null; summary: string | null; created_at: string } }) {
   const badge = eventTypeBadge(event.event_type)
   return (
     <div className={`border rounded-xl p-4 ${eventTypeColor(event.event_type)}`}>
@@ -482,7 +482,7 @@ export default function TraceDetail() {
   timeline.sort((a, b) => {
     const tsA = a.kind === 'message' ? a.msg.created_at : a.event.created_at
     const tsB = b.kind === 'message' ? b.msg.created_at : b.event.created_at
-    return tsA - tsB
+    return new Date(tsA).getTime() - new Date(tsB).getTime()
   })
 
   return (

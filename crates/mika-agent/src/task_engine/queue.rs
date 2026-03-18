@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QueuedTask {
     pub task_id: String,
-    pub next_fire_at: i64,
+    pub next_fire_at: String,
     /// "time", "recurring", "callback", "user_reply", "inject_context"
     pub trigger_type: String,
     pub action_type: String,
@@ -37,10 +37,10 @@ mod tests {
     use super::*;
     use std::collections::BinaryHeap;
 
-    fn qt(id: &str, fire_at: i64) -> QueuedTask {
+    fn qt(id: &str, fire_at: &str) -> QueuedTask {
         QueuedTask {
             task_id: id.to_string(),
-            next_fire_at: fire_at,
+            next_fire_at: fire_at.to_string(),
             trigger_type: "time".to_string(),
             action_type: "send_message".to_string(),
             cron_expr: None,
@@ -50,22 +50,22 @@ mod tests {
     #[test]
     fn test_min_heap_ordering() {
         let mut heap = BinaryHeap::new();
-        heap.push(qt("c", 300));
-        heap.push(qt("a", 100));
-        heap.push(qt("b", 200));
+        heap.push(qt("c", "2026-01-01T03:00:00Z"));
+        heap.push(qt("a", "2026-01-01T01:00:00Z"));
+        heap.push(qt("b", "2026-01-01T02:00:00Z"));
 
         // Min-heap: smallest fire_at pops first
-        assert_eq!(heap.pop().unwrap().next_fire_at, 100);
-        assert_eq!(heap.pop().unwrap().next_fire_at, 200);
-        assert_eq!(heap.pop().unwrap().next_fire_at, 300);
+        assert_eq!(heap.pop().unwrap().next_fire_at, "2026-01-01T01:00:00Z");
+        assert_eq!(heap.pop().unwrap().next_fire_at, "2026-01-01T02:00:00Z");
+        assert_eq!(heap.pop().unwrap().next_fire_at, "2026-01-01T03:00:00Z");
     }
 
     #[test]
     fn test_peek_returns_earliest() {
         let mut heap = BinaryHeap::new();
-        heap.push(qt("z", 999));
-        heap.push(qt("a", 1));
+        heap.push(qt("z", "2026-01-01T23:59:59Z"));
+        heap.push(qt("a", "2026-01-01T00:00:01Z"));
 
-        assert_eq!(heap.peek().unwrap().next_fire_at, 1);
+        assert_eq!(heap.peek().unwrap().next_fire_at, "2026-01-01T00:00:01Z");
     }
 }

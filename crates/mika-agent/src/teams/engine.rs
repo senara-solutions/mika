@@ -159,7 +159,7 @@ impl TeamEngine {
             iteration: 0,
             max_iterations: team.flow.max_iterations,
             tasks: Vec::new(),
-            started_at: chrono::Utc::now().timestamp(),
+            started_at: crate::timestamp::now(),
             ended_at: None,
             deliverable: None,
         };
@@ -357,7 +357,7 @@ impl TeamEngine {
                 &self.run.team_name,
                 &self.run.goal,
                 self.run.max_iterations,
-                self.run.started_at,
+                &self.run.started_at,
                 Some(&self.trace_id),
             )
             .await
@@ -480,8 +480,8 @@ impl TeamEngine {
         let ended_at = if is_suspended {
             None // Suspended runs haven't ended yet
         } else {
-            let ts = chrono::Utc::now().timestamp();
-            self.run.ended_at = Some(ts);
+            let ts = crate::timestamp::now();
+            self.run.ended_at = Some(ts.clone());
             Some(ts)
         };
 
@@ -500,7 +500,7 @@ impl TeamEngine {
                 failure_reason,
                 self.run.iteration,
                 self.run.deliverable.as_deref(),
-                ended_at,
+                ended_at.as_deref(),
             )
             .await
         {
@@ -816,7 +816,9 @@ impl TeamEngine {
             event_offset_secs: None,
             condition_expr: None,
             next_fire_at: None,
-            timeout_at: Some(chrono::Utc::now().timestamp() + TEAM_RUN_TIMEOUT_SECS as i64),
+            timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(
+                TEAM_RUN_TIMEOUT_SECS as i64,
+            ))),
             action_type: crate::task_engine::types::action_type::INVOKE_ORCHESTRATOR.to_string(),
             action_config: serde_json::json!({
                 "team_name": self.run.team_name,
@@ -849,7 +851,9 @@ impl TeamEngine {
                 event_offset_secs: None,
                 condition_expr: None,
                 next_fire_at: None,
-                timeout_at: Some(chrono::Utc::now().timestamp() + TEAM_RUN_TIMEOUT_SECS as i64),
+                timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(
+                    TEAM_RUN_TIMEOUT_SECS as i64,
+                ))),
                 action_type: crate::task_engine::types::action_type::RESUME_AGENT.to_string(),
                 action_config: serde_json::json!({
                     "agent": input.agent_name,

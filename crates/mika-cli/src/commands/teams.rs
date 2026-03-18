@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use std::io::{self, IsTerminal, Write};
 
 use mika_agent::async_db::AsyncDatabase;
-use mika_agent::db::{Database, format_unix_ts};
+use mika_agent::db::{Database, format_ts};
 use mika_common::home;
 use mika_common::team;
 
@@ -156,9 +156,9 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
         println!("    ID: {}", latest.id);
         println!("    Goal: {}", latest.goal);
         println!("    Status: {}", latest.status);
-        println!("    Started: {}", format_unix_ts(latest.started_at));
-        if let Some(ended) = latest.ended_at {
-            println!("    Ended: {}", format_unix_ts(ended));
+        println!("    Started: {}", format_ts(&latest.started_at));
+        if let Some(ref ended) = latest.ended_at {
+            println!("    Ended: {}", format_ts(ended));
         }
     }
     println!();
@@ -189,10 +189,11 @@ fn log(global_home: &std::path::Path, name: &str) -> Result<()> {
 
     println!("\n  Run history for team '{name}':");
     for run in &runs {
-        let started = format_unix_ts(run.started_at);
+        let started = format_ts(&run.started_at);
         let ended = run
             .ended_at
-            .map(format_unix_ts)
+            .as_ref()
+            .map(|s| format_ts(s))
             .unwrap_or_else(|| "in progress".to_string());
         println!(
             "    [{}] {} | {} -> {}",

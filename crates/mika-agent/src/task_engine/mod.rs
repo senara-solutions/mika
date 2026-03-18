@@ -65,11 +65,11 @@ pub async fn ensure_recurring_task(
             // Task already exists — check if the cron expression changed.
             if let Ok(Some(existing_cron)) = db.get_recurring_task_cron(label).await {
                 if existing_cron != cron_expr {
-                    let now = chrono::Utc::now().timestamp();
-                    match cron::next_fire_from_cron(cron_expr, now) {
+                    let now = crate::timestamp::now();
+                    match cron::next_fire_from_cron(cron_expr, &now) {
                         Ok(next_fire) => {
                             match db
-                                .update_recurring_task_cron(label, cron_expr, next_fire)
+                                .update_recurring_task_cron(label, cron_expr, &next_fire)
                                 .await
                             {
                                 Ok(_) => {

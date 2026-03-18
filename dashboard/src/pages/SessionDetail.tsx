@@ -403,7 +403,7 @@ export default function SessionDetail() {
     items.sort((a, b) => {
       const tsA = a.kind === 'workspace' ? a.entry.created_at : a.msg.created_at
       const tsB = b.kind === 'workspace' ? b.entry.created_at : b.msg.created_at
-      return tsA - tsB
+      return new Date(tsA).getTime() - new Date(tsB).getTime()
     })
     return items
   }, [isTeamSession, workspaceEntries, messages])
@@ -444,7 +444,7 @@ export default function SessionDetail() {
     ? session.agent_id.charAt(0).toUpperCase() + session.agent_id.slice(1)
     : 'Orchestrator'
 
-  const renderOrchestratorCard = (content: string, timestamp: number, label?: string) => {
+  const renderOrchestratorCard = (content: string, timestamp: string, label?: string) => {
     return (
       <div className="ml-12">
         <div className="border rounded-xl p-4 bg-bg-card border-white/[0.06]">
@@ -590,7 +590,7 @@ export default function SessionDetail() {
     )
   }
 
-  const renderRegularMessageCard = (msg: { id: number; role: string; content: string; metadata: string | null; created_at: number }) => {
+  const renderRegularMessageCard = (msg: { id: number; role: string; content: string; metadata: string | null; created_at: string }) => {
     const config = roleConfig(msg.role)
     return (
       <div key={msg.id} className={config.align}>

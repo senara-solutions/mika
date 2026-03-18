@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::db::format_unix_ts;
+use crate::db::format_ts;
 
 pub struct GetTaskTool;
 
@@ -49,14 +49,14 @@ impl Tool for GetTaskTool {
 
         let next_fire = task
             .next_fire_at
-            .map(format_unix_ts)
+            .map(|s| format_ts(&s))
             .unwrap_or_else(|| "N/A".to_string());
         let timeout = task
             .timeout_at
-            .map(format_unix_ts)
+            .map(|s| format_ts(&s))
             .unwrap_or_else(|| "none".to_string());
         let result = task.result.as_deref().unwrap_or("none");
-        let created = format_unix_ts(task.created_at);
+        let created = format_ts(&task.created_at);
         let ref_url = task.reference_url.as_deref().unwrap_or("none");
         let source = task.source.as_deref().unwrap_or("none");
 

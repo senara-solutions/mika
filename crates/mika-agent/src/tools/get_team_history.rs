@@ -5,7 +5,7 @@ use mika_common::team;
 use serde_json::Value;
 use std::fmt::Write;
 
-use crate::db::format_unix_ts;
+use crate::db::format_ts;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -86,7 +86,8 @@ impl Tool for GetTeamHistoryTool {
         for run in &runs {
             let ended = run
                 .ended_at
-                .map(format_unix_ts)
+                .as_ref()
+                .map(|s| format_ts(s))
                 .unwrap_or_else(|| "in progress".to_string());
             writeln!(
                 out,
@@ -94,7 +95,7 @@ impl Tool for GetTeamHistoryTool {
                 run.id,
                 run.status,
                 run.goal,
-                format_unix_ts(run.started_at),
+                format_ts(&run.started_at),
                 ended
             )
             .unwrap();
@@ -128,17 +129,32 @@ mod tests {
     async fn test_get_team_history_multiple_runs() {
         let harness = TestHarness::new();
         // Seed team runs in shared DB
+        let base_times = ["2025-02-19T15:06:40Z", "2025-02-19T15:11:40Z"];
+        let end_times = ["2025-02-19T15:07:40Z", "2025-02-19T15:12:40Z"];
         for i in 0..2 {
             let run_id = format!("run-{i:04}");
-            let ts = 1_740_000_000 + (i as i64 * 300);
             harness
                 .db
-                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts, None)
+                .insert_team_run(
+                    &run_id,
+                    "dev-team",
+                    &format!("Goal {i}"),
+                    3,
+                    base_times[i],
+                    None,
+                )
                 .await
                 .unwrap();
             harness
                 .db
-                .update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
+                .update_team_run(
+                    &run_id,
+                    "completed",
+                    None,
+                    1,
+                    Some("Done"),
+                    Some(end_times[i]),
+                )
                 .await
                 .unwrap();
         }
@@ -159,17 +175,44 @@ mod tests {
     #[tokio::test]
     async fn test_get_team_history_respects_limit() {
         let harness = TestHarness::new();
+        let base_times = [
+            "2025-02-19T15:06:40Z",
+            "2025-02-19T15:11:40Z",
+            "2025-02-19T15:16:40Z",
+            "2025-02-19T15:21:40Z",
+            "2025-02-19T15:26:40Z",
+        ];
+        let end_times = [
+            "2025-02-19T15:07:40Z",
+            "2025-02-19T15:12:40Z",
+            "2025-02-19T15:17:40Z",
+            "2025-02-19T15:22:40Z",
+            "2025-02-19T15:27:40Z",
+        ];
         for i in 0..5 {
             let run_id = format!("run-{i:04}");
-            let ts = 1_740_000_000 + (i as i64 * 300);
             harness
                 .db
-                .insert_team_run(&run_id, "dev-team", &format!("Goal {i}"), 3, ts, None)
+                .insert_team_run(
+                    &run_id,
+                    "dev-team",
+                    &format!("Goal {i}"),
+                    3,
+                    base_times[i],
+                    None,
+                )
                 .await
                 .unwrap();
             harness
                 .db
-                .update_team_run(&run_id, "completed", None, 1, Some("Done"), Some(ts + 60))
+                .update_team_run(
+                    &run_id,
+                    "completed",
+                    None,
+                    1,
+                    Some("Done"),
+                    Some(end_times[i]),
+                )
                 .await
                 .unwrap();
         }

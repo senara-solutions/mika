@@ -5,8 +5,8 @@ export interface Agent {
   id: string
   name: string
   active: boolean
-  last_seen: number | null
-  created_at: number
+  last_seen: string | null
+  created_at: string
   message_count: number
 }
 
@@ -27,8 +27,8 @@ export interface SessionItem {
   id: string
   agent_id: string
   channel_type: string
-  started_at: number
-  ended_at: number | null
+  started_at: string
+  ended_at: string | null
   metadata: string | null
   message_count: number
 }

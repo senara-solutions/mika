@@ -202,12 +202,13 @@ impl AsyncDatabase {
         &self,
         label: &str,
         new_cron: &str,
-        next_fire_at: i64,
+        next_fire_at: &str,
     ) -> Result<()> {
         let a = self.agent_id.clone();
         let l = label.to_owned();
         let c = new_cron.to_owned();
-        self.with_db(move |db| db.update_recurring_task_cron(&a, &l, &c, next_fire_at))
+        let nf = next_fire_at.to_owned();
+        self.with_db(move |db| db.update_recurring_task_cron(&a, &l, &c, &nf))
             .await
     }
 
@@ -264,15 +265,16 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: i64) -> Result<()> {
-        let i = id.to_owned();
-        self.with_db(move |db| db.update_task_next_fire_at(&i, next_fire_at))
+    pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
+        let (i, nf) = (id.to_owned(), next_fire_at.to_owned());
+        self.with_db(move |db| db.update_task_next_fire_at(&i, &nf))
             .await
     }
 
-    pub async fn update_task_rescheduled(&self, id: &str, next_fire_at: i64) -> Result<()> {
+    pub async fn update_task_rescheduled(&self, id: &str, next_fire_at: &str) -> Result<()> {
         let i = id.to_owned();
-        self.with_db(move |db| db.update_task_rescheduled(&i, next_fire_at))
+        let nf = next_fire_at.to_owned();
+        self.with_db(move |db| db.update_task_rescheduled(&i, &nf))
             .await
     }
 
@@ -327,10 +329,10 @@ impl AsyncDatabase {
         self.with_db(move |db| db.list_active_work_items(&a)).await
     }
 
-    pub async fn mark_tasks_expired(&self, now_unix: i64) -> Result<usize> {
+    pub async fn mark_tasks_expired(&self, now: &str) -> Result<usize> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.mark_tasks_expired(now_unix, &id))
-            .await
+        let n = now.to_owned();
+        self.with_db(move |db| db.mark_tasks_expired(&n, &id)).await
     }
 
     pub async fn get_expired_child_task_ids(&self) -> Result<Vec<String>> {
@@ -355,20 +357,22 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn get_undelivered_callback_tasks(&self, since_unix: i64) -> Result<Vec<Task>> {
+    pub async fn get_undelivered_callback_tasks(&self, since: &str) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
-        self.with_db(move |db| db.get_undelivered_callback_tasks(&id, since_unix))
+        let s = since.to_owned();
+        self.with_db(move |db| db.get_undelivered_callback_tasks(&id, &s))
             .await
     }
 
     pub async fn get_undelivered_callback_tasks_for_session(
         &self,
-        since_unix: i64,
+        since: &str,
         session_id: &str,
     ) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
+        let s = since.to_owned();
         let sid = session_id.to_owned();
-        self.with_db(move |db| db.get_undelivered_callback_tasks_for_session(&id, since_unix, &sid))
+        self.with_db(move |db| db.get_undelivered_callback_tasks_for_session(&id, &s, &sid))
             .await
     }
 
@@ -811,7 +815,7 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn last_user_message_time(&self) -> Result<Option<i64>> {
+    pub async fn last_user_message_time(&self) -> Result<Option<String>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.last_user_message_time(&a)).await
     }
@@ -1024,15 +1028,16 @@ impl AsyncDatabase {
 
     // -- Reflection --
 
-    pub async fn get_messages_since(&self, since_unix: i64) -> Result<Vec<SessionMessage>> {
+    pub async fn get_messages_since(&self, since: &str) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_messages_since(&a, since_unix))
-            .await
+        let s = since.to_owned();
+        self.with_db(move |db| db.get_messages_since(&a, &s)).await
     }
 
-    pub async fn get_audit_events_since(&self, since_unix: i64) -> Result<Vec<AuditEvent>> {
+    pub async fn get_audit_events_since(&self, since: &str) -> Result<Vec<AuditEvent>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.get_audit_events_since(&a, since_unix))
+        let s = since.to_owned();
+        self.with_db(move |db| db.get_audit_events_since(&a, &s))
             .await
     }
 
@@ -1153,19 +1158,18 @@ impl AsyncDatabase {
         team_name: &str,
         goal: &str,
         max_iterations: u32,
-        started_at: i64,
+        started_at: &str,
         trace_id: Option<&str>,
     ) -> Result<()> {
-        let (ri, tn, g, ti) = (
+        let (ri, tn, g, sa, ti) = (
             run_id.to_owned(),
             team_name.to_owned(),
             goal.to_owned(),
+            started_at.to_owned(),
             trace_id.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| {
-            db.insert_team_run(&ri, &tn, &g, max_iterations, started_at, ti.as_deref())
-        })
-        .await
+        self.with_db(move |db| db.insert_team_run(&ri, &tn, &g, max_iterations, &sa, ti.as_deref()))
+            .await
     }
 
     pub async fn update_team_run(
@@ -1175,16 +1179,24 @@ impl AsyncDatabase {
         failure_reason: Option<&str>,
         iteration: u32,
         deliverable: Option<&str>,
-        ended_at: Option<i64>,
+        ended_at: Option<&str>,
     ) -> Result<()> {
-        let (ri, s, fr, d) = (
+        let (ri, s, fr, d, ea) = (
             run_id.to_owned(),
             status.to_owned(),
             failure_reason.map(|s| s.to_owned()),
             deliverable.map(|s| s.to_owned()),
+            ended_at.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
-            db.update_team_run(&ri, &s, fr.as_deref(), iteration, d.as_deref(), ended_at)
+            db.update_team_run(
+                &ri,
+                &s,
+                fr.as_deref(),
+                iteration,
+                d.as_deref(),
+                ea.as_deref(),
+            )
         })
         .await
     }
@@ -1644,13 +1656,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_last_user_message_time_returns_i64() {
+    async fn test_last_user_message_time_returns_string() {
         let (db, sid) = test_async_db_with_session().await;
         assert!(db.last_user_message_time().await.unwrap().is_none());
         db.save_message(&sid, "user", "hello", None).await.unwrap();
         let ts = db.last_user_message_time().await.unwrap();
         assert!(ts.is_some());
-        assert!(ts.unwrap() > 0);
+        // ISO 8601 timestamps start with a year like "2026-"
+        assert!(ts.unwrap().starts_with("20"));
     }
 
     #[tokio::test]
@@ -1690,7 +1703,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: "{}".to_string(),

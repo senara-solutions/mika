@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::db::format_unix_ts;
+use crate::db::format_ts;
 
 pub struct ListTasksTool;
 
@@ -49,11 +49,13 @@ impl Tool for ListTasksTool {
         for t in &tasks {
             let fire_at = t
                 .next_fire_at
-                .map(format_unix_ts)
+                .as_ref()
+                .map(|s| format_ts(s))
                 .unwrap_or_else(|| "no schedule".to_string());
             let timeout = t
                 .timeout_at
-                .map(format_unix_ts)
+                .as_ref()
+                .map(|s| format_ts(s))
                 .unwrap_or_else(|| "none".to_string());
             output.push_str(&format!(
                 "- {} [{}/{}] {} ({}) — next: {} | timeout: {}\n",
@@ -85,7 +87,7 @@ mod tests {
                 event_source: None,
                 event_offset_secs: None,
                 condition_expr: None,
-                next_fire_at: Some(9_999_999_999),
+                next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
                 timeout_at: None,
                 action_type: action_type.to_string(),
                 action_config: serde_json::json!({"text": label}).to_string(),

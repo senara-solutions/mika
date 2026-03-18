@@ -8,7 +8,7 @@ export interface TimelineRow {
   event_type: string
   event_subtype: string
   summary: string | null
-  created_at: number
+  created_at: string
 }
 
 export interface TimelineFilters {
@@ -56,7 +56,7 @@ export interface TraceMessage {
   content: string
   channel_type: string
   metadata: string | null
-  created_at: number
+  created_at: string
 }
 
 export function useTraceMessages(traceId: string) {

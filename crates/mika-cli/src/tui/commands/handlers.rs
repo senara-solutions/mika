@@ -218,7 +218,8 @@ async fn handle_reminders(app: &mut App<'_>) -> String {
         let short_id = &t.id[..12.min(t.id.len())];
         let fire_at = t
             .next_fire_at
-            .map(mika_agent::db::format_unix_ts)
+            .as_ref()
+            .map(|s| mika_agent::db::format_ts(s))
             .unwrap_or_else(|| "unknown".to_string());
         let _ = writeln!(out, "  {}: {} (fires: {})", short_id, t.label, fire_at);
     }
@@ -257,7 +258,8 @@ async fn handle_tasks(app: &mut App<'_>, args: &str) -> String {
         let short_id = &t.id[..12.min(t.id.len())];
         let when = t
             .next_fire_at
-            .map(mika_agent::db::format_unix_ts)
+            .as_ref()
+            .map(|s| mika_agent::db::format_ts(s))
             .unwrap_or_else(|| t.trigger_type.clone());
         let _ = writeln!(
             out,

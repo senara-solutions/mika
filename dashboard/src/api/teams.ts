@@ -10,8 +10,8 @@ export interface TeamRun {
   iteration: number
   max_iterations: number
   deliverable: string | null
-  started_at: number
-  ended_at: number | null
+  started_at: string
+  ended_at: string | null
   trace_id: string | null
 }
 
@@ -23,7 +23,7 @@ export interface TeamWorkspaceEntry {
   entry_type: string
   content: string
   iteration: number
-  created_at: number
+  created_at: string
 }
 
 export interface AgentResultSummary {

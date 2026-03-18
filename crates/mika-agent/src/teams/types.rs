@@ -1,3 +1,72 @@
+use serde::Deserializer;
+
+/// Deserialize a value that could be either an integer (legacy) or string (new format).
+fn deserialize_timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    use serde::de;
+    struct TimestampVisitor;
+    impl<'de> de::Visitor<'de> for TimestampVisitor {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an ISO 8601 string or unix timestamp integer")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            let dt = chrono::TimeZone::timestamp_opt(&chrono::Utc, v, 0)
+                .single()
+                .ok_or_else(|| de::Error::custom(format!("invalid unix timestamp: {v}")))?;
+            Ok(crate::timestamp::format(&dt))
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            self.visit_i64(v as i64)
+        }
+    }
+    deserializer.deserialize_any(TimestampVisitor)
+}
+
+/// Same but for Option<T>
+fn deserialize_optional_timestamp<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    use serde::de;
+    struct OptTimestampVisitor;
+    impl<'de> de::Visitor<'de> for OptTimestampVisitor {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null, an ISO 8601 string, or unix timestamp integer")
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Option<String>, D2::Error> {
+            deserialize_timestamp(d).map(Some)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<String>, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Option<String>, E> {
+            Ok(Some(v))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Option<String>, E> {
+            let dt = chrono::TimeZone::timestamp_opt(&chrono::Utc, v, 0)
+                .single()
+                .ok_or_else(|| de::Error::custom(format!("invalid unix timestamp: {v}")))?;
+            Ok(Some(crate::timestamp::format(&dt)))
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Option<String>, E> {
+            self.visit_i64(v as i64)
+        }
+    }
+    deserializer.deserialize_any(OptTimestampVisitor)
+}
+
 /// Tracks the overall state of a team execution run.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TeamRun {
@@ -12,12 +81,18 @@ pub struct TeamRun {
     pub max_iterations: u32,
     #[serde(default)]
     pub tasks: Vec<TaskAssignment>,
+    #[serde(default = "default_timestamp")]
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub started_at: String,
     #[serde(default)]
-    pub started_at: i64,
-    #[serde(default)]
-    pub ended_at: Option<i64>,
+    #[serde(deserialize_with = "deserialize_optional_timestamp")]
+    pub ended_at: Option<String>,
     #[serde(default)]
     pub deliverable: Option<String>,
+}
+
+fn default_timestamp() -> String {
+    crate::timestamp::now()
 }
 
 fn default_max_iterations() -> u32 {
@@ -116,7 +191,7 @@ pub enum TeamEvent {
 pub type TeamEventCallback = Box<dyn Fn(TeamEvent) + Send + Sync>;
 
 /// Current checkpoint serialization version.
-pub const CHECKPOINT_VERSION: u32 = 1;
+pub const CHECKPOINT_VERSION: u32 = 2;
 
 /// Serialize a `TeamRun` into a versioned checkpoint envelope.
 pub fn serialize_checkpoint(run: &TeamRun) -> String {
@@ -266,14 +341,15 @@ mod tests {
     #[test]
     fn test_serde_defaults_on_team_run() {
         // Minimal JSON with only the required fields (no defaults)
-        let json = r#"{"run_id":"r1","team_name":"t1","goal":"g1"}"#;
+        let json =
+            r#"{"run_id":"r1","team_name":"t1","goal":"g1","started_at":"2026-01-01T00:00:00Z"}"#;
         let run: TeamRun = serde_json::from_str(json).unwrap();
         assert_eq!(run.run_id, "r1");
         assert_eq!(run.status, RunStatus::Running); // default
         assert_eq!(run.iteration, 0); // default
         assert_eq!(run.max_iterations, 3); // custom default
         assert!(run.tasks.is_empty()); // default
-        assert_eq!(run.started_at, 0); // default
+        assert_eq!(run.started_at, "2026-01-01T00:00:00Z"); // provided
         assert!(run.ended_at.is_none()); // default
         assert!(run.deliverable.is_none()); // default
     }
@@ -310,7 +386,7 @@ mod tests {
             iteration: 1,
             max_iterations: 3,
             tasks: vec![],
-            started_at: 100,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
             ended_at: None,
             deliverable: None,
         };
@@ -331,8 +407,8 @@ mod tests {
             iteration: 2,
             max_iterations: 3,
             tasks: vec![],
-            started_at: 100,
-            ended_at: Some(200),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            ended_at: Some("2026-01-01T01:00:00Z".to_string()),
             deliverable: Some("done".to_string()),
         };
         let checkpoint = serialize_checkpoint(&run);
@@ -341,13 +417,13 @@ mod tests {
         assert_eq!(restored.goal, "test goal");
         assert_eq!(restored.status, RunStatus::Completed);
         assert_eq!(restored.iteration, 2);
-        assert_eq!(restored.ended_at, Some(200));
+        assert_eq!(restored.ended_at.as_deref(), Some("2026-01-01T01:00:00Z"));
         assert_eq!(restored.deliverable.as_deref(), Some("done"));
     }
 
     #[test]
     fn test_deserialize_legacy_unversioned_checkpoint() {
-        // Legacy format: plain TeamRun JSON without version envelope
+        // Legacy format: plain TeamRun JSON without version envelope, using integer timestamps
         let legacy_json = r#"{
             "run_id": "r1",
             "team_name": "t1",
@@ -363,6 +439,37 @@ mod tests {
         let run = deserialize_checkpoint(legacy_json).unwrap();
         assert_eq!(run.run_id, "r1");
         assert_eq!(run.status, RunStatus::Running);
+        // Integer timestamp 100 should be converted to ISO 8601
+        assert_eq!(run.started_at, "1970-01-01T00:01:40Z");
+    }
+
+    #[test]
+    fn test_deserialize_legacy_checkpoint_with_integer_timestamps() {
+        // Backward compat: versioned checkpoint with integer timestamps (v1 format)
+        let legacy_json = r#"{
+            "version": 1,
+            "data": {
+                "run_id": "r1",
+                "team_name": "t1",
+                "goal": "g1",
+                "status": "Running",
+                "iteration": 1,
+                "max_iterations": 3,
+                "tasks": [],
+                "started_at": 1741000000,
+                "ended_at": 1741003600,
+                "deliverable": null
+            }
+        }"#;
+        let run = deserialize_checkpoint(legacy_json).unwrap();
+        assert_eq!(run.run_id, "r1");
+        // Integer timestamps should be converted to ISO 8601 strings
+        assert!(!run.started_at.is_empty());
+        assert!(run.ended_at.is_some());
+        // Verify they parse as valid timestamps
+        let started = crate::timestamp::parse(&run.started_at).unwrap();
+        let ended = crate::timestamp::parse(run.ended_at.as_ref().unwrap()).unwrap();
+        assert!(ended > started);
     }
 
     #[test]

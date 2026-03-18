@@ -236,7 +236,7 @@ export default function AgentDetail() {
                       </td>
                       <td className="px-4 py-2.5 text-xs text-muted font-mono">
                         {s.ended_at
-                          ? `${Math.round((s.ended_at - s.started_at) / 60)}m`
+                          ? `${Math.round((new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()) / 60000)}m`
                           : 'ongoing'}
                       </td>
                       <td className="px-4 py-2.5 text-xs text-heading font-medium">

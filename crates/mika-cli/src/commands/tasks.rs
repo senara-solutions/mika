@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mika_agent::db::format_unix_ts;
+use mika_agent::db::format_ts;
 
 use crate::cli::{TaskArgs, TaskCommand};
 use crate::init;
@@ -26,7 +26,8 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                     let short_id = &t.id[..12.min(t.id.len())];
                     let when = t
                         .next_fire_at
-                        .map(format_unix_ts)
+                        .as_ref()
+                        .map(|s| format_ts(s))
                         .unwrap_or_else(|| t.trigger_type.clone());
                     println!(
                         "    {}: [{}] [{}] \"{}\" ({})",

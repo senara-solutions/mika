@@ -27,3 +27,4 @@ compound-engineering.local.md
 .claude/worktrees
 .claude/scheduled_tasks.lock
 .claude/claude-pilot.json
+node_modules

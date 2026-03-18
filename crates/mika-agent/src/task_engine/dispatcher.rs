@@ -557,7 +557,14 @@ impl TaskDispatcher {
 
         // Skip if user active within 30 minutes
         if let Ok(Some(last_ts)) = self.db.last_user_message_time().await {
-            let elapsed = chrono::Utc::now().timestamp() - last_ts;
+            let elapsed = if let Ok(last_dt) = crate::timestamp::parse(&last_ts) {
+                chrono::Utc::now()
+                    .signed_duration_since(last_dt)
+                    .num_seconds()
+            } else {
+                warn!(timestamp = %last_ts, "failed to parse last_user_message_time, treating as stale");
+                i64::MAX
+            };
             if elapsed < 30 * 60 {
                 debug!(task_id = %task.id, "user active within 30 min, deferring reflection");
                 return Ok(());
@@ -565,10 +572,10 @@ impl TaskDispatcher {
         }
 
         // Skip if no conversations today
-        let midnight_unix = crate::db::today_midnight_utc(&tz_str).timestamp();
+        let midnight_str = crate::timestamp::format(&crate::db::today_midnight_utc(&tz_str));
         let conversations = self
             .db
-            .get_messages_since(midnight_unix)
+            .get_messages_since(&midnight_str)
             .await
             .unwrap_or_default();
         if conversations.is_empty() {
@@ -693,7 +700,12 @@ impl TaskDispatcher {
 
         // 4. Skip if user messaged within 2 hours
         if let Ok(Some(last_ts)) = self.db.last_user_message_time().await {
-            let elapsed = now_utc.timestamp() - last_ts;
+            let elapsed = if let Ok(last_dt) = crate::timestamp::parse(&last_ts) {
+                now_utc.signed_duration_since(last_dt).num_seconds()
+            } else {
+                warn!(timestamp = %last_ts, "failed to parse last_user_message_time, treating as stale");
+                i64::MAX
+            };
             if elapsed < 2 * 3600 {
                 return false;
             }
@@ -756,7 +768,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            next_fire_at: Some(crate::timestamp::now()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: "{}".to_string(), // missing "text" key
@@ -788,7 +800,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            next_fire_at: Some(crate::timestamp::now()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: r#"{"text": "hello"}"#.to_string(),
@@ -819,7 +831,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(chrono::Utc::now().timestamp()),
+            next_fire_at: Some(crate::timestamp::now()),
             timeout_at: None,
             action_type: "inject_context".to_string(),
             action_config: r#"{"context": "some context"}"#.to_string(),

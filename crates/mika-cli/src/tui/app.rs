@@ -1244,10 +1244,10 @@ impl<'a> App<'a> {
     /// Poll for completed-but-undelivered callback tasks and inject them into the conversation.
     async fn poll_callback_tasks(&mut self) {
         // Look back 7 days for undelivered callbacks
-        let since = chrono::Utc::now().timestamp() - 7 * 24 * 3600;
+        let since = mika_agent::timestamp::now_minus(chrono::Duration::days(7));
         let tasks = match self
             .db
-            .get_undelivered_callback_tasks_for_session(since, &self.session_id)
+            .get_undelivered_callback_tasks_for_session(&since, &self.session_id)
             .await
         {
             Ok(t) => t,

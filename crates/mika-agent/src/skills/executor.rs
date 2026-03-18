@@ -506,7 +506,6 @@ async fn execute_long_running(
 
     let estimated = estimated_duration_secs.unwrap_or(3600);
     let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
-    let now = chrono::Utc::now().timestamp();
 
     // Link callback task to work item via parent_task_id for task tree correlation
     let parent_task_id = input
@@ -527,7 +526,9 @@ async fn execute_long_running(
         event_offset_secs: None,
         condition_expr: None,
         next_fire_at: None,
-        timeout_at: Some(now + timeout_secs as i64),
+        timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(
+            timeout_secs as i64,
+        ))),
         action_type: action_type::RESUME_AGENT.to_string(),
         action_config: "{}".to_string(),
         input_context: Some(serde_json::to_string(&input).unwrap_or_default()),
