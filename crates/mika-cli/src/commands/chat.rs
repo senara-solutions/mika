@@ -291,6 +291,7 @@ async fn spawn_agent_worker(
                     label,
                     result,
                     trace_id,
+                    original_status,
                 } => {
                     // Save the callback result as a tool_result message
                     let metadata = serde_json::json!({
@@ -309,7 +310,9 @@ async fn spawn_agent_worker(
                         .await;
 
                     // Build framing message for the agent
-                    let framing = agent::format_callback_framing(&label, &task_id, &result);
+                    let is_failed = original_status == "failed";
+                    let framing =
+                        agent::format_callback_framing(&label, &task_id, &result, is_failed);
 
                     let is_onboarding = check_onboarding(&worker_db).await;
                     let callback_result = agent::run_agent(&AgentParams {
@@ -346,10 +349,11 @@ async fn spawn_agent_worker(
                         },
                         Err(e) => {
                             // Unclaim the task so the next poll cycle can retry it.
-                            // mark_task_delivered set status to 'delivered'; reset to 'completed'
-                            // so get_undelivered_callback_tasks will pick it up again.
-                            if let Err(reset_err) =
-                                worker_db.update_task_status(&task_id, "completed").await
+                            // mark_task_delivered set status to 'delivered'; reset to original
+                            // status so get_undelivered_callback_tasks will pick it up again.
+                            if let Err(reset_err) = worker_db
+                                .update_task_status(&task_id, &original_status)
+                                .await
                             {
                                 tracing::warn!(
                                     task_id = %task_id,

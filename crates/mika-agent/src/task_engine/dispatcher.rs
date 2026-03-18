@@ -260,14 +260,18 @@ impl TaskDispatcher {
     /// Returns `Err` with a specific message when the agent is busy so the caller
     /// can re-queue the task instead of losing the callback result.
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
-        let result = task.result.clone().unwrap_or_default();
-        if result.is_empty() {
-            return Err(anyhow!(
-                "resume_agent task {} has no result — callback may not have completed yet",
-                task.id
-            )
-            .into());
-        }
+        let is_failed = task.status == "failed";
+        let result = match task.result.clone() {
+            Some(r) if !r.is_empty() => r,
+            _ if is_failed => "Task failed with no error details.".to_string(),
+            _ => {
+                return Err(anyhow!(
+                    "resume_agent task {} has no result — callback may not have completed yet",
+                    task.id
+                )
+                .into());
+            }
+        };
 
         // Acquire agent lock — return error if busy so caller can re-queue
         let _guard = if let Some(ref lock) = self.agent_lock {
@@ -309,6 +313,7 @@ impl TaskDispatcher {
                 task_id: task.id.clone(),
                 label: task.label.clone(),
                 result,
+                failed: task.status == "failed",
             },
             home_dir: &self.home_dir,
             session_id: &session_id,
