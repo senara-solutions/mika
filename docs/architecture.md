@@ -511,10 +511,10 @@ Agent-created callback tasks follow this end-to-end pattern:
    - **HTTP:** `POST /tasks/{id}/complete` with Bearer auth and `{"result": "..."}` body
 4. `update_task_completed` validates status (`AND status IN ('pending','in_progress')`) before writing — returns `false` if already completed (TOCTOU guard).
 5. **Delivery** depends on the path:
-   - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }` → marks task `delivered` on success.
-   - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry.
+   - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result, failed }` → marks task `delivered` on success. The engine also periodically scans for undelivered callbacks (both completed and failed) via `dispatch_undelivered_callbacks()` every 60 ticks, ensuring failed callbacks from the background monitor are delivered even without an external trigger.
+   - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry (resetting to the original status, preserving `failed` vs `completed`). Failed tasks with empty results get a fallback message (`FAILED_TASK_FALLBACK`).
 
-The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered`.
+The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. When `failed=true`, the framing says "A background task has FAILED" to help the LLM distinguish success from failure. Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered` or `pending → failed → delivered`.
 
 ### SilentTrigger Variants
 
@@ -524,7 +524,7 @@ The result is wrapped in `<callback_result trust="untrusted">` delimiters via `f
 |---------|---------|---------------|
 | `Heartbeat` | Hourly heartbeat recurring task | Scheduled check-in, review commitments |
 | `Reflection` | Daily reflection recurring task | Memory reflection and consolidation |
-| `Callback { label, result }` | `resume_agent` dispatcher | Background task completed, inject result |
+| `Callback { label, result, failed }` | `resume_agent` dispatcher | Background task completed/failed, inject result |
 | `SkillRun { skill_name }` | `run_skill` dispatcher | Run the named skill |
 
 ### Startup Maintenance
@@ -540,7 +540,7 @@ WHERE status IN ('pending', 'recurring_active');
 
 -- TUI callback polling efficiency
 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at)
-WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status = 'completed';
+WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status IN ('completed', 'failed');
 
 -- Trace correlation (partial indexes — only non-NULL trace_ids)
 CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
