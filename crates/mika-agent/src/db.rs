@@ -4235,6 +4235,22 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Load the most recent finished team run (completed, failed, or cancelled).
+    /// Excludes running and suspended runs — only truly finished runs are returned.
+    pub fn get_last_finished_team_run(&self, team_name: &str) -> Result<Option<TeamRunRow>> {
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
+              WHERE t.name = ?1 COLLATE NOCASE
+                AND r.status NOT IN ('running', 'suspended')
+              ORDER BY r.started_at DESC LIMIT 1",
+            Self::TEAM_RUN_COLUMNS,
+        );
+        self.conn
+            .query_row(&sql, params![team_name], Self::row_to_team_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Build an enriched summary of a team run for context injection.
     /// Queries team_workspace (assignments, critic), messages (agent responses),
     /// and tasks (statuses) for the given run.
@@ -6910,6 +6926,79 @@ mod tests {
         let result = db.get_last_completed_team_run("filter-team").unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().id, run_id);
+    }
+
+    #[test]
+    fn test_get_last_finished_team_run_excludes_suspended() {
+        let db = db();
+        // Insert a running run
+        db.insert_team_run(
+            "run-finished-1",
+            "finished-team",
+            "running goal",
+            3,
+            "2020-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
+
+        // Running → should not be returned
+        let result = db.get_last_finished_team_run("finished-team").unwrap();
+        assert!(result.is_none());
+
+        // Suspend it → still should not be returned
+        db.update_team_run("run-finished-1", "suspended", None, 1, None, None)
+            .unwrap();
+        let result = db.get_last_finished_team_run("finished-team").unwrap();
+        assert!(result.is_none());
+
+        // Insert a completed run
+        db.insert_team_run(
+            "run-finished-2",
+            "finished-team",
+            "completed goal",
+            3,
+            "2020-01-01T00:01:00Z",
+            None,
+        )
+        .unwrap();
+        db.update_team_run(
+            "run-finished-2",
+            "completed",
+            None,
+            2,
+            Some("done"),
+            Some("2020-01-01T00:02:00Z"),
+        )
+        .unwrap();
+
+        let result = db.get_last_finished_team_run("finished-team").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "run-finished-2");
+
+        // Insert a cancelled run (newer) — should also be returned
+        db.insert_team_run(
+            "run-finished-3",
+            "finished-team",
+            "cancelled goal",
+            3,
+            "2020-01-01T00:03:00Z",
+            None,
+        )
+        .unwrap();
+        db.update_team_run(
+            "run-finished-3",
+            "cancelled",
+            None,
+            0,
+            None,
+            Some("2020-01-01T00:03:30Z"),
+        )
+        .unwrap();
+
+        let result = db.get_last_finished_team_run("finished-team").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "run-finished-3");
     }
 
     #[test]

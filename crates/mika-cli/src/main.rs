@@ -38,13 +38,19 @@ async fn main() -> Result<()> {
         match cli.command {
             // `mika --team` or `mika chat --team`
             None | Some(Commands::Chat(_)) => {
-                let run_id = match cli.command {
-                    Some(Commands::Chat(ref args)) => args.run_id.as_deref(),
-                    _ => None,
+                let (explicit_run_id, last_run) = match cli.command {
+                    Some(Commands::Chat(ref args)) => (args.run_id.as_deref(), args.last_run),
+                    _ => (None, false),
+                };
+
+                let run_id = if last_run {
+                    Some(resolve_last_run(&global_home, &team_name)?)
+                } else {
+                    explicit_run_id.map(String::from)
                 };
 
                 // Validate --run-id format before any filesystem/DB use (defense-in-depth)
-                if let Some(ref_id) = run_id
+                if let Some(ref ref_id) = run_id
                     && uuid::Uuid::parse_str(ref_id).is_err()
                 {
                     anyhow::bail!(
@@ -54,16 +60,22 @@ async fn main() -> Result<()> {
 
                 let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
-                return commands::chat::run_team(&team_name, &global_home, run_id).await;
+                return commands::chat::run_team(&team_name, &global_home, run_id.as_deref()).await;
             }
             // `mika ask --team`
             Some(Commands::Ask(ref args)) => {
+                let run_id = if args.last_run {
+                    Some(resolve_last_run(&global_home, &team_name)?)
+                } else {
+                    args.run_id.clone()
+                };
+
                 let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
                 return commands::ask::run_team_ask(
                     &team_name,
                     &args.message,
-                    args.run_id.as_deref(),
+                    run_id.as_deref(),
                     &args.format,
                     &global_home,
                 )
@@ -204,6 +216,18 @@ async fn main() -> Result<()> {
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
         Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
+    }
+}
+
+/// Resolve `--last-run` by looking up the most recent finished team run.
+fn resolve_last_run(global_home: &std::path::Path, team_name: &str) -> anyhow::Result<String> {
+    let db = commands::teams::open_container_db(global_home)?;
+    match db.get_last_finished_team_run(team_name)? {
+        Some(run) => Ok(run.id),
+        None => anyhow::bail!(
+            "No finished team run found for team '{team_name}'. \
+             Run the team first before using --last-run."
+        ),
     }
 }
 
@@ -497,6 +521,65 @@ mod tests {
         let result =
             crate::cli::Cli::try_parse_from(["mika", "ask", "--run-id", "abc-123", "hello"]);
         assert!(result.is_err(), "--run-id should require --team");
+    }
+
+    /// --last-run requires --team on ask subcommand.
+    #[test]
+    fn test_last_run_requires_team_on_ask() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "ask", "--last-run", "hello"]);
+        assert!(result.is_err(), "--last-run should require --team");
+    }
+
+    /// --last-run requires --team on chat subcommand.
+    #[test]
+    fn test_last_run_requires_team_on_chat() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "chat", "--last-run"]);
+        assert!(result.is_err(), "--last-run should require --team");
+    }
+
+    /// --last-run and --run-id conflict on chat subcommand.
+    #[test]
+    fn test_last_run_conflicts_with_run_id_on_chat() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika",
+            "chat",
+            "--team",
+            "foo",
+            "--last-run",
+            "--run-id",
+            "abc",
+        ]);
+        assert!(
+            result.is_err(),
+            "--last-run and --run-id should conflict on chat"
+        );
+    }
+
+    /// --last-run and --run-id conflict on ask subcommand.
+    #[test]
+    fn test_last_run_conflicts_with_run_id_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika",
+            "ask",
+            "--team",
+            "foo",
+            "--last-run",
+            "--run-id",
+            "abc",
+            "hello",
+        ]);
+        assert!(
+            result.is_err(),
+            "--last-run and --run-id should conflict on ask"
+        );
+    }
+
+    /// --last-run with --team on chat should parse successfully.
+    #[test]
+    fn test_last_run_with_team_on_chat_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "chat", "--team", "research", "--last-run"]);
+        assert!(cli.is_ok());
     }
 
     /// clap-markdown output should include the --team flag (on chat subcommand).

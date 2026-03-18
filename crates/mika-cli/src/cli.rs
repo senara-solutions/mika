@@ -121,8 +121,12 @@ pub struct ChatArgs {
     pub team: Option<String>,
 
     /// Continue from a previous team run (requires --team)
-    #[arg(long, requires = "team")]
+    #[arg(long, requires = "team", conflicts_with = "last_run")]
     pub run_id: Option<String>,
+
+    /// Use the most recent finished team run as context (requires --team)
+    #[arg(long, requires = "team", conflicts_with = "run_id")]
+    pub last_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -152,8 +156,12 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "agent")]
     pub team: Option<String>,
     /// Continue from a previous team run (requires --team)
-    #[arg(long, requires = "team")]
+    #[arg(long, requires = "team", conflicts_with = "last_run")]
     pub run_id: Option<String>,
+
+    /// Use the most recent finished team run as context (requires --team)
+    #[arg(long, requires = "team", conflicts_with = "run_id")]
+    pub last_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -251,6 +259,12 @@ pub enum TeamsCommand {
     Log {
         /// Name of the team
         name: String,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+        /// Maximum number of runs to show
+        #[arg(long, short = 'n', default_value = "10")]
+        limit: usize,
     },
     /// Delete a team and all its data
     Delete {
