@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::Once;
 use tracing::{debug, info};
 use utoipa::ToSchema;
+
+use crate::timestamp;
 
 /// Register sqlite-vec as an auto-extension so every new connection gets vec0.
 pub fn init_sqlite_vec() {
@@ -20,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -93,8 +95,8 @@ pub struct AgentRow {
     pub name: String,
     pub home_dir: String,
     pub active: bool,
-    pub last_seen: Option<i64>,
-    pub created_at: i64,
+    pub last_seen: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +104,7 @@ pub struct TeamRow {
     pub id: String,
     pub name: String,
     pub config_path: String,
-    pub created_at: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -118,8 +120,8 @@ pub struct Task {
     pub event_source: Option<String>,
     pub event_offset_secs: Option<i64>,
     pub condition_expr: Option<String>,
-    pub next_fire_at: Option<i64>,
-    pub timeout_at: Option<i64>,
+    pub next_fire_at: Option<String>,
+    pub timeout_at: Option<String>,
     pub action_type: String,
     pub action_config: String,
     pub status: String,
@@ -129,10 +131,10 @@ pub struct Task {
     pub created_by_session: Option<String>,
     pub created_trace_id: Option<String>,
     pub execution_trace_id: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub fired_at: Option<i64>,
-    pub completed_at: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub fired_at: Option<String>,
+    pub completed_at: Option<String>,
     pub reference_url: Option<String>,
     pub source: Option<String>,
 }
@@ -149,8 +151,8 @@ pub struct NewTask {
     pub event_source: Option<String>,
     pub event_offset_secs: Option<i64>,
     pub condition_expr: Option<String>,
-    pub next_fire_at: Option<i64>,
-    pub timeout_at: Option<i64>,
+    pub next_fire_at: Option<String>,
+    pub timeout_at: Option<String>,
     pub action_type: String,
     pub action_config: String,
     pub input_context: Option<String>,
@@ -165,8 +167,8 @@ pub struct Session {
     pub id: String,
     pub agent_id: String,
     pub channel_type: String,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
     pub metadata: Option<String>,
     pub parent_session_id: Option<String>,
 }
@@ -181,7 +183,7 @@ pub struct SessionMessage {
     pub channel_type: String,
     pub metadata: Option<String>,
     pub trace_id: Option<String>,
-    pub created_at: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -273,8 +275,8 @@ pub struct TeamRunRow {
     pub iteration: u32,
     pub max_iterations: u32,
     pub deliverable: Option<String>,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
     pub trace_id: Option<String>,
 }
 
@@ -307,8 +309,8 @@ pub enum TeamRunIdFilter {
 pub struct TeamRunFilters {
     pub team_name: Option<String>,
     pub status: Option<String>,
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,7 +322,7 @@ pub struct TeamWorkspaceEntry {
     pub entry_type: String,
     pub content: String,
     pub iteration: u32,
-    pub created_at: i64,
+    pub created_at: String,
 }
 
 // ===== Team Run Summary Types =====
@@ -370,7 +372,7 @@ pub struct TimelineRow {
     pub event_type: String,
     pub event_subtype: String,
     pub summary: Option<String>,
-    pub created_at: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -379,8 +381,8 @@ pub struct TimelineFilters {
     pub event_type: Option<String>,
     pub trace_id: Option<String>,
     pub session_id: Option<String>,
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 impl TimelineFilters {
@@ -406,12 +408,12 @@ impl TimelineFilters {
             params.push(rusqlite::types::Value::Text(sid.clone()));
             conditions.push(format!("session_id = ?{}", params.len()));
         }
-        if let Some(from) = self.from {
-            params.push(rusqlite::types::Value::Integer(from));
+        if let Some(ref from) = self.from {
+            params.push(rusqlite::types::Value::Text(from.clone()));
             conditions.push(format!("created_at >= ?{}", params.len()));
         }
-        if let Some(to) = self.to {
-            params.push(rusqlite::types::Value::Integer(to));
+        if let Some(ref to) = self.to {
+            params.push(rusqlite::types::Value::Text(to.clone()));
             conditions.push(format!("created_at <= ?{}", params.len()));
         }
 
@@ -431,8 +433,8 @@ pub struct AgentWithStats {
     #[serde(skip)]
     pub home_dir: String,
     pub active: bool,
-    pub last_seen: Option<i64>,
-    pub created_at: i64,
+    pub last_seen: Option<String>,
+    pub created_at: String,
     pub message_count: i64,
 }
 
@@ -441,8 +443,8 @@ pub struct SessionWithStats {
     pub id: String,
     pub agent_id: String,
     pub channel_type: String,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
     pub metadata: Option<String>,
     pub message_count: i64,
 }
@@ -577,6 +579,10 @@ impl Database {
             self.migrate_v10_to_v11()?;
             info!(version = 11, "database migrated to v11");
         }
+        if (3..=11).contains(&version) {
+            self.migrate_v11_to_v12()?;
+            info!(version = 12, "database migrated to v12");
+        }
         Ok(())
     }
 
@@ -624,24 +630,24 @@ impl Database {
 
             CREATE TABLE schema_version (
                 version INTEGER NOT NULL,
-                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (11);
+            INSERT INTO schema_version (version) VALUES (12);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL COLLATE NOCASE,
                 home_dir TEXT NOT NULL DEFAULT '',
                 active BOOLEAN NOT NULL DEFAULT 1,
-                last_seen INTEGER,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                last_seen TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE TABLE teams (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL COLLATE NOCASE,
                 config_path TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE TABLE team_runs (
@@ -656,8 +662,8 @@ impl Database {
                 deliverable TEXT,
                 checkpoint TEXT,
                 trace_id TEXT,
-                started_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                ended_at INTEGER
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ended_at TEXT
             );
             CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
 
@@ -675,8 +681,8 @@ impl Database {
                 event_source TEXT,
                 event_offset_secs INTEGER,
                 condition_expr TEXT,
-                next_fire_at INTEGER,
-                timeout_at INTEGER,
+                next_fire_at TEXT,
+                timeout_at TEXT,
                 action_type TEXT NOT NULL CHECK (
                     action_type IN (
                         'send_message','resume_agent','inject_context',
@@ -696,10 +702,10 @@ impl Database {
                 created_by_session TEXT,
                 created_trace_id TEXT,
                 execution_trace_id TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                fired_at INTEGER,
-                completed_at INTEGER
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                fired_at TEXT,
+                completed_at TEXT
             );
             CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
@@ -720,8 +726,8 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 channel_type TEXT NOT NULL DEFAULT 'cli',
-                started_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                ended_at INTEGER,
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ended_at TEXT,
                 metadata TEXT,
                 parent_session_id TEXT
             );
@@ -737,7 +743,7 @@ impl Database {
                 metadata TEXT,
                 trace_id TEXT,
                 compacted_through_id INTEGER,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
             CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
@@ -748,7 +754,7 @@ impl Database {
                 key TEXT NOT NULL COLLATE NOCASE,
                 value TEXT NOT NULL,
                 token_count INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 PRIMARY KEY (agent_id, key)
             );
 
@@ -758,8 +764,8 @@ impl Database {
                 canonical_name TEXT NOT NULL COLLATE NOCASE,
                 relationship TEXT,
                 notes TEXT,
-                first_mentioned INTEGER NOT NULL DEFAULT (unixepoch()),
-                last_mentioned INTEGER NOT NULL DEFAULT (unixepoch()),
+                first_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                last_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 mention_count INTEGER NOT NULL DEFAULT 1,
                 UNIQUE (agent_id, canonical_name)
             );
@@ -772,8 +778,8 @@ impl Database {
                     CHECK (status IN ('pending','completed','cancelled')),
                 due_date TEXT,
                 person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                completed_at INTEGER
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT
             );
             CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
 
@@ -785,7 +791,7 @@ impl Database {
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 category TEXT NOT NULL COLLATE NOCASE,
                 value TEXT NOT NULL,
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 PRIMARY KEY (agent_id, category)
             );
 
@@ -795,7 +801,7 @@ impl Database {
                 description TEXT NOT NULL,
                 event_date TEXT,
                 context TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE TABLE audit_events (
@@ -809,7 +815,7 @@ impl Database {
                 reasoning TEXT,
                 trace_id TEXT,
                 rewound_by_trace_id TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
             CREATE INDEX idx_audit_session ON audit_events(session_id);
@@ -823,7 +829,7 @@ impl Database {
                 month INTEGER NOT NULL,
                 summary TEXT NOT NULL,
                 event_count INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 UNIQUE (agent_id, year, month)
             );
 
@@ -834,8 +840,8 @@ impl Database {
                 source_id INTEGER,
                 content TEXT NOT NULL,
                 embedding_json TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_search_agent ON search_content(agent_id, source_type);
 
@@ -848,7 +854,7 @@ impl Database {
                 content TEXT NOT NULL,
                 trace_id TEXT,
                 iteration INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_team_ws_run ON team_workspace(run_id, created_at);
             CREATE INDEX idx_team_ws_trace ON team_workspace(trace_id)
@@ -857,7 +863,7 @@ impl Database {
             CREATE TABLE heartbeat_sends (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                sent_at INTEGER NOT NULL DEFAULT (unixepoch())
+                sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_heartbeat_agent ON heartbeat_sends(agent_id, sent_at DESC);
 
@@ -867,7 +873,7 @@ impl Database {
                 status TEXT NOT NULL,
                 changes_made INTEGER NOT NULL DEFAULT 0,
                 summary TEXT,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_reflect_agent ON reflection_runs(agent_id, created_at DESC);
 
@@ -875,7 +881,7 @@ impl Database {
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 key TEXT NOT NULL COLLATE NOCASE,
                 value TEXT NOT NULL,
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 PRIMARY KEY (agent_id, key)
             );
 
@@ -885,7 +891,7 @@ impl Database {
                 text TEXT NOT NULL,
                 request_id TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE TABLE skill_overrides (
@@ -1404,6 +1410,476 @@ impl Database {
         }
     }
 
+    fn migrate_v11_to_v12(&self) -> Result<()> {
+        info!("migrating database schema v11 → v12 (INTEGER timestamps → ISO 8601 TEXT)");
+
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            // Drop views that reference tables we're rebuilding
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+
+            // --- agents ---
+            self.conn.execute_batch(
+                "CREATE TABLE agents_new (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE,
+                    home_dir TEXT NOT NULL DEFAULT '',
+                    active BOOLEAN NOT NULL DEFAULT 1,
+                    last_seen TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO agents_new SELECT id, name, home_dir, active,
+                    CASE WHEN last_seen IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', last_seen, 'unixepoch') ELSE NULL END,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM agents;
+                DROP TABLE agents;
+                ALTER TABLE agents_new RENAME TO agents;")?;
+
+            // --- teams ---
+            self.conn.execute_batch(
+                "CREATE TABLE teams_new (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE,
+                    config_path TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO teams_new SELECT id, name, config_path,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM teams;
+                DROP TABLE teams;
+                ALTER TABLE teams_new RENAME TO teams;",
+            )?;
+
+            // --- team_runs ---
+            self.conn.execute_batch(
+                "CREATE TABLE team_runs_new (
+                    id TEXT PRIMARY KEY,
+                    team_id TEXT NOT NULL REFERENCES teams(id),
+                    goal TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running'
+                        CHECK (status IN ('running','completed','failed','cancelled','suspended')),
+                    failure_reason TEXT,
+                    iteration INTEGER NOT NULL DEFAULT 1,
+                    max_iterations INTEGER NOT NULL DEFAULT 3,
+                    deliverable TEXT,
+                    checkpoint TEXT,
+                    trace_id TEXT,
+                    started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    ended_at TEXT
+                );
+                INSERT INTO team_runs_new SELECT id, team_id, goal, status, failure_reason,
+                    iteration, max_iterations, deliverable, checkpoint, trace_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', started_at, 'unixepoch'),
+                    CASE WHEN ended_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', ended_at, 'unixepoch') ELSE NULL END
+                FROM team_runs;
+                DROP TABLE team_runs;
+                ALTER TABLE team_runs_new RENAME TO team_runs;
+                CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);")?;
+
+            // --- sessions (must be before messages due to FK) ---
+            self.conn.execute_batch(
+                "CREATE TABLE sessions_new (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    channel_type TEXT NOT NULL DEFAULT 'cli',
+                    started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    ended_at TEXT,
+                    metadata TEXT,
+                    parent_session_id TEXT
+                );
+                INSERT INTO sessions_new SELECT id, agent_id, channel_type,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', started_at, 'unixepoch'),
+                    CASE WHEN ended_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', ended_at, 'unixepoch') ELSE NULL END,
+                    metadata, parent_session_id
+                FROM sessions;
+                DROP TABLE sessions;
+                ALTER TABLE sessions_new RENAME TO sessions;
+                CREATE INDEX idx_sessions_agent ON sessions(agent_id, started_at DESC);
+                CREATE INDEX idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;")?;
+
+            // --- tasks ---
+            self.conn.execute_batch(
+                "CREATE TABLE tasks_new (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                    parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
+                    depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                    label TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL CHECK (
+                        trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual')
+                    ),
+                    cron_expr TEXT,
+                    event_source TEXT,
+                    event_offset_secs INTEGER,
+                    condition_expr TEXT,
+                    next_fire_at TEXT,
+                    timeout_at TEXT,
+                    action_type TEXT NOT NULL CHECK (
+                        action_type IN (
+                            'send_message','resume_agent','inject_context',
+                            'run_skill','invoke_orchestrator','none'
+                        )
+                    ),
+                    action_config TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        status IN ('pending','in_progress','completed','failed',
+                                   'cancelled','expired','recurring_active','delivered','blocked')
+                    ),
+                    process_id INTEGER,
+                    input_context TEXT,
+                    result TEXT,
+                    reference_url TEXT,
+                    source TEXT,
+                    created_by_session TEXT,
+                    created_trace_id TEXT,
+                    execution_trace_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    fired_at TEXT,
+                    completed_at TEXT
+                );
+                INSERT INTO tasks_new SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
+                    trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
+                    CASE WHEN next_fire_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', next_fire_at, 'unixepoch') ELSE NULL END,
+                    CASE WHEN timeout_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', timeout_at, 'unixepoch') ELSE NULL END,
+                    action_type, action_config, status, process_id, input_context, result,
+                    reference_url, source, created_by_session, created_trace_id, execution_trace_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch'),
+                    CASE WHEN fired_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', fired_at, 'unixepoch') ELSE NULL END,
+                    CASE WHEN completed_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', completed_at, 'unixepoch') ELSE NULL END
+                FROM tasks;
+                DROP TABLE tasks;
+                ALTER TABLE tasks_new RENAME TO tasks;")?;
+
+            // Recreate task indexes
+            self.conn.execute_batch(
+                "CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+                 CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at) WHERE status IN ('pending','recurring_active');
+                 CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC) WHERE status IN ('pending','recurring_active');
+                 CREATE INDEX idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
+                 CREATE INDEX idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
+                 CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+                 CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
+                 CREATE INDEX idx_tasks_manual_active ON tasks(agent_id, created_at DESC) WHERE trigger_type = 'manual' AND status IN ('pending', 'in_progress', 'blocked');
+                 CREATE UNIQUE INDEX idx_tasks_unique_recurring ON tasks(agent_id, label COLLATE NOCASE) WHERE trigger_type = 'recurring' AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+                 CREATE UNIQUE INDEX idx_tasks_unique_reminder ON tasks(agent_id, label COLLATE NOCASE) WHERE status IN ('pending', 'in_progress', 'recurring_active') AND action_type = 'send_message';
+                 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at) WHERE trigger_type='callback' AND action_type='resume_agent' AND status='completed';")?;
+
+            // --- messages ---
+            self.conn.execute_batch(
+                "CREATE TABLE messages_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    trace_id TEXT,
+                    compacted_through_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO messages_new SELECT id, session_id, agent_id, role, content, metadata,
+                    trace_id, compacted_through_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM messages;
+                DROP TABLE messages;
+                ALTER TABLE messages_new RENAME TO messages;
+                CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
+                CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
+                CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;")?;
+
+            // --- core_memory ---
+            self.conn.execute_batch(
+                "CREATE TABLE core_memory_new (
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    key TEXT NOT NULL COLLATE NOCASE,
+                    value TEXT NOT NULL,
+                    token_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    PRIMARY KEY (agent_id, key)
+                );
+                INSERT INTO core_memory_new SELECT agent_id, key, value, token_count,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+                FROM core_memory;
+                DROP TABLE core_memory;
+                ALTER TABLE core_memory_new RENAME TO core_memory;",
+            )?;
+
+            // --- people ---
+            self.conn.execute_batch(
+                "CREATE TABLE people_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    canonical_name TEXT NOT NULL COLLATE NOCASE,
+                    relationship TEXT,
+                    notes TEXT,
+                    first_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    last_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    mention_count INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE (agent_id, canonical_name)
+                );
+                INSERT INTO people_new SELECT id, agent_id, canonical_name, relationship, notes,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', first_mentioned, 'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%SZ', last_mentioned, 'unixepoch'),
+                    mention_count
+                FROM people;
+                DROP TABLE people;
+                ALTER TABLE people_new RENAME TO people;",
+            )?;
+
+            // --- commitments ---
+            self.conn.execute_batch(
+                "CREATE TABLE commitments_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    description TEXT NOT NULL COLLATE NOCASE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','completed','cancelled')),
+                    due_date TEXT,
+                    person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    completed_at TEXT
+                );
+                INSERT INTO commitments_new SELECT id, agent_id, description, status, due_date, person_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
+                    CASE WHEN completed_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', completed_at, 'unixepoch') ELSE NULL END
+                FROM commitments;
+                DROP TABLE commitments;
+                ALTER TABLE commitments_new RENAME TO commitments;
+                CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+                CREATE UNIQUE INDEX idx_commitments_unique_pending ON commitments(agent_id, description COLLATE NOCASE, due_date) WHERE status = 'pending';")?;
+
+            // --- preferences ---
+            self.conn.execute_batch(
+                "CREATE TABLE preferences_new (
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL COLLATE NOCASE,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    PRIMARY KEY (agent_id, category)
+                );
+                INSERT INTO preferences_new SELECT agent_id, category, value,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+                FROM preferences;
+                DROP TABLE preferences;
+                ALTER TABLE preferences_new RENAME TO preferences;",
+            )?;
+
+            // --- events ---
+            self.conn.execute_batch(
+                "CREATE TABLE events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    description TEXT NOT NULL,
+                    event_date TEXT,
+                    context TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO events_new SELECT id, agent_id, description, event_date, context,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM events;
+                DROP TABLE events;
+                ALTER TABLE events_new RENAME TO events;
+                CREATE UNIQUE INDEX idx_events_unique_description ON events(agent_id, description COLLATE NOCASE, event_date) WHERE event_date IS NOT NULL;")?;
+
+            // --- audit_events ---
+            self.conn.execute_batch(
+                "CREATE TABLE audit_events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    before_value TEXT,
+                    after_value TEXT,
+                    reasoning TEXT,
+                    trace_id TEXT,
+                    rewound_by_trace_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO audit_events_new SELECT id, agent_id, session_id, tool_name,
+                    target_key, before_value, after_value, reasoning, trace_id, rewound_by_trace_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM audit_events;
+                DROP TABLE audit_events;
+                ALTER TABLE audit_events_new RENAME TO audit_events;
+                CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
+                CREATE INDEX idx_audit_session ON audit_events(session_id);
+                CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
+                CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id) WHERE rewound_by_trace_id IS NOT NULL;")?;
+
+            // --- audit_event_summaries ---
+            self.conn.execute_batch(
+                "CREATE TABLE audit_event_summaries_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    year INTEGER NOT NULL,
+                    month INTEGER NOT NULL,
+                    summary TEXT NOT NULL,
+                    event_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    UNIQUE (agent_id, year, month)
+                );
+                INSERT INTO audit_event_summaries_new SELECT id, agent_id, year, month,
+                    summary, event_count,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM audit_event_summaries;
+                DROP TABLE audit_event_summaries;
+                ALTER TABLE audit_event_summaries_new RENAME TO audit_event_summaries;",
+            )?;
+
+            // --- search_content ---
+            self.conn.execute_batch(
+                "CREATE TABLE search_content_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    source_type TEXT NOT NULL,
+                    source_id INTEGER,
+                    content TEXT NOT NULL,
+                    embedding_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO search_content_new SELECT id, agent_id, source_type, source_id, content,
+                    embedding_json,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+                FROM search_content;
+                DROP TABLE search_content;
+                ALTER TABLE search_content_new RENAME TO search_content;
+                CREATE INDEX idx_search_agent ON search_content(agent_id, source_type);",
+            )?;
+
+            // --- team_workspace ---
+            self.conn.execute_batch(
+                "CREATE TABLE team_workspace_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+                    parent_id INTEGER REFERENCES team_workspace_new(id),
+                    agent_name TEXT,
+                    entry_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    trace_id TEXT,
+                    iteration INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO team_workspace_new SELECT id, run_id, parent_id, agent_name,
+                    entry_type, content, trace_id, iteration,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM team_workspace;
+                DROP TABLE team_workspace;
+                ALTER TABLE team_workspace_new RENAME TO team_workspace;
+                CREATE INDEX idx_team_ws_run ON team_workspace(run_id, created_at);
+                CREATE INDEX idx_team_ws_trace ON team_workspace(trace_id) WHERE trace_id IS NOT NULL;")?;
+
+            // --- heartbeat_sends ---
+            self.conn.execute_batch(
+                "CREATE TABLE heartbeat_sends_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO heartbeat_sends_new SELECT id, agent_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', sent_at, 'unixepoch')
+                FROM heartbeat_sends;
+                DROP TABLE heartbeat_sends;
+                ALTER TABLE heartbeat_sends_new RENAME TO heartbeat_sends;
+                CREATE INDEX idx_heartbeat_agent ON heartbeat_sends(agent_id, sent_at DESC);",
+            )?;
+
+            // --- reflection_runs ---
+            self.conn.execute_batch(
+                "CREATE TABLE reflection_runs_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    changes_made INTEGER NOT NULL DEFAULT 0,
+                    summary TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO reflection_runs_new SELECT id, agent_id, status, changes_made, summary,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM reflection_runs;
+                DROP TABLE reflection_runs;
+                ALTER TABLE reflection_runs_new RENAME TO reflection_runs;
+                CREATE INDEX idx_reflect_agent ON reflection_runs(agent_id, created_at DESC);",
+            )?;
+
+            // --- customer_config ---
+            self.conn.execute_batch(
+                "CREATE TABLE customer_config_new (
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    key TEXT NOT NULL COLLATE NOCASE,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    PRIMARY KEY (agent_id, key)
+                );
+                INSERT INTO customer_config_new SELECT agent_id, key, value,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+                FROM customer_config;
+                DROP TABLE customer_config;
+                ALTER TABLE customer_config_new RENAME TO customer_config;",
+            )?;
+
+            // --- failed_sends ---
+            self.conn.execute_batch(
+                "CREATE TABLE failed_sends_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    request_id TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO failed_sends_new SELECT id, agent_id, text, request_id, retry_count,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+                FROM failed_sends;
+                DROP TABLE failed_sends;
+                ALTER TABLE failed_sends_new RENAME TO failed_sends;",
+            )?;
+
+            // --- schema_version ---
+            self.conn.execute_batch(
+                "CREATE TABLE schema_version_new (
+                    version INTEGER NOT NULL,
+                    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                INSERT INTO schema_version_new SELECT version,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', applied_at, 'unixepoch')
+                FROM schema_version;
+                DROP TABLE schema_version;
+                ALTER TABLE schema_version_new RENAME TO schema_version;",
+            )?;
+
+            // Recreate unified_timeline VIEW
+            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+            // Record migration
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (12)", [])?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+                Err(e)
+            }
+        }
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -1439,7 +1915,7 @@ impl Database {
 
     pub fn update_agent_last_seen(&self, id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE agents SET last_seen = unixepoch() WHERE id = ?1",
+            "UPDATE agents SET last_seen = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -1622,7 +2098,7 @@ impl Database {
         agent_id: &str,
         label: &str,
         new_cron: &str,
-        next_fire_at: i64,
+        next_fire_at: &str,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET cron_expr = ?1, next_fire_at = ?2
@@ -1636,7 +2112,7 @@ impl Database {
     /// Cancel a recurring task by label (e.g. when reflection is disabled in identity.toml).
     pub fn cancel_recurring_task_by_label(&self, agent_id: &str, label: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
+            "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE agent_id = ?1 AND label = ?2 AND trigger_type = 'recurring'
                AND status NOT IN ('completed','failed','cancelled','expired')",
             params![agent_id, label],
@@ -1712,7 +2188,7 @@ impl Database {
 
     pub fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET status = ?1, updated_at = unixepoch() WHERE id = ?2",
+            "UPDATE tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
             params![status, id],
         )?;
         Ok(())
@@ -1723,7 +2199,7 @@ impl Database {
     /// execution_trace_id for tasks owned by different agents (cross-agent team tasks).
     pub fn update_task_execution_trace_id(&self, id: &str, trace_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET execution_trace_id = ?1, updated_at = unixepoch() WHERE id = ?2",
+            "UPDATE tasks SET execution_trace_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
             params![trace_id, id],
         )?;
         Ok(())
@@ -1735,8 +2211,8 @@ impl Database {
     pub fn claim_and_fire_task(&self, id: &str, agent_id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'in_progress',
-                              fired_at = unixepoch(),
-                              updated_at = unixepoch()
+                              fired_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1 AND agent_id = ?2 AND status IN ('pending', 'recurring_active')",
             params![id, agent_id],
         )?;
@@ -1751,7 +2227,7 @@ impl Database {
     ) -> Result<bool> {
         let rows = self.conn.execute(
             "UPDATE tasks SET status = 'completed', result = ?1,
-             completed_at = unixepoch(), updated_at = unixepoch()
+             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?2 AND agent_id = ?3 AND status IN ('pending', 'in_progress')",
             params![result, id, agent_id],
         )?;
@@ -1761,16 +2237,16 @@ impl Database {
     pub fn update_task_failed(&self, id: &str, agent_id: &str, error: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET status = 'failed', result = ?1,
-             completed_at = unixepoch(), updated_at = unixepoch()
+             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?2 AND agent_id = ?3",
             params![error, id, agent_id],
         )?;
         Ok(())
     }
 
-    pub fn update_task_next_fire_at(&self, id: &str, next_fire_at: i64) -> Result<()> {
+    pub fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET next_fire_at = ?1, updated_at = unixepoch() WHERE id = ?2",
+            "UPDATE tasks SET next_fire_at = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
             params![next_fire_at, id],
         )?;
         Ok(())
@@ -1778,9 +2254,9 @@ impl Database {
 
     /// Atomically reschedule a recurring task: set next_fire_at and status = 'recurring_active'
     /// in a single UPDATE, replacing two sequential writes.
-    pub fn update_task_rescheduled(&self, id: &str, next_fire_at: i64) -> Result<()> {
+    pub fn update_task_rescheduled(&self, id: &str, next_fire_at: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET next_fire_at = ?1, status = 'recurring_active', updated_at = unixepoch() WHERE id = ?2",
+            "UPDATE tasks SET next_fire_at = ?1, status = 'recurring_active', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
             params![next_fire_at, id],
         )?;
         Ok(())
@@ -1788,7 +2264,7 @@ impl Database {
 
     pub fn cancel_task(&self, id: &str, agent_id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE tasks SET status = 'cancelled', updated_at = unixepoch()
+            "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1 AND agent_id = ?2 AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
             params![id, agent_id],
         )?;
@@ -1822,8 +2298,8 @@ impl Database {
         }
 
         self.conn.execute(
-            "UPDATE tasks SET status = ?1, updated_at = unixepoch(),
-                    completed_at = CASE WHEN ?1 = 'completed' THEN unixepoch() ELSE NULL END
+            "UPDATE tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    completed_at = CASE WHEN ?1 = 'completed' THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE NULL END
              WHERE id = ?2 AND agent_id = ?3 AND trigger_type = 'manual'",
             params![new_status, task_id, agent_id],
         )?;
@@ -1920,13 +2396,13 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn mark_tasks_expired(&self, now_unix: i64, agent_id: &str) -> Result<usize> {
+    pub fn mark_tasks_expired(&self, now: &str, agent_id: &str) -> Result<usize> {
         let n = self.conn.execute(
-            "UPDATE tasks SET status = 'expired', updated_at = unixepoch()
+            "UPDATE tasks SET status = 'expired', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE agent_id = ?2
                AND timeout_at IS NOT NULL AND timeout_at < ?1
                AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
-            params![now_unix, agent_id],
+            params![now, agent_id],
         )?;
         Ok(n)
     }
@@ -1991,12 +2467,8 @@ impl Database {
     }
 
     /// Get callback tasks that completed but have not yet been delivered to the user.
-    /// Bounded by `since_unix` to avoid processing stale callbacks.
-    pub fn get_undelivered_callback_tasks(
-        &self,
-        agent_id: &str,
-        since_unix: i64,
-    ) -> Result<Vec<Task>> {
+    /// Bounded by `since` (ISO 8601) to avoid processing stale callbacks.
+    pub fn get_undelivered_callback_tasks(&self, agent_id: &str, since: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
@@ -2010,7 +2482,7 @@ impl Database {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, since_unix], Self::row_to_task)?
+            .query_map(params![agent_id, since], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -2020,7 +2492,7 @@ impl Database {
     pub fn get_undelivered_callback_tasks_for_session(
         &self,
         agent_id: &str,
-        since_unix: i64,
+        since: &str,
         session_id: &str,
     ) -> Result<Vec<Task>> {
         let sql = format!(
@@ -2037,7 +2509,7 @@ impl Database {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, since_unix, session_id], Self::row_to_task)?
+            .query_map(params![agent_id, since, session_id], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -2046,7 +2518,7 @@ impl Database {
     /// Returns `false` if the task was already claimed (not in 'completed' status).
     pub fn mark_task_delivered(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE tasks SET status = 'delivered', updated_at = unixepoch()
+            "UPDATE tasks SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1 AND status = 'completed'",
             params![id],
         )?;
@@ -2055,7 +2527,7 @@ impl Database {
 
     pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET process_id = ?1, updated_at = unixepoch() WHERE id = ?2",
+            "UPDATE tasks SET process_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
             params![process_id, id],
         )?;
         Ok(())
@@ -2078,7 +2550,7 @@ impl Database {
     /// Clear the process_id after killing an orphan process to prevent repeated kill attempts.
     pub fn clear_task_process_id(&self, id: &str, agent_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET process_id = NULL, updated_at = unixepoch()
+            "UPDATE tasks SET process_id = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1 AND agent_id = ?2",
             params![id, agent_id],
         )?;
@@ -2127,7 +2599,7 @@ impl Database {
         // 3. Atomically claim parent task (only if still pending).
         // No agent_id filter — the parent may have a different agent_id than children.
         let changed = tx.execute(
-            "UPDATE tasks SET status = 'in_progress', fired_at = unixepoch(), updated_at = unixepoch()
+            "UPDATE tasks SET status = 'in_progress', fired_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1 AND status = 'pending'",
             params![&parent_id],
         )?;
@@ -2173,7 +2645,7 @@ impl Database {
     }
 
     pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
-        let cutoff = Utc::now().timestamp() - older_than_secs;
+        let cutoff = timestamp::now_minus(Duration::seconds(older_than_secs));
         let n = self.conn.execute(
             "DELETE FROM tasks WHERE status IN ('completed','cancelled','expired','failed','delivered')
              AND completed_at IS NOT NULL AND completed_at < ?1",
@@ -2266,7 +2738,7 @@ impl Database {
 
     pub fn end_session(&self, id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET ended_at = unixepoch() WHERE id = ?1",
+            "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -2285,7 +2757,7 @@ impl Database {
     /// Targets heartbeat, callback, skill, and reflection sessions.
     /// Messages are cascade-deleted via FK ON DELETE CASCADE.
     pub fn prune_old_sessions(&self, retention_secs: i64) -> Result<usize> {
-        let cutoff = Utc::now().timestamp() - retention_secs;
+        let cutoff = timestamp::now_minus(Duration::seconds(retention_secs));
         let n = self.conn.execute(
             "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1
              AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%' OR id LIKE 'reflection-%' OR id LIKE 'team-%')",
@@ -2341,7 +2813,7 @@ impl Database {
             channel_type: r.get(5)?,
             metadata: r.get(6)?,
             trace_id: r.get(7)?,
-            created_at: r.get::<_, i64>(8)?,
+            created_at: r.get(8)?,
         })
     }
 
@@ -2521,11 +2993,7 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn get_messages_since(
-        &self,
-        agent_id: &str,
-        since_unix: i64,
-    ) -> Result<Vec<SessionMessage>> {
+    pub fn get_messages_since(&self, agent_id: &str, since: &str) -> Result<Vec<SessionMessage>> {
         let sql = format!(
             "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
               WHERE m.agent_id = ?1 AND m.created_at >= ?2 AND m.role != 'summary'
@@ -2534,12 +3002,12 @@ impl Database {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, since_unix], Self::row_to_session_message)?
+            .query_map(params![agent_id, since], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
-    pub fn last_user_message_time(&self, agent_id: &str) -> Result<Option<i64>> {
+    pub fn last_user_message_time(&self, agent_id: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
                 "SELECT MAX(created_at) FROM messages
@@ -2557,7 +3025,7 @@ impl Database {
     pub fn get_core_memory(&self, agent_id: &str, key: &str) -> Result<Option<CoreMemoryEntry>> {
         self.conn
             .query_row(
-                "SELECT key, value, token_count, datetime(updated_at, 'unixepoch')
+                "SELECT key, value, token_count, updated_at
                   FROM core_memory WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id, key],
                 |r| {
@@ -2575,7 +3043,7 @@ impl Database {
 
     pub fn get_all_core_memory(&self, agent_id: &str) -> Result<Vec<CoreMemoryEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, value, token_count, datetime(updated_at, 'unixepoch')
+            "SELECT key, value, token_count, updated_at
               FROM core_memory WHERE agent_id = ?1 ORDER BY key",
         )?;
         let rows = stmt
@@ -2600,7 +3068,7 @@ impl Database {
              ON CONFLICT(agent_id, key) DO UPDATE SET
                 value = excluded.value,
                 token_count = excluded.token_count,
-                updated_at = unixepoch()",
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             params![agent_id, key, value, token_count],
         )?;
         Ok(token_count)
@@ -2667,7 +3135,7 @@ impl Database {
             self.conn.execute(
                 "UPDATE people SET relationship = COALESCE(?1, relationship),
                   notes = COALESCE(?2, notes),
-                  last_mentioned = unixepoch(),
+                  last_mentioned = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                   mention_count = mention_count + 1
                   WHERE id = ?3",
                 params![relationship, notes, id],
@@ -2687,8 +3155,8 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT id, canonical_name, relationship, notes,
-                         datetime(first_mentioned, 'unixepoch'),
-                         datetime(last_mentioned, 'unixepoch'),
+                         first_mentioned,
+                         last_mentioned,
                          mention_count
                   FROM people WHERE agent_id = ?1 AND canonical_name = ?2",
                 params![agent_id, name],
@@ -2711,8 +3179,8 @@ impl Database {
     pub fn list_people(&self, agent_id: &str) -> Result<Vec<Person>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, canonical_name, relationship, notes,
-                     datetime(first_mentioned, 'unixepoch'),
-                     datetime(last_mentioned, 'unixepoch'),
+                     first_mentioned,
+                     last_mentioned,
                      mention_count
               FROM people WHERE agent_id = ?1 ORDER BY canonical_name",
         )?;
@@ -2736,8 +3204,8 @@ impl Database {
         let pattern = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
             "SELECT id, canonical_name, relationship, notes,
-                     datetime(first_mentioned, 'unixepoch'),
-                     datetime(last_mentioned, 'unixepoch'),
+                     first_mentioned,
+                     last_mentioned,
                      mention_count
               FROM people
               WHERE agent_id = ?1 AND (
@@ -2793,8 +3261,8 @@ impl Database {
     pub fn list_commitments(&self, agent_id: &str, status: &str) -> Result<Vec<Commitment>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, description, status, due_date, person_id,
-                     datetime(created_at, 'unixepoch'),
-                     datetime(completed_at, 'unixepoch')
+                     created_at,
+                     completed_at
               FROM commitments WHERE agent_id = ?1 AND status = ?2
               ORDER BY created_at DESC",
         )?;
@@ -2805,8 +3273,8 @@ impl Database {
     }
 
     pub fn update_commitment_status(&self, agent_id: &str, id: i64, status: &str) -> Result<bool> {
-        let completed_at = if status == "completed" {
-            Some(Utc::now().timestamp())
+        let completed_at: Option<String> = if status == "completed" {
+            Some(timestamp::now())
         } else {
             None
         };
@@ -2848,8 +3316,8 @@ impl Database {
         let pattern = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
             "SELECT id, description, status, due_date, person_id,
-                     datetime(created_at, 'unixepoch'),
-                     datetime(completed_at, 'unixepoch')
+                     created_at,
+                     completed_at
               FROM commitments WHERE agent_id = ?1 AND description LIKE ?2
               ORDER BY created_at DESC",
         )?;
@@ -2865,7 +3333,7 @@ impl Database {
         self.conn.execute(
             "INSERT INTO preferences (agent_id, category, value) VALUES (?1, ?2, ?3)
              ON CONFLICT(agent_id, category) DO UPDATE SET
-                 value = excluded.value, updated_at = unixepoch()",
+                 value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             params![agent_id, category, value],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -2884,7 +3352,7 @@ impl Database {
 
     pub fn list_preferences(&self, agent_id: &str) -> Result<Vec<Preference>> {
         let mut stmt = self.conn.prepare(
-            "SELECT category, value, datetime(updated_at, 'unixepoch')
+            "SELECT category, value, updated_at
               FROM preferences WHERE agent_id = ?1 ORDER BY category",
         )?;
         let rows = stmt
@@ -2902,7 +3370,7 @@ impl Database {
     pub fn search_preferences(&self, agent_id: &str, query: &str) -> Result<Vec<Preference>> {
         let pattern = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
-            "SELECT category, value, datetime(updated_at, 'unixepoch')
+            "SELECT category, value, updated_at
               FROM preferences WHERE agent_id = ?1 AND (category LIKE ?2 OR value LIKE ?2)
               ORDER BY category",
         )?;
@@ -2936,7 +3404,7 @@ impl Database {
 
     pub fn list_events(&self, agent_id: &str) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, description, event_date, context, datetime(created_at, 'unixepoch')
+            "SELECT id, description, event_date, context, created_at
               FROM events WHERE agent_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -2956,7 +3424,7 @@ impl Database {
     pub fn search_events(&self, agent_id: &str, query: &str) -> Result<Vec<Event>> {
         let pattern = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
-            "SELECT id, description, event_date, context, datetime(created_at, 'unixepoch')
+            "SELECT id, description, event_date, context, created_at
               FROM events WHERE agent_id = ?1 AND (description LIKE ?2 OR context LIKE ?2)
               ORDER BY created_at DESC",
         )?;
@@ -3007,7 +3475,7 @@ impl Database {
     }
 
     /// Standard column list for audit event queries.
-    const AUDIT_EVENT_COLS: &str = "id, agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning, trace_id, rewound_by_trace_id, datetime(created_at, 'unixepoch')";
+    const AUDIT_EVENT_COLS: &str = "id, agent_id, session_id, tool_name, target_key, before_value, after_value, reasoning, trace_id, rewound_by_trace_id, created_at";
 
     fn row_to_audit_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
         Ok(AuditEvent {
@@ -3037,18 +3505,14 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn get_audit_events_since(
-        &self,
-        agent_id: &str,
-        since_unix: i64,
-    ) -> Result<Vec<AuditEvent>> {
+    pub fn get_audit_events_since(&self, agent_id: &str, since: &str) -> Result<Vec<AuditEvent>> {
         let sql = format!(
             "SELECT {} FROM audit_events WHERE agent_id = ?1 AND created_at >= ?2 ORDER BY created_at ASC",
             Self::AUDIT_EVENT_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![agent_id, since_unix], Self::row_to_audit_event)?
+            .query_map(params![agent_id, since], Self::row_to_audit_event)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -3082,11 +3546,11 @@ impl Database {
     }
 
     pub fn compact_old_audit_events(&self, agent_id: &str, days: u32) -> Result<usize> {
-        let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
+        let cutoff = timestamp::now_minus(Duration::days(days as i64));
         let mut stmt = self.conn.prepare(
             "SELECT
-                 CAST(strftime('%Y', datetime(created_at, 'unixepoch')) AS INTEGER) AS year,
-                 CAST(strftime('%m', datetime(created_at, 'unixepoch')) AS INTEGER) AS month,
+                 CAST(strftime('%Y', created_at) AS INTEGER) AS year,
+                 CAST(strftime('%m', created_at) AS INTEGER) AS month,
                  COUNT(*) AS cnt,
                  GROUP_CONCAT(
                      tool_name || ': ' || target_key || ' = ' || substr(COALESCE(after_value, '(none)'), 1, 100),
@@ -3410,7 +3874,7 @@ impl Database {
     pub fn count_heartbeat_sends_last_hour(&self, agent_id: &str) -> Result<u32> {
         let n: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM heartbeat_sends
-             WHERE agent_id = ?1 AND sent_at >= unixepoch('now') - 3600",
+             WHERE agent_id = ?1 AND sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')",
             params![agent_id],
             |r| r.get(0),
         )?;
@@ -3427,8 +3891,8 @@ impl Database {
         let since_ts = tz
             .from_local_datetime(&midnight_local)
             .earliest()
-            .map(|dt| dt.with_timezone(&Utc).timestamp())
-            .unwrap_or_else(|| Utc::now().timestamp());
+            .map(|dt| timestamp::format(&dt.with_timezone(&Utc)))
+            .unwrap_or_else(timestamp::now);
         let n: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM heartbeat_sends WHERE agent_id = ?1 AND sent_at >= ?2",
             params![agent_id, since_ts],
@@ -3438,7 +3902,7 @@ impl Database {
     }
 
     pub fn prune_old_heartbeat_sends(&self, agent_id: &str, days: u32) -> Result<()> {
-        let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
+        let cutoff = timestamp::now_minus(Duration::days(days as i64));
         self.conn.execute(
             "DELETE FROM heartbeat_sends WHERE agent_id = ?1 AND sent_at < ?2",
             params![agent_id, cutoff],
@@ -3473,8 +3937,8 @@ impl Database {
         let since_ts = tz
             .from_local_datetime(&midnight_local)
             .earliest()
-            .map(|dt| dt.with_timezone(&Utc).timestamp())
-            .unwrap_or_else(|| Utc::now().timestamp());
+            .map(|dt| timestamp::format(&dt.with_timezone(&Utc)))
+            .unwrap_or_else(timestamp::now);
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM reflection_runs
              WHERE agent_id = ?1 AND status = 'completed' AND created_at >= ?2",
@@ -3485,7 +3949,7 @@ impl Database {
     }
 
     pub fn prune_old_reflection_runs(&self, agent_id: &str, days: u32) -> Result<usize> {
-        let cutoff = Utc::now().timestamp() - (days as i64 * 86_400);
+        let cutoff = timestamp::now_minus(Duration::days(days as i64));
         let n = self.conn.execute(
             "DELETE FROM reflection_runs WHERE agent_id = ?1 AND created_at < ?2",
             params![agent_id, cutoff],
@@ -3514,7 +3978,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<FailedSend>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, text, request_id, datetime(created_at, 'unixepoch'), retry_count
+            "SELECT id, text, request_id, created_at, retry_count
               FROM failed_sends WHERE agent_id = ?1
               ORDER BY created_at ASC LIMIT ?2",
         )?;
@@ -3564,7 +4028,7 @@ impl Database {
     pub fn set_customer_config(&self, agent_id: &str, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO customer_config (agent_id, key, value) VALUES (?1, ?2, ?3)
-             ON CONFLICT(agent_id, key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+             ON CONFLICT(agent_id, key) DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             params![agent_id, key, value],
         )?;
         Ok(())
@@ -3588,7 +4052,7 @@ impl Database {
         team_name: &str,
         goal: &str,
         max_iterations: u32,
-        started_at: i64,
+        started_at: &str,
         trace_id: Option<&str>,
     ) -> Result<()> {
         // Auto-register team (team_id = team_name)
@@ -3618,7 +4082,7 @@ impl Database {
         failure_reason: Option<&str>,
         iteration: u32,
         deliverable: Option<&str>,
-        ended_at: Option<i64>,
+        ended_at: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
@@ -3952,7 +4416,7 @@ impl Database {
             .optional()?;
         if let Some((existing_id, old_content)) = existing {
             self.conn.execute(
-                "UPDATE search_content SET content = ?1, updated_at = unixepoch() WHERE id = ?2",
+                "UPDATE search_content SET content = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
                 params![content, existing_id],
             )?;
             // Update FTS index
@@ -3983,7 +4447,7 @@ impl Database {
     pub fn index_embedding(&self, content_id: i64, embedding: &[f32]) -> Result<()> {
         let emb_json = serde_json::to_string(embedding)?;
         self.conn.execute(
-            "UPDATE search_content SET embedding_json = ?1, updated_at = unixepoch()
+            "UPDATE search_content SET embedding_json = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?2",
             params![emb_json, content_id],
         )?;
@@ -4742,12 +5206,12 @@ impl Database {
             Self::push_csv_in_clause("r.status", status, &mut conditions, &mut params);
         }
 
-        if let Some(from) = filters.from {
+        if let Some(ref from) = filters.from {
             params.push(from.to_string());
             conditions.push(format!("r.started_at >= ?{}", params.len()));
         }
 
-        if let Some(to) = filters.to {
+        if let Some(ref to) = filters.to {
             params.push(to.to_string());
             conditions.push(format!("r.started_at <= ?{}", params.len()));
         }
@@ -4841,11 +5305,11 @@ impl Database {
 
 // ===== Utility Functions =====
 
-/// Format a unix timestamp as a human-readable UTC string: "YYYY-MM-DD HH:MM:SS".
-pub fn format_unix_ts(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
+/// Format an ISO 8601 timestamp as a human-readable UTC string: "YYYY-MM-DD HH:MM:SS".
+pub fn format_ts(ts: &str) -> String {
+    crate::timestamp::parse(ts)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| ts.to_string())
+        .unwrap_or_else(|_| ts.to_string())
 }
 
 /// Return today's midnight UTC time for the given IANA timezone string.
@@ -5067,18 +5531,20 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO messages (session_id, agent_id, role, content, created_at)
-                  VALUES (?1, 'mika', 'user', 'old', 1000)",
+                  VALUES (?1, 'mika', 'user', 'old', '2020-01-01T00:00:00Z')",
                 params![sid],
             )
             .unwrap();
         db.conn
             .execute(
                 "INSERT INTO messages (session_id, agent_id, role, content, created_at)
-                  VALUES (?1, 'mika', 'user', 'new', 2000)",
+                  VALUES (?1, 'mika', 'user', 'new', '2025-01-01T00:00:00Z')",
                 params![sid],
             )
             .unwrap();
-        let msgs = db.get_messages_since("mika", 1500).unwrap();
+        let msgs = db
+            .get_messages_since("mika", "2024-01-01T00:00:00Z")
+            .unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "new");
     }
@@ -5109,7 +5575,7 @@ mod tests {
             .unwrap();
         let ts = db.last_user_message_time("mika").unwrap();
         assert!(ts.is_some());
-        assert!(ts.unwrap() > 0);
+        assert!(!ts.unwrap().is_empty());
     }
 
     #[test]
@@ -5244,7 +5710,7 @@ mod tests {
             .execute(
                 "INSERT INTO audit_events
                   (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('mika', 's1', 'tool', 'key', 'val', 1000)",
+                  VALUES ('mika', 's1', 'tool', 'key', 'val', '2020-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -5252,11 +5718,13 @@ mod tests {
             .execute(
                 "INSERT INTO audit_events
                   (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('mika', 's2', 'tool', 'key', 'val', 2000)",
+                  VALUES ('mika', 's2', 'tool', 'key', 'val', '2025-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
-        let evs = db.get_audit_events_since("mika", 1500).unwrap();
+        let evs = db
+            .get_audit_events_since("mika", "2024-01-01T00:00:00Z")
+            .unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].session_id, "s2");
     }
@@ -5327,7 +5795,7 @@ mod tests {
             "engineering",
             "Build feature X",
             3,
-            1_700_000_000,
+            "2023-11-14T22:13:20Z",
             None,
         )
         .unwrap();
@@ -5337,7 +5805,7 @@ mod tests {
             None,
             1,
             Some("Done!"),
-            Some(1_700_001_000),
+            Some("2023-11-14T22:30:00Z"),
         )
         .unwrap();
         let runs = db.load_team_runs("engineering", 10).unwrap();
@@ -5349,7 +5817,7 @@ mod tests {
     #[test]
     fn test_team_workspace_insert_and_load() {
         let db = db();
-        db.insert_team_run("run-001", "eng", "Goal", 3, 0, None)
+        db.insert_team_run("run-001", "eng", "Goal", 3, "2020-01-01T00:00:00Z", None)
             .unwrap();
         let id = db
             .insert_team_workspace_entry("run-001", None, Some("mika"), "plan", "Do this", 1, None)
@@ -5374,7 +5842,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: r#"{"message":"hello"}"#.to_string(),
@@ -5518,9 +5986,9 @@ mod tests {
         db.conn
             .execute_batch(
                 "INSERT INTO audit_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('mika', 's1', 'tool', 'k1', 'v1', 1580000000);
+                  VALUES ('mika', 's1', 'tool', 'k1', 'v1', '2020-01-01T00:00:00Z');
                  INSERT INTO audit_events (agent_id, session_id, tool_name, target_key, after_value, created_at)
-                  VALUES ('mika', 's1', 'tool', 'k2', 'v2', 1580000001);",
+                  VALUES ('mika', 's1', 'tool', 'k2', 'v2', '2020-01-01T00:00:01Z');",
             )
             .unwrap();
         // Insert recent event
@@ -5698,7 +6166,7 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO team_runs (id, team_id, goal, started_at)
-                 VALUES ('run123', 'team1', 'test goal', unixepoch())",
+                 VALUES ('run123', 'team1', 'test goal', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
                 [],
             )
             .unwrap();
@@ -5734,7 +6202,7 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO team_runs (id, team_id, goal, started_at)
-                 VALUES ('other-run', 'team1', 'other goal', unixepoch())",
+                 VALUES ('other-run', 'team1', 'other goal', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
                 [],
             )
             .unwrap();
@@ -5821,7 +6289,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "inject_context".to_string(),
             action_config: "{}".to_string(),
@@ -5851,7 +6319,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "inject_context".to_string(),
             action_config: "{}".to_string(),
@@ -5901,14 +6369,18 @@ mod tests {
         let id = db.create_task(&callback_task("mika")).unwrap();
 
         // Pending task should not appear
-        let results = db.get_undelivered_callback_tasks("mika", 0).unwrap();
+        let results = db
+            .get_undelivered_callback_tasks("mika", "1970-01-01T00:00:00Z")
+            .unwrap();
         assert!(results.is_empty());
 
         // Complete it
         assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
 
         // Now it should appear
-        let results = db.get_undelivered_callback_tasks("mika", 0).unwrap();
+        let results = db
+            .get_undelivered_callback_tasks("mika", "1970-01-01T00:00:00Z")
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
     }
@@ -5923,18 +6395,20 @@ mod tests {
         let task = db.get_task(&id, "mika").unwrap().unwrap();
         let completed_at = task.completed_at.unwrap();
 
-        // since_unix = completed_at means "after this time", so the task at exactly
+        // since = completed_at means "after this time", so the task at exactly
         // that time should still be included (query uses >)
-        // But since completed_at == since_unix, and query is >, it should NOT appear
+        // But since completed_at == since, and query is >, it should NOT appear
         let results = db
-            .get_undelivered_callback_tasks("mika", completed_at)
+            .get_undelivered_callback_tasks("mika", &completed_at)
             .unwrap();
         assert!(results.is_empty());
 
-        // since_unix before completed_at should include it
-        let results = db
-            .get_undelivered_callback_tasks("mika", completed_at - 1)
-            .unwrap();
+        // since before completed_at should include it
+        let before = {
+            let dt = timestamp::parse(&completed_at).unwrap();
+            timestamp::format(&(dt - Duration::seconds(1)))
+        };
+        let results = db.get_undelivered_callback_tasks("mika", &before).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -5946,7 +6420,9 @@ mod tests {
         let id = db.create_task(&callback_task("agent_a")).unwrap();
         assert!(db.update_task_completed(&id, "agent_a", Some("x")).unwrap());
 
-        let results = db.get_undelivered_callback_tasks("agent_b", 0).unwrap();
+        let results = db
+            .get_undelivered_callback_tasks("agent_b", "1970-01-01T00:00:00Z")
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -5961,14 +6437,14 @@ mod tests {
 
         // Session A should see it
         let results = db
-            .get_undelivered_callback_tasks_for_session("mika", 0, "session_a")
+            .get_undelivered_callback_tasks_for_session("mika", "1970-01-01T00:00:00Z", "session_a")
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
 
         // Session B should NOT see it
         let results = db
-            .get_undelivered_callback_tasks_for_session("mika", 0, "session_b")
+            .get_undelivered_callback_tasks_for_session("mika", "1970-01-01T00:00:00Z", "session_b")
             .unwrap();
         assert!(results.is_empty());
     }
@@ -5981,7 +6457,7 @@ mod tests {
         assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
 
         let results = db
-            .get_undelivered_callback_tasks_for_session("mika", 0, "session_a")
+            .get_undelivered_callback_tasks_for_session("mika", "1970-01-01T00:00:00Z", "session_a")
             .unwrap();
         assert!(results.is_empty());
     }
@@ -6207,9 +6683,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_11() {
+    fn test_schema_version_is_12() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
     }
 
     #[test]
@@ -6238,7 +6714,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: "{}".to_string(),
@@ -6281,7 +6757,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: "{}".to_string(),
@@ -6355,7 +6831,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(9_999_999_999),
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: "{}".to_string(),
@@ -6406,8 +6882,15 @@ mod tests {
     fn test_get_last_completed_team_run_filters_running() {
         let db = db();
         let run_id = "run-filter-1";
-        db.insert_team_run(run_id, "filter-team", "test goal", 3, 1000, None)
-            .unwrap();
+        db.insert_team_run(
+            run_id,
+            "filter-team",
+            "test goal",
+            3,
+            "2020-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
 
         // Run is in "running" status — should not be returned
         let result = db.get_last_completed_team_run("filter-team").unwrap();
@@ -6420,7 +6903,7 @@ mod tests {
             None,
             2,
             Some("deliverable"),
-            Some(1001),
+            Some("2020-01-01T00:01:00Z"),
         )
         .unwrap();
 
@@ -6438,7 +6921,7 @@ mod tests {
             "summary-team",
             "test goal for summary",
             3,
-            1000,
+            "2020-01-01T00:00:00Z",
             None,
         )
         .unwrap();
@@ -6448,7 +6931,7 @@ mod tests {
             None,
             1,
             Some("final output"),
-            Some(1001),
+            Some("2020-01-01T00:01:00Z"),
         )
         .unwrap();
 
@@ -6466,8 +6949,15 @@ mod tests {
     fn test_get_team_run_summary_with_critic() {
         let db = db();
         let run_id = "run-critic-1";
-        db.insert_team_run(run_id, "critic-team", "critic test", 3, 1000, None)
-            .unwrap();
+        db.insert_team_run(
+            run_id,
+            "critic-team",
+            "critic test",
+            3,
+            "2020-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
 
         // Add critic feedback
         db.insert_team_workspace_entry(
@@ -6546,7 +7036,7 @@ mod tests {
         let db = db();
         db.create_session("end-test", "mika", "system").unwrap();
         // ended_at should be NULL initially
-        let ended: Option<i64> = db
+        let ended: Option<String> = db
             .conn
             .query_row(
                 "SELECT ended_at FROM sessions WHERE id = 'end-test'",
@@ -6557,7 +7047,7 @@ mod tests {
         assert!(ended.is_none());
         // End the session
         db.end_session("end-test").unwrap();
-        let ended: Option<i64> = db
+        let ended: Option<String> = db
             .conn
             .query_row(
                 "SELECT ended_at FROM sessions WHERE id = 'end-test'",
@@ -6588,7 +7078,7 @@ mod tests {
         // Backdate heartbeat-old to 10 days ago
         db.conn
             .execute(
-                "UPDATE sessions SET ended_at = unixepoch() - 864000 WHERE id = 'heartbeat-old'",
+                "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 days') WHERE id = 'heartbeat-old'",
                 [],
             )
             .unwrap();
@@ -6658,7 +7148,7 @@ mod tests {
             db.conn
                 .execute(
                     &format!(
-                        "UPDATE sessions SET ended_at = unixepoch() - 864000 WHERE id = '{prefix}'"
+                        "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 days') WHERE id = '{prefix}'"
                     ),
                     [],
                 )
@@ -6669,7 +7159,7 @@ mod tests {
         db.end_session("cli-session").unwrap();
         db.conn
             .execute(
-                "UPDATE sessions SET ended_at = unixepoch() - 864000 WHERE id = 'cli-session'",
+                "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 days') WHERE id = 'cli-session'",
                 [],
             )
             .unwrap();

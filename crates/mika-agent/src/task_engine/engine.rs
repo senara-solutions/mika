@@ -67,10 +67,10 @@ impl TaskEngine {
     ///
     /// Returns `(loaded_count, queue_len)` for the caller to aggregate across agents.
     pub async fn startup_recovery(&mut self) -> Result<(usize, usize)> {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::timestamp::now();
 
         // 1. Expire timed-out tasks
-        match self.db.mark_tasks_expired(now).await {
+        match self.db.mark_tasks_expired(&now).await {
             Ok(n) if n > 0 => info!(count = n, "expired timed-out tasks on startup"),
             Ok(_) => {}
             Err(e) => warn!(error = %e, "failed to expire timed-out tasks"),
@@ -112,8 +112,8 @@ impl TaskEngine {
                 &task.trigger_type,
                 &task.action_type,
                 task.cron_expr.as_deref(),
-                task.next_fire_at,
-                now,
+                task.next_fire_at.as_deref(),
+                &now,
             );
         }
 
@@ -137,7 +137,7 @@ impl TaskEngine {
     ///
     /// Returns the new task's UUID string ID.
     pub async fn enqueue(&mut self, task: NewTask) -> Result<String> {
-        let next_fire_at = task.next_fire_at;
+        let next_fire_at = task.next_fire_at.clone();
         let trigger_type_val = task.trigger_type.clone();
         let action_type_val = task.action_type.clone();
         let cron_expr = task.cron_expr.as_deref().map(str::to_owned);
@@ -200,7 +200,7 @@ impl TaskEngine {
             self.scan_db_for_new_tasks().await;
         }
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::timestamp::now();
         let mut fired = 0;
 
         while fired < MAX_PER_TICK {
@@ -225,8 +225,8 @@ impl TaskEngine {
     /// long_running callback tasks that never completed. After expiring, checks
     /// sibling completion so parent tasks can fire even when a child times out.
     async fn expire_timed_out_tasks(&mut self) {
-        let now = chrono::Utc::now().timestamp();
-        match self.db.mark_tasks_expired(now).await {
+        let now = crate::timestamp::now();
+        match self.db.mark_tasks_expired(&now).await {
             Ok(n) if n > 0 => {
                 info!(count = n, "expired timed-out tasks in tick loop");
                 // Check if any expired tasks unblock their parent
@@ -282,7 +282,7 @@ impl TaskEngine {
     /// Scan DB for schedulable tasks not already in the heap.
     /// Called every `DB_SCAN_INTERVAL_TICKS` seconds as a safety net.
     async fn scan_db_for_new_tasks(&mut self) {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::timestamp::now();
         let tasks = match self.db.get_schedulable_tasks().await {
             Ok(t) => t,
             Err(e) => {
@@ -300,8 +300,8 @@ impl TaskEngine {
                 &task.trigger_type,
                 &task.action_type,
                 task.cron_expr.as_deref(),
-                task.next_fire_at,
-                now,
+                task.next_fire_at.as_deref(),
+                &now,
             );
             added += 1;
         }
@@ -318,8 +318,8 @@ impl TaskEngine {
         trigger_type_str: &str,
         action_type_str: &str,
         cron_expr: Option<&str>,
-        next_fire_at: Option<i64>,
-        now: i64,
+        next_fire_at: Option<&str>,
+        now: &str,
     ) {
         if self.queued_ids.contains(task_id) {
             return;
@@ -340,7 +340,7 @@ impl TaskEngine {
             }
         } else {
             match next_fire_at {
-                Some(ts) => ts,
+                Some(ts) => ts.to_string(),
                 None => {
                     warn!(task_id, "task missing next_fire_at");
                     return;
@@ -405,7 +405,7 @@ impl TaskEngine {
                         let next = match cron_expr
                             .as_deref()
                             .ok_or_else(|| anyhow::anyhow!("recurring task missing cron_expr"))
-                            .and_then(|e| next_fire_from_cron(e, chrono::Utc::now().timestamp()))
+                            .and_then(|e| next_fire_from_cron(e, &crate::timestamp::now()))
                         {
                             Ok(ts) => ts,
                             Err(e) => {
@@ -419,7 +419,7 @@ impl TaskEngine {
                             }
                         };
 
-                        if let Err(e) = db.update_task_rescheduled(&task_id, next).await {
+                        if let Err(e) = db.update_task_rescheduled(&task_id, &next).await {
                             warn!(task_id = %task_id, error = %e, "failed to reschedule recurring task after fire");
                         }
 
@@ -452,9 +452,11 @@ impl TaskEngine {
                 Err(e) => {
                     if matches!(e, super::dispatcher::DispatchError::AgentBusy(_)) {
                         // Check if the task has expired before re-queuing
-                        let now = chrono::Utc::now().timestamp();
+                        let now = crate::timestamp::now();
                         let is_expired = match db.get_task(&task_id).await {
-                            Ok(Some(t)) => t.timeout_at.is_some_and(|ts| ts <= now),
+                            Ok(Some(t)) => {
+                                t.timeout_at.as_deref().is_some_and(|ts| ts <= now.as_str())
+                            }
                             _ => false,
                         };
 
@@ -472,13 +474,14 @@ impl TaskEngine {
                         } else {
                             // Agent is busy — reset task to pending and re-enqueue for retry
                             debug!(task_id = %task_id, "agent busy, re-queuing task for retry in 30s");
-                            let retry_at = now + 30;
+                            let retry_at =
+                                crate::timestamp::now_plus(chrono::Duration::seconds(30));
                             if let Err(e) =
                                 db.update_task_status(&task_id, task_status::PENDING).await
                             {
                                 warn!(task_id = %task_id, error = %e, "failed to reset task status to pending for retry");
                             }
-                            if let Err(e) = db.update_task_next_fire_at(&task_id, retry_at).await {
+                            if let Err(e) = db.update_task_next_fire_at(&task_id, &retry_at).await {
                                 warn!(task_id = %task_id, error = %e, "failed to update next_fire_at for retry");
                             }
                             let _ = reenqueue_tx
@@ -541,7 +544,7 @@ mod tests {
         })
     }
 
-    fn make_task(label: &str, next_fire_at: i64) -> NewTask {
+    fn make_task(label: &str, next_fire_at: &str) -> NewTask {
         NewTask {
             agent_id: "mika".to_string(),
             team_run_id: None,
@@ -553,7 +556,7 @@ mod tests {
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at: Some(next_fire_at),
+            next_fire_at: Some(next_fire_at.to_string()),
             timeout_at: None,
             action_type: "send_message".to_string(),
             action_config: r#"{"text": "hello"}"#.to_string(),
@@ -580,9 +583,9 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db, dispatcher);
 
-        let future_ts = chrono::Utc::now().timestamp() + 3600;
+        let future_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
         let id = engine
-            .enqueue(make_task("test reminder", future_ts))
+            .enqueue(make_task("test reminder", &future_ts))
             .await
             .unwrap();
 
@@ -598,9 +601,9 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
-        let past_ts = chrono::Utc::now().timestamp() - 10;
+        let past_ts = crate::timestamp::now_minus(chrono::Duration::seconds(10));
         let id = engine
-            .enqueue(make_task("past reminder", past_ts))
+            .enqueue(make_task("past reminder", &past_ts))
             .await
             .unwrap();
         assert_eq!(engine.queue.len(), 1);
@@ -632,9 +635,9 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db, dispatcher);
 
-        let future_ts = chrono::Utc::now().timestamp() + 3600;
+        let future_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
         engine
-            .enqueue(make_task("future reminder", future_ts))
+            .enqueue(make_task("future reminder", &future_ts))
             .await
             .unwrap();
         engine.tick().await;
@@ -648,9 +651,9 @@ mod tests {
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
-        let past_ts = chrono::Utc::now().timestamp() - 10;
+        let past_ts = crate::timestamp::now_minus(chrono::Duration::seconds(10));
         let id = engine
-            .enqueue(make_task("cancelled reminder", past_ts))
+            .enqueue(make_task("cancelled reminder", &past_ts))
             .await
             .unwrap();
 
@@ -671,9 +674,9 @@ mod tests {
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         // Create task directly in DB (bypassing engine.enqueue)
-        let past_ts = chrono::Utc::now().timestamp() - 10;
+        let past_ts = crate::timestamp::now_minus(chrono::Duration::seconds(10));
         let id = db
-            .create_task(make_task("direct db task", past_ts))
+            .create_task(make_task("direct db task", &past_ts))
             .await
             .unwrap();
 
@@ -707,7 +710,7 @@ mod tests {
             event_offset_secs: None,
             condition_expr: None,
             next_fire_at: None,
-            timeout_at: Some(chrono::Utc::now().timestamp() - 60), // expired 60s ago
+            timeout_at: Some(crate::timestamp::now_minus(chrono::Duration::seconds(60))), // expired 60s ago
             action_type: action_type::RESUME_AGENT.to_string(),
             action_config: "{}".to_string(),
             input_context: None,
@@ -743,7 +746,7 @@ mod tests {
             event_offset_secs: None,
             condition_expr: None,
             next_fire_at: None,
-            timeout_at: Some(chrono::Utc::now().timestamp() + 3600),
+            timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(3600))),
             action_type: action_type::RESUME_AGENT.to_string(),
             action_config: "{}".to_string(),
             input_context: None,
@@ -829,7 +832,7 @@ mod tests {
             event_offset_secs: None,
             condition_expr: None,
             next_fire_at: None,
-            timeout_at: Some(chrono::Utc::now().timestamp() - 60),
+            timeout_at: Some(crate::timestamp::now_minus(chrono::Duration::seconds(60))),
             action_type: action_type::RESUME_AGENT.to_string(),
             action_config: "{}".to_string(),
             input_context: None,
@@ -866,7 +869,10 @@ mod tests {
         let db = test_db();
 
         let task_id = db
-            .create_task(make_task("orphan", chrono::Utc::now().timestamp() + 3600))
+            .create_task(make_task(
+                "orphan",
+                &crate::timestamp::now_plus(chrono::Duration::seconds(3600)),
+            ))
             .await
             .unwrap();
 

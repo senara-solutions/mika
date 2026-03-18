@@ -440,8 +440,11 @@ pub async fn handle_task_complete(
             match dispatcher.dispatch_resume_agent(&completed_task).await {
                 Err(crate::task_engine::DispatchError::AgentBusy(_)) => {
                     // Check if the task has expired before re-queuing
-                    let now = chrono::Utc::now().timestamp();
-                    let is_expired = completed_task.timeout_at.is_some_and(|ts| ts <= now);
+                    let now = crate::timestamp::now();
+                    let is_expired = completed_task
+                        .timeout_at
+                        .as_ref()
+                        .is_some_and(|ts| ts.as_str() <= now.as_str());
 
                     if is_expired {
                         warn!(task_id = %completed_task.id, "task timed out while waiting for agent, marking failed");
@@ -457,7 +460,7 @@ pub async fn handle_task_complete(
                     } else {
                         // Agent is busy — reset task to pending for the tick loop to retry
                         debug!(task_id = %completed_task.id, "agent busy, deferring resume_agent to tick loop in 30s");
-                        let retry_at = now + 30;
+                        let retry_at = crate::timestamp::now_plus(chrono::Duration::seconds(30));
                         if let Err(e) = db
                             .update_task_status(&completed_task.id, task_status::PENDING)
                             .await
@@ -465,7 +468,7 @@ pub async fn handle_task_complete(
                             warn!(task_id = %completed_task.id, error = %e, "failed to reset task status to pending for retry");
                         }
                         if let Err(e) = db
-                            .update_task_next_fire_at(&completed_task.id, retry_at)
+                            .update_task_next_fire_at(&completed_task.id, &retry_at)
                             .await
                         {
                             warn!(task_id = %completed_task.id, error = %e, "failed to update next_fire_at for retry");

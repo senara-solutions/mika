@@ -1374,7 +1374,7 @@ mod tests {
                 event_source: None,
                 event_offset_secs: None,
                 condition_expr: None,
-                next_fire_at: Some(9_999_999_999),
+                next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
                 timeout_at: None,
                 action_type: "send_message".to_string(),
                 action_config: r#"{"text":"hi"}"#.to_string(),

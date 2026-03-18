@@ -42,7 +42,7 @@ mod tests {
     use crate::db::NewTask;
     use crate::test_utils::test_helpers::TestHarness;
 
-    async fn add_reminder(harness: &TestHarness, fire_at_unix: i64, message: &str) -> String {
+    async fn add_reminder(harness: &TestHarness, fire_at_unix: &str, message: &str) -> String {
         harness
             .db
             .create_task(NewTask {
@@ -56,7 +56,7 @@ mod tests {
                 event_source: None,
                 event_offset_secs: None,
                 condition_expr: None,
-                next_fire_at: Some(fire_at_unix),
+                next_fire_at: Some(fire_at_unix.to_string()),
                 timeout_at: None,
                 action_type: "send_message".to_string(),
                 action_config: serde_json::json!({"text": message}).to_string(),
@@ -73,7 +73,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_reminder_success() {
         let harness = TestHarness::new();
-        let id = add_reminder(&harness, 4_070_908_800, "To cancel").await;
+        let id = add_reminder(&harness, "2099-01-01T00:00:00Z", "To cancel").await;
 
         let ctx = harness.ctx();
         let tool = CancelReminderTool;

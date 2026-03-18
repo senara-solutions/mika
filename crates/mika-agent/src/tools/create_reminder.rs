@@ -69,8 +69,8 @@ impl Tool for CreateReminderTool {
                 return Ok(ToolOutput::error("'cron_expr' is too long."));
             }
 
-            let now = Utc::now().timestamp();
-            let next_fire = match next_fire_from_cron(cron_expr_input, now) {
+            let now_str = crate::timestamp::now();
+            let next_fire = match next_fire_from_cron(cron_expr_input, &now_str) {
                 Ok(ts) => ts,
                 Err(_) => {
                     return Ok(ToolOutput::error(
@@ -81,15 +81,22 @@ impl Tool for CreateReminderTool {
             };
 
             // Reject cron expressions that fire more frequently than once per minute
-            const MIN_INTERVAL_SECS: i64 = 60;
-            if next_fire - now < MIN_INTERVAL_SECS {
-                // Check second interval to confirm (the first might be short due to alignment)
-                if let Ok(second_fire) = next_fire_from_cron(cron_expr_input, next_fire)
-                    && second_fire - next_fire < MIN_INTERVAL_SECS
-                {
-                    return Ok(ToolOutput::error(
-                        "Cron expression fires too frequently. Minimum interval is 1 minute.",
-                    ));
+            {
+                let now_dt = crate::timestamp::parse(&now_str).unwrap_or_else(|_| Utc::now());
+                let next_dt = crate::timestamp::parse(&next_fire).unwrap_or(now_dt);
+                let interval = next_dt.signed_duration_since(now_dt).num_seconds();
+                if interval < 60 {
+                    // Check second interval to confirm (the first might be short due to alignment)
+                    if let Ok(second_fire) = next_fire_from_cron(cron_expr_input, &next_fire) {
+                        let second_dt = crate::timestamp::parse(&second_fire).unwrap_or(next_dt);
+                        let second_interval =
+                            second_dt.signed_duration_since(next_dt).num_seconds();
+                        if second_interval < 60 {
+                            return Ok(ToolOutput::error(
+                                "Cron expression fires too frequently. Minimum interval is 1 minute.",
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -123,7 +130,7 @@ impl Tool for CreateReminderTool {
                 return Ok(ToolOutput::error("Reminder time must be in the future."));
             }
 
-            let timestamp = parsed.timestamp();
+            let timestamp = crate::timestamp::format(&parsed);
             let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC").to_string();
             ("time", None, timestamp, display_time)
         };
@@ -164,7 +171,8 @@ impl Tool for CreateReminderTool {
                         .map(|t| {
                             let time_info = t
                                 .next_fire_at
-                                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                                .as_ref()
+                                .and_then(|ts| crate::timestamp::parse(ts).ok())
                                 .map(|dt| {
                                     format!(", next fire: {}", dt.format("%Y-%m-%d %H:%M UTC"))
                                 })

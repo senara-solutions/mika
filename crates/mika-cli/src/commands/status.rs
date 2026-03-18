@@ -30,7 +30,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     let last_activity = last_msg
         .ok()
         .flatten()
-        .map(mika_agent::db::format_unix_ts)
+        .map(|s| mika_agent::db::format_ts(&s))
         .unwrap_or_else(|| "never".to_string());
 
     println!();

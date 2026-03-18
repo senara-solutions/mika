@@ -14,14 +14,14 @@ export interface TaskItem {
   source: string | null
   reference_url: string | null
   cron_expr: string | null
-  next_fire_at: number | null
-  fired_at: number | null
-  completed_at: number | null
+  next_fire_at: string | null
+  fired_at: string | null
+  completed_at: string | null
   created_by_session: string | null
   created_trace_id: string | null
   execution_trace_id: string | null
-  created_at: number
-  updated_at: number
+  created_at: string
+  updated_at: string
   action_config_preview: string | null
   result_preview: string | null
 }

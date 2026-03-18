@@ -8,6 +8,7 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::db::NewTask;
 use crate::task_engine::types::action_type;
 use crate::task_engine::types::trigger_type as tt;
+use crate::timestamp;
 
 /// Agent tool for creating scheduled/callback tasks.
 ///
@@ -152,7 +153,7 @@ impl Tool for CreateTaskTool {
                 if parsed <= Utc::now() {
                     return Ok(ToolOutput::error("'fire_at' must be in the future."));
                 }
-                (Some(parsed.timestamp()), None)
+                (Some(timestamp::format(&parsed)), None)
             }
             tt::RECURRING => {
                 let cron = input["cron_expr"].as_str().unwrap_or("").trim();
@@ -164,7 +165,7 @@ impl Tool for CreateTaskTool {
                 if cron.len() > 128 {
                     return Ok(ToolOutput::error("'cron_expr' is too long."));
                 }
-                match crate::task_engine::cron::next_fire_from_cron(cron, Utc::now().timestamp()) {
+                match crate::task_engine::cron::next_fire_from_cron(cron, &timestamp::now()) {
                     Ok(ts) => (Some(ts), Some(cron.to_string())),
                     Err(_) => {
                         return Ok(ToolOutput::error(
@@ -190,7 +191,7 @@ impl Tool for CreateTaskTool {
                     MAX_TIMEOUT_SECS
                 )));
             }
-            Some(Utc::now().timestamp() + secs)
+            Some(timestamp::now_plus(chrono::Duration::seconds(secs)))
         } else {
             None
         };

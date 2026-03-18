@@ -66,61 +66,63 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 11
+**Current schema version:** 12
+
+**Timestamp format:** All timestamp columns use ISO 8601 TEXT (`%Y-%m-%dT%H:%M:%SZ`) — not Unix epoch integers. SQL defaults use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`. Fixed-width UTC format ensures correct lexicographic ordering.
 
 ### Core Tables
 
-**schema_version** — `version INTEGER`, `applied_at INTEGER DEFAULT unixepoch()`
+**schema_version** — `version INTEGER`, `applied_at TEXT DEFAULT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`
 
-**agents** — `id TEXT PK`, `name TEXT NOCASE`, `home_dir TEXT`, `active BOOLEAN DEFAULT 1`, `last_seen INTEGER`, `created_at INTEGER`
+**agents** — `id TEXT PK`, `name TEXT NOCASE`, `home_dir TEXT`, `active BOOLEAN DEFAULT 1`, `last_seen TEXT`, `created_at TEXT`
 
-**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `started_at INTEGER`, `ended_at INTEGER`, `metadata TEXT`
+**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `started_at TEXT`, `ended_at TEXT`, `metadata TEXT`
 
-**messages** — `id INTEGER PK AUTO`, `session_id TEXT FK→sessions`, `agent_id TEXT FK→agents`, `role TEXT CHECK(user|assistant|system|summary|tool_result)`, `content TEXT`, `metadata TEXT`, `trace_id TEXT`, `compacted_through_id INTEGER`, `created_at INTEGER`
+**messages** — `id INTEGER PK AUTO`, `session_id TEXT FK→sessions`, `agent_id TEXT FK→agents`, `role TEXT CHECK(user|assistant|system|summary|tool_result)`, `content TEXT`, `metadata TEXT`, `trace_id TEXT`, `compacted_through_id INTEGER`, `created_at TEXT`
 
 ### Memory Tables
 
-**core_memory** — `(agent_id, key) PK`, `value TEXT`, `token_count INTEGER`, `updated_at INTEGER`. Sections: `user_summary`, `self_model`, `current_priorities`, `key_people`, `workflows`.
+**core_memory** — `(agent_id, key) PK`, `value TEXT`, `token_count INTEGER`, `updated_at TEXT`. Sections: `user_summary`, `self_model`, `current_priorities`, `key_people`, `workflows`.
 
-**people** — `id INTEGER PK AUTO`, `agent_id TEXT FK→agents`, `canonical_name TEXT NOCASE`, `relationship TEXT`, `notes TEXT`, `first_mentioned INTEGER`, `last_mentioned INTEGER`, `mention_count INTEGER DEFAULT 1`. Unique: `(agent_id, canonical_name)`.
+**people** — `id INTEGER PK AUTO`, `agent_id TEXT FK→agents`, `canonical_name TEXT NOCASE`, `relationship TEXT`, `notes TEXT`, `first_mentioned TEXT`, `last_mentioned TEXT`, `mention_count INTEGER DEFAULT 1`. Unique: `(agent_id, canonical_name)`.
 
-**commitments** — `id INTEGER PK AUTO`, `agent_id FK`, `description TEXT NOCASE`, `status TEXT CHECK(pending|completed|cancelled)`, `due_date TEXT`, `person_id FK→people`, `created_at`, `completed_at`
+**commitments** — `id INTEGER PK AUTO`, `agent_id FK`, `description TEXT NOCASE`, `status TEXT CHECK(pending|completed|cancelled)`, `due_date TEXT`, `person_id FK→people`, `created_at TEXT`, `completed_at TEXT`
 
-**preferences** — `(agent_id, category) PK`, `value TEXT`, `updated_at INTEGER`
+**preferences** — `(agent_id, category) PK`, `value TEXT`, `updated_at TEXT`
 
-**events** — `id INTEGER PK AUTO`, `agent_id FK`, `description TEXT`, `event_date TEXT`, `context TEXT`, `created_at`
+**events** — `id INTEGER PK AUTO`, `agent_id FK`, `description TEXT`, `event_date TEXT`, `context TEXT`, `created_at TEXT`
 
-**search_content** — `id INTEGER PK AUTO`, `agent_id FK`, `source_type TEXT`, `source_id INTEGER`, `content TEXT`, `embedding_json TEXT`, `created_at`, `updated_at`
+**search_content** — `id INTEGER PK AUTO`, `agent_id FK`, `source_type TEXT`, `source_id INTEGER`, `content TEXT`, `embedding_json TEXT`, `created_at TEXT`, `updated_at TEXT`
 
 **Virtual tables:** `fts_search` (FTS5 on search_content), `vec_search` (sqlite-vec, float[512])
 
 ### Task Engine
 
-**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at INTEGER`, `timeout_at INTEGER`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `execution_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at`, `updated_at`, `fired_at`, `completed_at`
+**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at TEXT`, `timeout_at TEXT`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `execution_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at TEXT`, `updated_at TEXT`, `fired_at TEXT`, `completed_at TEXT`
 
 ### Team Tables
 
-**teams** — `id TEXT PK`, `name TEXT NOCASE`, `config_path TEXT`, `created_at INTEGER`
+**teams** — `id TEXT PK`, `name TEXT NOCASE`, `config_path TEXT`, `created_at TEXT`
 
-**team_runs** — `id TEXT PK`, `team_id FK→teams`, `goal TEXT`, `status TEXT CHECK(running|completed|failed|cancelled|suspended)`, `failure_reason TEXT`, `iteration INTEGER DEFAULT 1`, `max_iterations INTEGER DEFAULT 3`, `deliverable TEXT`, `checkpoint TEXT`, `trace_id TEXT`, `started_at INTEGER`, `ended_at INTEGER`
+**team_runs** — `id TEXT PK`, `team_id FK→teams`, `goal TEXT`, `status TEXT CHECK(running|completed|failed|cancelled|suspended)`, `failure_reason TEXT`, `iteration INTEGER DEFAULT 1`, `max_iterations INTEGER DEFAULT 3`, `deliverable TEXT`, `checkpoint TEXT`, `trace_id TEXT`, `started_at TEXT`, `ended_at TEXT`
 
-**team_workspace** — `id INTEGER PK AUTO`, `run_id FK→team_runs`, `parent_id FK→self`, `agent_name TEXT`, `entry_type TEXT`, `content TEXT`, `trace_id TEXT`, `iteration INTEGER DEFAULT 1`, `created_at`
+**team_workspace** — `id INTEGER PK AUTO`, `run_id FK→team_runs`, `parent_id FK→self`, `agent_name TEXT`, `entry_type TEXT`, `content TEXT`, `trace_id TEXT`, `iteration INTEGER DEFAULT 1`, `created_at TEXT`
 
 ### Audit Tables
 
-**audit_events** — `id INTEGER PK AUTO`, `agent_id FK`, `session_id TEXT`, `tool_name TEXT`, `target_key TEXT`, `before_value TEXT`, `after_value TEXT` (nullable), `reasoning TEXT`, `trace_id TEXT`, `rewound_by_trace_id TEXT`, `created_at`
+**audit_events** — `id INTEGER PK AUTO`, `agent_id FK`, `session_id TEXT`, `tool_name TEXT`, `target_key TEXT`, `before_value TEXT`, `after_value TEXT` (nullable), `reasoning TEXT`, `trace_id TEXT`, `rewound_by_trace_id TEXT`, `created_at TEXT`
 
-**audit_event_summaries** — `id INTEGER PK AUTO`, `agent_id FK`, `year INTEGER`, `month INTEGER`, `summary TEXT`, `event_count INTEGER`, `created_at`. Unique: `(agent_id, year, month)`.
+**audit_event_summaries** — `id INTEGER PK AUTO`, `agent_id FK`, `year INTEGER`, `month INTEGER`, `summary TEXT`, `event_count INTEGER`, `created_at TEXT`. Unique: `(agent_id, year, month)`.
 
 ### System Tables
 
-**heartbeat_sends** — `id INTEGER PK AUTO`, `agent_id FK`, `sent_at INTEGER`
+**heartbeat_sends** — `id INTEGER PK AUTO`, `agent_id FK`, `sent_at TEXT`
 
-**reflection_runs** — `id INTEGER PK AUTO`, `agent_id FK`, `status TEXT`, `changes_made INTEGER DEFAULT 0`, `summary TEXT`, `created_at`
+**reflection_runs** — `id INTEGER PK AUTO`, `agent_id FK`, `status TEXT`, `changes_made INTEGER DEFAULT 0`, `summary TEXT`, `created_at TEXT`
 
-**customer_config** — `(agent_id, key) PK`, `value TEXT`, `updated_at INTEGER`
+**customer_config** — `(agent_id, key) PK`, `value TEXT`, `updated_at TEXT`
 
-**failed_sends** — `id INTEGER PK AUTO`, `agent_id FK`, `text TEXT`, `request_id TEXT`, `retry_count INTEGER DEFAULT 0`, `created_at`
+**failed_sends** — `id INTEGER PK AUTO`, `agent_id FK`, `text TEXT`, `request_id TEXT`, `retry_count INTEGER DEFAULT 0`, `created_at TEXT`
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`
 

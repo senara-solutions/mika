@@ -5,7 +5,7 @@ use mika_common::team;
 use serde_json::Value;
 use std::fmt::Write;
 
-use crate::db::{TeamRunRow, format_unix_ts};
+use crate::db::{TeamRunRow, format_ts};
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
@@ -98,9 +98,9 @@ impl Tool for GetTeamStatusTool {
         writeln!(out, "Status: {}", run.status).unwrap();
         writeln!(out, "Goal: {}", run.goal).unwrap();
         writeln!(out, "Iteration: {}/{}", run.iteration, run.max_iterations).unwrap();
-        writeln!(out, "Started: {}", format_unix_ts(run.started_at)).unwrap();
-        if let Some(ended) = run.ended_at {
-            writeln!(out, "Ended: {}", format_unix_ts(ended)).unwrap();
+        writeln!(out, "Started: {}", format_ts(&run.started_at)).unwrap();
+        if let Some(ref ended) = run.ended_at {
+            writeln!(out, "Ended: {}", format_ts(ended)).unwrap();
         }
 
         if let Some(ref reason) = run.failure_reason {
@@ -172,7 +172,14 @@ mod tests {
         // Seed team run data in the shared DB
         harness
             .db
-            .insert_team_run("run-0000", "dev-team", "Goal 0", 3, 1_740_000_000, None)
+            .insert_team_run(
+                "run-0000",
+                "dev-team",
+                "Goal 0",
+                3,
+                "2025-02-19T15:06:40Z",
+                None,
+            )
             .await
             .unwrap();
         harness
@@ -183,7 +190,7 @@ mod tests {
                 None,
                 1,
                 Some("Done"),
-                Some(1_740_000_060),
+                Some("2025-02-19T15:07:40Z"),
             )
             .await
             .unwrap();

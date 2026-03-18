@@ -161,7 +161,7 @@ async fn search_reminders(
             let short_id = &t.id[..8.min(t.id.len())];
             let fire_at = t
                 .next_fire_at
-                .map(crate::db::format_unix_ts)
+                .map(|s| crate::db::format_ts(&s))
                 .unwrap_or_else(|| "unknown".to_string());
             results.push(format!(
                 "[reminder] {}: \"{}\" at {}",

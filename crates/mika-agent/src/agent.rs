@@ -1322,10 +1322,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
                 .get_customer_config("timezone")
                 .await?
                 .unwrap_or_else(|| "UTC".to_string());
-            let midnight_unix = crate::db::today_midnight_utc(&tz_str).timestamp();
+            let midnight_str = crate::timestamp::format(&crate::db::today_midnight_utc(&tz_str));
 
             // Load today's conversations (capped at 50,000 chars)
-            let conversations = db.get_messages_since(midnight_unix).await?;
+            let conversations = db.get_messages_since(&midnight_str).await?;
             let conv_digest = if conversations.is_empty() {
                 None
             } else {
@@ -1342,7 +1342,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
             };
 
             // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
-            let audit_events = db.get_audit_events_since(midnight_unix).await?;
+            let audit_events = db.get_audit_events_since(&midnight_str).await?;
             let mem_digest = if audit_events.is_empty() {
                 None
             } else {

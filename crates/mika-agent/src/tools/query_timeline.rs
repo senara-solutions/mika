@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, is_orchestrator};
-use crate::db::{TimelineFilters, format_unix_ts};
+use crate::db::{TimelineFilters, format_ts};
 
 pub struct QueryTimelineTool;
 
@@ -83,7 +83,7 @@ impl Tool for QueryTimelineTool {
 
         let mut output = format!("Timeline ({} event(s)):\n", rows.len());
         for row in &rows {
-            let ts = format_unix_ts(row.created_at);
+            let ts = format_ts(&row.created_at);
             let trace = row
                 .trace_id
                 .as_deref()

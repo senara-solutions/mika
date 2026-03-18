@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, is_orchestrator};
-use crate::db::format_unix_ts;
+use crate::db::format_ts;
 
 pub struct GetSessionMessagesTool;
 
@@ -96,7 +96,7 @@ impl Tool for GetSessionMessagesTool {
         );
 
         for msg in &messages {
-            let ts = format_unix_ts(msg.created_at);
+            let ts = format_ts(&msg.created_at);
             // Truncate long messages for readability
             let content = if msg.content.len() > 500 {
                 format!("{}... ({} chars)", &msg.content[..500], msg.content.len())

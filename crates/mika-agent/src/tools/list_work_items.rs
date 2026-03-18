@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::db::format_unix_ts;
+use crate::db::format_ts;
 
 pub struct ListWorkItemsTool;
 
@@ -103,7 +103,7 @@ impl Tool for ListWorkItemsTool {
         lines.push(format!("Work items ({}):\n", items.len()));
 
         for (task, child_count) in &items {
-            let created = format_unix_ts(task.created_at);
+            let created = format_ts(&task.created_at);
             let ref_url = task
                 .reference_url
                 .as_deref()

@@ -6,8 +6,8 @@ export interface SessionDetail {
   id: string
   agent_id: string
   channel_type: string
-  started_at: number
-  ended_at: number | null
+  started_at: string
+  ended_at: string | null
   metadata: string | null
 }
 
@@ -19,7 +19,7 @@ export interface Message {
   content: string
   channel_type: string
   metadata: string | null
-  created_at: number
+  created_at: string
 }
 
 export interface SessionsFilters {
