@@ -1,8 +1,8 @@
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use rust_embed::Embed;
 
@@ -22,6 +22,20 @@ struct DashboardAssets;
 /// - **Disabled (default):** Returns a branded "disabled" page.
 pub fn dashboard_routes() -> Router<AppState> {
     Router::new().fallback(serve_dashboard)
+}
+
+/// Root handler: redirects to `/dashboard` when enabled, returns JSON info when disabled.
+pub async fn handle_root(State(state): State<AppState>) -> Response {
+    if state.settings.dashboard_enabled {
+        Redirect::temporary("/dashboard").into_response()
+    } else {
+        Json(serde_json::json!({
+            "name": "mika-server",
+            "version": env!("CARGO_PKG_VERSION"),
+            "dashboard": "/dashboard (disabled)"
+        }))
+        .into_response()
+    }
 }
 
 /// Check whether any dashboard assets were embedded at compile time.

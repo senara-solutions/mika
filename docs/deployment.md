@@ -56,7 +56,7 @@ docker build -f Dockerfile.agent -t mika-agent:dev .
 ```
 
 Build details:
-- **Dashboard builder:** `node:22-slim` — builds the React SPA (`npm ci && VITE_BASE_PATH=/dashboard/ npm run build --prefix dashboard`). The built `dashboard/dist/` is copied into the Rust builder for embedding via `rust-embed`.
+- **Dashboard builder:** `node:22-slim` — builds the React SPA (`npm ci && npm run build --prefix dashboard`). The built `dashboard/dist/` is copied into the Rust builder for embedding via `rust-embed`.
 - **Builder:** `rust:1.93-slim` with gcc, libc-dev, pkg-config (no OpenSSL — uses rustls)
 - **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, gh (GitHub CLI v2.65.0), and gws (Google Workspace CLI v0.13.3) — both with SHA256 checksum verification
 - **Binary:** `mika-server` (Axum HTTP server)

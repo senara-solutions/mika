@@ -139,6 +139,8 @@ fn build_router(state: AppState) -> Router {
         .nest("/api/v1", dashboard_routes)
         // Embedded dashboard SPA (no auth — static assets; SPA authenticates its own API calls)
         .nest("/dashboard", embedded_dashboard::dashboard_routes())
+        // Root: redirect to dashboard (if enabled) or return JSON info
+        .route("/", get(embedded_dashboard::handle_root))
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
         .layer(TraceLayer::new_for_http())
