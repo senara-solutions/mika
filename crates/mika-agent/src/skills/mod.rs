@@ -168,6 +168,7 @@ mod tests {
                     always_on,
                     timeout_secs: 30,
                     dependencies: deps.iter().map(|s| s.to_string()).collect(),
+                    max_prompt_size: None,
                 },
                 triggers: Triggers { keywords: vec![] },
             },
