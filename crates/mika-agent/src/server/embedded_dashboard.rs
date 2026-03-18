@@ -24,13 +24,18 @@ pub fn dashboard_routes() -> Router<AppState> {
     Router::new().fallback(serve_dashboard)
 }
 
+/// Check whether any dashboard assets were embedded at compile time.
+pub fn has_embedded_assets() -> bool {
+    DashboardAssets::iter().next().is_some()
+}
+
 async fn serve_dashboard(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     if !state.settings.dashboard_enabled {
         return disabled_page().into_response();
     }
 
     // Check if any assets are embedded at all
-    if DashboardAssets::iter().next().is_none() {
+    if !has_embedded_assets() {
         return not_built_page().into_response();
     }
 
@@ -40,57 +45,86 @@ async fn serve_dashboard(State(state): State<AppState>, uri: axum::http::Uri) ->
 
     // Try to serve the exact file
     if let Some(file) = DashboardAssets::get(path) {
-        let mime = mime_from_path(path);
         if path == "index.html" {
-            // Inject runtime config into index.html
-            let html = String::from_utf8_lossy(&file.data);
-            let injected = inject_config_into_html(&html, &state);
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                injected,
-            )
-                .into_response();
+            return serve_index_html(&file.data, &state);
         }
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, mime)],
-            file.data.to_vec(),
-        )
-            .into_response();
+        return serve_static_asset(path, &file.data);
     }
 
     // SPA fallback: serve index.html for any unmatched path (client-side routing)
     if let Some(index) = DashboardAssets::get("index.html") {
-        let html = String::from_utf8_lossy(&index.data);
-        let injected = inject_config_into_html(&html, &state);
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            injected,
-        )
-            .into_response();
+        return serve_index_html(&index.data, &state);
     }
 
     // Should not happen if assets were embedded, but handle gracefully
     not_built_page().into_response()
 }
 
+/// Serve index.html with injected config and security headers.
+fn serve_index_html(data: &[u8], state: &AppState) -> Response {
+    let html = String::from_utf8_lossy(data);
+    let injected = inject_config_into_html(&html, state);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+            (header::HeaderName::from_static("x-frame-options"), "DENY"),
+        ],
+        injected,
+    )
+        .into_response()
+}
+
+/// Serve a static asset with appropriate caching headers.
+fn serve_static_asset(path: &str, data: &[u8]) -> Response {
+    let mime = mime_from_path(path);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+        ],
+        data.to_vec(),
+    )
+        .into_response()
+}
+
 /// Inject `window.__MIKA_CONFIG__` into the HTML `<head>` for runtime token discovery.
+///
+/// Uses proper JSON serialization with HTML-safe escaping to prevent XSS.
+/// Only injects the dashboard token (read-only). If no dashboard token is configured,
+/// returns the "not configured" error page instead of leaking the internal token.
 fn inject_config_into_html(html: &str, state: &AppState) -> String {
     use secrecy::ExposeSecret;
 
-    // Prefer dashboard_token (read-only). Fall back to internal_token (superuser).
-    let token = state
-        .dashboard_token
-        .as_ref()
-        .map(|t| t.expose_secret().to_string())
-        .unwrap_or_else(|| state.internal_token.expose_secret().to_string());
+    // Only use the dashboard token (read-only). Never fall back to the superuser internal token.
+    let Some(ref dashboard_token) = state.dashboard_token else {
+        return token_not_configured_page();
+    };
+    let token = dashboard_token.expose_secret().to_string();
 
-    let config_script = format!(
-        r#"<script>window.__MIKA_CONFIG__={{token:"{}",basePath:"/dashboard"}};</script>"#,
-        token.replace('\\', "\\\\").replace('"', "\\\""),
-    );
+    // Use serde_json for proper escaping, then make HTML-safe
+    let config = serde_json::json!({
+        "token": token,
+        "basePath": "/dashboard"
+    });
+    let json = serde_json::to_string(&config).unwrap_or_default();
+    // Escape HTML-sensitive characters within JSON to prevent script breakout
+    let safe_json = json
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+
+    let config_script = format!("<script>window.__MIKA_CONFIG__={safe_json};</script>");
 
     // Insert before </head> if found, otherwise prepend to document
     if let Some(pos) = html.find("</head>") {
@@ -102,6 +136,47 @@ fn inject_config_into_html(html: &str, state: &AppState) -> String {
     } else {
         format!("{config_script}{html}")
     }
+}
+
+/// HTML page shown when dashboard is enabled but MIKA_DASHBOARD_TOKEN is not set.
+fn token_not_configured_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mika Dashboard — Token Required</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0a; color: #e5e5e5;
+    font-family: system-ui, -apple-system, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 2rem;
+  }
+  .container { max-width: 520px; text-align: center; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.75rem; color: #fff; }
+  p { color: #a3a3a3; line-height: 1.6; margin-bottom: 1rem; }
+  code {
+    display: block; background: #1a1a2e; color: #818cf8;
+    padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.875rem;
+    font-family: 'SF Mono', Menlo, monospace; margin: 0.5rem 0;
+    text-align: left;
+  }
+  .mika { color: #818cf8; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1><span class="mika">✦</span> Mika Dashboard</h1>
+  <p>The dashboard is enabled but <code style="display:inline">MIKA_DASHBOARD_TOKEN</code> is not configured.
+     Set a read-only dashboard token to use the embedded dashboard:</p>
+  <code>MIKA_DASHBOARD_TOKEN=$(openssl rand -hex 32)</code>
+  <p style="margin-top: 1rem; font-size: 0.875rem;">Then restart mika-server.</p>
+</div>
+</body>
+</html>"#
+        .to_string()
 }
 
 /// Branded HTML page shown when the dashboard is disabled.
@@ -202,7 +277,6 @@ fn mime_from_path(path: &str) -> &'static str {
         Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
         Some("ttf") => "font/ttf",
-        Some("map") => "application/json",
         _ => "application/octet-stream",
     }
 }
@@ -224,29 +298,43 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_config_into_html() {
-        // We can't easily construct a full AppState for unit testing,
-        // so we test the HTML injection logic directly.
-        let html = "<html><head><title>Test</title></head><body></body></html>";
-        let expected_contains = r#"window.__MIKA_CONFIG__"#;
+    fn test_inject_script_html_safe() {
+        // Verify that the JSON serialization + HTML escaping produces safe output
+        let config = serde_json::json!({
+            "token": "test</script><img onerror=alert(1)>",
+            "basePath": "/dashboard"
+        });
+        let json = serde_json::to_string(&config).unwrap();
+        let safe_json = json
+            .replace('&', "\\u0026")
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e");
 
-        // Test the injection point detection
-        assert!(html.contains("</head>"));
-        let pos = html.find("</head>").unwrap();
-        assert!(pos > 0);
+        // Verify no raw </script> in output
+        assert!(!safe_json.contains("</script>"));
+        assert!(!safe_json.contains('<'));
+        assert!(!safe_json.contains('>'));
+        // Verify the escaped form is present
+        assert!(safe_json.contains("\\u003c"));
+    }
 
-        // Test that the disabled and not-built pages render
-        let disabled = disabled_page();
-        assert!(disabled.0.contains("MIKA_DASHBOARD_ENABLED"));
+    #[test]
+    fn test_disabled_page_content() {
+        let page = disabled_page();
+        assert!(page.0.contains("MIKA_DASHBOARD_ENABLED"));
+        assert!(page.0.contains("disabled"));
+    }
 
-        let not_built = not_built_page();
-        assert!(not_built.0.contains("npm run build"));
+    #[test]
+    fn test_not_built_page_content() {
+        let page = not_built_page();
+        assert!(page.0.contains("npm run build"));
+    }
 
-        // Verify the config script format is valid
-        let script = format!(
-            r#"<script>window.__MIKA_CONFIG__={{token:"{}",basePath:"/dashboard"}};</script>"#,
-            "test-token"
-        );
-        assert!(script.contains(expected_contains));
+    #[test]
+    fn test_token_not_configured_page() {
+        let page = token_not_configured_page();
+        assert!(page.contains("MIKA_DASHBOARD_TOKEN"));
+        assert!(page.contains("not configured"));
     }
 }

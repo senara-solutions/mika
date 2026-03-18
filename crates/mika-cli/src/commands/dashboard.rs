@@ -20,19 +20,25 @@ pub async fn run(command: DashboardCommand) -> Result<()> {
 }
 
 /// Resolve the PID file path: `~/.mika/dashboard.pid`.
-fn pid_file_path() -> Result<PathBuf> {
+pub fn pid_file_path() -> Result<PathBuf> {
     let home = home::resolve_home_dir()?;
     Ok(home.join("dashboard.pid"))
 }
 
-/// Check if a process with the given PID is alive via /proc on Linux.
+/// Check if a process with the given PID is alive.
+/// Uses kill(1) with signal 0 for POSIX portability (works on both Linux and macOS).
 fn is_process_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
-/// Send a signal to a process.
+/// Send a signal to a process via kill(1).
 fn send_signal(pid: u32, signal: i32) {
-    // Use std::process::Command to send signal via kill(1) utility
     let _ = Command::new("kill")
         .arg(format!("-{signal}"))
         .arg(pid.to_string())
@@ -40,7 +46,7 @@ fn send_signal(pid: u32, signal: i32) {
 }
 
 /// Read and validate the PID file. Returns `Some(pid)` if the process is alive.
-fn read_pid() -> Option<u32> {
+pub fn read_pid() -> Option<u32> {
     let path = pid_file_path().ok()?;
     let content = fs::read_to_string(&path).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
@@ -53,12 +59,36 @@ fn read_pid() -> Option<u32> {
     }
 }
 
-async fn start() -> Result<()> {
+/// Check if the dashboard dev server is running (used by TUI for status polling).
+pub fn is_dashboard_running() -> bool {
+    read_pid().is_some()
+}
+
+/// Walk up from the current directory to find the Mika project root.
+pub fn find_project_root() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let pkg = dir.join("package.json");
+        if pkg.exists()
+            && let Ok(content) = fs::read_to_string(&pkg)
+            && content.contains("dev:dashboard")
+        {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Start the dashboard dev server as a background process.
+/// Returns `(pid, message)` on success.
+///
+/// Shared between CLI `start` and TUI `/dashboard start` handler.
+pub fn start_dashboard_process() -> Result<(u32, String)> {
     // Check if already running
     if let Some(pid) = read_pid() {
-        println!("Dashboard is already running (PID {pid}).");
-        println!("  URL: {DASHBOARD_URL}");
-        return Ok(());
+        return Ok((pid, format!("Dashboard is already running (PID {pid}).")));
     }
 
     // Check npm is available
@@ -70,8 +100,7 @@ async fn start() -> Result<()> {
         );
     }
 
-    // Resolve the project root (where package.json lives).
-    // Walk up from the current directory looking for package.json with "dev:dashboard" script.
+    // Resolve the project root
     let project_root = find_project_root().context(
         "Could not find the Mika project root (directory containing package.json with dev:dashboard script). \
          Run this command from within the Mika source tree."
@@ -109,17 +138,18 @@ async fn start() -> Result<()> {
     fs::write(&pid_path, pid.to_string())
         .with_context(|| format!("Failed to write PID file: {}", pid_path.display()))?;
 
-    println!("Dashboard dev server started (PID {pid}).");
-    println!("  URL: {DASHBOARD_URL}");
-    Ok(())
+    Ok((
+        pid,
+        format!("Dashboard dev server started (PID {pid}).\n  URL: {DASHBOARD_URL}"),
+    ))
 }
 
-fn stop() -> Result<()> {
-    let pid_path = pid_file_path()?;
-
+/// Stop the dashboard process by PID.
+///
+/// Shared between CLI `stop` and TUI `/dashboard stop` handler.
+pub fn stop_dashboard() -> String {
     let Some(pid) = read_pid() else {
-        println!("Dashboard is not running.");
-        return Ok(());
+        return "Dashboard is not running.".to_string();
     };
 
     // Send SIGTERM (signal 15)
@@ -134,15 +164,28 @@ fn stop() -> Result<()> {
     }
 
     // Clean up PID file
-    let _ = fs::remove_file(&pid_path);
+    if let Ok(path) = pid_file_path() {
+        let _ = fs::remove_file(&path);
+    }
 
     if is_process_alive(pid) {
-        println!(
+        format!(
             "Dashboard process (PID {pid}) did not stop gracefully. You may need to kill it manually."
-        );
+        )
     } else {
-        println!("Dashboard stopped.");
+        "Dashboard stopped.".to_string()
     }
+}
+
+async fn start() -> Result<()> {
+    let (_pid, message) = start_dashboard_process()?;
+    println!("{message}");
+    Ok(())
+}
+
+fn stop() -> Result<()> {
+    let message = stop_dashboard();
+    println!("{message}");
     Ok(())
 }
 
@@ -178,57 +221,4 @@ fn open() -> Result<()> {
         Err(e) => println!("Could not open browser: {e}\n  URL: {url}"),
     }
     Ok(())
-}
-
-/// Walk up from the current directory to find the Mika project root.
-fn find_project_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let pkg = dir.join("package.json");
-        if pkg.exists()
-            && let Ok(content) = fs::read_to_string(&pkg)
-            && content.contains("dev:dashboard")
-        {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-/// Check if the dashboard dev server is running (used by TUI for status polling).
-pub fn is_dashboard_running() -> bool {
-    read_pid().is_some()
-}
-
-/// Public accessor for the PID file path (used by TUI handler).
-pub fn pid_file_path_pub() -> Result<PathBuf> {
-    pid_file_path()
-}
-
-/// Public accessor for reading the live PID (used by TUI handler).
-pub fn read_pid_pub() -> Option<u32> {
-    read_pid()
-}
-
-/// Public accessor for finding the project root (used by TUI handler).
-pub fn find_project_root_pub() -> Option<PathBuf> {
-    find_project_root()
-}
-
-/// Stop the dashboard process by PID (used by TUI handler).
-pub fn stop_dashboard(pid: u32) {
-    send_signal(pid, 15);
-    // Wait briefly for process to exit
-    for _ in 0..50 {
-        if !is_process_alive(pid) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    // Clean up PID file
-    if let Ok(path) = pid_file_path() {
-        let _ = fs::remove_file(&path);
-    }
 }

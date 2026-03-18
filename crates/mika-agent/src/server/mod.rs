@@ -314,6 +314,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
 
+    // Warn if embedded dashboard is enabled but no assets were compiled in
+    if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
+        warn!(
+            "MIKA_DASHBOARD_ENABLED=true but no dashboard assets are embedded in the binary. \
+             Build the dashboard first: npm run build --prefix dashboard && cargo build"
+        );
+    }
+
     let llm = settings.make_llm_provider()?;
     let http_client = reqwest::Client::new();
     let mut tool_registry = tools::default_tools();

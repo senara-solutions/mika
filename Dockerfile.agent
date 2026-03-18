@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/ packages/
 COPY dashboard/ dashboard/
-RUN npm ci --ignore-scripts && npm run build --prefix dashboard
+RUN npm ci --ignore-scripts && VITE_BASE_PATH=/dashboard/ npm run build --prefix dashboard
 
 # === Builder stage ===
 FROM rust:1.93-slim AS builder
