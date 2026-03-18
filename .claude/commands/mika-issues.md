@@ -29,6 +29,10 @@ $ARGUMENTS
 4. **After approval**, create the issues sequentially using `gh issue create` with HEREDOC bodies (same format as `/mika-issue`)
 5. **After all issues are created**, print a summary with issue numbers and URLs
 
+## Branch References
+
+If a branch is associated with an issue, always link it as a clickable GitHub URL using `[branch-name](https://github.com/senara-solutions/mika/tree/branch-name)` format in a `## Branch` section at the bottom of the body.
+
 If the issues share a theme, suggest grouping them under a milestone.
 
 Wait for my approval before creating any issues.

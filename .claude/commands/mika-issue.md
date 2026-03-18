@@ -66,6 +66,12 @@ $ARGUMENTS
 <Details>
 ```
 
+## Branch References
+
+If a branch is associated with the issue, always link it as a clickable GitHub URL:
+- Use `[branch-name](https://github.com/senara-solutions/mika/tree/branch-name)` format
+- Place it in a `## Branch` section at the bottom of the body
+
 ## Command Format
 
 Use a HEREDOC for the body:
@@ -74,6 +80,9 @@ Use a HEREDOC for the body:
 gh issue create --title "..." --label "type,priority,component" --body "$(cat <<'EOF'
 ## Description
 ...
+
+## Branch
+[`branch-name`](https://github.com/senara-solutions/mika/tree/branch-name)
 EOF
 )"
 ```
