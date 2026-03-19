@@ -271,6 +271,7 @@ keywords = ["test"]
                 url: "https://github.com/user/mika-skill-market.git".to_string(),
                 path: ".".to_string(),
                 commit: "abc123".to_string(),
+                linked: false,
                 installed_at: "2026-03-02T10:00:00Z".to_string(),
                 updated_at: "2026-03-02T10:00:00Z".to_string(),
             },

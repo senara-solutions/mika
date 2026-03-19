@@ -98,6 +98,22 @@ updated_at = "2026-03-02T10:30:00Z"
 - CLI-only installation (agent cannot install skills via tool calls)
 - Keeps existing TOML-based skill format unchanged
 
+## Addendum: Local Source Support (2026-03-19)
+
+11. **Local path as install source.** Accept absolute paths and `file://` URIs in
+    addition to git URLs. `resolve_source()` returns `SourceKind::Git(url)` or
+    `SourceKind::Local(path)`. Local installs skip git clone and copy files directly
+    from disk. Lock file records `url = "file:///..."` with `commit = ""`.
+
+12. **`--link` symlink mode.** Optional `--link` flag creates an absolute symlink
+    instead of a copy. Changes to the source are reflected immediately with no
+    update step. Lock file records `linked = true`. Only valid for local sources;
+    rejected for git sources.
+
+13. **Absolute symlink invariant.** Symlinks always point to the directory
+    containing `skill.toml`, never a parent. Source paths are canonicalized before
+    symlink creation to prevent relative-path breakage.
+
 ## Alternatives Considered
 
 - **Central registry (ClawHub model):** Requires hosting, moderation, publishing

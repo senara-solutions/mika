@@ -325,13 +325,16 @@ pub enum SkillsCommand {
         /// Skill name
         name: String,
     },
-    /// Install a skill from a Git repository
+    /// Install a skill from a Git repository or local path
     Install {
-        /// Git URL or GitHub shorthand (user/repo)
+        /// Git URL, GitHub shorthand (user/repo), or local path
         source: String,
         /// Install under a different name (alias)
         #[arg(long)]
         name: Option<String>,
+        /// Create symlink instead of copy (local sources only)
+        #[arg(long)]
+        link: bool,
     },
     /// Uninstall a marketplace-installed skill
     Uninstall {

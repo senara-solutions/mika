@@ -483,17 +483,23 @@ mika skills install https://github.com/user/mika-skill-weather.git
 
 # Install under a different name (alias)
 mika skills install user/repo --name my-weather
+
+# From a local path (snapshot copy)
+mika skills install /path/to/my-skill
+mika skills install file:///path/to/my-skill
+
+# From a local path (live symlink — changes reflected immediately)
+mika skills install /path/to/my-skill --link
+
+# Local repo root with multiple skills (interactive picker)
+mika skills install /path/to/mika-skills --link
 ```
 
-The install process:
-1. Clones the repository (shallow clone)
-2. Scans for `skill.toml` files (up to 2 levels deep)
-3. If multiple skills found, presents an interactive picker
-4. Validates the manifest and checks for name collisions
-5. Copies the skill directory into `~/.mika/skills/<name>/`
-6. Records the installation in `marketplace.lock`
+**Git sources:** The install process clones the repository (shallow clone), scans for `skill.toml` files (up to 2 levels deep), presents an interactive picker if multiple skills are found, validates the manifest and checks for name collisions, copies the skill directory into `~/.mika/skills/<name>/`, and records the installation in `marketplace.lock`.
 
-Skills with exec handlers show a security warning before installation and require confirmation to proceed.
+**Local sources:** Accepts absolute paths or `file://` URIs. Without `--link`, files are copied (snapshot). With `--link`, a symlink is created so changes to the source directory are reflected immediately — ideal for skill development. `--link` is not supported with git sources.
+
+Skills with exec handlers show a security warning before installation and require confirmation to proceed. For `--link` installs, an additional note warns that handler scripts can be modified at any time.
 
 ### Updating Skills
 
@@ -505,7 +511,10 @@ mika skills update weather
 mika skills update
 ```
 
-Updates re-clone the source repo and replace the installed skill with the latest version. The lock file is updated with the new commit hash.
+Update behavior depends on the source type:
+- **Git sources:** Re-clones the repo and replaces the installed skill with the latest version. The lock file is updated with the new commit hash.
+- **Local snapshots:** Re-copies from the original source path. Fails with a clear message if the source directory no longer exists.
+- **Linked skills:** No-op — source changes are always current. The update summary reports these as "Linked (no-op)".
 
 ### Uninstalling Skills
 
@@ -517,10 +526,11 @@ This removes the skill directory and its lock file entry. Built-in skills cannot
 
 ### Skill Origins
 
-Skills have three possible origins, shown in `list_skills` output:
+Skills have four possible origins, shown in `list_skills` output:
 
 - **[built-in]** — Bundled with Mika, re-synced on startup
-- **[marketplace]** — Installed from a Git repository via `mika skills install`
+- **[marketplace]** — Installed from a Git repository or local path via `mika skills install`
+- **[marketplace/linked]** — Installed via `mika skills install --link` (symlink to source)
 - **[custom]** — Created locally via `mika skills create` or manually
 
 ### Publishing Skills
@@ -557,12 +567,30 @@ The installer scans up to 2 directory levels for `skill.toml` files. Ensure your
 Marketplace installations are tracked in `~/.mika/agents/<agent>/marketplace.lock`:
 
 ```toml
+# Git source
 [skills.weather]
 url = "https://github.com/user/mika-skill-weather.git"
 path = "."
 commit = "abc123def456"
 installed_at = "2026-03-02T10:30:00Z"
 updated_at = "2026-03-02T10:30:00Z"
+
+# Local snapshot
+[skills.my-dev-skill]
+url = "file:///home/user/projects/my-skill"
+path = "."
+commit = ""
+installed_at = "2026-03-19T10:00:00Z"
+updated_at = "2026-03-19T10:00:00Z"
+
+# Linked (symlink)
+[skills.self-dev]
+url = "file:///home/user/projects/mika-skills/self-dev"
+path = "."
+commit = ""
+linked = true
+installed_at = "2026-03-19T10:00:00Z"
+updated_at = "2026-03-19T10:00:00Z"
 ```
 
 ---

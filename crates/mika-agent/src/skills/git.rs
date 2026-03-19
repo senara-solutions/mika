@@ -1,13 +1,61 @@
-//! Git command wrappers for marketplace skill installation.
+//! Git command wrappers and source resolution for marketplace skill installation.
 //!
 //! All git operations shell out to the `git` binary. Environment variables
 //! prefixed with `MIKA_` are scrubbed from child processes (defense-in-depth).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use tempfile::TempDir;
+
+/// Discriminant for skill install source types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceKind {
+    /// Remote git repository URL (https://, ssh://, git@, or GitHub shorthand).
+    Git(String),
+    /// Local filesystem path (absolute, canonicalized).
+    Local(PathBuf),
+}
+
+/// Resolve a source string into either a git URL or a local filesystem path.
+///
+/// Resolution order:
+/// 1. `file://` prefix → strip and treat as local path
+/// 2. Absolute path that exists on disk → local path
+/// 3. Everything else → delegate to git URL resolution
+pub fn resolve_source(input: &str) -> Result<SourceKind> {
+    let input = input.trim();
+
+    if input.is_empty() {
+        bail!("source cannot be empty");
+    }
+
+    // Handle file:// URIs
+    if let Some(path) = input.strip_prefix("file://") {
+        let p = PathBuf::from(path);
+        if !p.is_absolute() {
+            bail!("file:// URI must use an absolute path, got: {path}");
+        }
+        if !p.exists() {
+            bail!("path does not exist: {}", p.display());
+        }
+        return Ok(SourceKind::Local(std::fs::canonicalize(&p).with_context(
+            || format!("failed to canonicalize {}", p.display()),
+        )?));
+    }
+
+    // Handle bare absolute paths
+    let p = Path::new(input);
+    if p.is_absolute() && p.exists() {
+        return Ok(SourceKind::Local(std::fs::canonicalize(p).with_context(
+            || format!("failed to canonicalize {}", p.display()),
+        )?));
+    }
+
+    // Fall through to git URL resolution
+    Ok(SourceKind::Git(resolve_git_url(input)?))
+}
 
 /// Check if git is available on PATH.
 pub fn check_git() -> Result<()> {
@@ -75,7 +123,7 @@ pub fn get_head_commit(repo_dir: &Path) -> Result<String> {
 /// - `ssh://...` → pass through
 /// - `user/repo` (exactly one `/`, no protocol) → `https://github.com/user/repo.git`
 /// - Everything else → error
-pub fn resolve_url(source: &str) -> Result<String> {
+fn resolve_git_url(source: &str) -> Result<String> {
     let source = source.trim();
 
     if source.is_empty() {
@@ -130,67 +178,136 @@ fn git_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    // --- resolve_url tests ---
+    // --- resolve_git_url tests ---
 
     #[test]
     fn test_resolve_github_shorthand() {
-        let url = resolve_url("user/repo").unwrap();
+        let url = resolve_git_url("user/repo").unwrap();
         assert_eq!(url, "https://github.com/user/repo.git");
     }
 
     #[test]
     fn test_resolve_github_shorthand_trimmed() {
-        let url = resolve_url("  user/repo  ").unwrap();
+        let url = resolve_git_url("  user/repo  ").unwrap();
         assert_eq!(url, "https://github.com/user/repo.git");
     }
 
     #[test]
     fn test_resolve_https_passthrough() {
-        let url = resolve_url("https://github.com/user/repo.git").unwrap();
+        let url = resolve_git_url("https://github.com/user/repo.git").unwrap();
         assert_eq!(url, "https://github.com/user/repo.git");
     }
 
     #[test]
     fn test_resolve_http_rejected() {
-        let result = resolve_url("http://example.com/repo.git");
+        let result = resolve_git_url("http://example.com/repo.git");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Insecure"));
     }
 
     #[test]
     fn test_resolve_ssh_passthrough() {
-        let url = resolve_url("ssh://git@github.com/user/repo.git").unwrap();
+        let url = resolve_git_url("ssh://git@github.com/user/repo.git").unwrap();
         assert_eq!(url, "ssh://git@github.com/user/repo.git");
     }
 
     #[test]
     fn test_resolve_git_at_passthrough() {
-        let url = resolve_url("git@github.com:user/repo.git").unwrap();
+        let url = resolve_git_url("git@github.com:user/repo.git").unwrap();
         assert_eq!(url, "git@github.com:user/repo.git");
     }
 
     #[test]
     fn test_resolve_empty_error() {
-        assert!(resolve_url("").is_err());
-        assert!(resolve_url("  ").is_err());
+        assert!(resolve_git_url("").is_err());
+        assert!(resolve_git_url("  ").is_err());
     }
 
     #[test]
     fn test_resolve_invalid_single_word() {
-        assert!(resolve_url("justrepo").is_err());
+        assert!(resolve_git_url("justrepo").is_err());
     }
 
     #[test]
     fn test_resolve_domain_with_slash_not_shorthand() {
         // "example.com/repo" has a dot before the slash, so it's not GitHub shorthand
-        assert!(resolve_url("example.com/repo").is_err());
+        assert!(resolve_git_url("example.com/repo").is_err());
     }
 
     #[test]
     fn test_resolve_triple_path_not_shorthand() {
         // "user/repo/extra" has more than one slash
-        assert!(resolve_url("user/repo/extra").is_err());
+        assert!(resolve_git_url("user/repo/extra").is_err());
+    }
+
+    // --- resolve_source tests ---
+
+    #[test]
+    fn test_resolve_source_github_shorthand() {
+        let source = resolve_source("user/repo").unwrap();
+        assert_eq!(
+            source,
+            SourceKind::Git("https://github.com/user/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_https_url() {
+        let source = resolve_source("https://github.com/user/repo.git").unwrap();
+        assert_eq!(
+            source,
+            SourceKind::Git("https://github.com/user/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_local_path() {
+        let tmp = TempDir::new().unwrap();
+        let source = resolve_source(tmp.path().to_str().unwrap()).unwrap();
+        match source {
+            SourceKind::Local(p) => assert!(p.exists()),
+            _ => panic!("expected SourceKind::Local"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_source_file_uri() {
+        let tmp = TempDir::new().unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        let source = resolve_source(&uri).unwrap();
+        match source {
+            SourceKind::Local(p) => assert!(p.exists()),
+            _ => panic!("expected SourceKind::Local"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_source_file_uri_relative_rejected() {
+        let result = resolve_source("file://relative/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn test_resolve_source_nonexistent_path() {
+        let result = resolve_source("/nonexistent/path/that/does/not/exist");
+        // Non-existent absolute paths fall through to git URL resolution (and fail there)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_source_nonexistent_file_uri() {
+        let result = resolve_source("file:///nonexistent/path/that/does/not/exist");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_resolve_source_empty() {
+        assert!(resolve_source("").is_err());
+        assert!(resolve_source("  ").is_err());
     }
 
     // --- check_git test ---
