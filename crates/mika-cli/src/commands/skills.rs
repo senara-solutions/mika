@@ -353,16 +353,8 @@ fn install_skill(
     let source_kind = git::resolve_source(source)?;
 
     // Reject --link with git sources
-    if link {
-        if let SourceKind::Git(_) = &source_kind {
-            bail!(
-                "--link requires a local path source (got: {})",
-                match &source_kind {
-                    SourceKind::Git(url) => url.as_str(),
-                    _ => unreachable!(),
-                }
-            );
-        }
+    if link && let SourceKind::Git(url) = &source_kind {
+        bail!("--link requires a local path source (got: {url})");
     }
 
     // Ensure skills dir exists
