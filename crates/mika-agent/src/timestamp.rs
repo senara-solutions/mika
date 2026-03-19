@@ -36,6 +36,15 @@ pub fn now_plus(d: Duration) -> String {
     format(&(Utc::now() + d))
 }
 
+/// Check whether a timestamp string is older than the given duration from now.
+/// Returns `false` if the timestamp cannot be parsed.
+pub fn is_older_than(ts: &str, d: Duration) -> bool {
+    match parse(ts) {
+        Ok(dt) => Utc::now() - dt > d,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,4 +73,18 @@ mod tests {
     }
 
     use chrono::Datelike;
+
+    #[test]
+    fn test_is_older_than() {
+        // 10 minutes ago should be older than 5 minutes
+        let old = format(&(Utc::now() - Duration::minutes(10)));
+        assert!(is_older_than(&old, Duration::minutes(5)));
+
+        // 2 minutes ago should NOT be older than 5 minutes
+        let recent = format(&(Utc::now() - Duration::minutes(2)));
+        assert!(!is_older_than(&recent, Duration::minutes(5)));
+
+        // Invalid timestamp returns false
+        assert!(!is_older_than("not-a-timestamp", Duration::minutes(5)));
+    }
 }

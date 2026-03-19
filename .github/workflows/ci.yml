@@ -26,6 +26,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist && touch dashboard/dist/.gitkeep
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 

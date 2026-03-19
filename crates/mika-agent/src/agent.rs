@@ -48,6 +48,11 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
 
+/// Maximum age (in minutes) for a failed callback to be delivered to the agent.
+/// Failed callbacks older than this are silently marked as delivered to prevent
+/// flooding the conversation with stale failures (e.g., after an upgrade).
+pub const STALE_FAILED_CALLBACK_MINUTES: i64 = 5;
+
 /// Wraps a callback task result in untrusted-framing XML tags.
 ///
 /// Both the CLI (interactive callback handling) and the silent agent loop
