@@ -474,9 +474,9 @@ pub struct DashboardArgs {
 
 #[derive(Subcommand)]
 pub enum DashboardCommand {
-    /// Start the dashboard dev server
+    /// Enable the embedded dashboard on the running server
     Start,
-    /// Stop the dashboard dev server
+    /// Disable the embedded dashboard on the running server
     Stop,
     /// Show dashboard status
     Status,

@@ -61,6 +61,8 @@ pub struct AppState {
     pub investigation_lock: Arc<tokio::sync::Mutex<()>>,
     /// Lazily initialized investigation tool registry.
     pub investigation_tools: Arc<OnceCell<Arc<ToolRegistry>>>,
+    /// Runtime toggle for the embedded dashboard (initialized from `settings.dashboard_enabled`).
+    pub dashboard_enabled: Arc<AtomicBool>,
 }
 
 impl AppState {

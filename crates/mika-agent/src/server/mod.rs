@@ -59,7 +59,7 @@ fn build_router(state: AppState) -> Router {
         .allow_methods([http::Method::GET, http::Method::OPTIONS, http::Method::POST])
         .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]);
 
-    // Dashboard API routes (read-only, with CORS for browser access)
+    // Dashboard API routes (read-only, accepts dashboard OR internal token)
     let dashboard_routes = Router::new()
         .route("/timeline", get(dashboard::handle_timeline))
         .route(
@@ -104,10 +104,26 @@ fn build_router(state: AppState) -> Router {
                 investigate::INVESTIGATE_BODY_LIMIT,
             )),
         )
-        .layer(cors)
+        // Dashboard toggle endpoints
+        .route("/dashboard/enable", post(embedded_dashboard::handle_enable))
+        .route(
+            "/dashboard/disable",
+            post(embedded_dashboard::handle_disable),
+        )
+        .route("/dashboard/status", get(embedded_dashboard::handle_status))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_dashboard_or_internal_token,
+        ));
+
+    // Rewind routes — internal token only, no CORS (server-to-server)
+    let rewind_routes = Router::new()
+        .route("/rewind/preview", post(rewind::handle_rewind_preview))
+        .route("/rewind/execute", post(rewind::handle_rewind_execute))
+        .route("/rewind/resolve", post(rewind::handle_rewind_resolve))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
         ));
 
     // Mutation routes (no CORS — gateway-to-agent only).
@@ -118,25 +134,16 @@ fn build_router(state: AppState) -> Router {
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
         .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
-        .route(
-            "/api/v1/rewind/preview",
-            post(rewind::handle_rewind_preview),
-        )
-        .route(
-            "/api/v1/rewind/execute",
-            post(rewind::handle_rewind_execute),
-        )
-        .route(
-            "/api/v1/rewind/resolve",
-            post(rewind::handle_rewind_resolve),
-        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
         ));
 
+    // Merge dashboard + rewind into a single /api/v1 nest — no prefix conflict.
+    // CORS applied after merge so both sub-routers are reachable (Axum .layer()
+    // wraps the router as a service; merging after .layer() can shadow routes).
     mutation_routes
-        .nest("/api/v1", dashboard_routes)
+        .nest("/api/v1", dashboard_routes.merge(rewind_routes).layer(cors))
         // Embedded dashboard SPA (no auth — static assets; SPA authenticates its own API calls)
         .nest("/dashboard", embedded_dashboard::dashboard_routes())
         // Root: redirect to dashboard (if enabled) or return JSON info
@@ -467,6 +474,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         dashboard_db,
         investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
         investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
+        dashboard_enabled: Arc::new(AtomicBool::new(settings.dashboard_enabled)),
     };
 
     let app = build_router(state.clone());
@@ -674,6 +682,7 @@ mod tests {
             dashboard_db,
             investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
             investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
+            dashboard_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1939,5 +1948,222 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["total"].is_number());
         assert!(json["data"].is_array());
+    }
+
+    // ===== Dashboard toggle endpoint tests =====
+
+    #[tokio::test]
+    async fn test_dashboard_status_returns_200() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/status")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Should have enabled, has_assets, has_token fields
+        assert!(json.get("enabled").is_some());
+        assert!(json.get("has_assets").is_some());
+        assert!(json.get("has_token").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_enable_returns_200() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/dashboard/enable")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_disable_returns_200() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/dashboard/disable")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_toggle_with_dashboard_token() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Dashboard token should work on toggle endpoints
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/status")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_toggle_without_token_returns_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_enable_toggles_state() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        // Start disabled
+        assert!(!state.dashboard_enabled.load(Ordering::Relaxed));
+
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/dashboard/enable")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.dashboard_enabled.load(Ordering::Relaxed));
+    }
+
+    // ===== Rewind route tests (after restructuring into nested group) =====
+
+    #[tokio::test]
+    async fn test_rewind_preview_returns_401_without_token() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rewind/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session_id":"test","count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Without token → 401 (not 404, proving the route exists)
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_routes_accept_internal_token() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Send a valid rewind resolve request — auth should pass (not 401).
+        // The handler returns 404 "No exchanges found" because the session is empty,
+        // which proves the route IS matched and auth IS accepted.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rewind/resolve")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"session_id":"test-session","count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Not 401 — auth passed
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        // The handler returns 404 "No exchanges found" (not a routing 404)
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("No exchanges"),
+            "expected handler-level 404, got: {}",
+            json
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewind_rejects_dashboard_token() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Dashboard token should NOT work on rewind routes (internal-only)
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rewind/preview")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"session_id":"test","count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

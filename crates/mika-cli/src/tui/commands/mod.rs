@@ -180,13 +180,6 @@ pub const COMMANDS: &[SlashCommand] = &[
         args_hint: Some("[<count> | to <message_id>]"),
         completer: None,
     },
-    SlashCommand {
-        name: "dashboard",
-        aliases: &[],
-        description: "Manage dashboard dev server (start/stop/status)",
-        args_hint: Some("[start|stop|status]"),
-        completer: Some(completers::complete_dashboard),
-    },
 ];
 
 /// Resolve a thinking level keyword to (budget_tokens, level_name).

@@ -333,29 +333,6 @@ fn split_path_for_completion(path: &str, cwd: &Path) -> (std::path::PathBuf, Str
     }
 }
 
-/// `/dashboard <tab>` — dashboard subcommands.
-pub fn complete_dashboard(
-    arg_text: &str,
-    _arg_index: usize,
-    _ctx: &CompletionContext,
-) -> (Vec<CompletionItem>, &'static str) {
-    let items = vec![
-        CompletionItem {
-            value: "start".to_string(),
-            description: Some("Start dev server".to_string()),
-        },
-        CompletionItem {
-            value: "stop".to_string(),
-            description: Some("Stop dev server".to_string()),
-        },
-        CompletionItem {
-            value: "status".to_string(),
-            description: Some("Show status".to_string()),
-        },
-    ];
-    (filter_by_prefix(items, arg_text), " Dashboard ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
