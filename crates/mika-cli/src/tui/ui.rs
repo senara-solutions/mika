@@ -229,7 +229,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
     draw_messages(f, app, messages_area);
 
     draw_input(f, app, chunks[2]);
-    draw_footer(f, app, chunks[3]);
+    draw_footer(f, app, chunks[3], f.area().width);
 
     // Autocomplete popup (rendered last to overlay)
     if app.autocomplete.visible() && app.autocomplete.item_count() > 0 {
@@ -240,12 +240,6 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App<'_>) {
 fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
     let now = chrono::Utc::now().format("%H:%M UTC");
 
-    let dashboard_dot_color = if app.dashboard_running {
-        Color::Green
-    } else {
-        Color::Red
-    };
-
     let header = if app.is_team_mode() {
         Line::from(vec![
             Span::styled(
@@ -254,9 +248,6 @@ fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   "),
-            Span::styled("\u{25CF}", Style::default().fg(dashboard_dot_color)),
-            Span::styled(" Dashboard", Style::default().fg(Color::DarkGray)),
             Span::raw("   "),
             Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
         ])
@@ -273,9 +264,6 @@ fn draw_header(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
                 format!("\u{2014} session {short_session}"),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::raw("   "),
-            Span::styled("\u{25CF}", Style::default().fg(dashboard_dot_color)),
-            Span::styled(" Dashboard", Style::default().fg(Color::DarkGray)),
             Span::raw("   "),
             Span::styled(format!("{now}"), Style::default().fg(Color::DarkGray)),
         ])
@@ -945,7 +933,7 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     }
 }
 
-fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
+fn draw_footer(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect, terminal_width: u16) {
     let status_text = match &app.status {
         AgentStatus::Idle => "ready",
         AgentStatus::Thinking => {
@@ -1085,6 +1073,47 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
         }
     }
 
+    // Dashboard indicator with clickable [start]/[stop] and [open]
+    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    let dashboard_dot_color = if app.dashboard_running {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    spans.push(Span::styled(
+        "\u{25CF} ",
+        Style::default().fg(dashboard_dot_color),
+    ));
+    // [start] or [stop] button
+    let col_before_start_stop: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+    let start_stop_text = if app.dashboard_running {
+        "[stop]"
+    } else {
+        "[start]"
+    };
+    spans.push(Span::styled(
+        start_stop_text,
+        Style::default().fg(Color::Cyan),
+    ));
+    app.footer_start_stop_rect = Some(Rect::new(
+        area.x + col_before_start_stop,
+        area.y,
+        start_stop_text.len() as u16,
+        1,
+    ));
+    spans.push(Span::raw(" "));
+    // [open] button
+    let col_before_open: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+    let open_text = "[open]";
+    spans.push(Span::styled(open_text, Style::default().fg(Color::Cyan)));
+    // Store the screen rect for click handling
+    app.footer_open_rect = Some(Rect::new(
+        area.x + col_before_open,
+        area.y,
+        open_text.len() as u16,
+        1,
+    ));
+
     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
     spans.push(Span::styled(
         "/ commands",
@@ -1101,6 +1130,18 @@ fn draw_footer(f: &mut Frame<'_>, app: &App<'_>, area: Rect) {
             "Ctrl+C quit",
             Style::default().fg(Color::DarkGray),
         ));
+    }
+
+    // Clamp footer rects to terminal width to avoid false positives on narrow terminals
+    if let Some(ref rect) = app.footer_start_stop_rect
+        && rect.x >= terminal_width
+    {
+        app.footer_start_stop_rect = None;
+    }
+    if let Some(ref rect) = app.footer_open_rect
+        && rect.x >= terminal_width
+    {
+        app.footer_open_rect = None;
     }
 
     let footer = Line::from(spans);

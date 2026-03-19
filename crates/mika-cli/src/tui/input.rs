@@ -3,7 +3,8 @@ use std::path::Path;
 use tui_textarea::CursorMove;
 
 use crate::tui::app::{
-    AgentStatus, App, ChatMessage, ChatRole, MessagePosition, SelectionState, TextPosition,
+    AgentStatus, App, ChatMessage, ChatRole, DashboardAction, MessagePosition, SelectionState,
+    TextPosition,
 };
 use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands::autocomplete::{
@@ -110,6 +111,33 @@ pub fn handle_mouse(app: &mut App<'_>, mouse: MouseEvent) {
             app.scroll_down(3);
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            // Check footer [start]/[stop] button
+            if let Some(rect) = app.footer_start_stop_rect
+                && mouse.column >= rect.x
+                && mouse.column < rect.x + rect.width
+                && mouse.row >= rect.y
+                && mouse.row < rect.y + rect.height
+            {
+                let action = if app.dashboard_running {
+                    DashboardAction::Stop
+                } else {
+                    DashboardAction::Start
+                };
+                app.pending_dashboard_action = Some(action);
+                return;
+            }
+
+            // Check footer [open] button
+            if let Some(rect) = app.footer_open_rect
+                && mouse.column >= rect.x
+                && mouse.column < rect.x + rect.width
+                && mouse.row >= rect.y
+                && mouse.row < rect.y + rect.height
+            {
+                app.pending_dashboard_action = Some(DashboardAction::Open);
+                return;
+            }
+
             // Check textarea area first
             if is_in_textarea(app, mouse.column, mouse.row) {
                 if let Some((row, col)) = screen_to_textarea_pos(app, mouse.column, mouse.row) {

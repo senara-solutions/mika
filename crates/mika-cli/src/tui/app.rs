@@ -23,6 +23,13 @@ pub enum TeamRequest {
     Quit,
 }
 
+/// Dashboard action dispatched from footer button clicks (processed in tick).
+pub enum DashboardAction {
+    Start,
+    Stop,
+    Open,
+}
+
 /// Agent processing status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -535,8 +542,17 @@ pub struct App<'a> {
     /// Live dashboard state during team runs (created on first PhaseChanged event).
     pub team_dashboard: Option<TeamDashboardState>,
 
-    /// Whether the dashboard dev server is running (polled periodically).
+    /// Whether the embedded dashboard is enabled on the running server (polled periodically).
     pub dashboard_running: bool,
+
+    /// Screen rect of the `[open]` button in the footer (set during draw, used for click handling).
+    pub footer_open_rect: Option<Rect>,
+
+    /// Screen rect of the `[start]`/`[stop]` button in the footer (set during draw).
+    pub footer_start_stop_rect: Option<Rect>,
+
+    /// Pending dashboard action from footer button click (processed in tick).
+    pub pending_dashboard_action: Option<DashboardAction>,
 }
 
 /// Context window limit for the model (Claude's 200K context).
@@ -610,7 +626,10 @@ impl<'a> App<'a> {
             team_dir: None,
             verbose_mode: false,
             team_dashboard: None,
-            dashboard_running: crate::commands::dashboard::is_dashboard_running(),
+            dashboard_running: false,
+            footer_open_rect: None,
+            footer_start_stop_rect: None,
+            pending_dashboard_action: None,
         }
     }
 
@@ -689,7 +708,10 @@ impl<'a> App<'a> {
             team_dir: Some(team_dir),
             verbose_mode: false,
             team_dashboard: None,
-            dashboard_running: crate::commands::dashboard::is_dashboard_running(),
+            dashboard_running: false,
+            footer_open_rect: None,
+            footer_start_stop_rect: None,
+            pending_dashboard_action: None,
         }
     }
 
@@ -820,6 +842,57 @@ impl<'a> App<'a> {
             self.needs_redraw = true;
         }
 
+        // Process pending dashboard action (from footer button clicks)
+        if let Some(action) = self.pending_dashboard_action.take() {
+            let msg = match action {
+                DashboardAction::Start | DashboardAction::Stop => {
+                    let (endpoint, verb) = match action {
+                        DashboardAction::Start => ("enable", "enabled"),
+                        DashboardAction::Stop => ("disable", "disabled"),
+                        _ => unreachable!(),
+                    };
+                    match crate::commands::dashboard::auth_token() {
+                        Err(_) => {
+                            "MIKA_INTERNAL_TOKEN or MIKA_DASHBOARD_TOKEN is required.".to_string()
+                        }
+                        Ok(token) => {
+                            let url = format!(
+                                "{}/api/v1/dashboard/{endpoint}",
+                                crate::commands::dashboard::server_url()
+                            );
+                            let client = reqwest::Client::new();
+                            match client
+                                .post(&url)
+                                .header("authorization", format!("Bearer {token}"))
+                                .timeout(std::time::Duration::from_secs(5))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    self.dashboard_running =
+                                        matches!(action, DashboardAction::Start);
+                                    format!("Dashboard {verb}.")
+                                }
+                                Ok(resp) => {
+                                    format!("Failed to {endpoint} dashboard: {}", resp.status())
+                                }
+                                Err(e) => format!("Failed to reach mika-server: {e}"),
+                            }
+                        }
+                    }
+                }
+                DashboardAction::Open => crate::commands::dashboard::open_dashboard_in_browser(),
+            };
+            self.messages.push(ChatMessage {
+                role: ChatRole::Command,
+                content: msg,
+                rendered: None,
+                channel: None,
+            });
+            self.auto_scroll_to_bottom();
+            self.needs_redraw = true;
+        }
+
         // Team mode: poll team response channel
         if self.is_team_mode() {
             self.tick_team_mode().await;
@@ -900,9 +973,9 @@ impl<'a> App<'a> {
             self.poll_callback_tasks().await;
         }
 
-        // Dashboard status polling: check PID file liveness.
+        // Dashboard status polling: query mika-server for embedded dashboard state.
         if self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) {
-            let running = crate::commands::dashboard::is_dashboard_running();
+            let running = crate::commands::dashboard::is_dashboard_running().await;
             if running != self.dashboard_running {
                 self.dashboard_running = running;
                 self.needs_redraw = true;

@@ -1,8 +1,10 @@
+use std::sync::atomic::Ordering;
+
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use rust_embed::Embed;
 
@@ -24,13 +26,48 @@ pub fn dashboard_routes() -> Router<AppState> {
     Router::new().fallback(serve_dashboard)
 }
 
+/// Root handler: redirects to `/dashboard` when enabled, returns JSON info when disabled.
+pub async fn handle_root(State(state): State<AppState>) -> Response {
+    if state.dashboard_enabled.load(Ordering::Relaxed) {
+        Redirect::temporary("/dashboard").into_response()
+    } else {
+        Json(serde_json::json!({
+            "name": "mika-server",
+            "version": env!("CARGO_PKG_VERSION"),
+            "dashboard": "/dashboard (disabled)"
+        }))
+        .into_response()
+    }
+}
+
+/// Enable the embedded dashboard at runtime.
+pub async fn handle_enable(State(state): State<AppState>) -> Json<serde_json::Value> {
+    state.dashboard_enabled.store(true, Ordering::Relaxed);
+    Json(serde_json::json!({ "enabled": true }))
+}
+
+/// Disable the embedded dashboard at runtime.
+pub async fn handle_disable(State(state): State<AppState>) -> Json<serde_json::Value> {
+    state.dashboard_enabled.store(false, Ordering::Relaxed);
+    Json(serde_json::json!({ "enabled": false }))
+}
+
+/// Return the current dashboard status.
+pub async fn handle_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "enabled": state.dashboard_enabled.load(Ordering::Relaxed),
+        "has_assets": has_embedded_assets(),
+        "has_token": state.dashboard_token.is_some(),
+    }))
+}
+
 /// Check whether any dashboard assets were embedded at compile time.
 pub fn has_embedded_assets() -> bool {
     DashboardAssets::iter().next().is_some()
 }
 
 async fn serve_dashboard(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
-    if !state.settings.dashboard_enabled {
+    if !state.dashboard_enabled.load(Ordering::Relaxed) {
         return disabled_page().into_response();
     }
 

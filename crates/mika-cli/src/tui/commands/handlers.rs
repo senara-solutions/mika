@@ -11,22 +11,8 @@ use crate::tui::input;
 
 /// Commands allowed in team mode. New commands are blocked by default (safe failure mode).
 const TEAM_MODE_ALLOWED_COMMANDS: &[&str] = &[
-    "help",
-    "h",
-    "?",
-    "clear",
-    "exit",
-    "quit",
-    "q",
-    "export",
-    "agents",
-    "teams",
-    "team",
-    "status",
-    "stat",
-    "verbose",
-    "v",
-    "dashboard",
+    "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team", "status",
+    "stat", "verbose", "v",
 ];
 
 /// Dispatch a slash command string to the appropriate handler.
@@ -78,7 +64,6 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "attach" | "img" => Some(handle_attach(app, args)),
         "undo" => Some(handle_undo(app).await),
         "rewind" => Some(handle_rewind(app, args).await),
-        "dashboard" => Some(handle_dashboard(app, args)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
@@ -1003,40 +988,6 @@ async fn handle_rewind_impl(
             output
         }
         Err(e) => format!("Rewind failed: {e}"),
-    }
-}
-
-fn handle_dashboard(app: &mut App<'_>, args: &str) -> String {
-    let sub = args.trim().to_lowercase();
-    match sub.as_str() {
-        "start" => match crate::commands::dashboard::start_dashboard_process() {
-            Ok((_pid, message)) => {
-                app.dashboard_running = true;
-                message
-            }
-            Err(e) => format!("Failed to start dashboard: {e}"),
-        },
-        "stop" => {
-            let message = crate::commands::dashboard::stop_dashboard();
-            app.dashboard_running = crate::commands::dashboard::is_dashboard_running();
-            message
-        }
-        "status" => {
-            if crate::commands::dashboard::is_dashboard_running() {
-                "Dashboard is running.\n  URL: http://localhost:5173".to_string()
-            } else {
-                "Dashboard is not running.\n  Start with: /dashboard start".to_string()
-            }
-        }
-        "" => {
-            // Toggle: start if stopped, stop if running
-            if app.dashboard_running {
-                handle_dashboard(app, "stop")
-            } else {
-                handle_dashboard(app, "start")
-            }
-        }
-        _ => format!("Unknown dashboard command: {sub}\n  Usage: /dashboard [start|stop|status]"),
     }
 }
 

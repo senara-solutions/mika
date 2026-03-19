@@ -12,7 +12,7 @@ Slash commands are client-side actions executed directly in the Mika TUI. They a
 database and renders output in-place, while typing a regular message (no `/` prefix)
 sends it to the Claude-backed agent loop as usual.
 
-All 24 commands are defined in a single `COMMANDS` array
+All 23 commands are defined in a single `COMMANDS` array
 (`crates/mika-cli/src/tui/commands/mod.rs`), dispatched through pattern matching in
 `handlers.rs`, and surfaced via an autocomplete popup driven by `autocomplete.rs`.
 
@@ -29,7 +29,7 @@ arguments.
 
 ### Command Completion
 
-1. Type `/` -- a popup appears listing all 24 commands.
+1. Type `/` -- a popup appears listing all 23 commands.
 2. Continue typing to narrow the list. For example, `/me` narrows to `/memory`.
    Matching works on both command names and aliases (e.g., typing `/q` matches
    `/exit` via its `q` alias).
@@ -49,7 +49,6 @@ accepting a command name, press Tab to see available completions:
 | `/team` | Team names | `~/.mika/teams/` |
 | `/skill` | Skill names from the registry | Skill registry |
 | `/attach` | File paths with tilde expansion | Current working directory |
-| `/dashboard` | Subcommands (start, stop, status) | Static |
 
 Argument completion is lazy (Tab-triggered) -- the popup does not appear
 automatically when a space is typed after the command name.
@@ -88,7 +87,7 @@ Enter is context-aware in the autocomplete popup:
 
 The popup title changes contextually: " Commands ", " Models ", " Agents ",
 " Teams ", " Skills ", " Files ", " Config ", " Config Keys ", " Values ",
-" Think ", " Memory ", " Dashboard ".
+" Think ", " Memory ".
 
 ## Command Reference
 
@@ -439,38 +438,18 @@ Errors: `Cannot rewind while agent is busy.` or `No messages to rewind.`
 
 ---
 
-### /dashboard
+## Dashboard Controls
 
-Manage the dashboard dev server. Without arguments, toggles the server (starts if
-stopped, stops if running). With a subcommand, performs the specified action.
+The TUI footer bar shows a colored dot indicating dashboard status (green when
+enabled, red when disabled) with clickable `[start]`/`[stop]` and `[open]`
+buttons. Status is polled every ~5 seconds by querying the mika-server
+`GET /api/v1/dashboard/status` endpoint.
 
-**Aliases:** None | **Arguments:** `[start|stop|status]` (optional)
+Requires `MIKA_INTERNAL_TOKEN` or `MIKA_DASHBOARD_TOKEN` to be set. Server URL
+defaults to `http://localhost:8080`, overridable via `MIKA_SERVER_URL`.
 
-**Start the dev server:**
-```
-/dashboard start
-→ Dashboard dev server started (PID 12345).
-  URL: http://localhost:5173
-```
-
-**Stop the dev server:**
-```
-/dashboard stop
-→ Dashboard stopped.
-```
-
-**Show status:**
-```
-/dashboard status
-→ Dashboard is running.
-  URL: http://localhost:5173
-```
-
-The TUI header bar shows a colored dot indicating dashboard status: green when
-running, red when stopped. Status is polled every ~5 seconds via PID file liveness
-check.
-
-Available in both agent mode and team mode.
+The CLI commands (`mika dashboard start/stop/status/open`) remain available for
+non-interactive use.
 
 ---
 
@@ -484,7 +463,7 @@ to a safe subset. Agent-specific commands are disabled:
 | `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
 | `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
-| `/dashboard` | `/undo`, `/rewind` |
+|  | `/undo`, `/rewind` |
 
 In team mode, `/status` and `/team` both show team info (name, orchestrator,
 agents). `/export` writes to the team directory instead of the agent home.

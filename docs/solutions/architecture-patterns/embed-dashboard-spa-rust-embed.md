@@ -55,9 +55,9 @@ Both Vite's `base` config and React Router's `basename` must be set to `/dashboa
 
 - `vite.config.ts`: `base: process.env.VITE_BASE_PATH || '/'`
 - `main.tsx`: `<BrowserRouter basename={window.__MIKA_CONFIG__?.basePath || '/'}>`
-- Docker build: `VITE_BASE_PATH=/dashboard/ npm run build --prefix dashboard`
+- npm build script: `VITE_BASE_PATH=/dashboard/` is set automatically in `dashboard/package.json`
 
-Missing the `VITE_BASE_PATH` causes all asset references to use `/assets/...` instead of `/dashboard/assets/...`, resulting in 404s.
+The `VITE_BASE_PATH` env var is baked into the npm `build` script, so `npm run build --prefix dashboard` always produces correct `/dashboard/assets/...` paths. Missing it would cause 404s.
 
 **5. Route placement in Axum**
 
@@ -72,9 +72,7 @@ Dashboard routes go outside auth middleware — static assets are publicly serve
 
 **6. CLI/TUI dashboard management**
 
-Extract shared functions (`start_dashboard_process()`, `stop_dashboard()`, `is_dashboard_running()`) in a single module. Both CLI subcommands and TUI slash commands call the same functions — never duplicate process management logic.
-
-Process liveness: use `kill -0 <pid>` (via `Command::new("kill").arg("-0")`) for POSIX portability. Do NOT use `/proc/{pid}` which is Linux-only.
+Shared helpers (`server_url()`, `auth_token()`, `open_dashboard_in_browser()`, `query_dashboard_status()`, `is_dashboard_running()`) live in `crate::commands::dashboard`. CLI subcommands (`mika dashboard start/stop/status/open`) call these directly. The TUI uses clickable footer buttons (`[start]`/`[stop]`/`[open]`) that dispatch through `pending_dashboard_action` in the async tick loop — never duplicate HTTP logic between CLI and TUI.
 
 ### Docker Multi-Stage Build
 
@@ -84,7 +82,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/ packages/
 COPY dashboard/ dashboard/
-RUN npm ci --ignore-scripts && VITE_BASE_PATH=/dashboard/ npm run build --prefix dashboard
+RUN npm ci --ignore-scripts && npm run build --prefix dashboard
 
 FROM rust:1.93-slim AS builder
 # ... existing setup ...

@@ -255,7 +255,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
 | `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
 | `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
-| `dashboard_enabled` | `bool` | `false` | `MIKA_DASHBOARD_ENABLED` | Enable embedded dashboard SPA at `/dashboard/`. When enabled, the pre-built React dashboard is served from the binary via `rust-embed`. Requires `MIKA_DASHBOARD_TOKEN` for token injection. Build the dashboard before compiling: `VITE_BASE_PATH=/dashboard/ npm run build --prefix dashboard`. |
+| `dashboard_enabled` | `bool` | `false` | `MIKA_DASHBOARD_ENABLED` | Enable embedded dashboard SPA at `/dashboard/`. When enabled, the pre-built React dashboard is served from the binary via `rust-embed`. Requires `MIKA_DASHBOARD_TOKEN` for token injection. Build the dashboard before compiling: `npm run build --prefix dashboard` (`VITE_BASE_PATH` is set automatically). |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
 | `otlp_endpoint` | `Option<String>` | None | `MIKA_OTLP_ENDPOINT` | OTLP endpoint URL for trace export — must include `/v1/traces` (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` for Langfuse, `http://localhost:4318/v1/traces` for Jaeger). Required when `telemetry_enabled` is true. |
@@ -422,6 +422,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
+| `MIKA_SERVER_URL` | No | mika-server URL for dashboard CLI commands (default: `http://localhost:8080`) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
