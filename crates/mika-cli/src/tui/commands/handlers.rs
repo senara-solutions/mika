@@ -5,7 +5,10 @@ use mika_common::agent;
 use mika_common::home;
 use mika_common::team;
 
-use crate::tui::app::{AgentRequest, AgentStatus, App, ChatMessage, ChatRole};
+use crate::tui::app::{
+    AgentRequest, AgentStatus, App, ChatMessage, ChatRole, MessagesLayout,
+    callback_label_from_metadata,
+};
 use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
 use crate::tui::input;
 
@@ -939,34 +942,45 @@ async fn handle_rewind_impl(
             // rewound the current session. Cross-session rewinds affect a prior
             // session whose messages were loaded at startup; the TUI display
             // should be fully refreshed instead.
-            if rewind_session == app.session_id {
-                let display_msgs_to_remove = preview
-                    .messages
-                    .iter()
-                    .filter(|m| m.role == "user" || m.role == "assistant")
-                    .count();
-                let keep = app.messages.len().saturating_sub(display_msgs_to_remove);
-                app.messages.truncate(keep);
-            } else {
-                // Cross-session rewind: clear display and reload from DB
-                app.messages.clear();
-                if let Ok(recent) = app.db.load_recent_messages(20).await {
-                    for msg in &recent {
-                        let chat_role = match msg.role.as_str() {
-                            "user" => ChatRole::User,
-                            "assistant" => ChatRole::Assistant,
-                            "system" => ChatRole::System,
-                            _ => continue,
-                        };
-                        app.messages.push(ChatMessage {
-                            role: chat_role,
-                            content: msg.content.clone(),
-                            rendered: None,
-                            channel: None,
-                        });
-                    }
+            // Reload messages from DB for both same-session and cross-session
+            // rewinds. The DB may contain intermediate assistant messages (tool_use)
+            // that are never in app.messages, so counting-based truncation is unreliable.
+            // This mirrors the startup loader in chat.rs.
+            app.messages.clear();
+            if let Ok(recent) = app.db.load_recent_messages(20).await {
+                for msg in &recent {
+                    let role = match msg.role.as_str() {
+                        "user" => {
+                            if msg.content.starts_with("A background task has completed.") {
+                                continue;
+                            }
+                            ChatRole::User
+                        }
+                        "assistant" => ChatRole::Assistant,
+                        "tool_result" => ChatRole::System,
+                        _ => continue,
+                    };
+                    let channel = if msg.channel_type == "cli" {
+                        None
+                    } else {
+                        Some(msg.channel_type.clone())
+                    };
+                    let content = if msg.role == "tool_result" {
+                        let label = callback_label_from_metadata(&msg.metadata);
+                        format!("[Task: {}] Result received", label)
+                    } else {
+                        msg.content.clone()
+                    };
+                    app.messages.push(ChatMessage {
+                        role,
+                        content,
+                        rendered: None,
+                        channel,
+                    });
                 }
             }
+            app.scroll_offset = 0;
+            app.messages_layout = MessagesLayout::default();
 
             let mut output = preview_text;
             output.push_str(&format!(
