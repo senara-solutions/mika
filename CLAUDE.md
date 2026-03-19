@@ -169,3 +169,10 @@ Local clones of agent platforms to study for patterns and inspiration. Read free
 
 - **LettaBot** — `../lettabot/`
   TypeScript. Study for: memory hierarchy patterns (core/archival/recall from MemGPT), autonomous memory self-editing via tool calls, agent state persistence, channel integrations built on top of Letta's memory API.
+
+## Workspace Context
+
+This repo is part of the [mika-platform](../CLAUDE.md) workspace. For cross-repo navigation, development workflow, and the autonomous development loop, see `../CLAUDE.md`.
+
+Cross-repo documentation:
+- `../docs/solutions/cross-repo-patterns/` — Security hardening playbook, reference architecture patterns
