@@ -47,6 +47,8 @@ rmcp.workspace = true
 http.workspace = true
 tempfile.workspace = true
 rust-embed.workspace = true
+mika-a2a.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

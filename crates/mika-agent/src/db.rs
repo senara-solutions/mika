@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -452,7 +452,7 @@ pub struct SessionWithStats {
 // ===== Database =====
 
 pub struct Database {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Database {
@@ -583,6 +583,10 @@ impl Database {
             self.migrate_v11_to_v12()?;
             info!(version = 12, "database migrated to v12");
         }
+        if (3..=12).contains(&version) {
+            self.migrate_v12_to_v13()?;
+            info!(version = 13, "database migrated to v13");
+        }
         Ok(())
     }
 
@@ -632,7 +636,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (12);
+            INSERT INTO schema_version (version) VALUES (13);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -899,6 +903,47 @@ impl Database {
                 skill_name TEXT NOT NULL COLLATE NOCASE,
                 always_on  INTEGER,
                 PRIMARY KEY (agent_id, skill_name)
+            );
+
+            -- A2A Protocol tables
+            CREATE TABLE a2a_tasks (
+                id TEXT PRIMARY KEY,
+                context_id TEXT,
+                state TEXT NOT NULL DEFAULT 'submitted',
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE TABLE a2a_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                parts TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE TABLE a2a_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                name TEXT,
+                description TEXT,
+                parts TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE TABLE a2a_push_notification_configs (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+                url TEXT NOT NULL,
+                token TEXT,
+                auth_scheme TEXT,
+                auth_credentials TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
@@ -1875,6 +1920,72 @@ impl Database {
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK;");
                 let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate_v12_to_v13(&self) -> Result<()> {
+        info!("migrating database schema v12 → v13 (A2A protocol tables)");
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS a2a_tasks (
+                    id TEXT PRIMARY KEY,
+                    context_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'submitted',
+                    metadata TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS a2a_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    parts TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS a2a_artifacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+                    artifact_id TEXT NOT NULL,
+                    name TEXT,
+                    description TEXT,
+                    parts TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS a2a_push_notification_configs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+                    url TEXT NOT NULL,
+                    token TEXT,
+                    auth_scheme TEXT,
+                    auth_credentials TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );",
+            )?;
+
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (13)", [])?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
                 Err(e)
             }
         }
@@ -6814,9 +6925,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_12() {
+    fn test_schema_version_is_13() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 13);
     }
 
     #[test]

@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use dashmap::DashMap;
+use mika_a2a::streaming::StreamEvent;
 use mika_common::agent;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::LlmProvider;
 use secrecy::SecretString;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, broadcast};
 
 use crate::async_db::AsyncDatabase;
 use crate::mcp::McpManager;
@@ -63,6 +65,8 @@ pub struct AppState {
     pub investigation_tools: Arc<OnceCell<Arc<ToolRegistry>>>,
     /// Runtime toggle for the embedded dashboard (initialized from `settings.dashboard_enabled`).
     pub dashboard_enabled: Arc<AtomicBool>,
+    /// Active A2A task broadcasters for SSE streaming (keyed by task ID).
+    pub a2a_broadcasters: Arc<DashMap<String, broadcast::Sender<StreamEvent>>>,
 }
 
 impl AppState {

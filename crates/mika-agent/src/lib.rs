@@ -1,3 +1,5 @@
+pub mod a2a_card;
+pub mod a2a_db;
 pub mod agent;
 pub mod async_db;
 pub mod bundled_skills;

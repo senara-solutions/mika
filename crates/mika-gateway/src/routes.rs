@@ -19,6 +19,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::a2a_routes;
 use crate::telegram::{
     ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_update,
 };
@@ -72,6 +73,15 @@ pub fn build_router(state: AppState) -> Router {
                     require_bearer_token,
                 ))
                 .layer(RequestBodyLimitLayer::new(256 * 1024)),
+        )
+        // A2A protocol proxy (API key auth)
+        .route(
+            "/a2a/{customer_id}/{agent_name}",
+            post(a2a_routes::handle_a2a_proxy),
+        )
+        .route(
+            "/a2a/{customer_id}/{agent_name}/agent.json",
+            get(a2a_routes::handle_a2a_agent_card),
         )
         // Health probes (no auth)
         .route("/health", get(handle_readiness))
@@ -227,6 +237,15 @@ pub(crate) async fn handle_webhook(
 fn container_url(customer_id: &Uuid, agent_base_url: &Option<String>) -> String {
     match agent_base_url {
         Some(base) => base.clone(),
+        None => format!("http://mika-{customer_id}:8080"),
+    }
+}
+
+/// Compute container URL from a string customer ID.
+/// Used by A2A proxy routes where customer_id comes from the URL path.
+pub(crate) fn container_url_str(customer_id: &str, agent_base_url: Option<&str>) -> String {
+    match agent_base_url {
+        Some(base) => base.to_string(),
         None => format!("http://mika-{customer_id}:8080"),
     }
 }

@@ -1528,6 +1528,73 @@ impl AsyncDatabase {
         self.with_db(move |db| db.list_team_runs_paginated_with_count(&filters, limit, offset))
             .await
     }
+
+    // -- A2A Protocol --
+
+    pub async fn a2a_create_task(&self, id: &str, context_id: Option<&str>) -> Result<()> {
+        let (i, c) = (id.to_owned(), context_id.map(|s| s.to_owned()));
+        self.with_db(move |db| db.a2a_create_task(&i, c.as_deref()))
+            .await
+    }
+
+    pub async fn a2a_get_task_state(&self, id: &str) -> Result<Option<String>> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.a2a_get_task_state(&i)).await
+    }
+
+    pub async fn a2a_update_task_state(&self, id: &str, state: &str) -> Result<()> {
+        let (i, s) = (id.to_owned(), state.to_owned());
+        self.with_db(move |db| db.a2a_update_task_state(&i, &s))
+            .await
+    }
+
+    pub async fn a2a_insert_message(
+        &self,
+        task_id: &str,
+        message: &mika_a2a::types::Message,
+    ) -> Result<()> {
+        let (t, m) = (task_id.to_owned(), message.clone());
+        self.with_db(move |db| db.a2a_insert_message(&t, &m)).await
+    }
+
+    pub async fn a2a_build_task(
+        &self,
+        id: &str,
+        history_length: Option<i32>,
+    ) -> Result<Option<mika_a2a::types::Task>> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.a2a_build_task(&i, history_length))
+            .await
+    }
+
+    pub async fn a2a_set_push_config(
+        &self,
+        config: &mika_a2a::types::TaskPushNotificationConfig,
+    ) -> Result<()> {
+        let c = config.clone();
+        self.with_db(move |db| db.a2a_set_push_config(&c)).await
+    }
+
+    pub async fn a2a_get_push_config(
+        &self,
+        id: &str,
+    ) -> Result<Option<mika_a2a::types::TaskPushNotificationConfig>> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.a2a_get_push_config(&i)).await
+    }
+
+    pub async fn a2a_list_push_configs(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<mika_a2a::types::TaskPushNotificationConfig>> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.a2a_list_push_configs(&t)).await
+    }
+
+    pub async fn a2a_delete_push_config(&self, id: &str) -> Result<bool> {
+        let i = id.to_owned();
+        self.with_db(move |db| db.a2a_delete_push_config(&i)).await
+    }
 }
 
 #[cfg(test)]

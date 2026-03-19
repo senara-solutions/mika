@@ -1,3 +1,4 @@
+mod a2a;
 mod auth;
 pub mod dashboard;
 pub mod embedded_dashboard;
@@ -130,6 +131,16 @@ fn build_router(state: AppState) -> Router {
             auth::require_internal_token,
         ));
 
+    // A2A routes (no CORS — gateway handles external auth).
+    // Accepts only MIKA_INTERNAL_TOKEN.
+    let a2a_routes = Router::new()
+        .route("/a2a/{agent_name}", post(a2a::handle_a2a_jsonrpc))
+        .route("/a2a/{agent_name}/agent.json", get(a2a::handle_agent_card))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
+        ));
+
     // Mutation routes (no CORS — gateway-to-agent only).
     // Accepts only MIKA_INTERNAL_TOKEN.
     let mutation_routes = Router::new()
@@ -147,6 +158,7 @@ fn build_router(state: AppState) -> Router {
     // CORS applied after merge so both sub-routers are reachable (Axum .layer()
     // wraps the router as a service; merging after .layer() can shadow routes).
     mutation_routes
+        .merge(a2a_routes)
         .nest("/api/v1", dashboard_routes.merge(rewind_routes).layer(cors))
         // Embedded dashboard SPA (no auth — static assets; SPA authenticates its own API calls)
         .nest("/dashboard", embedded_dashboard::dashboard_routes())
@@ -479,6 +491,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
         investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
         dashboard_enabled: Arc::new(AtomicBool::new(settings.dashboard_enabled)),
+        a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
     };
 
     let app = build_router(state.clone());
@@ -687,6 +700,7 @@ mod tests {
             investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
             investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
             dashboard_enabled: Arc::new(AtomicBool::new(false)),
+            a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
         }
     }
 

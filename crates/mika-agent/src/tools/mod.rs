@@ -1,3 +1,4 @@
+mod a2a_call;
 mod cancel_reminder;
 mod cancel_task;
 mod complete_task;
@@ -440,6 +441,7 @@ pub fn team_tools(workspace_dir: &Path, reference_dir: Option<&Path>) -> Vec<Box
 /// Create a registry with all built-in tools.
 pub fn default_tools() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    registry.register(Box::new(a2a_call::A2aCallTool));
     registry.register(Box::new(update_core_memory::UpdateCoreMemoryTool));
     registry.register(Box::new(store_fact::StoreFactTool));
     registry.register(Box::new(search_memory::SearchMemoryTool));

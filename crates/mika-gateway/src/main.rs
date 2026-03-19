@@ -1,3 +1,5 @@
+mod a2a_auth;
+mod a2a_routes;
 pub mod openapi;
 mod routes;
 mod settings;
