@@ -365,8 +365,24 @@ async fn spawn_and_collect(
     if status.success() {
         ToolOutput::success(stdout.into_owned())
     } else {
-        let code = status.code().unwrap_or(-1);
-        let mut result = format!("Exit code: {code}\n");
+        let code_display = match status.code() {
+            Some(code) => format!("Exit code: {code}"),
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    match status.signal() {
+                        Some(sig) => format!("Killed by signal: {sig}"),
+                        None => "Exit code: unknown".to_string(),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    "Exit code: unknown".to_string()
+                }
+            }
+        };
+        let mut result = format!("{code_display}\n");
         if !stderr.is_empty() {
             result.push_str(&stderr);
         }

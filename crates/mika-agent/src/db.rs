@@ -2234,14 +2234,15 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn update_task_failed(&self, id: &str, agent_id: &str, error: &str) -> Result<()> {
-        self.conn.execute(
+    pub fn update_task_failed(&self, id: &str, agent_id: &str, error: &str) -> Result<bool> {
+        let rows = self.conn.execute(
             "UPDATE tasks SET status = 'failed', result = ?1,
              completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             WHERE id = ?2 AND agent_id = ?3",
+             WHERE id = ?2 AND agent_id = ?3
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'expired', 'delivered')",
             params![error, id, agent_id],
         )?;
-        Ok(())
+        Ok(rows > 0)
     }
 
     pub fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
@@ -6610,6 +6611,26 @@ mod tests {
         assert!(db.mark_task_delivered(&id).unwrap());
         // Second claim returns false (already delivered)
         assert!(!db.mark_task_delivered(&id).unwrap());
+    }
+
+    #[test]
+    fn test_update_task_failed_guards_terminal_states() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+
+        // Complete the task first
+        assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
+
+        // Attempting to fail an already-completed task should return Ok(false)
+        let updated = db
+            .update_task_failed(&id, "mika", "should not overwrite")
+            .unwrap();
+        assert!(!updated);
+
+        // Verify the task status is still 'completed' (not overwritten to 'failed')
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.result.as_deref(), Some("done"));
     }
 
     #[test]

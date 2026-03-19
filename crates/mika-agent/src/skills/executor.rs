@@ -654,11 +654,19 @@ fn spawn_long_running_exec(
             Ok(s) => s,
             Err(e) => {
                 warn!(task_id = %task_id, error = %e, "failed to wait on long-running exec");
-                if let Err(db_err) = db
+                match db
                     .update_task_failed(&task_id, &format!("wait failed: {e}"))
                     .await
                 {
-                    warn!(task_id = %task_id, error = %db_err, "failed to mark wait-failed task in DB");
+                    Ok(true) => {
+                        warn!(task_id = %task_id, error = %e, "long-running exec wait failed")
+                    }
+                    Ok(false) => {
+                        info!(task_id = %task_id, "long-running exec wait failed but task already in terminal state")
+                    }
+                    Err(db_err) => {
+                        warn!(task_id = %task_id, error = %db_err, "failed to mark wait-failed task in DB")
+                    }
                 }
                 return;
             }
@@ -675,14 +683,32 @@ fn spawn_long_running_exec(
                     .ok();
                 stderr_text = String::from_utf8_lossy(&buf).to_string();
             }
-            let exit_code = status.code().unwrap_or(-1);
-            let err_msg = format!(
-                "Process exited with code {exit_code}: {}",
-                truncate_output(&stderr_text)
-            );
-            warn!(task_id = %task_id, exit_code, "long-running exec failed");
-            if let Err(db_err) = db.update_task_failed(&task_id, &err_msg).await {
-                warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB");
+            let code_display = match status.code() {
+                Some(code) => format!("Exit code: {code}"),
+                None => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        match status.signal() {
+                            Some(sig) => format!("Killed by signal: {sig}"),
+                            None => "Exit code: unknown".to_string(),
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        "Exit code: unknown".to_string()
+                    }
+                }
+            };
+            let err_msg = format!("Process {code_display}: {}", truncate_output(&stderr_text));
+            match db.update_task_failed(&task_id, &err_msg).await {
+                Ok(true) => warn!(task_id = %task_id, %code_display, "long-running exec failed"),
+                Ok(false) => {
+                    info!(task_id = %task_id, %code_display, "long-running exec exited but task already in terminal state")
+                }
+                Err(db_err) => {
+                    warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB")
+                }
             }
         }
         // If success, the script called `mika ask --task-id` which completes the task.
@@ -1452,6 +1478,10 @@ mod tests {
             "expected 1 failed task, got {}",
             tasks.len()
         );
-        assert!(tasks[0].result.as_ref().unwrap().contains("exit"));
+        let result_text = tasks[0].result.as_ref().unwrap();
+        assert!(
+            result_text.contains("Exit code: 1"),
+            "expected 'Exit code: 1' in result, got: {result_text}"
+        );
     }
 }

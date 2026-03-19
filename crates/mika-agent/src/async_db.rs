@@ -257,7 +257,7 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn update_task_failed(&self, id: &str, error: &str) -> Result<()> {
+    pub async fn update_task_failed(&self, id: &str, error: &str) -> Result<bool> {
         let id = id.to_string();
         let error = error.to_string();
         let a = self.agent_id.clone();
