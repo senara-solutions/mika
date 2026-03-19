@@ -80,6 +80,29 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         };
 
         let path = dir_entry.path();
+
+        // Detect broken symlinks (linked skills whose target was removed)
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.file_type().is_symlink()
+            && !path.exists()
+        {
+            let target = std::fs::read_link(&path).ok();
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            warn!(
+                skill = dir_name,
+                target = ?target,
+                "Broken symlink for skill '{}': target no longer exists. \
+                 Reinstall or remove with 'mika skills uninstall {}'",
+                dir_name,
+                dir_name
+            );
+            skipped_count += 1;
+            continue;
+        }
+
         if !path.is_dir() {
             continue;
         }

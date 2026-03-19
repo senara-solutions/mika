@@ -40,8 +40,8 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Disable { name }) => {
             toggle_skill(&skills_dir, &name, false)?;
         }
-        Some(SkillsCommand::Install { source, name }) => {
-            install_skill(&agent_home, &skills_dir, &source, name.as_deref())?;
+        Some(SkillsCommand::Install { source, name, link }) => {
+            install_skill(&agent_home, &skills_dir, &source, name.as_deref(), link)?;
         }
         Some(SkillsCommand::Uninstall { name }) => {
             uninstall_skill(&agent_home, &skills_dir, &name)?;
@@ -75,8 +75,12 @@ fn list_skills(registry: &SkillRegistry, agent_home: &Path) {
         };
         let origin = if bundled_skills::is_bundled_skill(name) {
             " [built-in]"
-        } else if lock.skills.contains_key(name.as_str()) {
-            " [marketplace]"
+        } else if let Some(mp_entry) = lock.skills.get(name.as_str()) {
+            if mp_entry.linked {
+                " [marketplace/linked]"
+            } else {
+                " [marketplace]"
+            }
         } else {
             " [custom]"
         };
@@ -144,9 +148,15 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
             // Show marketplace metadata if applicable
             let lock = marketplace::read_lock(agent_home);
             if let Some(mp_entry) = lock.skills.get(&m.skill.name) {
-                println!("    Source:      {}", mp_entry.url);
-                println!("    Repo path:   {}", mp_entry.path);
-                println!("    Commit:      {}", mp_entry.commit);
+                if mp_entry.linked {
+                    println!("    Source:      {} (linked)", mp_entry.url);
+                } else if marketplace::is_local_source(mp_entry) {
+                    println!("    Source:      {} (local copy)", mp_entry.url);
+                } else {
+                    println!("    Source:      {}", mp_entry.url);
+                    println!("    Repo path:   {}", mp_entry.path);
+                    println!("    Commit:      {}", mp_entry.commit);
+                }
                 println!("    Installed:   {}", mp_entry.installed_at);
                 println!("    Updated:     {}", mp_entry.updated_at);
             }
@@ -335,35 +345,55 @@ fn install_skill(
     skills_dir: &Path,
     source: &str,
     alias: Option<&str>,
+    link: bool,
 ) -> Result<()> {
-    // Resolve URL
-    let url = git::resolve_url(source)?;
-    println!("\n  Installing from {url}...");
+    use mika_agent::skills::git::SourceKind;
 
-    // Check git is available
-    git::check_git()?;
+    // Resolve source (local path or git URL)
+    let source_kind = git::resolve_source(source)?;
 
-    // Clone to temp dir
-    let tmp = git::clone_to_temp(&url)?;
-
-    // Get commit hash
-    let commit = git::get_head_commit(tmp.path())?;
-
-    // Scan for skills
-    let candidates = marketplace::scan_repo_for_skills(tmp.path());
-    if candidates.is_empty() {
-        bail!("No valid skills found in repository. Ensure the repo contains a skill.toml file.");
+    // Reject --link with git sources
+    if link && let SourceKind::Git(url) = &source_kind {
+        bail!("--link requires a local path source (got: {url})");
     }
 
     // Ensure skills dir exists
     std::fs::create_dir_all(skills_dir)
         .with_context(|| format!("failed to create {}", skills_dir.display()))?;
 
-    // Select skill(s) to install
+    match source_kind {
+        SourceKind::Git(url) => {
+            install_from_git(agent_home, skills_dir, &url, alias)?;
+        }
+        SourceKind::Local(path) => {
+            install_from_local(agent_home, skills_dir, &path, alias, link)?;
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+fn install_from_git(
+    agent_home: &Path,
+    skills_dir: &Path,
+    url: &str,
+    alias: Option<&str>,
+) -> Result<()> {
+    println!("\n  Installing from {url}...");
+
+    git::check_git()?;
+    let tmp = git::clone_to_temp(url)?;
+    let commit = git::get_head_commit(tmp.path())?;
+
+    let candidates = marketplace::scan_repo_for_skills(tmp.path());
+    if candidates.is_empty() {
+        bail!("No valid skills found in repository. Ensure the repo contains a skill.toml file.");
+    }
+
     let selected = if candidates.len() == 1 {
         vec![&candidates[0]]
     } else {
-        // --name can only be used with a single skill
         if alias.is_some() {
             bail!(
                 "Multiple skills found in repo. --name can only be used when installing a single skill.\n\
@@ -379,14 +409,14 @@ fn install_skill(
     };
 
     if selected.is_empty() {
-        println!("  No skills selected.\n");
+        println!("  No skills selected.");
         return Ok(());
     }
 
     for candidate in &selected {
         if candidate.has_exec_handlers {
             println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
-            println!("  Review the source before use: {}", &url);
+            println!("  Review the source before use: {url}");
             if std::io::stdin().is_terminal() {
                 let confirm = dialoguer::Confirm::new()
                     .with_prompt("  Continue with installation?")
@@ -404,7 +434,7 @@ fn install_skill(
             skills_dir,
             candidate,
             if selected.len() == 1 { alias } else { None },
-            &url,
+            url,
             &commit,
         )?;
 
@@ -415,7 +445,101 @@ fn install_skill(
         );
     }
 
-    println!();
+    Ok(())
+}
+
+fn install_from_local(
+    agent_home: &Path,
+    skills_dir: &Path,
+    path: &Path,
+    alias: Option<&str>,
+    link: bool,
+) -> Result<()> {
+    let mode = if link { "linking" } else { "copying" };
+    println!("\n  Installing from {} ({mode})...", path.display());
+
+    let candidates = marketplace::scan_repo_for_skills(path);
+    if candidates.is_empty() {
+        bail!(
+            "No valid skills found at {}. Ensure the directory contains a skill.toml file.",
+            path.display()
+        );
+    }
+
+    let selected = if candidates.len() == 1 {
+        vec![&candidates[0]]
+    } else {
+        if alias.is_some() {
+            bail!(
+                "Multiple skills found. --name can only be used when installing a single skill.\n\
+                 Found skills: {}",
+                candidates
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        select_skills_interactive(&candidates)?
+    };
+
+    if selected.is_empty() {
+        println!("  No skills selected.");
+        return Ok(());
+    }
+
+    let file_url = format!("file://{}", path.display());
+
+    for candidate in &selected {
+        if candidate.has_exec_handlers {
+            println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
+            println!(
+                "  Review the source at: {}",
+                candidate.absolute_path.display()
+            );
+            if link {
+                println!("  NOTE: With --link, handler scripts can be modified at any time.");
+            }
+            if std::io::stdin().is_terminal() {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt("  Continue with installation?")
+                    .default(false)
+                    .interact()?;
+                if !confirm {
+                    println!("  Installation cancelled.");
+                    continue;
+                }
+            }
+        }
+
+        let install_alias = if selected.len() == 1 { alias } else { None };
+
+        let result = if link {
+            install::install_skill_linked(
+                agent_home,
+                skills_dir,
+                candidate,
+                install_alias,
+                &file_url,
+            )?
+        } else {
+            install::install_skill(
+                agent_home,
+                skills_dir,
+                candidate,
+                install_alias,
+                &file_url,
+                "",
+            )?
+        };
+
+        if result.linked {
+            println!("  Installed '{}' (linked)", result.name);
+        } else {
+            println!("  Installed '{}' (local copy)", result.name);
+        }
+    }
+
     Ok(())
 }
 
@@ -456,6 +580,8 @@ fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<(
 }
 
 fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Result<()> {
+    use mika_agent::skills::install::UpdateResult;
+
     let lock = marketplace::read_lock(agent_home);
 
     if lock.skills.is_empty() {
@@ -471,16 +597,27 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
             }
             println!("\n  Updating '{name}'...");
             match install::update_skill(agent_home, skills_dir, name)? {
-                Some(result) => {
-                    println!(
-                        "  {}: updated ({} -> {})",
-                        result.name,
-                        &result.old_commit[..12.min(result.old_commit.len())],
-                        &result.new_commit[..12.min(result.new_commit.len())]
-                    );
+                UpdateResult::Updated {
+                    name,
+                    old_commit,
+                    new_commit,
+                } => {
+                    if old_commit.is_empty() {
+                        // Local source — no commit hashes
+                        println!("  {name}: updated (re-copied from source).");
+                    } else if old_commit == new_commit {
+                        println!("  {name}: already up to date.");
+                    } else {
+                        println!(
+                            "  {}: updated ({} -> {})",
+                            name,
+                            &old_commit[..12.min(old_commit.len())],
+                            &new_commit[..12.min(new_commit.len())]
+                        );
+                    }
                 }
-                None => {
-                    println!("  {name}: already up to date.");
+                UpdateResult::LinkedNoOp { name } => {
+                    println!("  {name}: linked — source changes are always current.");
                 }
             }
         }
@@ -491,21 +628,33 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
 
             let mut updated = 0;
             let mut up_to_date = 0;
+            let mut linked_skipped = 0;
             let mut failed: Vec<(String, String)> = Vec::new();
 
             for skill_name in &names {
                 match install::update_skill(agent_home, skills_dir, skill_name) {
-                    Ok(Some(result)) => {
-                        println!(
-                            "  {}: updated ({} -> {})",
-                            result.name,
-                            &result.old_commit[..12.min(result.old_commit.len())],
-                            &result.new_commit[..12.min(result.new_commit.len())]
-                        );
-                        updated += 1;
+                    Ok(UpdateResult::Updated {
+                        ref name,
+                        ref old_commit,
+                        ref new_commit,
+                    }) => {
+                        if old_commit.is_empty() {
+                            println!("  {name}: updated (re-copied from source).");
+                            updated += 1;
+                        } else if old_commit == new_commit {
+                            up_to_date += 1;
+                        } else {
+                            println!(
+                                "  {}: updated ({} -> {})",
+                                name,
+                                &old_commit[..12.min(old_commit.len())],
+                                &new_commit[..12.min(new_commit.len())]
+                            );
+                            updated += 1;
+                        }
                     }
-                    Ok(None) => {
-                        up_to_date += 1;
+                    Ok(UpdateResult::LinkedNoOp { .. }) => {
+                        linked_skipped += 1;
                     }
                     Err(e) => {
                         println!("  {skill_name}: failed ({e})");
@@ -515,15 +664,11 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
             }
 
             println!();
-            if updated > 0 {
-                println!("  Updated {updated} skill(s).");
-            }
-            if up_to_date > 0 {
-                println!("  {up_to_date} skill(s) already up to date.");
-            }
-            if !failed.is_empty() {
-                println!("  {} skill(s) failed to update.", failed.len());
-            }
+            let total = names.len();
+            println!(
+                "  Updated {updated}/{total} skills. Linked (no-op): {linked_skipped}. Up to date: {up_to_date}. Failed: {}.",
+                failed.len()
+            );
         }
     }
 

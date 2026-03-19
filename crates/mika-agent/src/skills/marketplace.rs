@@ -20,12 +20,17 @@ pub struct MarketplaceLock {
 /// A single marketplace skill entry in the lock file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketplaceEntry {
-    /// Git clone URL (e.g. "https://github.com/user/repo.git").
+    /// Source URL: git clone URL (e.g. "https://github.com/user/repo.git")
+    /// or local path as file URI (e.g. "file:///abs/path/to/skill").
     pub url: String,
-    /// Path within the repo to the skill directory ("." for root-level skills).
+    /// Path within the repo to the skill directory ("." for root-level and local skills).
     pub path: String,
-    /// Pinned commit hash at install/update time.
+    /// Pinned commit hash at install/update time. Empty string for local sources.
     pub commit: String,
+    /// Whether this skill is a symlink to its source (live link mode).
+    /// Default `false` for backward compatibility with existing lock files.
+    #[serde(default)]
+    pub linked: bool,
     /// ISO 8601 timestamp of first install.
     pub installed_at: String,
     /// ISO 8601 timestamp of last update.
@@ -82,6 +87,22 @@ pub fn write_lock(agent_home: &Path, lock: &MarketplaceLock) -> anyhow::Result<(
 pub fn is_marketplace_skill(agent_home: &Path, name: &str) -> bool {
     let lock = read_lock(agent_home);
     lock.skills.contains_key(name)
+}
+
+/// Get the marketplace entry for a skill, if it exists.
+pub fn get_marketplace_entry(agent_home: &Path, name: &str) -> Option<MarketplaceEntry> {
+    let lock = read_lock(agent_home);
+    lock.skills.get(name).cloned()
+}
+
+/// Convert a `file://` URL back to a `PathBuf`.
+pub fn url_to_local_path(url: &str) -> Option<std::path::PathBuf> {
+    url.strip_prefix("file://").map(std::path::PathBuf::from)
+}
+
+/// Check if a marketplace entry represents a local source (file:// URL).
+pub fn is_local_source(entry: &MarketplaceEntry) -> bool {
+    entry.url.starts_with("file://")
 }
 
 /// A skill candidate discovered by scanning a cloned repository.
@@ -219,6 +240,7 @@ mod tests {
                 url: "https://github.com/user/mika-skill-web-scraper.git".to_string(),
                 path: ".".to_string(),
                 commit: "abc123def456".to_string(),
+                linked: false,
                 installed_at: "2026-03-02T10:30:00Z".to_string(),
                 updated_at: "2026-03-02T10:30:00Z".to_string(),
             },

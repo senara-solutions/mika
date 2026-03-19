@@ -1,3 +1,8 @@
+// READ-ONLY INVARIANT: Skills must never write to their own directory at runtime.
+// This is critical for `--link` mode where the skill directory is a symlink to the
+// author's source directory. Writing back would silently modify the author's source
+// files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
+
 use std::path::PathBuf;
 use std::time::Duration;
 

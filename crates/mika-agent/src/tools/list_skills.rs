@@ -6,7 +6,7 @@ use serde_json::Value;
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bundled_skills::is_bundled_skill;
 use crate::skills::SkillRegistry;
-use crate::skills::marketplace::is_marketplace_skill;
+use crate::skills::marketplace::get_marketplace_entry;
 
 pub struct ListSkillsTool;
 
@@ -66,8 +66,12 @@ impl Tool for ListSkillsTool {
             let name = &entry.manifest.skill.name;
             let origin = if is_bundled_skill(name) {
                 " [built-in]"
-            } else if is_marketplace_skill(ctx.home_dir, name) {
-                " [marketplace]"
+            } else if let Some(mp_entry) = get_marketplace_entry(ctx.home_dir, name) {
+                if mp_entry.linked {
+                    " [marketplace/linked]"
+                } else {
+                    " [marketplace]"
+                }
             } else {
                 " [custom]"
             };
