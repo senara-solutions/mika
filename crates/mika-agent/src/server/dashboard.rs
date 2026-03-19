@@ -587,6 +587,23 @@ pub async fn handle_task_detail(
     }
 }
 
+/// GET /api/v1/tasks/:id/children — child tasks of a parent.
+pub async fn handle_task_children(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_child_tasks(&task_id).await {
+        Ok(children) => Json(
+            children
+                .into_iter()
+                .map(TaskResponse::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 // ===== Team Runs List =====
 
 #[derive(Debug, Deserialize)]

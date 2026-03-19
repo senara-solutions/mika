@@ -52,3 +52,11 @@ export function useTask(taskId: string | undefined) {
     enabled: !!taskId,
   })
 }
+
+export function useTaskChildren(parentTaskId: string | undefined) {
+  return useQuery<TaskItem[]>({
+    queryKey: ['task-children', parentTaskId],
+    queryFn: () => apiFetch(`/tasks/${parentTaskId}/children`),
+    enabled: !!parentTaskId,
+  })
+}

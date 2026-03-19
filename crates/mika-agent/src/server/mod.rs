@@ -85,6 +85,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/tasks", get(dashboard::handle_tasks_list))
         .route("/tasks/{task_id}", get(dashboard::handle_task_detail))
+        .route(
+            "/tasks/{task_id}/children",
+            get(dashboard::handle_task_children),
+        )
         .route("/team-runs", get(dashboard::handle_team_runs_list))
         .route(
             "/team-runs/{run_id}",

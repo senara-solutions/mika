@@ -1,16 +1,19 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { useTasks, type TasksFilters } from '../api/tasks.ts'
+import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
 import { Pagination, EmptyState, TaskStatusBadge, formatRelativeTime } from '@senara-solutions/ui'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
-function TaskRow({ task }: { task: import('../api/tasks.ts').TaskItem }) {
+function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
   return (
     <tr className="hover:bg-white/[0.02] transition-colors">
       <td className="px-4 py-3">
         <TaskStatusBadge status={task.status} />
       </td>
       <td className="px-4 py-3 text-xs text-heading max-w-[300px] truncate">
+        {indent > 0 && (
+          <span style={{ paddingLeft: `${indent * 1.5}rem` }} className="inline-block" />
+        )}
         {task.label}
       </td>
       <td className="px-4 py-3">
@@ -54,6 +57,122 @@ function TaskRow({ task }: { task: import('../api/tasks.ts').TaskItem }) {
         {formatRelativeTime(task.updated_at)}
       </td>
     </tr>
+  )
+}
+
+function ChildTaskRows({ parentTaskId, indent }: { parentTaskId: string; indent: number }) {
+  const { data: children, isLoading } = useTaskChildren(parentTaskId)
+
+  if (isLoading) {
+    return (
+      <tr>
+        <td colSpan={7} className="px-4 py-2 text-xs text-muted/40" style={{ paddingLeft: `${indent * 1.5 + 1}rem` }}>
+          Loading...
+        </td>
+      </tr>
+    )
+  }
+
+  if (!children || children.length === 0) return null
+
+  return (
+    <>
+      {children.map((child) => (
+        <ExpandableTaskRow key={child.id} task={child} indent={indent} />
+      ))}
+    </>
+  )
+}
+
+function ExpandableTaskRow({
+  task,
+  indent = 0,
+  expandedIds,
+  onToggle,
+}: {
+  task: TaskItem
+  indent?: number
+  expandedIds?: Set<string>
+  onToggle?: (id: string) => void
+}) {
+  // When used recursively (from ChildTaskRows), manage own expanded state
+  const [localExpanded, setLocalExpanded] = useState(false)
+  const isExpanded = expandedIds ? expandedIds.has(task.id) : localExpanded
+  const toggle = () => {
+    if (onToggle) onToggle(task.id)
+    else setLocalExpanded((v) => !v)
+  }
+
+  const isRoot = task.depth === 0
+
+  return (
+    <>
+      <tr
+        className={`hover:bg-white/[0.02] transition-colors ${isRoot ? 'cursor-pointer' : ''}`}
+        onClick={isRoot ? toggle : undefined}
+      >
+        <td className="px-4 py-3">
+          <div className="flex items-center gap-1">
+            {isRoot && (
+              isExpanded
+                ? <ChevronDown size={12} className="text-muted/40 shrink-0" />
+                : <ChevronRight size={12} className="text-muted/40 shrink-0" />
+            )}
+            <TaskStatusBadge status={task.status} />
+          </div>
+        </td>
+        <td className="px-4 py-3 text-xs text-heading max-w-[300px] truncate">
+          {indent > 0 && (
+            <span style={{ paddingLeft: `${indent * 1.5}rem` }} className="inline-block" />
+          )}
+          {task.label}
+        </td>
+        <td className="px-4 py-3">
+          <Link
+            to={`/agents/${task.agent_id}`}
+            className="text-accent text-xs hover:text-accent-light transition-colors"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {task.agent_id}
+          </Link>
+        </td>
+        <td className="px-4 py-3">
+          {task.source && (
+            <span className="text-xs text-muted bg-white/[0.04] px-2 py-0.5 rounded-full">
+              {task.source}
+            </span>
+          )}
+        </td>
+        <td className="px-4 py-3">
+          {task.team_run_id ? (
+            <Link
+              to={`/team-runs/${task.team_run_id}`}
+              className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
+              onClick={(e) => e.stopPropagation()}
+            >
+              Team Run &rarr;
+            </Link>
+          ) : (
+            <span className="text-xs text-muted/40">&mdash;</span>
+          )}
+        </td>
+        <td className="px-4 py-3 text-xs text-muted/70">
+          {task.created_trace_id && (
+            <Link
+              to={`/traces/${task.created_trace_id}`}
+              className="text-accent font-mono hover:text-accent-light transition-colors"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {task.created_trace_id.slice(0, 12)}...
+            </Link>
+          )}
+        </td>
+        <td className="px-4 py-3 text-xs text-muted/70 font-mono">
+          {formatRelativeTime(task.updated_at)}
+        </td>
+      </tr>
+      {isExpanded && <ChildTaskRows parentTaskId={task.id} indent={indent + 1} />}
+    </>
   )
 }
 
@@ -120,8 +239,18 @@ function Section({
 
 function WorkItemsSection() {
   const [page, setPage] = useState(1)
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = { trigger_type: 'manual', page, per_page: 20 }
   const { data, isLoading, error } = useTasks(filters)
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   return (
     <Section title="Work Items" count={data?.total} defaultOpen={true}>
@@ -139,7 +268,12 @@ function WorkItemsSection() {
             headers={['Status', 'Title', 'Agent', 'Source', 'Team Run', 'Trace', 'Updated']}
           >
             {data.data.map((t) => (
-              <TaskRow key={t.id} task={t} />
+              <ExpandableTaskRow
+                key={t.id}
+                task={t}
+                expandedIds={expandedIds}
+                onToggle={toggleExpanded}
+              />
             ))}
           </TaskTable>
           <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
@@ -151,12 +285,22 @@ function WorkItemsSection() {
 
 function TeamRunTasksSection() {
   const [page, setPage] = useState(1)
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = {
     team_run_id: 'notnull',
     page,
     per_page: 20,
   }
   const { data, isLoading, error } = useTasks(filters)
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   return (
     <Section title="Team Run Tasks" count={data?.total} defaultOpen={true}>
@@ -174,50 +318,12 @@ function TeamRunTasksSection() {
             headers={['Status', 'Title', 'Agent', 'Action', 'Team Run', 'Trace', 'Updated']}
           >
             {data.data.map((t) => (
-              <tr key={t.id} className="hover:bg-white/[0.02] transition-colors">
-                <td className="px-4 py-3">
-                  <TaskStatusBadge status={t.status} />
-                </td>
-                <td className="px-4 py-3 text-xs text-heading max-w-[300px] truncate">
-                  {t.label}
-                </td>
-                <td className="px-4 py-3">
-                  <Link
-                    to={`/agents/${t.agent_id}`}
-                    className="text-accent text-xs hover:text-accent-light transition-colors"
-                  >
-                    {t.agent_id}
-                  </Link>
-                </td>
-                <td className="px-4 py-3">
-                  <span className="text-xs text-muted bg-white/[0.04] px-2 py-0.5 rounded-full">
-                    {t.action_type}
-                  </span>
-                </td>
-                <td className="px-4 py-3">
-                  {t.team_run_id && (
-                    <Link
-                      to={`/team-runs/${t.team_run_id}`}
-                      className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
-                    >
-                      {t.team_run_id.slice(0, 12)}...
-                    </Link>
-                  )}
-                </td>
-                <td className="px-4 py-3">
-                  {t.created_trace_id && (
-                    <Link
-                      to={`/traces/${t.created_trace_id}`}
-                      className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
-                    >
-                      {t.created_trace_id.slice(0, 12)}...
-                    </Link>
-                  )}
-                </td>
-                <td className="px-4 py-3 text-xs text-muted/70 font-mono">
-                  {formatRelativeTime(t.updated_at)}
-                </td>
-              </tr>
+              <ExpandableTaskRow
+                key={t.id}
+                task={t}
+                expandedIds={expandedIds}
+                onToggle={toggleExpanded}
+              />
             ))}
           </TaskTable>
           <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
