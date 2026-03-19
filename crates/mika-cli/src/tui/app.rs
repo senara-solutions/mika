@@ -1421,7 +1421,40 @@ impl<'a> App<'a> {
             }
         };
 
+        let stale_threshold =
+            chrono::Duration::minutes(mika_agent::agent::STALE_FAILED_CALLBACK_MINUTES);
+        let mut stale_skipped: usize = 0;
+
         for task in tasks {
+            let is_failed = task.status == "failed";
+
+            // Staleness guard: skip failed callbacks older than the threshold.
+            // Completed callbacks are always delivered — they may carry legitimate results.
+            if is_failed {
+                let is_stale = task
+                    .completed_at
+                    .as_deref()
+                    .is_some_and(|ts| mika_agent::timestamp::is_older_than(ts, stale_threshold));
+                if is_stale {
+                    // Silently mark as delivered without injecting into conversation
+                    match self.db.mark_task_delivered(&task.id).await {
+                        Ok(true) => {
+                            stale_skipped += 1;
+                            tracing::debug!(
+                                task_id = %task.id,
+                                label = %task.label,
+                                "skipped stale failed callback"
+                            );
+                        }
+                        Ok(false) => {} // already claimed
+                        Err(e) => {
+                            tracing::warn!(task_id = %task.id, "failed to mark stale task delivered: {e}");
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Atomically claim this task — prevents double-processing by multiple TUI instances
             match self.db.mark_task_delivered(&task.id).await {
                 Ok(true) => {}
@@ -1432,7 +1465,6 @@ impl<'a> App<'a> {
                 }
             }
 
-            let is_failed = task.status == "failed";
             let result = match task.result {
                 Some(r) if !r.is_empty() => r,
                 _ if is_failed => mika_agent::agent::FAILED_TASK_FALLBACK.to_string(),
@@ -1463,6 +1495,23 @@ impl<'a> App<'a> {
             self.needs_redraw = true;
             // Only inject one callback per tick to keep the agent responsive
             break;
+        }
+
+        // Show a single summary for skipped stale failures
+        if stale_skipped > 0 {
+            let noun = if stale_skipped == 1 { "task" } else { "tasks" };
+            self.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: format!(
+                    "Cleared {} stale failed {} (older than {} minutes)",
+                    stale_skipped,
+                    noun,
+                    mika_agent::agent::STALE_FAILED_CALLBACK_MINUTES
+                ),
+                rendered: None,
+                channel: None,
+            });
+            self.needs_redraw = true;
         }
     }
 

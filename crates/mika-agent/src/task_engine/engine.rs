@@ -328,7 +328,31 @@ impl TaskEngine {
             }
         };
 
+        let stale_threshold =
+            chrono::Duration::minutes(crate::agent::STALE_FAILED_CALLBACK_MINUTES);
+        let mut stale_skipped: usize = 0;
+
         for task in tasks {
+            // Staleness guard: skip failed callbacks older than the threshold.
+            // Completed callbacks are always delivered — they may carry legitimate results.
+            if task.status == "failed" {
+                let is_stale = task
+                    .completed_at
+                    .as_deref()
+                    .is_some_and(|ts| crate::timestamp::is_older_than(ts, stale_threshold));
+                if is_stale {
+                    if let Ok(true) = self.db.mark_task_delivered(&task.id).await {
+                        stale_skipped += 1;
+                        debug!(
+                            task_id = %task.id,
+                            label = %task.label,
+                            "skipped stale failed callback"
+                        );
+                    }
+                    continue;
+                }
+            }
+
             let dispatcher = self.dispatcher.clone();
             tokio::spawn(async move {
                 if let Err(e) = dispatcher.dispatch_resume_agent(&task).await {
@@ -338,6 +362,10 @@ impl TaskEngine {
                     }
                 }
             });
+        }
+
+        if stale_skipped > 0 {
+            info!(count = stale_skipped, "cleared stale failed callback tasks");
         }
     }
 
