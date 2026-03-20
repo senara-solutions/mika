@@ -103,7 +103,7 @@ fn a2a_state_to_task_status(state: &str) -> &'static str {
 }
 ```
 
-A2A messages are stored in the unified `messages` table with original `Part[]` arrays preserved in `metadata` JSON as `a2a_parts`.
+A2A messages are stored in the unified `messages` table via `run_agent`'s standard persistence (`save_message`/`save_message_with_metadata`). A2A-specific metadata (`a2a_message_id`, `a2a_parts`, `a2a_task_id`) is **not** preserved — only text content survives. This is acceptable while only text parts are supported. See [A2A Dual-Write Fix](../logic-errors/a2a-dual-write-duplicate-rows.md).
 
 #### Task State Machine
 
@@ -209,6 +209,7 @@ The `a2a_call` tool rejects: non-http/https schemes, localhost/127.0.0.1/::1, RF
 - `docs/solutions/architecture-patterns/trace-id-correlation-unified-observability.md` — Trace ID propagation across agent boundaries
 - `docs/solutions/integration-issues/multi-agent-telegram-delivery-and-reply-routing.md` — Related routing pattern for agent identification
 - `docs/solutions/security-issues/env-var-leakage-exec-handler-child-processes.md` — Relevant to SSRF/secret leakage concerns
+- `docs/solutions/logic-errors/a2a-dual-write-duplicate-rows.md` — Dual-write fix: removed handler-level `a2a_insert_message` calls, single persistence owner
 
 ### Code Review Findings
 17 findings in `todos/700-716`: 5 P1 (all resolved), 9 P2 (1 pending: #707 a2a_call not in system prompt), 3 P3 (2 pending: #713 SSE race, #716 API key in history).

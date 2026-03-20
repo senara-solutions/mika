@@ -217,15 +217,6 @@ async fn handle_message_send(
         }
     };
 
-    // Store the inbound message
-    if let Err(e) = agent_state
-        .db
-        .a2a_insert_message(&task_id, &params.message)
-        .await
-    {
-        error!(error = %e, "failed to insert A2A message");
-    }
-
     if return_immediately {
         // Return task in submitted state immediately
         match agent_state.db.a2a_build_task(&task_id, None).await {
@@ -258,27 +249,7 @@ async fn handle_message_send(
 
         // Run the real agent loop
         match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id).await {
-            Ok(response_text) => {
-                let text = response_text.unwrap_or_else(|| "Task completed.".to_string());
-                let response_message = Message {
-                    message_id: Uuid::new_v4().to_string(),
-                    role: Role::Agent,
-                    parts: vec![Part::Text {
-                        text,
-                        metadata: None,
-                    }],
-                    context_id: context_id.clone(),
-                    task_id: Some(task_id.clone()),
-                    metadata: None,
-                    reference_task_ids: None,
-                    extensions: None,
-                    kind: "message".to_string(),
-                };
-
-                let _ = agent_state
-                    .db
-                    .a2a_insert_message(&task_id, &response_message)
-                    .await;
+            Ok(_) => {
                 let _ = agent_state
                     .db
                     .a2a_update_task_state(&task_id, "completed")
@@ -373,15 +344,6 @@ async fn handle_message_stream(
         }
     };
 
-    // Store the inbound message
-    if let Err(e) = agent_state
-        .db
-        .a2a_insert_message(&task_id, &params.message)
-        .await
-    {
-        error!(error = %e, "failed to insert A2A message");
-    }
-
     // Create broadcast channel for this task
     let (tx, rx) = broadcast::channel::<StreamEvent>(32);
     let task_id_clone = task_id.clone();
@@ -445,10 +407,6 @@ async fn handle_message_stream(
                     kind: "message".to_string(),
                 };
 
-                let _ = agent_state_clone
-                    .db
-                    .a2a_insert_message(&task_id_clone, &response_message)
-                    .await;
                 let _ = agent_state_clone
                     .db
                     .a2a_update_task_state(&task_id_clone, "completed")
