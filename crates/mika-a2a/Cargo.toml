@@ -3,6 +3,13 @@ name = "mika-a2a"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+description = "A2A (Agent-to-Agent) protocol implementation for Mika"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 serde = { workspace = true }
