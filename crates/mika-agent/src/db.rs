@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -587,10 +587,6 @@ impl Database {
             self.migrate_v12_to_v13()?;
             info!(version = 13, "database migrated to v13");
         }
-        if (3..=13).contains(&version) {
-            self.migrate_v13_to_v14()?;
-            info!(version = 14, "database migrated to v14");
-        }
         Ok(())
     }
 
@@ -645,7 +641,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (14);
+            INSERT INTO schema_version (version) VALUES (13);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1925,73 +1921,7 @@ impl Database {
     }
 
     fn migrate_v12_to_v13(&self) -> Result<()> {
-        info!("migrating database schema v12 → v13 (A2A protocol tables)");
-
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-
-        let result = (|| -> Result<()> {
-            self.conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS a2a_tasks (
-                    id TEXT PRIMARY KEY,
-                    context_id TEXT,
-                    state TEXT NOT NULL DEFAULT 'submitted',
-                    metadata TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-
-                CREATE TABLE IF NOT EXISTS a2a_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
-                    message_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    parts TEXT NOT NULL,
-                    metadata TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-
-                CREATE TABLE IF NOT EXISTS a2a_artifacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
-                    artifact_id TEXT NOT NULL,
-                    name TEXT,
-                    description TEXT,
-                    parts TEXT NOT NULL,
-                    metadata TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-
-                CREATE TABLE IF NOT EXISTS a2a_push_notification_configs (
-                    id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
-                    url TEXT NOT NULL,
-                    token TEXT,
-                    auth_scheme TEXT,
-                    auth_credentials TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );",
-            )?;
-
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (13)", [])?;
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
-    }
-
-    fn migrate_v13_to_v14(&self) -> Result<()> {
-        info!("migrating database schema v13 → v14 (A2A orthogonal persistence)");
+        info!("migrating database schema v12 → v13 (A2A orthogonal persistence)");
 
         self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
@@ -2065,14 +1995,6 @@ impl Database {
                     WHERE status IN ('pending', 'in_progress', 'recurring_active')
                     AND action_type = 'send_message';")?;
 
-            // Drop redundant A2A tables (stub data only — no production data to preserve)
-            self.conn.execute_batch(
-                "DROP TABLE IF EXISTS a2a_messages;
-                 DROP TABLE IF EXISTS a2a_push_notification_configs;
-                 DROP TABLE IF EXISTS a2a_artifacts;
-                 DROP TABLE IF EXISTS a2a_tasks;",
-            )?;
-
             // Create thin mapping table
             self.conn.execute_batch(
                 "CREATE TABLE a2a_task_map (
@@ -2085,7 +2007,7 @@ impl Database {
                 CREATE INDEX idx_a2a_task_map_task ON a2a_task_map(task_id);",
             )?;
 
-            // Recreate genuinely new A2A tables with FK to mapping table
+            // Create A2A tables with FK to mapping table
             self.conn.execute_batch(
                 "CREATE TABLE a2a_artifacts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2114,7 +2036,7 @@ impl Database {
             self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
             self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (14)", [])?;
+                .execute("INSERT INTO schema_version (version) VALUES (13)", [])?;
 
             Ok(())
         })();
@@ -7067,9 +6989,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_14() {
+    fn test_schema_version_is_13() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 14);
+        assert_eq!(db.schema_version().unwrap(), 13);
     }
 
     #[test]
