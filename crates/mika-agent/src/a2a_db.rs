@@ -7,107 +7,283 @@ use mika_a2a::types::{
 use crate::db::Database;
 use crate::timestamp;
 
-impl Database {
-    // === A2A Tasks ===
+/// Map A2A state strings to internal task status values.
+fn a2a_state_to_task_status(state: &str) -> &'static str {
+    match state {
+        "submitted" => "pending",
+        "working" => "in_progress",
+        "completed" => "completed",
+        "failed" => "failed",
+        "canceled" => "cancelled",
+        _ => "pending",
+    }
+}
 
-    pub fn a2a_create_task(&self, id: &str, context_id: Option<&str>) -> Result<()> {
+/// Map internal task status to A2A state strings.
+fn task_status_to_a2a_state(status: &str) -> &'static str {
+    match status {
+        "pending" => "submitted",
+        "in_progress" => "working",
+        "completed" | "delivered" => "completed",
+        "failed" | "expired" => "failed",
+        "cancelled" => "canceled",
+        "blocked" => "working",
+        _ => "submitted",
+    }
+}
+
+/// Extract text content from A2A message parts.
+fn extract_text_from_parts(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl Database {
+    // === A2A Tasks (via tasks + a2a_task_map) ===
+
+    /// Create an A2A task: inserts into `tasks`, `sessions`, and `a2a_task_map`.
+    /// Returns the session_id for use with the agent loop.
+    pub fn a2a_create_task(
+        &self,
+        a2a_task_id: &str,
+        agent_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<String> {
         let now = timestamp::now();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = format!("a2a-{a2a_task_id}");
+
+        // Create session for this A2A interaction
         self.conn.execute(
-            "INSERT INTO a2a_tasks (id, context_id, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![id, context_id, "submitted", &now, &now],
+            "INSERT INTO sessions (id, agent_id, channel_type) VALUES (?1, ?2, 'a2a')",
+            rusqlite::params![&session_id, agent_id],
         )?;
-        Ok(())
+
+        // Create task row in the unified tasks table
+        self.conn.execute(
+            "INSERT INTO tasks (id, agent_id, label, trigger_type, action_type, status,
+                created_by_session, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'a2a', 'resume_agent', 'pending', ?4, ?5, ?5)",
+            rusqlite::params![
+                &task_id,
+                agent_id,
+                format!("A2A task {a2a_task_id}"),
+                &session_id,
+                &now,
+            ],
+        )?;
+
+        // Create mapping row
+        self.conn.execute(
+            "INSERT INTO a2a_task_map (a2a_task_id, task_id, session_id, context_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![a2a_task_id, &task_id, &session_id, context_id, &now],
+        )?;
+
+        Ok(session_id)
     }
 
-    pub fn a2a_get_task_state(&self, id: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT state FROM a2a_tasks WHERE id = ?1")?;
-        let result = stmt.query_row(rusqlite::params![id], |row| row.get::<_, String>(0));
+    /// Get the A2A state for a task (maps internal status to A2A state).
+    pub fn a2a_get_task_state(&self, a2a_task_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.status FROM tasks t
+             JOIN a2a_task_map m ON m.task_id = t.id
+             WHERE m.a2a_task_id = ?1",
+        )?;
+        let result = stmt.query_row(rusqlite::params![a2a_task_id], |row| {
+            row.get::<_, String>(0)
+        });
         match result {
-            Ok(state) => Ok(Some(state)),
+            Ok(status) => Ok(Some(task_status_to_a2a_state(&status).to_string())),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn a2a_update_task_state(&self, id: &str, state: &str) -> Result<()> {
+    /// Update an A2A task's state (maps A2A state to internal status).
+    pub fn a2a_update_task_state(&self, a2a_task_id: &str, a2a_state: &str) -> Result<()> {
+        let internal_status = a2a_state_to_task_status(a2a_state);
         let now = timestamp::now();
+
+        let completed_at = if internal_status == "completed"
+            || internal_status == "failed"
+            || internal_status == "cancelled"
+        {
+            Some(&now)
+        } else {
+            None
+        };
+
         let rows = self.conn.execute(
-            "UPDATE a2a_tasks SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![state, &now, id],
+            "UPDATE tasks SET status = ?1, updated_at = ?2, completed_at = ?3
+             WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?4)",
+            rusqlite::params![internal_status, &now, completed_at, a2a_task_id],
         )?;
         if rows == 0 {
-            anyhow::bail!("a2a task not found: {id}");
+            anyhow::bail!("a2a task not found: {a2a_task_id}");
         }
         Ok(())
     }
 
-    pub fn a2a_update_task_metadata(&self, id: &str, metadata: Option<&str>) -> Result<()> {
+    /// Update A2A task metadata (stored in the tasks.result column as JSON).
+    pub fn a2a_update_task_metadata(
+        &self,
+        a2a_task_id: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
         let now = timestamp::now();
         self.conn.execute(
-            "UPDATE a2a_tasks SET metadata = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![metadata, &now, id],
+            "UPDATE tasks SET result = ?1, updated_at = ?2
+             WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?3)",
+            rusqlite::params![metadata, &now, a2a_task_id],
         )?;
         Ok(())
     }
 
-    // === A2A Messages ===
+    // === A2A Messages (via messages table) ===
 
-    pub fn a2a_insert_message(&self, task_id: &str, message: &Message) -> Result<()> {
-        let now = timestamp::now();
-        let parts_json = serde_json::to_string(&message.parts)?;
-        let metadata_json = message
-            .metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
+    /// Insert an A2A message into the unified messages table.
+    pub fn a2a_insert_message(
+        &self,
+        a2a_task_id: &str,
+        agent_id: &str,
+        message: &Message,
+    ) -> Result<()> {
+        // Look up the session_id from the mapping
+        let session_id: String = self.conn.query_row(
+            "SELECT session_id FROM a2a_task_map WHERE a2a_task_id = ?1",
+            rusqlite::params![a2a_task_id],
+            |row| row.get(0),
+        )?;
+
+        // Map A2A role to Mika role
         let role = match message.role {
             mika_a2a::types::Role::User => "user",
-            mika_a2a::types::Role::Agent => "agent",
+            mika_a2a::types::Role::Agent => "assistant",
         };
+
+        // Extract text content for the content column
+        let content = extract_text_from_parts(&message.parts);
+
+        // Store original A2A parts + message metadata in the metadata column
+        let a2a_meta = serde_json::json!({
+            "a2a_message_id": message.message_id,
+            "a2a_parts": message.parts,
+            "a2a_metadata": message.metadata,
+            "a2a_task_id": a2a_task_id,
+        });
+        let metadata_str = serde_json::to_string(&a2a_meta)?;
+
         self.conn.execute(
-            "INSERT INTO a2a_messages (task_id, message_id, role, parts, metadata, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![task_id, &message.message_id, role, &parts_json, &metadata_json, &now],
+            "INSERT INTO messages (session_id, agent_id, role, content, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![&session_id, agent_id, role, &content, &metadata_str],
         )?;
         Ok(())
     }
 
-    pub fn a2a_get_messages(&self, task_id: &str, limit: Option<i32>) -> Result<Vec<Message>> {
+    /// Get A2A messages for a task by reading from the messages table.
+    pub fn a2a_get_messages(&self, a2a_task_id: &str, limit: Option<i32>) -> Result<Vec<Message>> {
+        // Look up the session_id
+        let session_id: String = match self.conn.query_row(
+            "SELECT session_id FROM a2a_task_map WHERE a2a_task_id = ?1",
+            rusqlite::params![a2a_task_id],
+            |row| row.get(0),
+        ) {
+            Ok(sid) => sid,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
         let sql = match limit {
             Some(n) => format!(
-                "SELECT message_id, role, parts, metadata FROM a2a_messages WHERE task_id = ?1 ORDER BY id ASC LIMIT {n}"
+                "SELECT role, content, metadata FROM messages
+                 WHERE session_id = ?1 AND role IN ('user', 'assistant')
+                 ORDER BY id ASC LIMIT {n}"
             ),
-            None => "SELECT message_id, role, parts, metadata FROM a2a_messages WHERE task_id = ?1 ORDER BY id ASC".to_string(),
+            None => "SELECT role, content, metadata FROM messages
+                     WHERE session_id = ?1 AND role IN ('user', 'assistant')
+                     ORDER BY id ASC"
+                .to_string(),
         };
+
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![task_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![&session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(2)?,
             ))
         })?;
 
         let mut messages = Vec::new();
         for row in rows {
-            let (message_id, role, parts_json, metadata_json) = row?;
-            let role = match role.as_str() {
-                "agent" => mika_a2a::types::Role::Agent,
+            let (role_str, content, metadata_json) = row?;
+
+            let role = match role_str.as_str() {
+                "assistant" => mika_a2a::types::Role::Agent,
                 _ => mika_a2a::types::Role::User,
             };
-            let parts: Vec<Part> = serde_json::from_str(&parts_json)?;
-            let metadata = metadata_json
-                .map(|m| serde_json::from_str(&m))
-                .transpose()?;
+
+            // Try to recover original A2A parts from metadata, fall back to text part
+            let (message_id, parts, a2a_metadata) = if let Some(ref meta_str) = metadata_json {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                    let mid = meta
+                        .get("a2a_message_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let p = meta
+                        .get("a2a_parts")
+                        .and_then(|v| serde_json::from_value::<Vec<Part>>(v.clone()).ok())
+                        .unwrap_or_else(|| {
+                            vec![Part::Text {
+                                text: content.clone(),
+                                metadata: None,
+                            }]
+                        });
+                    let am = meta.get("a2a_metadata").and_then(|v| {
+                        if v.is_null() {
+                            None
+                        } else {
+                            serde_json::from_value(v.clone()).ok()
+                        }
+                    });
+                    (mid, p, am)
+                } else {
+                    (
+                        String::new(),
+                        vec![Part::Text {
+                            text: content,
+                            metadata: None,
+                        }],
+                        None,
+                    )
+                }
+            } else {
+                (
+                    String::new(),
+                    vec![Part::Text {
+                        text: content,
+                        metadata: None,
+                    }],
+                    None,
+                )
+            };
+
             messages.push(Message {
                 message_id,
                 role,
                 parts,
                 context_id: None,
-                task_id: Some(task_id.to_string()),
-                metadata,
+                task_id: Some(a2a_task_id.to_string()),
+                metadata: a2a_metadata,
                 reference_task_ids: None,
                 extensions: None,
                 kind: "message".to_string(),
@@ -116,9 +292,9 @@ impl Database {
         Ok(messages)
     }
 
-    // === A2A Artifacts ===
+    // === A2A Artifacts (genuinely new — kept as-is) ===
 
-    pub fn a2a_insert_artifact(&self, task_id: &str, artifact: &Artifact) -> Result<()> {
+    pub fn a2a_insert_artifact(&self, a2a_task_id: &str, artifact: &Artifact) -> Result<()> {
         let now = timestamp::now();
         let parts_json = serde_json::to_string(&artifact.parts)?;
         let metadata_json = artifact
@@ -128,16 +304,16 @@ impl Database {
             .transpose()?;
         self.conn.execute(
             "INSERT OR REPLACE INTO a2a_artifacts (task_id, artifact_id, name, description, parts, metadata, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![task_id, &artifact.artifact_id, &artifact.name, &artifact.description, &parts_json, &metadata_json, &now],
+            rusqlite::params![a2a_task_id, &artifact.artifact_id, &artifact.name, &artifact.description, &parts_json, &metadata_json, &now],
         )?;
         Ok(())
     }
 
-    pub fn a2a_get_artifacts(&self, task_id: &str) -> Result<Vec<Artifact>> {
+    pub fn a2a_get_artifacts(&self, a2a_task_id: &str) -> Result<Vec<Artifact>> {
         let mut stmt = self.conn.prepare(
             "SELECT artifact_id, name, description, parts, metadata FROM a2a_artifacts WHERE task_id = ?1 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(rusqlite::params![task_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![a2a_task_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -166,7 +342,7 @@ impl Database {
         Ok(artifacts)
     }
 
-    // === A2A Push Notification Configs ===
+    // === A2A Push Notification Configs (genuinely new — kept as-is) ===
 
     pub fn a2a_set_push_config(&self, config: &TaskPushNotificationConfig) -> Result<()> {
         let now = timestamp::now();
@@ -217,11 +393,14 @@ impl Database {
         }
     }
 
-    pub fn a2a_list_push_configs(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>> {
+    pub fn a2a_list_push_configs(
+        &self,
+        a2a_task_id: &str,
+    ) -> Result<Vec<TaskPushNotificationConfig>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, url, token, auth_scheme, auth_credentials FROM a2a_push_notification_configs WHERE task_id = ?1",
         )?;
-        let rows = stmt.query_map(rusqlite::params![task_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![a2a_task_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -263,26 +442,39 @@ impl Database {
 
     // === A2A Task Assembly ===
 
-    /// Build a complete A2A Task from the database tables.
-    pub fn a2a_build_task(&self, id: &str, history_length: Option<i32>) -> Result<Option<Task>> {
-        let state_opt = self.a2a_get_task_state(id)?;
-        let state_str = match state_opt {
-            Some(s) => s,
-            None => return Ok(None),
+    /// Build a complete A2A Task from the unified tables.
+    pub fn a2a_build_task(
+        &self,
+        a2a_task_id: &str,
+        history_length: Option<i32>,
+    ) -> Result<Option<Task>> {
+        // Look up mapping + task status
+        let mut stmt = self.conn.prepare(
+            "SELECT t.status, m.context_id, t.result, t.updated_at
+             FROM a2a_task_map m
+             JOIN tasks t ON t.id = m.task_id
+             WHERE m.a2a_task_id = ?1",
+        )?;
+        let row = match stmt.query_row(rusqlite::params![a2a_task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
+        let (status, context_id, metadata_json, updated_at) = row;
 
-        let state: TaskState = serde_json::from_value(serde_json::Value::String(state_str))?;
-        let messages = self.a2a_get_messages(id, history_length)?;
-        let artifacts = self.a2a_get_artifacts(id)?;
+        let a2a_state_str = task_status_to_a2a_state(&status);
+        let state: TaskState =
+            serde_json::from_value(serde_json::Value::String(a2a_state_str.to_string()))?;
 
-        // Get context_id and metadata from a2a_tasks
-        let mut stmt = self
-            .conn
-            .prepare("SELECT context_id, metadata, updated_at FROM a2a_tasks WHERE id = ?1")?;
-        let (context_id, metadata_json, updated_at): (Option<String>, Option<String>, String) =
-            stmt.query_row(rusqlite::params![id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+        let messages = self.a2a_get_messages(a2a_task_id, history_length)?;
+        let artifacts = self.a2a_get_artifacts(a2a_task_id)?;
 
         let metadata = metadata_json
             .map(|m| serde_json::from_str(&m))
@@ -301,7 +493,7 @@ impl Database {
         };
 
         Ok(Some(Task {
-            id: id.to_string(),
+            id: a2a_task_id.to_string(),
             context_id,
             status,
             artifacts: if artifacts.is_empty() {
@@ -317,6 +509,21 @@ impl Database {
             metadata,
             kind: "task".to_string(),
         }))
+    }
+
+    /// Get the session_id for an A2A task (for use with the agent loop).
+    pub fn a2a_get_session_id(&self, a2a_task_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id FROM a2a_task_map WHERE a2a_task_id = ?1")?;
+        let result = stmt.query_row(rusqlite::params![a2a_task_id], |row| {
+            row.get::<_, String>(0)
+        });
+        match result {
+            Ok(sid) => Ok(Some(sid)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -349,7 +556,7 @@ mod tests {
     #[test]
     fn create_and_get_task_state() {
         let db = db();
-        db.a2a_create_task("t1", Some("ctx-1")).unwrap();
+        db.a2a_create_task("t1", "mika", Some("ctx-1")).unwrap();
         let state = db.a2a_get_task_state("t1").unwrap();
         assert_eq!(state, Some("submitted".to_string()));
     }
@@ -364,15 +571,50 @@ mod tests {
     #[test]
     fn create_task_without_context() {
         let db = db();
-        db.a2a_create_task("t2", None).unwrap();
+        db.a2a_create_task("t2", "mika", None).unwrap();
         let state = db.a2a_get_task_state("t2").unwrap();
         assert_eq!(state, Some("submitted".to_string()));
     }
 
     #[test]
+    fn create_task_creates_internal_task_row() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None).unwrap();
+
+        // Verify a row exists in the tasks table with trigger_type='a2a'
+        let mut stmt = db
+            .conn
+            .prepare("SELECT trigger_type, action_type, status FROM tasks WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = 't1')")
+            .unwrap();
+        let (trigger, action, status): (String, String, String) = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        assert_eq!(trigger, "a2a");
+        assert_eq!(action, "resume_agent");
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn create_task_creates_session() {
+        let db = db();
+        let session_id = db.a2a_create_task("t1", "mika", None).unwrap();
+
+        // Verify the session exists with channel_type='a2a'
+        let channel: String = db
+            .conn
+            .query_row(
+                "SELECT channel_type FROM sessions WHERE id = ?1",
+                rusqlite::params![&session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(channel, "a2a");
+    }
+
+    #[test]
     fn update_task_state() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
         db.a2a_update_task_state("t1", "working").unwrap();
         let state = db.a2a_get_task_state("t1").unwrap();
         assert_eq!(state, Some("working".to_string()));
@@ -392,13 +634,13 @@ mod tests {
     #[test]
     fn insert_and_retrieve_messages() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let msg1 = make_message("m1", mika_a2a::types::Role::User, "hello");
         let msg2 = make_message("m2", mika_a2a::types::Role::Agent, "hi there");
 
-        db.a2a_insert_message("t1", &msg1).unwrap();
-        db.a2a_insert_message("t1", &msg2).unwrap();
+        db.a2a_insert_message("t1", "mika", &msg1).unwrap();
+        db.a2a_insert_message("t1", "mika", &msg2).unwrap();
 
         let messages = db.a2a_get_messages("t1", None).unwrap();
         assert_eq!(messages.len(), 2);
@@ -416,9 +658,29 @@ mod tests {
     }
 
     #[test]
+    fn messages_stored_in_unified_messages_table() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None).unwrap();
+
+        let msg = make_message("m1", mika_a2a::types::Role::User, "hello");
+        db.a2a_insert_message("t1", "mika", &msg).unwrap();
+
+        // Verify the message is in the messages table
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'a2a-t1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn get_messages_with_limit() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         for i in 0..5 {
             let msg = make_message(
@@ -426,7 +688,7 @@ mod tests {
                 mika_a2a::types::Role::User,
                 &format!("msg {i}"),
             );
-            db.a2a_insert_message("t1", &msg).unwrap();
+            db.a2a_insert_message("t1", "mika", &msg).unwrap();
         }
 
         let messages = db.a2a_get_messages("t1", Some(3)).unwrap();
@@ -438,7 +700,7 @@ mod tests {
     #[test]
     fn get_messages_empty() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
         let messages = db.a2a_get_messages("t1", None).unwrap();
         assert!(messages.is_empty());
     }
@@ -446,7 +708,7 @@ mod tests {
     #[test]
     fn insert_and_retrieve_artifacts() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let artifact = Artifact {
             artifact_id: "a1".to_string(),
@@ -471,7 +733,7 @@ mod tests {
     #[test]
     fn get_artifacts_empty() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
         let artifacts = db.a2a_get_artifacts("t1").unwrap();
         assert!(artifacts.is_empty());
     }
@@ -479,7 +741,7 @@ mod tests {
     #[test]
     fn multiple_artifacts_for_task() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let artifact1 = Artifact {
             artifact_id: "a1".to_string(),
@@ -515,7 +777,7 @@ mod tests {
     #[test]
     fn set_get_push_config() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let config = TaskPushNotificationConfig {
             id: "cfg-1".to_string(),
@@ -549,7 +811,7 @@ mod tests {
     #[test]
     fn set_push_config_no_auth() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let config = TaskPushNotificationConfig {
             id: "cfg-2".to_string(),
@@ -568,7 +830,7 @@ mod tests {
     #[test]
     fn list_push_configs() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         for i in 0..3 {
             let config = TaskPushNotificationConfig {
@@ -588,7 +850,7 @@ mod tests {
     #[test]
     fn list_push_configs_empty() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
         let configs = db.a2a_list_push_configs("t1").unwrap();
         assert!(configs.is_empty());
     }
@@ -596,7 +858,7 @@ mod tests {
     #[test]
     fn delete_push_config() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let config = TaskPushNotificationConfig {
             id: "cfg-1".to_string(),
@@ -624,10 +886,10 @@ mod tests {
     #[test]
     fn build_task_basic() {
         let db = db();
-        db.a2a_create_task("t1", Some("ctx-1")).unwrap();
+        db.a2a_create_task("t1", "mika", Some("ctx-1")).unwrap();
 
         let msg = make_message("m1", mika_a2a::types::Role::User, "request");
-        db.a2a_insert_message("t1", &msg).unwrap();
+        db.a2a_insert_message("t1", "mika", &msg).unwrap();
 
         let task = db.a2a_build_task("t1", None).unwrap().unwrap();
         assert_eq!(task.id, "t1");
@@ -650,7 +912,7 @@ mod tests {
     #[test]
     fn build_task_with_artifacts() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
         db.a2a_update_task_state("t1", "completed").unwrap();
 
         let artifact = Artifact {
@@ -676,12 +938,12 @@ mod tests {
     #[test]
     fn build_task_status_has_last_agent_message() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let user_msg = make_message("m1", mika_a2a::types::Role::User, "request");
         let agent_msg = make_message("m2", mika_a2a::types::Role::Agent, "response");
-        db.a2a_insert_message("t1", &user_msg).unwrap();
-        db.a2a_insert_message("t1", &agent_msg).unwrap();
+        db.a2a_insert_message("t1", "mika", &user_msg).unwrap();
+        db.a2a_insert_message("t1", "mika", &agent_msg).unwrap();
 
         let task = db.a2a_build_task("t1", None).unwrap().unwrap();
         let status_msg = task.status.message.unwrap();
@@ -692,7 +954,7 @@ mod tests {
     #[test]
     fn build_task_with_history_length() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         for i in 0..5 {
             let msg = make_message(
@@ -700,7 +962,7 @@ mod tests {
                 mika_a2a::types::Role::User,
                 &format!("msg {i}"),
             );
-            db.a2a_insert_message("t1", &msg).unwrap();
+            db.a2a_insert_message("t1", "mika", &msg).unwrap();
         }
 
         let task = db.a2a_build_task("t1", Some(2)).unwrap().unwrap();
@@ -711,7 +973,7 @@ mod tests {
     #[test]
     fn build_task_empty_history_and_artifacts_are_none() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let task = db.a2a_build_task("t1", None).unwrap().unwrap();
         assert!(task.history.is_none());
@@ -721,7 +983,7 @@ mod tests {
     #[test]
     fn update_task_metadata() {
         let db = db();
-        db.a2a_create_task("t1", None).unwrap();
+        db.a2a_create_task("t1", "mika", None).unwrap();
 
         let meta = r#"{"key":"value"}"#;
         db.a2a_update_task_metadata("t1", Some(meta)).unwrap();
@@ -729,5 +991,57 @@ mod tests {
         let task = db.a2a_build_task("t1", None).unwrap().unwrap();
         let metadata = task.metadata.unwrap();
         assert_eq!(metadata["key"], serde_json::json!("value"));
+    }
+
+    #[test]
+    fn a2a_task_visible_in_unified_timeline() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None).unwrap();
+
+        // Verify the task appears in unified_timeline via the tasks leg
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM unified_timeline WHERE event_type = 'task' AND summary LIKE '%A2A task t1%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a2a_messages_visible_in_unified_timeline() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None).unwrap();
+
+        let msg = make_message("m1", mika_a2a::types::Role::User, "hello from a2a");
+        db.a2a_insert_message("t1", "mika", &msg).unwrap();
+
+        // Verify the message appears in unified_timeline via the messages leg
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM unified_timeline WHERE event_type = 'message' AND summary LIKE '%hello from a2a%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn get_session_id() {
+        let db = db();
+        let session_id = db.a2a_create_task("t1", "mika", None).unwrap();
+        let retrieved = db.a2a_get_session_id("t1").unwrap().unwrap();
+        assert_eq!(session_id, retrieved);
+    }
+
+    #[test]
+    fn get_session_id_nonexistent() {
+        let db = db();
+        let result = db.a2a_get_session_id("nonexistent").unwrap();
+        assert!(result.is_none());
     }
 }

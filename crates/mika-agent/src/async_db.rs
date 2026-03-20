@@ -1531,9 +1531,19 @@ impl AsyncDatabase {
 
     // -- A2A Protocol --
 
-    pub async fn a2a_create_task(&self, id: &str, context_id: Option<&str>) -> Result<()> {
-        let (i, c) = (id.to_owned(), context_id.map(|s| s.to_owned()));
-        self.with_db(move |db| db.a2a_create_task(&i, c.as_deref()))
+    /// Create an A2A task (creates entries in tasks, sessions, and a2a_task_map).
+    /// Returns the session_id for use with the agent loop.
+    pub async fn a2a_create_task(
+        &self,
+        a2a_task_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<String> {
+        let (i, a, c) = (
+            a2a_task_id.to_owned(),
+            self.agent_id.clone(),
+            context_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.a2a_create_task(&i, &a, c.as_deref()))
             .await
     }
 
@@ -1550,11 +1560,16 @@ impl AsyncDatabase {
 
     pub async fn a2a_insert_message(
         &self,
-        task_id: &str,
+        a2a_task_id: &str,
         message: &mika_a2a::types::Message,
     ) -> Result<()> {
-        let (t, m) = (task_id.to_owned(), message.clone());
-        self.with_db(move |db| db.a2a_insert_message(&t, &m)).await
+        let (t, a, m) = (
+            a2a_task_id.to_owned(),
+            self.agent_id.clone(),
+            message.clone(),
+        );
+        self.with_db(move |db| db.a2a_insert_message(&t, &a, &m))
+            .await
     }
 
     pub async fn a2a_build_task(
@@ -1565,6 +1580,11 @@ impl AsyncDatabase {
         let i = id.to_owned();
         self.with_db(move |db| db.a2a_build_task(&i, history_length))
             .await
+    }
+
+    pub async fn a2a_get_session_id(&self, a2a_task_id: &str) -> Result<Option<String>> {
+        let i = a2a_task_id.to_owned();
+        self.with_db(move |db| db.a2a_get_session_id(&i)).await
     }
 
     pub async fn a2a_set_push_config(

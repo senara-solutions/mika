@@ -1,12 +1,13 @@
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::broadcast;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use mika_a2a::jsonrpc::{
@@ -19,6 +20,7 @@ use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
 use mika_a2a::types::{Message, Part, Role, TaskState, TaskStatus};
 
 use crate::a2a_card::build_agent_card;
+use crate::agent::{self, AgentParams, check_onboarding};
 use crate::server::state::{AgentState, AppState};
 
 /// Handle A2A JSON-RPC POST requests.
@@ -88,9 +90,67 @@ pub async fn handle_a2a_jsonrpc(
     }
 }
 
-/// Handle `message/send` — synchronous message processing.
+/// Run the agent loop for an A2A request, similar to handle_message.
+async fn run_a2a_agent(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    session_id: &str,
+    input_text: &str,
+    task_id: &str,
+) -> Result<Option<String>, String> {
+    // Hot-reload skills if dirty
+    let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
+        agent_state.skills_dirty.store(false, Ordering::Release);
+        let mut registry =
+            crate::skills::SkillRegistry::from_dir(&agent_state.home_dir.join("skills"));
+        if let Ok(overrides) = agent_state
+            .db
+            .get_skill_overrides(agent_state.db.agent_id())
+            .await
+        {
+            registry.apply_overrides(&overrides);
+        }
+        let new = Arc::new(registry);
+        *agent_state.skills.lock().unwrap() = new.clone();
+        new
+    } else {
+        agent_state.skills.lock().unwrap().clone()
+    };
+
+    let is_onboarding = check_onboarding(&agent_state.db).await;
+
+    let params = AgentParams {
+        db: &agent_state.db,
+        llm: state.llm.as_ref(),
+        tools: &state.tools,
+        skills: &skills,
+        user_message: input_text,
+        channel_type: "a2a",
+        session_id,
+        home_dir: &agent_state.home_dir,
+        is_onboarding,
+        message_sender: None, // A2A responses go back via JSON-RPC, not outbound messaging
+        skip_compaction: true,
+        embedding_client: agent_state.embedding_client.as_ref(),
+        thinking: None,
+        user_images: &[],
+        brave_api_key: state.brave_api_key.as_deref(),
+        skills_dirty: &agent_state.skills_dirty,
+        mcp_manager: agent_state.mcp_manager.as_ref(),
+        global_home_dir: Some(&state.global_home_dir),
+        is_callback_turn: false,
+        trace_id: Some(task_id.to_string()),
+    };
+
+    match agent::run_agent(&params).await {
+        Ok(output) => Ok(output.text),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Handle `message/send` — synchronous message processing via the real agent loop.
 async fn handle_message_send(
-    _state: &AppState,
+    state: &AppState,
     agent_state: &Arc<AgentState>,
     request: JsonRpcRequest,
 ) -> Response {
@@ -113,19 +173,24 @@ async fn handle_message_send(
         .and_then(|c| c.return_immediately)
         .unwrap_or(false);
 
-    // Create task in DB
-    if let Err(e) = agent_state
+    // Create task in DB (creates task row, session, and mapping)
+    let session_id = match agent_state
         .db
         .a2a_create_task(&task_id, context_id.as_deref())
         .await
     {
-        error!(error = %e, "failed to create A2A task");
-        return Json(JsonRpcResponse::error(
-            request.id.clone(),
-            JsonRpcError::from_code(INTERNAL_ERROR),
-        ))
-        .into_response();
-    }
+        Ok(sid) => sid,
+        Err(e) => {
+            error!(error = %e, "failed to create A2A task");
+            return Json(JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError::from_code(INTERNAL_ERROR),
+            ))
+            .into_response();
+        }
+    };
+
+    // Store the inbound message
     if let Err(e) = agent_state
         .db
         .a2a_insert_message(&task_id, &params.message)
@@ -156,41 +221,52 @@ async fn handle_message_send(
             }
         }
     } else {
-        // Process synchronously: transition to working, process, return completed task
+        // Process synchronously: transition to working, run agent loop, return completed task
         let _ = agent_state
             .db
             .a2a_update_task_state(&task_id, "working")
             .await;
 
-        // Extract text from the incoming message parts
         let input_text = extract_text_from_parts(&params.message.parts);
 
-        // Process through the agent (simplified: create a response message)
-        // In a full implementation, this would go through the agent loop
-        let response_text = format!("Processed A2A request: {input_text}");
-        let response_message = Message {
-            message_id: Uuid::new_v4().to_string(),
-            role: Role::Agent,
-            parts: vec![Part::Text {
-                text: response_text,
-                metadata: None,
-            }],
-            context_id: context_id.clone(),
-            task_id: Some(task_id.clone()),
-            metadata: None,
-            reference_task_ids: None,
-            extensions: None,
-            kind: "message".to_string(),
-        };
+        // Run the real agent loop
+        match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id).await {
+            Ok(response_text) => {
+                let text = response_text.unwrap_or_else(|| "Task completed.".to_string());
+                let response_message = Message {
+                    message_id: Uuid::new_v4().to_string(),
+                    role: Role::Agent,
+                    parts: vec![Part::Text {
+                        text,
+                        metadata: None,
+                    }],
+                    context_id: context_id.clone(),
+                    task_id: Some(task_id.clone()),
+                    metadata: None,
+                    reference_task_ids: None,
+                    extensions: None,
+                    kind: "message".to_string(),
+                };
 
-        let _ = agent_state
-            .db
-            .a2a_insert_message(&task_id, &response_message)
-            .await;
-        let _ = agent_state
-            .db
-            .a2a_update_task_state(&task_id, "completed")
-            .await;
+                let _ = agent_state
+                    .db
+                    .a2a_insert_message(&task_id, &response_message)
+                    .await;
+                let _ = agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "completed")
+                    .await;
+
+                info!(task_id = %task_id, "A2A task completed via agent loop");
+            }
+            Err(e) => {
+                error!(error = %e, task_id = %task_id, "A2A agent loop failed");
+                let _ = agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "failed")
+                    .await;
+            }
+        }
 
         match agent_state
             .db
@@ -221,7 +297,7 @@ async fn handle_message_send(
     }
 }
 
-/// Handle `message/stream` — SSE streaming response.
+/// Handle `message/stream` — SSE streaming response via the real agent loop.
 async fn handle_message_stream(
     state: &AppState,
     agent_state: &Arc<AgentState>,
@@ -242,18 +318,23 @@ async fn handle_message_stream(
     let context_id = params.message.context_id.clone();
 
     // Create task in DB
-    if let Err(e) = agent_state
+    let session_id = match agent_state
         .db
         .a2a_create_task(&task_id, context_id.as_deref())
         .await
     {
-        error!(error = %e, "failed to create A2A task");
-        return Json(JsonRpcResponse::error(
-            request.id.clone(),
-            JsonRpcError::from_code(INTERNAL_ERROR),
-        ))
-        .into_response();
-    }
+        Ok(sid) => sid,
+        Err(e) => {
+            error!(error = %e, "failed to create A2A task");
+            return Json(JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError::from_code(INTERNAL_ERROR),
+            ))
+            .into_response();
+        }
+    };
+
+    // Store the inbound message
     if let Err(e) = agent_state
         .db
         .a2a_insert_message(&task_id, &params.message)
@@ -269,7 +350,8 @@ async fn handle_message_stream(
     // Store broadcaster
     state.a2a_broadcasters.insert(task_id.clone(), tx.clone());
 
-    // Spawn task processing
+    // Spawn task processing with real agent loop
+    let state_clone = state.clone();
     let agent_state_clone = Arc::clone(agent_state);
     let input_text = extract_text_from_parts(&params.message.parts);
     let broadcasters = Arc::clone(&state.a2a_broadcasters);
@@ -292,44 +374,75 @@ async fn handle_message_stream(
             metadata: None,
         }));
 
-        // Process (simplified)
-        let response_text = format!("Processed A2A request: {input_text}");
-        let response_message = Message {
-            message_id: Uuid::new_v4().to_string(),
-            role: Role::Agent,
-            parts: vec![Part::Text {
-                text: response_text,
-                metadata: None,
-            }],
-            context_id: context_id.clone(),
-            task_id: Some(task_id_clone.clone()),
-            metadata: None,
-            reference_task_ids: None,
-            extensions: None,
-            kind: "message".to_string(),
-        };
+        // Run the real agent loop
+        match run_a2a_agent(
+            &state_clone,
+            &agent_state_clone,
+            &session_id,
+            &input_text,
+            &task_id_clone,
+        )
+        .await
+        {
+            Ok(response_text) => {
+                let text = response_text.unwrap_or_else(|| "Task completed.".to_string());
+                let response_message = Message {
+                    message_id: Uuid::new_v4().to_string(),
+                    role: Role::Agent,
+                    parts: vec![Part::Text {
+                        text,
+                        metadata: None,
+                    }],
+                    context_id: context_id.clone(),
+                    task_id: Some(task_id_clone.clone()),
+                    metadata: None,
+                    reference_task_ids: None,
+                    extensions: None,
+                    kind: "message".to_string(),
+                };
 
-        let _ = agent_state_clone
-            .db
-            .a2a_insert_message(&task_id_clone, &response_message)
-            .await;
-        let _ = agent_state_clone
-            .db
-            .a2a_update_task_state(&task_id_clone, "completed")
-            .await;
+                let _ = agent_state_clone
+                    .db
+                    .a2a_insert_message(&task_id_clone, &response_message)
+                    .await;
+                let _ = agent_state_clone
+                    .db
+                    .a2a_update_task_state(&task_id_clone, "completed")
+                    .await;
 
-        // Send completion
-        let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: task_id_clone.clone(),
-            context_id,
-            status: TaskStatus {
-                state: TaskState::Completed,
-                message: Some(response_message),
-                timestamp: Some(chrono::Utc::now().to_rfc3339()),
-            },
-            is_final: true,
-            metadata: None,
-        }));
+                // Send completion event
+                let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: task_id_clone.clone(),
+                    context_id,
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: Some(response_message),
+                        timestamp: Some(chrono::Utc::now().to_rfc3339()),
+                    },
+                    is_final: true,
+                    metadata: None,
+                }));
+            }
+            Err(e) => {
+                error!(error = %e, task_id = %task_id_clone, "A2A streaming agent loop failed");
+                let _ = agent_state_clone
+                    .db
+                    .a2a_update_task_state(&task_id_clone, "failed")
+                    .await;
+
+                let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: task_id_clone.clone(),
+                    context_id,
+                    status: TaskStatus {
+                        state: TaskState::Failed,
+                        message: None,
+                        timestamp: Some(chrono::Utc::now().to_rfc3339()),
+                    },
+                    is_final: true,
+                    metadata: None,
+                }));
+            }
+        }
 
         // Clean up broadcaster after completion
         broadcasters.remove(&task_id_clone);
