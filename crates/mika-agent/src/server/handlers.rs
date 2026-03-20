@@ -179,7 +179,8 @@ pub async fn handle_message(
     // Spawn async agent processing with request_id span for log correlation
     let s = state.clone();
     let a = agent_state.clone();
-    let span = tracing::info_span!("process_message", request_id = %request_id);
+    let span =
+        tracing::info_span!(target: "mika::otel", "process_message", request_id = %request_id);
     tokio::spawn(
         async move {
             let _lock = lock; // Hold lock for duration of agent loop

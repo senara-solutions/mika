@@ -17,21 +17,25 @@ impl Drop for TelemetryGuard {
 ///
 /// Returns `None` when telemetry is disabled, the endpoint is not configured,
 /// or the exporter fails to build (graceful degradation).
+///
+/// The returned layer includes a per-layer `Targets` filter that only exports
+/// spans from the `mika::otel` target. This ensures only LLM-relevant spans
+/// (tagged with `target: "mika::otel"`) reach the OTLP endpoint (e.g. Langfuse),
+/// filtering out infrastructure spans from tower-http, reqwest, etc.
 #[cfg(feature = "telemetry")]
-pub fn build_otel_layer<S>(
+pub fn build_otel_layer(
     settings: &Settings,
 ) -> Option<(
-    tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>,
+    impl tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + use<>,
     TelemetryGuard,
-)>
-where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
-{
+)> {
     use opentelemetry::KeyValue;
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter;
 
     if !settings.telemetry_enabled {
         return None;
@@ -79,7 +83,14 @@ where
     let tracer = provider.tracer("mika");
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    Some((layer, TelemetryGuard(provider)))
+    // Per-layer filter: only export spans from the "mika::otel" target.
+    // This prevents infrastructure spans (tower-http, reqwest, etc.) from
+    // reaching Langfuse while allowing LLM call spans and their parent
+    // agent_turn/process_message spans through.
+    let filtered_layer =
+        layer.with_filter(filter::Targets::new().with_target("mika::otel", tracing::Level::INFO));
+
+    Some((filtered_layer, TelemetryGuard(provider)))
 }
 
 /// Normalize an OTLP auth header value: if it contains `:` it's a raw
@@ -111,12 +122,7 @@ fn normalize_auth_header(value: &str) -> String {
 pub fn try_init_otel(
     settings: &Settings,
 ) -> (
-    Option<
-        tracing_opentelemetry::OpenTelemetryLayer<
-            tracing_subscriber::Registry,
-            opentelemetry_sdk::trace::SdkTracer,
-        >,
-    >,
+    Option<impl tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + use<>>,
     Option<TelemetryGuard>,
 ) {
     match build_otel_layer(settings) {
@@ -179,7 +185,7 @@ mod tests {
         let settings = Settings::load(tmp.path()).unwrap();
         // telemetry_enabled defaults to false
         #[cfg(feature = "telemetry")]
-        assert!(build_otel_layer::<tracing_subscriber::Registry>(&settings).is_none());
+        assert!(build_otel_layer(&settings).is_none());
         #[cfg(not(feature = "telemetry"))]
         assert!(build_otel_layer(&settings).is_none());
     }
