@@ -5,6 +5,8 @@ argument-hint: "[feature description]"
 disable-model-invocation: true
 ---
 
+<!-- SCOPE: mika core repo ONLY. Do NOT copy this to the meta-repo or other sub-repos. -->
+
 Run these slash commands in order. Do not do anything else. Do not stop between steps — complete every step through to the end.
 
 **Issue linking:** If `$ARGUMENTS` starts with `#` followed by a number (e.g. `#42`) or is just a number, treat it as a GitHub issue reference. Run `gh issue view <number> --json number,title,body,labels` to fetch the issue details, then use the issue title and body as the feature description for the planning step. Remember the issue number for the PR step.
