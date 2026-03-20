@@ -530,8 +530,25 @@ fn install_from_local(
 
     let file_url = format!("file://{}", path.display());
 
+    // Build the full pool of available candidates for dependency resolution.
+    // If the source path has a parent directory, scan it too so that sibling
+    // skills (e.g. mika-skills/build-mika alongside mika-skills/self-dev) are
+    // discoverable as dependencies.
+    let mut available_candidates = candidates.clone();
+    if let Some(parent) = path.parent().filter(|p| *p != path) {
+        let siblings = marketplace::scan_repo_for_skills(parent);
+        for sibling in siblings {
+            let already_present = available_candidates
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&sibling.name));
+            if !already_present {
+                available_candidates.push(sibling);
+            }
+        }
+    }
+
     // Resolve dependencies
-    let deps = install::resolve_dependencies(&selected, &candidates, skills_dir)?;
+    let deps = install::resolve_dependencies(&selected, &available_candidates, skills_dir)?;
 
     // Install dependencies first (in BFS order — leaves before roots)
     for dep in &deps {
