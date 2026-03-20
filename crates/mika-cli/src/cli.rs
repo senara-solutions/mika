@@ -340,6 +340,9 @@ pub enum SkillsCommand {
     Uninstall {
         /// Skill name to uninstall
         name: String,
+        /// Also remove orphaned dependencies without prompting
+        #[arg(long)]
+        remove_deps: bool,
     },
     /// Update marketplace-installed skills
     Update {
