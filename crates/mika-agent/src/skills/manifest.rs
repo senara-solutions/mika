@@ -32,7 +32,7 @@ pub struct SkillInfo {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// Other skills that should be loaded when this skill is active.
-    /// One level only — no transitive resolution.
+    /// Full transitive resolution via BFS at runtime and install time.
     #[serde(default)]
     pub dependencies: Vec<String>,
     /// Optional max prompt snippet size in bytes. Overrides the global 16KB default.

@@ -3,6 +3,7 @@
 //! These functions handle filesystem operations and lock file updates.
 //! CLI interaction (prompts, output formatting) belongs in `mika-cli`.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,238 @@ use super::marketplace::{
 };
 use crate::bundled_skills::is_bundled_skill;
 use crate::tools::create_skill::validate_skill_name;
+
+/// Maximum dependency depth to prevent pathological chains.
+const MAX_DEP_DEPTH: usize = 10;
+
+/// A resolved dependency ready for installation.
+#[derive(Debug, Clone)]
+pub struct ResolvedDep {
+    /// The skill candidate to install.
+    pub candidate: SkillCandidate,
+    /// Depth in the dependency tree (0 = root, 1 = direct dep, 2+ = transitive).
+    pub depth: usize,
+    /// Name of the skill that depends on this one.
+    pub required_by: String,
+}
+
+/// Resolve the full transitive dependency tree for a set of skill candidates.
+///
+/// Returns an ordered list of `ResolvedDep` in install order (dependencies first).
+///
+/// Resolution strategy per dependency name:
+/// 1. Already installed in agent's `skills_dir` → skip (passthrough)
+/// 2. Bundled skill name → skip (always available)
+/// 3. Found in `available_candidates` (same-source siblings) → include for install
+/// 4. Not found → error with clear message
+///
+/// Cycle detection: tracks the resolution chain, errors with full cycle path.
+/// Max depth: 10 levels (guard against pathological chains).
+pub fn resolve_dependencies(
+    roots: &[&SkillCandidate],
+    available_candidates: &[SkillCandidate],
+    skills_dir: &Path,
+) -> Result<Vec<ResolvedDep>> {
+    let mut result: Vec<ResolvedDep> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    // Mark roots as visited so they are not pulled in as deps of each other
+    for root in roots {
+        visited.insert(root.name.to_lowercase());
+    }
+
+    // BFS: process roots, then their deps breadth-first
+    let mut queue: VecDeque<(String, usize, Vec<String>)> = VecDeque::new();
+
+    // Seed queue with direct dependencies of all roots
+    for root in roots {
+        for dep_name in &root.dependencies {
+            let dep_lower = dep_name.to_lowercase();
+            // Self-dependency check
+            if dep_lower == root.name.to_lowercase() {
+                bail!(
+                    "Skill \"{}\" lists itself as a dependency. Remove the self-reference from skill.toml.",
+                    root.name
+                );
+            }
+            if !visited.contains(&dep_lower) {
+                queue.push_back((
+                    dep_name.clone(),
+                    1,
+                    vec![root.name.clone(), dep_name.clone()],
+                ));
+            }
+        }
+    }
+
+    while let Some((dep_name, depth, chain)) = queue.pop_front() {
+        let dep_lower = dep_name.to_lowercase();
+
+        // Cycle detection FIRST: check if dep_name appears earlier in the chain
+        // (before the last entry), excluding the root at index 0 since roots are
+        // being installed directly and a dep pointing back to a root is fine.
+        // This must run before the visited check so mutual dependency cycles are caught
+        // even when one node was already visited via a different BFS path.
+        let cycle_in_deps = chain.len() > 2
+            && chain[1..chain.len() - 1]
+                .iter()
+                .any(|n| n.to_lowercase() == dep_lower);
+        if cycle_in_deps {
+            bail!("Circular dependency detected: {}", chain.join(" -> "));
+        }
+
+        // Depth guard
+        if depth > MAX_DEP_DEPTH {
+            bail!(
+                "Dependency chain exceeds maximum depth ({MAX_DEP_DEPTH}). Chain: {}",
+                chain.join(" -> ")
+            );
+        }
+
+        // Already resolved (handles diamonds and root-as-dep-of-dep)
+        if visited.contains(&dep_lower) {
+            continue;
+        }
+
+        // 1. Already installed → skip
+        let installed_dir = skills_dir.join(&dep_name);
+        if installed_dir.exists() || installed_dir.symlink_metadata().is_ok() {
+            visited.insert(dep_lower);
+            continue;
+        }
+
+        // 2. Bundled skill → skip
+        if is_bundled_skill(&dep_name) {
+            visited.insert(dep_lower);
+            continue;
+        }
+
+        // 3. Find in available candidates (case-insensitive)
+        let found = available_candidates
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&dep_name));
+
+        match found {
+            Some(candidate) => {
+                let parent = chain
+                    .get(chain.len().saturating_sub(2))
+                    .cloned()
+                    .unwrap_or_default();
+                visited.insert(dep_lower);
+                result.push(ResolvedDep {
+                    candidate: candidate.clone(),
+                    depth,
+                    required_by: parent,
+                });
+
+                // Enqueue this candidate's own dependencies
+                for sub_dep in &candidate.dependencies {
+                    let sub_lower = sub_dep.to_lowercase();
+                    if sub_lower == candidate.name.to_lowercase() {
+                        bail!(
+                            "Skill \"{}\" lists itself as a dependency. Remove the self-reference from skill.toml.",
+                            candidate.name
+                        );
+                    }
+                    let mut new_chain = chain.clone();
+                    new_chain.push(sub_dep.clone());
+                    queue.push_back((sub_dep.clone(), depth + 1, new_chain));
+                }
+            }
+            None => {
+                let parent = chain
+                    .get(chain.len().saturating_sub(2))
+                    .cloned()
+                    .unwrap_or_default();
+                bail!(
+                    "Dependency \"{}\" required by \"{}\" not found in source or as bundled skill. Install it manually first.",
+                    dep_name,
+                    parent
+                );
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Find orphaned dependencies after uninstalling a skill.
+///
+/// Returns the names of skills that were installed as dependencies of `removed_skill`
+/// and are no longer needed by any other installed skill.
+pub fn find_orphaned_deps(agent_home: &Path, removed_skill: &str) -> Vec<String> {
+    let mut lock = read_lock(agent_home);
+    let mut orphans = Vec::new();
+
+    for (name, entry) in &mut lock.skills {
+        if entry
+            .installed_as_dependency_of
+            .contains(&removed_skill.to_string())
+        {
+            // Remove the uninstalled skill from the dependency_of list
+            let remaining: Vec<String> = entry
+                .installed_as_dependency_of
+                .iter()
+                .filter(|s| s != &removed_skill)
+                .cloned()
+                .collect();
+
+            if remaining.is_empty() {
+                // This skill was only a dependency of the removed skill → orphan
+                orphans.push(name.clone());
+            }
+        }
+    }
+
+    orphans
+}
+
+/// Remove a skill from the `installed_as_dependency_of` lists in the lock file.
+///
+/// Called after uninstalling a skill to clean up dependency tracking.
+pub fn remove_from_dependency_lists(agent_home: &Path, removed_skill: &str) -> Result<()> {
+    let mut lock = read_lock(agent_home);
+    let mut changed = false;
+
+    for entry in lock.skills.values_mut() {
+        if entry
+            .installed_as_dependency_of
+            .contains(&removed_skill.to_string())
+        {
+            entry
+                .installed_as_dependency_of
+                .retain(|s| s != removed_skill);
+            changed = true;
+        }
+    }
+
+    if changed {
+        write_lock(agent_home, &lock)?;
+    }
+
+    Ok(())
+}
+
+/// Mark a skill as a dependency of another skill in the lock file.
+///
+/// If the skill already has a lock entry, appends the parent (diamond case).
+/// If the skill is manually installed (empty vec), it stays manually installed.
+pub fn mark_as_dependency(agent_home: &Path, skill_name: &str, parent_name: &str) -> Result<()> {
+    let mut lock = read_lock(agent_home);
+
+    if let Some(entry) = lock.skills.get_mut(skill_name)
+        && !entry
+            .installed_as_dependency_of
+            .contains(&parent_name.to_string())
+    {
+        entry
+            .installed_as_dependency_of
+            .push(parent_name.to_string());
+        write_lock(agent_home, &lock)?;
+    }
+
+    Ok(())
+}
 
 /// Result of a successful skill installation.
 #[derive(Debug)]
@@ -163,6 +396,7 @@ fn install_skill_inner(
             path: candidate.relative_path.clone(),
             commit: commit.to_string(),
             linked,
+            installed_as_dependency_of: vec![],
             installed_at: now.clone(),
             updated_at: now,
         },
@@ -498,6 +732,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src,
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         let result = install_skill(
@@ -527,6 +762,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src,
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         let result = install_skill(
@@ -556,6 +792,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src,
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         // Install
@@ -602,6 +839,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src,
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         let result = install_skill(
@@ -673,6 +911,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src.clone(),
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         let result = install_skill_linked(
@@ -714,6 +953,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src.clone(),
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         install_skill_linked(
@@ -752,6 +992,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src.clone(),
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         let result = install_skill(
@@ -795,6 +1036,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src,
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         let result = install_skill(
@@ -829,6 +1071,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src.clone(),
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         install_skill(
@@ -868,6 +1111,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src.clone(),
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         install_skill_linked(
@@ -898,6 +1142,7 @@ mod tests {
             relative_path: ".".to_string(),
             absolute_path: skill_src.clone(),
             has_exec_handlers: false,
+            dependencies: vec![],
         };
 
         install_skill(
@@ -917,5 +1162,367 @@ mod tests {
         let result = update_skill(tmp.path(), &skills_dir, "disappearing-skill");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no longer exists"));
+    }
+
+    // --- Dependency resolution tests ---
+
+    fn make_candidate(name: &str, deps: &[&str]) -> SkillCandidate {
+        SkillCandidate {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            relative_path: ".".to_string(),
+            absolute_path: std::path::PathBuf::from(format!("/tmp/test/{name}")),
+            has_exec_handlers: false,
+            dependencies: deps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_no_dependencies() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let root = make_candidate("skill-a", &[]);
+        let roots = vec![&root];
+        let available = vec![root.clone()];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_simple_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let root = make_candidate("skill-a", &["skill-b"]);
+        let dep = make_candidate("skill-b", &[]);
+        let roots = vec![&root];
+        let available = vec![root.clone(), dep];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].candidate.name, "skill-b");
+        assert_eq!(result[0].required_by, "skill-a");
+        assert_eq!(result[0].depth, 1);
+    }
+
+    #[test]
+    fn test_resolve_transitive_dependencies() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let root = make_candidate("skill-a", &["skill-b"]);
+        let mid = make_candidate("skill-b", &["skill-c"]);
+        let leaf = make_candidate("skill-c", &[]);
+        let roots = vec![&root];
+        let available = vec![root.clone(), mid, leaf];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].candidate.name, "skill-b");
+        assert_eq!(result[0].depth, 1);
+        assert_eq!(result[1].candidate.name, "skill-c");
+        assert_eq!(result[1].depth, 2);
+    }
+
+    #[test]
+    fn test_resolve_circular_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // A depends on B, B depends on C, C depends on B (cycle in deps, not involving root)
+        let a = make_candidate("skill-a", &["skill-b"]);
+        let b = make_candidate("skill-b", &["skill-c"]);
+        let c = make_candidate("skill-c", &["skill-b"]);
+        let roots = vec![&a];
+        let available = vec![a.clone(), b, c];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Circular dependency"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_root_as_dep_of_dep_is_not_circular() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // A depends on B, B depends on A → B is resolved, A is skipped (root)
+        let a = make_candidate("skill-a", &["skill-b"]);
+        let b = make_candidate("skill-b", &["skill-a"]);
+        let roots = vec![&a];
+        let available = vec![a.clone(), b];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].candidate.name, "skill-b");
+    }
+
+    #[test]
+    fn test_resolve_diamond_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // A and B both depend on C
+        let a = make_candidate("skill-a", &["shared"]);
+        let b = make_candidate("skill-b", &["shared"]);
+        let shared = make_candidate("shared", &[]);
+        let roots = vec![&a, &b];
+        let available = vec![a.clone(), b.clone(), shared];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        // shared should appear only once
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].candidate.name, "shared");
+    }
+
+    #[test]
+    fn test_resolve_self_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let root = make_candidate("skill-a", &["skill-a"]);
+        let roots = vec![&root];
+        let available = vec![root.clone()];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("lists itself as a dependency"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_already_installed_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // Pre-install skill-b
+        create_skill_dir(&skills_dir.join("skill-b"), "skill-b");
+
+        let root = make_candidate("skill-a", &["skill-b"]);
+        let dep = make_candidate("skill-b", &[]);
+        let roots = vec![&root];
+        let available = vec![root.clone(), dep];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        assert!(result.is_empty(), "already-installed dep should be skipped");
+    }
+
+    #[test]
+    fn test_resolve_bundled_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // "tmux" is a bundled skill
+        let root = make_candidate("skill-a", &["tmux"]);
+        let roots = vec![&root];
+        let available = vec![root.clone()];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir).unwrap();
+        assert!(result.is_empty(), "bundled dep should be skipped");
+    }
+
+    #[test]
+    fn test_resolve_missing_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let root = make_candidate("skill-a", &["nonexistent"]);
+        let roots = vec![&root];
+        let available = vec![root.clone()];
+
+        let result = resolve_dependencies(&roots, &available, &skills_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent"), "got: {err}");
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_max_depth_exceeded() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // Create a chain of 12 deep: a -> b -> c -> ... -> l
+        let names: Vec<String> = (0..12)
+            .map(|i| format!("skill-{}", (b'a' + i) as char))
+            .collect();
+        let mut candidates: Vec<SkillCandidate> = Vec::new();
+        for i in 0..12 {
+            let deps = if i < 11 {
+                vec![names[i + 1].as_str()]
+            } else {
+                vec![]
+            };
+            candidates.push(make_candidate(&names[i], &deps));
+        }
+
+        let roots = vec![&candidates[0]];
+        let result = resolve_dependencies(&roots, &candidates, &skills_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("maximum depth"), "got: {err}");
+    }
+
+    // --- Lock file dependency tracking tests ---
+
+    #[test]
+    fn test_lock_backward_compat_no_installed_as_dependency_of() {
+        // Existing lock files without installed_as_dependency_of should deserialize fine
+        let toml_str = r#"
+[skills.web-scraper]
+url = "https://github.com/user/repo.git"
+path = "."
+commit = "abc123"
+installed_at = "2026-03-02T10:30:00Z"
+updated_at = "2026-03-02T10:30:00Z"
+"#;
+        let lock: super::super::marketplace::MarketplaceLock = toml::from_str(toml_str).unwrap();
+        let entry = lock.skills.get("web-scraper").unwrap();
+        assert!(entry.installed_as_dependency_of.is_empty());
+        assert!(!entry.linked);
+    }
+
+    #[test]
+    fn test_mark_as_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let skill_src = tmp.path().join("repo-skill");
+        create_skill_dir(&skill_src, "dep-skill");
+
+        let candidate = SkillCandidate {
+            name: "dep-skill".to_string(),
+            description: "Dep".to_string(),
+            relative_path: ".".to_string(),
+            absolute_path: skill_src,
+            has_exec_handlers: false,
+            dependencies: vec![],
+        };
+
+        install_skill(
+            tmp.path(),
+            &skills_dir,
+            &candidate,
+            None,
+            "file:///tmp/test",
+            "",
+        )
+        .unwrap();
+
+        mark_as_dependency(tmp.path(), "dep-skill", "parent-a").unwrap();
+
+        let lock = read_lock(tmp.path());
+        let entry = &lock.skills["dep-skill"];
+        assert_eq!(entry.installed_as_dependency_of, vec!["parent-a"]);
+
+        // Diamond: add second parent
+        mark_as_dependency(tmp.path(), "dep-skill", "parent-b").unwrap();
+        let lock = read_lock(tmp.path());
+        let entry = &lock.skills["dep-skill"];
+        assert_eq!(
+            entry.installed_as_dependency_of,
+            vec!["parent-a", "parent-b"]
+        );
+
+        // Duplicate parent is not added twice
+        mark_as_dependency(tmp.path(), "dep-skill", "parent-a").unwrap();
+        let lock = read_lock(tmp.path());
+        let entry = &lock.skills["dep-skill"];
+        assert_eq!(
+            entry.installed_as_dependency_of,
+            vec!["parent-a", "parent-b"]
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_deps() {
+        let tmp = TempDir::new().unwrap();
+
+        // Simulate lock file with dependency tracking
+        let mut lock = super::super::marketplace::MarketplaceLock::default();
+        lock.skills.insert(
+            "parent-a".to_string(),
+            MarketplaceEntry {
+                url: "file:///test".to_string(),
+                path: ".".to_string(),
+                commit: String::new(),
+                linked: false,
+                installed_as_dependency_of: vec![],
+                installed_at: "2026-03-02T10:30:00Z".to_string(),
+                updated_at: "2026-03-02T10:30:00Z".to_string(),
+            },
+        );
+        lock.skills.insert(
+            "dep-only-of-a".to_string(),
+            MarketplaceEntry {
+                url: "file:///test".to_string(),
+                path: ".".to_string(),
+                commit: String::new(),
+                linked: false,
+                installed_as_dependency_of: vec!["parent-a".to_string()],
+                installed_at: "2026-03-02T10:30:00Z".to_string(),
+                updated_at: "2026-03-02T10:30:00Z".to_string(),
+            },
+        );
+        lock.skills.insert(
+            "dep-of-a-and-b".to_string(),
+            MarketplaceEntry {
+                url: "file:///test".to_string(),
+                path: ".".to_string(),
+                commit: String::new(),
+                linked: false,
+                installed_as_dependency_of: vec!["parent-a".to_string(), "parent-b".to_string()],
+                installed_at: "2026-03-02T10:30:00Z".to_string(),
+                updated_at: "2026-03-02T10:30:00Z".to_string(),
+            },
+        );
+        write_lock(tmp.path(), &lock).unwrap();
+
+        let orphans = find_orphaned_deps(tmp.path(), "parent-a");
+        assert_eq!(orphans, vec!["dep-only-of-a"]);
+        // dep-of-a-and-b is not orphaned because parent-b still depends on it
+    }
+
+    #[test]
+    fn test_remove_from_dependency_lists() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut lock = super::super::marketplace::MarketplaceLock::default();
+        lock.skills.insert(
+            "dep-skill".to_string(),
+            MarketplaceEntry {
+                url: "file:///test".to_string(),
+                path: ".".to_string(),
+                commit: String::new(),
+                linked: false,
+                installed_as_dependency_of: vec!["parent-a".to_string(), "parent-b".to_string()],
+                installed_at: "2026-03-02T10:30:00Z".to_string(),
+                updated_at: "2026-03-02T10:30:00Z".to_string(),
+            },
+        );
+        write_lock(tmp.path(), &lock).unwrap();
+
+        remove_from_dependency_lists(tmp.path(), "parent-a").unwrap();
+
+        let lock = read_lock(tmp.path());
+        assert_eq!(
+            lock.skills["dep-skill"].installed_as_dependency_of,
+            vec!["parent-b"]
+        );
     }
 }

@@ -31,6 +31,11 @@ pub struct MarketplaceEntry {
     /// Default `false` for backward compatibility with existing lock files.
     #[serde(default)]
     pub linked: bool,
+    /// Names of skills that caused this skill to be installed as a dependency.
+    /// Empty vec means manually installed.
+    /// Diamond deps: both parents are tracked (e.g. ["skill-a", "skill-b"]).
+    #[serde(default)]
+    pub installed_as_dependency_of: Vec<String>,
     /// ISO 8601 timestamp of first install.
     pub installed_at: String,
     /// ISO 8601 timestamp of last update.
@@ -118,6 +123,8 @@ pub struct SkillCandidate {
     pub absolute_path: std::path::PathBuf,
     /// Whether the skill has exec handler tools.
     pub has_exec_handlers: bool,
+    /// Dependencies declared in skill.toml.
+    pub dependencies: Vec<String>,
 }
 
 /// Scan a cloned repo for skill.toml files up to depth 2.
@@ -216,6 +223,7 @@ fn try_load_candidate(skill_dir: &Path, repo_dir: &Path) -> Option<SkillCandidat
         relative_path,
         absolute_path: skill_dir.to_path_buf(),
         has_exec_handlers,
+        dependencies: manifest.skill.dependencies,
     })
 }
 
@@ -241,6 +249,7 @@ mod tests {
                 path: ".".to_string(),
                 commit: "abc123def456".to_string(),
                 linked: false,
+                installed_as_dependency_of: vec![],
                 installed_at: "2026-03-02T10:30:00Z".to_string(),
                 updated_at: "2026-03-02T10:30:00Z".to_string(),
             },

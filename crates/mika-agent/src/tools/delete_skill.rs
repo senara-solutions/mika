@@ -272,6 +272,7 @@ keywords = ["test"]
                 path: ".".to_string(),
                 commit: "abc123".to_string(),
                 linked: false,
+                installed_as_dependency_of: vec![],
                 installed_at: "2026-03-02T10:00:00Z".to_string(),
                 updated_at: "2026-03-02T10:00:00Z".to_string(),
             },

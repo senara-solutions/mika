@@ -43,8 +43,8 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Install { source, name, link }) => {
             install_skill(&agent_home, &skills_dir, &source, name.as_deref(), link)?;
         }
-        Some(SkillsCommand::Uninstall { name }) => {
-            uninstall_skill(&agent_home, &skills_dir, &name)?;
+        Some(SkillsCommand::Uninstall { name, remove_deps }) => {
+            uninstall_skill(&agent_home, &skills_dir, &name, remove_deps)?;
         }
         Some(SkillsCommand::Update { name }) => {
             update_skills(&agent_home, &skills_dir, name.as_deref())?;
@@ -413,6 +413,46 @@ fn install_from_git(
         return Ok(());
     }
 
+    // Resolve dependencies
+    let deps = install::resolve_dependencies(&selected, &candidates, skills_dir)?;
+
+    // Install dependencies first (in BFS order — leaves before roots)
+    for dep in &deps {
+        let dep_candidate = &dep.candidate;
+
+        if dep_candidate.has_exec_handlers {
+            println!(
+                "\n  WARNING: Dependency '{}' contains exec handlers that run shell commands.",
+                dep_candidate.name
+            );
+            println!("  Review the source before use: {url}");
+            if std::io::stdin().is_terminal() {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt("  Continue with installation?")
+                    .default(false)
+                    .interact()?;
+                if !confirm {
+                    bail!(
+                        "Installation cancelled: dependency '{}' requires exec handlers.",
+                        dep_candidate.name
+                    );
+                }
+            }
+        }
+
+        let result =
+            install::install_skill(agent_home, skills_dir, dep_candidate, None, url, &commit)?;
+
+        // Mark as dependency in the lock file
+        install::mark_as_dependency(agent_home, &result.name, &dep.required_by)?;
+
+        println!(
+            "  Installing dependency: {} (required by {})",
+            result.name, dep.required_by
+        );
+    }
+
+    // Install primary skills
     for candidate in &selected {
         if candidate.has_exec_handlers {
             println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
@@ -490,6 +530,101 @@ fn install_from_local(
 
     let file_url = format!("file://{}", path.display());
 
+    // Build the full pool of available candidates for dependency resolution.
+    // If the source path has a parent directory, scan it too so that sibling
+    // skills (e.g. mika-skills/build-mika alongside mika-skills/self-dev) are
+    // discoverable as dependencies.
+    let mut available_candidates = candidates.clone();
+    if let Some(parent) = path.parent().filter(|p| *p != path) {
+        let siblings = marketplace::scan_repo_for_skills(parent);
+        for sibling in siblings {
+            let already_present = available_candidates
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&sibling.name));
+            if !already_present {
+                available_candidates.push(sibling);
+            }
+        }
+    }
+
+    // Resolve dependencies
+    let deps = install::resolve_dependencies(&selected, &available_candidates, skills_dir)?;
+
+    // Install dependencies first (in BFS order — leaves before roots)
+    for dep in &deps {
+        let dep_candidate = &dep.candidate;
+
+        if dep_candidate.has_exec_handlers {
+            println!(
+                "\n  WARNING: Dependency '{}' contains exec handlers that run shell commands.",
+                dep_candidate.name
+            );
+            println!(
+                "  Review the source at: {}",
+                dep_candidate.absolute_path.display()
+            );
+            if link {
+                println!("  NOTE: With --link, handler scripts can be modified at any time.");
+            }
+            if std::io::stdin().is_terminal() {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt("  Continue with installation?")
+                    .default(false)
+                    .interact()?;
+                if !confirm {
+                    bail!(
+                        "Installation cancelled: dependency '{}' requires exec handlers.",
+                        dep_candidate.name
+                    );
+                }
+            }
+        }
+
+        // --link propagates to deps from the same source directory
+        let dep_file_url = format!(
+            "file://{}",
+            dep_candidate
+                .absolute_path
+                .parent()
+                .unwrap_or(path)
+                .display()
+        );
+        let result = if link {
+            install::install_skill_linked(
+                agent_home,
+                skills_dir,
+                dep_candidate,
+                None,
+                &dep_file_url,
+            )?
+        } else {
+            install::install_skill(
+                agent_home,
+                skills_dir,
+                dep_candidate,
+                None,
+                &dep_file_url,
+                "",
+            )?
+        };
+
+        // Mark as dependency in the lock file
+        install::mark_as_dependency(agent_home, &result.name, &dep.required_by)?;
+
+        if result.linked {
+            println!(
+                "  Installing dependency: {} (required by {}, linked)",
+                result.name, dep.required_by
+            );
+        } else {
+            println!(
+                "  Installing dependency: {} (required by {})",
+                result.name, dep.required_by
+            );
+        }
+    }
+
+    // Install primary skills
     for candidate in &selected {
         if candidate.has_exec_handlers {
             println!("\n  WARNING: This skill contains exec handlers that run shell commands.");
@@ -573,9 +708,70 @@ fn select_skills_interactive(
     Ok(selections.iter().map(|&i| &candidates[i]).collect())
 }
 
-fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<()> {
+fn uninstall_skill(
+    agent_home: &Path,
+    skills_dir: &Path,
+    name: &str,
+    remove_deps: bool,
+) -> Result<()> {
+    // Find orphans before uninstalling (need lock state before removal)
+    let orphans = install::find_orphaned_deps(agent_home, name);
+
+    // Uninstall the primary skill
     install::uninstall_skill(agent_home, skills_dir, name)?;
-    println!("\n  Uninstalled '{name}'.\n");
+    println!("\n  Uninstalled '{name}'.");
+
+    // Clean up dependency tracking
+    install::remove_from_dependency_lists(agent_home, name)?;
+
+    // Handle orphaned dependencies
+    if !orphans.is_empty() {
+        let is_tty = std::io::stdin().is_terminal();
+
+        let mut to_remove: Vec<String> = Vec::new();
+
+        for orphan in &orphans {
+            if remove_deps {
+                to_remove.push(orphan.clone());
+            } else if is_tty {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "  Dependency \"{orphan}\" is no longer needed. Remove?"
+                    ))
+                    .default(false)
+                    .interact()?;
+                if confirm {
+                    to_remove.push(orphan.clone());
+                }
+            } else {
+                println!(
+                    "  Orphaned dependency \"{orphan}\" kept (non-interactive mode). Use --remove-deps to remove."
+                );
+            }
+        }
+
+        // Cascading removal: removing an orphan may orphan its own deps
+        while let Some(orphan_name) = to_remove.pop() {
+            let sub_orphans = install::find_orphaned_deps(agent_home, &orphan_name);
+            if let Err(e) = install::uninstall_skill(agent_home, skills_dir, &orphan_name) {
+                println!("  Warning: failed to remove orphaned dependency \"{orphan_name}\": {e}");
+                continue;
+            }
+            install::remove_from_dependency_lists(agent_home, &orphan_name)?;
+            println!("  Removed orphaned dependency: {orphan_name}");
+
+            // Enqueue any newly-orphaned transitive deps
+            for sub in sub_orphans {
+                // Check it's still actually orphaned after the lock update
+                let current_orphans = install::find_orphaned_deps(agent_home, &orphan_name);
+                if current_orphans.contains(&sub) {
+                    to_remove.push(sub);
+                }
+            }
+        }
+    }
+
+    println!();
     Ok(())
 }
 

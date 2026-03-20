@@ -1,13 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use super::index::SkillEntry;
 
 /// Match skills against a user message.
 ///
 /// Returns all enabled `always_on` skills plus any enabled skill where at least
-/// one keyword is a substring of the lowercased message. Then resolves one level
-/// of dependencies: if a matched skill declares `dependencies = ["foo"]`, the
-/// skill named "foo" is also included (if enabled and present).
+/// one keyword is a substring of the lowercased message. Then resolves the full
+/// transitive dependency tree via BFS: if a matched skill declares
+/// `dependencies = ["foo"]` and foo depends on `["bar"]`, all three are included
+/// (if enabled and present). Disabled mid-chain skills break their sub-tree.
 pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<&'a SkillEntry> {
     let message_lower = user_message.to_lowercase();
 
@@ -25,16 +26,19 @@ pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<&'a
         }
     }
 
-    // Second pass: resolve one level of dependencies
-    let initial_indices: Vec<usize> = matched_indices.iter().copied().collect();
-    for i in initial_indices {
-        for dep_name in &skills[i].manifest.skill.dependencies {
+    // Second pass: BFS transitive dependency resolution
+    let mut queue: VecDeque<usize> = matched_indices.iter().copied().collect();
+
+    while let Some(idx) = queue.pop_front() {
+        for dep_name in &skills[idx].manifest.skill.dependencies {
             if let Some(dep_idx) = skills
                 .iter()
                 .position(|e| e.manifest.skill.name.eq_ignore_ascii_case(dep_name))
-                && skills[dep_idx].enabled
             {
-                matched_indices.insert(dep_idx);
+                // Disabled mid-chain dep breaks its sub-tree
+                if skills[dep_idx].enabled && matched_indices.insert(dep_idx) {
+                    queue.push_back(dep_idx);
+                }
             }
         }
     }
@@ -254,19 +258,38 @@ mod tests {
     }
 
     #[test]
-    fn test_no_transitive_dependencies() {
-        // A depends on B, B depends on C. Only A+B should match, not C.
+    fn test_transitive_dependencies() {
+        // A depends on B, B depends on C. All three should match (full transitive resolution).
         let skills = vec![
             make_entry_with_deps("skill-a", &[], true, &["skill-b"]),
             make_entry_with_deps("skill-b", &[], false, &["skill-c"]),
             make_entry("skill-c", &[], false),
         ];
         let matched = match_skills(&skills, "hello");
-        assert_eq!(matched.len(), 2);
+        assert_eq!(matched.len(), 3);
         let names: Vec<&str> = matched
             .iter()
             .map(|e| e.manifest.skill.name.as_str())
             .collect();
-        assert_eq!(names, vec!["skill-a", "skill-b"]);
+        assert_eq!(names, vec!["skill-a", "skill-b", "skill-c"]);
+    }
+
+    #[test]
+    fn test_disabled_mid_chain_breaks_subtree() {
+        // A depends on B, B depends on C. B is disabled → C is NOT loaded.
+        let mut skill_b = make_entry_with_deps("skill-b", &[], false, &["skill-c"]);
+        skill_b.enabled = false;
+        let skills = vec![
+            make_entry_with_deps("skill-a", &[], true, &["skill-b"]),
+            skill_b,
+            make_entry("skill-c", &[], false),
+        ];
+        let matched = match_skills(&skills, "hello");
+        assert_eq!(matched.len(), 1);
+        let names: Vec<&str> = matched
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["skill-a"]);
     }
 }
