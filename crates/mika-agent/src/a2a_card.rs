@@ -47,7 +47,7 @@ pub fn build_agent_card(
         }),
         capabilities: AgentCapabilities {
             streaming: Some(true),
-            push_notifications: Some(true),
+            push_notifications: Some(false),
         },
         security_schemes: Some(security_schemes),
         security_requirements: None,
@@ -115,7 +115,7 @@ mod tests {
         let card = build_agent_card("agent", "desc", &registry, "http://localhost");
 
         assert_eq!(card.capabilities.streaming, Some(true));
-        assert_eq!(card.capabilities.push_notifications, Some(true));
+        assert_eq!(card.capabilities.push_notifications, Some(false));
     }
 
     #[test]

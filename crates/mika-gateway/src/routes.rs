@@ -77,7 +77,7 @@ pub fn build_router(state: AppState) -> Router {
         // A2A protocol proxy (API key auth)
         .route(
             "/a2a/{customer_id}/{agent_name}",
-            post(a2a_routes::handle_a2a_proxy),
+            post(a2a_routes::handle_a2a_proxy).layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)),
         )
         .route(
             "/a2a/{customer_id}/{agent_name}/agent.json",

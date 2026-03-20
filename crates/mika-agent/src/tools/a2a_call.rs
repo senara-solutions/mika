@@ -61,6 +61,37 @@ impl Tool for A2aCallTool {
             )));
         }
 
+        // SSRF protection: validate URL scheme, host, and IP ranges
+        let parsed_url = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid URL: {e}"))),
+        };
+
+        if !matches!(parsed_url.scheme(), "http" | "https") {
+            return Ok(ToolOutput::error("Only http and https URLs are allowed."));
+        }
+
+        if let Some(host) = parsed_url.host_str() {
+            if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+                return Ok(ToolOutput::error("Cannot call localhost URLs."));
+            }
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                let is_private = match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        v4.is_private() || v4.is_loopback() || v4.is_link_local()
+                    }
+                    std::net::IpAddr::V6(v6) => v6.is_loopback(),
+                };
+                if is_private {
+                    return Ok(ToolOutput::error(
+                        "Cannot call private or internal IP addresses.",
+                    ));
+                }
+            }
+        } else {
+            return Ok(ToolOutput::error("URL must have a host."));
+        }
+
         let message_text = input["message"].as_str().unwrap_or("");
         if message_text.is_empty() {
             return Ok(ToolOutput::error("'message' is required."));

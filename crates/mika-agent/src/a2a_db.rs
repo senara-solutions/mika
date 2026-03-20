@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
+use serde::Deserialize;
+
 use mika_a2a::types::{
     Artifact, AuthenticationInfo, Message, Part, Task, TaskPushNotificationConfig, TaskState,
     TaskStatus,
@@ -6,6 +10,20 @@ use mika_a2a::types::{
 
 use crate::db::Database;
 use crate::timestamp;
+
+/// Typed representation of the A2A message metadata stored in the `metadata`
+/// column of the `messages` table. Deserializing directly into this struct
+/// avoids an intermediate `serde_json::Value` and the deep `.clone()` calls
+/// that were previously needed to extract individual fields.
+#[derive(Deserialize)]
+struct A2aMessageMeta {
+    #[serde(default)]
+    a2a_message_id: String,
+    #[serde(default)]
+    a2a_parts: Option<Vec<Part>>,
+    #[serde(default)]
+    a2a_metadata: Option<HashMap<String, serde_json::Value>>,
+}
 
 /// Map A2A state strings to internal task status values.
 fn a2a_state_to_task_status(state: &str) -> &'static str {
@@ -33,7 +51,7 @@ fn task_status_to_a2a_state(status: &str) -> &'static str {
 }
 
 /// Extract text content from A2A message parts.
-fn extract_text_from_parts(parts: &[Part]) -> String {
+pub(crate) fn extract_text_from_parts(parts: &[Part]) -> String {
     parts
         .iter()
         .filter_map(|part| match part {
@@ -131,21 +149,6 @@ impl Database {
         Ok(())
     }
 
-    /// Update A2A task metadata (stored in the tasks.result column as JSON).
-    pub fn a2a_update_task_metadata(
-        &self,
-        a2a_task_id: &str,
-        metadata: Option<&str>,
-    ) -> Result<()> {
-        let now = timestamp::now();
-        self.conn.execute(
-            "UPDATE tasks SET result = ?1, updated_at = ?2
-             WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?3)",
-            rusqlite::params![metadata, &now, a2a_task_id],
-        )?;
-        Ok(())
-    }
-
     // === A2A Messages (via messages table) ===
 
     /// Insert an A2A message into the unified messages table.
@@ -233,38 +236,24 @@ impl Database {
 
             // Try to recover original A2A parts from metadata, fall back to text part
             let (message_id, parts, a2a_metadata) = if let Some(ref meta_str) = metadata_json {
-                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                    let mid = meta
-                        .get("a2a_message_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let p = meta
-                        .get("a2a_parts")
-                        .and_then(|v| serde_json::from_value::<Vec<Part>>(v.clone()).ok())
-                        .unwrap_or_else(|| {
+                match serde_json::from_str::<A2aMessageMeta>(meta_str) {
+                    Ok(meta) => {
+                        let parts = meta.a2a_parts.unwrap_or_else(|| {
                             vec![Part::Text {
                                 text: content.clone(),
                                 metadata: None,
                             }]
                         });
-                    let am = meta.get("a2a_metadata").and_then(|v| {
-                        if v.is_null() {
-                            None
-                        } else {
-                            serde_json::from_value(v.clone()).ok()
-                        }
-                    });
-                    (mid, p, am)
-                } else {
-                    (
+                        (meta.a2a_message_id, parts, meta.a2a_metadata)
+                    }
+                    Err(_) => (
                         String::new(),
                         vec![Part::Text {
                             text: content,
                             metadata: None,
                         }],
                         None,
-                    )
+                    ),
                 }
             } else {
                 (
@@ -978,19 +967,6 @@ mod tests {
         let task = db.a2a_build_task("t1", None).unwrap().unwrap();
         assert!(task.history.is_none());
         assert!(task.artifacts.is_none());
-    }
-
-    #[test]
-    fn update_task_metadata() {
-        let db = db();
-        db.a2a_create_task("t1", "mika", None).unwrap();
-
-        let meta = r#"{"key":"value"}"#;
-        db.a2a_update_task_metadata("t1", Some(meta)).unwrap();
-
-        let task = db.a2a_build_task("t1", None).unwrap().unwrap();
-        let metadata = task.metadata.unwrap();
-        assert_eq!(metadata["key"], serde_json::json!("value"));
     }
 
     #[test]

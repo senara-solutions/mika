@@ -43,14 +43,3 @@ pub struct TaskQueryParams {
 pub struct TaskIdParams {
     pub id: String,
 }
-
-/// Parameters for push notification config operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PushNotificationConfigParams {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<TaskPushNotificationConfig>,
-}

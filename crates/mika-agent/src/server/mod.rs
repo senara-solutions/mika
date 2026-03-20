@@ -134,7 +134,10 @@ fn build_router(state: AppState) -> Router {
     // A2A routes (no CORS — gateway handles external auth).
     // Accepts only MIKA_INTERNAL_TOKEN.
     let a2a_routes = Router::new()
-        .route("/a2a/{agent_name}", post(a2a::handle_a2a_jsonrpc))
+        .route(
+            "/a2a/{agent_name}",
+            post(a2a::handle_a2a_jsonrpc).layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)),
+        )
         .route("/a2a/{agent_name}/agent.json", get(a2a::handle_agent_card))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

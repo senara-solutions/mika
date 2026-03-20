@@ -21,7 +21,6 @@ pub const INVALID_AGENT_RESPONSE: i32 = -32006;
 pub enum JsonRpcId {
     Number(i64),
     String(String),
-    Null,
 }
 
 /// JSON-RPC 2.0 request.
@@ -141,21 +140,6 @@ impl A2aMethod {
             "tasks/pushNotificationConfig/list" => Some(Self::PushNotificationConfigList),
             "tasks/pushNotificationConfig/delete" => Some(Self::PushNotificationConfigDelete),
             _ => None,
-        }
-    }
-
-    /// Get the method string.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::MessageSend => "message/send",
-            Self::MessageStream => "message/stream",
-            Self::TasksGet => "tasks/get",
-            Self::TasksCancel => "tasks/cancel",
-            Self::TasksResubscribe => "tasks/resubscribe",
-            Self::PushNotificationConfigSet => "tasks/pushNotificationConfig/set",
-            Self::PushNotificationConfigGet => "tasks/pushNotificationConfig/get",
-            Self::PushNotificationConfigList => "tasks/pushNotificationConfig/list",
-            Self::PushNotificationConfigDelete => "tasks/pushNotificationConfig/delete",
         }
     }
 }
@@ -319,25 +303,5 @@ mod tests {
         assert_eq!(A2aMethod::parse("unknown/method"), None);
         assert_eq!(A2aMethod::parse(""), None);
         assert_eq!(A2aMethod::parse("message/send/extra"), None);
-    }
-
-    #[test]
-    fn a2a_method_as_str_round_trip() {
-        let methods = [
-            A2aMethod::MessageSend,
-            A2aMethod::MessageStream,
-            A2aMethod::TasksGet,
-            A2aMethod::TasksCancel,
-            A2aMethod::TasksResubscribe,
-            A2aMethod::PushNotificationConfigSet,
-            A2aMethod::PushNotificationConfigGet,
-            A2aMethod::PushNotificationConfigList,
-            A2aMethod::PushNotificationConfigDelete,
-        ];
-        for method in &methods {
-            let s = method.as_str();
-            let parsed = A2aMethod::parse(s).unwrap();
-            assert_eq!(&parsed, method);
-        }
     }
 }

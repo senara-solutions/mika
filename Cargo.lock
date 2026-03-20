@@ -1809,6 +1809,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "utoipa",
  "uuid",
  "zerocopy 0.7.35",

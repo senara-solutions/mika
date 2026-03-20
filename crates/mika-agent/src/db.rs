@@ -1927,6 +1927,10 @@ impl Database {
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
 
         let result = (|| -> Result<()> {
+            // Drop view first — it references the tasks table we're about to rebuild
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+
             // Rebuild tasks table to add 'a2a' to trigger_type CHECK constraint
             self.conn.execute_batch(
                 "CREATE TABLE tasks_new (

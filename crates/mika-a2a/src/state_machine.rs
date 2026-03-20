@@ -1,4 +1,3 @@
-use crate::error::A2aError;
 use crate::types::TaskState;
 
 /// Validates task state transitions according to the A2A protocol.
@@ -36,15 +35,6 @@ impl TaskStateMachine {
                 | (TaskState::AuthRequired, TaskState::Canceled)
                 | (TaskState::AuthRequired, TaskState::Failed)
         )
-    }
-
-    /// Attempt a state transition. Returns error if invalid.
-    pub fn transition(from: TaskState, to: TaskState) -> Result<TaskState, A2aError> {
-        if Self::can_transition(from, to) {
-            Ok(to)
-        } else {
-            Err(A2aError::InvalidStateTransition { from, to })
-        }
     }
 }
 
@@ -167,17 +157,5 @@ mod tests {
             TaskState::Working,
             TaskState::Submitted
         ));
-    }
-
-    #[test]
-    fn test_transition_success() {
-        let result = TaskStateMachine::transition(TaskState::Submitted, TaskState::Working);
-        assert_eq!(result.unwrap(), TaskState::Working);
-    }
-
-    #[test]
-    fn test_transition_failure() {
-        let result = TaskStateMachine::transition(TaskState::Completed, TaskState::Working);
-        assert!(result.is_err());
     }
 }

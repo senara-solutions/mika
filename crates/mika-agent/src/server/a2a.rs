@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use dashmap::DashMap;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -20,8 +21,22 @@ use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
 use mika_a2a::types::{Message, Part, Role, TaskState, TaskStatus};
 
 use crate::a2a_card::build_agent_card;
+use crate::a2a_db::extract_text_from_parts;
 use crate::agent::{self, AgentParams, check_onboarding};
 use crate::server::state::{AgentState, AppState};
+
+/// Guard that removes a broadcaster entry from the DashMap when dropped.
+/// Ensures cleanup happens even if the spawned task panics.
+struct BroadcasterGuard {
+    map: Arc<DashMap<String, broadcast::Sender<StreamEvent>>>,
+    key: String,
+}
+
+impl Drop for BroadcasterGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
+}
 
 /// Handle A2A JSON-RPC POST requests.
 pub async fn handle_a2a_jsonrpc(
@@ -160,6 +175,18 @@ async fn handle_message_send(
             return Json(JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError::with_message(INVALID_PARAMS, e.to_string()),
+            ))
+            .into_response();
+        }
+    };
+
+    // Acquire agent lock to prevent concurrent agent loops
+    let _lock_guard = match agent_state.agent_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Json(JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError::with_message(INTERNAL_ERROR, "Agent is busy"),
             ))
             .into_response();
         }
@@ -314,6 +341,18 @@ async fn handle_message_stream(
         }
     };
 
+    // Acquire agent lock — moved into the spawned task to hold for duration of agent loop
+    let lock_guard = match agent_state.agent_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Json(JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError::with_message(INTERNAL_ERROR, "Agent is busy"),
+            ))
+            .into_response();
+        }
+    };
+
     let task_id = Uuid::new_v4().to_string();
     let context_id = params.message.context_id.clone();
 
@@ -356,6 +395,11 @@ async fn handle_message_stream(
     let input_text = extract_text_from_parts(&params.message.parts);
     let broadcasters = Arc::clone(&state.a2a_broadcasters);
     tokio::spawn(async move {
+        let _lock_guard = lock_guard; // Hold agent lock for duration of agent loop
+        let _broadcaster_guard = BroadcasterGuard {
+            map: broadcasters,
+            key: task_id_clone.clone(),
+        };
         // Transition to working
         let _ = agent_state_clone
             .db
@@ -443,9 +487,6 @@ async fn handle_message_stream(
                 }));
             }
         }
-
-        // Clean up broadcaster after completion
-        broadcasters.remove(&task_id_clone);
     });
 
     // Return SSE stream
@@ -827,16 +868,4 @@ pub async fn handle_agent_card(
     let card = build_agent_card(&agent_name, "Mika AI Agent", &skills, &state.gateway_url);
 
     Json(card).into_response()
-}
-
-/// Extract text content from A2A message parts.
-fn extract_text_from_parts(parts: &[Part]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            Part::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
