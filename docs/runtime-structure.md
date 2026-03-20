@@ -66,7 +66,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 12
+**Current schema version:** 13
 
 **Timestamp format:** All timestamp columns use ISO 8601 TEXT (`%Y-%m-%dT%H:%M:%SZ`) — not Unix epoch integers. SQL defaults use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`. Fixed-width UTC format ensures correct lexicographic ordering.
 
@@ -98,7 +98,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 ### Task Engine
 
-**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at TEXT`, `timeout_at TEXT`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `execution_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at TEXT`, `updated_at TEXT`, `fired_at TEXT`, `completed_at TEXT`
+**tasks** — `id TEXT PK`, `agent_id FK`, `team_run_id FK→team_runs`, `parent_task_id FK→tasks(self)`, `depth INTEGER CHECK(0..3)`, `label TEXT`, `trigger_type TEXT CHECK(time|recurring|callback|user_reply|event|condition|manual|a2a)`, `cron_expr TEXT`, `event_source TEXT`, `event_offset_secs INTEGER`, `condition_expr TEXT`, `next_fire_at TEXT`, `timeout_at TEXT`, `action_type TEXT CHECK(send_message|resume_agent|inject_context|run_skill|invoke_orchestrator|none)`, `action_config TEXT DEFAULT '{}'`, `status TEXT CHECK(pending|in_progress|completed|failed|cancelled|expired|recurring_active|delivered|blocked)`, `process_id INTEGER`, `input_context TEXT`, `result TEXT`, `created_by_session TEXT`, `created_trace_id TEXT`, `execution_trace_id TEXT`, `reference_url TEXT`, `source TEXT`, `created_at TEXT`, `updated_at TEXT`, `fired_at TEXT`, `completed_at TEXT`
 
 ### Team Tables
 
@@ -107,6 +107,14 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 **team_runs** — `id TEXT PK`, `team_id FK→teams`, `goal TEXT`, `status TEXT CHECK(running|completed|failed|cancelled|suspended)`, `failure_reason TEXT`, `iteration INTEGER DEFAULT 1`, `max_iterations INTEGER DEFAULT 3`, `deliverable TEXT`, `checkpoint TEXT`, `trace_id TEXT`, `started_at TEXT`, `ended_at TEXT`
 
 **team_workspace** — `id INTEGER PK AUTO`, `run_id FK→team_runs`, `parent_id FK→self`, `agent_name TEXT`, `entry_type TEXT`, `content TEXT`, `trace_id TEXT`, `iteration INTEGER DEFAULT 1`, `created_at TEXT`
+
+### A2A Protocol Tables
+
+**a2a_task_map** — `a2a_task_id TEXT PK`, `task_id TEXT FK→tasks`, `session_id TEXT FK→sessions`, `context_id TEXT`, `created_at TEXT`. Maps A2A protocol task IDs to internal task/session IDs. Index: `idx_a2a_task_map_task(task_id)`.
+
+**a2a_artifacts** — `id INTEGER PK AUTO`, `task_id TEXT FK→a2a_task_map(a2a_task_id)`, `artifact_id TEXT`, `name TEXT`, `description TEXT`, `parts TEXT` (JSON), `metadata TEXT`, `created_at TEXT`
+
+**a2a_push_notification_configs** — `id TEXT PK`, `task_id TEXT FK→a2a_task_map(a2a_task_id)`, `url TEXT`, `token TEXT`, `auth_scheme TEXT`, `auth_credentials TEXT`, `created_at TEXT`
 
 ### Audit Tables
 
