@@ -36,4 +36,5 @@ pub mod trigger_type {
     pub const EVENT: &str = "event";
     pub const CONDITION: &str = "condition";
     pub const MANUAL: &str = "manual";
+    pub const A2A: &str = "a2a";
 }

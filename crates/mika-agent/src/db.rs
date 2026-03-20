@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -452,7 +452,7 @@ pub struct SessionWithStats {
 // ===== Database =====
 
 pub struct Database {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Database {
@@ -583,6 +583,10 @@ impl Database {
             self.migrate_v11_to_v12()?;
             info!(version = 12, "database migrated to v12");
         }
+        if (3..=12).contains(&version) {
+            self.migrate_v12_to_v13()?;
+            info!(version = 13, "database migrated to v13");
+        }
         Ok(())
     }
 
@@ -593,6 +597,11 @@ impl Database {
         let drops = [
             "DROP TABLE IF EXISTS fts_search",
             "DROP TABLE IF EXISTS vec_search",
+            "DROP TABLE IF EXISTS a2a_push_notification_configs",
+            "DROP TABLE IF EXISTS a2a_artifacts",
+            "DROP TABLE IF EXISTS a2a_messages",
+            "DROP TABLE IF EXISTS a2a_tasks",
+            "DROP TABLE IF EXISTS a2a_task_map",
             "DROP TABLE IF EXISTS reminders",
             "DROP TABLE IF EXISTS heartbeat_sends",
             "DROP TABLE IF EXISTS reflection_runs",
@@ -632,7 +641,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (12);
+            INSERT INTO schema_version (version) VALUES (13);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -675,7 +684,7 @@ impl Database {
                 depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
                 label TEXT NOT NULL,
                 trigger_type TEXT NOT NULL CHECK (
-                    trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual')
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual','a2a')
                 ),
                 cron_expr TEXT,
                 event_source TEXT,
@@ -899,6 +908,37 @@ impl Database {
                 skill_name TEXT NOT NULL COLLATE NOCASE,
                 always_on  INTEGER,
                 PRIMARY KEY (agent_id, skill_name)
+            );
+
+            -- A2A Protocol tables: thin mapping table + genuinely new tables
+            CREATE TABLE a2a_task_map (
+                a2a_task_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                context_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_a2a_task_map_task ON a2a_task_map(task_id);
+
+            CREATE TABLE a2a_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                name TEXT,
+                description TEXT,
+                parts TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE TABLE a2a_push_notification_configs (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
+                url TEXT NOT NULL,
+                token TEXT,
+                auth_scheme TEXT,
+                auth_credentials TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_recurring
@@ -1862,6 +1902,145 @@ impl Database {
             // Record migration
             self.conn
                 .execute("INSERT INTO schema_version (version) VALUES (12)", [])?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate_v12_to_v13(&self) -> Result<()> {
+        info!("migrating database schema v12 → v13 (A2A orthogonal persistence)");
+
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let result = (|| -> Result<()> {
+            // Drop view first — it references the tasks table we're about to rebuild
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+
+            // Rebuild tasks table to add 'a2a' to trigger_type CHECK constraint
+            self.conn.execute_batch(
+                "CREATE TABLE tasks_new (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                    parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
+                    depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                    label TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL CHECK (
+                        trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual','a2a')
+                    ),
+                    cron_expr TEXT,
+                    event_source TEXT,
+                    event_offset_secs INTEGER,
+                    condition_expr TEXT,
+                    next_fire_at TEXT,
+                    timeout_at TEXT,
+                    action_type TEXT NOT NULL CHECK (
+                        action_type IN (
+                            'send_message','resume_agent','inject_context',
+                            'run_skill','invoke_orchestrator','none'
+                        )
+                    ),
+                    action_config TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        status IN ('pending','in_progress','completed','failed',
+                                   'cancelled','expired','recurring_active','delivered','blocked')
+                    ),
+                    process_id INTEGER,
+                    input_context TEXT,
+                    result TEXT,
+                    reference_url TEXT,
+                    source TEXT,
+                    created_by_session TEXT,
+                    created_trace_id TEXT,
+                    execution_trace_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    fired_at TEXT,
+                    completed_at TEXT
+                );
+                INSERT INTO tasks_new SELECT * FROM tasks;
+                DROP TABLE tasks;
+                ALTER TABLE tasks_new RENAME TO tasks;
+                CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+                CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
+                    WHERE status IN ('pending','recurring_active');
+                CREATE INDEX idx_tasks_schedulable
+                    ON tasks(agent_id, next_fire_at ASC)
+                    WHERE status IN ('pending','recurring_active');
+                CREATE INDEX idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
+                CREATE INDEX idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
+                CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+                CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
+                CREATE INDEX idx_tasks_manual_active
+                    ON tasks(agent_id, created_at DESC)
+                    WHERE trigger_type = 'manual'
+                    AND status IN ('pending', 'in_progress', 'blocked');
+                CREATE UNIQUE INDEX idx_tasks_unique_recurring
+                    ON tasks(agent_id, label COLLATE NOCASE)
+                    WHERE trigger_type = 'recurring'
+                    AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+                CREATE UNIQUE INDEX idx_tasks_unique_reminder
+                    ON tasks(agent_id, label COLLATE NOCASE)
+                    WHERE status IN ('pending', 'in_progress', 'recurring_active')
+                    AND action_type = 'send_message';")?;
+
+            // Create thin mapping table
+            self.conn.execute_batch(
+                "CREATE TABLE a2a_task_map (
+                    a2a_task_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    context_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                CREATE INDEX idx_a2a_task_map_task ON a2a_task_map(task_id);",
+            )?;
+
+            // Create A2A tables with FK to mapping table
+            self.conn.execute_batch(
+                "CREATE TABLE a2a_artifacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
+                    artifact_id TEXT NOT NULL,
+                    name TEXT,
+                    description TEXT,
+                    parts TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );
+                CREATE TABLE a2a_push_notification_configs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
+                    url TEXT NOT NULL,
+                    token TEXT,
+                    auth_scheme TEXT,
+                    auth_credentials TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                );",
+            )?;
+
+            // Recreate unified_timeline VIEW (tasks table was rebuilt)
+            self.conn
+                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (13)", [])?;
 
             Ok(())
         })();
@@ -6814,9 +6993,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_12() {
+    fn test_schema_version_is_13() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 13);
     }
 
     #[test]
