@@ -1,7 +1,7 @@
 ---
 title: "fix: Filter non-LLM spans from Langfuse export and add gen_ai semantic conventions"
 type: fix
-status: active
+status: completed
 date: 2026-03-20
 origin: docs/brainstorms/2026-03-20-langfuse-llm-span-filtering-brainstorm.md
 ---
