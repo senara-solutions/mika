@@ -166,7 +166,7 @@ impl ModelSpec {
             ProviderKind::OpenAi => Some("https://api.openai.com/v1"),
             ProviderKind::Ollama => Some("http://localhost:11434/v1"),
             ProviderKind::Groq => Some("https://api.groq.com/openai/v1"),
-            ProviderKind::MiniMax => Some("https://api.minimax.chat/v1"),
+            ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
             ProviderKind::Qwen => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
             ProviderKind::Kimi => Some("https://api.moonshot.ai/v1"),
             ProviderKind::OpenAiCompatible => None, // requires explicit base_url
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn test_default_base_urls_new_providers() {
         let spec = ModelSpec::parse("minimax/MiniMax-M2.5").unwrap();
-        assert_eq!(spec.default_base_url(), Some("https://api.minimax.chat/v1"));
+        assert_eq!(spec.default_base_url(), Some("https://api.minimax.io/v1"));
 
         let spec = ModelSpec::parse("qwen/qwen3.5-plus").unwrap();
         assert_eq!(
