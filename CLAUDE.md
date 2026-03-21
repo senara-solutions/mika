@@ -23,7 +23,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 ## Directory Structure
 
-- `crates/mika-common/` — Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum, `get_effective_value`/`lookup_config_key` helpers), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` load/read/write via dotenvy), Claude API client, logging, telemetry (feature-gated OTel export), home directory
+- `crates/mika-common/` — Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum, `get_effective_value`/`lookup_config_key` helpers), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` load/read/write via dotenvy), Claude API client, OAuth PKCE token exchange (`oauth.rs` — PKCE flow, `OAuthTokenManager` with `tokio::sync::RwLock` caching, `~/.mika/oauth.json` persistence), logging, telemetry (feature-gated OTel export), home directory
 - `crates/mika-a2a/` — A2A (Agent-to-Agent) protocol v0.3 implementation: JSON-RPC types, task state machine (submitted → working → completed/failed/canceled), SSE streaming, A2A client
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpoints, HTTP server binary
 - `crates/mika-gateway/` — Telegram webhook router: Postgres customer registry, message routing, pairing flow, outbound relay, A2A protocol proxy with API key auth. `build.rs` forces recompilation when `migrations/` directory changes (prevents stale `sqlx::migrate!()` embeds from incremental compilation cache).
@@ -79,6 +79,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docker build -f Dockerfile.gateway -t mika-gateway:dev .` — Build gateway container image
 - `docker compose up` — Run agent + gateway (add `--profile db` for local Postgres)
 - `mika setup --mode compose` — Generate `.env` for docker-compose in current directory
+- `mika setup --mode oauth` — Authorize Mika with Claude Pro/Max subscription via PKCE (exchanges `sk-ant-oat*` token for access token, stores in `~/.mika/oauth.json`)
 
 ## Architecture
 
@@ -114,7 +115,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Environment Variables
 
 See `.env.example` for the full list. Required:
-- `MIKA_LLM_API_KEY` — LLM API key (Anthropic, OpenAI, Groq, etc.). For Anthropic keys, auto-detected from prefix: `sk-ant-oat*` → OAuth bearer auth, otherwise → standard API key auth.
+- `MIKA_LLM_API_KEY` — LLM API key (Anthropic, OpenAI, Groq, etc.). For Anthropic keys, auto-detected from prefix: `sk-ant-oat*` → OAuth PKCE managed auth (auto-refresh via `OAuthTokenManager`, tokens cached in `~/.mika/oauth.json`), otherwise → standard API key auth. OAuth tokens require initial setup: `mika setup --mode oauth`.
 
 Optional (Layer 3 vector search):
 - `MIKA_OPENAI_API_KEY` — OpenAI API key for embedding generation (enables vector similarity in hybrid search)

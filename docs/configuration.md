@@ -275,6 +275,12 @@ defaults to `~/.mika/`.
   from the `sk-ant-oat` prefix and adjusts the HTTP auth scheme automatically
   (Bearer + `anthropic-beta` header for OAuth, `x-api-key` header for standard
   keys). For non-Anthropic providers, the key is sent as a Bearer token.
+- **OAuth PKCE flow:** When `MIKA_LLM_API_KEY` starts with `sk-ant-oat`, Mika
+  uses an `OAuthTokenManager` that transparently exchanges the subscription token
+  for a short-lived access token via PKCE. Tokens are cached in `~/.mika/oauth.json`
+  (0600 permissions) and auto-refreshed 60 seconds before expiry. Initial setup
+  requires `mika setup --mode oauth` (interactive browser-based authorization).
+  A SHA-256 hash of the subscription token is stored to detect token changes.
 - Secrets should be set in `~/.mika/.env` or via shell environment variables, never committed to config files.
 - `internal_token` is validated on load: if present, it must be exactly 64
   hex characters. Invalid values cause an immediate startup error.
