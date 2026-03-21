@@ -1,6 +1,5 @@
 {
   "command": "mika",
   "args": ["--agent", "mika-dev", "ask"],
-  "model": "openai/gpt-4o",
   "timeout": 120000
 }
