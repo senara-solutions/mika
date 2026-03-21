@@ -77,6 +77,9 @@ pub enum ProviderKind {
     OpenAi,
     Ollama,
     Groq,
+    MiniMax,
+    Qwen,
+    Kimi,
     /// Generic OpenAI-compatible provider with a custom base URL.
     OpenAiCompatible,
 }
@@ -88,6 +91,9 @@ impl std::fmt::Display for ProviderKind {
             ProviderKind::OpenAi => write!(f, "openai"),
             ProviderKind::Ollama => write!(f, "ollama"),
             ProviderKind::Groq => write!(f, "groq"),
+            ProviderKind::MiniMax => write!(f, "minimax"),
+            ProviderKind::Qwen => write!(f, "qwen"),
+            ProviderKind::Kimi => write!(f, "kimi"),
             ProviderKind::OpenAiCompatible => write!(f, "openai-compatible"),
         }
     }
@@ -118,10 +124,13 @@ impl ModelSpec {
                 "openai" => ProviderKind::OpenAi,
                 "ollama" => ProviderKind::Ollama,
                 "groq" => ProviderKind::Groq,
+                "minimax" => ProviderKind::MiniMax,
+                "qwen" => ProviderKind::Qwen,
+                "kimi" => ProviderKind::Kimi,
                 "openai-compatible" => ProviderKind::OpenAiCompatible,
                 _ => bail!(
                     "unknown provider prefix '{prefix}'. \
-                     Known prefixes: anthropic, openai, ollama, groq, openai-compatible"
+                     Known prefixes: anthropic, openai, ollama, groq, minimax, qwen, kimi, openai-compatible"
                 ),
             };
             (provider, model.to_string())
@@ -157,6 +166,9 @@ impl ModelSpec {
             ProviderKind::OpenAi => Some("https://api.openai.com/v1"),
             ProviderKind::Ollama => Some("http://localhost:11434/v1"),
             ProviderKind::Groq => Some("https://api.groq.com/openai/v1"),
+            ProviderKind::MiniMax => Some("https://api.minimax.chat/v1"),
+            ProviderKind::Qwen => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+            ProviderKind::Kimi => Some("https://api.moonshot.ai/v1"),
             ProviderKind::OpenAiCompatible => None, // requires explicit base_url
         }
     }
@@ -187,6 +199,9 @@ pub fn create_provider(spec: &ModelSpec, max_tokens: u32) -> Result<Arc<dyn LlmP
         ProviderKind::OpenAi
         | ProviderKind::Ollama
         | ProviderKind::Groq
+        | ProviderKind::MiniMax
+        | ProviderKind::Qwen
+        | ProviderKind::Kimi
         | ProviderKind::OpenAiCompatible => {
             if matches!(spec.provider, ProviderKind::OpenAiCompatible) {
                 tracing::warn!(
@@ -310,13 +325,69 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_minimax_prefix() {
+        let spec = ModelSpec::parse("minimax/MiniMax-M2.5").unwrap();
+        assert_eq!(spec.provider, ProviderKind::MiniMax);
+        assert_eq!(spec.model, "MiniMax-M2.5");
+    }
+
+    #[test]
+    fn test_parse_qwen_prefix() {
+        let spec = ModelSpec::parse("qwen/qwen3.5-plus").unwrap();
+        assert_eq!(spec.provider, ProviderKind::Qwen);
+        assert_eq!(spec.model, "qwen3.5-plus");
+    }
+
+    #[test]
+    fn test_parse_kimi_prefix() {
+        let spec = ModelSpec::parse("kimi/kimi-k2.5").unwrap();
+        assert_eq!(spec.provider, ProviderKind::Kimi);
+        assert_eq!(spec.model, "kimi-k2.5");
+    }
+
+    #[test]
+    fn test_default_base_urls_new_providers() {
+        let spec = ModelSpec::parse("minimax/MiniMax-M2.5").unwrap();
+        assert_eq!(spec.default_base_url(), Some("https://api.minimax.chat/v1"));
+
+        let spec = ModelSpec::parse("qwen/qwen3.5-plus").unwrap();
+        assert_eq!(
+            spec.default_base_url(),
+            Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+        );
+
+        let spec = ModelSpec::parse("kimi/kimi-k2.5").unwrap();
+        assert_eq!(spec.default_base_url(), Some("https://api.moonshot.ai/v1"));
+    }
+
+    #[test]
+    fn test_openai_compatible_still_works() {
+        let spec = ModelSpec::parse("openai-compatible/custom-model").unwrap();
+        assert_eq!(spec.provider, ProviderKind::OpenAiCompatible);
+        assert_eq!(spec.model, "custom-model");
+        assert_eq!(spec.default_base_url(), None);
+    }
+
+    #[test]
     fn test_provider_kind_display() {
         assert_eq!(ProviderKind::Anthropic.to_string(), "anthropic");
         assert_eq!(ProviderKind::OpenAi.to_string(), "openai");
         assert_eq!(ProviderKind::Ollama.to_string(), "ollama");
+        assert_eq!(ProviderKind::MiniMax.to_string(), "minimax");
+        assert_eq!(ProviderKind::Qwen.to_string(), "qwen");
+        assert_eq!(ProviderKind::Kimi.to_string(), "kimi");
         assert_eq!(
             ProviderKind::OpenAiCompatible.to_string(),
             "openai-compatible"
         );
+    }
+
+    #[test]
+    fn test_unknown_prefix_lists_new_providers() {
+        let err = ModelSpec::parse("unknown/model").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("minimax"), "error should list minimax");
+        assert!(msg.contains("qwen"), "error should list qwen");
+        assert!(msg.contains("kimi"), "error should list kimi");
     }
 }

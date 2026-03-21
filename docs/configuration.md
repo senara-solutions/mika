@@ -237,7 +237,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
 | `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | LLM API key. Supports Anthropic API keys (`sk-ant-api03-...`), OAuth subscription tokens (`sk-ant-oat01-...`), and third-party provider keys. Auto-detected from prefix for auth scheme selection. Required for any command that calls an LLM. |
-| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`. No prefix defaults to Anthropic. CLI: `--model <model>` on `mika ask` / `mika chat` overrides for a single invocation without persisting. Aliases: `sonnet`, `opus`, `haiku`. |
+| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`, `minimax/MiniMax-M2.5`, `qwen/qwen3.5-plus`, `kimi/kimi-k2.5`. No prefix defaults to Anthropic. CLI: `--model <model>` on `mika ask` / `mika chat` overrides for a single invocation without persisting. Aliases: `sonnet`, `opus`, `haiku`, `minimax`, `qwen`, `kimi`. |
 | `llm_base_url` | `Option<String>` | None | `MIKA_LLM_BASE_URL` | Override base URL for OpenAI-compatible providers (e.g., `http://localhost:11434/v1` for Ollama). Each known provider has a default; only needed for `openai-compatible` or custom endpoints. |
 | `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for Claude responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
@@ -501,6 +501,9 @@ is present, Anthropic is used by default.
 | OpenAI | `openai/` | `https://api.openai.com/v1` | `MIKA_LLM_API_KEY` |
 | Ollama | `ollama/` | `http://localhost:11434/v1` | Optional |
 | Groq | `groq/` | `https://api.groq.com/openai/v1` | `MIKA_LLM_API_KEY` |
+| MiniMax | `minimax/` | `https://api.minimax.chat/v1` | `MIKA_LLM_API_KEY` |
+| Qwen | `qwen/` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `MIKA_LLM_API_KEY` |
+| Kimi | `kimi/` | `https://api.moonshot.ai/v1` | `MIKA_LLM_API_KEY` |
 | OpenAI-compatible | `openai-compatible/` | None (requires `MIKA_LLM_BASE_URL`) | `MIKA_LLM_API_KEY` |
 
 ### Anthropic models
@@ -541,6 +544,27 @@ export MIKA_LLM_MODEL=groq/llama-3.1-70b
 export MIKA_LLM_API_KEY=gsk_...
 ```
 
+**MiniMax** (best tool calling, cost-effective Claude alternative):
+
+```sh
+export MIKA_LLM_MODEL=minimax/MiniMax-M2.5
+export MIKA_LLM_API_KEY=<minimax-key>  # Get key at https://platform.minimax.io/
+```
+
+**Qwen** (best open-source agentic):
+
+```sh
+export MIKA_LLM_MODEL=qwen/qwen3.5-plus
+export MIKA_LLM_API_KEY=<dashscope-key>  # Get key at https://qwen.ai/apiplatform
+```
+
+**Kimi** (best coding):
+
+```sh
+export MIKA_LLM_MODEL=kimi/kimi-k2.5
+export MIKA_LLM_API_KEY=<moonshot-key>  # Get key at https://api.moonshot.ai/
+```
+
 **Custom OpenAI-compatible endpoint:**
 
 ```sh
@@ -573,11 +597,11 @@ next message.
 
 Not all providers support all features. The `LlmProvider` trait reports capabilities:
 
-| Feature | Anthropic | OpenAI | Ollama | Groq |
-|---------|-----------|--------|--------|------|
-| Tool calling | Yes | Yes | Varies by model | Varies by model |
-| Vision/images | Yes | Yes | Varies by model | No |
-| Extended thinking | Yes | No | No | No |
+| Feature | Anthropic | OpenAI | MiniMax | Qwen | Kimi | Ollama | Groq |
+|---------|-----------|--------|---------|------|------|--------|------|
+| Tool calling | Yes | Yes | Yes | Yes | Yes | Varies | Varies |
+| Vision/images | Yes | Yes | Yes | Yes | Yes | Varies | No |
+| Extended thinking | Yes | No | No | No | No | No | No |
 
 When using a provider that doesn't support tool calling, Mika's agent tools
 (memory, reminders, etc.) will not be available. The agent will operate in

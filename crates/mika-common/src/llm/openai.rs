@@ -314,6 +314,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
             ProviderKind::OpenAi => "openai",
             ProviderKind::Ollama => "ollama",
             ProviderKind::Groq => "groq",
+            ProviderKind::MiniMax => "minimax",
+            ProviderKind::Qwen => "qwen",
+            ProviderKind::Kimi => "kimi",
             _ => "openai-compatible",
         }
     }
@@ -331,9 +334,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        // Most OpenAI-compatible providers support vision for their multimodal models.
-        // Conservative default; can be made configurable later.
-        matches!(self.provider_kind, ProviderKind::OpenAi)
+        matches!(
+            self.provider_kind,
+            ProviderKind::OpenAi | ProviderKind::MiniMax | ProviderKind::Qwen | ProviderKind::Kimi
+        )
     }
 
     fn supports_extended_thinking(&self) -> bool {
