@@ -735,7 +735,11 @@ async fn run_investigation(
         session_id: investigation_session_id,
         trace_id: investigation_trace_id,
     } = params;
-    let tool_defs = tools.definitions().to_vec();
+    let tool_defs: Vec<_> = tools
+        .definitions()
+        .iter()
+        .map(|d| d.clone().into())
+        .collect();
     let edit_count = std::sync::atomic::AtomicU32::new(0);
     let skills_dirty = std::sync::atomic::AtomicBool::new(false);
     // Create a minimal ToolContext for investigation tools.
@@ -763,7 +767,7 @@ async fn run_investigation(
             max_tokens: 4096,
             system: Some(system_prompt.clone()),
             messages: messages.clone(),
-            tools: Some(tool_defs.iter().map(|d| d.clone().into()).collect()),
+            tools: Some(tool_defs.clone()),
             thinking: None,
         };
 
