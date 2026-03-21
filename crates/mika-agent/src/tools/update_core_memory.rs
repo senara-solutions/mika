@@ -25,7 +25,10 @@ impl Tool for UpdateCoreMemoryTool {
         ToolDefinition {
             name: "update_core_memory".to_string(),
             description: format!(
-                "Update your persistent core memory blocks. Core memory is always visible in the system prompt. You have {} blocks: {section_list}. Each block is limited to ~500 tokens.",
+                "Update your persistent core memory blocks. Core memory is always visible in your system prompt. \
+                You have {} blocks: {section_list}. Each block is limited to ~500 tokens. \
+                All three parameters 'section', 'action', and 'reasoning' are REQUIRED. \
+                The 'content' parameter is also required unless action is 'reset'.",
                 section_names.len()
             ),
             input_schema: serde_json::json!({
@@ -34,27 +37,28 @@ impl Tool for UpdateCoreMemoryTool {
                     "section": {
                         "type": "string",
                         "enum": section_names,
-                        "description": "Which core memory block to update"
+                        "description": format!("REQUIRED. Which core memory block to update. Must be one of: {section_list}")
                     },
                     "action": {
                         "type": "string",
                         "enum": ["replace", "append", "remove_line", "reset"],
-                        "description": "How to modify the block: replace (full replacement), append (add to end), remove_line (remove first line containing the content), reset (restore block to its default value — content field is ignored)"
+                        "description": "REQUIRED. How to modify the block. Must be one of: 'replace' (overwrite entire block), 'append' (add text to end of block), 'remove_line' (remove first line containing the content string), 'reset' (restore block to default value, content parameter is ignored)"
                     },
                     "content": {
                         "type": "string",
-                        "description": "New content (for replace/append) or text to find and remove (for remove_line). Not required for reset."
+                        "description": "The text content. Required for 'replace' (new block content), 'append' (text to add), and 'remove_line' (substring to match). Not required when action is 'reset'."
                     },
                     "reasoning": {
                         "type": "string",
-                        "description": "Why you are making this change (recorded in audit log)"
+                        "description": "REQUIRED. A brief explanation of why you are making this change. This is recorded in the audit log."
                     },
                     "evidence": {
                         "type": "string",
-                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
+                        "description": "Only required in reflection mode. Cite a specific conversation timestamp and quote as justification for this change."
                     }
                 },
-                "required": ["section", "action", "reasoning"]
+                "required": ["section", "action", "reasoning"],
+                "additionalProperties": false
             }),
         }
     }
@@ -65,16 +69,32 @@ impl Tool for UpdateCoreMemoryTool {
         let content = input["content"].as_str().unwrap_or("");
         let reasoning = input["reasoning"].as_str().unwrap_or("");
 
-        // Validate required fields (content is not required for "reset")
-        let content_required = action != "reset";
-        if section.is_empty()
-            || action.is_empty()
-            || (content_required && content.is_empty())
-            || reasoning.is_empty()
-        {
-            return Ok(ToolOutput::error(
-                "Required fields missing: section, action, reasoning (and content for non-reset actions).",
-            ));
+        // Validate required fields with specific error messages
+        let content_required = action != "reset" && !action.is_empty();
+        let mut missing = Vec::new();
+        if section.is_empty() {
+            missing.push("section");
+        }
+        if action.is_empty() {
+            missing.push("action");
+        }
+        if reasoning.is_empty() {
+            missing.push("reasoning");
+        }
+        if content_required && content.is_empty() {
+            missing.push("content");
+        }
+        if !missing.is_empty() {
+            let allowed_sections = core_memory_section_names().join(", ");
+            return Ok(ToolOutput::error(format!(
+                "Missing required parameter(s): {}. \
+                You must provide: 'section' (one of: {allowed_sections}), \
+                'action' (one of: replace, append, remove_line, reset), \
+                'reasoning' (why you are making this change), \
+                and 'content' (the text, required unless action is 'reset'). \
+                Example: {{\"section\": \"user_summary\", \"action\": \"replace\", \"content\": \"New info\", \"reasoning\": \"User shared this\"}}",
+                missing.join(", ")
+            )));
         }
 
         // Reflection mode: require evidence field
@@ -591,6 +611,93 @@ mod tests {
         let reasoning = events[0].reasoning.as_deref().unwrap();
         assert!(reasoning.contains("[evidence]"));
         assert!(reasoning.contains("CEO of Acme"));
+    }
+
+    #[tokio::test]
+    async fn test_missing_section_and_reasoning_lists_both() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        // Simulate what MiniMax-M2.5 sends: only action + content, missing section + reasoning
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "replace",
+                    "content": "Some text"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("section"));
+        assert!(result.content.contains("reasoning"));
+        assert!(result.content.contains("Missing required parameter"));
+        // Should include an example call
+        assert!(result.content.contains("Example:"));
+    }
+
+    #[tokio::test]
+    async fn test_missing_only_section_specific_error() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "replace",
+                    "content": "Some text",
+                    "reasoning": "test"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("section"));
+        // Should NOT list reasoning as missing since it was provided
+        assert!(
+            !result
+                .content
+                .starts_with("Missing required parameter(s): reasoning")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_content_for_non_reset_action() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "section": "user_summary",
+                    "action": "replace",
+                    "reasoning": "test"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("content"));
+        assert!(result.content.contains("Missing required parameter"));
+    }
+
+    #[tokio::test]
+    async fn test_all_fields_missing_lists_all() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("section"));
+        assert!(result.content.contains("action"));
+        assert!(result.content.contains("reasoning"));
     }
 
     #[tokio::test]
