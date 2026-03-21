@@ -17,9 +17,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info};
 
-use mika_common::claude::{
-    ClaudeClient, ContentBlock, Message, MessageContent, MessagesRequest, StopReason,
-    ToolDefinition,
+use mika_common::claude::ToolDefinition;
+use mika_common::llm::{
+    LlmContent, LlmContentBlock, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent, LlmRole,
+    LlmStopReason, LlmToolResultContent, response_content_to_blocks,
 };
 
 use crate::async_db::AsyncDatabase;
@@ -713,7 +714,7 @@ async fn build_investigation_context(
 /// Parameters for running an investigation agent loop.
 struct InvestigationParams {
     system_prompt: String,
-    messages: Vec<Message>,
+    messages: Vec<LlmMessage>,
     tx: mpsc::Sender<Result<sse::Event, Infallible>>,
     db: AsyncDatabase,
     session_id: String,
@@ -722,7 +723,7 @@ struct InvestigationParams {
 
 /// Run the investigation agent loop, sending SSE events via the channel.
 async fn run_investigation(
-    claude: &ClaudeClient,
+    llm: &dyn LlmProvider,
     tools: &ToolRegistry,
     params: InvestigationParams,
 ) {
@@ -734,7 +735,11 @@ async fn run_investigation(
         session_id: investigation_session_id,
         trace_id: investigation_trace_id,
     } = params;
-    let tool_defs = tools.definitions().to_vec();
+    let tool_defs: Vec<_> = tools
+        .definitions()
+        .iter()
+        .map(|d| d.clone().into())
+        .collect();
     let edit_count = std::sync::atomic::AtomicU32::new(0);
     let skills_dirty = std::sync::atomic::AtomicBool::new(false);
     // Create a minimal ToolContext for investigation tools.
@@ -757,8 +762,8 @@ async fn run_investigation(
     };
 
     for _step in 0..MAX_INVESTIGATION_STEPS {
-        let request = MessagesRequest {
-            model: claude.model.clone(),
+        let request = LlmRequest {
+            model: llm.model_name().to_string(),
             max_tokens: 4096,
             system: Some(system_prompt.clone()),
             messages: messages.clone(),
@@ -766,36 +771,32 @@ async fn run_investigation(
             thinking: None,
         };
 
-        let response = match tokio::time::timeout(
-            INVESTIGATION_TIMEOUT,
-            claude.send_message(&request),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                let _ = send_event(
-                    &tx,
-                    InvestigateEvent::Error {
-                        message: format!("Claude API error: {e}"),
-                    },
-                )
-                .await;
-                let _ = send_event(&tx, InvestigateEvent::Done {}).await;
-                return;
-            }
-            Err(_) => {
-                let _ = send_event(
-                    &tx,
-                    InvestigateEvent::Error {
-                        message: "Investigation timed out".to_string(),
-                    },
-                )
-                .await;
-                let _ = send_event(&tx, InvestigateEvent::Done {}).await;
-                return;
-            }
-        };
+        let response =
+            match tokio::time::timeout(INVESTIGATION_TIMEOUT, llm.send_message(&request)).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    let _ = send_event(
+                        &tx,
+                        InvestigateEvent::Error {
+                            message: format!("LLM error: {e}"),
+                        },
+                    )
+                    .await;
+                    let _ = send_event(&tx, InvestigateEvent::Done {}).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = send_event(
+                        &tx,
+                        InvestigateEvent::Error {
+                            message: "Investigation timed out".to_string(),
+                        },
+                    )
+                    .await;
+                    let _ = send_event(&tx, InvestigateEvent::Done {}).await;
+                    return;
+                }
+            };
 
         // Collect text and tool_use blocks
         let mut text_parts = Vec::new();
@@ -803,13 +804,16 @@ async fn run_investigation(
 
         for block in &response.content {
             match block {
-                ContentBlock::Text { text } => {
+                LlmResponseContent::Text(text) => {
                     text_parts.push(text.clone());
                 }
-                ContentBlock::ToolUse { id, name, input } => {
-                    tool_uses.push((id.clone(), name.clone(), input.clone()));
+                LlmResponseContent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    tool_uses.push((id.clone(), name.clone(), arguments.clone()));
                 }
-                _ => {}
             }
         }
 
@@ -825,7 +829,7 @@ async fn run_investigation(
         }
 
         // If stop_reason is end_turn (no tool calls), we're done
-        if response.stop_reason == StopReason::EndTurn || tool_uses.is_empty() {
+        if response.stop_reason == LlmStopReason::EndTurn || tool_uses.is_empty() {
             let _ = send_event(&tx, InvestigateEvent::Done {}).await;
             return;
         }
@@ -882,21 +886,21 @@ async fn run_investigation(
                 return;
             }
 
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id: id.clone(),
-                content: mika_common::claude::ToolResultBody::Text(output.content),
-                is_error: if output.is_error { Some(true) } else { None },
+            tool_results.push(LlmContentBlock::ToolResult {
+                tool_call_id: id.clone(),
+                content: LlmToolResultContent::Text(output.content),
+                is_error: output.is_error,
             });
         }
 
         // Add assistant response + tool results to message history for next turn
-        messages.push(Message {
-            role: "assistant".to_string(),
-            content: MessageContent::Blocks(response.content),
+        messages.push(LlmMessage {
+            role: LlmRole::Assistant,
+            content: LlmContent::Blocks(response_content_to_blocks(&response.content)),
         });
-        messages.push(Message {
-            role: "user".to_string(),
-            content: MessageContent::Blocks(tool_results),
+        messages.push(LlmMessage {
+            role: LlmRole::Tool,
+            content: LlmContent::Blocks(tool_results),
         });
     }
 
@@ -1037,7 +1041,7 @@ pub async fn handle_investigate(
         .clone();
 
     // --- Build messages array ---
-    let mut messages: Vec<Message> = Vec::new();
+    let mut messages: Vec<LlmMessage> = Vec::new();
 
     // Add history turns (capped)
     let history = if req.history.len() > MAX_HISTORY_TURNS {
@@ -1046,37 +1050,25 @@ pub async fn handle_investigate(
         &req.history
     };
     for turn in history {
-        messages.push(Message {
-            role: turn.role.clone(),
-            content: MessageContent::Text(turn.content.clone()),
+        let role = match turn.role.as_str() {
+            "assistant" => LlmRole::Assistant,
+            _ => LlmRole::User,
+        };
+        messages.push(LlmMessage {
+            role,
+            content: LlmContent::Text(turn.content.clone()),
         });
     }
 
     // Add current question
-    messages.push(Message {
-        role: "user".to_string(),
-        content: MessageContent::Text(req.question),
+    messages.push(LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Text(req.question),
     });
 
     // --- Start SSE stream ---
     let (tx, rx) = mpsc::channel::<Result<sse::Event, Infallible>>(64);
-    // Investigation panel uses Anthropic-specific types (its own mini agent loop).
-    // Create a ClaudeClient from settings for investigation use.
-    let claude = match ClaudeClient::new(
-        state.settings.llm_api_key.clone(),
-        state.settings.llm_model.clone(),
-        4096,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            error!(error = %e, "failed to create investigation client");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to initialize investigation client"})),
-            )
-                .into_response());
-        }
-    };
+    let llm = state.llm.clone();
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
     let lock = state.investigation_lock.clone();
@@ -1090,7 +1082,7 @@ pub async fn handle_investigate(
         let _guard = lock.lock().await;
         let _agents = agents; // keep alive for the duration
         run_investigation(
-            &claude,
+            llm.as_ref(),
             &tools,
             InvestigationParams {
                 system_prompt,
