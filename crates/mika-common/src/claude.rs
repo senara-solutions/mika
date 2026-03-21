@@ -3,7 +3,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -296,6 +296,51 @@ impl ClaudeClient {
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+        let span = info_span!(
+            target: "mika::otel",
+            "llm_call",
+            model = %request.model,
+            max_tokens = request.max_tokens,
+        );
+
+        // Set gen_ai semantic convention attributes for Langfuse generation classification
+        #[cfg(feature = "telemetry")]
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute("gen_ai.operation.name", "chat");
+            span.set_attribute("gen_ai.provider.name", "anthropic");
+            span.set_attribute("gen_ai.request.model", request.model.clone());
+            span.set_attribute("gen_ai.request.max_tokens", request.max_tokens as i64);
+        }
+
+        let response = self
+            .send_message_inner(request)
+            .instrument(span.clone())
+            .await?;
+
+        // Set gen_ai response attributes after successful API call
+        #[cfg(feature = "telemetry")]
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute(
+                "gen_ai.usage.input_tokens",
+                response.usage.input_tokens as i64,
+            );
+            span.set_attribute(
+                "gen_ai.usage.output_tokens",
+                response.usage.output_tokens as i64,
+            );
+            span.set_attribute(
+                "gen_ai.response.finish_reasons",
+                format!("{:?}", response.stop_reason),
+            );
+        }
+
+        Ok(response)
+    }
+
+    /// Inner implementation of send_message with retry logic.
+    async fn send_message_inner(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
         info!(
             model = %request.model,
             max_tokens = request.max_tokens,

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 use super::error::LlmError;
 use super::types::*;
@@ -209,11 +209,9 @@ impl OpenAiCompatibleProvider {
 
         Ok(resp)
     }
-}
 
-#[async_trait]
-impl LlmProvider for OpenAiCompatibleProvider {
-    async fn send_message(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+    /// Inner implementation of send_message with retry logic.
+    async fn send_message_inner(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let openai_request = to_openai_request(request);
 
         info!(
@@ -261,6 +259,54 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
 
         Err(last_error.unwrap_or_else(|| LlmError::ProviderError("max retries exceeded".into())))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiCompatibleProvider {
+    async fn send_message(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let span = info_span!(
+            target: "mika::otel",
+            "llm_call",
+            model = %request.model,
+            max_tokens = request.max_tokens,
+            provider = %self.provider_kind,
+        );
+
+        // Set gen_ai semantic convention attributes for Langfuse generation classification
+        #[cfg(feature = "telemetry")]
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute("gen_ai.operation.name", "chat");
+            span.set_attribute("gen_ai.provider.name", self.provider_kind.to_string());
+            span.set_attribute("gen_ai.request.model", request.model.clone());
+            span.set_attribute("gen_ai.request.max_tokens", request.max_tokens as i64);
+        }
+
+        let response = self
+            .send_message_inner(request)
+            .instrument(span.clone())
+            .await?;
+
+        // Set gen_ai response attributes after successful API call
+        #[cfg(feature = "telemetry")]
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute(
+                "gen_ai.usage.input_tokens",
+                response.usage.input_tokens as i64,
+            );
+            span.set_attribute(
+                "gen_ai.usage.output_tokens",
+                response.usage.output_tokens as i64,
+            );
+            span.set_attribute(
+                "gen_ai.response.finish_reasons",
+                format!("{:?}", response.stop_reason),
+            );
+        }
+
+        Ok(response)
     }
 
     fn provider_name(&self) -> &str {

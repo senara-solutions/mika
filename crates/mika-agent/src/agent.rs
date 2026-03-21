@@ -691,6 +691,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
     let span = info_span!(
+        target: "mika::otel",
         "agent_turn",
         agent = %agent_name,
         mode = "conversation",
@@ -1294,6 +1295,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
     };
 
     let silent_span = info_span!(
+        target: "mika::otel",
         "agent_turn",
         agent = %params.home_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
         mode = "silent",
@@ -1652,7 +1654,9 @@ pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<Strin
 
 async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
     run_team_agent_inner_impl(params)
-        .instrument(tracing::info_span!("team_agent", agent = %params.agent_name))
+        .instrument(
+            tracing::info_span!(target: "mika::otel", "team_agent", agent = %params.agent_name),
+        )
         .await
 }
 
