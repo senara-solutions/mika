@@ -632,12 +632,45 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
         cache_read_input_tokens: None,
     });
 
+    // Extract <think>…</think> blocks as reasoning (e.g. MiniMax, DeepSeek).
+    let mut reasoning: Option<String> = None;
+    for item in &mut content {
+        if let LlmResponseContent::Text(text) = item
+            && let Some((think_text, stripped)) = extract_think_block(text)
+        {
+            reasoning = Some(think_text);
+            *text = stripped;
+        }
+    }
+    // Remove empty text entries left after stripping
+    content.retain(|c| !matches!(c, LlmResponseContent::Text(t) if t.is_empty()));
+
     Ok(LlmResponse {
         content,
-        reasoning: None,
+        reasoning,
         stop_reason,
         usage,
     })
+}
+
+/// Extract `<think>…</think>` block from text, returning (thinking, remaining_text).
+/// Returns `None` if no think block is found.
+fn extract_think_block(text: &str) -> Option<(String, String)> {
+    let start_tag = "<think>";
+    let end_tag = "</think>";
+    let start = text.find(start_tag)?;
+    let end = text.find(end_tag)?;
+    if end <= start {
+        return None;
+    }
+    let think_content = text[start + start_tag.len()..end].trim().to_string();
+    let remaining = format!("{}{}", &text[..start], &text[end + end_tag.len()..])
+        .trim()
+        .to_string();
+    if think_content.is_empty() {
+        return None;
+    }
+    Some((think_content, remaining))
 }
 
 #[cfg(test)]
@@ -953,5 +986,76 @@ mod tests {
         assert_eq!(json["max_tokens"], 4096);
         // tools should be omitted when None
         assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_extract_think_block_basic() {
+        let (thinking, remaining) =
+            extract_think_block("<think>Let me think...</think>Hello!").unwrap();
+        assert_eq!(thinking, "Let me think...");
+        assert_eq!(remaining, "Hello!");
+    }
+
+    #[test]
+    fn test_extract_think_block_with_newlines() {
+        let input = "<think>\nI should respond friendly.\n</think>\n\nHey Vincent!";
+        let (thinking, remaining) = extract_think_block(input).unwrap();
+        assert_eq!(thinking, "I should respond friendly.");
+        assert_eq!(remaining, "Hey Vincent!");
+    }
+
+    #[test]
+    fn test_extract_think_block_no_tags() {
+        assert!(extract_think_block("Just a normal response").is_none());
+    }
+
+    #[test]
+    fn test_extract_think_block_empty_think() {
+        assert!(extract_think_block("<think></think>Hello").is_none());
+    }
+
+    #[test]
+    fn test_from_openai_response_strips_think_tags() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<think>\nLet me think about this.\n</think>\n\nHello!".into(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+            }),
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.text(), "Hello!");
+        assert_eq!(llm.reasoning, Some("Let me think about this.".into()));
+    }
+
+    #[test]
+    fn test_from_openai_response_no_think_tags_unchanged() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.text(), "Hello!");
+        assert!(llm.reasoning.is_none());
     }
 }

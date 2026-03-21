@@ -166,7 +166,7 @@ impl ModelSpec {
             ProviderKind::OpenAi => Some("https://api.openai.com/v1"),
             ProviderKind::Ollama => Some("http://localhost:11434/v1"),
             ProviderKind::Groq => Some("https://api.groq.com/openai/v1"),
-            ProviderKind::MiniMax => Some("https://api.minimax.chat/v1"),
+            ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
             ProviderKind::Qwen => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
             ProviderKind::Kimi => Some("https://api.moonshot.ai/v1"),
             ProviderKind::OpenAiCompatible => None, // requires explicit base_url
