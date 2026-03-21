@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn test_default_base_urls_new_providers() {
         let spec = ModelSpec::parse("minimax/MiniMax-M2.5").unwrap();
-        assert_eq!(spec.default_base_url(), Some("https://api.minimax.chat/v1"));
+        assert_eq!(spec.default_base_url(), Some("https://api.minimax.io/v1"));
 
         let spec = ModelSpec::parse("qwen/qwen3.5-plus").unwrap();
         assert_eq!(
