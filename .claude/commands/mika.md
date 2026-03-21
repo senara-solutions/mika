@@ -33,11 +33,12 @@ Before running the pipeline, set up an isolated worktree:
 5. `/compound-engineering:resolve_todo_parallel`
 6. `/mika-doc-audit`
 7. `/ce:compound`
-8. Create a PR if one doesn't already exist. If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
+8. Run `bash scripts/verify-pipeline.sh` to verify pipeline artifacts exist. If it fails, read the error messages to identify missing artifacts, go back and produce them (run `/ce:plan` if no plan doc, `/ce:work` if no source changes), then re-run verification until it passes.
+9. Create a PR if one doesn't already exist. If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
 
 ## Cleanup
 
-9. If `CREATED_WORKTREE=true`: cd back to `ORIGINAL_DIR`, then run `git worktree remove --force <WORKTREE>`.
-10. Output `<promise>DONE</promise>` when complete
+10. Do NOT remove the worktree. Worktrees persist until the PR is merged — needed for CI fixes, review feedback, and acceptance testing. Cleanup happens post-merge.
+11. Output `<promise>DONE</promise>` when complete
 
 Start with worktree isolation, then step 1.
