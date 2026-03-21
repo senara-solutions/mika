@@ -29,9 +29,14 @@ dotenvy.workspace = true
 secrecy.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
+url.workspace = true
+hex.workspace = true
 
 [features]
-telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:base64"]
+telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dependencies.opentelemetry]
 workspace = true
@@ -46,10 +51,6 @@ workspace = true
 optional = true
 
 [dependencies.tracing-opentelemetry]
-workspace = true
-optional = true
-
-[dependencies.base64]
 workspace = true
 optional = true
 

@@ -13,6 +13,15 @@ pub async fn run(agent_name: &str, mode: SetupMode, api_key: Option<&str>) -> Re
         return run_compose_generation();
     }
 
+    // OAuth mode is a standalone flow — exchanges subscription token for access token
+    if matches!(mode, SetupMode::Oauth) {
+        let home_dir = home::resolve_home_dir()?;
+        if !home::is_initialized(&home_dir) {
+            home::bootstrap_fresh_install(&home_dir)?;
+        }
+        return run_oauth_setup(&home_dir).await;
+    }
+
     let home_dir = home::resolve_home_dir()?;
     let already_initialized = home::is_initialized(&home_dir);
 
@@ -61,7 +70,7 @@ pub async fn run(agent_name: &str, mode: SetupMode, api_key: Option<&str>) -> Re
     let mode_label = match mode {
         SetupMode::Cli => "CLI",
         SetupMode::Server => "Server",
-        SetupMode::Compose => unreachable!(),
+        SetupMode::Compose | SetupMode::Oauth => unreachable!(),
     };
     println!("\n  Mika Setup ({mode_label} Mode)\n");
 
@@ -237,6 +246,120 @@ fn run_server_prompts(
     }
 
     Ok(())
+}
+
+/// OAuth mode: PKCE flow to exchange an Anthropic subscription token for access tokens.
+async fn run_oauth_setup(home_dir: &Path) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "mika setup --mode oauth requires an interactive terminal. \
+             If running in CI, use a standard API key (sk-ant-api*) instead."
+        );
+    }
+
+    println!("\n  \u{1f510} Anthropic OAuth Setup (PKCE)\n");
+    println!("  This will authorize Mika to use your Claude Pro/Max subscription.\n");
+
+    // 1. Check for existing subscription token
+    let subscription_token = std::env::var("MIKA_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty() && mika_common::claude::is_oauth_token(k.trim()));
+
+    let subscription_token = if let Some(token) = subscription_token {
+        println!("  Found OAuth subscription token in MIKA_LLM_API_KEY.");
+        token.trim().to_string()
+    } else {
+        println!("  No subscription token found in MIKA_LLM_API_KEY.");
+        println!("  Run `claude setup-token` first to get one, then set MIKA_LLM_API_KEY.\n");
+        let token = Password::new()
+            .with_prompt("  Paste your subscription token (sk-ant-oat...)")
+            .interact()?;
+        let token = token.trim().to_string();
+        if !mika_common::claude::is_oauth_token(&token) {
+            bail!(
+                "Token does not start with 'sk-ant-oat'. \
+                 This command is for OAuth subscription tokens only. \
+                 Standard API keys (sk-ant-api*) don't need OAuth setup."
+            );
+        }
+        // Persist the subscription token to .env for future use
+        mika_common::dotenv::set_env_var(home_dir, "MIKA_LLM_API_KEY", &token)?;
+        token
+    };
+
+    // 2. Generate PKCE parameters
+    let params = mika_common::oauth::generate_pkce_params();
+
+    // 3. Show authorization URL
+    println!("\n  Opening your browser to authorize Mika...\n");
+    println!("  If the browser doesn't open, visit this URL manually:\n");
+    println!("  {}\n", params.authorize_url);
+
+    // Best-effort browser open
+    let _ = open_browser(&params.authorize_url);
+
+    // 4. Prompt for authorization code
+    println!("  After authorizing, you'll see a code on the page.\n");
+    let code: String = Input::new()
+        .with_prompt("  Paste the authorization code here")
+        .interact_text()?;
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        bail!("Authorization code is empty. Please try again.");
+    }
+
+    // 5. Exchange code for tokens
+    println!("\n  Exchanging code for tokens...");
+    let tokens =
+        mika_common::oauth::exchange_code(&code, &params.code_verifier, &subscription_token)
+            .await
+            .context(
+                "Failed to exchange authorization code. The code may have expired — try again.",
+            )?;
+
+    // 6. Persist tokens
+    mika_common::oauth::save_oauth_tokens(home_dir, &tokens)?;
+
+    println!(
+        "\n  \u{2705} OAuth tokens saved to {}",
+        home_dir.join("oauth.json").display()
+    );
+    println!("     Access token expires at: {}", tokens.expires_at);
+    println!("\n  Mika will automatically refresh the token when it expires.");
+    println!();
+
+    Ok(())
+}
+
+/// Open a URL in the default browser (best-effort, cross-platform).
+fn open_browser(url: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "linux")]
+    let result = Command::new("xdg-open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let result = Command::new("cmd")
+        .args(["/c", "start", url])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+
+    result.map(|_| ()).map_err(Into::into)
 }
 
 /// Compose mode: generate a standalone .env file for docker-compose in CWD.
