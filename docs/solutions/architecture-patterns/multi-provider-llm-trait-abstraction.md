@@ -61,14 +61,13 @@ pub trait LlmProvider: Send + Sync {
 - **Model switching**: Can't mutate `dyn LlmProvider`. Solution: recreate provider from
   settings when model changes via `/model` command.
 
-- **Investigation panel**: Kept Anthropic-only (own mini agent loop). Creates fresh
-  `ClaudeClient` since it's a specialized diagnostic feature.
-
 - **`Arc<dyn LlmProvider>`**: All consumers hold `Arc<dyn LlmProvider>` instead of
   `ClaudeClient`. Factory method `Settings::make_llm_provider()` handles construction.
+  The investigation panel (previously Anthropic-only) was migrated to `dyn LlmProvider`
+  in #224, completing the provider abstraction across all LLM-calling code paths.
 
 ## Prevention
 
 - When adding new LLM-dependent features, use `LlmProvider` trait, not `ClaudeClient` directly.
-- The `investigate.rs` pattern (direct `ClaudeClient`) is the exception, not the rule.
+- All LLM-calling code paths now use `dyn LlmProvider` — no exceptions remain.
 - Test with `dummy_provider()` in unit tests — no API calls needed.
