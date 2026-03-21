@@ -22,14 +22,12 @@ pub fn is_oauth_token(token: &str) -> bool {
 
 /// Anthropic authentication method, auto-detected from token prefix.
 ///
-/// Three variants:
+/// Two variants:
 /// - `ApiKey` — standard `sk-ant-api*` keys, sent via `x-api-key` header
-/// - `OAuthBearer` — raw static OAuth token (legacy/testing), sent via `Authorization: Bearer`
 /// - `OAuthManaged` — managed token lifecycle with auto-refresh via `OAuthTokenManager`
 #[derive(Clone)]
 enum AnthropicAuth {
     ApiKey(String),
-    OAuthBearer(String),
     OAuthManaged(Arc<OAuthTokenManager>),
 }
 
@@ -37,38 +35,21 @@ impl std::fmt::Debug for AnthropicAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ApiKey(_) => write!(f, "AnthropicAuth::ApiKey([REDACTED])"),
-            Self::OAuthBearer(_) => write!(f, "AnthropicAuth::OAuthBearer([REDACTED])"),
             Self::OAuthManaged(mgr) => write!(f, "AnthropicAuth::OAuthManaged({mgr:?})"),
         }
     }
 }
 
 impl AnthropicAuth {
-    /// Auto-detect auth method from token prefix.
-    /// Non-OAuth tokens use `ApiKey`; OAuth tokens use `OAuthBearer` (static).
-    /// For managed OAuth with auto-refresh, use `from_oauth_token()` instead.
-    fn from_token(token: String) -> Self {
-        if token.starts_with(OAUTH_TOKEN_PREFIX) {
-            Self::OAuthBearer(token)
-        } else {
-            Self::ApiKey(token)
-        }
-    }
-
     /// Create a managed OAuth auth from a subscription token.
     /// The manager handles token exchange and auto-refresh.
     fn from_oauth_token(subscription_token: String, home_dir: std::path::PathBuf) -> Self {
-        let manager = crate::oauth::create_token_manager(&subscription_token, home_dir);
+        let manager = Arc::new(OAuthTokenManager::new(&subscription_token, home_dir));
         Self::OAuthManaged(manager)
     }
 
-    /// Whether this is an OAuth bearer token (static or managed).
+    /// Whether this is an OAuth bearer token with managed auto-refresh.
     fn is_oauth(&self) -> bool {
-        matches!(self, Self::OAuthBearer(_) | Self::OAuthManaged(_))
-    }
-
-    /// Whether this is a managed OAuth token with auto-refresh.
-    fn is_oauth_managed(&self) -> bool {
         matches!(self, Self::OAuthManaged(_))
     }
 }
@@ -296,7 +277,7 @@ impl ClaudeClient {
             let home_dir = crate::home::resolve_home_dir()?;
             AnthropicAuth::from_oauth_token(credential, home_dir)
         } else {
-            AnthropicAuth::from_token(credential)
+            AnthropicAuth::ApiKey(credential)
         };
 
         let client = reqwest::Client::builder()
@@ -383,8 +364,6 @@ impl ClaudeClient {
             AnthropicAuth::ApiKey(k) => {
                 HeaderValue::from_str(k).context("invalid API key characters")?
             }
-            AnthropicAuth::OAuthBearer(t) => HeaderValue::from_str(&format!("Bearer {t}"))
-                .context("invalid OAuth token characters")?,
             AnthropicAuth::OAuthManaged(manager) => {
                 let token = manager.get_valid_token().await.context(
                     "OAuth token resolution failed. Run `mika setup --mode oauth` to authorize.",
@@ -441,12 +420,9 @@ impl ClaudeClient {
 
                     return Err(match &e {
                         ClaudeApiError::HttpError { status: 401, .. } => {
-                            let hint = if self.auth.is_oauth_managed() {
+                            let hint = if self.auth.is_oauth() {
                                 "Authentication failed after token refresh. \
                                  Run `mika setup --mode oauth` to re-authorize."
-                            } else if self.auth.is_oauth() {
-                                "Authentication failed. Your OAuth token may have expired. \
-                                 Run `mika setup --mode oauth` to get a new one."
                             } else {
                                 "Authentication failed. Check that MIKA_LLM_API_KEY is set to a valid Anthropic API key."
                             };
@@ -497,7 +473,7 @@ impl ClaudeClient {
             AnthropicAuth::ApiKey(_) => {
                 headers.insert("x-api-key", auth_header);
             }
-            AnthropicAuth::OAuthBearer(_) | AnthropicAuth::OAuthManaged(_) => {
+            AnthropicAuth::OAuthManaged(_) => {
                 headers.insert(AUTHORIZATION, auth_header);
             }
         }
@@ -641,24 +617,8 @@ mod tests {
     // -- AnthropicAuth tests --
 
     #[test]
-    fn test_auth_auto_detect_api_key() {
-        let auth = AnthropicAuth::from_token("sk-ant-api03-abc123".into());
-        assert!(matches!(auth, AnthropicAuth::ApiKey(_)));
-        assert!(!auth.is_oauth());
-    }
-
-    #[test]
-    fn test_auth_auto_detect_oauth_token() {
-        // from_token() creates OAuthBearer (static); from_oauth_token() creates OAuthManaged
-        let auth = AnthropicAuth::from_token("sk-ant-oat01-abc123def456".into());
-        assert!(matches!(auth, AnthropicAuth::OAuthBearer(_)));
-        assert!(auth.is_oauth());
-        assert!(!auth.is_oauth_managed());
-    }
-
-    #[test]
-    fn test_auth_unknown_prefix_falls_back_to_api_key() {
-        let auth = AnthropicAuth::from_token("some-random-key".into());
+    fn test_api_key_variant() {
+        let auth = AnthropicAuth::ApiKey("sk-ant-api03-abc123".into());
         assert!(matches!(auth, AnthropicAuth::ApiKey(_)));
         assert!(!auth.is_oauth());
     }
@@ -668,7 +628,7 @@ mod tests {
         let client =
             ClaudeClient::new(Some("sk-ant-oat01-test-token".into()), "model".into(), 100).unwrap();
         assert!(client.auth.is_oauth());
-        assert!(client.auth.is_oauth_managed());
+        assert!(matches!(client.auth, AnthropicAuth::OAuthManaged(_)));
     }
 
     #[test]
@@ -676,17 +636,18 @@ mod tests {
         let client =
             ClaudeClient::new(Some("sk-ant-api03-test-key".into()), "model".into(), 100).unwrap();
         assert!(!client.auth.is_oauth());
-        assert!(!client.auth.is_oauth_managed());
+        assert!(matches!(client.auth, AnthropicAuth::ApiKey(_)));
     }
 
     #[test]
-    fn test_oauth_managed_variant() {
+    fn test_oauth_managed_variant_debug_redacts() {
         let tmp = tempfile::tempdir().unwrap();
-        let manager =
-            crate::oauth::create_token_manager("sk-ant-oat01-test", tmp.path().to_path_buf());
+        let manager = Arc::new(crate::oauth::OAuthTokenManager::new(
+            "sk-ant-oat01-test",
+            tmp.path().to_path_buf(),
+        ));
         let auth = AnthropicAuth::OAuthManaged(manager);
         assert!(auth.is_oauth());
-        assert!(auth.is_oauth_managed());
         // Debug should not leak the subscription token
         let debug = format!("{:?}", auth);
         assert!(!debug.contains("sk-ant-oat01-test"));

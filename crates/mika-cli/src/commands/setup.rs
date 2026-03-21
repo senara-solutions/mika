@@ -299,6 +299,11 @@ async fn run_oauth_setup(home_dir: &Path) -> Result<()> {
     let _ = open_browser(&params.authorize_url);
 
     // 4. Prompt for authorization code
+    // Note: The PKCE `state` parameter is included in the authorize URL for spec compliance,
+    // but is not validated here. In this manual copy-paste flow (user opens browser themselves
+    // and copies the code), CSRF attacks are not applicable — there is no redirect endpoint
+    // for an attacker to intercept. State validation would be needed if a local HTTP callback
+    // listener were added in the future.
     println!("  After authorizing, you'll see a code on the page.\n");
     let code: String = Input::new()
         .with_prompt("  Paste the authorization code here")

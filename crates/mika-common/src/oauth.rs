@@ -14,7 +14,6 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -134,6 +133,22 @@ fn generate_state() -> String {
     hex::encode(bytes)
 }
 
+/// Maximum acceptable `expires_in` value from the token endpoint (30 days).
+const MAX_EXPIRES_IN_SECS: i64 = 86400 * 30;
+
+/// Validate the `expires_in` field from the token endpoint response.
+fn validate_expires_in(expires_in: i64) -> Result<()> {
+    if expires_in <= 0 {
+        anyhow::bail!("token endpoint returned non-positive expires_in: {expires_in}");
+    }
+    if expires_in > MAX_EXPIRES_IN_SECS {
+        anyhow::bail!(
+            "token endpoint returned unreasonably large expires_in: {expires_in}s (max {MAX_EXPIRES_IN_SECS}s)"
+        );
+    }
+    Ok(())
+}
+
 // -- Public API --
 
 /// Generate PKCE parameters and build the full authorization URL.
@@ -207,6 +222,7 @@ pub async fn exchange_code(
         .await
         .context("failed to parse token exchange response")?;
 
+    validate_expires_in(token_response.expires_in)?;
     let expires_at = Utc::now() + chrono::Duration::seconds(token_response.expires_in);
 
     Ok(OAuthTokens {
@@ -374,7 +390,7 @@ impl OAuthTokenManager {
     ///
     /// Used after a 401 response when the token was believed to be valid
     /// (handles clock skew between client and server).
-    pub async fn force_refresh(&self) -> Result<String> {
+    pub(crate) async fn force_refresh(&self) -> Result<String> {
         let mut cache = self.cache.write().await;
 
         // Load from disk if cache is empty
@@ -405,13 +421,8 @@ impl OAuthTokenManager {
 
     /// Check if the access token is still valid (not within the refresh buffer).
     fn is_token_valid(&self, tokens: &OAuthTokens) -> bool {
-        let Ok(expires_at) =
-            chrono::DateTime::parse_from_rfc3339(&tokens.expires_at).or_else(|_| {
-                // Also try our custom format without timezone offset
-                chrono::NaiveDateTime::parse_from_str(&tokens.expires_at, "%Y-%m-%dT%H:%M:%SZ")
-                    .map(|naive| naive.and_utc().fixed_offset())
-            })
-        else {
+        // Our format (%Y-%m-%dT%H:%M:%SZ) is valid RFC 3339 — Z is accepted.
+        let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(&tokens.expires_at) else {
             warn!(
                 expires_at = %tokens.expires_at,
                 "failed to parse OAuth token expiry timestamp"
@@ -450,6 +461,7 @@ impl OAuthTokenManager {
             .await
             .context("failed to parse token refresh response")?;
 
+        validate_expires_in(token_response.expires_in)?;
         let expires_at = Utc::now() + chrono::Duration::seconds(token_response.expires_in);
 
         Ok(OAuthTokens {
@@ -459,11 +471,6 @@ impl OAuthTokenManager {
             subscription_token_hash: self.subscription_hash.clone(),
         })
     }
-}
-
-/// Create a shared `OAuthTokenManager` wrapped in `Arc` for use across providers.
-pub fn create_token_manager(subscription_token: &str, home_dir: PathBuf) -> Arc<OAuthTokenManager> {
-    Arc::new(OAuthTokenManager::new(subscription_token, home_dir))
 }
 
 #[cfg(test)]
