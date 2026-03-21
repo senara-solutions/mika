@@ -10,7 +10,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - **Language:** Rust (edition 2024)
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context → build prompt → LLM API → match stop_reason → execute tools or respond
-- **LLM:** Multi-provider via `LlmProvider` trait — Anthropic (default, Claude Sonnet 4.6), OpenAI-compatible (OpenAI, Ollama, vLLM, Groq, Together). Provider selected by `llm_model` config with `provider/model` prefix (e.g., `openai/gpt-4o`, `ollama/llama3`). No prefix defaults to Anthropic.
+- **LLM:** Multi-provider via `LlmProvider` trait — Anthropic (default, Claude Sonnet 4.6), OpenAI-compatible (OpenAI, Ollama, vLLM, Groq, Together), plus first-class MiniMax (`minimax/`), Qwen (`qwen/`), and Kimi (`kimi/`) with built-in base URLs. Provider selected by `llm_model` config with `provider/model` prefix (e.g., `openai/gpt-4o`, `minimax/MiniMax-M2.5`, `ollama/llama3`). No prefix defaults to Anthropic.
 - **Database:** SQLite via rusqlite (single DB per container at `~/.mika/data/mika.db`)
 - **HTTP server:** Axum 0.8 (mika-server binary) with tower-http middleware
 - **HTTP client:** reqwest 0.12 with rustls-tls (Claude API client with typed errors and retry)
