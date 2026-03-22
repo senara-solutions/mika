@@ -310,15 +310,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     fn provider_name(&self) -> &str {
-        match self.provider_kind {
-            ProviderKind::OpenAi => "openai",
-            ProviderKind::Ollama => "ollama",
-            ProviderKind::Groq => "groq",
-            ProviderKind::MiniMax => "minimax",
-            ProviderKind::Qwen => "qwen",
-            ProviderKind::Kimi => "kimi",
-            _ => "openai-compatible",
-        }
+        self.provider_kind.config_prefix()
     }
 
     fn model_name(&self) -> &str {
@@ -336,7 +328,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
     fn supports_vision(&self) -> bool {
         matches!(
             self.provider_kind,
-            ProviderKind::OpenAi | ProviderKind::MiniMax | ProviderKind::Qwen | ProviderKind::Kimi
+            ProviderKind::OpenAi
+                | ProviderKind::OpenRouter
+                | ProviderKind::Mistral
+                | ProviderKind::Google
+                | ProviderKind::DeepSeek
         )
     }
 

@@ -5,6 +5,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::llm::ProviderKind;
+
 // -- Config Key Registry --
 
 /// Storage backend for a configuration key.
@@ -34,14 +36,185 @@ pub struct ConfigKeyInfo {
 
 /// All known configuration keys across all backends.
 pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
-    // File backend (config.toml)
+    // -- Active provider selection --
     ConfigKeyInfo {
-        key: "llm_model",
+        key: "llm_provider",
         backend: ConfigBackend::File,
-        env_var: Some("MIKA_LLM_MODEL"),
+        env_var: Some("MIKA_LLM_PROVIDER"),
         secret: false,
-        description: "LLM model ID (supports provider/model prefix)",
+        description: "Active LLM provider (anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek)",
     },
+    // -- Per-provider: Anthropic --
+    ConfigKeyInfo {
+        key: "anthropic_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_ANTHROPIC_MODEL"),
+        secret: false,
+        description: "Anthropic model ID",
+    },
+    ConfigKeyInfo {
+        key: "anthropic_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_ANTHROPIC_API_KEY"),
+        secret: true,
+        description: "Anthropic API key",
+    },
+    ConfigKeyInfo {
+        key: "anthropic_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_ANTHROPIC_BASE_URL"),
+        secret: false,
+        description: "Anthropic base URL override",
+    },
+    // -- Per-provider: OpenAI --
+    ConfigKeyInfo {
+        key: "openai_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OPENAI_MODEL"),
+        secret: false,
+        description: "OpenAI model ID",
+    },
+    ConfigKeyInfo {
+        key: "openai_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OPENAI_BASE_URL"),
+        secret: false,
+        description: "OpenAI base URL override",
+    },
+    // Note: openai_api_key is listed separately below (legacy, also used for embeddings)
+    // -- Per-provider: OpenRouter --
+    ConfigKeyInfo {
+        key: "openrouter_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OPENROUTER_MODEL"),
+        secret: false,
+        description: "OpenRouter model ID",
+    },
+    ConfigKeyInfo {
+        key: "openrouter_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_OPENROUTER_API_KEY"),
+        secret: true,
+        description: "OpenRouter API key",
+    },
+    ConfigKeyInfo {
+        key: "openrouter_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OPENROUTER_BASE_URL"),
+        secret: false,
+        description: "OpenRouter base URL override",
+    },
+    // -- Per-provider: Groq --
+    ConfigKeyInfo {
+        key: "groq_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_GROQ_MODEL"),
+        secret: false,
+        description: "Groq model ID",
+    },
+    ConfigKeyInfo {
+        key: "groq_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GROQ_API_KEY"),
+        secret: true,
+        description: "Groq API key",
+    },
+    ConfigKeyInfo {
+        key: "groq_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_GROQ_BASE_URL"),
+        secret: false,
+        description: "Groq base URL override",
+    },
+    // -- Per-provider: Ollama --
+    ConfigKeyInfo {
+        key: "ollama_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OLLAMA_MODEL"),
+        secret: false,
+        description: "Ollama model ID",
+    },
+    ConfigKeyInfo {
+        key: "ollama_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_OLLAMA_API_KEY"),
+        secret: true,
+        description: "Ollama API key (usually not needed)",
+    },
+    ConfigKeyInfo {
+        key: "ollama_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OLLAMA_BASE_URL"),
+        secret: false,
+        description: "Ollama base URL override",
+    },
+    // -- Per-provider: Mistral --
+    ConfigKeyInfo {
+        key: "mistral_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MISTRAL_MODEL"),
+        secret: false,
+        description: "Mistral model ID",
+    },
+    ConfigKeyInfo {
+        key: "mistral_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_MISTRAL_API_KEY"),
+        secret: true,
+        description: "Mistral API key",
+    },
+    ConfigKeyInfo {
+        key: "mistral_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MISTRAL_BASE_URL"),
+        secret: false,
+        description: "Mistral base URL override",
+    },
+    // -- Per-provider: Google --
+    ConfigKeyInfo {
+        key: "google_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_GOOGLE_MODEL"),
+        secret: false,
+        description: "Google AI model ID",
+    },
+    ConfigKeyInfo {
+        key: "google_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GOOGLE_API_KEY"),
+        secret: true,
+        description: "Google AI API key",
+    },
+    ConfigKeyInfo {
+        key: "google_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_GOOGLE_BASE_URL"),
+        secret: false,
+        description: "Google AI base URL override",
+    },
+    // -- Per-provider: DeepSeek --
+    ConfigKeyInfo {
+        key: "deepseek_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_DEEPSEEK_MODEL"),
+        secret: false,
+        description: "DeepSeek model ID",
+    },
+    ConfigKeyInfo {
+        key: "deepseek_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_DEEPSEEK_API_KEY"),
+        secret: true,
+        description: "DeepSeek API key",
+    },
+    ConfigKeyInfo {
+        key: "deepseek_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_DEEPSEEK_BASE_URL"),
+        secret: false,
+        description: "DeepSeek base URL override",
+    },
+    // -- Non-provider settings (File backend) --
     ConfigKeyInfo {
         key: "llm_max_tokens",
         backend: ConfigBackend::File,
@@ -85,33 +258,19 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Embedding vector dimensions",
     },
     ConfigKeyInfo {
-        key: "llm_base_url",
-        backend: ConfigBackend::File,
-        env_var: Some("MIKA_LLM_BASE_URL"),
-        secret: false,
-        description: "LLM provider base URL override",
-    },
-    ConfigKeyInfo {
         key: "dashboard_enabled",
         backend: ConfigBackend::File,
         env_var: Some("MIKA_DASHBOARD_ENABLED"),
         secret: false,
         description: "Enable embedded dashboard SPA at /dashboard/ (default: false)",
     },
-    // Env backend (.env secrets)
+    // -- Env backend (.env secrets) --
     ConfigKeyInfo {
         key: "openai_api_key",
         backend: ConfigBackend::Env,
         env_var: Some("MIKA_OPENAI_API_KEY"),
         secret: true,
-        description: "OpenAI API key (for embeddings)",
-    },
-    ConfigKeyInfo {
-        key: "llm_api_key",
-        backend: ConfigBackend::Env,
-        env_var: Some("MIKA_LLM_API_KEY"),
-        secret: true,
-        description: "LLM API key",
+        description: "OpenAI API key (for embeddings + OpenAI LLM provider)",
     },
     ConfigKeyInfo {
         key: "brave_api_key",
@@ -182,19 +341,50 @@ pub fn lookup_config_key(key: &str) -> Option<&'static ConfigKeyInfo> {
 /// For DB keys, returns None (caller must query the database).
 pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
     match key {
-        "llm_model" => Some(settings.llm_model.clone()),
+        "llm_provider" => Some(settings.llm_provider.to_string()),
         "llm_max_tokens" => Some(settings.llm_max_tokens.to_string()),
         "log_level" => Some(settings.log_level.clone()),
         "log_format" => Some(settings.log_format.clone()),
         "server_port" => Some(settings.server_port.to_string()),
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
-        "llm_base_url" => settings.llm_base_url.clone(),
-        "llm_api_key" => settings.llm_api_key.clone(),
-        "openai_api_key" => settings.openai_api_key.clone(),
-        "brave_api_key" => settings.brave_api_key.clone(),
         "dashboard_enabled" => Some(settings.dashboard_enabled.to_string()),
 
+        // Per-provider: Anthropic
+        "anthropic_model" => settings.anthropic_model.clone(),
+        "anthropic_api_key" => settings.anthropic_api_key.clone(),
+        "anthropic_base_url" => settings.anthropic_base_url.clone(),
+        // Per-provider: OpenAI (api_key shares with openai_api_key)
+        "openai_model" => settings.openai_model.clone(),
+        "openai_api_key" => settings.openai_api_key.clone(),
+        "openai_base_url" => settings.openai_base_url.clone(),
+        // Per-provider: OpenRouter
+        "openrouter_model" => settings.openrouter_model.clone(),
+        "openrouter_api_key" => settings.openrouter_api_key.clone(),
+        "openrouter_base_url" => settings.openrouter_base_url.clone(),
+        // Per-provider: Groq
+        "groq_model" => settings.groq_model.clone(),
+        "groq_api_key" => settings.groq_api_key.clone(),
+        "groq_base_url" => settings.groq_base_url.clone(),
+        // Per-provider: Ollama
+        "ollama_model" => settings.ollama_model.clone(),
+        "ollama_api_key" => settings.ollama_api_key.clone(),
+        "ollama_base_url" => settings.ollama_base_url.clone(),
+        // Per-provider: Mistral
+        "mistral_model" => settings.mistral_model.clone(),
+        "mistral_api_key" => settings.mistral_api_key.clone(),
+        "mistral_base_url" => settings.mistral_base_url.clone(),
+        // Per-provider: Google
+        "google_model" => settings.google_model.clone(),
+        "google_api_key" => settings.google_api_key.clone(),
+        "google_base_url" => settings.google_base_url.clone(),
+        // Per-provider: DeepSeek
+        "deepseek_model" => settings.deepseek_model.clone(),
+        "deepseek_api_key" => settings.deepseek_api_key.clone(),
+        "deepseek_base_url" => settings.deepseek_base_url.clone(),
+
+        // Non-provider secrets/settings
+        "brave_api_key" => settings.brave_api_key.clone(),
         "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
         "internal_token" => settings
@@ -210,16 +400,78 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
 
 #[derive(Deserialize, Clone)]
 pub struct Settings {
-    /// LLM model ID (default: claude-sonnet-4-6). Supports provider prefix:
-    /// `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`.
-    /// No prefix defaults to Anthropic.
-    #[serde(default = "default_llm_model")]
-    pub llm_model: String,
+    /// Active LLM provider. Each provider has its own model, api_key, and base_url fields.
+    #[serde(default = "default_llm_provider")]
+    pub llm_provider: ProviderKind,
 
     /// Max tokens for LLM responses
     #[serde(default = "default_max_tokens")]
     pub llm_max_tokens: u32,
 
+    // -- Per-provider fields: Anthropic --
+    #[serde(default)]
+    pub anthropic_model: Option<String>,
+    #[serde(default)]
+    pub anthropic_api_key: Option<String>,
+    #[serde(default)]
+    pub anthropic_base_url: Option<String>,
+
+    // -- Per-provider fields: OpenAI --
+    #[serde(default)]
+    pub openai_model: Option<String>,
+    // openai_api_key is below (shared with legacy embedding key)
+    #[serde(default)]
+    pub openai_base_url: Option<String>,
+
+    // -- Per-provider fields: OpenRouter --
+    #[serde(default)]
+    pub openrouter_model: Option<String>,
+    #[serde(default)]
+    pub openrouter_api_key: Option<String>,
+    #[serde(default)]
+    pub openrouter_base_url: Option<String>,
+
+    // -- Per-provider fields: Groq --
+    #[serde(default)]
+    pub groq_model: Option<String>,
+    #[serde(default)]
+    pub groq_api_key: Option<String>,
+    #[serde(default)]
+    pub groq_base_url: Option<String>,
+
+    // -- Per-provider fields: Ollama --
+    #[serde(default)]
+    pub ollama_model: Option<String>,
+    #[serde(default)]
+    pub ollama_api_key: Option<String>,
+    #[serde(default)]
+    pub ollama_base_url: Option<String>,
+
+    // -- Per-provider fields: Mistral --
+    #[serde(default)]
+    pub mistral_model: Option<String>,
+    #[serde(default)]
+    pub mistral_api_key: Option<String>,
+    #[serde(default)]
+    pub mistral_base_url: Option<String>,
+
+    // -- Per-provider fields: Google --
+    #[serde(default)]
+    pub google_model: Option<String>,
+    #[serde(default)]
+    pub google_api_key: Option<String>,
+    #[serde(default)]
+    pub google_base_url: Option<String>,
+
+    // -- Per-provider fields: DeepSeek --
+    #[serde(default)]
+    pub deepseek_model: Option<String>,
+    #[serde(default)]
+    pub deepseek_api_key: Option<String>,
+    #[serde(default)]
+    pub deepseek_base_url: Option<String>,
+
+    // -- Non-provider settings --
     /// SQLite database path
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
@@ -249,13 +501,11 @@ pub struct Settings {
     pub internal_token: Option<SecretString>,
 
     /// Separate bearer token for read-only dashboard API routes (env: MIKA_DASHBOARD_TOKEN).
-    /// If unset, dashboard routes accept `internal_token` for backwards compatibility.
-    /// This token only grants access to `/api/v1/*` routes — mutation endpoints still
-    /// require `internal_token`.
     #[serde(default)]
     pub dashboard_token: Option<SecretString>,
 
-    /// OpenAI API key for embeddings (optional; enables Layer 3 vector search)
+    /// OpenAI API key — used for embeddings AND as the OpenAI LLM provider's API key.
+    /// Legacy field: MIKA_OPENAI_API_KEY env var.
     #[serde(default)]
     pub openai_api_key: Option<String>,
 
@@ -283,15 +533,6 @@ pub struct Settings {
     #[serde(default)]
     pub github_repo: Option<String>,
 
-    /// LLM provider base URL override (for OpenAI-compatible providers)
-    #[serde(default)]
-    pub llm_base_url: Option<String>,
-
-    /// LLM API key (required for any command that calls an LLM).
-    /// Supports Anthropic API keys, OAuth tokens, and third-party provider keys.
-    #[serde(default)]
-    pub llm_api_key: Option<String>,
-
     /// Enable embedded dashboard SPA at /dashboard/ (default: false)
     #[serde(default)]
     pub dashboard_enabled: bool,
@@ -317,8 +558,8 @@ pub struct Settings {
     pub home_dir: PathBuf,
 }
 
-fn default_llm_model() -> String {
-    "claude-sonnet-4-6".to_string()
+fn default_llm_provider() -> ProviderKind {
+    ProviderKind::Anthropic
 }
 
 fn default_max_tokens() -> u32 {
@@ -349,19 +590,113 @@ fn default_embedding_dimensions() -> u32 {
     512
 }
 
+/// Per-provider config fields resolved for the active provider.
+pub struct ActiveLlmConfig {
+    pub provider: ProviderKind,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+}
+
 impl Settings {
+    /// Return `(model_field, api_key_field, base_url_field)` references for a given provider.
+    pub fn provider_fields(
+        &self,
+        provider: ProviderKind,
+    ) -> (Option<&str>, Option<&str>, Option<&str>) {
+        match provider {
+            ProviderKind::Anthropic => (
+                self.anthropic_model.as_deref(),
+                self.anthropic_api_key.as_deref(),
+                self.anthropic_base_url.as_deref(),
+            ),
+            ProviderKind::OpenAi => (
+                self.openai_model.as_deref(),
+                self.openai_api_key.as_deref(), // shared with embedding key
+                self.openai_base_url.as_deref(),
+            ),
+            ProviderKind::OpenRouter => (
+                self.openrouter_model.as_deref(),
+                self.openrouter_api_key.as_deref(),
+                self.openrouter_base_url.as_deref(),
+            ),
+            ProviderKind::Groq => (
+                self.groq_model.as_deref(),
+                self.groq_api_key.as_deref(),
+                self.groq_base_url.as_deref(),
+            ),
+            ProviderKind::Ollama => (
+                self.ollama_model.as_deref(),
+                self.ollama_api_key.as_deref(),
+                self.ollama_base_url.as_deref(),
+            ),
+            ProviderKind::Mistral => (
+                self.mistral_model.as_deref(),
+                self.mistral_api_key.as_deref(),
+                self.mistral_base_url.as_deref(),
+            ),
+            ProviderKind::Google => (
+                self.google_model.as_deref(),
+                self.google_api_key.as_deref(),
+                self.google_base_url.as_deref(),
+            ),
+            ProviderKind::DeepSeek => (
+                self.deepseek_model.as_deref(),
+                self.deepseek_api_key.as_deref(),
+                self.deepseek_base_url.as_deref(),
+            ),
+        }
+    }
+
+    /// Resolve the active LLM configuration from per-provider fields.
+    /// Falls back to the provider's default model if none is set.
+    pub fn active_llm_config(&self) -> ActiveLlmConfig {
+        let (model, api_key, base_url) = self.provider_fields(self.llm_provider);
+        ActiveLlmConfig {
+            provider: self.llm_provider,
+            model: model
+                .unwrap_or(self.llm_provider.default_model())
+                .to_string(),
+            api_key: api_key.map(String::from),
+            base_url: base_url.map(String::from),
+        }
+    }
+
+    /// Set the model for a given provider (used by `--model` overrides and `/model` command).
+    pub fn set_provider_model(&mut self, provider: ProviderKind, model: Option<String>) {
+        match provider {
+            ProviderKind::Anthropic => self.anthropic_model = model,
+            ProviderKind::OpenAi => self.openai_model = model,
+            ProviderKind::OpenRouter => self.openrouter_model = model,
+            ProviderKind::Groq => self.groq_model = model,
+            ProviderKind::Ollama => self.ollama_model = model,
+            ProviderKind::Mistral => self.mistral_model = model,
+            ProviderKind::Google => self.google_model = model,
+            ProviderKind::DeepSeek => self.deepseek_model = model,
+        }
+    }
+
+    /// The active model string for display (provider/model or just model for Anthropic).
+    pub fn active_model_display(&self) -> String {
+        let config = self.active_llm_config();
+        if config.provider == ProviderKind::Anthropic {
+            config.model
+        } else {
+            format!("{}/{}", config.provider, config.model)
+        }
+    }
+
     /// Create an LLM provider from the current settings.
     ///
-    /// Parses `llm_model` as a model spec (e.g. `anthropic/claude-sonnet-4-6`,
-    /// `openai/gpt-4o`, or just `claude-sonnet-4-6` which defaults to Anthropic).
-    /// Uses `llm_api_key` for all providers.
+    /// Resolves per-provider model, api_key, and base_url from the active provider's fields.
     pub fn make_llm_provider(&self) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
-        let spec = crate::llm::ModelSpec::parse(&self.llm_model)?;
-
-        let spec = spec
-            .with_base_url(self.llm_base_url.clone())
-            .with_api_key(self.llm_api_key.clone());
-
+        let config = self.active_llm_config();
+        let spec = crate::llm::ModelSpec {
+            provider: config.provider,
+            model: config.model,
+            base_url: config.base_url,
+            api_key: config.api_key,
+        };
         crate::llm::create_provider(&spec, self.llm_max_tokens)
     }
 
@@ -449,8 +784,58 @@ impl Settings {
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Settings")
-            .field("llm_model", &self.llm_model)
+            .field("llm_provider", &self.llm_provider)
             .field("llm_max_tokens", &self.llm_max_tokens)
+            // Per-provider (redact api_keys)
+            .field("anthropic_model", &self.anthropic_model)
+            .field(
+                "anthropic_api_key",
+                &self.anthropic_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("anthropic_base_url", &self.anthropic_base_url)
+            .field("openai_model", &self.openai_model)
+            .field(
+                "openai_api_key",
+                &self.openai_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("openai_base_url", &self.openai_base_url)
+            .field("openrouter_model", &self.openrouter_model)
+            .field(
+                "openrouter_api_key",
+                &self.openrouter_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("openrouter_base_url", &self.openrouter_base_url)
+            .field("groq_model", &self.groq_model)
+            .field(
+                "groq_api_key",
+                &self.groq_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("groq_base_url", &self.groq_base_url)
+            .field("ollama_model", &self.ollama_model)
+            .field(
+                "ollama_api_key",
+                &self.ollama_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("ollama_base_url", &self.ollama_base_url)
+            .field("mistral_model", &self.mistral_model)
+            .field(
+                "mistral_api_key",
+                &self.mistral_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("mistral_base_url", &self.mistral_base_url)
+            .field("google_model", &self.google_model)
+            .field(
+                "google_api_key",
+                &self.google_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("google_base_url", &self.google_base_url)
+            .field("deepseek_model", &self.deepseek_model)
+            .field(
+                "deepseek_api_key",
+                &self.deepseek_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("deepseek_base_url", &self.deepseek_base_url)
+            // Non-provider
             .field("db_path", &self.db_path)
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
@@ -465,17 +850,8 @@ impl std::fmt::Debug for Settings {
                 "dashboard_token",
                 &self.dashboard_token.as_ref().map(|_| "[REDACTED]"),
             )
-            .field(
-                "openai_api_key",
-                &self.openai_api_key.as_ref().map(|_| "[REDACTED]"),
-            )
             .field("embedding_model", &self.embedding_model)
             .field("embedding_dimensions", &self.embedding_dimensions)
-            .field("llm_base_url", &self.llm_base_url)
-            .field(
-                "llm_api_key",
-                &self.llm_api_key.as_ref().map(|_| "[REDACTED]"),
-            )
             .field(
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -508,7 +884,7 @@ mod tests {
     fn clean_env() {
         // Safety: tests set env vars; no production thread reads these.
         unsafe {
-            std::env::remove_var("MIKA_LLM_MODEL");
+            std::env::remove_var("MIKA_LLM_PROVIDER");
             std::env::remove_var("MIKA_DB_PATH");
             std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
         }
@@ -521,7 +897,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::load(tmp.path()).unwrap();
-        assert_eq!(settings.llm_model, "claude-sonnet-4-6");
+        assert_eq!(settings.llm_provider, ProviderKind::Anthropic);
         assert_eq!(settings.llm_max_tokens, 4096);
         assert_eq!(settings.log_level, "info");
         // db_path should resolve to home_dir/data/mika.db
@@ -539,12 +915,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),
-            "llm_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
+            "llm_provider = \"openai\"\nopenai_model = \"gpt-4o\"\nlog_level = \"debug\"\n",
         )
         .unwrap();
 
         let settings = Settings::load(tmp.path()).unwrap();
-        assert_eq!(settings.llm_model, "claude-opus-4-6");
+        assert_eq!(settings.llm_provider, ProviderKind::OpenAi);
+        assert_eq!(settings.openai_model, Some("gpt-4o".to_string()));
         assert_eq!(settings.log_level, "debug");
     }
 
@@ -553,20 +930,20 @@ mod tests {
     fn test_env_overrides_home_config() {
         clean_env();
         // Safety: test-only env var.
-        unsafe { std::env::set_var("MIKA_LLM_MODEL", "claude-haiku-4-5") };
+        unsafe { std::env::set_var("MIKA_LLM_PROVIDER", "groq") };
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),
-            "llm_model = \"claude-opus-4-6\"\n",
+            "llm_provider = \"openai\"\n",
         )
         .unwrap();
 
         let settings = Settings::load(tmp.path()).unwrap();
         // Env var should win over home config
-        assert_eq!(settings.llm_model, "claude-haiku-4-5");
+        assert_eq!(settings.llm_provider, ProviderKind::Groq);
 
-        unsafe { std::env::remove_var("MIKA_LLM_MODEL") };
+        unsafe { std::env::remove_var("MIKA_LLM_PROVIDER") };
     }
 
     #[test]
@@ -594,23 +971,23 @@ mod tests {
         std::fs::create_dir_all(&global_home).unwrap();
         std::fs::create_dir_all(&agent_home).unwrap();
 
-        // Global config sets model
+        // Global config sets provider and log_level
         std::fs::write(
             global_home.join("config.toml"),
-            "llm_model = \"claude-opus-4-6\"\nlog_level = \"debug\"\n",
+            "llm_provider = \"openai\"\nlog_level = \"debug\"\n",
         )
         .unwrap();
 
-        // Agent config overrides model but not log_level
+        // Agent config overrides provider but not log_level
         std::fs::write(
             agent_home.join("config.toml"),
-            "llm_model = \"claude-haiku-4-5\"\n",
+            "llm_provider = \"anthropic\"\n",
         )
         .unwrap();
 
         let settings = Settings::load_for_agent(&global_home, &agent_home).unwrap();
         // Agent config should override global config
-        assert_eq!(settings.llm_model, "claude-haiku-4-5");
+        assert_eq!(settings.llm_provider, ProviderKind::Anthropic);
         // log_level should come from global config
         assert_eq!(settings.log_level, "debug");
         // home_dir should be agent_home
@@ -627,13 +1004,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),
-            "llm_model = \"claude-opus-4-6\"\n",
+            "llm_provider = \"anthropic\"\n",
         )
         .unwrap();
 
         let via_load = Settings::load(tmp.path()).unwrap();
         let via_load_for_agent = Settings::load_for_agent(tmp.path(), tmp.path()).unwrap();
-        assert_eq!(via_load.llm_model, via_load_for_agent.llm_model);
+        assert_eq!(via_load.llm_provider, via_load_for_agent.llm_provider);
         assert_eq!(via_load.home_dir, via_load_for_agent.home_dir);
     }
 
@@ -649,5 +1026,46 @@ mod tests {
         assert!(settings.disable_bundled_skills);
 
         unsafe { std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_active_llm_config_uses_provider_defaults() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        let config = settings.active_llm_config();
+        assert_eq!(config.provider, ProviderKind::Anthropic);
+        assert_eq!(config.model, "claude-sonnet-4-6");
+        assert_eq!(config.api_key, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_active_llm_config_with_explicit_model() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "llm_provider = \"openai\"\nopenai_model = \"gpt-4-turbo\"\n",
+        )
+        .unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        let config = settings.active_llm_config();
+        assert_eq!(config.provider, ProviderKind::OpenAi);
+        assert_eq!(config.model, "gpt-4-turbo");
+    }
+
+    #[test]
+    #[serial]
+    fn test_active_model_display() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        // Anthropic shows just the model
+        assert_eq!(settings.active_model_display(), "claude-sonnet-4-6");
     }
 }

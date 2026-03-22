@@ -69,9 +69,37 @@ pub fn check_binary_in_path(name: &str) -> Option<PathBuf> {
 /// Validate a value for a config.toml (File backend) key.
 pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
     match key {
-        "llm_model" | "embedding_model" => {
+        "llm_provider" => {
+            value
+                .parse::<crate::llm::ProviderKind>()
+                .map_err(|e| format!("Invalid {key}: {e}"))?;
+        }
+        // Per-provider model fields + embedding_model: non-empty string
+        "anthropic_model" | "openai_model" | "openrouter_model" | "groq_model" | "ollama_model"
+        | "mistral_model" | "google_model" | "deepseek_model" | "embedding_model" => {
             if value.trim().is_empty() {
                 return Err(format!("{key} cannot be empty"));
+            }
+        }
+        // Per-provider base URL fields: valid http(s) URL
+        "anthropic_base_url"
+        | "openai_base_url"
+        | "openrouter_base_url"
+        | "groq_base_url"
+        | "ollama_base_url"
+        | "mistral_base_url"
+        | "google_base_url"
+        | "deepseek_base_url" => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("{key} cannot be empty"));
+            }
+            let parsed = reqwest::Url::parse(value).map_err(|e| format!("Invalid {key}: {e}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(format!(
+                    "Invalid {key}: must use http or https scheme, got '{}'",
+                    parsed.scheme()
+                ));
             }
         }
         "llm_max_tokens" => {
@@ -103,19 +131,6 @@ pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
                 .map_err(|_| format!("Invalid {key}: must be a positive integer"))?;
             if n == 0 || n > 4096 {
                 return Err(format!("Invalid {key}: must be between 1 and 4096"));
-            }
-        }
-        "llm_base_url" => {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(format!("{key} cannot be empty"));
-            }
-            let parsed = reqwest::Url::parse(value).map_err(|e| format!("Invalid {key}: {e}"))?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                return Err(format!(
-                    "Invalid {key}: must use http or https scheme, got '{}'",
-                    parsed.scheme()
-                ));
             }
         }
         _ => {}
@@ -195,10 +210,30 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_key_llm_model() {
-        assert!(validate_file_key("llm_model", "claude-sonnet-4-6").is_ok());
-        assert!(validate_file_key("llm_model", "").is_err());
-        assert!(validate_file_key("llm_model", "  ").is_err());
+    fn test_validate_file_key_llm_provider() {
+        assert!(validate_file_key("llm_provider", "anthropic").is_ok());
+        assert!(validate_file_key("llm_provider", "openai").is_ok());
+        assert!(validate_file_key("llm_provider", "deepseek").is_ok());
+        assert!(validate_file_key("llm_provider", "unknown").is_err());
+        assert!(validate_file_key("llm_provider", "").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_key_provider_model() {
+        assert!(validate_file_key("anthropic_model", "claude-sonnet-4-6").is_ok());
+        assert!(validate_file_key("openai_model", "gpt-4o").is_ok());
+        assert!(validate_file_key("anthropic_model", "").is_err());
+        assert!(validate_file_key("openai_model", "  ").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_key_provider_base_url() {
+        assert!(validate_file_key("anthropic_base_url", "https://api.anthropic.com").is_ok());
+        assert!(validate_file_key("openai_base_url", "https://api.openai.com/v1").is_ok());
+        assert!(validate_file_key("ollama_base_url", "http://localhost:11434/v1").is_ok());
+        assert!(validate_file_key("groq_base_url", "").is_err());
+        assert!(validate_file_key("deepseek_base_url", "file:///etc/passwd").is_err());
+        assert!(validate_file_key("mistral_base_url", "not-a-url").is_err());
     }
 
     #[test]
@@ -233,17 +268,6 @@ mod tests {
         assert!(validate_file_key("embedding_dimensions", "512").is_ok());
         assert!(validate_file_key("embedding_dimensions", "0").is_err());
         assert!(validate_file_key("embedding_dimensions", "4097").is_err());
-    }
-
-    #[test]
-    fn test_validate_file_key_llm_base_url() {
-        assert!(validate_file_key("llm_base_url", "http://localhost:11434/v1").is_ok());
-        assert!(validate_file_key("llm_base_url", "https://api.openai.com/v1").is_ok());
-        assert!(validate_file_key("llm_base_url", "").is_err());
-        assert!(validate_file_key("llm_base_url", "  ").is_err());
-        assert!(validate_file_key("llm_base_url", "file:///etc/passwd").is_err());
-        assert!(validate_file_key("llm_base_url", "gopher://evil.com").is_err());
-        assert!(validate_file_key("llm_base_url", "not-a-url").is_err());
     }
 
     #[cfg(unix)]

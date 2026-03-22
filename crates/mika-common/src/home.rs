@@ -167,10 +167,15 @@ pub fn write_active_agent(home_dir: &Path, name: &str) -> Result<()> {
 pub const DEFAULT_GLOBAL_CONFIG: &str = r#"# Mika global configuration (shared across all agents).
 # Override with MIKA_* environment variables (highest priority).
 #
-# Secrets go in ~/.mika/.env (auto-loaded, 0600 permissions):
-#   MIKA_LLM_API_KEY       — LLM API key (Anthropic, OpenAI, etc.)
-#   MIKA_OPENAI_API_KEY   — OpenAI API key (optional, for vector search)
-#   MIKA_BRAVE_API_KEY    — Brave Search API key (optional, for web search)
+# Per-provider API keys go in ~/.mika/.env (auto-loaded, 0600 permissions):
+#   MIKA_ANTHROPIC_API_KEY — Anthropic API key
+#   MIKA_OPENAI_API_KEY    — OpenAI API key (LLM + optional vector search)
+#   MIKA_OPENROUTER_API_KEY — OpenRouter API key
+#   MIKA_GROQ_API_KEY      — Groq API key
+#   MIKA_MISTRAL_API_KEY   — Mistral API key
+#   MIKA_GOOGLE_API_KEY    — Google AI API key
+#   MIKA_DEEPSEEK_API_KEY  — DeepSeek API key
+#   MIKA_BRAVE_API_KEY     — Brave Search API key (optional, for web search)
 
 log_level = "info"
 "#;
@@ -240,9 +245,20 @@ pub const DEFAULT_CONFIG: &str = r#"# Mika configuration (per-agent overrides).
 # Secrets go in ~/.mika/.env (auto-loaded, 0600 permissions).
 # Run `mika setup` to configure your API key.
 
-llm_model = "claude-sonnet-4-6"
+# Active LLM provider — one of: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek
+llm_provider = "anthropic"
 llm_max_tokens = 4096
 log_level = "info"
+
+# Per-provider model (optional — defaults to provider's recommended model)
+# anthropic_model = "claude-sonnet-4-6"
+# openai_model = "gpt-4o"
+# openrouter_model = "anthropic/claude-sonnet-4"
+# groq_model = "llama-3.3-70b-versatile"
+# ollama_model = "llama3"
+# mistral_model = "mistral-large-latest"
+# google_model = "gemini-2.5-flash"
+# deepseek_model = "deepseek-chat"
 "#;
 
 pub const DEFAULT_IDENTITY: &str = r#"name = "Mika"
@@ -346,7 +362,7 @@ mod tests {
 
         // Verify content
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        assert!(config.contains("llm_model"));
+        assert!(config.contains("llm_provider"));
         assert!(config.contains("mika setup"));
 
         let soul = fs::read_to_string(home.join("soul.md")).unwrap();

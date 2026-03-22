@@ -24,14 +24,16 @@ pub async fn run(args: ConfigArgs, agent_name: &str) -> Result<()> {
 async fn run_summary(agent_name: &str) -> Result<()> {
     let ctx = init::init_db_only_for_agent(agent_name)?;
 
+    let active_config = ctx.settings.active_llm_config();
     println!();
     println!("  Mika Configuration");
     println!("  Home:       {}", ctx.home_dir.display());
-    println!("  Model:      {}", ctx.settings.llm_model);
+    println!("  Provider:   {}", active_config.provider);
+    println!("  Model:      {}", ctx.settings.active_model_display());
     println!("  Max tokens: {}", ctx.settings.llm_max_tokens);
     println!("  Log level:  {}", ctx.settings.log_level);
     println!("  DB path:    {}", ctx.settings.db_path.display());
-    let auth_display = match &ctx.settings.llm_api_key {
+    let auth_display = match &active_config.api_key {
         Some(key) => {
             if is_oauth_token(key.trim()) {
                 "OAuth token [REDACTED]"
@@ -376,10 +378,10 @@ mod tests {
     fn test_write_config_toml_creates_new() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        write_config_toml(&path, "llm_model", "claude-opus-4-6").unwrap();
+        write_config_toml(&path, "anthropic_model", "claude-opus-4-6").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("llm_model = \"claude-opus-4-6\""));
+        assert!(content.contains("anthropic_model = \"claude-opus-4-6\""));
     }
 
     #[test]
@@ -388,24 +390,24 @@ mod tests {
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "# My comment\nlog_level = \"info\"\n").unwrap();
 
-        write_config_toml(&path, "llm_model", "claude-opus-4-6").unwrap();
+        write_config_toml(&path, "anthropic_model", "claude-opus-4-6").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("# My comment"));
         assert!(content.contains("log_level = \"info\""));
-        assert!(content.contains("llm_model = \"claude-opus-4-6\""));
+        assert!(content.contains("anthropic_model = \"claude-opus-4-6\""));
     }
 
     #[test]
     fn test_write_config_toml_updates_existing() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "llm_model = \"old-model\"\n").unwrap();
+        std::fs::write(&path, "anthropic_model = \"old-model\"\n").unwrap();
 
-        write_config_toml(&path, "llm_model", "new-model").unwrap();
+        write_config_toml(&path, "anthropic_model", "new-model").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("llm_model = \"new-model\""));
+        assert!(content.contains("anthropic_model = \"new-model\""));
         assert!(!content.contains("old-model"));
     }
 
@@ -424,9 +426,9 @@ mod tests {
     fn test_toml_key_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "llm_model = \"test\"\n").unwrap();
+        std::fs::write(&path, "llm_provider = \"anthropic\"\n").unwrap();
 
-        assert!(toml_key_exists(&path, "llm_model"));
+        assert!(toml_key_exists(&path, "llm_provider"));
         assert!(!toml_key_exists(&path, "log_level"));
     }
 
@@ -434,9 +436,9 @@ mod tests {
     fn test_env_key_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".env");
-        std::fs::write(&path, "# comment\nMIKA_LLM_API_KEY=\"test\"\n").unwrap();
+        std::fs::write(&path, "# comment\nMIKA_ANTHROPIC_API_KEY=\"test\"\n").unwrap();
 
-        assert!(env_key_exists(&path, "MIKA_LLM_API_KEY"));
+        assert!(env_key_exists(&path, "MIKA_ANTHROPIC_API_KEY"));
         assert!(!env_key_exists(&path, "MIKA_OPENAI_API_KEY"));
     }
 

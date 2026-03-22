@@ -421,10 +421,23 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             });
             app.needs_redraw = true;
 
-            // Persist to config.toml so the choice survives restarts
+            // Persist to config.toml so the choice survives restarts.
+            // Write the provider-specific model key (e.g., anthropic_model).
             let config_path = app.home_dir.join("config.toml");
+            // Parse provider/model if present to determine the right config key
+            let (provider_prefix, model_name) = if let Some(slash_pos) = full_id.find('/') {
+                let prefix = &full_id[..slash_pos];
+                if prefix.parse::<mika_common::llm::ProviderKind>().is_ok() {
+                    (prefix, &full_id[slash_pos + 1..])
+                } else {
+                    ("anthropic", full_id)
+                }
+            } else {
+                ("anthropic", full_id)
+            };
+            let model_key = format!("{provider_prefix}_model");
             if let Err(e) =
-                crate::commands::config::write_config_toml(&config_path, "llm_model", full_id)
+                crate::commands::config::write_config_toml(&config_path, &model_key, model_name)
             {
                 tracing::warn!(error = %e, "failed to persist model to config.toml");
             }

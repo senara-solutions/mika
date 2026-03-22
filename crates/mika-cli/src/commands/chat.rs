@@ -175,7 +175,7 @@ async fn spawn_agent_worker(
 
     let worker_db = ctx.async_db.clone();
     let mut worker_llm = ctx.llm.clone();
-    let worker_settings = ctx.settings.clone();
+    let mut worker_settings = ctx.settings.clone();
     let worker_tools = tool_registry.clone();
     let mut worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
@@ -375,11 +375,26 @@ async fn spawn_agent_worker(
                     }
                 }
                 AgentRequest::SetModel { model } => {
-                    // Recreate the LLM provider with the new model
+                    // Recreate the LLM provider with the new model.
+                    // Parse provider/model format if present, otherwise set on active provider.
                     let mut updated_settings = worker_settings.clone();
-                    updated_settings.llm_model = model;
+                    if let Some(slash_pos) = model.find('/') {
+                        let prefix = &model[..slash_pos];
+                        if let Ok(provider) = prefix.parse::<mika_common::llm::ProviderKind>() {
+                            let model_name = model[slash_pos + 1..].to_string();
+                            updated_settings.llm_provider = provider;
+                            updated_settings.set_provider_model(provider, Some(model_name));
+                        } else {
+                            let provider = updated_settings.llm_provider;
+                            updated_settings.set_provider_model(provider, Some(model.clone()));
+                        }
+                    } else {
+                        let provider = updated_settings.llm_provider;
+                        updated_settings.set_provider_model(provider, Some(model.clone()));
+                    }
                     if let Ok(new_llm) = updated_settings.make_llm_provider() {
                         worker_llm = new_llm;
+                        worker_settings = updated_settings;
                     }
                 }
                 AgentRequest::Quit => break,
@@ -391,7 +406,7 @@ async fn spawn_agent_worker(
         }
     });
 
-    let model = ctx.settings.llm_model.clone();
+    let model = ctx.settings.active_model_display();
     let identity_name = identity.name.clone();
 
     let worker = AgentWorker {
