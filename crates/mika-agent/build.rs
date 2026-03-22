@@ -41,4 +41,18 @@ fn main() {
     fs::create_dir_all(docs_out.join("openapi")).unwrap();
     fs::copy(&api_src, docs_out.join("openapi/mika-server.yaml"))
         .unwrap_or_else(|e| panic!("failed to copy {}: {e}", api_src.display()));
+
+    // Warn if dashboard assets are not present (rust-embed will embed zero files).
+    // Uses cargo:warning (not panic) so cargo test/clippy work without a dashboard build.
+    let dashboard_index = Path::new(&manifest_dir).join("../../dashboard/dist/index.html");
+    println!("cargo:rerun-if-changed={}", dashboard_index.display());
+    if !dashboard_index.exists()
+        || fs::metadata(&dashboard_index)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+    {
+        println!(
+            "cargo:warning=Dashboard assets not found at dashboard/dist/index.html — the embedded dashboard will be empty. Run: npm run build --prefix dashboard"
+        );
+    }
 }

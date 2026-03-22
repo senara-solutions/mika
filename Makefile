@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-server mika-gateway
 
-.PHONY: build build-dashboard deploy deploy-local stop restart install test lint fmt check clean help
+.PHONY: build build-dashboard deploy stop restart install test lint fmt check clean help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -63,9 +63,7 @@ install: ## Copy release binaries to INSTALL_DIR
 		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
 	done
 
-deploy: build stop install restart ## Build, stop, install, and restart (full deploy)
-
-deploy-dashboard: build-dashboard build stop install restart ## Build dashboard + binaries, stop, install, and restart
+deploy: build-dashboard build stop install restart ## Build dashboard + binaries, stop, install, and restart
 
 test: ## Run all tests
 	cargo test
