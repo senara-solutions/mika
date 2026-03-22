@@ -104,6 +104,8 @@ pub enum ProviderKind {
     Google,
     #[serde(rename = "deepseek")]
     DeepSeek,
+    #[serde(rename = "minimax")]
+    MiniMax,
 }
 
 impl ProviderKind {
@@ -117,6 +119,7 @@ impl ProviderKind {
         ProviderKind::Mistral,
         ProviderKind::Google,
         ProviderKind::DeepSeek,
+        ProviderKind::MiniMax,
     ];
 
     /// Config key prefix for per-provider settings (e.g., `"anthropic"` → `anthropic_model`).
@@ -130,6 +133,7 @@ impl ProviderKind {
             ProviderKind::Mistral => "mistral",
             ProviderKind::Google => "google",
             ProviderKind::DeepSeek => "deepseek",
+            ProviderKind::MiniMax => "minimax",
         }
     }
 
@@ -144,6 +148,7 @@ impl ProviderKind {
             ProviderKind::Mistral => Some("https://api.mistral.ai/v1"),
             ProviderKind::Google => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             ProviderKind::DeepSeek => Some("https://api.deepseek.com"),
+            ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
         }
     }
 
@@ -158,6 +163,7 @@ impl ProviderKind {
             ProviderKind::Mistral => "mistral-large-latest",
             ProviderKind::Google => "gemini-2.5-flash",
             ProviderKind::DeepSeek => "deepseek-chat",
+            ProviderKind::MiniMax => "MiniMax-M2.7",
         }
     }
 }
@@ -181,8 +187,9 @@ impl FromStr for ProviderKind {
             "mistral" => Ok(ProviderKind::Mistral),
             "google" => Ok(ProviderKind::Google),
             "deepseek" => Ok(ProviderKind::DeepSeek),
+            "minimax" => Ok(ProviderKind::MiniMax),
             _ => Err(format!(
-                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek"
+                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax"
             )),
         }
     }

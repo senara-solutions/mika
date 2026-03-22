@@ -212,6 +212,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         backend: ConfigBackend::File,
         env_var: Some("MIKA_DEEPSEEK_BASE_URL"),
         secret: false,
+        description: "DeepSeek base URL",
+    },
+    // MiniMax
+    ConfigKeyInfo {
+        key: "minimax_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MINIMAX_MODEL"),
+        secret: false,
+        description: "MiniMax model name",
+    },
+    ConfigKeyInfo {
+        key: "minimax_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_MINIMAX_API_KEY"),
+        secret: true,
+        description: "MiniMax API key",
+    },
+    ConfigKeyInfo {
+        key: "minimax_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MINIMAX_BASE_URL"),
+        secret: false,
         description: "DeepSeek base URL override",
     },
     // -- Non-provider settings (File backend) --
@@ -381,6 +403,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         // Per-provider: DeepSeek
         "deepseek_model" => settings.deepseek_model.clone(),
         "deepseek_api_key" => settings.deepseek_api_key.clone(),
+        "minimax_api_key" => settings.minimax_api_key.clone(),
         "deepseek_base_url" => settings.deepseek_base_url.clone(),
 
         // Non-provider secrets/settings
@@ -466,8 +489,11 @@ pub struct Settings {
     // -- Per-provider fields: DeepSeek --
     #[serde(default)]
     pub deepseek_model: Option<String>,
+    pub minimax_model: Option<String>,
+    pub minimax_base_url: Option<String>,
     #[serde(default)]
     pub deepseek_api_key: Option<String>,
+    pub minimax_api_key: Option<String>,
     #[serde(default)]
     pub deepseek_base_url: Option<String>,
 
@@ -645,6 +671,11 @@ impl Settings {
                 self.deepseek_api_key.as_deref(),
                 self.deepseek_base_url.as_deref(),
             ),
+            ProviderKind::MiniMax => (
+                self.minimax_model.as_deref(),
+                self.minimax_api_key.as_deref(),
+                self.minimax_base_url.as_deref(),
+            ),
         }
     }
 
@@ -673,6 +704,7 @@ impl Settings {
             ProviderKind::Mistral => self.mistral_model = model,
             ProviderKind::Google => self.google_model = model,
             ProviderKind::DeepSeek => self.deepseek_model = model,
+            ProviderKind::MiniMax => self.minimax_model = model,
         }
     }
 
@@ -833,6 +865,10 @@ impl std::fmt::Debug for Settings {
             .field(
                 "deepseek_api_key",
                 &self.deepseek_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "minimax_api_key",
+                &self.minimax_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("deepseek_base_url", &self.deepseek_base_url)
             // Non-provider
