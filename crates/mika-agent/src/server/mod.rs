@@ -1,6 +1,7 @@
 mod a2a;
 mod auth;
 pub mod dashboard;
+pub mod dashboard_dev_runs;
 pub mod embedded_dashboard;
 mod handlers;
 pub mod investigate;
@@ -102,6 +103,15 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/team-runs/{run_id}/summary",
             get(dashboard::handle_team_run_summary),
+        )
+        .route("/dev-runs", get(dashboard_dev_runs::handle_dev_runs_list))
+        .route(
+            "/dev-runs/{task_id}",
+            get(dashboard_dev_runs::handle_dev_run_detail),
+        )
+        .route(
+            "/dev-runs/{task_id}/merge",
+            post(dashboard_dev_runs::handle_dev_run_merge),
         )
         .route(
             "/investigate",
@@ -1251,6 +1261,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         })
         .await
         .unwrap()
@@ -1427,6 +1438,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: None,
                 source: None,
+                metadata: None,
             })
             .await
             .unwrap();

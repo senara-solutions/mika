@@ -35,14 +35,14 @@ pub struct PaginatedResponse<T: Serialize> {
     pub per_page: u32,
 }
 
-fn resolve_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, u32) {
+pub fn resolve_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, u32) {
     let page = page.unwrap_or(1).clamp(1, 100_000);
     let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE);
     let offset = (page - 1).saturating_mul(per_page);
     (page, per_page, offset)
 }
 
-fn internal_error(e: anyhow::Error) -> impl IntoResponse {
+pub fn internal_error(e: anyhow::Error) -> impl IntoResponse {
     error!(error = %e, "dashboard query failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,

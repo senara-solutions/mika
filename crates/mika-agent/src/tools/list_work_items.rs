@@ -165,6 +165,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: reference_url.map(|s| s.to_string()),
                 source: source.map(|s| s.to_string()),
+                metadata: None,
             })
             .await
             .unwrap()
@@ -271,6 +272,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: None,
                 source: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -317,6 +319,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: None,
                 source: None,
+                metadata: None,
             })
             .await
             .unwrap();

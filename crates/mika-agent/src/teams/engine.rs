@@ -830,6 +830,7 @@ impl TeamEngine {
             created_trace_id: Some(self.trace_id.clone()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
 
         let parent_task_id = self
@@ -864,6 +865,7 @@ impl TeamEngine {
                 created_trace_id: Some(self.trace_id.clone()),
                 reference_url: None,
                 source: None,
+                metadata: None,
             };
 
             match self.team_db.create_task(child_task).await {

@@ -139,6 +139,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: None,
                 source: None,
+                metadata: None,
             })
             .await
             .unwrap()

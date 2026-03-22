@@ -13,6 +13,9 @@ const VALID_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
+/// Maximum metadata JSON size (10 KB).
+const MAX_METADATA_LEN: usize = 10_240;
+
 pub struct UpdateWorkItemStatusTool;
 
 #[async_trait]
@@ -27,7 +30,8 @@ impl Tool for UpdateWorkItemStatusTool {
             description: "Update the status of a work item (manual task). \
                 Only works on manual work items, not system tasks (reminders, callbacks, etc.). \
                 Free transitions allowed — any status can move to any other status. \
-                Every transition is logged as an audit event."
+                Every transition is logged as an audit event. \
+                Optionally attach or merge structured metadata (JSON object) on the work item."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -44,6 +48,11 @@ impl Tool for UpdateWorkItemStatusTool {
                     "note": {
                         "type": "string",
                         "description": "Optional reason for the status change"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional structured metadata to merge into the work item. \
+                            Top-level keys are shallow-merged with existing metadata. Max 10 KB."
                     }
                 },
                 "required": ["task_id", "status"]
@@ -58,6 +67,7 @@ impl Tool for UpdateWorkItemStatusTool {
             .as_str()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
+        let metadata_input = input.get("metadata").filter(|v| !v.is_null());
 
         // Validate inputs
         if task_id.is_empty() {
@@ -84,6 +94,23 @@ impl Tool for UpdateWorkItemStatusTool {
             return Ok(ToolOutput::error("'note' is too long."));
         }
 
+        // Validate metadata if provided
+        if let Some(meta) = metadata_input {
+            if !meta.is_object() {
+                return Ok(ToolOutput::error(
+                    "'metadata' must be a JSON object, not an array or scalar.",
+                ));
+            }
+            let meta_str = serde_json::to_string(meta)?;
+            if meta_str.len() > MAX_METADATA_LEN {
+                return Ok(ToolOutput::error(format!(
+                    "'metadata' is too large ({} bytes). Maximum is {} bytes.",
+                    meta_str.len(),
+                    MAX_METADATA_LEN
+                )));
+            }
+        }
+
         // Update the task status (only works for manual/work item tasks)
         let old_status = match ctx.db.update_manual_task_status(task_id, status).await? {
             Some(old) => old,
@@ -94,10 +121,42 @@ impl Tool for UpdateWorkItemStatusTool {
             }
         };
 
+        // Merge and persist metadata if provided
+        if let Some(new_meta) = metadata_input {
+            let merged = if let Ok(Some(task)) = ctx.db.get_task_unscoped(task_id).await {
+                if let Some(existing_str) = &task.metadata {
+                    if let Ok(mut existing) = serde_json::from_str::<Value>(existing_str) {
+                        if let (Some(existing_obj), Some(new_obj)) =
+                            (existing.as_object_mut(), new_meta.as_object())
+                        {
+                            for (k, v) in new_obj {
+                                existing_obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                        existing
+                    } else {
+                        new_meta.clone()
+                    }
+                } else {
+                    new_meta.clone()
+                }
+            } else {
+                new_meta.clone()
+            };
+
+            let merged_str = serde_json::to_string(&merged)?;
+            ctx.db
+                .update_work_item_metadata(task_id, &merged_str)
+                .await?;
+        }
+
         if old_status == status {
-            return Ok(ToolOutput::success(format!(
-                "Work item {task_id} is already '{status}'. No change."
-            )));
+            let mut response =
+                format!("Work item {task_id} is already '{status}'. No status change.");
+            if metadata_input.is_some() {
+                response.push_str(" Metadata updated.");
+            }
+            return Ok(ToolOutput::success(response));
         }
 
         // Log audit event
@@ -116,6 +175,9 @@ impl Tool for UpdateWorkItemStatusTool {
         let mut response = format!("Work item {task_id}: {old_status} → {status}");
         if let Some(n) = note {
             response.push_str(&format!("\nNote: {n}"));
+        }
+        if metadata_input.is_some() {
+            response.push_str("\nMetadata updated.");
         }
 
         Ok(ToolOutput::success(response))
@@ -152,6 +214,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: None,
                 source: None,
+                metadata: None,
             })
             .await
             .unwrap()
@@ -256,7 +319,6 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_rejects_non_manual_task() {
         let harness = TestHarness::new();
-        // Create a callback task (not manual)
         let id = harness
             .db
             .create_task(NewTask {
@@ -279,6 +341,7 @@ mod tests {
                 created_trace_id: None,
                 reference_url: None,
                 source: None,
+                metadata: None,
             })
             .await
             .unwrap();
@@ -315,5 +378,99 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("'status' is required"));
+    }
+
+    #[tokio::test]
+    async fn test_update_status_with_metadata() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Meta item").await;
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"claude_pilot": {"branch": "feat/test", "repo": "mika"}}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("pending → in_progress"));
+        assert!(result.content.contains("Metadata updated"));
+    }
+
+    #[tokio::test]
+    async fn test_update_status_metadata_merge() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Merge meta").await;
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"claude_pilot": {"branch": "feat/test"}}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"extra": "data"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Metadata updated"));
+    }
+
+    #[tokio::test]
+    async fn test_update_status_rejects_non_object_metadata() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Bad meta").await;
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": "not an object"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("JSON object"));
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": [1, 2, 3]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("JSON object"));
     }
 }

@@ -782,6 +782,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -814,6 +815,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -845,6 +847,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;

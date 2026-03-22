@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -137,6 +137,7 @@ pub struct Task {
     pub completed_at: Option<String>,
     pub reference_url: Option<String>,
     pub source: Option<String>,
+    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,7 @@ pub struct NewTask {
     pub created_trace_id: Option<String>,
     pub reference_url: Option<String>,
     pub source: Option<String>,
+    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -587,6 +589,10 @@ impl Database {
             self.migrate_v12_to_v13()?;
             info!(version = 13, "database migrated to v13");
         }
+        if (3..=13).contains(&version) {
+            self.migrate_v13_to_v14()?;
+            info!(version = 14, "database migrated to v14");
+        }
         Ok(())
     }
 
@@ -641,7 +647,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (13);
+            INSERT INTO schema_version (version) VALUES (14);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -708,6 +714,7 @@ impl Database {
                 result TEXT,
                 reference_url TEXT,
                 source TEXT,
+                metadata TEXT,
                 created_by_session TEXT,
                 created_trace_id TEXT,
                 execution_trace_id TEXT,
@@ -2059,6 +2066,22 @@ impl Database {
         }
     }
 
+    fn migrate_v13_to_v14(&self) -> Result<()> {
+        info!("migrating database schema v13 → v14 (task metadata column)");
+
+        // Simple ALTER TABLE — SQLite supports adding nullable columns without table rebuild.
+        // Idempotent: check if column already exists before adding.
+        if !self.column_exists("tasks", "metadata")? {
+            self.conn
+                .execute_batch("ALTER TABLE tasks ADD COLUMN metadata TEXT;")?;
+        }
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (14)", [])?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -2199,13 +2222,13 @@ impl Database {
                 trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
                 next_fire_at, timeout_at, action_type, action_config,
                 input_context, created_by_session, created_trace_id,
-                reference_url, source
+                reference_url, source, metadata
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18,
-                ?19, ?20
+                ?19, ?20, ?21
              )",
             params![
                 id,
@@ -2228,6 +2251,7 @@ impl Database {
                 task.created_trace_id,
                 task.reference_url,
                 task.source,
+                task.metadata,
             ],
         )?;
         Ok(id)
@@ -2243,15 +2267,16 @@ impl Database {
               trigger_type, cron_expr, event_source, event_offset_secs,
               condition_expr, next_fire_at, timeout_at, action_type,
               action_config, status, input_context, created_by_session, created_trace_id,
-              reference_url, source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18,?19,?20)",
+              reference_url, source, metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18,?19,?20,?21)",
             params![
                 id, task.agent_id, task.team_run_id, task.parent_task_id,
                 task.depth, task.label, task.trigger_type, task.cron_expr,
                 task.event_source, task.event_offset_secs, task.condition_expr,
                 task.next_fire_at, task.timeout_at, task.action_type,
                 task.action_config, task.input_context, task.created_by_session,
-                task.created_trace_id, task.reference_url, task.source
+                task.created_trace_id, task.reference_url, task.source,
+                task.metadata
             ],
         )?;
         if n > 0 {
@@ -2329,6 +2354,7 @@ impl Database {
             completed_at: r.get(25)?,
             reference_url: r.get(26)?,
             source: r.get(27)?,
+            metadata: r.get(28)?,
         })
     }
 
@@ -2337,7 +2363,7 @@ impl Database {
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
          created_trace_id, execution_trace_id, created_at, updated_at, fired_at, completed_at,
-         reference_url, source";
+         reference_url, source, metadata";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
@@ -2488,7 +2514,7 @@ impl Database {
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
-    const TASK_COLUMN_COUNT: usize = 28;
+    const TASK_COLUMN_COUNT: usize = 29;
 
     /// List manual (work item) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
@@ -5500,6 +5526,77 @@ impl Database {
         let data = self.list_team_runs_paginated(filters, limit, offset)?;
         Ok((data, count))
     }
+
+    // ===== Dashboard: Dev Runs (work items with source='self_dev') =====
+
+    /// Update the metadata JSON on a manual (work item) task.
+    /// Only works on `trigger_type='manual'` tasks. Returns false if not found.
+    pub fn update_work_item_metadata(&self, task_id: &str, metadata_json: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET metadata = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2 AND trigger_type = 'manual'",
+            params![metadata_json, task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Get a single dev run (work item with source='self_dev') by ID — unscoped by agent_id.
+    pub fn get_dev_run(&self, task_id: &str) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE id = ?1 AND trigger_type = 'manual' AND source = 'self_dev'",
+            Self::TASK_COLUMNS
+        );
+        self.conn
+            .query_row(&sql, params![task_id], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// List dev runs (work items with source='self_dev') with pagination and count.
+    pub fn list_dev_runs_paginated_with_count(
+        &self,
+        status: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Task>, u64)> {
+        let (count_sql, data_sql, status_param);
+
+        if let Some(s) = status {
+            status_param = Some(s.to_string());
+            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev' AND status = ?1";
+            data_sql = format!(
+                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev' AND status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                Self::TASK_COLUMNS
+            );
+        } else {
+            status_param = None;
+            count_sql =
+                "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev'";
+            data_sql = format!(
+                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev' ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                Self::TASK_COLUMNS
+            );
+        }
+
+        let count: u64 = if let Some(ref s) = status_param {
+            self.conn
+                .query_row(count_sql, params![s], |r| r.get::<_, i64>(0))? as u64
+        } else {
+            self.conn.query_row(count_sql, [], |r| r.get::<_, i64>(0))? as u64
+        };
+
+        let data: Vec<Task> = if let Some(ref s) = status_param {
+            let mut stmt = self.conn.prepare(&data_sql)?;
+            stmt.query_map(params![s, limit as i64, offset as i64], Self::row_to_task)?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            let mut stmt = self.conn.prepare(&data_sql)?;
+            stmt.query_map(params![limit as i64, offset as i64], Self::row_to_task)?
+                .collect::<rusqlite::Result<_>>()?
+        };
+
+        Ok((data, count))
+    }
 }
 
 // ===== Utility Functions =====
@@ -6050,6 +6147,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -6081,6 +6179,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
         assert!(db.cancel_task(&id, "mika").unwrap());
@@ -6236,6 +6335,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
@@ -6262,6 +6362,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         }
     }
 
@@ -6497,6 +6598,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id1 = db.create_task(&task).unwrap();
         assert!(!id1.is_empty());
@@ -6527,6 +6629,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id2 = db.create_task(&task2).unwrap();
         assert!(!id2.is_empty());
@@ -6559,6 +6662,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         }
     }
 
@@ -6877,6 +6981,7 @@ mod tests {
             created_trace_id: Some(trace.to_string()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
         db.create_task(&task).unwrap();
 
@@ -6996,9 +7101,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_13() {
+    fn test_schema_version_is_14() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -7036,6 +7141,7 @@ mod tests {
             created_trace_id: Some("created-trace-aaa".to_string()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -7079,6 +7185,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -7153,6 +7260,7 @@ mod tests {
             created_trace_id: Some("created-trace-111".to_string()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
 

@@ -163,6 +163,7 @@ impl Tool for CreateWorkItemTool {
             created_trace_id: Some(ctx.trace_id.to_string()),
             reference_url: reference_url.map(|s| s.to_string()),
             source: source.map(|s| s.to_string()),
+            metadata: None,
         };
 
         let id = ctx.db.create_task(task).await?;
