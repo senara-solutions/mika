@@ -404,6 +404,8 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "deepseek_model" => settings.deepseek_model.clone(),
         "deepseek_api_key" => settings.deepseek_api_key.clone(),
         "minimax_api_key" => settings.minimax_api_key.clone(),
+        "kimi_api_key" => settings.kimi_api_key.clone(),
+        "qwen_api_key" => settings.qwen_api_key.clone(),
         "deepseek_base_url" => settings.deepseek_base_url.clone(),
 
         // Non-provider secrets/settings
@@ -491,6 +493,12 @@ pub struct Settings {
     pub deepseek_model: Option<String>,
     pub minimax_model: Option<String>,
     pub minimax_base_url: Option<String>,
+    pub kimi_api_key: Option<String>,
+    pub kimi_model: Option<String>,
+    pub kimi_base_url: Option<String>,
+    pub qwen_api_key: Option<String>,
+    pub qwen_model: Option<String>,
+    pub qwen_base_url: Option<String>,
     #[serde(default)]
     pub deepseek_api_key: Option<String>,
     pub minimax_api_key: Option<String>,
@@ -676,6 +684,16 @@ impl Settings {
                 self.minimax_api_key.as_deref(),
                 self.minimax_base_url.as_deref(),
             ),
+            ProviderKind::Kimi => (
+                self.kimi_model.as_deref(),
+                self.kimi_api_key.as_deref(),
+                self.kimi_base_url.as_deref(),
+            ),
+            ProviderKind::Qwen => (
+                self.qwen_model.as_deref(),
+                self.qwen_api_key.as_deref(),
+                self.qwen_base_url.as_deref(),
+            ),
         }
     }
 
@@ -705,6 +723,8 @@ impl Settings {
             ProviderKind::Google => self.google_model = model,
             ProviderKind::DeepSeek => self.deepseek_model = model,
             ProviderKind::MiniMax => self.minimax_model = model,
+            ProviderKind::Kimi => self.kimi_model = model,
+            ProviderKind::Qwen => self.qwen_model = model,
         }
     }
 

@@ -106,6 +106,8 @@ pub enum ProviderKind {
     DeepSeek,
     #[serde(rename = "minimax")]
     MiniMax,
+    Kimi,
+    Qwen,
 }
 
 impl ProviderKind {
@@ -120,6 +122,8 @@ impl ProviderKind {
         ProviderKind::Google,
         ProviderKind::DeepSeek,
         ProviderKind::MiniMax,
+        ProviderKind::Kimi,
+        ProviderKind::Qwen,
     ];
 
     /// Config key prefix for per-provider settings (e.g., `"anthropic"` → `anthropic_model`).
@@ -134,6 +138,8 @@ impl ProviderKind {
             ProviderKind::Google => "google",
             ProviderKind::DeepSeek => "deepseek",
             ProviderKind::MiniMax => "minimax",
+            ProviderKind::Kimi => "kimi",
+            ProviderKind::Qwen => "qwen",
         }
     }
 
@@ -149,6 +155,8 @@ impl ProviderKind {
             ProviderKind::Google => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             ProviderKind::DeepSeek => Some("https://api.deepseek.com"),
             ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
+            ProviderKind::Kimi => Some("https://api.moonshot.cn/v1"),
+            ProviderKind::Qwen => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         }
     }
 
@@ -164,6 +172,8 @@ impl ProviderKind {
             ProviderKind::Google => "gemini-2.5-flash",
             ProviderKind::DeepSeek => "deepseek-chat",
             ProviderKind::MiniMax => "MiniMax-M2.7",
+            ProviderKind::Kimi => "moonshot-v1-128k",
+            ProviderKind::Qwen => "qwen-plus",
         }
     }
 }
@@ -188,8 +198,10 @@ impl FromStr for ProviderKind {
             "google" => Ok(ProviderKind::Google),
             "deepseek" => Ok(ProviderKind::DeepSeek),
             "minimax" => Ok(ProviderKind::MiniMax),
+            "kimi" => Ok(ProviderKind::Kimi),
+            "qwen" => Ok(ProviderKind::Qwen),
             _ => Err(format!(
-                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax"
+                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen"
             )),
         }
     }
