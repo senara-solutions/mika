@@ -454,6 +454,7 @@ pub async fn run(
         skill_registry,
         agent_name.to_string(),
         worker._ctx.global_home.clone(),
+        worker._ctx.settings.llm_provider,
     );
 
     // Load recent conversation history so the user sees prior messages on restart
