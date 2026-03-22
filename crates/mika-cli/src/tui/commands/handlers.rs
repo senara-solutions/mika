@@ -680,14 +680,23 @@ fn handle_skills(app: &App<'_>) -> String {
         } else {
             ""
         };
+        let variants = {
+            let count = entry.variant_count();
+            if count > 0 {
+                format!(" [variants: {count}]")
+            } else {
+                String::new()
+            }
+        };
         let _ = writeln!(
             out,
-            "  ● {:<width$}  {:<9}  {}{}{}",
+            "  ● {:<width$}  {:<9}  {}{}{}{}",
             entry.manifest.skill.name,
             tool_info,
             entry.manifest.skill.description,
             disabled,
             overridden,
+            variants,
             width = max_name_width
         );
     };
@@ -803,6 +812,15 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
                 let _ = writeln!(out, "  Tools: {}", tool_names.join(", "));
             }
             let _ = writeln!(out, "  Path: {}", entry.dir.display());
+            let providers = entry.variant_providers();
+            if !providers.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  Variants: {} ({})",
+                    providers.len(),
+                    providers.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
             out
         }
         None => {

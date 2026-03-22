@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use mika_common::claude::ToolDefinition;
+use mika_common::llm::ProviderKind;
 
 use super::builtin_handlers::KNOWN_BUILTINS;
-use super::manifest::{SkillManifest, SkillToolDef, ToolHandler};
+use super::manifest::{
+    ProviderSkillFields, ProviderSkillOverride, SkillManifest, SkillToolDef, ToolHandler,
+};
 
 /// Maximum size for skill.toml files (64 KB).
 const MAX_SKILL_TOML_SIZE: u64 = 64 * 1024;
@@ -42,6 +46,41 @@ pub struct SkillEntry {
     pub enabled: bool,
     /// Whether this entry has a DB override applied (for display purposes).
     pub has_override: bool,
+    /// Provider-specific prompt snippet overrides.
+    /// Key = provider name (e.g., "anthropic"), value = prompt content.
+    /// Empty map if no variants exist. Populated eagerly at scan time.
+    pub provider_prompts: HashMap<String, String>,
+    /// Provider-specific manifest field overrides.
+    /// Key = provider name, value = sparse override fields.
+    /// Empty map if no variants exist.
+    pub provider_overrides: HashMap<String, ProviderSkillFields>,
+}
+
+impl SkillEntry {
+    /// Effective timeout for a given provider, considering overrides.
+    pub fn effective_timeout(&self, provider: &str) -> u64 {
+        self.provider_overrides
+            .get(provider)
+            .and_then(|o| o.timeout_secs)
+            .unwrap_or(self.manifest.skill.timeout_secs)
+    }
+
+    /// Sorted set of all provider names that have any variant (prompt or override).
+    pub fn variant_providers(&self) -> std::collections::BTreeSet<&str> {
+        let mut providers = std::collections::BTreeSet::new();
+        for key in self.provider_prompts.keys() {
+            providers.insert(key.as_str());
+        }
+        for key in self.provider_overrides.keys() {
+            providers.insert(key.as_str());
+        }
+        providers
+    }
+
+    /// Number of provider variants (prompt or override) attached to this skill.
+    pub fn variant_count(&self) -> usize {
+        self.variant_providers().len()
+    }
 }
 
 /// Result of scanning a skills directory.
@@ -183,6 +222,9 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         // Parse tools.json if present
         let skill_tools = load_tools_json(&path);
 
+        // Scan for provider variant directories
+        let (provider_prompts, provider_overrides) = scan_provider_variants(&path, &manifest);
+
         entries.push(SkillEntry {
             manifest,
             dir: path,
@@ -191,6 +233,8 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             skill_tools,
             enabled,
             has_override: false,
+            provider_prompts,
+            provider_overrides,
         });
     }
 
@@ -421,7 +465,123 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
-    // 7. Warnings for no-op or never-activates skills
+    // 7. Validate provider variant directories
+    if let Ok(rd) = std::fs::read_dir(skill_dir) {
+        for dir_entry in rd.flatten() {
+            let sub_path = dir_entry.path();
+            if !sub_path.is_dir() {
+                continue;
+            }
+            let subdir_name = match sub_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            if subdir_name.parse::<ProviderKind>().is_ok() {
+                // Known provider — validate its contents
+                let has_prompt = sub_path.join("system_prompt.md").exists();
+                let has_override = sub_path.join("skill.toml").exists();
+
+                if !has_prompt && !has_override {
+                    diags.push(SkillDiagnostic::warn(format!(
+                        "provider variant '{subdir_name}/' is empty (no system_prompt.md or skill.toml)"
+                    )));
+                    continue;
+                }
+
+                // Validate prompt size
+                if has_prompt {
+                    let prompt_path = sub_path.join("system_prompt.md");
+                    let effective_limit = manifest
+                        .skill
+                        .max_prompt_size
+                        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+                        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+                    if let Ok(meta) = std::fs::metadata(&prompt_path) {
+                        if meta.len() > effective_limit {
+                            diags.push(SkillDiagnostic::fail(format!(
+                                "provider '{subdir_name}/system_prompt.md' ({} bytes) exceeds limit ({} bytes)",
+                                meta.len(), effective_limit
+                            )));
+                        } else {
+                            diags.push(SkillDiagnostic::ok(format!(
+                                "provider '{subdir_name}/system_prompt.md' size OK ({} bytes)",
+                                meta.len()
+                            )));
+                        }
+                    }
+                }
+
+                // Validate override parseability and check for identity fields
+                if has_override {
+                    let override_path = sub_path.join("skill.toml");
+                    match std::fs::read_to_string(&override_path) {
+                        Ok(content) => match toml::from_str::<ProviderSkillOverride>(&content) {
+                            Ok(_) => {
+                                diags.push(SkillDiagnostic::ok(format!(
+                                    "provider '{subdir_name}/skill.toml' valid"
+                                )));
+                                // Warn if identity fields are present (they are silently ignored)
+                                if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
+                                    if let Some(skill_table) =
+                                        raw.get("skill").and_then(|v| v.as_table())
+                                    {
+                                        for field in &["name", "description"] {
+                                            if skill_table.contains_key(*field) {
+                                                diags.push(SkillDiagnostic::warn(format!(
+                                                    "provider '{subdir_name}/skill.toml' contains identity field '{field}' which is ignored — identity fields cannot be overridden per-provider"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    // [triggers] is a top-level section, not inside [skill]
+                                    if raw.get("triggers").is_some() {
+                                        diags.push(SkillDiagnostic::warn(format!(
+                                            "provider '{subdir_name}/skill.toml' contains [triggers] section which is ignored — triggers cannot be overridden per-provider"
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                diags.push(SkillDiagnostic::fail(format!(
+                                    "provider '{subdir_name}/skill.toml' invalid: {e}"
+                                )));
+                            }
+                        },
+                        Err(e) => {
+                            diags.push(SkillDiagnostic::fail(format!(
+                                "cannot read provider '{subdir_name}/skill.toml': {e}"
+                            )));
+                        }
+                    }
+                }
+
+                // Warn if provider subdir contains tools.json (not supported)
+                if sub_path.join("tools.json").exists() {
+                    diags.push(SkillDiagnostic::warn(format!(
+                        "provider '{subdir_name}/tools.json' is not supported — tools cannot be overridden per-provider"
+                    )));
+                }
+            } else {
+                // Not a known provider — check for typos
+                let known_names: Vec<&str> = ProviderKind::ALL
+                    .iter()
+                    .map(|p| p.config_prefix())
+                    .collect();
+                // Simple typo detection: check Levenshtein-like similarity
+                for known in &known_names {
+                    if looks_like_typo(&subdir_name, known) {
+                        diags.push(SkillDiagnostic::warn(format!(
+                            "subdirectory '{subdir_name}/' looks like a misspelling of provider '{known}'"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 8. Warnings for no-op or never-activates skills
     let has_tools = tools_path.exists();
     let has_snippet = snippet_path.exists();
     if !has_tools && !has_snippet {
@@ -458,6 +618,53 @@ fn is_legacy_format(content: &str) -> bool {
     false
 }
 
+/// Simple typo detection: checks if two strings are close enough to be a misspelling.
+/// Uses Levenshtein edit distance — two strings within edit distance 2 and
+/// at least 4 characters long are considered potential typos.
+fn looks_like_typo(input: &str, known: &str) -> bool {
+    let a = input.to_lowercase();
+    let b = known.to_lowercase();
+
+    // Exact match is not a typo (it's a valid provider handled elsewhere)
+    if a == b {
+        return false;
+    }
+
+    // Too short — "foo" matches too many things
+    if a.len() < 4 || b.len() < 4 {
+        return false;
+    }
+
+    let len_diff = (a.len() as isize - b.len() as isize).unsigned_abs();
+    if len_diff > 2 {
+        return false;
+    }
+
+    // Compute Levenshtein distance
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = a_chars.len();
+    let m = b_chars.len();
+
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr = vec![0usize; m + 1];
+
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[m] <= 2
+}
+
 /// Inject `work_item_id` as a required field into a tool's input schema.
 ///
 /// Long-running exec handlers must track delegation via work items.
@@ -477,6 +684,100 @@ fn inject_work_item_id_field(schema: &mut serde_json::Value) {
     } else {
         schema["required"] = serde_json::json!(["work_item_id"]);
     }
+}
+
+/// Scan a skill directory for provider variant subdirectories.
+///
+/// Iterates over immediate subdirectories and checks if each name matches
+/// a known `ProviderKind`. For matching directories, loads any
+/// `system_prompt.md` and `skill.toml` (as sparse override).
+fn scan_provider_variants(
+    skill_dir: &Path,
+    manifest: &SkillManifest,
+) -> (
+    HashMap<String, String>,
+    HashMap<String, ProviderSkillFields>,
+) {
+    let mut prompts = HashMap::new();
+    let mut overrides = HashMap::new();
+
+    let read_dir = match std::fs::read_dir(skill_dir) {
+        Ok(rd) => rd,
+        Err(_) => return (prompts, overrides),
+    };
+
+    for dir_entry in read_dir.flatten() {
+        let path = dir_entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let subdir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Only recognize subdirs that match a known ProviderKind
+        if subdir_name.parse::<ProviderKind>().is_err() {
+            continue;
+        }
+
+        let mut has_content = false;
+
+        // Load provider-specific prompt snippet
+        let prompt_path = path.join("system_prompt.md");
+        if prompt_path.exists() {
+            let max_size = manifest
+                .skill
+                .max_prompt_size
+                .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+                .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+            let snippet = load_snippet_with_limit(&prompt_path, max_size);
+            if !snippet.is_empty() {
+                prompts.insert(subdir_name.clone(), snippet);
+                has_content = true;
+            }
+        }
+
+        // Load provider-specific skill.toml override
+        let override_path = path.join("skill.toml");
+        if override_path.exists() {
+            match std::fs::read_to_string(&override_path) {
+                Ok(content) => match toml::from_str::<ProviderSkillOverride>(&content) {
+                    Ok(parsed) => {
+                        overrides.insert(subdir_name.clone(), parsed.skill);
+                        has_content = true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %override_path.display(),
+                            provider = %subdir_name,
+                            error = %e,
+                            "malformed provider skill.toml override, skipping"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        path = %override_path.display(),
+                        provider = %subdir_name,
+                        error = %e,
+                        "cannot read provider skill.toml override"
+                    );
+                }
+            }
+        }
+
+        if !has_content {
+            warn!(
+                skill = %manifest.skill.name,
+                provider = %subdir_name,
+                "provider variant directory is empty (no system_prompt.md or skill.toml)"
+            );
+        }
+    }
+
+    (prompts, overrides)
 }
 
 /// Load and parse `tools.json` from a skill directory.
@@ -1256,6 +1557,502 @@ mod tests {
         assert!(
             schema["properties"]["work_item_id"].is_null(),
             "work_item_id should not be injected for non-long_running tools"
+        );
+    }
+
+    // -- Provider variant tests --
+
+    #[test]
+    fn test_scan_with_provider_variant_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Root prompt.").unwrap();
+
+        // Create anthropic variant
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(
+            anthropic_dir.join("system_prompt.md"),
+            "Anthropic-tuned prompt.",
+        )
+        .unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "Root prompt.");
+        assert_eq!(
+            scan.entries[0].provider_prompts.get("anthropic").unwrap(),
+            "Anthropic-tuned prompt."
+        );
+    }
+
+    #[test]
+    fn test_scan_with_provider_variant_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            timeout_secs = 30
+            "#,
+        )
+        .unwrap();
+
+        // Create openai variant with timeout override
+        let openai_dir = skill_dir.join("openai");
+        fs::create_dir_all(&openai_dir).unwrap();
+        fs::write(
+            openai_dir.join("skill.toml"),
+            r#"
+            [skill]
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        let overrides = scan.entries[0].provider_overrides.get("openai").unwrap();
+        assert_eq!(overrides.timeout_secs, Some(60));
+        assert_eq!(overrides.max_prompt_size, None);
+    }
+
+    #[test]
+    fn test_scan_ignores_non_provider_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // Create handlers/ subdir (not a provider)
+        let handlers_dir = skill_dir.join("handlers");
+        fs::create_dir_all(&handlers_dir).unwrap();
+        fs::write(handlers_dir.join("search.sh"), "#!/bin/sh\necho ok").unwrap();
+
+        // Create .git subdir (not a provider)
+        let git_dir = skill_dir.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert!(scan.entries[0].provider_prompts.is_empty());
+        assert!(scan.entries[0].provider_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_scan_empty_provider_dir_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // Create empty groq variant directory
+        let groq_dir = skill_dir.join("groq");
+        fs::create_dir_all(&groq_dir).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        // Empty provider dir should not add to maps
+        assert!(!scan.entries[0].provider_prompts.contains_key("groq"));
+        assert!(!scan.entries[0].provider_overrides.contains_key("groq"));
+    }
+
+    #[test]
+    fn test_scan_malformed_provider_override_warned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // Create anthropic variant with bad TOML
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("skill.toml"), "not valid toml {{{}}}").unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        // Malformed override should be skipped
+        assert!(!scan.entries[0].provider_overrides.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn test_effective_timeout_with_override() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+        };
+        entry.provider_overrides.insert(
+            "openai".to_string(),
+            super::super::manifest::ProviderSkillFields {
+                timeout_secs: Some(90),
+                max_prompt_size: None,
+            },
+        );
+        assert_eq!(entry.effective_timeout("openai"), 90);
+    }
+
+    #[test]
+    fn test_effective_timeout_without_override() {
+        let entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+        };
+        assert_eq!(entry.effective_timeout("anthropic"), 30);
+    }
+
+    #[test]
+    fn test_effective_timeout_unknown_provider() {
+        let entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+        };
+        assert_eq!(entry.effective_timeout("unknown_provider"), 30);
+    }
+
+    #[test]
+    fn test_variant_count() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+        };
+
+        assert_eq!(entry.variant_count(), 0);
+
+        entry
+            .provider_prompts
+            .insert("anthropic".to_string(), "prompt".to_string());
+        assert_eq!(entry.variant_count(), 1);
+
+        entry.provider_overrides.insert(
+            "anthropic".to_string(),
+            super::super::manifest::ProviderSkillFields {
+                timeout_secs: Some(60),
+                max_prompt_size: None,
+            },
+        );
+        // Same provider — still 1
+        assert_eq!(entry.variant_count(), 1);
+
+        entry
+            .provider_prompts
+            .insert("openai".to_string(), "openai prompt".to_string());
+        assert_eq!(entry.variant_count(), 2);
+    }
+
+    #[test]
+    fn test_validate_provider_variant_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Root prompt.").unwrap();
+
+        // Valid provider variant
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+        fs::write(
+            anthropic_dir.join("skill.toml"),
+            r#"
+            [skill]
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let provider_ok_count = diags
+            .iter()
+            .filter(|d| d.level == DiagnosticLevel::Ok && d.message.contains("provider 'anthropic"))
+            .count();
+        assert!(
+            provider_ok_count >= 2,
+            "Expected OK diags for both prompt and skill.toml"
+        );
+    }
+
+    #[test]
+    fn test_validate_provider_variant_tools_json_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Prompt.").unwrap();
+        fs::write(anthropic_dir.join("tools.json"), "[]").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let warn = diags
+            .iter()
+            .find(|d| d.message.contains("tools.json") && d.message.contains("not supported"));
+        assert!(warn.is_some());
+    }
+
+    #[test]
+    fn test_validate_provider_subdir_typo_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // Typo: "antropic" instead of "anthropic"
+        let typo_dir = skill_dir.join("antropic");
+        fs::create_dir_all(&typo_dir).unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let typo_warn = diags
+            .iter()
+            .find(|d| d.message.contains("misspelling") && d.message.contains("anthropic"));
+        assert!(
+            typo_warn.is_some(),
+            "Expected typo warning for 'antropic'. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_typo() {
+        // Should detect common typos
+        assert!(looks_like_typo("antropic", "anthropic"));
+        assert!(looks_like_typo("openia", "openai"));
+        assert!(looks_like_typo("gogle", "google"));
+
+        // Should NOT flag clearly different names
+        assert!(!looks_like_typo("handlers", "anthropic"));
+        assert!(!looks_like_typo(".git", "groq"));
+
+        // Same string is not a typo
+        assert!(!looks_like_typo("anthropic", "anthropic"));
+    }
+
+    #[test]
+    fn test_scan_multiple_provider_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("multi-provider");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "multi-provider"
+            description = "Multi-provider skill"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Root prompt.").unwrap();
+
+        // Create multiple provider variants
+        for provider in &["anthropic", "openai", "groq"] {
+            let dir = skill_dir.join(provider);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("system_prompt.md"),
+                format!("{provider}-tuned prompt."),
+            )
+            .unwrap();
+        }
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].provider_prompts.len(), 3);
+        assert_eq!(
+            scan.entries[0].provider_prompts.get("anthropic").unwrap(),
+            "anthropic-tuned prompt."
+        );
+        assert_eq!(
+            scan.entries[0].provider_prompts.get("openai").unwrap(),
+            "openai-tuned prompt."
+        );
+        assert_eq!(
+            scan.entries[0].provider_prompts.get("groq").unwrap(),
+            "groq-tuned prompt."
+        );
+        assert_eq!(scan.entries[0].variant_count(), 3);
+    }
+
+    #[test]
+    fn test_validate_provider_override_identity_field_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // Create provider override with identity fields (should warn)
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(
+            anthropic_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search-anthropic"
+            description = "Anthropic-specific search"
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let name_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("identity field 'name'")
+                && d.message.contains("anthropic")
+        });
+        assert!(
+            name_warn.is_some(),
+            "Expected warning for identity field 'name'. Got: {diags:?}"
+        );
+
+        let desc_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("identity field 'description'")
+                && d.message.contains("anthropic")
+        });
+        assert!(
+            desc_warn.is_some(),
+            "Expected warning for identity field 'description'. Got: {diags:?}"
         );
     }
 }

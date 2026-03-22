@@ -76,6 +76,27 @@ fn default_http_method() -> String {
     "POST".to_string()
 }
 
+/// Sparse skill.toml overrides from a provider variant directory.
+/// Only fields that make sense to vary per-provider are included.
+/// Identity fields (name, description, triggers) cannot be overridden.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProviderSkillOverride {
+    #[serde(default)]
+    pub skill: ProviderSkillFields,
+}
+
+/// Overridable fields in a provider-specific `skill.toml`.
+///
+/// All fields are optional — only present fields override the root manifest.
+/// `always_on` is intentionally omitted from v1 to avoid matching complexity.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProviderSkillFields {
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_prompt_size: Option<u64>,
+}
+
 /// A tool definition loaded from a skill's `tools.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SkillToolDef {
@@ -297,6 +318,39 @@ mod tests {
             }
             _ => panic!("expected Exec handler"),
         }
+    }
+
+    #[test]
+    fn test_parse_provider_override_sparse() {
+        let toml_str = r#"
+            [skill]
+            timeout_secs = 60
+        "#;
+        let parsed: ProviderSkillOverride = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.skill.timeout_secs, Some(60));
+        assert_eq!(parsed.skill.max_prompt_size, None);
+    }
+
+    #[test]
+    fn test_parse_provider_override_full() {
+        let toml_str = r#"
+            [skill]
+            timeout_secs = 90
+            max_prompt_size = 32768
+        "#;
+        let parsed: ProviderSkillOverride = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.skill.timeout_secs, Some(90));
+        assert_eq!(parsed.skill.max_prompt_size, Some(32768));
+    }
+
+    #[test]
+    fn test_parse_provider_override_empty_skill_section() {
+        let toml_str = r#"
+            [skill]
+        "#;
+        let parsed: ProviderSkillOverride = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.skill.timeout_secs, None);
+        assert_eq!(parsed.skill.max_prompt_size, None);
     }
 
     #[test]
