@@ -57,6 +57,7 @@ pub async fn ensure_recurring_task(
         created_trace_id: None,
         reference_url: None,
         source: None,
+        metadata: None,
     };
 
     match db.create_recurring_task_if_absent(task).await {

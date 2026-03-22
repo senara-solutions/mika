@@ -105,7 +105,7 @@ impl AsyncDatabase {
         }
     }
 
-    async fn with_db<T: Send + 'static>(
+    pub async fn with_db<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -1529,6 +1529,35 @@ impl AsyncDatabase {
             .await
     }
 
+    // -- Dashboard: Dev Runs --
+
+    pub async fn update_work_item_metadata(
+        &self,
+        task_id: &str,
+        metadata_json: &str,
+    ) -> Result<bool> {
+        let (i, m) = (task_id.to_owned(), metadata_json.to_owned());
+        self.with_db(move |db| db.update_work_item_metadata(&i, &m))
+            .await
+    }
+
+    pub async fn get_dev_run(&self, task_id: &str) -> Result<Option<Task>> {
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.get_dev_run(&i)).await
+    }
+
+    pub async fn list_dev_runs_paginated_with_count(
+        &self,
+        status: Option<String>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Task>, u64)> {
+        self.with_db(move |db| {
+            db.list_dev_runs_paginated_with_count(status.as_deref(), limit, offset)
+        })
+        .await
+    }
+
     // -- A2A Protocol --
 
     /// Create an A2A task (creates entries in tasks, sessions, and a2a_task_map).
@@ -1799,6 +1828,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(task).await.unwrap();
         let t = db.get_task(&id).await.unwrap().unwrap();

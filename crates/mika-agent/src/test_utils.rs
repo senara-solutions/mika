@@ -162,6 +162,7 @@ pub mod test_helpers {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         db.create_task(task).await.unwrap()
     }

@@ -647,7 +647,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (13);
+            INSERT INTO schema_version (version) VALUES (14);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -6144,6 +6144,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -6175,6 +6176,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
         assert!(db.cancel_task(&id, "mika").unwrap());
@@ -6330,6 +6332,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
@@ -6356,6 +6359,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         }
     }
 
@@ -6591,6 +6595,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id1 = db.create_task(&task).unwrap();
         assert!(!id1.is_empty());
@@ -6621,6 +6626,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id2 = db.create_task(&task2).unwrap();
         assert!(!id2.is_empty());
@@ -6653,6 +6659,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         }
     }
 
@@ -6971,6 +6978,7 @@ mod tests {
             created_trace_id: Some(trace.to_string()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
         db.create_task(&task).unwrap();
 
@@ -7090,9 +7098,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_13() {
+    fn test_schema_version_is_14() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -7130,6 +7138,7 @@ mod tests {
             created_trace_id: Some("created-trace-aaa".to_string()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -7173,6 +7182,7 @@ mod tests {
             created_trace_id: None,
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -7247,6 +7257,7 @@ mod tests {
             created_trace_id: Some("created-trace-111".to_string()),
             reference_url: None,
             source: None,
+            metadata: None,
         };
         let id = db.create_task(&task).unwrap();
 

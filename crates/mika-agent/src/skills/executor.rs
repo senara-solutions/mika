@@ -541,6 +541,7 @@ async fn execute_long_running(
         created_trace_id: Some(ctx.trace_id.clone()),
         reference_url: None,
         source: None,
+        metadata: None,
     };
 
     let task_id = match ctx.db.create_task(task).await {
