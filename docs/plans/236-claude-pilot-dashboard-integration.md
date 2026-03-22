@@ -215,10 +215,10 @@ The detail page shows all metadata fields plus a "Merge PR" button (enabled only
 | Step | Status | Notes |
 |------|--------|-------|
 | Write plan | ✅ | This document |
-| Schema v14 + DB layer | | |
-| update_work_item_status metadata | | |
-| Dashboard API endpoints | | |
-| Dashboard frontend (DevRuns + DevRunDetail) | | |
-| Sidebar + routing | | |
-| Tests + clippy | | |
-| Doc updates | | |
+| Schema v14 + DB layer | ✅ | ALTER TABLE + Task/NewTask structs + DB functions |
+| update_work_item_status metadata | ✅ | Optional metadata param with merge semantics |
+| Dashboard API endpoints | ✅ | GET/GET/POST dev-runs endpoints in dashboard_dev_runs.rs |
+| Dashboard frontend (DevRuns + DevRunDetail) | ✅ | List + detail pages with merge button |
+| Sidebar + routing | ✅ | Hammer icon, /dev-runs routes |
+| Tests + clippy | ✅ | All 1578 tests pass, clippy clean |
+| Doc updates | ✅ | runtime-structure.md schema v14 |
