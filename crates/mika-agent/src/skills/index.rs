@@ -65,16 +65,21 @@ impl SkillEntry {
             .unwrap_or(self.manifest.skill.timeout_secs)
     }
 
-    /// Number of provider variants (prompt or override) attached to this skill.
-    pub fn variant_count(&self) -> usize {
-        let mut providers: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    /// Sorted set of all provider names that have any variant (prompt or override).
+    pub fn variant_providers(&self) -> std::collections::BTreeSet<&str> {
+        let mut providers = std::collections::BTreeSet::new();
         for key in self.provider_prompts.keys() {
             providers.insert(key.as_str());
         }
         for key in self.provider_overrides.keys() {
             providers.insert(key.as_str());
         }
-        providers.len()
+        providers
+    }
+
+    /// Number of provider variants (prompt or override) attached to this skill.
+    pub fn variant_count(&self) -> usize {
+        self.variant_providers().len()
     }
 }
 
@@ -507,7 +512,7 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                     }
                 }
 
-                // Validate override parseability
+                // Validate override parseability and check for identity fields
                 if has_override {
                     let override_path = sub_path.join("skill.toml");
                     match std::fs::read_to_string(&override_path) {
@@ -516,6 +521,26 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                                 diags.push(SkillDiagnostic::ok(format!(
                                     "provider '{subdir_name}/skill.toml' valid"
                                 )));
+                                // Warn if identity fields are present (they are silently ignored)
+                                if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
+                                    if let Some(skill_table) =
+                                        raw.get("skill").and_then(|v| v.as_table())
+                                    {
+                                        for field in &["name", "description"] {
+                                            if skill_table.contains_key(*field) {
+                                                diags.push(SkillDiagnostic::warn(format!(
+                                                    "provider '{subdir_name}/skill.toml' contains identity field '{field}' which is ignored — identity fields cannot be overridden per-provider"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    // [triggers] is a top-level section, not inside [skill]
+                                    if raw.get("triggers").is_some() {
+                                        diags.push(SkillDiagnostic::warn(format!(
+                                            "provider '{subdir_name}/skill.toml' contains [triggers] section which is ignored — triggers cannot be overridden per-provider"
+                                        )));
+                                    }
+                                }
                             }
                             Err(e) => {
                                 diags.push(SkillDiagnostic::fail(format!(
@@ -1978,5 +2003,56 @@ mod tests {
             "groq-tuned prompt."
         );
         assert_eq!(scan.entries[0].variant_count(), 3);
+    }
+
+    #[test]
+    fn test_validate_provider_override_identity_field_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // Create provider override with identity fields (should warn)
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(
+            anthropic_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search-anthropic"
+            description = "Anthropic-specific search"
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let name_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("identity field 'name'")
+                && d.message.contains("anthropic")
+        });
+        assert!(
+            name_warn.is_some(),
+            "Expected warning for identity field 'name'. Got: {diags:?}"
+        );
+
+        let desc_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("identity field 'description'")
+                && d.message.contains("anthropic")
+        });
+        assert!(
+            desc_warn.is_some(),
+            "Expected warning for identity field 'description'. Got: {diags:?}"
+        );
     }
 }

@@ -325,9 +325,9 @@ mod tests {
 
     #[test]
     fn test_provider_kind_all() {
-        assert_eq!(ProviderKind::ALL.len(), 8);
+        assert_eq!(ProviderKind::ALL.len(), 11);
         assert_eq!(ProviderKind::ALL[0], ProviderKind::Anthropic);
-        assert_eq!(ProviderKind::ALL[7], ProviderKind::DeepSeek);
+        assert_eq!(ProviderKind::ALL[10], ProviderKind::Qwen);
     }
 
     #[test]

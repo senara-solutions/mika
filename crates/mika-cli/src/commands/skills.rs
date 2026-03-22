@@ -154,17 +154,9 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
             println!("    Path:        {}", entry.dir.display());
 
             // Show provider variants
-            let variant_count = entry.variant_count();
-            if variant_count > 0 {
-                println!("    Variants:    {} provider(s)", variant_count);
-                let mut providers: std::collections::BTreeSet<&str> =
-                    std::collections::BTreeSet::new();
-                for key in entry.provider_prompts.keys() {
-                    providers.insert(key.as_str());
-                }
-                for key in entry.provider_overrides.keys() {
-                    providers.insert(key.as_str());
-                }
+            let providers = entry.variant_providers();
+            if !providers.is_empty() {
+                println!("    Variants:    {} provider(s)", providers.len());
                 for provider in &providers {
                     let has_prompt = entry.provider_prompts.contains_key(*provider);
                     let has_override = entry.provider_overrides.contains_key(*provider);

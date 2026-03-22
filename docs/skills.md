@@ -352,6 +352,71 @@ max_prompt_size = 32768  # 32KB
 
 The `max_prompt_size` value is clamped to a hard ceiling of **64KB** regardless of what is specified. Use `mika skills validate` to check whether a skill's prompt exceeds its effective limit.
 
+### Per-Provider Variant Directories
+
+Skills can ship provider-tuned prompt variants alongside the root prompt. Provider-specific files live in subdirectories named after the provider (matching `ProviderKind` values):
+
+```
+~/.mika/skills/web-search/
+├── skill.toml              # Root manifest (required)
+├── system_prompt.md        # Root prompt (fallback)
+├── tools.json              # Tool definitions (NOT overridable per-provider)
+├── handlers/               # Handler scripts (NOT overridable per-provider)
+├── anthropic/              # Provider variant directory
+│   ├── system_prompt.md    # Anthropic-tuned prompt (replaces root)
+│   └── skill.toml          # Sparse overrides (optional)
+├── openai/
+│   └── system_prompt.md    # OpenAI-tuned prompt
+└── groq/
+    └── system_prompt.md    # Groq-tuned prompt
+```
+
+Valid provider directory names: `anthropic`, `openai`, `openrouter`, `groq`, `ollama`, `mistral`, `google`, `deepseek`, `minimax`, `kimi`, `qwen`. Subdirectories with non-matching names (e.g., `handlers/`, `.git/`) are silently ignored.
+
+#### Resolution Order
+
+When injecting a skill's prompt, the agent loop resolves the prompt for the active LLM provider:
+
+1. `{skill}/{active_provider}/system_prompt.md` → use if exists
+2. `{skill}/system_prompt.md` → fallback
+
+A single path check at prompt injection time. The active provider is determined from `llm.provider_name()`.
+
+#### Sparse Manifest Overrides
+
+A provider-specific `skill.toml` inside a provider directory is **sparse** — it contains only the fields that differ from the root manifest. Fields absent from the variant retain their root values.
+
+**Overridable fields:** `timeout_secs`, `max_prompt_size`.
+
+**Not overridable per-provider:** `name`, `description`, `version`, `dependencies`, `[triggers]`, `tools.json`, handler scripts. These are identity/structural fields and must remain consistent across providers.
+
+Example `openai/skill.toml`:
+```toml
+[skill]
+timeout_secs = 60
+```
+
+This gives OpenAI-routed turns a 60-second timeout while all other providers use the root manifest's value.
+
+#### Validation
+
+`mika skills validate` checks provider variant directories:
+
+- Warns if a subdirectory name looks like a misspelling of a known provider
+- Validates `system_prompt.md` size against the effective limit
+- Validates `skill.toml` parseability
+- Warns if a provider `skill.toml` contains identity fields (`name`, `description`) — these are silently ignored at runtime
+- Warns if a provider directory contains `tools.json` (not supported)
+
+#### Notes
+
+- All variants are loaded eagerly at startup — no filesystem access at request time
+- Runtime provider switching (`/provider` command) selects the correct variant without re-scanning
+- Skills without provider variant directories work exactly as before (zero overhead)
+- `mika skills install` copies or symlinks the entire skill directory including variant subdirectories
+- `mika skills list` shows `[variants: N]` for skills with provider variants
+- `mika skills info <name>` shows which providers have variants and what they include (prompt, overrides)
+
 ---
 
 ## Tool Definitions (tools.json)
