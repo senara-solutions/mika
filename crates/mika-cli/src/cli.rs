@@ -193,6 +193,8 @@ pub enum SetupMode {
     Server,
     /// Compose mode: generate a .env file for docker-compose in the current directory
     Compose,
+    /// OAuth mode: authorize Mika with your Claude Pro/Max subscription via PKCE
+    Oauth,
 }
 
 #[derive(clap::Args)]

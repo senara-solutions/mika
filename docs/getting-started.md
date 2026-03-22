@@ -207,6 +207,7 @@ configuration and only prompts for missing values.
 | `cli` (default) | `mika setup` | Configure API keys, GitHub config, telemetry, internal token |
 | `server` | `mika setup --mode server` | CLI config + routing URL, dashboard token |
 | `compose` | `mika setup --mode compose` | Generate a `.env` for docker-compose in CWD |
+| `oauth` | `mika setup --mode oauth` | Exchange Claude Pro/Max subscription token (`sk-ant-oat*`) for access token via PKCE |
 
 **Non-interactive setup:** If stdin is not a terminal, `mika setup` requires all
 secrets to be pre-set via environment variables. Pre-set all `MIKA_*` vars before
