@@ -2534,13 +2534,16 @@ impl Database {
         Ok(rows)
     }
 
-    /// Count agent-created work items in a session (for per-session cap enforcement).
+    /// Count **active** agent-created work items in a session (for per-session cap enforcement).
+    /// Only pending/in_progress/blocked items count — completed/cancelled/failed/delivered
+    /// items are terminal and should not block new work item creation (sprint mode).
     /// Scoped to agent_id for defense-in-depth.
     pub fn count_session_work_items(&self, agent_id: &str, session_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE agent_id = ?1 AND created_by_session = ?2 AND trigger_type = 'manual'
-               AND (source IS NULL OR source != 'user_request')",
+               AND (source IS NULL OR source != 'user_request')
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')",
             params![agent_id, session_id],
             |r| r.get(0),
         )?;

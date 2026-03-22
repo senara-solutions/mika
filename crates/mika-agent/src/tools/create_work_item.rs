@@ -307,21 +307,48 @@ mod tests {
         let tool = CreateWorkItemTool;
 
         // Create MAX_WORK_ITEMS_PER_SESSION items
+        let mut item_ids = Vec::new();
         for i in 0..MAX_WORK_ITEMS_PER_SESSION {
             let result = tool
                 .execute(serde_json::json!({"label": format!("Item {i}")}), &ctx)
                 .await
                 .unwrap();
             assert!(!result.is_error, "item {i} failed: {}", result.content);
+            let id = result
+                .content
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("Work item created: ")
+                .unwrap()
+                .to_string();
+            item_ids.push(id);
         }
 
-        // 6th should be rejected
+        // 6th should be rejected (all 5 are active)
         let result = tool
             .execute(serde_json::json!({"label": "One too many"}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Maximum"));
+
+        // Complete one item — should free up a slot
+        ctx.db
+            .update_task_status(&item_ids[0], "completed")
+            .await
+            .unwrap();
+
+        // Now creating a 6th should succeed (only 4 active)
+        let result = tool
+            .execute(serde_json::json!({"label": "After completing one"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "should succeed after completing one: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
