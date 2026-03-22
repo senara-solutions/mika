@@ -236,10 +236,11 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
-| `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | LLM API key. Supports Anthropic API keys (`sk-ant-api03-...`), OAuth subscription tokens (`sk-ant-oat01-...`), and third-party provider keys. Auto-detected from prefix for auth scheme selection. Required for any command that calls an LLM. |
-| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Model ID for inference. Supports provider prefix: `openai/gpt-4o`, `ollama/llama3`, `groq/llama-3.1-70b`, `minimax/MiniMax-M2.5`, `qwen/qwen3.5-plus`, `kimi/kimi-k2.5`. No prefix defaults to Anthropic. CLI: `--model <model>` on `mika ask` / `mika chat` overrides for a single invocation without persisting. Aliases: `sonnet`, `opus`, `haiku`, `minimax`, `qwen`, `kimi`. |
-| `llm_base_url` | `Option<String>` | None | `MIKA_LLM_BASE_URL` | Override base URL for OpenAI-compatible providers (e.g., `http://localhost:11434/v1` for Ollama). Each known provider has a default; only needed for `openai-compatible` or custom endpoints. |
-| `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for Claude responses. |
+| `llm_provider` | `ProviderKind` | `anthropic` | `MIKA_LLM_PROVIDER` | Active LLM provider. One of: `anthropic`, `openai`, `openrouter`, `groq`, `ollama`, `mistral`, `google`, `deepseek`. Each provider has per-provider `{prefix}_model`, `{prefix}_api_key`, `{prefix}_base_url` fields. See [LLM Provider Configuration](#llm-provider-configuration). |
+| `{provider}_model` | `Option<String>` | Provider default | `MIKA_{PROVIDER}_MODEL` | Model ID for the provider. Falls back to provider's default model if not set. |
+| `{provider}_api_key` | `Option<String>` | None | `MIKA_{PROVIDER}_API_KEY` | API key for the provider. Stored in `.env`. `MIKA_OPENAI_API_KEY` is shared with embeddings. |
+| `{provider}_base_url` | `Option<String>` | Provider default | `MIKA_{PROVIDER}_BASE_URL` | Override base URL for the provider. Each provider has a built-in default. |
+| `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for LLM responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
 | `log_format` | `String` | `json` | `MIKA_LOG_FORMAT` | Stdout log format for mika-server and mika-gateway: `json` (default) or `pretty` (human-readable). CLI always uses pretty format regardless of this setting. File output always uses JSON. |
@@ -493,125 +494,115 @@ hexadecimal characters (32 bytes hex-encoded). Generate with `openssl rand -hex 
 
 ---
 
-## Model Configuration
+## LLM Provider Configuration
 
-Mika supports multiple LLM providers via the `LlmProvider` trait. The provider is
-selected by a `provider/model` prefix in the `llm_model` setting. If no prefix
-is present, Anthropic is used by default.
+Mika supports 8 LLM providers via the `LlmProvider` trait. Each provider has its
+own `model`, `api_key`, and `base_url` fields. The active provider is selected by
+`llm_provider` in `config.toml`.
 
 ### Supported providers
 
-| Provider | Prefix | Default Base URL | API Key Required |
-|----------|--------|------------------|------------------|
-| Anthropic (default) | `anthropic/` or none | `https://api.anthropic.com` | `MIKA_LLM_API_KEY` |
-| OpenAI | `openai/` | `https://api.openai.com/v1` | `MIKA_LLM_API_KEY` |
-| Ollama | `ollama/` | `http://localhost:11434/v1` | Optional |
-| Groq | `groq/` | `https://api.groq.com/openai/v1` | `MIKA_LLM_API_KEY` |
-| MiniMax | `minimax/` | `https://api.minimax.chat/v1` | `MIKA_LLM_API_KEY` |
-| Qwen | `qwen/` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `MIKA_LLM_API_KEY` |
-| Kimi | `kimi/` | `https://api.moonshot.ai/v1` | `MIKA_LLM_API_KEY` |
-| OpenAI-compatible | `openai-compatible/` | None (requires `MIKA_LLM_BASE_URL`) | `MIKA_LLM_API_KEY` |
+| Provider | Config value | Default Model | Default Base URL | API Key Env Var |
+|----------|-------------|---------------|------------------|-----------------|
+| Anthropic (default) | `anthropic` | `claude-sonnet-4-6` | `https://api.anthropic.com` | `MIKA_ANTHROPIC_API_KEY` |
+| OpenAI | `openai` | `gpt-4o` | `https://api.openai.com/v1` | `MIKA_OPENAI_API_KEY` |
+| OpenRouter | `openrouter` | `anthropic/claude-sonnet-4` | `https://openrouter.ai/api/v1` | `MIKA_OPENROUTER_API_KEY` |
+| Groq | `groq` | `llama-3.3-70b-versatile` | `https://api.groq.com/openai/v1` | `MIKA_GROQ_API_KEY` |
+| Ollama | `ollama` | `llama3` | `http://localhost:11434/v1` | `MIKA_OLLAMA_API_KEY` (optional) |
+| Mistral | `mistral` | `mistral-large-latest` | `https://api.mistral.ai/v1` | `MIKA_MISTRAL_API_KEY` |
+| Google AI | `google` | `gemini-2.5-flash` | `https://generativelanguage.googleapis.com/v1beta/openai` | `MIKA_GOOGLE_API_KEY` |
+| DeepSeek | `deepseek` | `deepseek-chat` | `https://api.deepseek.com` | `MIKA_DEEPSEEK_API_KEY` |
 
-### Anthropic models
+### Per-provider configuration
 
-| Model ID | Description |
-|----------|-------------|
-| `claude-sonnet-4-6` | Default. Good balance of speed and quality. |
-| `claude-opus-4-6` | Highest quality. Slower and more expensive. |
-| `claude-haiku-4-5` | Fastest and cheapest. Suitable for simple tasks. |
+Each provider has three config keys with a `{provider}_` prefix:
 
-### Switching models
+| Key pattern | Example | Description |
+|-------------|---------|-------------|
+| `{provider}_model` | `anthropic_model = "claude-opus-4-6"` | Override the default model |
+| `{provider}_api_key` | Set via `MIKA_ANTHROPIC_API_KEY` env var | API key (stored in `.env`) |
+| `{provider}_base_url` | `openai_base_url = "http://custom:8000/v1"` | Override the default base URL |
 
-**Anthropic (default)** — no prefix needed:
+### Switching providers
+
+**config.toml** (persisted):
 
 ```toml
 # ~/.mika/config.toml
-llm_model = "claude-opus-4-6"
+llm_provider = "anthropic"
+anthropic_model = "claude-opus-4-6"
 ```
 
-**OpenAI:**
+**Environment variables** (override config.toml):
 
 ```sh
-export MIKA_LLM_MODEL=openai/gpt-4o
-export MIKA_LLM_API_KEY=sk-...
+export MIKA_LLM_PROVIDER=openai
+export MIKA_OPENAI_API_KEY=sk-...
+# Model defaults to gpt-4o, or override:
+export MIKA_OPENAI_MODEL=gpt-4-turbo
 ```
 
-**Ollama (local):**
+**Ollama (local, no key needed):**
 
 ```sh
-export MIKA_LLM_MODEL=ollama/llama3
-# No API key needed for local Ollama
+export MIKA_LLM_PROVIDER=ollama
+# Model defaults to llama3, base URL defaults to localhost:11434
 ```
 
 **Groq:**
 
 ```sh
-export MIKA_LLM_MODEL=groq/llama-3.1-70b
-export MIKA_LLM_API_KEY=gsk_...
+export MIKA_LLM_PROVIDER=groq
+export MIKA_GROQ_API_KEY=gsk_...
 ```
 
-**MiniMax** (best tool calling, cost-effective Claude alternative):
+**Google Gemini:**
 
 ```sh
-export MIKA_LLM_MODEL=minimax/MiniMax-M2.5
-export MIKA_LLM_API_KEY=<minimax-key>  # Get key at https://platform.minimax.io/
+export MIKA_LLM_PROVIDER=google
+export MIKA_GOOGLE_API_KEY=...
+export MIKA_GOOGLE_MODEL=gemini-2.5-pro
 ```
 
-**Qwen** (best open-source agentic):
+### Runtime switching
 
-```sh
-export MIKA_LLM_MODEL=qwen/qwen3.5-plus
-export MIKA_LLM_API_KEY=<dashscope-key>  # Get key at https://qwen.ai/apiplatform
-```
-
-**Kimi** (best coding):
-
-```sh
-export MIKA_LLM_MODEL=kimi/kimi-k2.5
-export MIKA_LLM_API_KEY=<moonshot-key>  # Get key at https://api.moonshot.ai/
-```
-
-**Custom OpenAI-compatible endpoint:**
-
-```sh
-export MIKA_LLM_MODEL=openai-compatible/my-model
-export MIKA_LLM_BASE_URL=http://my-server:8000/v1
-export MIKA_LLM_API_KEY=my-key
-```
-
-**Via environment variable (any provider):**
-
-```sh
-export MIKA_LLM_MODEL=openai/gpt-4o
-```
-
-The environment variable always wins if set, regardless of config file values.
-
-### Runtime model switching
-
-In the TUI chat, use the `/model` slash command to switch models at runtime:
+In the TUI chat, use slash commands to switch providers and models at runtime:
 
 ```
-/model ollama/llama3
-/model claude-opus-4-6
+/provider openai         # Switch to OpenAI (uses default model)
+/provider set model gpt-4-turbo  # Override model for current provider
+/model sonnet            # Switch model (aliases: sonnet, opus, haiku, gpt4o, deepseek, gemini)
 ```
 
-This recreates the provider with the new model. The switch takes effect for the
-next message.
+Changes via `/provider` are persisted to `config.toml`. Changes via `/model` are
+persisted to the provider-specific model key in `config.toml`.
 
 ### Provider capabilities
 
 Not all providers support all features. The `LlmProvider` trait reports capabilities:
 
-| Feature | Anthropic | OpenAI | MiniMax | Qwen | Kimi | Ollama | Groq |
-|---------|-----------|--------|---------|------|------|--------|------|
-| Tool calling | Yes | Yes | Yes | Yes | Yes | Varies | Varies |
-| Vision/images | Yes | Yes | Yes | Yes | Yes | Varies | No |
-| Extended thinking | Yes | No | No | No | No | No | No |
+| Feature | Anthropic | OpenAI | OpenRouter | Groq | Ollama | Mistral | Google | DeepSeek |
+|---------|-----------|--------|------------|------|--------|---------|--------|----------|
+| Tool calling | Yes | Yes | Yes | Yes | Varies | Yes | Yes | Yes |
+| Vision/images | Yes | Yes | Yes | No | No | Yes | Yes | Yes |
+| Extended thinking | Yes | No | No | No | No | No | No | No |
 
 When using a provider that doesn't support tool calling, Mika's agent tools
 (memory, reminders, etc.) will not be available. The agent will operate in
 text-only mode.
+
+### Migration from v0.x
+
+If you're upgrading from a version that used `llm_model`, `llm_api_key`, and
+`llm_base_url`, update your configuration:
+
+| Old | New |
+|-----|-----|
+| `llm_model = "claude-sonnet-4-6"` | `llm_provider = "anthropic"` (model defaults to claude-sonnet-4-6) |
+| `llm_model = "openai/gpt-4o"` | `llm_provider = "openai"` + `openai_model = "gpt-4o"` |
+| `MIKA_LLM_API_KEY=sk-ant-...` | `MIKA_ANTHROPIC_API_KEY=sk-ant-...` |
+| `MIKA_LLM_API_KEY=sk-...` (OpenAI) | `MIKA_OPENAI_API_KEY=sk-...` |
+| `MIKA_LLM_BASE_URL=...` | `{provider}_base_url = "..."` in config.toml |
 
 ---
 

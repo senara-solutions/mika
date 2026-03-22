@@ -10,7 +10,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - **Language:** Rust (edition 2024)
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context → build prompt → LLM API → match stop_reason → execute tools or respond
-- **LLM:** Multi-provider via `LlmProvider` trait — Anthropic (default, Claude Sonnet 4.6), OpenAI-compatible (OpenAI, Ollama, vLLM, Groq, Together), plus first-class MiniMax (`minimax/`), Qwen (`qwen/`), and Kimi (`kimi/`) with built-in base URLs. Provider selected by `llm_model` config with `provider/model` prefix (e.g., `openai/gpt-4o`, `minimax/MiniMax-M2.5`, `ollama/llama3`). No prefix defaults to Anthropic.
+- **LLM:** Multi-provider via `LlmProvider` trait — 8 supported providers, each with its own `model`, `api_key`, and `base_url` fields in config. Active provider selected by `llm_provider` config key. Providers: Anthropic (default, Claude Sonnet 4.6), OpenAI, OpenRouter, Groq, Ollama, Mistral, Google (Gemini), DeepSeek. All non-Anthropic providers use the `OpenAiCompatibleProvider` adapter. TUI `/provider` command for interactive switching.
 - **Database:** SQLite via rusqlite (single DB per container at `~/.mika/data/mika.db`)
 - **HTTP server:** Axum 0.8 (mika-server binary) with tower-http middleware
 - **HTTP client:** reqwest 0.12 with rustls-tls (Claude API client with typed errors and retry)
@@ -114,11 +114,15 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 ## Environment Variables
 
-See `.env.example` for the full list. Required:
-- `MIKA_LLM_API_KEY` — LLM API key (Anthropic, OpenAI, Groq, etc.). For Anthropic keys, auto-detected from prefix: `sk-ant-oat*` → OAuth PKCE managed auth (auto-refresh via `OAuthTokenManager`, tokens cached in `~/.mika/oauth.json`), otherwise → standard API key auth. OAuth tokens require initial setup: `mika setup --mode oauth`.
-
-Optional (Layer 3 vector search):
-- `MIKA_OPENAI_API_KEY` — OpenAI API key for embedding generation (enables vector similarity in hybrid search)
+See `.env.example` for the full list. Per-provider API keys (set the one for your active provider):
+- `MIKA_ANTHROPIC_API_KEY` — Anthropic API key. For OAuth tokens (`sk-ant-oat*`): auto-detected, PKCE managed auth (auto-refresh via `OAuthTokenManager`, cached in `~/.mika/oauth.json`). OAuth setup: `mika setup --mode oauth`.
+- `MIKA_OPENAI_API_KEY` — OpenAI API key (also used for Layer 3 vector search embeddings)
+- `MIKA_OPENROUTER_API_KEY` — OpenRouter API key
+- `MIKA_GROQ_API_KEY` — Groq API key
+- `MIKA_OLLAMA_API_KEY` — Ollama API key (usually not needed)
+- `MIKA_MISTRAL_API_KEY` — Mistral API key
+- `MIKA_GOOGLE_API_KEY` — Google AI API key
+- `MIKA_DEEPSEEK_API_KEY` — DeepSeek API key
 
 Optional (web search):
 - `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
