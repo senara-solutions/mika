@@ -192,20 +192,29 @@ pub async fn exchange_code(
     code_verifier: &str,
     subscription_token: &str,
 ) -> Result<OAuthTokens> {
+    // The authorization code may include a state suffix after '#' (e.g. "code#state").
+    // Split and send them as separate fields, matching pi-ai's token exchange format.
+    let (auth_code, state) = code.split_once('#').unwrap_or((code, ""));
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("failed to build HTTP client for token exchange")?;
 
+    let mut body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID,
+        "code_verifier": code_verifier,
+    });
+    if !state.is_empty() {
+        body["state"] = serde_json::Value::String(state.to_string());
+    }
+
     let response = client
         .post(TOKEN_URL)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", REDIRECT_URI),
-            ("client_id", CLIENT_ID),
-            ("code_verifier", code_verifier),
-        ])
+        .json(&body)
         .send()
         .await
         .context("failed to connect to Anthropic token endpoint")?;
