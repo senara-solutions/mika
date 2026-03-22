@@ -62,7 +62,7 @@ export default function DevRunDetail() {
           <div className="flex items-center gap-3 mt-2">
             <TaskStatusBadge status={run.status} />
             <span className="text-muted/60 text-xs">{run.agent_id}</span>
-            <CopyButton text={run.id} label="Copy ID" />
+            <CopyButton text={run.id} title="Copy ID" />
           </div>
         </div>
         {canMerge && (
