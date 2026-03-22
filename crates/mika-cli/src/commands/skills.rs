@@ -90,9 +90,17 @@ fn list_skills(registry: &SkillRegistry, agent_home: &Path) {
             ""
         };
         let status = if entry.enabled { "" } else { " [disabled]" };
+        let variants = {
+            let count = entry.variant_count();
+            if count > 0 {
+                format!(" [variants: {count}]")
+            } else {
+                String::new()
+            }
+        };
         println!(
-            "    {} ({}) — {}{}{}{}",
-            name, tools_desc, entry.manifest.skill.description, origin, always_on, status
+            "    {} ({}) — {}{}{}{}{}",
+            name, tools_desc, entry.manifest.skill.description, origin, always_on, status, variants
         );
     }
     println!();
@@ -144,6 +152,36 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
                 }
             }
             println!("    Path:        {}", entry.dir.display());
+
+            // Show provider variants
+            let variant_count = entry.variant_count();
+            if variant_count > 0 {
+                println!("    Variants:    {} provider(s)", variant_count);
+                let mut providers: std::collections::BTreeSet<&str> =
+                    std::collections::BTreeSet::new();
+                for key in entry.provider_prompts.keys() {
+                    providers.insert(key.as_str());
+                }
+                for key in entry.provider_overrides.keys() {
+                    providers.insert(key.as_str());
+                }
+                for provider in &providers {
+                    let has_prompt = entry.provider_prompts.contains_key(*provider);
+                    let has_override = entry.provider_overrides.contains_key(*provider);
+                    let parts: Vec<&str> = [
+                        if has_prompt { Some("prompt") } else { None },
+                        if has_override {
+                            Some("overrides")
+                        } else {
+                            None
+                        },
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    println!("      - {} ({})", provider, parts.join(", "));
+                }
+            }
 
             // Show marketplace metadata if applicable
             let lock = marketplace::read_lock(agent_home);
