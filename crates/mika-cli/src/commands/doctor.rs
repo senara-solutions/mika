@@ -667,7 +667,11 @@ mod tests {
     #[test]
     fn test_check_config_toml_valid() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("config.toml"), "llm_model = \"test\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "llm_provider = \"anthropic\"\n",
+        )
+        .unwrap();
         let result = check_config_toml(tmp.path(), tmp.path());
         assert_eq!(result.status, CheckStatus::Ok);
     }

@@ -48,6 +48,23 @@ pub fn complete_model(
     (filter_by_prefix(items, arg_text), " Models ")
 }
 
+/// `/provider <tab>` — LLM provider names.
+pub fn complete_provider(
+    arg_text: &str,
+    _arg_index: usize,
+    _ctx: &CompletionContext,
+) -> (Vec<CompletionItem>, &'static str) {
+    use mika_common::llm::ProviderKind;
+    let items: Vec<CompletionItem> = ProviderKind::ALL
+        .iter()
+        .map(|p| CompletionItem {
+            value: p.to_string(),
+            description: Some(format!("default: {}", p.default_model())),
+        })
+        .collect();
+    (filter_by_prefix(items, arg_text), " Providers ")
+}
+
 /// `/think <tab>` — thinking levels (only for arg_index 0).
 pub fn complete_think(
     arg_text: &str,

@@ -71,9 +71,31 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
 impl AppContext {
     /// Apply a one-shot model override (not persisted to config).
     /// Resolves aliases (e.g., "sonnet" → "claude-sonnet-4-6") and rebuilds the LLM provider.
+    ///
+    /// Accepts plain model names (overrides the active provider's model)
+    /// or `provider/model` format (switches provider and sets model).
     pub fn override_model(&mut self, model: &str) -> Result<()> {
         let resolved = crate::cli::resolve_model_alias(model);
-        self.db_ctx.settings.llm_model = resolved;
+
+        // Check for provider/model format
+        if let Some(slash_pos) = resolved.find('/') {
+            let prefix = &resolved[..slash_pos];
+            if let Ok(provider) = prefix.parse::<mika_common::llm::ProviderKind>() {
+                let model_name = resolved[slash_pos + 1..].to_string();
+                self.db_ctx.settings.llm_provider = provider;
+                self.db_ctx
+                    .settings
+                    .set_provider_model(provider, Some(model_name));
+                self.llm = self.db_ctx.settings.make_llm_provider()?;
+                return Ok(());
+            }
+        }
+
+        // Plain model name — override the active provider's model
+        let provider = self.db_ctx.settings.llm_provider;
+        self.db_ctx
+            .settings
+            .set_provider_model(provider, Some(resolved));
         self.llm = self.db_ctx.settings.make_llm_provider()?;
         Ok(())
     }

@@ -331,14 +331,13 @@ mod tests {
 
     #[test]
     fn test_parse_log_level_with_other_fields() {
-        let content =
-            "llm_model = \"claude-sonnet-4-6\"\nlog_level = \"info\"\nmax_tokens = 4096\n";
+        let content = "llm_provider = \"anthropic\"\nlog_level = \"info\"\nllm_max_tokens = 4096\n";
         assert_eq!(parse_log_level(content), Some("info".to_string()));
     }
 
     #[test]
     fn test_parse_log_level_missing() {
-        assert_eq!(parse_log_level("llm_model = \"claude-sonnet-4-6\"\n"), None);
+        assert_eq!(parse_log_level("llm_provider = \"anthropic\"\n"), None);
     }
 
     #[test]

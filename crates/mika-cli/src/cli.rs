@@ -539,9 +539,9 @@ pub const MODEL_ALIASES: &[(&str, &str, &str)] = &[
     ("sonnet", "claude-sonnet-4-6", "Claude Sonnet 4.6"),
     ("opus", "claude-opus-4-6", "Claude Opus 4.6"),
     ("haiku", "claude-haiku-4-5", "Claude Haiku 4.5"),
-    ("minimax", "minimax/MiniMax-M2.5", "MiniMax M2.5"),
-    ("qwen", "qwen/qwen3.5-plus", "Qwen 3.5 Medium"),
-    ("kimi", "kimi/kimi-k2.5", "Kimi K2.5"),
+    ("gpt4o", "openai/gpt-4o", "GPT-4o"),
+    ("deepseek", "deepseek/deepseek-chat", "DeepSeek Chat"),
+    ("gemini", "google/gemini-2.5-flash", "Gemini 2.5 Flash"),
 ];
 
 /// Resolve a model alias (e.g., "sonnet") to its full model ID (e.g., "claude-sonnet-4-6").

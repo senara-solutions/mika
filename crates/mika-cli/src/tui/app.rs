@@ -475,6 +475,8 @@ pub struct App<'a> {
     pub session_id: String,
     pub model: String,
     pub identity_name: String,
+    /// The active LLM provider (for /provider command).
+    pub provider: mika_common::llm::ProviderKind,
 
     // Animated thinking dots
     pub tick_count: u64,
@@ -578,6 +580,7 @@ impl<'a> App<'a> {
         skills: Arc<SkillRegistry>,
         agent_name: String,
         global_home: PathBuf,
+        provider: mika_common::llm::ProviderKind,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -598,6 +601,7 @@ impl<'a> App<'a> {
             session_id,
             model,
             identity_name,
+            provider,
             tick_count: 0,
             needs_redraw: true,
             selection_state: SelectionState::default(),
@@ -677,6 +681,7 @@ impl<'a> App<'a> {
             session_id: String::new(),
             model: String::new(),
             identity_name: format!("Team: {team_name}"),
+            provider: mika_common::llm::ProviderKind::Anthropic,
             tick_count: 0,
             needs_redraw: true,
             selection_state: SelectionState::default(),

@@ -170,8 +170,33 @@ pub mod test_helpers {
     /// Minimal Settings for validation-only tests (no API key needed).
     pub fn dummy_settings() -> Settings {
         Settings {
-            llm_model: "claude-sonnet-4-6".to_string(),
+            llm_provider: mika_common::llm::ProviderKind::Anthropic,
             llm_max_tokens: 4096,
+            // Per-provider fields (all None = use defaults)
+            anthropic_model: None,
+            anthropic_api_key: None,
+            anthropic_base_url: None,
+            openai_model: None,
+            openai_base_url: None,
+            openrouter_model: None,
+            openrouter_api_key: None,
+            openrouter_base_url: None,
+            groq_model: None,
+            groq_api_key: None,
+            groq_base_url: None,
+            ollama_model: None,
+            ollama_api_key: None,
+            ollama_base_url: None,
+            mistral_model: None,
+            mistral_api_key: None,
+            mistral_base_url: None,
+            google_model: None,
+            google_api_key: None,
+            google_base_url: None,
+            deepseek_model: None,
+            deepseek_api_key: None,
+            deepseek_base_url: None,
+            // Non-provider settings
             db_path: PathBuf::from("test.db"),
             log_level: "info".to_string(),
             log_format: "json".to_string(),
@@ -193,8 +218,6 @@ pub mod test_helpers {
             telemetry_enabled: false,
             otlp_endpoint: None,
             otlp_auth_header: None,
-            llm_base_url: None,
-            llm_api_key: None,
         }
     }
 }

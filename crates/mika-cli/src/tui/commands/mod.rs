@@ -97,6 +97,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         completer: Some(completers::complete_model),
     },
     SlashCommand {
+        name: "provider",
+        aliases: &[],
+        description: "Show or switch LLM provider",
+        args_hint: Some("[anthropic|openai|groq|ollama|...]"),
+        completer: Some(completers::complete_provider),
+    },
+    SlashCommand {
         name: "export",
         aliases: &[],
         description: "Export conversation to markdown",

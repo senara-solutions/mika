@@ -49,6 +49,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "soul" => Some(handle_soul(app).await),
         "config" | "cfg" => Some(handle_config(app, args).await),
         "model" => Some(handle_model(app, args).await),
+        "provider" => Some(handle_provider(app, args).await),
         "export" => Some(handle_export(app).await),
         "skills" => Some(handle_skills(app)),
         "skill" => Some(handle_skill(app, args)),
@@ -421,10 +422,23 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             });
             app.needs_redraw = true;
 
-            // Persist to config.toml so the choice survives restarts
+            // Persist to config.toml so the choice survives restarts.
+            // Write the provider-specific model key (e.g., anthropic_model).
             let config_path = app.home_dir.join("config.toml");
+            // Parse provider/model if present to determine the right config key
+            let (provider_prefix, model_name) = if let Some(slash_pos) = full_id.find('/') {
+                let prefix = &full_id[..slash_pos];
+                if prefix.parse::<mika_common::llm::ProviderKind>().is_ok() {
+                    (prefix, &full_id[slash_pos + 1..])
+                } else {
+                    ("anthropic", full_id)
+                }
+            } else {
+                ("anthropic", full_id)
+            };
+            let model_key = format!("{provider_prefix}_model");
             if let Err(e) =
-                crate::commands::config::write_config_toml(&config_path, "llm_model", full_id)
+                crate::commands::config::write_config_toml(&config_path, &model_key, model_name)
             {
                 tracing::warn!(error = %e, "failed to persist model to config.toml");
             }
@@ -434,6 +448,102 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
         None => {
             let options: Vec<&str> = MODEL_ALIASES.iter().map(|&(a, _, _)| a).collect();
             format!("Unknown model: {args}\nAvailable: {}", options.join(", "))
+        }
+    }
+}
+
+async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
+    use mika_common::llm::ProviderKind;
+
+    let args = args.trim();
+    if args.is_empty() {
+        // Show current provider and list all available
+        let current = app.provider.to_string();
+        let mut out = format!("Current provider: {current}\n\nAvailable providers:");
+        for &p in ProviderKind::ALL {
+            let marker = if p.to_string() == current {
+                " (current)"
+            } else {
+                ""
+            };
+            let _ = write!(out, "\n  {} — {}{}", p, p.default_model(), marker);
+        }
+        let _ = write!(out, "\n\nUsage: /provider <name>");
+        return out;
+    }
+
+    // Handle subcommands: "set model <name>", "set api_key <value>", "set base_url <value>"
+    if let Some(rest) = args.strip_prefix("set ") {
+        let rest = rest.trim();
+        if let Some((field, value)) = rest.split_once(' ') {
+            let value = value.trim();
+            let prefix = app.provider.config_prefix();
+            let config_path = app.home_dir.join("config.toml");
+            let key = match field {
+                "model" => format!("{prefix}_model"),
+                "base_url" => format!("{prefix}_base_url"),
+                "api_key" => {
+                    // API keys go to .env, not config.toml
+                    let env_key = format!("MIKA_{}_API_KEY", prefix.to_uppercase());
+                    let global_home = &app.global_home;
+                    match mika_common::dotenv::set_env_var(global_home, &env_key, value) {
+                        Ok(()) => return format!("Set {env_key} in .env"),
+                        Err(e) => return format!("Error: {e}"),
+                    }
+                }
+                _ => return format!("Unknown field: {field}. Use: model, api_key, base_url"),
+            };
+            match crate::commands::config::write_config_toml(&config_path, &key, value) {
+                Ok(()) => {
+                    // If setting model, also update the display and agent worker
+                    if field == "model" {
+                        let full_id = if app.provider == ProviderKind::Anthropic {
+                            value.to_string()
+                        } else {
+                            format!("{}/{}", app.provider, value)
+                        };
+                        app.model = full_id.clone();
+                        let _ = app.agent_tx.send(AgentRequest::SetModel { model: full_id });
+                        app.needs_redraw = true;
+                    }
+                    format!("Set {key} = \"{value}\"")
+                }
+                Err(e) => format!("Error writing config: {e}"),
+            }
+        } else {
+            "Usage: /provider set <model|api_key|base_url> <value>".to_string()
+        }
+    } else {
+        // Switch provider
+        match args.parse::<ProviderKind>() {
+            Ok(new_provider) => {
+                if new_provider == app.provider {
+                    return format!("Already using {new_provider}.");
+                }
+                app.provider = new_provider;
+                let model = new_provider.default_model();
+                let full_id = if new_provider == ProviderKind::Anthropic {
+                    model.to_string()
+                } else {
+                    format!("{new_provider}/{model}")
+                };
+                app.model = full_id.clone();
+                let _ = app.agent_tx.send(AgentRequest::SetModel { model: full_id });
+                app.needs_redraw = true;
+
+                // Persist provider switch to config.toml
+                let config_path = app.home_dir.join("config.toml");
+                if let Err(e) = crate::commands::config::write_config_toml(
+                    &config_path,
+                    "llm_provider",
+                    &new_provider.to_string(),
+                ) {
+                    tracing::warn!(error = %e, "failed to persist provider to config.toml");
+                }
+
+                format!("Switched to {new_provider} (model: {model}).")
+            }
+            Err(e) => e,
         }
     }
 }
@@ -1071,8 +1181,8 @@ mod tests {
     fn test_team_mode_blocks_agent_commands() {
         // Verify agent-specific commands are NOT in the allowlist
         for cmd in &[
-            "compact", "memory", "model", "think", "soul", "config", "skills", "agent", "attach",
-            "undo", "rewind",
+            "compact", "memory", "model", "provider", "think", "soul", "config", "skills", "agent",
+            "attach", "undo", "rewind",
         ] {
             assert!(
                 !TEAM_MODE_ALLOWED_COMMANDS.contains(cmd),
