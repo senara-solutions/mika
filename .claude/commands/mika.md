@@ -17,7 +17,7 @@ Before running the pipeline, set up an isolated worktree:
 
 1. **Parse branch:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` as the branch name and strip the `branch:<name>` prefix from `$ARGUMENTS`. Otherwise, derive the branch name from args (issue → `feat|fix|chore/<number>/<kebab-title>`, free-text → `feat/<kebab>`).
 2. **Skip if no branch or no args:** If there are no arguments (backlog eval mode), skip worktree creation and run the pipeline in the current directory.
-3. **Detect existing worktree:** Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`. If they differ, you are already in a worktree — skip creation, set `CREATED_WORKTREE=false`.
+3. **Detect existing worktree (MANDATORY):** Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`. If they differ, you are ALREADY inside a worktree. **STOP worktree setup immediately** — set `CREATED_WORKTREE=false` and proceed directly to the Pipeline section below. Do NOT attempt to create, remove, or modify any worktree. Do NOT clean up or recreate. Just use the current directory as-is.
 4. **Create worktree:** Set `WORKTREE=../.claude/worktrees/<sanitized-branch>/mika/` (sanitize branch name: replace `/` with `-`). Record `ORIGINAL_DIR=$(pwd)`.
    - If the worktree path already exists, remove it first: `git worktree remove --force <WORKTREE>` (ignore errors).
    - Try: `git worktree add -b <branch> <WORKTREE> main`
