@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-server mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test lint fmt check clean help
+.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok clean help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -63,7 +63,16 @@ install: ## Copy release binaries to INSTALL_DIR
 		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
 	done
 
-deploy: build-dashboard build stop install restart ## Build dashboard + binaries, stop, install, and restart
+deploy: build-dashboard build stop install restart check-ngrok ## Build dashboard + binaries, stop, install, and restart
+
+check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
+	@if ! curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1; then \
+		echo ""; \
+		echo "  ⚠  WARNING: ngrok is not running!"; \
+		echo "  Telegram webhooks will not reach the gateway."; \
+		echo "  Start ngrok: ngrok http 8080"; \
+		echo ""; \
+	fi
 
 test: ## Run all tests
 	cargo test
