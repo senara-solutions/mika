@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use crate::a2a_routes;
 use crate::telegram::{
-    ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_update,
+    ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_agent_prefix,
+    parse_update,
 };
 
 // -- AppState --
@@ -162,8 +163,17 @@ pub(crate) async fn handle_webhook(
                 text,
                 update_id,
                 reply_to_message_id,
+                reply_to_text,
             } => {
-                handle_text_message(&s, chat_id, &text, update_id, reply_to_message_id).await;
+                handle_text_message(
+                    &s,
+                    chat_id,
+                    &text,
+                    update_id,
+                    reply_to_message_id,
+                    reply_to_text.as_deref(),
+                )
+                .await;
             }
             ParsedMessage::Photo {
                 chat_id,
@@ -171,6 +181,7 @@ pub(crate) async fn handle_webhook(
                 caption,
                 update_id,
                 reply_to_message_id,
+                reply_to_text,
             } => {
                 handle_photo_message(
                     &s,
@@ -179,6 +190,7 @@ pub(crate) async fn handle_webhook(
                     caption.as_deref(),
                     update_id,
                     reply_to_message_id,
+                    reply_to_text.as_deref(),
                 )
                 .await;
             }
@@ -189,6 +201,7 @@ pub(crate) async fn handle_webhook(
                 caption,
                 update_id,
                 reply_to_message_id,
+                reply_to_text,
             } => {
                 // Image documents use the same flow as photos
                 handle_photo_message(
@@ -198,6 +211,7 @@ pub(crate) async fn handle_webhook(
                     caption.as_deref(),
                     update_id,
                     reply_to_message_id,
+                    reply_to_text.as_deref(),
                 )
                 .await;
             }
@@ -348,6 +362,7 @@ async fn handle_text_message(
     text: &str,
     update_id: i64,
     reply_to_message_id: Option<i64>,
+    reply_to_text: Option<&str>,
 ) {
     let row = match resolve_customer(state, chat_id).await {
         Some(r) => r,
@@ -366,7 +381,8 @@ async fn handle_text_message(
     }
 
     // Look up target agent from reply context (if replying to an agent message)
-    let target_agent = resolve_reply_agent(state, chat_id, reply_to_message_id).await;
+    let target_agent =
+        resolve_reply_agent(state, chat_id, reply_to_message_id, reply_to_text).await;
 
     if reply_to_message_id.is_some() && target_agent.is_none() {
         warn!(
@@ -416,6 +432,7 @@ async fn handle_photo_message(
     caption: Option<&str>,
     update_id: i64,
     reply_to_message_id: Option<i64>,
+    reply_to_text: Option<&str>,
 ) {
     let row = match resolve_customer(state, chat_id).await {
         Some(r) => r,
@@ -484,7 +501,8 @@ async fn handle_photo_message(
     }
 
     // Look up target agent from reply context (if replying to an agent message)
-    let target_agent = resolve_reply_agent(state, chat_id, reply_to_message_id).await;
+    let target_agent =
+        resolve_reply_agent(state, chat_id, reply_to_message_id, reply_to_text).await;
 
     if reply_to_message_id.is_some() && target_agent.is_none() {
         warn!(
@@ -803,7 +821,17 @@ async fn resolve_reply_agent(
     state: &AppState,
     chat_id: i64,
     reply_to_message_id: Option<i64>,
+    reply_to_text: Option<&str>,
 ) -> Option<String> {
+    // Primary: parse [agent_name] from the replied-to message text
+    if let Some(text) = reply_to_text
+        && let Some(agent) = parse_agent_prefix(text)
+    {
+        debug!(chat_id, agent = %agent, "reply routing: resolved agent from text prefix");
+        return Some(agent);
+    }
+
+    // Fallback: DB lookup (outbound_messages)
     let msg_id = reply_to_message_id?;
     match sqlx::query_scalar::<_, String>(
         "SELECT agent_name FROM outbound_messages WHERE telegram_message_id = $1 AND chat_id = $2",
