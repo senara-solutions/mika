@@ -877,9 +877,10 @@ struct VariantScanResult {
 /// Scan a skill directory for provider and model variant subdirectories.
 ///
 /// Iterates over immediate subdirectories and checks if each name matches
-/// a known `ProviderKind`. For matching directories, loads any
-/// `system_prompt.md` and `skill.toml` (as sparse override). Then scans
-/// subdirectories within each provider directory for model variants.
+/// a known `ProviderKind`. For matching directories, loads `skill.toml`
+/// (as sparse override for timeout/max_prompt_size). Provider-level
+/// `system_prompt.md` is intentionally not loaded. Then scans subdirectories
+/// within each provider directory for model variants (both prompts and overrides).
 fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> VariantScanResult {
     let mut overrides = HashMap::new();
     let mut model_prompts = HashMap::new();

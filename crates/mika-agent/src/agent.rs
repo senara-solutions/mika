@@ -1870,7 +1870,8 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &
 /// tool definitions. Always includes all builtin tools plus skill-defined tools.
 ///
 /// `provider_name` and `model_name` select variant-specific prompts when available.
-/// Three-level fallback: model-specific > provider-specific > root prompt.
+/// Two-level fallback for prompts: model-specific > root.
+/// Three-level fallback for timeouts: model > provider > root.
 fn inject_skills_and_resolve_tools(
     matched: &[&SkillEntry],
     tools: &ToolRegistry,
@@ -1885,7 +1886,7 @@ fn inject_skills_and_resolve_tools(
 
     // Add skill prompt snippets and skill-defined tools from matched skills
     for entry in matched {
-        // Three-level resolution via SkillEntry helper
+        // Two-level prompt resolution via SkillEntry helper (model → root)
         let prompt = entry.resolve_prompt(provider_name, model_name);
 
         if !prompt.is_empty() {
