@@ -158,23 +158,11 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
             if !providers.is_empty() || entry.variant_count() > 0 {
                 println!("    Variants:    {} total", entry.variant_count());
                 for provider in &providers {
-                    let has_prompt = entry.provider_prompts.contains_key(*provider);
                     let has_override = entry.provider_overrides.contains_key(*provider);
-                    let parts: Vec<&str> = [
-                        if has_prompt { Some("prompt") } else { None },
-                        if has_override {
-                            Some("overrides")
-                        } else {
-                            None
-                        },
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    if parts.is_empty() {
-                        println!("      - {}", provider);
+                    if has_override {
+                        println!("      - {} (overrides)", provider);
                     } else {
-                        println!("      - {} ({})", provider, parts.join(", "));
+                        println!("      - {}", provider);
                     }
 
                     // Show model variants under this provider

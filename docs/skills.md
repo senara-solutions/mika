@@ -354,30 +354,29 @@ The `max_prompt_size` value is clamped to a hard ceiling of **64KB** regardless 
 
 ### Per-Provider and Per-Model Variant Directories
 
-Skills can ship provider-tuned and model-tuned prompt variants alongside the root prompt. The variant hierarchy supports two levels of nesting: **provider** directories (matching `ProviderKind` values) and **model** subdirectories within each provider:
+Skills can ship model-tuned prompt variants alongside the root prompt. The variant hierarchy supports two levels of nesting: **provider** directories (matching `ProviderKind` values) and **model** subdirectories within each provider:
 
 ```
 ~/.mika/skills/web-search/
 ├── skill.toml              # Root manifest (required)
-├── system_prompt.md        # Root prompt (ultimate fallback)
+├── system_prompt.md        # Root prompt (fallback for all models)
 ├── tools.json              # Tool definitions (NOT overridable per-variant)
 ├── handlers/               # Handler scripts (NOT overridable per-variant)
-├── anthropic/              # Provider variant directory
-│   ├── system_prompt.md    # Anthropic-tuned prompt (replaces root)
-│   ├── skill.toml          # Sparse overrides (optional)
+├── anthropic/              # Provider directory (overrides + model subdirs)
+│   ├── skill.toml          # Sparse overrides: timeout_secs, max_prompt_size (optional)
 │   └── claude-sonnet-4-6/  # Model variant directory
 │       ├── system_prompt.md  # Sonnet 4.6-specific prompt
 │       └── skill.toml        # Sparse overrides (optional)
 ├── openai/
-│   ├── system_prompt.md    # OpenAI-tuned prompt
+│   ├── skill.toml          # OpenAI-wide timeout override
 │   └── gpt-4o/
 │       └── system_prompt.md  # GPT-4o-specific prompt
-├── openrouter/
-│   └── anthropic--claude-sonnet-4/   # Slash in model name → '--' separator
-│       └── system_prompt.md
-└── groq/
-    └── system_prompt.md    # Groq-tuned prompt (no model variants)
+└── openrouter/
+    └── anthropic--claude-sonnet-4/   # Slash in model name → '--' separator
+        └── system_prompt.md
 ```
+
+**Important:** Provider-level `system_prompt.md` files are **not supported** and will be ignored. Models from the same provider (e.g., gpt-4o vs gpt-5) have different prompt requirements, so prompts must be specified at the model level. Provider directories hold only `skill.toml` overrides and model subdirectories.
 
 Valid provider directory names: `anthropic`, `openai`, `openrouter`, `groq`, `ollama`, `mistral`, `google`, `deepseek`, `minimax`, `kimi`, `qwen`. Subdirectories with non-matching names (e.g., `handlers/`, `.git/`) are silently ignored. Within provider directories, any subdirectory (except dotdirs like `.git/`) is treated as a model variant.
 
@@ -385,13 +384,12 @@ Valid provider directory names: `anthropic`, `openai`, `openrouter`, `groq`, `ol
 
 #### Resolution Order
 
-When injecting a skill's prompt, the agent loop resolves the best prompt using a three-level fallback:
+When injecting a skill's prompt, the agent loop resolves the best prompt using a two-level fallback:
 
 1. `{skill}/{provider}/{sanitized_model}/system_prompt.md` → model-specific (most specific)
-2. `{skill}/{provider}/system_prompt.md` → provider-specific
-3. `{skill}/system_prompt.md` → root (least specific)
+2. `{skill}/system_prompt.md` → root (fallback)
 
-The first match wins. The active provider comes from `llm.provider_name()` and the active model from `llm.model_name()`. The same three-level fallback applies to `timeout_secs` and `max_prompt_size` overrides: model override > provider override > root manifest.
+The first match wins. The active provider comes from `llm.provider_name()` and the active model from `llm.model_name()`. For numeric config overrides (`timeout_secs`, `max_prompt_size`), a three-level fallback applies: model override > provider override > root manifest.
 
 #### Sparse Manifest Overrides
 
@@ -420,10 +418,12 @@ This gives GPT-4o a 120-second timeout, other OpenAI models get 60 seconds, and 
 `mika skills validate` checks provider and model variant directories:
 
 - Warns if a provider subdirectory name looks like a misspelling of a known provider
-- Validates `system_prompt.md` size against the effective limit (at both provider and model levels)
+- Warns if a provider directory contains `system_prompt.md` (not supported — use model-level prompts instead)
+- Validates `system_prompt.md` size against the effective limit (at model level)
 - Validates `skill.toml` parseability (at both provider and model levels)
 - Warns if a variant `skill.toml` contains identity fields (`name`, `description`) or `[triggers]` — these are silently ignored at runtime
 - Warns if a variant directory contains `tools.json` (not supported at any variant level)
+- Warns if a provider directory is empty (no `skill.toml` or model subdirectories)
 - Warns if a model variant directory is empty (no `system_prompt.md` or `skill.toml`)
 - Warns about unexpected subdirectories deeper than the model level (only two levels of nesting supported: provider/model)
 
@@ -431,7 +431,7 @@ This gives GPT-4o a 120-second timeout, other OpenAI models get 60 seconds, and 
 
 - All variants (provider and model) are loaded eagerly at startup — no filesystem access at request time
 - `SkillEntry` stores model variants in `model_prompts` and `model_overrides` maps, keyed by `"{provider}/{sanitized_model}"`
-- `resolve_prompt(provider, model)` and `effective_timeout(provider, model)` implement the three-level fallback
+- `resolve_prompt(provider, model)` implements two-level fallback (model → root); `effective_timeout(provider, model)` implements three-level fallback (model → provider → root)
 - Runtime provider/model switching (`/provider`, `/model` commands) selects the correct variant without re-scanning
 - Skills without variant directories work exactly as before (zero overhead)
 - `mika skills install` copies or symlinks the entire skill directory including all variant subdirectories

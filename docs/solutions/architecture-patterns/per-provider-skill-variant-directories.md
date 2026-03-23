@@ -13,26 +13,24 @@ related_issues: ["#241", "#239", "#246"]
 
 ## Problem
 
-Skills have a single `system_prompt.md` shared across all LLM providers and models. Prompts written for Claude (Anthropic) behave differently on OpenAI, Groq, Mistral, etc. Even within the same provider, different models (e.g., Claude Sonnet 4.6 vs Opus 4.6, MiniMax M2.7 vs M2.5) may need different prompt guidance. There was no mechanism to ship provider-tuned or model-tuned prompt variants alongside the root prompt.
+Skills have a single `system_prompt.md` shared across all LLM providers and models. Prompts written for Claude (Anthropic) behave differently on OpenAI, Groq, Mistral, etc. Even within the same provider, different models (e.g., Claude Sonnet 4.6 vs Opus 4.6, MiniMax M2.7 vs M2.5) may need different prompt guidance. There was no mechanism to ship model-tuned prompt variants alongside the root prompt.
 
 ## Solution
 
-Variant files live in a two-level directory hierarchy under the skill root: `{provider}/` for provider-level variants and `{provider}/{model}/` for model-level variants. Provider directories are named after `ProviderKind::config_prefix()` values (e.g., `anthropic/`, `openai/`). Model directories within use the model name with slashes replaced by `--` (via `sanitize_model_dir_name()`, e.g., `anthropic--claude-sonnet-4` for OpenRouter's `anthropic/claude-sonnet-4`).
+Variant files live in a two-level directory hierarchy under the skill root: `{provider}/` for provider-level overrides and `{provider}/{model}/` for model-level variants. Provider directories are named after `ProviderKind::config_prefix()` values (e.g., `anthropic/`, `openai/`). Model directories within use the model name with slashes replaced by `--` (via `sanitize_model_dir_name()`, e.g., `anthropic--claude-sonnet-4` for OpenRouter's `anthropic/claude-sonnet-4`).
 
-The skill scanner eagerly loads all variants at startup into four `HashMap` fields on `SkillEntry`:
+The skill scanner eagerly loads all variants at startup into three `HashMap` fields on `SkillEntry`:
 
-- `provider_prompts: HashMap<String, String>` — provider-specific prompt content
 - `provider_overrides: HashMap<String, ProviderSkillFields>` — provider-level sparse manifest field overrides (`timeout_secs`, `max_prompt_size`)
 - `model_prompts: HashMap<String, String>` — model-specific prompt content (keyed by `"{provider}/{sanitized_model}"`)
 - `model_overrides: HashMap<String, ProviderSkillFields>` — model-level sparse manifest field overrides
 
-At prompt injection time, `inject_skills_and_resolve_tools()` takes both `provider_name` and `model_name` parameters. Resolution uses three-level fallback via `SkillEntry::resolve_prompt()`:
+At prompt injection time, `inject_skills_and_resolve_tools()` takes both `provider_name` and `model_name` parameters. Resolution uses two-level fallback via `SkillEntry::resolve_prompt()`:
 
 1. Model-specific prompt (`model_prompts["{provider}/{sanitized_model}"]`) → most specific
-2. Provider-specific prompt (`provider_prompts["{provider}"]`)
-3. Root `prompt_snippet` → least specific, ultimate fallback
+2. Root `prompt_snippet` → fallback
 
-The same three-level fallback applies to `effective_timeout()` and `max_prompt_size` overrides.
+Provider-level prompts are intentionally **not** supported — models from the same provider (e.g., gpt-4o vs gpt-5) have different capabilities and prompt requirements. Provider-level overrides for numeric config (`timeout_secs`, `max_prompt_size`) remain useful and follow a three-level fallback via `effective_timeout()`: model → provider → root.
 
 ### Key Design Decisions
 
@@ -44,13 +42,14 @@ The same three-level fallback applies to `effective_timeout()` and `max_prompt_s
 6. **Two-level nesting maximum:** Provider/model is the deepest nesting supported. Subdirectories within model directories trigger validation warnings.
 7. **`always_on` not overridable per-variant:** Matching uses root `always_on` value only. Avoids complexity of skills appearing/disappearing based on provider or model.
 8. **Tools/handlers not overridable:** `tools.json` and handler scripts must remain consistent across all variants. If a provider/model needs different tool schemas, that's a different skill.
+9. **No provider-level prompts:** Provider directories hold overrides (`skill.toml`) and model subdirectories only. Provider-level `system_prompt.md` files are ignored at scan time and warned about during validation.
 
 ### Files Changed
 
 | File | Change |
 |------|--------|
 | `crates/mika-agent/src/skills/manifest.rs` | `ProviderSkillOverride`, `ProviderSkillFields` types (unchanged — reused for model overrides) |
-| `crates/mika-agent/src/skills/index.rs` | `SkillEntry` gains `model_prompts`, `model_overrides` fields; `sanitize_model_dir_name()` function; `resolve_prompt(provider, model)`, `variant_models(provider)` methods; `effective_timeout()` and `variant_count()` updated for three-level fallback; `scan_provider_variants()` extended to scan model subdirs; `validate_skill()` extended for model dir validation |
+| `crates/mika-agent/src/skills/index.rs` | `SkillEntry` gains `model_prompts`, `model_overrides` fields; `sanitize_model_dir_name()` function; `resolve_prompt(provider, model)`, `variant_models(provider)` methods; `effective_timeout()` and `variant_count()` updated; `scan_provider_variants()` scans model subdirs; `validate_skill()` extended for model dir validation |
 | `crates/mika-agent/src/agent.rs` | `inject_skills_and_resolve_tools()` + `max_skill_timeout()` gain `model_name` parameter; all 3 call sites updated; prompt resolution uses `resolve_prompt()` |
 | `crates/mika-cli/src/commands/skills.rs` | Info shows model variants nested under providers with tree-style `└─` indentation |
 | `crates/mika-cli/src/tui/commands/handlers.rs` | `/skills` handler shows model count per provider |
@@ -58,8 +57,8 @@ The same three-level fallback applies to `effective_timeout()` and `max_prompt_s
 ## Prevention / Best Practices
 
 - When adding a new `ProviderKind` variant, ensure its `config_prefix()` value is unique and lowercase — it doubles as the variant directory name.
-- Skill authors should always include a root `system_prompt.md` as fallback for providers and models without dedicated variants.
+- Skill authors should always include a root `system_prompt.md` as fallback for models without dedicated variants.
 - For models with slashes in their names (OpenRouter convention), use `--` as the separator in directory names (e.g., `anthropic--claude-sonnet-4` for model `anthropic/claude-sonnet-4`).
-- Variant directories (provider or model) with no `system_prompt.md` and no `skill.toml` are skipped with a warning — use `mika skills validate` to catch empty variants.
+- Provider directories need at least a `skill.toml` override or model subdirectories to be valid — empty provider dirs or dirs with only a `system_prompt.md` trigger a warning. Use `mika skills validate` to catch these.
 - The `validate_skill()` function includes typo detection for provider subdirectory names that are close to but don't match known providers.
 - Validation warns about subdirectories deeper than the model level — only two levels of nesting are supported.

@@ -2079,7 +2079,6 @@ mod tests {
                 .collect(),
             enabled: true,
             has_override: false,
-            provider_prompts: std::collections::HashMap::new(),
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
@@ -2247,42 +2246,14 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_skills_uses_provider_prompt() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt for search.".to_string();
-        entry.provider_prompts.insert(
-            "anthropic".to_string(),
-            "Anthropic-tuned prompt for search.".to_string(),
-        );
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-        );
-
-        assert!(system.contains("Anthropic-tuned prompt for search."));
-        assert!(!system.contains("Root prompt for search."));
-    }
-
-    #[test]
     fn test_inject_skills_falls_back_to_root() {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt for search.".to_string();
-        entry.provider_prompts.insert(
-            "anthropic".to_string(),
-            "Anthropic-tuned prompt.".to_string(),
-        );
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
-        // "groq" has no variant — should fall back to root
+        // No model variant — should fall back to root
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
@@ -2292,7 +2263,6 @@ mod tests {
         );
 
         assert!(system.contains("Root prompt for search."));
-        assert!(!system.contains("Anthropic-tuned prompt."));
     }
 
     #[test]
@@ -2320,9 +2290,6 @@ mod tests {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt.".to_string();
-        entry
-            .provider_prompts
-            .insert("anthropic".to_string(), "Anthropic prompt.".to_string());
         entry.model_prompts.insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "Sonnet-specific prompt.".to_string(),
@@ -2339,19 +2306,19 @@ mod tests {
         );
 
         assert!(system.contains("Sonnet-specific prompt."));
-        assert!(!system.contains("Anthropic prompt."));
         assert!(!system.contains("Root prompt."));
     }
 
     #[test]
-    fn test_inject_skills_model_falls_back_to_provider() {
+    fn test_inject_skills_model_no_match_falls_back_to_root() {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt.".to_string();
-        entry
-            .provider_prompts
-            .insert("anthropic".to_string(), "Anthropic prompt.".to_string());
-        // No model variant for claude-opus-4
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "Sonnet prompt.".to_string(),
+        );
+        // No model variant for claude-opus-4 — should fall back to root
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
@@ -2363,8 +2330,8 @@ mod tests {
             "claude-opus-4",
         );
 
-        assert!(system.contains("Anthropic prompt."));
-        assert!(!system.contains("Root prompt."));
+        assert!(system.contains("Root prompt."));
+        assert!(!system.contains("Sonnet prompt."));
     }
 
     #[test]

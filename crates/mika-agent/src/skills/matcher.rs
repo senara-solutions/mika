@@ -89,7 +89,6 @@ mod tests {
             skill_tools: vec![],
             enabled: true,
             has_override: false,
-            provider_prompts: std::collections::HashMap::new(),
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
