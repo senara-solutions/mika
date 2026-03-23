@@ -180,6 +180,8 @@ mod tests {
             has_override: false,
             provider_prompts: std::collections::HashMap::new(),
             provider_overrides: std::collections::HashMap::new(),
+            model_prompts: std::collections::HashMap::new(),
+            model_overrides: std::collections::HashMap::new(),
         }
     }
 

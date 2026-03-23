@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -54,33 +54,110 @@ pub struct SkillEntry {
     /// Key = provider name, value = sparse override fields.
     /// Empty map if no variants exist.
     pub provider_overrides: HashMap<String, ProviderSkillFields>,
+    /// Model-specific prompt snippet overrides.
+    /// Key = "{provider}/{sanitized_model}" (e.g., "anthropic/claude-sonnet-4-6").
+    /// Empty map if no model variants exist. Populated eagerly at scan time.
+    pub model_prompts: HashMap<String, String>,
+    /// Model-specific manifest field overrides.
+    /// Key = "{provider}/{sanitized_model}", value = sparse override fields.
+    /// Empty map if no model variants exist.
+    pub model_overrides: HashMap<String, ProviderSkillFields>,
 }
 
 impl SkillEntry {
-    /// Effective timeout for a given provider, considering overrides.
-    pub fn effective_timeout(&self, provider: &str) -> u64 {
-        self.provider_overrides
-            .get(provider)
+    /// Effective timeout: model override > provider override > root.
+    pub fn effective_timeout(&self, provider: &str, model: &str) -> u64 {
+        let model_key = format!("{}/{}", provider, sanitize_model_dir_name(model));
+        self.model_overrides
+            .get(&model_key)
             .and_then(|o| o.timeout_secs)
+            .or_else(|| {
+                self.provider_overrides
+                    .get(provider)
+                    .and_then(|o| o.timeout_secs)
+            })
             .unwrap_or(self.manifest.skill.timeout_secs)
     }
 
+    /// Resolve the best prompt for a given provider + model combination.
+    /// Three-level fallback: model-specific > provider-specific > root.
+    pub fn resolve_prompt(&self, provider: &str, model: &str) -> &str {
+        let model_key = format!("{}/{}", provider, sanitize_model_dir_name(model));
+        if let Some(prompt) = self.model_prompts.get(&model_key) {
+            return prompt;
+        }
+        if let Some(prompt) = self.provider_prompts.get(provider) {
+            return prompt;
+        }
+        &self.prompt_snippet
+    }
+
     /// Sorted set of all provider names that have any variant (prompt or override).
-    pub fn variant_providers(&self) -> std::collections::BTreeSet<&str> {
-        let mut providers = std::collections::BTreeSet::new();
+    pub fn variant_providers(&self) -> BTreeSet<&str> {
+        let mut providers = BTreeSet::new();
         for key in self.provider_prompts.keys() {
             providers.insert(key.as_str());
         }
         for key in self.provider_overrides.keys() {
             providers.insert(key.as_str());
         }
+        // Also include providers from model variants
+        for key in self.model_prompts.keys() {
+            if let Some(provider) = key.split('/').next() {
+                providers.insert(provider);
+            }
+        }
+        for key in self.model_overrides.keys() {
+            if let Some(provider) = key.split('/').next() {
+                providers.insert(provider);
+            }
+        }
         providers
     }
 
-    /// Number of provider variants (prompt or override) attached to this skill.
-    pub fn variant_count(&self) -> usize {
-        self.variant_providers().len()
+    /// Model variants for a specific provider.
+    pub fn variant_models(&self, provider: &str) -> BTreeSet<&str> {
+        let prefix = format!("{provider}/");
+        let mut models = BTreeSet::new();
+        for key in self.model_prompts.keys() {
+            if let Some(model) = key.strip_prefix(&prefix) {
+                models.insert(model);
+            }
+        }
+        for key in self.model_overrides.keys() {
+            if let Some(model) = key.strip_prefix(&prefix) {
+                models.insert(model);
+            }
+        }
+        models
     }
+
+    /// Total number of distinct variant entries (providers + models).
+    pub fn variant_count(&self) -> usize {
+        let mut all_keys = BTreeSet::new();
+        // Provider-level keys
+        for key in self.provider_prompts.keys() {
+            all_keys.insert(key.as_str());
+        }
+        for key in self.provider_overrides.keys() {
+            all_keys.insert(key.as_str());
+        }
+        // Model-level composite keys
+        for key in self.model_prompts.keys() {
+            all_keys.insert(key.as_str());
+        }
+        for key in self.model_overrides.keys() {
+            all_keys.insert(key.as_str());
+        }
+        all_keys.len()
+    }
+}
+
+/// Sanitize a model name for use as a directory name.
+/// Replaces '/' with '--' to avoid filesystem path conflicts.
+/// Applied at both scan time (directory discovery) and resolution time (lookup).
+pub(crate) fn sanitize_model_dir_name(model: &str) -> String {
+    model.replace('/', "--")
 }
 
 /// Result of scanning a skills directory.
@@ -222,8 +299,8 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         // Parse tools.json if present
         let skill_tools = load_tools_json(&path);
 
-        // Scan for provider variant directories
-        let (provider_prompts, provider_overrides) = scan_provider_variants(&path, &manifest);
+        // Scan for provider and model variant directories
+        let variants = scan_provider_variants(&path, &manifest);
 
         entries.push(SkillEntry {
             manifest,
@@ -233,8 +310,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             skill_tools,
             enabled,
             has_override: false,
-            provider_prompts,
-            provider_overrides,
+            provider_prompts: variants.provider_prompts,
+            provider_overrides: variants.provider_overrides,
+            model_prompts: variants.model_prompts,
+            model_overrides: variants.model_overrides,
         });
     }
 
@@ -489,14 +568,15 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                     continue;
                 }
 
+                let effective_limit = manifest
+                    .skill
+                    .max_prompt_size
+                    .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+                    .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+
                 // Validate prompt size
                 if has_prompt {
                     let prompt_path = sub_path.join("system_prompt.md");
-                    let effective_limit = manifest
-                        .skill
-                        .max_prompt_size
-                        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-                        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
                     if let Ok(meta) = std::fs::metadata(&prompt_path) {
                         if meta.len() > effective_limit {
                             diags.push(SkillDiagnostic::fail(format!(
@@ -561,6 +641,123 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                     diags.push(SkillDiagnostic::warn(format!(
                         "provider '{subdir_name}/tools.json' is not supported — tools cannot be overridden per-provider"
                     )));
+                }
+
+                // Validate model subdirectories within this provider
+                if let Ok(model_rd) = std::fs::read_dir(&sub_path) {
+                    for model_entry in model_rd.flatten() {
+                        let model_path = model_entry.path();
+                        if !model_path.is_dir() {
+                            continue;
+                        }
+                        let model_name = match model_path.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n.to_string(),
+                            None => continue,
+                        };
+                        if model_name.starts_with('.') {
+                            continue;
+                        }
+
+                        let model_has_prompt = model_path.join("system_prompt.md").exists();
+                        let model_has_override = model_path.join("skill.toml").exists();
+
+                        if !model_has_prompt && !model_has_override {
+                            diags.push(SkillDiagnostic::warn(format!(
+                                "model variant '{subdir_name}/{model_name}/' is empty (no system_prompt.md or skill.toml)"
+                            )));
+                            continue;
+                        }
+
+                        // Validate model prompt size
+                        if model_has_prompt {
+                            let model_prompt_path = model_path.join("system_prompt.md");
+                            if let Ok(meta) = std::fs::metadata(&model_prompt_path) {
+                                if meta.len() > effective_limit {
+                                    diags.push(SkillDiagnostic::fail(format!(
+                                        "model '{subdir_name}/{model_name}/system_prompt.md' ({} bytes) exceeds limit ({} bytes)",
+                                        meta.len(), effective_limit
+                                    )));
+                                } else {
+                                    diags.push(SkillDiagnostic::ok(format!(
+                                        "model '{subdir_name}/{model_name}/system_prompt.md' size OK ({} bytes)",
+                                        meta.len()
+                                    )));
+                                }
+                            }
+                        }
+
+                        // Validate model override parseability and identity fields
+                        if model_has_override {
+                            let model_override_path = model_path.join("skill.toml");
+                            match std::fs::read_to_string(&model_override_path) {
+                                Ok(content) => {
+                                    match toml::from_str::<ProviderSkillOverride>(&content) {
+                                        Ok(_) => {
+                                            diags.push(SkillDiagnostic::ok(format!(
+                                                "model '{subdir_name}/{model_name}/skill.toml' valid"
+                                            )));
+                                            // Warn if identity fields are present
+                                            if let Ok(raw) = toml::from_str::<toml::Value>(&content)
+                                            {
+                                                if let Some(skill_table) =
+                                                    raw.get("skill").and_then(|v| v.as_table())
+                                                {
+                                                    for field in &["name", "description"] {
+                                                        if skill_table.contains_key(*field) {
+                                                            diags.push(SkillDiagnostic::warn(format!(
+                                                                "model '{subdir_name}/{model_name}/skill.toml' contains identity field '{field}' which is ignored — identity fields cannot be overridden per-model"
+                                                            )));
+                                                        }
+                                                    }
+                                                }
+                                                if raw.get("triggers").is_some() {
+                                                    diags.push(SkillDiagnostic::warn(format!(
+                                                        "model '{subdir_name}/{model_name}/skill.toml' contains [triggers] section which is ignored — triggers cannot be overridden per-model"
+                                                    )));
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            diags.push(SkillDiagnostic::fail(format!(
+                                                "model '{subdir_name}/{model_name}/skill.toml' invalid: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    diags.push(SkillDiagnostic::fail(format!(
+                                        "cannot read model '{subdir_name}/{model_name}/skill.toml': {e}"
+                                    )));
+                                }
+                            }
+                        }
+
+                        // Warn if model subdir contains tools.json
+                        if model_path.join("tools.json").exists() {
+                            diags.push(SkillDiagnostic::warn(format!(
+                                "model '{subdir_name}/{model_name}/tools.json' is not supported — tools cannot be overridden per-model"
+                            )));
+                        }
+
+                        // Warn about unexpected nesting deeper than model level
+                        if let Ok(deep_rd) = std::fs::read_dir(&model_path) {
+                            for deep_entry in deep_rd.flatten() {
+                                if deep_entry.path().is_dir() {
+                                    let deep_name =
+                                        deep_entry.file_name().to_string_lossy().to_string();
+                                    if !deep_name.starts_with('.') {
+                                        diags.push(SkillDiagnostic::warn(format!(
+                                            "unexpected subdirectory '{subdir_name}/{model_name}/{deep_name}/' — only two levels of nesting supported (provider/model)"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+
+                        diags.push(SkillDiagnostic::ok(format!(
+                            "model variant '{subdir_name}/{model_name}/' valid"
+                        )));
+                    }
                 }
             } else {
                 // Not a known provider — check for typos
@@ -686,25 +883,43 @@ fn inject_work_item_id_field(schema: &mut serde_json::Value) {
     }
 }
 
-/// Scan a skill directory for provider variant subdirectories.
+/// Result of scanning provider and model variant directories.
+struct VariantScanResult {
+    provider_prompts: HashMap<String, String>,
+    provider_overrides: HashMap<String, ProviderSkillFields>,
+    model_prompts: HashMap<String, String>,
+    model_overrides: HashMap<String, ProviderSkillFields>,
+}
+
+/// Scan a skill directory for provider and model variant subdirectories.
 ///
 /// Iterates over immediate subdirectories and checks if each name matches
 /// a known `ProviderKind`. For matching directories, loads any
-/// `system_prompt.md` and `skill.toml` (as sparse override).
-fn scan_provider_variants(
-    skill_dir: &Path,
-    manifest: &SkillManifest,
-) -> (
-    HashMap<String, String>,
-    HashMap<String, ProviderSkillFields>,
-) {
+/// `system_prompt.md` and `skill.toml` (as sparse override). Then scans
+/// subdirectories within each provider directory for model variants.
+fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> VariantScanResult {
     let mut prompts = HashMap::new();
     let mut overrides = HashMap::new();
+    let mut model_prompts = HashMap::new();
+    let mut model_overrides = HashMap::new();
 
     let read_dir = match std::fs::read_dir(skill_dir) {
         Ok(rd) => rd,
-        Err(_) => return (prompts, overrides),
+        Err(_) => {
+            return VariantScanResult {
+                provider_prompts: prompts,
+                provider_overrides: overrides,
+                model_prompts,
+                model_overrides,
+            };
+        }
     };
+
+    let max_size = manifest
+        .skill
+        .max_prompt_size
+        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
 
     for dir_entry in read_dir.flatten() {
         let path = dir_entry.path();
@@ -727,11 +942,6 @@ fn scan_provider_variants(
         // Load provider-specific prompt snippet
         let prompt_path = path.join("system_prompt.md");
         if prompt_path.exists() {
-            let max_size = manifest
-                .skill
-                .max_prompt_size
-                .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-                .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
             let snippet = load_snippet_with_limit(&prompt_path, max_size);
             if !snippet.is_empty() {
                 prompts.insert(subdir_name.clone(), snippet);
@@ -775,9 +985,84 @@ fn scan_provider_variants(
                 "provider variant directory is empty (no system_prompt.md or skill.toml)"
             );
         }
+
+        // Scan model subdirectories within this provider directory
+        if let Ok(model_rd) = std::fs::read_dir(&path) {
+            for model_entry in model_rd.flatten() {
+                let model_path = model_entry.path();
+                if !model_path.is_dir() {
+                    continue;
+                }
+                let model_name = match model_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                // Skip dotfiles/dotdirs
+                if model_name.starts_with('.') {
+                    continue;
+                }
+                let composite_key = format!("{}/{}", subdir_name, model_name);
+                let mut model_has_content = false;
+
+                // Load model-specific prompt
+                let model_prompt_path = model_path.join("system_prompt.md");
+                if model_prompt_path.exists() {
+                    let snippet = load_snippet_with_limit(&model_prompt_path, max_size);
+                    if !snippet.is_empty() {
+                        model_prompts.insert(composite_key.clone(), snippet);
+                        model_has_content = true;
+                    }
+                }
+
+                // Load model-specific skill.toml override
+                let model_override_path = model_path.join("skill.toml");
+                if model_override_path.exists() {
+                    match std::fs::read_to_string(&model_override_path) {
+                        Ok(content) => match toml::from_str::<ProviderSkillOverride>(&content) {
+                            Ok(parsed) => {
+                                model_overrides.insert(composite_key.clone(), parsed.skill);
+                                model_has_content = true;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    path = %model_override_path.display(),
+                                    provider = %subdir_name,
+                                    model = %model_name,
+                                    error = %e,
+                                    "malformed model skill.toml override, skipping"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                path = %model_override_path.display(),
+                                provider = %subdir_name,
+                                model = %model_name,
+                                error = %e,
+                                "cannot read model skill.toml override"
+                            );
+                        }
+                    }
+                }
+
+                if !model_has_content {
+                    warn!(
+                        skill = %manifest.skill.name,
+                        provider = %subdir_name,
+                        model = %model_name,
+                        "model variant directory is empty (no system_prompt.md or skill.toml)"
+                    );
+                }
+            }
+        }
     }
 
-    (prompts, overrides)
+    VariantScanResult {
+        provider_prompts: prompts,
+        provider_overrides: overrides,
+        model_prompts,
+        model_overrides,
+    }
 }
 
 /// Load and parse `tools.json` from a skill directory.
@@ -1736,6 +2021,8 @@ mod tests {
             has_override: false,
             provider_prompts: HashMap::new(),
             provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
         };
         entry.provider_overrides.insert(
             "openai".to_string(),
@@ -1744,7 +2031,7 @@ mod tests {
                 max_prompt_size: None,
             },
         );
-        assert_eq!(entry.effective_timeout("openai"), 90);
+        assert_eq!(entry.effective_timeout("openai", "gpt-4o"), 90);
     }
 
     #[test]
@@ -1770,8 +2057,13 @@ mod tests {
             has_override: false,
             provider_prompts: HashMap::new(),
             provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
         };
-        assert_eq!(entry.effective_timeout("anthropic"), 30);
+        assert_eq!(
+            entry.effective_timeout("anthropic", "claude-sonnet-4-6"),
+            30
+        );
     }
 
     #[test]
@@ -1797,8 +2089,13 @@ mod tests {
             has_override: false,
             provider_prompts: HashMap::new(),
             provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
         };
-        assert_eq!(entry.effective_timeout("unknown_provider"), 30);
+        assert_eq!(
+            entry.effective_timeout("unknown_provider", "some-model"),
+            30
+        );
     }
 
     #[test]
@@ -1824,6 +2121,8 @@ mod tests {
             has_override: false,
             provider_prompts: HashMap::new(),
             provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
         };
 
         assert_eq!(entry.variant_count(), 0);
@@ -2053,6 +2352,744 @@ mod tests {
         assert!(
             desc_warn.is_some(),
             "Expected warning for identity field 'description'. Got: {diags:?}"
+        );
+    }
+
+    // -- Model variant tests --
+
+    #[test]
+    fn test_sanitize_model_dir_name() {
+        assert_eq!(
+            sanitize_model_dir_name("claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            sanitize_model_dir_name("anthropic/claude-sonnet-4"),
+            "anthropic--claude-sonnet-4"
+        );
+        assert_eq!(sanitize_model_dir_name("gpt-4o"), "gpt-4o");
+        assert_eq!(sanitize_model_dir_name("MiniMax-M2.7"), "MiniMax-M2.7");
+        // Multiple slashes
+        assert_eq!(sanitize_model_dir_name("a/b/c"), "a--b--c");
+        // No slash — unchanged
+        assert_eq!(sanitize_model_dir_name("no-slash"), "no-slash");
+    }
+
+    #[test]
+    fn test_scan_with_model_variant_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Root prompt.").unwrap();
+
+        // Create provider + model variant
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        let model_dir = anthropic_dir.join("claude-sonnet-4-6");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("system_prompt.md"), "Sonnet 4.6 prompt.").unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "Root prompt.");
+        assert_eq!(
+            scan.entries[0].provider_prompts.get("anthropic").unwrap(),
+            "Anthropic prompt."
+        );
+        assert_eq!(
+            scan.entries[0]
+                .model_prompts
+                .get("anthropic/claude-sonnet-4-6")
+                .unwrap(),
+            "Sonnet 4.6 prompt."
+        );
+    }
+
+    #[test]
+    fn test_scan_with_model_variant_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            timeout_secs = 30
+            "#,
+        )
+        .unwrap();
+
+        // Create openai provider + model variant with override
+        let openai_dir = skill_dir.join("openai");
+        fs::create_dir_all(&openai_dir).unwrap();
+        fs::write(
+            openai_dir.join("skill.toml"),
+            r#"
+            [skill]
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        let model_dir = openai_dir.join("gpt-4o");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(
+            model_dir.join("skill.toml"),
+            r#"
+            [skill]
+            timeout_secs = 120
+            "#,
+        )
+        .unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        let model_override = scan.entries[0]
+            .model_overrides
+            .get("openai/gpt-4o")
+            .unwrap();
+        assert_eq!(model_override.timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn test_scan_model_with_slash_in_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        // OpenRouter model with slash: directory uses -- as separator
+        let openrouter_dir = skill_dir.join("openrouter");
+        fs::create_dir_all(&openrouter_dir).unwrap();
+        fs::write(
+            openrouter_dir.join("system_prompt.md"),
+            "OpenRouter prompt.",
+        )
+        .unwrap();
+
+        let model_dir = openrouter_dir.join("anthropic--claude-sonnet-4");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(
+            model_dir.join("system_prompt.md"),
+            "OpenRouter Claude Sonnet prompt.",
+        )
+        .unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(
+            scan.entries[0]
+                .model_prompts
+                .get("openrouter/anthropic--claude-sonnet-4")
+                .unwrap(),
+            "OpenRouter Claude Sonnet prompt."
+        );
+        // Verify sanitize_model_dir_name produces the right key
+        let sanitized = sanitize_model_dir_name("anthropic/claude-sonnet-4");
+        assert_eq!(sanitized, "anthropic--claude-sonnet-4");
+        let lookup_key = format!("openrouter/{sanitized}");
+        assert!(scan.entries[0].model_prompts.contains_key(&lookup_key));
+    }
+
+    #[test]
+    fn test_scan_skips_dotdirs_inside_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        // Dotdir inside provider — should be skipped
+        let git_dir = anthropic_dir.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("system_prompt.md"), "Should be ignored.").unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert!(scan.entries[0].model_prompts.is_empty());
+    }
+
+    #[test]
+    fn test_scan_empty_model_dir_warned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        // Empty model dir
+        let model_dir = anthropic_dir.join("claude-opus-4");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        // Should not panic — warning logged
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        // Model dir is empty so should not be in model_prompts or model_overrides
+        assert!(
+            !scan.entries[0]
+                .model_prompts
+                .contains_key("anthropic/claude-opus-4")
+        );
+        assert!(
+            !scan.entries[0]
+                .model_overrides
+                .contains_key("anthropic/claude-opus-4")
+        );
+    }
+
+    #[test]
+    fn test_scan_multiple_model_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("multi-model");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "multi-model"
+            description = "Multi-model skill"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Root prompt.").unwrap();
+
+        // Two models under anthropic
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        let sonnet_dir = anthropic_dir.join("claude-sonnet-4-6");
+        fs::create_dir_all(&sonnet_dir).unwrap();
+        fs::write(sonnet_dir.join("system_prompt.md"), "Sonnet prompt.").unwrap();
+
+        let opus_dir = anthropic_dir.join("claude-opus-4");
+        fs::create_dir_all(&opus_dir).unwrap();
+        fs::write(opus_dir.join("system_prompt.md"), "Opus prompt.").unwrap();
+
+        // One model under minimax
+        let minimax_dir = skill_dir.join("minimax");
+        fs::create_dir_all(&minimax_dir).unwrap();
+        fs::write(minimax_dir.join("system_prompt.md"), "MiniMax prompt.").unwrap();
+
+        let m27_dir = minimax_dir.join("MiniMax-M2.7");
+        fs::create_dir_all(&m27_dir).unwrap();
+        fs::write(m27_dir.join("system_prompt.md"), "M2.7 prompt.").unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        // 2 providers + 3 model variants = 5 total
+        assert_eq!(scan.entries[0].provider_prompts.len(), 2);
+        assert_eq!(scan.entries[0].model_prompts.len(), 3);
+        assert_eq!(scan.entries[0].variant_count(), 5);
+
+        // Verify specific entries
+        assert_eq!(
+            scan.entries[0]
+                .model_prompts
+                .get("anthropic/claude-sonnet-4-6")
+                .unwrap(),
+            "Sonnet prompt."
+        );
+        assert_eq!(
+            scan.entries[0]
+                .model_prompts
+                .get("anthropic/claude-opus-4")
+                .unwrap(),
+            "Opus prompt."
+        );
+        assert_eq!(
+            scan.entries[0]
+                .model_prompts
+                .get("minimax/MiniMax-M2.7")
+                .unwrap(),
+            "M2.7 prompt."
+        );
+    }
+
+    #[test]
+    fn test_resolve_prompt_model_level() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: "Root prompt.".to_string(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
+        };
+        entry
+            .provider_prompts
+            .insert("anthropic".to_string(), "Anthropic prompt.".to_string());
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "Sonnet prompt.".to_string(),
+        );
+
+        // Model-specific wins
+        assert_eq!(
+            entry.resolve_prompt("anthropic", "claude-sonnet-4-6"),
+            "Sonnet prompt."
+        );
+        // No model variant for opus — falls back to provider
+        assert_eq!(
+            entry.resolve_prompt("anthropic", "claude-opus-4"),
+            "Anthropic prompt."
+        );
+        // No provider or model variant — falls back to root
+        assert_eq!(
+            entry.resolve_prompt("groq", "llama-3.3-70b-versatile"),
+            "Root prompt."
+        );
+    }
+
+    #[test]
+    fn test_resolve_prompt_with_slash_in_model_name() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: "Root prompt.".to_string(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
+        };
+        entry.model_prompts.insert(
+            "openrouter/anthropic--claude-sonnet-4".to_string(),
+            "OpenRouter model prompt.".to_string(),
+        );
+
+        // Model name with slash gets sanitized, matching the stored key
+        assert_eq!(
+            entry.resolve_prompt("openrouter", "anthropic/claude-sonnet-4"),
+            "OpenRouter model prompt."
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_model_override() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
+        };
+        entry.provider_overrides.insert(
+            "anthropic".to_string(),
+            super::super::manifest::ProviderSkillFields {
+                timeout_secs: Some(90),
+                max_prompt_size: None,
+            },
+        );
+        entry.model_overrides.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            super::super::manifest::ProviderSkillFields {
+                timeout_secs: Some(120),
+                max_prompt_size: None,
+            },
+        );
+
+        // Model override wins
+        assert_eq!(
+            entry.effective_timeout("anthropic", "claude-sonnet-4-6"),
+            120
+        );
+        // No model override — falls back to provider
+        assert_eq!(entry.effective_timeout("anthropic", "claude-opus-4"), 90);
+        // No model or provider override — falls back to root
+        assert_eq!(entry.effective_timeout("groq", "llama"), 30);
+    }
+
+    #[test]
+    fn test_variant_count_includes_models() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
+        };
+
+        // 2 provider variants
+        entry
+            .provider_prompts
+            .insert("anthropic".to_string(), "prompt".to_string());
+        entry
+            .provider_prompts
+            .insert("openai".to_string(), "prompt".to_string());
+        assert_eq!(entry.variant_count(), 2);
+
+        // + 3 model variants = 5 total
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "prompt".to_string(),
+        );
+        entry
+            .model_prompts
+            .insert("anthropic/claude-opus-4".to_string(), "prompt".to_string());
+        entry
+            .model_prompts
+            .insert("openai/gpt-4o".to_string(), "prompt".to_string());
+        assert_eq!(entry.variant_count(), 5);
+    }
+
+    #[test]
+    fn test_variant_models_for_provider() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
+        };
+
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "prompt".to_string(),
+        );
+        entry.model_overrides.insert(
+            "anthropic/claude-opus-4".to_string(),
+            super::super::manifest::ProviderSkillFields {
+                timeout_secs: Some(90),
+                max_prompt_size: None,
+            },
+        );
+        entry
+            .model_prompts
+            .insert("openai/gpt-4o".to_string(), "prompt".to_string());
+
+        let anthropic_models = entry.variant_models("anthropic");
+        assert_eq!(anthropic_models.len(), 2);
+        assert!(anthropic_models.contains("claude-sonnet-4-6"));
+        assert!(anthropic_models.contains("claude-opus-4"));
+
+        let openai_models = entry.variant_models("openai");
+        assert_eq!(openai_models.len(), 1);
+        assert!(openai_models.contains("gpt-4o"));
+
+        let groq_models = entry.variant_models("groq");
+        assert!(groq_models.is_empty());
+    }
+
+    #[test]
+    fn test_variant_providers_includes_model_only_providers() {
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_prompts: HashMap::new(),
+            provider_overrides: HashMap::new(),
+            model_prompts: HashMap::new(),
+            model_overrides: HashMap::new(),
+        };
+
+        // Only model variants, no provider-level
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "prompt".to_string(),
+        );
+
+        let providers = entry.variant_providers();
+        assert!(providers.contains("anthropic"));
+    }
+
+    // -- Model variant validation tests --
+
+    #[test]
+    fn test_validate_model_variant_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Root prompt.").unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        let model_dir = anthropic_dir.join("claude-sonnet-4-6");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("system_prompt.md"), "Sonnet prompt.").unwrap();
+        fs::write(
+            model_dir.join("skill.toml"),
+            r#"
+            [skill]
+            timeout_secs = 120
+            "#,
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let model_ok_count = diags
+            .iter()
+            .filter(|d| {
+                d.level == DiagnosticLevel::Ok
+                    && d.message.contains("model")
+                    && d.message.contains("claude-sonnet-4-6")
+            })
+            .count();
+        assert!(
+            model_ok_count >= 2,
+            "Expected OK diags for model prompt and skill.toml. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_model_variant_tools_json_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        let model_dir = anthropic_dir.join("claude-sonnet-4-6");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("system_prompt.md"), "Sonnet prompt.").unwrap();
+        fs::write(model_dir.join("tools.json"), "[]").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let tools_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("tools.json")
+                && d.message.contains("claude-sonnet-4-6")
+                && d.message.contains("not supported")
+        });
+        assert!(
+            tools_warn.is_some(),
+            "Expected warning for model tools.json. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_model_variant_empty_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        // Empty model dir
+        let model_dir = anthropic_dir.join("claude-opus-4");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let empty_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("model variant")
+                && d.message.contains("claude-opus-4")
+                && d.message.contains("empty")
+        });
+        assert!(
+            empty_warn.is_some(),
+            "Expected warning for empty model dir. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_model_variant_deep_nesting_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            "#,
+        )
+        .unwrap();
+
+        let anthropic_dir = skill_dir.join("anthropic");
+        fs::create_dir_all(&anthropic_dir).unwrap();
+        fs::write(anthropic_dir.join("system_prompt.md"), "Anthropic prompt.").unwrap();
+
+        let model_dir = anthropic_dir.join("claude-sonnet-4-6");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("system_prompt.md"), "Sonnet prompt.").unwrap();
+
+        // Create unexpected deep nesting
+        let deep_dir = model_dir.join("some-subdir");
+        fs::create_dir_all(&deep_dir).unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let nesting_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("unexpected subdirectory")
+                && d.message.contains("some-subdir")
+        });
+        assert!(
+            nesting_warn.is_some(),
+            "Expected warning for deep nesting. Got: {diags:?}"
         );
     }
 }
