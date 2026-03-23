@@ -98,9 +98,9 @@ fn list_skills(registry: &SkillRegistry, agent_home: &Path) {
                 String::new()
             }
         };
-        let llm_badge = if !entry.llm.is_empty() {
-            let provider = entry.llm.provider.as_deref().unwrap_or("*");
-            let model = entry.llm.model.as_deref().unwrap_or("default");
+        let llm_badge = if !entry.manifest.llm.is_empty() {
+            let provider = entry.manifest.llm.provider.as_deref().unwrap_or("*");
+            let model = entry.manifest.llm.model.as_deref().unwrap_or("default");
             format!(" [llm: {provider}/{model}]")
         } else {
             String::new()
@@ -168,9 +168,19 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
             println!("    Path:        {}", entry.dir.display());
 
             // Show LLM override if configured
-            if !entry.llm.is_empty() {
-                let provider = entry.llm.provider.as_deref().unwrap_or("(agent default)");
-                let model = entry.llm.model.as_deref().unwrap_or("(provider default)");
+            if !entry.manifest.llm.is_empty() {
+                let provider = entry
+                    .manifest
+                    .llm
+                    .provider
+                    .as_deref()
+                    .unwrap_or("(agent default)");
+                let model = entry
+                    .manifest
+                    .llm
+                    .model
+                    .as_deref()
+                    .unwrap_or("(provider default)");
                 println!("    LLM Override:");
                 println!("      Provider:  {}", provider);
                 println!("      Model:     {}", model);

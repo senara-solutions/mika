@@ -1911,17 +1911,13 @@ fn resolve_skill_llm_override(
     let mut override_skills: Vec<&str> = Vec::new();
 
     for entry in matched {
-        if entry.llm.is_empty() {
+        if entry.manifest.llm.is_empty() {
             continue;
         }
-        let provider_str = entry.llm.provider.as_deref();
-        let model_str = entry.llm.model.as_deref();
-
-        // Only count skills that declare at least provider or model
-        if provider_str.is_some() || model_str.is_some() {
-            overrides.push((provider_str.unwrap_or(""), model_str));
-            override_skills.push(&entry.manifest.skill.name);
-        }
+        let provider_str = entry.manifest.llm.provider.as_deref().unwrap_or("");
+        let model_str = entry.manifest.llm.model.as_deref();
+        overrides.push((provider_str, model_str));
+        override_skills.push(&entry.manifest.skill.name);
     }
 
     if overrides.is_empty() {
@@ -2235,7 +2231,6 @@ mod tests {
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
-            llm: Default::default(),
         }
     }
 

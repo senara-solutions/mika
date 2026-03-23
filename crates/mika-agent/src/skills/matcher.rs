@@ -93,7 +93,6 @@ mod tests {
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
-            llm: Default::default(),
         }
     }
 

@@ -1,7 +1,7 @@
 ---
 title: "feat(skills): [llm] section in skill.toml for per-skill provider and model override"
 type: feat
-status: active
+status: completed
 date: 2026-03-23
 issue: "#242"
 ---

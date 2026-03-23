@@ -7,8 +7,7 @@ use mika_common::llm::ProviderKind;
 
 use super::builtin_handlers::KNOWN_BUILTINS;
 use super::manifest::{
-    LlmOverride, ProviderSkillFields, ProviderSkillOverride, SkillManifest, SkillToolDef,
-    ToolHandler,
+    ProviderSkillFields, ProviderSkillOverride, SkillManifest, SkillToolDef, ToolHandler,
 };
 
 /// Maximum size for skill.toml files (64 KB).
@@ -59,9 +58,6 @@ pub struct SkillEntry {
     /// Key = "{provider}/{sanitized_model}", value = sparse override fields.
     /// Empty map if no model variants exist.
     pub model_overrides: HashMap<String, ProviderSkillFields>,
-    /// Per-skill LLM provider/model override from root `[llm]` section.
-    /// Copied from `manifest.llm` at scan time for convenient access.
-    pub llm: LlmOverride,
 }
 
 impl SkillEntry {
@@ -295,7 +291,6 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         // Scan for provider and model variant directories
         let variants = scan_provider_variants(&path, &manifest);
 
-        let llm = manifest.llm.clone();
         entries.push(SkillEntry {
             manifest,
             dir: path,
@@ -307,7 +302,6 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             provider_overrides: variants.provider_overrides,
             model_prompts: variants.model_prompts,
             model_overrides: variants.model_overrides,
-            llm,
         });
     }
 
@@ -365,7 +359,7 @@ impl SkillDiagnostic {
 /// providers without configured API keys. Call after `scan_skills_dir()`.
 pub fn warn_missing_llm_api_keys(entries: &[SkillEntry], settings: &mika_common::config::Settings) {
     for entry in entries {
-        if let Some(ref provider_str) = entry.llm.provider {
+        if let Some(ref provider_str) = entry.manifest.llm.provider {
             if let Ok(pk) = provider_str.parse::<ProviderKind>() {
                 let (_, api_key, _) = settings.provider_fields(pk);
                 // Ollama doesn't require an API key
@@ -2061,7 +2055,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
         entry.provider_overrides.insert(
             "openai".to_string(),
@@ -2098,7 +2091,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
         assert_eq!(
             entry.effective_timeout("anthropic", "claude-sonnet-4-6"),
@@ -2131,7 +2123,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
         assert_eq!(
             entry.effective_timeout("unknown_provider", "some-model"),
@@ -2164,7 +2155,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
 
         assert_eq!(entry.variant_count(), 0);
@@ -2750,7 +2740,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
         entry.model_prompts.insert(
             "anthropic/claude-sonnet-4-6".to_string(),
@@ -2799,7 +2788,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
         entry.model_prompts.insert(
             "openrouter/anthropic--claude-sonnet-4".to_string(),
@@ -2838,7 +2826,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
         entry.provider_overrides.insert(
             "anthropic".to_string(),
@@ -2891,7 +2878,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
 
         // 2 provider overrides
@@ -2950,7 +2936,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
 
         entry.model_prompts.insert(
@@ -3006,7 +2991,6 @@ mod tests {
             provider_overrides: HashMap::new(),
             model_prompts: HashMap::new(),
             model_overrides: HashMap::new(),
-            llm: Default::default(),
         };
 
         // Only model variants, no provider-level
