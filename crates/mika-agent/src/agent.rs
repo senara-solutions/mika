@@ -784,10 +784,11 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.user_message);
     let provider = llm.provider_name();
+    let model = llm.model_name();
     let mut skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider);
+        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
-    let skill_timeout = max_skill_timeout(&matched, provider);
+    let skill_timeout = max_skill_timeout(&matched, provider, model);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -1477,9 +1478,11 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     // Match skills: use safe always-on skills (no exec/http handlers).
     let matched = params.skills.safe_always_on_skills();
     let provider = llm.provider_name();
-    let skill_tool_defs = inject_skills_and_resolve_tools(&matched, tools, &mut system, provider);
+    let model = llm.model_name();
+    let skill_tool_defs =
+        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
-    let skill_timeout = max_skill_timeout(&matched, provider);
+    let skill_timeout = max_skill_timeout(&matched, provider, model);
 
     // For silent mode, provide a brief "trigger" as the user message
     let user_msg = match &params.trigger {
@@ -1694,10 +1697,11 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.task_message);
     let provider = llm.provider_name();
+    let model = llm.model_name();
     let mut skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider);
+        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
-    let skill_timeout = max_skill_timeout(&matched, provider);
+    let skill_timeout = max_skill_timeout(&matched, provider, model);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -1854,10 +1858,10 @@ fn build_skill_tool_map<'a>(matched: &[&'a SkillEntry]) -> HashMap<String, &'a R
 /// Compute the maximum timeout across matched skills (for skill tool execution).
 /// Falls back to TOOL_TIMEOUT_SECS if no skills matched.
 /// Uses provider-specific timeout overrides when available.
-fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str) -> u64 {
+fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &str) -> u64 {
     matched
         .iter()
-        .map(|e| e.effective_timeout(provider_name))
+        .map(|e| e.effective_timeout(provider_name, model_name))
         .max()
         .unwrap_or(TOOL_TIMEOUT_SECS)
 }
@@ -1865,13 +1869,15 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str) -> u64 {
 /// Inject matched skill prompt snippets into the system prompt and resolve
 /// tool definitions. Always includes all builtin tools plus skill-defined tools.
 ///
-/// `provider_name` selects provider-specific prompt variants when available.
-/// Falls back to the root `prompt_snippet` if no variant exists for the active provider.
+/// `provider_name` and `model_name` select variant-specific prompts when available.
+/// Two-level fallback for prompts: model-specific > root.
+/// Three-level fallback for timeouts: model > provider > root.
 fn inject_skills_and_resolve_tools(
     matched: &[&SkillEntry],
     tools: &ToolRegistry,
     system: &mut String,
     provider_name: &str,
+    model_name: &str,
 ) -> Vec<mika_common::claude::ToolDefinition> {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
@@ -1880,11 +1886,8 @@ fn inject_skills_and_resolve_tools(
 
     // Add skill prompt snippets and skill-defined tools from matched skills
     for entry in matched {
-        // Resolve prompt: provider-specific > root
-        let prompt = entry
-            .provider_prompts
-            .get(provider_name)
-            .unwrap_or(&entry.prompt_snippet);
+        // Two-level prompt resolution via SkillEntry helper (model → root)
+        let prompt = entry.resolve_prompt(provider_name, model_name);
 
         if !prompt.is_empty() {
             write!(
@@ -2077,8 +2080,9 @@ mod tests {
                 .collect(),
             enabled: true,
             has_override: false,
-            provider_prompts: std::collections::HashMap::new(),
             provider_overrides: std::collections::HashMap::new(),
+            model_prompts: std::collections::HashMap::new(),
+            model_overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -2117,13 +2121,19 @@ mod tests {
         let s1 = make_skill_entry("fast", 10, &[]);
         let s2 = make_skill_entry("slow", 120, &[]);
         let matched: Vec<&SkillEntry> = vec![&s1, &s2];
-        assert_eq!(max_skill_timeout(&matched, "anthropic"), 120);
+        assert_eq!(
+            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
+            120
+        );
     }
 
     #[test]
     fn test_max_skill_timeout_fallback_when_empty() {
         let matched: Vec<&SkillEntry> = vec![];
-        assert_eq!(max_skill_timeout(&matched, "anthropic"), TOOL_TIMEOUT_SECS);
+        assert_eq!(
+            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
+            TOOL_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -2138,9 +2148,12 @@ mod tests {
         );
         let matched: Vec<&SkillEntry> = vec![&s1];
         // With openai provider, should use the override
-        assert_eq!(max_skill_timeout(&matched, "openai"), 90);
+        assert_eq!(max_skill_timeout(&matched, "openai", "gpt-4o"), 90);
         // With anthropic provider, should use root
-        assert_eq!(max_skill_timeout(&matched, "anthropic"), 30);
+        assert_eq!(
+            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
+            30
+        );
     }
 
     #[test]
@@ -2151,7 +2164,13 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = "Base prompt.".to_string();
 
-        let defs = inject_skills_and_resolve_tools(&matched, &tools, &mut system, "anthropic");
+        let defs = inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-sonnet-4-6",
+        );
 
         // Should append skill snippet to system prompt
         assert!(system.contains("test Skill"));
@@ -2193,7 +2212,13 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
-        let defs = inject_skills_and_resolve_tools(&matched, &tools, &mut system, "anthropic");
+        let defs = inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-sonnet-4-6",
+        );
 
         // "overlap" should appear exactly once (builtin wins)
         assert_eq!(defs.len(), 1);
@@ -2208,7 +2233,13 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = "Base.".to_string();
 
-        inject_skills_and_resolve_tools(&matched, &tools, &mut system, "anthropic");
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-sonnet-4-6",
+        );
 
         // Should NOT add skill context section when snippet is empty
         assert!(!system.contains("quiet Skill"));
@@ -2216,40 +2247,23 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_skills_uses_provider_prompt() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt for search.".to_string();
-        entry.provider_prompts.insert(
-            "anthropic".to_string(),
-            "Anthropic-tuned prompt for search.".to_string(),
-        );
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        inject_skills_and_resolve_tools(&matched, &tools, &mut system, "anthropic");
-
-        assert!(system.contains("Anthropic-tuned prompt for search."));
-        assert!(!system.contains("Root prompt for search."));
-    }
-
-    #[test]
     fn test_inject_skills_falls_back_to_root() {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt for search.".to_string();
-        entry.provider_prompts.insert(
-            "anthropic".to_string(),
-            "Anthropic-tuned prompt.".to_string(),
-        );
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
-        // "groq" has no variant — should fall back to root
-        inject_skills_and_resolve_tools(&matched, &tools, &mut system, "groq");
+        // No model variant — should fall back to root
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "groq",
+            "llama-3.3-70b-versatile",
+        );
 
         assert!(system.contains("Root prompt for search."));
-        assert!(!system.contains("Anthropic-tuned prompt."));
     }
 
     #[test]
@@ -2260,10 +2274,142 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = "Base.".to_string();
 
-        inject_skills_and_resolve_tools(&matched, &tools, &mut system, "anthropic");
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-sonnet-4-6",
+        );
 
         // Should NOT add any skill context section
         assert_eq!(system, "Base.");
+    }
+
+    #[test]
+    fn test_inject_skills_uses_model_prompt() {
+        let tools = ToolRegistry::new();
+        let mut entry = make_skill_entry("search", 30, &[]);
+        entry.prompt_snippet = "Root prompt.".to_string();
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "Sonnet-specific prompt.".to_string(),
+        );
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = String::new();
+
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-sonnet-4-6",
+        );
+
+        assert!(system.contains("Sonnet-specific prompt."));
+        assert!(!system.contains("Root prompt."));
+    }
+
+    #[test]
+    fn test_inject_skills_model_no_match_falls_back_to_root() {
+        let tools = ToolRegistry::new();
+        let mut entry = make_skill_entry("search", 30, &[]);
+        entry.prompt_snippet = "Root prompt.".to_string();
+        entry.model_prompts.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            "Sonnet prompt.".to_string(),
+        );
+        // No model variant for claude-opus-4 — should fall back to root
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = String::new();
+
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-opus-4",
+        );
+
+        assert!(system.contains("Root prompt."));
+        assert!(!system.contains("Sonnet prompt."));
+    }
+
+    #[test]
+    fn test_inject_skills_model_falls_back_to_root() {
+        let tools = ToolRegistry::new();
+        let mut entry = make_skill_entry("search", 30, &[]);
+        entry.prompt_snippet = "Root prompt.".to_string();
+        // No provider or model variant for groq/llama
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = String::new();
+
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "groq",
+            "llama-3.3-70b-versatile",
+        );
+
+        assert!(system.contains("Root prompt."));
+    }
+
+    #[test]
+    fn test_inject_skills_model_with_slash() {
+        let tools = ToolRegistry::new();
+        let mut entry = make_skill_entry("search", 30, &[]);
+        entry.prompt_snippet = "Root prompt.".to_string();
+        entry.model_prompts.insert(
+            "openrouter/anthropic--claude-sonnet-4".to_string(),
+            "OpenRouter model prompt.".to_string(),
+        );
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = String::new();
+
+        // Model name contains a slash — sanitize_model_dir_name should match
+        inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+        );
+
+        assert!(system.contains("OpenRouter model prompt."));
+        assert!(!system.contains("Root prompt."));
+    }
+
+    #[test]
+    fn test_max_skill_timeout_uses_model_override() {
+        let mut s1 = make_skill_entry("search", 30, &[]);
+        s1.provider_overrides.insert(
+            "anthropic".to_string(),
+            crate::skills::manifest::ProviderSkillFields {
+                timeout_secs: Some(90),
+                max_prompt_size: None,
+            },
+        );
+        s1.model_overrides.insert(
+            "anthropic/claude-sonnet-4-6".to_string(),
+            crate::skills::manifest::ProviderSkillFields {
+                timeout_secs: Some(120),
+                max_prompt_size: None,
+            },
+        );
+        let matched: Vec<&SkillEntry> = vec![&s1];
+        // With model override, should use model
+        assert_eq!(
+            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
+            120
+        );
+        // Without model override, should use provider
+        assert_eq!(
+            max_skill_timeout(&matched, "anthropic", "claude-opus-4"),
+            90
+        );
+        // Without provider or model, should use root
+        assert_eq!(max_skill_timeout(&matched, "groq", "llama"), 30);
     }
 
     // -- ToolCallSummary and metadata tests --

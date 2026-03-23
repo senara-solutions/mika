@@ -812,13 +812,24 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
                 let _ = writeln!(out, "  Tools: {}", tool_names.join(", "));
             }
             let _ = writeln!(out, "  Path: {}", entry.dir.display());
-            let providers = entry.variant_providers();
-            if !providers.is_empty() {
+            let variant_total = entry.variant_count();
+            if variant_total > 0 {
+                let providers = entry.variant_providers();
+                let provider_list: Vec<_> = providers.iter().copied().collect();
+                let mut variant_details = Vec::new();
+                for p in &provider_list {
+                    let model_count = entry.variant_models(p).len();
+                    if model_count > 0 {
+                        variant_details.push(format!("{p} ({model_count} models)"));
+                    } else {
+                        variant_details.push(p.to_string());
+                    }
+                }
                 let _ = writeln!(
                     out,
-                    "  Variants: {} ({})",
-                    providers.len(),
-                    providers.into_iter().collect::<Vec<_>>().join(", ")
+                    "  Variants: {} total ({})",
+                    variant_total,
+                    variant_details.join(", ")
                 );
             }
             out
