@@ -1,20 +1,15 @@
-# Fix: Reply Routing Observability (#231)
+# Fix: Reply Routing — Parse Agent Name from Reply Text (#231)
 
 ## Problem
 
-Telegram reply routing to specific agents appears broken — replies fall back to the default agent. Code review confirmed the routing logic is correct across the entire stack, but silent error handling (`let _ =`) masks failures at critical points in the pipeline.
+Telegram reply routing to specific agents was broken. The `ReplyToMessage` struct only captured `message_id`, discarding the `text` field from Telegram's reply context. The `[agent_name]` prefix (e.g., `[mika-test] hello`) was available in every outbound message but never parsed on inbound replies.
 
 ## Approach
 
-Add structured logging at every failure point in the reply routing pipeline to make the root cause visible in production logs.
+Parse `[agent_name]` from `reply_to_message.text` as the primary routing mechanism. Keep the `outbound_messages` DB lookup as a fallback.
 
 ## Changes
 
-### `crates/mika-gateway/src/routes.rs`
-- Replace `let _ =` on outbound_messages INSERT with `warn!` on error
-- Add fallback warning in `handle_text_message` and `handle_photo_message` when `reply_to_message_id` is present but no agent is found
-- Add `debug!` log on successful agent resolution in `resolve_reply_agent`
-- Replace `let _ =` on cleanup query with `debug!` on error
-
-### `crates/mika-gateway/src/telegram.rs`
-- Replace `unwrap_or(0)` on sendMessage response with explicit match + `warn!` when result is missing
+- `telegram.rs`: Added `text: Option<String>` to `ReplyToMessage`, `reply_to_text` to `ParsedMessage` variants, `parse_agent_prefix()` function, 10 unit tests
+- `routes.rs`: Threaded `reply_to_text` through handlers, updated `resolve_reply_agent()` to use text prefix first
+- `gateway.yaml`: Regenerated OpenAPI spec for updated `ReplyToMessage` schema
