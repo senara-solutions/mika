@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::a2a_routes;
@@ -368,6 +368,14 @@ async fn handle_text_message(
     // Look up target agent from reply context (if replying to an agent message)
     let target_agent = resolve_reply_agent(state, chat_id, reply_to_message_id).await;
 
+    if reply_to_message_id.is_some() && target_agent.is_none() {
+        warn!(
+            chat_id,
+            reply_to_message_id = ?reply_to_message_id,
+            "reply routing: no agent found for replied-to message, falling back to default agent"
+        );
+    }
+
     let url = container_url(&row.id, &state.agent_base_url);
     let request_id = Uuid::new_v4().to_string();
 
@@ -477,6 +485,14 @@ async fn handle_photo_message(
 
     // Look up target agent from reply context (if replying to an agent message)
     let target_agent = resolve_reply_agent(state, chat_id, reply_to_message_id).await;
+
+    if reply_to_message_id.is_some() && target_agent.is_none() {
+        warn!(
+            chat_id,
+            reply_to_message_id = ?reply_to_message_id,
+            "reply routing: no agent found for replied-to message, falling back to default agent"
+        );
+    }
 
     // Use caption or synthetic text for captionless photos
     let text = caption.unwrap_or("[Photo]");
@@ -688,16 +704,24 @@ pub(crate) async fn handle_send(
         Ok(message_id) => {
             info!(chat_id = payload.chat_id, request_id = ?payload.request_id, telegram_message_id = message_id, "sent to telegram");
 
-            // Store outbound message mapping for reply routing (best-effort)
-            if let Some(ref name) = payload.agent_name {
-                let _ = sqlx::query(
+            // Store outbound message mapping for reply routing
+            if let Some(ref name) = payload.agent_name
+                && let Err(e) = sqlx::query(
                     "INSERT INTO outbound_messages (telegram_message_id, chat_id, agent_name) VALUES ($1, $2, $3)",
                 )
                 .bind(message_id)
                 .bind(payload.chat_id)
                 .bind(name)
                 .execute(&state.pool)
-                .await;
+                .await
+            {
+                warn!(
+                    error = %e,
+                    chat_id = payload.chat_id,
+                    telegram_message_id = message_id,
+                    agent_name = %name,
+                    "failed to store outbound message mapping — reply routing will not work for this message"
+                );
             }
 
             StatusCode::OK.into_response()
@@ -789,7 +813,12 @@ async fn resolve_reply_agent(
     .fetch_optional(&state.pool)
     .await
     {
-        Ok(opt) => opt,
+        Ok(opt) => {
+            if let Some(ref agent) = opt {
+                debug!(chat_id, telegram_message_id = msg_id, agent = %agent, "reply routing: resolved agent");
+            }
+            opt
+        }
         Err(e) => {
             warn!(error = %e, chat_id, telegram_message_id = msg_id, "reply agent lookup failed");
             None
@@ -800,11 +829,14 @@ async fn resolve_reply_agent(
 /// Purge outbound message mappings older than 7 days.
 /// Called periodically from webhook handler to avoid unbounded table growth.
 async fn cleanup_old_outbound_messages(state: &AppState) {
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "DELETE FROM outbound_messages WHERE ctid IN (SELECT ctid FROM outbound_messages WHERE created_at < now() - interval '7 days' LIMIT 1000)",
     )
     .execute(&state.pool)
-    .await;
+    .await
+    {
+        debug!(error = %e, "outbound_messages cleanup failed");
+    }
 }
 
 // -- Helpers --

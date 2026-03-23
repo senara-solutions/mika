@@ -2,6 +2,7 @@ use bytes::Bytes;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Typed error for Telegram Bot API responses, following the ClaudeApiError pattern.
 #[derive(Debug, thiserror::Error)]
@@ -312,7 +313,17 @@ impl TelegramClient {
                     status: 200,
                     body: format!("failed to parse sendMessage response: {e}"),
                 })?;
-            return Ok(send_resp.result.map(|r| r.message_id).unwrap_or(0));
+            let message_id = match send_resp.result {
+                Some(r) => r.message_id,
+                None => {
+                    warn!(
+                        chat_id,
+                        "telegram sendMessage returned 200 but no result — using message_id 0, reply routing will not work"
+                    );
+                    0
+                }
+            };
+            return Ok(message_id);
         }
 
         let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
