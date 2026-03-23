@@ -82,6 +82,7 @@ mod tests {
                 triggers: Triggers {
                     keywords: keywords.iter().map(|s| s.to_string()).collect(),
                 },
+                llm: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: keywords.iter().map(|s| s.to_lowercase()).collect(),
@@ -92,6 +93,7 @@ mod tests {
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
+            llm: Default::default(),
         }
     }
 

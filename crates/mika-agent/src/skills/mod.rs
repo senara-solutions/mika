@@ -171,6 +171,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![],
@@ -181,6 +182,7 @@ mod tests {
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
+            llm: Default::default(),
         }
     }
 

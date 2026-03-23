@@ -228,6 +228,7 @@ impl Tool for DelegateTaskTool {
             embedding_client: embedding_client.as_ref(),
             brave_api_key: self.settings.brave_api_key.as_deref(),
             skills_dirty: &skills_dirty,
+            settings: Some(&self.settings),
             mcp_manager: None,
             agent_name,
             child_task_id: None,

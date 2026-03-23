@@ -752,6 +752,33 @@ impl Settings {
         crate::llm::create_provider(&spec, self.llm_max_tokens)
     }
 
+    /// Create an LLM provider for a specific provider kind with an optional model override.
+    ///
+    /// Used by per-skill LLM overrides: a skill's `[llm]` section can specify a different
+    /// provider and/or model. This method resolves the provider's credentials from the
+    /// agent's per-provider config and constructs a fresh provider instance.
+    ///
+    /// Falls back to the provider's default model if no model override is given and
+    /// no per-provider model is configured.
+    pub fn make_provider_for(
+        &self,
+        provider: crate::llm::ProviderKind,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
+        let (model_field, api_key, base_url) = self.provider_fields(provider);
+        let model = model_override
+            .map(String::from)
+            .or_else(|| model_field.map(String::from))
+            .unwrap_or_else(|| provider.default_model().to_string());
+        let spec = crate::llm::ModelSpec {
+            provider,
+            model,
+            base_url: base_url.map(String::from),
+            api_key: api_key.map(String::from),
+        };
+        crate::llm::create_provider(&spec, self.llm_max_tokens)
+    }
+
     /// Create an EmbeddingClient if OpenAI API key is configured.
     pub fn make_embedding_client(&self) -> Option<crate::embedding::EmbeddingClient> {
         self.openai_api_key

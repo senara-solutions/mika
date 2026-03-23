@@ -263,6 +263,7 @@ impl Tool for CreateSkillTool {
                 max_prompt_size: None,
             },
             triggers: Triggers { keywords },
+            llm: Default::default(),
         };
 
         let skill_toml = match toml::to_string_pretty(&manifest) {

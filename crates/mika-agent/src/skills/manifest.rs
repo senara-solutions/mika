@@ -12,12 +12,44 @@ use serde::{Deserialize, Serialize};
 ///
 /// [triggers]
 /// keywords = ["search", "look up"]
+///
+/// [llm]
+/// provider = "openai"       # optional — overrides agent active provider
+/// model    = "gpt-4o-mini"  # optional — overrides provider default model
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillManifest {
     pub skill: SkillInfo,
     #[serde(default)]
     pub triggers: Triggers,
+    /// Optional LLM provider/model override for this skill.
+    /// When set, the agent constructs a per-skill provider instance for turns
+    /// where this skill is active. Only valid in root `skill.toml`, not variant dirs.
+    #[serde(default)]
+    pub llm: LlmOverride,
+}
+
+/// Per-skill LLM provider and model preferences.
+///
+/// Declared in the root `skill.toml` `[llm]` section. Both fields are optional:
+/// - `provider` only: use this provider with its configured or default model
+/// - `model` only: use this model on the agent's active provider
+/// - both: fully explicit override
+/// - neither (default): use the agent's active provider and model
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct LlmOverride {
+    /// Provider name matching a `ProviderKind` variant (e.g., "openai", "anthropic").
+    /// Case-insensitive at parse time.
+    pub provider: Option<String>,
+    /// Model identifier to use (e.g., "gpt-4o-mini", "claude-sonnet-4-6").
+    pub model: Option<String>,
+}
+
+impl LlmOverride {
+    /// Returns `true` if no LLM override is configured.
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none()
+    }
 }
 
 /// Core skill metadata from the `[skill]` section.
@@ -370,5 +402,140 @@ mod tests {
             }
             _ => panic!("expected Exec handler"),
         }
+    }
+
+    // -- [llm] section tests --
+
+    #[test]
+    fn test_parse_llm_provider_and_model() {
+        let toml_str = r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+
+            [llm]
+            provider = "openai"
+            model = "gpt-4o-mini"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.llm.provider.as_deref(), Some("openai"));
+        assert_eq!(manifest.llm.model.as_deref(), Some("gpt-4o-mini"));
+        assert!(!manifest.llm.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_provider_only() {
+        let toml_str = r#"
+            [skill]
+            name = "code-review"
+            description = "Review code"
+
+            [llm]
+            provider = "anthropic"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.llm.provider.as_deref(), Some("anthropic"));
+        assert_eq!(manifest.llm.model, None);
+        assert!(!manifest.llm.is_empty());
+    }
+
+    #[test]
+    fn test_parse_llm_model_only() {
+        let toml_str = r#"
+            [skill]
+            name = "fast-search"
+            description = "Fast search"
+
+            [llm]
+            model = "gpt-4o-mini"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.llm.provider, None);
+        assert_eq!(manifest.llm.model.as_deref(), Some("gpt-4o-mini"));
+        assert!(!manifest.llm.is_empty());
+    }
+
+    #[test]
+    fn test_parse_no_llm_section_defaults_empty() {
+        let toml_str = r#"
+            [skill]
+            name = "normal"
+            description = "Normal skill"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.llm.is_empty());
+        assert_eq!(manifest.llm.provider, None);
+        assert_eq!(manifest.llm.model, None);
+    }
+
+    #[test]
+    fn test_parse_empty_llm_section_defaults_empty() {
+        let toml_str = r#"
+            [skill]
+            name = "normal"
+            description = "Normal skill"
+
+            [llm]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.llm.is_empty());
+    }
+
+    #[test]
+    fn test_llm_override_equality() {
+        let a = LlmOverride {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+        };
+        let b = LlmOverride {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+        };
+        assert_eq!(a, b);
+
+        let c = LlmOverride {
+            provider: Some("anthropic".to_string()),
+            model: None,
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_llm_section_serializes_clean() {
+        // Verify that a skill with [llm] round-trips through serialization
+        let toml_str = r#"
+            [skill]
+            name = "test"
+            description = "Test"
+
+            [llm]
+            provider = "groq"
+            model = "llama3-8b"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        let serialized = toml::to_string_pretty(&manifest).unwrap();
+        let reparsed: SkillManifest = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.llm.provider.as_deref(), Some("groq"));
+        assert_eq!(reparsed.llm.model.as_deref(), Some("llama3-8b"));
+    }
+
+    #[test]
+    fn test_existing_skill_toml_backward_compat() {
+        // A skill.toml from before [llm] was introduced should parse fine
+        let toml_str = r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+            version = "0.1.0"
+            always_on = true
+            timeout_secs = 30
+
+            [triggers]
+            keywords = ["search", "look up"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.llm.is_empty());
+        assert_eq!(manifest.skill.name, "web-search");
+        assert!(manifest.skill.always_on);
     }
 }

@@ -22,7 +22,9 @@ use crate::skills::executor;
 use crate::skills::index::{ResolvedSkillTool, SkillEntry};
 use crate::skills::manifest::ToolHandler;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
+use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::ProviderKind;
 
 const MAX_TOOL_STEPS: usize = 10;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
@@ -654,6 +656,9 @@ pub struct AgentParams<'a> {
     pub global_home_dir: Option<&'a Path>,
     /// When true, this is a callback result turn — long-running tasks are blocked.
     pub is_callback_turn: bool,
+    /// Settings for per-skill LLM provider overrides. When a matched skill declares
+    /// `[llm].provider`, this is used to construct the per-skill provider instance.
+    pub settings: Option<&'a Settings>,
     /// Optional external trace_id (e.g. from HTTP request_id). If None, a new one is generated.
     pub trace_id: Option<String>,
 }
@@ -783,8 +788,16 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.user_message);
-    let provider = llm.provider_name();
-    let model = llm.model_name();
+
+    // Resolve per-skill LLM override (if any matched skill declares [llm])
+    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    let effective_llm: &dyn LlmProvider = match &skill_llm_override {
+        Some(override_llm) => override_llm.as_ref(),
+        None => llm,
+    };
+
+    let provider = effective_llm.provider_name();
+    let model = effective_llm.model_name();
     let mut skill_tool_defs =
         inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
@@ -872,13 +885,15 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     let max_tokens = if let Some(mika_common::claude::ThinkingConfig::Enabled { budget_tokens }) =
         &params.thinking
     {
-        llm.max_tokens().max(budget_tokens.saturating_add(4096))
+        effective_llm
+            .max_tokens()
+            .max(budget_tokens.saturating_add(4096))
     } else {
-        llm.max_tokens()
+        effective_llm.max_tokens()
     };
 
     // Gate features on provider capabilities
-    let tools_for_request = if llm.supports_tool_calling() {
+    let tools_for_request = if effective_llm.supports_tool_calling() {
         let llm_tool_defs: Vec<LlmToolDefinition> =
             skill_tool_defs.into_iter().map(Into::into).collect();
         if llm_tool_defs.is_empty() {
@@ -918,7 +933,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     }
 
     let mut request = LlmRequest {
-        model: llm.model_name().to_string(),
+        model: effective_llm.model_name().to_string(),
         max_tokens,
         system: Some(system),
         messages,
@@ -938,7 +953,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         })
     };
     let result = run_loop(
-        llm,
+        effective_llm,
         tools,
         &skill_tool_map,
         skill_timeout,
@@ -1278,6 +1293,8 @@ pub struct SilentAgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
+    /// Settings for per-skill LLM provider overrides.
+    pub settings: Option<&'a Settings>,
     /// Optional trace_id to propagate from the dispatcher.
     /// When `Some`, the agent reuses this trace_id instead of generating a fresh one,
     /// enabling correlation of silent agent execution with the triggering task.
@@ -1477,8 +1494,16 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
 
     // Match skills: use safe always-on skills (no exec/http handlers).
     let matched = params.skills.safe_always_on_skills();
-    let provider = llm.provider_name();
-    let model = llm.model_name();
+
+    // Resolve per-skill LLM override
+    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    let effective_llm: &dyn LlmProvider = match &skill_llm_override {
+        Some(override_llm) => override_llm.as_ref(),
+        None => llm,
+    };
+
+    let provider = effective_llm.provider_name();
+    let model = effective_llm.model_name();
     let skill_tool_defs =
         inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
@@ -1522,8 +1547,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let llm_tool_defs: Vec<LlmToolDefinition> =
         skill_tool_defs.into_iter().map(Into::into).collect();
     let mut request = LlmRequest {
-        model: llm.model_name().to_string(),
-        max_tokens: llm.max_tokens(),
+        model: effective_llm.model_name().to_string(),
+        max_tokens: effective_llm.max_tokens(),
         system: Some(system),
         messages,
         tools: if llm_tool_defs.is_empty() {
@@ -1536,7 +1561,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
 
     let mode = LoopMode::Silent;
     run_loop(
-        llm,
+        effective_llm,
         tools,
         &skill_tool_map,
         skill_timeout,
@@ -1610,6 +1635,8 @@ pub struct TeamAgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
+    /// Settings for per-skill LLM provider overrides.
+    pub settings: Option<&'a Settings>,
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
     /// Agent name for per-agent log filtering in team runs.
@@ -1696,8 +1723,16 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.task_message);
-    let provider = llm.provider_name();
-    let model = llm.model_name();
+
+    // Resolve per-skill LLM override
+    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    let effective_llm: &dyn LlmProvider = match &skill_llm_override {
+        Some(override_llm) => override_llm.as_ref(),
+        None => llm,
+    };
+
+    let provider = effective_llm.provider_name();
+    let model = effective_llm.model_name();
     let mut skill_tool_defs =
         inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
@@ -1738,8 +1773,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     let llm_tool_defs: Vec<LlmToolDefinition> =
         skill_tool_defs.into_iter().map(Into::into).collect();
     let mut request = LlmRequest {
-        model: llm.model_name().to_string(),
-        max_tokens: llm.max_tokens(),
+        model: effective_llm.model_name().to_string(),
+        max_tokens: effective_llm.max_tokens(),
         system: Some(system),
         messages,
         tools: if llm_tool_defs.is_empty() {
@@ -1752,7 +1787,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     let mode = LoopMode::Team;
     let result = run_loop(
-        llm,
+        effective_llm,
         tools,
         &skill_tool_map,
         skill_timeout,
@@ -1853,6 +1888,122 @@ fn build_skill_tool_map<'a>(matched: &[&'a SkillEntry]) -> HashMap<String, &'a R
         .flat_map(|e| e.skill_tools.iter())
         .map(|st| (st.definition.name.clone(), st))
         .collect()
+}
+
+/// Resolve per-skill LLM override from matched skills.
+///
+/// Examines `[llm]` sections in matched skills. Returns a new `Arc<dyn LlmProvider>` if
+/// a unique, unambiguous override is found. Returns `None` if no override is needed (use
+/// the default provider).
+///
+/// **Conflict resolution:** If multiple matched skills declare different `[llm]` overrides,
+/// the agent falls back to the default provider with a warning. Same overrides are deduplicated.
+///
+/// **Same-provider short-circuit:** If the override matches the current active provider and
+/// model, no new instance is constructed.
+fn resolve_skill_llm_override(
+    matched: &[&SkillEntry],
+    settings: Option<&Settings>,
+    default_llm: &dyn LlmProvider,
+) -> Option<Arc<dyn LlmProvider>> {
+    // Collect unique (provider, model) override pairs from matched skills
+    let mut overrides: Vec<(&str, Option<&str>)> = Vec::new();
+    let mut override_skills: Vec<&str> = Vec::new();
+
+    for entry in matched {
+        if entry.llm.is_empty() {
+            continue;
+        }
+        let provider_str = entry.llm.provider.as_deref();
+        let model_str = entry.llm.model.as_deref();
+
+        // Only count skills that declare at least provider or model
+        if provider_str.is_some() || model_str.is_some() {
+            overrides.push((provider_str.unwrap_or(""), model_str));
+            override_skills.push(&entry.manifest.skill.name);
+        }
+    }
+
+    if overrides.is_empty() {
+        return None;
+    }
+
+    // Deduplicate: check if all overrides are the same
+    let first = &overrides[0];
+    let all_same = overrides.iter().all(|o| o == first);
+
+    if !all_same {
+        warn!(
+            skills = ?override_skills,
+            "multiple matched skills have conflicting [llm] overrides — falling back to default provider"
+        );
+        return None;
+    }
+
+    let (provider_str, model_str) = first;
+
+    // If only model is set (no provider), apply to the active provider
+    let resolved_provider = if provider_str.is_empty() {
+        None // no provider override — model applied to active provider
+    } else {
+        match provider_str.parse::<ProviderKind>() {
+            Ok(pk) => Some(pk),
+            Err(_) => {
+                warn!(
+                    provider = provider_str,
+                    skill = override_skills[0],
+                    "invalid provider in skill [llm] section — falling back to default"
+                );
+                return None;
+            }
+        }
+    };
+
+    // Same-provider short-circuit
+    let active_provider = default_llm.provider_name();
+    let active_model = default_llm.model_name();
+
+    let target_provider_name = resolved_provider
+        .map(|pk| pk.config_prefix().to_string())
+        .unwrap_or_else(|| active_provider.to_string());
+    let target_model = model_str.unwrap_or(active_model);
+
+    if target_provider_name == active_provider && target_model == active_model {
+        return None; // Same as active — no need to construct a new provider
+    }
+
+    // Need Settings to construct a provider
+    let settings = match settings {
+        Some(s) => s,
+        None => {
+            warn!(
+                "skill [llm] override requires Settings but none provided — falling back to default"
+            );
+            return None;
+        }
+    };
+
+    let provider_kind = resolved_provider.unwrap_or(settings.llm_provider);
+    match settings.make_provider_for(provider_kind, *model_str) {
+        Ok(provider) => {
+            info!(
+                skill = override_skills[0],
+                provider = provider.provider_name(),
+                model = provider.model_name(),
+                "using per-skill LLM override"
+            );
+            Some(provider)
+        }
+        Err(e) => {
+            warn!(
+                skill = override_skills[0],
+                provider = ?provider_kind,
+                error = %e,
+                "failed to construct per-skill LLM provider — falling back to default"
+            );
+            None
+        }
+    }
 }
 
 /// Compute the maximum timeout across matched skills (for skill tool execution).
@@ -2060,6 +2211,7 @@ mod tests {
                 triggers: Triggers {
                     keywords: vec![name.to_string()],
                 },
+                llm: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![name.to_lowercase()],
@@ -2083,6 +2235,7 @@ mod tests {
             provider_overrides: std::collections::HashMap::new(),
             model_prompts: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
+            llm: Default::default(),
         }
     }
 

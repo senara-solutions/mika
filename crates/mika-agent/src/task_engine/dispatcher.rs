@@ -236,6 +236,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            settings: None,
             trace_id: Some(trace_id.clone()),
         };
 
@@ -321,6 +322,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            settings: None,
             trace_id: Some(trace_id.clone()),
         };
 
@@ -499,6 +501,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            settings: None,
             trace_id: Some(trace_id.clone()),
         };
 
@@ -637,6 +640,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             skills_dirty: &self.skills_dirty,
+            settings: None,
             trace_id: Some(trace_id.clone()),
         };
 

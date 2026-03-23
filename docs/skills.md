@@ -45,7 +45,7 @@ Each immediate subdirectory of `~/.mika/skills/` is treated as a skill. The dire
 
 ## Manifest Reference (skill.toml)
 
-The manifest is a TOML file with two sections: `[skill]` (required) and `[triggers]` (optional).
+The manifest is a TOML file with three sections: `[skill]` (required), `[triggers]` (optional), and `[llm]` (optional).
 
 ### `[skill]` section
 
@@ -66,6 +66,48 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `keywords` | Array<String>  | No       | `[]`    | Keywords for substring matching against user messages. Case-insensitive. |
 
 If the `[triggers]` section is omitted entirely, it defaults to an empty keyword list. A skill with no keywords and `always_on = false` will never activate.
+
+### `[llm]` section
+
+Optional per-skill LLM provider and model override. When set, the agent constructs a separate provider instance for turns where this skill is active, using the agent's per-provider credentials.
+
+| Field      | Type   | Required | Default | Description                                     |
+|------------|--------|----------|---------|-------------------------------------------------|
+| `provider` | String | No       | —       | Provider name matching a `ProviderKind` (e.g., `"openai"`, `"anthropic"`, `"groq"`). Case-insensitive. |
+| `model`    | String | No       | —       | Model identifier (e.g., `"gpt-4o-mini"`, `"claude-sonnet-4-6"`). |
+
+**Resolution order** (highest to lowest priority):
+
+1. `skill.toml` `[llm].provider` + `[llm].model` — explicit skill override
+2. Per-provider agent config (e.g., `anthropic.model` from config.toml)
+3. Agent global `llm_provider` + provider default model
+
+**Important:** The `[llm]` section belongs only in the **root** `skill.toml`. Provider variant directories already imply their provider — adding `[llm]` to variant `skill.toml` files is ignored with a validation warning.
+
+**Conflict resolution:** If multiple matched skills declare different `[llm]` overrides, the agent falls back to the default provider with a warning log. Skills with identical overrides are deduplicated.
+
+**Examples:**
+
+```toml
+# Provider only — use OpenAI with its configured or default model
+[llm]
+provider = "openai"
+
+# Model only — use this model on the agent's active provider
+[llm]
+model = "gpt-4o-mini"
+
+# Both — fully explicit override
+[llm]
+provider = "openai"
+model = "gpt-4o-mini"
+```
+
+The resolved provider/model feeds into the existing variant resolution system:
+- `resolve_prompt(provider, model)` selects the best prompt variant
+- `effective_timeout(provider, model)` selects the correct timeout
+
+This means `[llm].provider = "openai"` + `[llm].model = "gpt-4o-mini"` automatically selects `openai/gpt-4o-mini/system_prompt.md` if it exists, falling back to root `system_prompt.md`.
 
 ### Minimal valid manifest
 
