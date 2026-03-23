@@ -2,6 +2,7 @@ use bytes::Bytes;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Typed error for Telegram Bot API responses, following the ClaudeApiError pattern.
 #[derive(Debug, thiserror::Error)]
@@ -43,10 +44,14 @@ pub struct TelegramMessage {
     pub reply_to_message: Option<ReplyToMessage>,
 }
 
-/// Minimal representation of a replied-to message (only message_id needed for routing).
+/// Replied-to message context for reply routing.
+/// Telegram sends the full original message; we capture `message_id` for DB lookup
+/// and `text` for parsing the `[agent_name]` prefix.
 #[derive(Debug, Clone, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ReplyToMessage {
     pub message_id: i64,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -91,6 +96,7 @@ pub enum ParsedMessage {
         text: String,
         update_id: i64,
         reply_to_message_id: Option<i64>,
+        reply_to_text: Option<String>,
     },
     Photo {
         chat_id: i64,
@@ -98,6 +104,7 @@ pub enum ParsedMessage {
         caption: Option<String>,
         update_id: i64,
         reply_to_message_id: Option<i64>,
+        reply_to_text: Option<String>,
     },
     Document {
         chat_id: i64,
@@ -106,6 +113,7 @@ pub enum ParsedMessage {
         caption: Option<String>,
         update_id: i64,
         reply_to_message_id: Option<i64>,
+        reply_to_text: Option<String>,
     },
     BareStart {
         chat_id: i64,
@@ -119,6 +127,24 @@ pub enum ParsedMessage {
 /// Image MIME types supported for forwarding to the agent.
 const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+/// Parse `[agent_name]` prefix from message text.
+/// Returns the agent name if the text starts with `[name] ` where name matches
+/// the agent naming convention (lowercase alphanumeric + hyphens, 1-32 chars).
+pub fn parse_agent_prefix(text: &str) -> Option<String> {
+    let rest = text.strip_prefix('[')?;
+    let (name, _) = rest.split_once("] ")?;
+    if name.is_empty() || name.len() > 32 {
+        return None;
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// Parse a Telegram update into a structured message type.
 pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
     let message = match &update.message {
@@ -128,6 +154,10 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
 
     let chat_id = message.chat.id;
     let reply_to_message_id = message.reply_to_message.as_ref().map(|r| r.message_id);
+    let reply_to_text = message
+        .reply_to_message
+        .as_ref()
+        .and_then(|r| r.text.clone());
 
     // Text messages (including /start commands) take priority
     if let Some(text) = &message.text {
@@ -149,6 +179,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             text: text.clone(),
             update_id: update.update_id,
             reply_to_message_id,
+            reply_to_text: reply_to_text.clone(),
         };
     }
 
@@ -162,6 +193,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             caption: message.caption.clone(),
             update_id: update.update_id,
             reply_to_message_id,
+            reply_to_text: reply_to_text.clone(),
         };
     }
 
@@ -177,6 +209,7 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             caption: message.caption.clone(),
             update_id: update.update_id,
             reply_to_message_id,
+            reply_to_text,
         };
     }
 
@@ -312,7 +345,17 @@ impl TelegramClient {
                     status: 200,
                     body: format!("failed to parse sendMessage response: {e}"),
                 })?;
-            return Ok(send_resp.result.map(|r| r.message_id).unwrap_or(0));
+            let message_id = match send_resp.result {
+                Some(r) => r.message_id,
+                None => {
+                    warn!(
+                        chat_id,
+                        "telegram sendMessage returned 200 but no result — using message_id 0, reply routing will not work"
+                    );
+                    0
+                }
+            };
+            return Ok(message_id);
         }
 
         let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
@@ -595,6 +638,7 @@ mod tests {
                 text: "Hello Mika!".to_string(),
                 update_id: 100,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -704,6 +748,7 @@ mod tests {
                 caption: None,
                 update_id: 200,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -723,6 +768,7 @@ mod tests {
                 caption: Some("Look at this!".to_string()),
                 update_id: 201,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -742,6 +788,7 @@ mod tests {
                 caption: None,
                 update_id: 202,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -763,6 +810,7 @@ mod tests {
                 caption: None,
                 update_id: 300,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -787,6 +835,7 @@ mod tests {
                 caption: Some("A diagram".to_string()),
                 update_id: 301,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -830,6 +879,7 @@ mod tests {
                 caption: None,
                 update_id: 304,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -849,6 +899,7 @@ mod tests {
                 caption: None,
                 update_id: 305,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -917,6 +968,7 @@ mod tests {
                 caption: Some("Check this out".to_string()),
                 update_id: 500,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -946,6 +998,7 @@ mod tests {
                 caption: None,
                 update_id: 501,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -968,6 +1021,7 @@ mod tests {
                 text: "Hello".to_string(),
                 update_id: 502,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -977,7 +1031,10 @@ mod tests {
     #[test]
     fn test_parse_reply_message_extracts_id() {
         let mut msg = text_msg(42, Some("replying"));
-        msg.reply_to_message = Some(ReplyToMessage { message_id: 999 });
+        msg.reply_to_message = Some(ReplyToMessage {
+            message_id: 999,
+            text: None,
+        });
         let update = TelegramUpdate {
             update_id: 600,
             message: Some(msg),
@@ -989,6 +1046,7 @@ mod tests {
                 text: "replying".to_string(),
                 update_id: 600,
                 reply_to_message_id: Some(999),
+                reply_to_text: None,
             }
         );
     }
@@ -1006,6 +1064,7 @@ mod tests {
                 text: "no reply".to_string(),
                 update_id: 601,
                 reply_to_message_id: None,
+                reply_to_text: None,
             }
         );
     }
@@ -1028,8 +1087,77 @@ mod tests {
                 text: "reply text".to_string(),
                 update_id: 602,
                 reply_to_message_id: Some(555),
+                reply_to_text: Some("original".to_string()),
             }
         );
+    }
+
+    // -- parse_agent_prefix tests --
+
+    #[test]
+    fn test_parse_agent_prefix_valid() {
+        assert_eq!(
+            parse_agent_prefix("[mika-test] hello"),
+            Some("mika-test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_default_agent() {
+        assert_eq!(
+            parse_agent_prefix("[mika] Hello, Vincent!"),
+            Some("mika".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_no_prefix() {
+        assert_eq!(parse_agent_prefix("Hello world"), None);
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_empty_name() {
+        assert_eq!(parse_agent_prefix("[] hello"), None);
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_invalid_uppercase() {
+        assert_eq!(parse_agent_prefix("[MIKA] hello"), None);
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_too_long() {
+        let long_name = "a".repeat(33);
+        assert_eq!(parse_agent_prefix(&format!("[{long_name}] hello")), None);
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_no_space_after_bracket() {
+        assert_eq!(parse_agent_prefix("[mika]hello"), None);
+    }
+
+    #[test]
+    fn test_parse_agent_prefix_with_digits() {
+        assert_eq!(
+            parse_agent_prefix("[agent-2] task result"),
+            Some("agent-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deserialize_reply_with_text() {
+        let json = r#"{"message_id": 100, "text": "[mika-test] hello"}"#;
+        let reply: ReplyToMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(reply.message_id, 100);
+        assert_eq!(reply.text, Some("[mika-test] hello".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_reply_without_text() {
+        let json = r#"{"message_id": 200}"#;
+        let reply: ReplyToMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(reply.message_id, 200);
+        assert_eq!(reply.text, None);
     }
 
     // -- file_path validation tests --

@@ -112,13 +112,20 @@ components:
           minimum: 0
     ReplyToMessage:
       type: object
-      description: Minimal representation of a replied-to message (only message_id needed for routing).
+      description: |-
+        Replied-to message context for reply routing.
+        Telegram sends the full original message; we capture `message_id` for DB lookup
+        and `text` for parsing the `[agent_name]` prefix.
       required:
       - message_id
       properties:
         message_id:
           type: integer
           format: int64
+        text:
+          type:
+          - string
+          - 'null'
     SendPayload:
       type: object
       required:
