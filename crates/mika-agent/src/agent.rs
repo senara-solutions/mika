@@ -69,9 +69,6 @@ pub const STALE_FAILED_CALLBACK_MINUTES: i64 = 5;
 ///
 /// Routes to workflow-specific instructions for claude-pilot callbacks (see #264),
 /// or falls back to the generic "analyze and notify" instruction for all others.
-///
-/// Extracted as a standalone function so the branching logic is directly testable
-/// without spinning up a full silent agent.
 fn build_callback_trigger_context(
     label: &str,
     task_id: &str,
