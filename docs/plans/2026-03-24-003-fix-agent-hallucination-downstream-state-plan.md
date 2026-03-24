@@ -1,7 +1,7 @@
 ---
 title: "fix(agent): hallucination of downstream state from valid tool results"
 type: fix
-status: active
+status: completed
 date: 2026-03-24
 issue: "#141"
 ---
