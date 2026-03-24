@@ -125,6 +125,20 @@ impl Tool for DelegateTaskTool {
             skills.apply_overrides(&overrides);
         }
 
+        // Register delegate agent so sessions FK constraint is satisfied.
+        // Follows the team engine pattern (engine.rs line 95).
+        let identity = crate::prompt::load_identity(&agent_home);
+        if let Err(e) = async_db
+            .register_agent(
+                agent_name,
+                &identity.name,
+                agent_home.to_str().unwrap_or(""),
+            )
+            .await
+        {
+            tracing::warn!(agent = agent_name, error = %e, "failed to register delegate agent");
+        }
+
         // Build tools: default_tools only — NO management tools (prevents recursion)
         let tool_registry = crate::tools::default_tools();
 
@@ -140,7 +154,7 @@ impl Tool for DelegateTaskTool {
         };
 
         let embedding_client = self.settings.make_embedding_client();
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = format!("delegate-{}", uuid::Uuid::new_v4());
         let skills_dirty = AtomicBool::new(false);
 
         // Look up chat_id from the orchestrator's DB context. The delegate's
@@ -216,6 +230,36 @@ impl Tool for DelegateTaskTool {
             None
         };
 
+        // -- Session lifecycle for observability (#253) --
+        // Create session BEFORE run_team_agent so tool-level DB writes
+        // (audit events) during the agent run have a valid session FK.
+        let delegate_metadata = serde_json::json!({
+            "trigger": "delegate",
+            "orchestrator": current_agent_id,
+            "work_item_id": work_item_id
+        })
+        .to_string();
+        if let Err(e) = async_db
+            .create_session_with_parent(
+                &session_id,
+                agent_name,
+                "system",
+                Some(&delegate_metadata),
+                Some(ctx.session_id),
+            )
+            .await
+        {
+            tracing::warn!(session = %session_id, error = %e, "failed to create delegate session");
+        }
+
+        // Persist the delegated task as a user message
+        if let Err(e) = async_db
+            .save_message(&session_id, "user", task, Some(ctx.trace_id))
+            .await
+        {
+            tracing::warn!(session = %session_id, error = %e, "failed to persist delegate task message");
+        }
+
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
             llm: llm.as_ref(),
@@ -238,6 +282,33 @@ impl Tool for DelegateTaskTool {
         };
 
         let result = crate::agent::run_team_agent(&params).await;
+
+        // Persist result message for observability (#253)
+        match &result {
+            Ok(Some(text)) => {
+                if let Err(e) = async_db
+                    .save_message(&session_id, "assistant", text, Some(ctx.trace_id))
+                    .await
+                {
+                    tracing::warn!(session = %session_id, error = %e, "failed to persist delegate response");
+                }
+            }
+            Ok(None) => {} // No text response — skip empty assistant message
+            Err(e) => {
+                let error_msg = format!("Delegation failed: {e}");
+                if let Err(pe) = async_db
+                    .save_message(&session_id, "system", &error_msg, Some(ctx.trace_id))
+                    .await
+                {
+                    tracing::warn!(session = %session_id, error = %pe, "failed to persist delegate error");
+                }
+            }
+        }
+
+        // End the delegate session
+        if let Err(e) = async_db.end_session(&session_id).await {
+            tracing::warn!(session = %session_id, error = %e, "failed to end delegate session");
+        }
 
         // Critical: shut down the async DB thread to prevent leaks
         async_db.shutdown();

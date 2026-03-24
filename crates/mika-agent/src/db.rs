@@ -2963,13 +2963,13 @@ impl Database {
     }
 
     /// Prune ended system/silent sessions older than `retention_secs`.
-    /// Targets heartbeat, callback, skill, and reflection sessions.
+    /// Targets heartbeat, callback, skill, reflection, team, and delegate sessions.
     /// Messages are cascade-deleted via FK ON DELETE CASCADE.
     pub fn prune_old_sessions(&self, retention_secs: i64) -> Result<usize> {
         let cutoff = timestamp::now_minus(Duration::seconds(retention_secs));
         let n = self.conn.execute(
             "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1
-             AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%' OR id LIKE 'reflection-%' OR id LIKE 'team-%')",
+             AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%' OR id LIKE 'reflection-%' OR id LIKE 'team-%' OR id LIKE 'delegate-%')",
             params![cutoff],
         )?;
         Ok(n)
@@ -7635,6 +7635,7 @@ mod tests {
             "skill-test-1",
             "reflection-2026-01-01",
             "team-run1-agent1",
+            "delegate-task-1",
         ] {
             db.create_session(prefix, "mika", "system").unwrap();
             db.end_session(prefix).unwrap();
@@ -7659,7 +7660,7 @@ mod tests {
             .unwrap();
 
         let pruned = db.prune_old_sessions(7 * 24 * 60 * 60).unwrap();
-        assert_eq!(pruned, 5); // All prefixed sessions pruned, CLI session preserved
+        assert_eq!(pruned, 6); // All prefixed sessions pruned, CLI session preserved
 
         // CLI session should still exist
         let count: i64 = db
