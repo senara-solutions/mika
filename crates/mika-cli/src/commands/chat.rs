@@ -133,6 +133,10 @@ async fn spawn_agent_worker(
         // which serializes at the DB thread level). Concurrent Claude API calls are
         // accepted in CLI mode; rate-limit errors are handled by the Claude client.
         agent_lock: None,
+        // CLI mode: the TUI's poll_callback_tasks() handles callback delivery with
+        // session-scoped queries and atomic claiming. Skip engine dispatch to prevent
+        // the engine from stealing callbacks. See #264.
+        cli_mode: true,
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         ctx.async_db.clone(),

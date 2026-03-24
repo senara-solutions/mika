@@ -55,10 +55,76 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
 
+/// Label for claude-pilot long-running callback tasks.
+/// Used to detect self-dev workflow callbacks and inject workflow-aware continuation
+/// instructions instead of the generic "analyze and notify" trigger. See #264.
+const CLAUDE_PILOT_CALLBACK_LABEL: &str = "long_running:run_claude_pilot";
+
 /// Maximum age (in minutes) for a failed callback to be delivered to the agent.
 /// Failed callbacks older than this are silently marked as delivered to prevent
 /// flooding the conversation with stale failures (e.g., after an upgrade).
 pub const STALE_FAILED_CALLBACK_MINUTES: i64 = 5;
+
+/// Build the trigger context for a callback in silent mode.
+///
+/// Routes to workflow-specific instructions for claude-pilot callbacks (see #264),
+/// or falls back to the generic "analyze and notify" instruction for all others.
+///
+/// Extracted as a standalone function so the branching logic is directly testable
+/// without spinning up a full silent agent.
+fn build_callback_trigger_context(
+    label: &str,
+    task_id: &str,
+    result: &str,
+    failed: bool,
+) -> String {
+    let base = format_callback_framing(label, task_id, result, failed);
+    if label == CLAUDE_PILOT_CALLBACK_LABEL && !failed {
+        // Self-dev workflow continuation: delegate to mika-qa for acceptance testing.
+        // See #264 — generic "analyze and notify" was causing the agent to skip
+        // mika-qa delegation and mark work items complete prematurely.
+        format!(
+            "{base}\n\
+             IMPORTANT: A successful result confirms only the specific action performed. \
+             NEVER extrapolate to downstream states (PR status, CI health, deploy readiness) \
+             that the result does not explicitly mention.\n\n\
+             This is a completed claude-pilot development session. Your workflow:\n\
+             1. Extract the PR URL and key findings from the callback result above.\n\
+             2. Use send_message to notify the user with: PR URL, summary of changes, and any warnings.\n\
+             3. MANDATORY: Use delegate_task to delegate acceptance testing to mika-qa. \
+                Include the PR URL and change summary in the delegation message. \
+                Wait for mika-qa's verdict before proceeding.\n\
+             4. Based on mika-qa's verdict:\n\
+                - If APPROVED: Use update_work_item_status to mark the work item as completed.\n\
+                - If REJECTED: Use send_message to notify the user of the rejection reason. \
+                  Do NOT mark the work item as completed.\n\
+             5. Use send_message to give the user a final status update."
+        )
+    } else if label == CLAUDE_PILOT_CALLBACK_LABEL && failed {
+        // Self-dev failure escalation: notify user, do not retry.
+        format!(
+            "{base}\n\
+             IMPORTANT: This claude-pilot development session has FAILED.\n\n\
+             Your workflow:\n\
+             1. Extract the failure details from the callback result above.\n\
+             2. Use send_message to notify the user with: failure reason, any partial progress, \
+                and recommended next steps.\n\
+             3. Do NOT retry the development session — the user must decide how to proceed.\n\
+             4. Do NOT mark the work item as completed. Leave it in its current status \
+                so the user can decide whether to retry or cancel."
+        )
+    } else {
+        // Generic callback: analyze and notify.
+        format!(
+            "{base}\n\
+             IMPORTANT: A successful result confirms only the specific action performed. \
+             NEVER extrapolate to downstream states (PR status, CI health, deploy readiness) \
+             that the result does not explicitly mention.\n\
+             Analyze the data and use send_message to notify the user \
+             with a clear, concise summary. Include the key findings and any recommended actions."
+        )
+    }
+}
 
 /// Wraps a callback task result in untrusted-framing XML tags.
 ///
@@ -1452,17 +1518,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
             label,
             result,
             failed,
-        } => {
-            let base = format_callback_framing(label, task_id, result, *failed);
-            format!(
-                "{base}\n\
-                 IMPORTANT: A successful result confirms only the specific action performed. \
-                 NEVER extrapolate to downstream states (PR status, CI health, deploy readiness) \
-                 that the result does not explicitly mention.\n\
-                 Analyze the data and use send_message to notify the user \
-                 with a clear, concise summary. Include the key findings and any recommended actions."
-            )
-        }
+        } => build_callback_trigger_context(label, task_id, result, *failed),
         SilentTrigger::Reflection => {
             "You are in REFLECTION mode. This is your daily end-of-day review.\n\n\
              Your job: Review today's conversations and recently stored facts. Update your\n\
@@ -3247,5 +3303,88 @@ mod tests {
             format_callback_framing("build_code", "task-789", "Compilation succeeded", false);
         assert!(result.contains("Report only what this result explicitly states"));
         assert!(result.contains("Do not infer the state of any system, artifact, or process"));
+    }
+
+    // -- Callback trigger context tests (#264) --
+
+    #[test]
+    fn test_callback_trigger_claude_pilot_success_injects_workflow_continuation() {
+        let ctx = build_callback_trigger_context(
+            "long_running:run_claude_pilot",
+            "task-001",
+            "PR created: https://github.com/senara-solutions/mika/pull/265",
+            false,
+        );
+        // Must contain self-dev workflow instructions
+        assert!(ctx.contains("completed claude-pilot development session"));
+        assert!(ctx.contains("delegate_task"));
+        assert!(ctx.contains("mika-qa"));
+        assert!(ctx.contains("update_work_item_status"));
+        // Must NOT contain generic "Analyze the data"
+        assert!(!ctx.contains("Analyze the data"));
+    }
+
+    #[test]
+    fn test_callback_trigger_claude_pilot_failure_injects_escalation() {
+        let ctx = build_callback_trigger_context(
+            "long_running:run_claude_pilot",
+            "task-002",
+            "Error: cargo build failed with 3 errors",
+            true,
+        );
+        // Must contain failure escalation
+        assert!(ctx.contains("FAILED"));
+        assert!(ctx.contains("Do NOT retry"));
+        assert!(ctx.contains("Do NOT mark the work item as completed"));
+        // Must NOT contain workflow continuation or generic analyze
+        assert!(!ctx.contains("delegate_task"));
+        assert!(!ctx.contains("Analyze the data"));
+    }
+
+    #[test]
+    fn test_callback_trigger_generic_retains_analyze_instruction() {
+        let ctx = build_callback_trigger_context(
+            "long_running:run_shell",
+            "task-003",
+            "Script completed successfully",
+            false,
+        );
+        // Must contain generic instruction
+        assert!(ctx.contains("Analyze the data"));
+        assert!(ctx.contains("send_message to notify the user"));
+        // Must NOT contain self-dev workflow
+        assert!(!ctx.contains("delegate_task"));
+        assert!(!ctx.contains("mika-qa"));
+        assert!(!ctx.contains("claude-pilot development session"));
+    }
+
+    #[test]
+    fn test_callback_trigger_generic_failed_retains_analyze_instruction() {
+        let ctx = build_callback_trigger_context(
+            "long_running:run_shell",
+            "task-004",
+            "Script failed",
+            true,
+        );
+        // Generic failed callback gets same generic instruction
+        assert!(ctx.contains("Analyze the data"));
+        // The base framing says FAILED
+        assert!(ctx.contains("FAILED"));
+        // Must NOT contain self-dev specific instructions
+        assert!(!ctx.contains("Do NOT retry the development session"));
+    }
+
+    #[test]
+    fn test_callback_trigger_label_must_be_exact_match() {
+        // A label containing "run_claude_pilot" as substring should NOT trigger
+        // the self-dev workflow instructions — only exact match on the full label.
+        let ctx = build_callback_trigger_context(
+            "long_running:test_run_claude_pilot_mock",
+            "task-005",
+            "Test result",
+            false,
+        );
+        assert!(ctx.contains("Analyze the data"));
+        assert!(!ctx.contains("delegate_task"));
     }
 }
