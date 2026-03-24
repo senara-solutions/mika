@@ -243,7 +243,7 @@ impl Tool for DelegateTaskTool {
             .create_session_with_parent(
                 &session_id,
                 agent_name,
-                "system",
+                "delegate",
                 Some(&delegate_metadata),
                 Some(ctx.session_id),
             )

@@ -60,7 +60,7 @@ let delegate_metadata = serde_json::json!({
     "work_item_id": work_item_id
 }).to_string();
 if let Err(e) = async_db
-    .create_session_with_parent(&session_id, agent_name, "system",
+    .create_session_with_parent(&session_id, agent_name, "delegate",
         Some(&delegate_metadata), Some(ctx.session_id))
     .await
 {
@@ -124,7 +124,7 @@ AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%'
 | Decision | Rationale |
 |----------|-----------|
 | Session created BEFORE agent run | Tools write audit events referencing `session_id` during `run_loop` |
-| `channel_type = "system"` | Matches non-interactive convention used by all silent dispatchers |
+| `channel_type = "delegate"` | Distinguishes agent-to-agent delegation from autonomous background sessions (`"system"`) |
 | `parent_session_id = ctx.session_id` | Enables session hierarchy tracing in dashboard |
 | `trace_id = ctx.trace_id` | Correlates delegate events with orchestrator's turn in `unified_timeline` |
 | Persistence failures are warn-and-continue | Observability is best-effort; tool functionality is not degraded |

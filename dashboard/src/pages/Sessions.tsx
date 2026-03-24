@@ -3,9 +3,9 @@ import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import { Pagination, EmptyState, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
-import { Search, Terminal, MessageSquare, Users, Settings } from 'lucide-react'
+import { Search, Terminal, MessageSquare, Users, Settings, ArrowRightLeft } from 'lucide-react'
 
-const CHANNEL_TYPES = ['', 'cli', 'telegram', 'team', 'system']
+const CHANNEL_TYPES = ['', 'cli', 'telegram', 'team', 'system', 'delegate']
 
 function channelIcon(type: string) {
   switch (type) {
@@ -17,6 +17,8 @@ function channelIcon(type: string) {
       return <Users size={12} />
     case 'system':
       return <Settings size={12} />
+    case 'delegate':
+      return <ArrowRightLeft size={12} />
     default:
       return <MessageSquare size={12} />
   }

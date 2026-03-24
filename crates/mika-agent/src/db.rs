@@ -7665,7 +7665,6 @@ mod tests {
             "skill-test-1",
             "reflection-2026-01-01",
             "team-run1-agent1",
-            "delegate-task-1",
         ] {
             db.create_session(prefix, "mika", "system").unwrap();
             db.end_session(prefix).unwrap();
@@ -7679,6 +7678,16 @@ mod tests {
                 )
                 .unwrap();
         }
+        // Delegate session uses "delegate" channel (not "system")
+        db.create_session("delegate-task-1", "mika", "delegate")
+            .unwrap();
+        db.end_session("delegate-task-1").unwrap();
+        db.conn
+            .execute(
+                "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 days') WHERE id = 'delegate-task-1'",
+                [],
+            )
+            .unwrap();
         // Also create a regular CLI session that should NOT be pruned
         db.create_session("cli-session", "mika", "cli").unwrap();
         db.end_session("cli-session").unwrap();
