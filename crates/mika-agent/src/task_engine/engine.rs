@@ -198,7 +198,13 @@ impl TaskEngine {
             self.expire_timed_out_tasks().await;
             self.kill_orphan_processes().await;
             self.scan_db_for_new_tasks().await;
-            self.dispatch_undelivered_callbacks().await;
+            // In CLI mode, the TUI's poll_callback_tasks() handles callback delivery
+            // (session-scoped, atomic claim). Skip engine dispatch to prevent a race
+            // where the engine steals callbacks and processes them in a context-free
+            // silent turn. See #264.
+            if !self.dispatcher.cli_mode {
+                self.dispatch_undelivered_callbacks().await;
+            }
         }
 
         let now = crate::timestamp::now();
@@ -601,6 +607,7 @@ mod tests {
             github_token: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
+            cli_mode: false,
         })
     }
 
@@ -952,5 +959,78 @@ mod tests {
 
         let task = db.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "failed");
+    }
+
+    /// Create a callback task that is already completed (as if `mika ask --task-id` ran).
+    fn make_callback_task(label: &str) -> NewTask {
+        NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: r#"{"trigger":"callback"}"#.to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_mode_skips_callback_dispatch() {
+        let db = test_db();
+        // Create dispatcher with cli_mode: true
+        let dispatcher = Arc::new(TaskDispatcher {
+            db: db.clone(),
+            llm: mika_common::llm::dummy_provider(),
+            tools: Arc::new(crate::tools::default_tools()),
+            skills: Arc::new(crate::skills::SkillRegistry::empty()),
+            message_sender: Some(Arc::new(NoopSender)),
+            home_dir: PathBuf::from("/tmp"),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+            cli_mode: true,
+        });
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Insert a completed callback task directly in DB
+        let task_id = db
+            .create_task(make_callback_task("long_running:test_tool"))
+            .await
+            .unwrap();
+        db.update_task_completed(&task_id, Some("test result"))
+            .await
+            .unwrap();
+
+        // Verify the task is completed
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+
+        // Run enough ticks to trigger the DB scan (DB_SCAN_INTERVAL_TICKS = 60)
+        for _ in 0..=DB_SCAN_INTERVAL_TICKS {
+            engine.tick().await;
+        }
+
+        // In CLI mode, dispatch_undelivered_callbacks is skipped.
+        // The task should still be in 'completed' status, NOT 'delivered'.
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status, "completed",
+            "cli_mode should prevent engine from dispatching callbacks"
+        );
     }
 }

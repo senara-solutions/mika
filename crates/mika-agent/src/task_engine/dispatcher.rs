@@ -44,6 +44,10 @@ pub struct TaskDispatcher {
     /// Per-agent lock used when running a silent agent turn.
     /// When `Some`, `dispatch_run_skill` uses `try_lock` and defers if busy.
     pub agent_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// When true, the engine skips `dispatch_undelivered_callbacks()`.
+    /// CLI/TUI mode handles callbacks via `poll_callback_tasks()` instead,
+    /// preventing a race where the engine steals callbacks from the TUI.
+    pub cli_mode: bool,
 }
 
 impl TaskDispatcher {
@@ -764,6 +768,7 @@ mod tests {
             github_token: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
+            cli_mode: false,
         }
     }
 

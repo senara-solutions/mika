@@ -246,6 +246,9 @@ async fn init_agent(
         github_token,
         skills_dirty: skills_dirty.clone(),
         agent_lock: Some(agent_lock.clone()),
+        // Server mode: engine dispatches callbacks via dispatch_undelivered_callbacks().
+        // The agent_lock serializes concurrent dispatch attempts.
+        cli_mode: false,
     });
 
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
@@ -642,6 +645,7 @@ mod tests {
             github_token: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
+            cli_mode: false,
         });
         let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
             db,
