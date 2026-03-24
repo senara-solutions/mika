@@ -51,6 +51,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Doc sync:** `docs/` is the single source of truth. `crates/mika-agent/build.rs` copies docs into `OUT_DIR` at build time via `include_str!(concat!(env!("OUT_DIR"), ...))`. Crate-local copies in `crates/mika-agent/docs/` are fallbacks for crates.io; sync them with `scripts/sync-agent-docs.sh` before publishing.
 - **Proactive state checking:** The system prompt instructs the agent to check existing state (via `list_reminders`, `search_memory`) before any write operation (reminders, facts, people, events). This prevents duplicates after conversation compaction. New write tools should have a corresponding query tool. The system prompt also instructs the agent to check its own files (`list_agent_files`, `read_agent_file`) and documentation (`get_documentation`) before answering questions about its own configuration or internals — reinforced by the `self-knowledge` skill's always-on prompt.
+- **Grounding rule:** The system prompt prohibits the agent from claiming the state of downstream or adjacent systems (PR status, CI pipeline, deploy, merge readiness) unless a tool result explicitly confirms that state. Includes BAD/GOOD examples. Reinforced in `format_callback_framing` (covers both CLI and silent callback paths) and the `SilentTrigger::Callback` trigger context.
 - **Confirmation before action:** The system prompt includes a guardrail instructing the agent to answer informational questions directly without starting multi-step workflows. If follow-up action may be useful, the agent suggests it and waits for confirmation.
 - **Database:** Case-insensitive COLLATE NOCASE on unique text columns.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key and OTLP auth header. API key errors are opaque. Exec handler executor scrubs all MIKA_* env vars from child processes (defense-in-depth). Shell-exec and github handlers additionally `unset` specific vars in their scripts. MCP child processes use `env_clear()` + allowlist. Git subprocesses scrub MIKA_* vars and set `GIT_TERMINAL_PROMPT=0`.
@@ -62,7 +63,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~1642 tests)
+- `cargo test` — Run all tests (~1664 tests)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-server on :8080)
