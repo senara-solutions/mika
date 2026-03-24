@@ -359,19 +359,18 @@ impl SkillDiagnostic {
 /// providers without configured API keys. Call after `scan_skills_dir()`.
 pub fn warn_missing_llm_api_keys(entries: &[SkillEntry], settings: &mika_common::config::Settings) {
     for entry in entries {
-        if let Some(ref provider_str) = entry.manifest.llm.provider {
-            if let Ok(pk) = provider_str.parse::<ProviderKind>() {
-                let (_, api_key, _) = settings.provider_fields(pk);
-                // Ollama doesn't require an API key
-                if pk != ProviderKind::Ollama && api_key.filter(|k| !k.trim().is_empty()).is_none()
-                {
-                    warn!(
-                        skill = %entry.manifest.skill.name,
-                        provider = %provider_str,
-                        "skill declares [llm].provider but no API key is configured for this provider — \
-                         LLM calls will fail when this skill is active"
-                    );
-                }
+        if let Some(ref provider_str) = entry.manifest.llm.provider
+            && let Ok(pk) = provider_str.parse::<ProviderKind>()
+        {
+            let (_, api_key, _) = settings.provider_fields(pk);
+            // Ollama doesn't require an API key
+            if pk != ProviderKind::Ollama && api_key.filter(|k| !k.trim().is_empty()).is_none() {
+                warn!(
+                    skill = %entry.manifest.skill.name,
+                    provider = %provider_str,
+                    "skill declares [llm].provider but no API key is configured for this provider — \
+                     LLM calls will fail when this skill is active"
+                );
             }
         }
     }
