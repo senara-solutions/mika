@@ -225,6 +225,29 @@ pub struct Preference {
     pub updated_at: String,
 }
 
+/// A single anomalous task state detected by the health check.
+#[derive(Debug, Clone)]
+pub struct TaskHealthAnomaly {
+    pub task_id: String,
+    pub label: String,
+    pub trigger_type: String,
+    pub status: String,
+    /// One of: "stuck_callback", "stale_blocked", "failed_recurring", "long_running", "github_linked"
+    pub anomaly_type: String,
+    /// Human-readable age description (e.g., "3h 22m", "5 days").
+    pub age_description: String,
+    pub reference_url: Option<String>,
+}
+
+/// Aggregated task health summary for heartbeat prompt injection.
+#[derive(Debug, Clone, Default)]
+pub struct TaskHealthSummary {
+    /// Active manual work items (pending/in_progress/blocked).
+    pub active_work_items: Vec<Task>,
+    /// Anomalous task states across all trigger types, capped at [`health_thresholds::MAX_ANOMALIES`].
+    pub anomalies: Vec<TaskHealthAnomaly>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: i64,
@@ -2633,6 +2656,236 @@ impl Database {
             .query_map(params![agent_id], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Build a task health summary for heartbeat prompt injection.
+    ///
+    /// Returns active manual work items plus anomalous task states across all trigger types.
+    /// Anomalies are capped at [`crate::task_engine::types::health_thresholds::MAX_ANOMALIES`].
+    pub fn get_task_health_summary(&self, agent_id: &str) -> Result<TaskHealthSummary> {
+        use crate::task_engine::types::health_thresholds;
+
+        let active_work_items = self.list_active_work_items(agent_id)?;
+        let now = Utc::now();
+        let mut anomalies: Vec<TaskHealthAnomaly> = Vec::new();
+
+        // 1. Stuck callbacks: completed but not delivered for > threshold
+        {
+            let threshold = timestamp::format(
+                &(now - Duration::seconds(health_thresholds::STUCK_CALLBACK_SECS)),
+            );
+            let mut stmt = self.conn.prepare(
+                "SELECT id, label, trigger_type, status, updated_at, reference_url
+                 FROM tasks
+                 WHERE agent_id = ?1
+                   AND trigger_type = 'callback'
+                   AND status = 'completed'
+                   AND updated_at < ?2
+                 ORDER BY updated_at ASC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![agent_id, threshold, health_thresholds::MAX_ANOMALIES as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (id, label, trigger_type, status, updated_at, reference_url) = row?;
+                let age = format_age(&updated_at, now);
+                anomalies.push(TaskHealthAnomaly {
+                    task_id: id,
+                    label,
+                    trigger_type,
+                    status,
+                    anomaly_type: "stuck_callback".to_string(),
+                    age_description: format!("stuck {age}"),
+                    reference_url,
+                });
+            }
+        }
+
+        // 2. Failed recurring tasks
+        {
+            let since = timestamp::format(&(now - Duration::seconds(86_400)));
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            if remaining > 0 {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, label, trigger_type, status, updated_at, reference_url
+                     FROM tasks
+                     WHERE agent_id = ?1
+                       AND trigger_type = 'recurring'
+                       AND status = 'failed'
+                       AND updated_at > ?2
+                     ORDER BY updated_at DESC
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![agent_id, since, remaining as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, label, trigger_type, status, updated_at, reference_url) = row?;
+                    let age = format_age(&updated_at, now);
+                    anomalies.push(TaskHealthAnomaly {
+                        task_id: id,
+                        label,
+                        trigger_type,
+                        status,
+                        anomaly_type: "failed_recurring".to_string(),
+                        age_description: format!("failed {age} ago"),
+                        reference_url,
+                    });
+                }
+            }
+        }
+
+        // 3. Long-running in_progress tasks
+        {
+            let threshold = timestamp::format(
+                &(now - Duration::seconds(health_thresholds::LONG_RUNNING_DEFAULT_SECS)),
+            );
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            if remaining > 0 {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, label, trigger_type, status, fired_at, reference_url
+                     FROM tasks
+                     WHERE agent_id = ?1
+                       AND status = 'in_progress'
+                       AND trigger_type != 'manual'
+                       AND fired_at IS NOT NULL
+                       AND fired_at < ?2
+                     ORDER BY fired_at ASC
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![agent_id, threshold, remaining as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, label, trigger_type, status, fired_at, reference_url) = row?;
+                    let age = format_age(&fired_at, now);
+                    anomalies.push(TaskHealthAnomaly {
+                        task_id: id,
+                        label,
+                        trigger_type,
+                        status,
+                        anomaly_type: "long_running".to_string(),
+                        age_description: format!("running for {age}"),
+                        reference_url,
+                    });
+                }
+            }
+        }
+
+        // 4. Stale blocked manual work items
+        {
+            let threshold = timestamp::format(
+                &(now - Duration::seconds(health_thresholds::STALE_BLOCKED_SECS)),
+            );
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            if remaining > 0 {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, label, trigger_type, status, updated_at, reference_url
+                     FROM tasks
+                     WHERE agent_id = ?1
+                       AND trigger_type = 'manual'
+                       AND status = 'blocked'
+                       AND updated_at < ?2
+                     ORDER BY updated_at ASC
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![agent_id, threshold, remaining as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, label, trigger_type, status, updated_at, reference_url) = row?;
+                    let age = format_age(&updated_at, now);
+                    anomalies.push(TaskHealthAnomaly {
+                        task_id: id,
+                        label,
+                        trigger_type,
+                        status,
+                        anomaly_type: "stale_blocked".to_string(),
+                        age_description: format!("blocked for {age}"),
+                        reference_url,
+                    });
+                }
+            }
+        }
+
+        // 5. GitHub-linked manual work items (active, with reference_url containing github.com)
+        {
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            if remaining > 0 {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, label, trigger_type, status, created_at, reference_url
+                     FROM tasks
+                     WHERE agent_id = ?1
+                       AND trigger_type = 'manual'
+                       AND status IN ('pending', 'in_progress')
+                       AND reference_url LIKE '%github.com%'
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![agent_id, remaining as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, label, trigger_type, status, _created_at, reference_url) = row?;
+                    anomalies.push(TaskHealthAnomaly {
+                        task_id: id,
+                        label,
+                        trigger_type,
+                        status,
+                        anomaly_type: "github_linked".to_string(),
+                        age_description: "has linked GitHub PR".to_string(),
+                        reference_url,
+                    });
+                }
+            }
+        }
+
+        // Cap total anomalies
+        anomalies.truncate(health_thresholds::MAX_ANOMALIES);
+
+        Ok(TaskHealthSummary {
+            active_work_items,
+            anomalies,
+        })
     }
 
     pub fn mark_tasks_expired(&self, now: &str, agent_id: &str) -> Result<usize> {
@@ -5663,6 +5916,34 @@ pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Format the age of a timestamp relative to `now` as a human-readable string.
+///
+/// Examples: "3h 22m", "5d", "45m", "2d 4h"
+fn format_age(timestamp_str: &str, now: chrono::DateTime<Utc>) -> String {
+    let ts = match timestamp::parse(timestamp_str) {
+        Ok(t) => t,
+        Err(_) => return "unknown".to_string(),
+    };
+    let secs = now.signed_duration_since(ts).num_seconds().max(0);
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+
+    if days > 0 && hours > 0 {
+        format!("{days}d {hours}h")
+    } else if days > 0 {
+        format!("{days}d")
+    } else if hours > 0 && mins > 0 {
+        format!("{hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "< 1m".to_string()
+    }
+}
+
 // ===== Tests =====
 
 #[cfg(test)]
@@ -7711,5 +7992,268 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // -- Task health summary tests --
+
+    fn new_task(agent: &str, label: &str, trigger: &str, action: &str) -> NewTask {
+        NewTask {
+            agent_id: agent.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: trigger.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_health_summary_empty_no_anomalies() {
+        let db = db();
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(summary.active_work_items.is_empty());
+        assert!(summary.anomalies.is_empty());
+    }
+
+    #[test]
+    fn test_health_summary_active_work_items() {
+        let db = db();
+        let task = NewTask {
+            reference_url: Some("https://github.com/org/repo/issues/1".to_string()),
+            ..new_task("mika", "Fix bug", "manual", "none")
+        };
+        db.create_task(&task).unwrap();
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert_eq!(summary.active_work_items.len(), 1);
+        assert_eq!(summary.active_work_items[0].label, "Fix bug");
+        // Also detected as github_linked anomaly
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|a| a.anomaly_type == "github_linked")
+        );
+    }
+
+    #[test]
+    fn test_health_summary_stuck_callback() {
+        let db = db();
+        let id = db
+            .create_task(&new_task(
+                "mika",
+                "Build deploy",
+                "callback",
+                "resume_agent",
+            ))
+            .unwrap();
+        // Mark as completed with a timestamp >10 min ago
+        let old_time = timestamp::format(&(Utc::now() - Duration::seconds(700)));
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+                params![old_time, id],
+            )
+            .unwrap();
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert_eq!(summary.anomalies.len(), 1);
+        assert_eq!(summary.anomalies[0].anomaly_type, "stuck_callback");
+        assert_eq!(summary.anomalies[0].label, "Build deploy");
+        assert!(summary.anomalies[0].age_description.starts_with("stuck "));
+    }
+
+    #[test]
+    fn test_health_summary_stuck_callback_not_triggered_within_threshold() {
+        let db = db();
+        let id = db
+            .create_task(&new_task(
+                "mika",
+                "Recent callback",
+                "callback",
+                "resume_agent",
+            ))
+            .unwrap();
+        // Mark as completed just 2 minutes ago (within 10 min threshold)
+        let recent_time = timestamp::format(&(Utc::now() - Duration::seconds(120)));
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+                params![recent_time, id],
+            )
+            .unwrap();
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        // Should NOT appear as stuck_callback
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .all(|a| a.anomaly_type != "stuck_callback")
+        );
+    }
+
+    #[test]
+    fn test_health_summary_failed_recurring() {
+        let db = db();
+        let id = db
+            .create_task(&new_task("mika", "Heartbeat", "recurring", "run_skill"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|a| a.anomaly_type == "failed_recurring")
+        );
+    }
+
+    #[test]
+    fn test_health_summary_long_running() {
+        let db = db();
+        let id = db
+            .create_task(&new_task("mika", "Slow task", "time", "run_skill"))
+            .unwrap();
+        let old_time = timestamp::format(&(Utc::now() - Duration::seconds(7200)));
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress', fired_at = ?1 WHERE id = ?2",
+                params![old_time, id],
+            )
+            .unwrap();
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|a| a.anomaly_type == "long_running")
+        );
+    }
+
+    #[test]
+    fn test_health_summary_stale_blocked() {
+        let db = db();
+        let id = db
+            .create_task(&new_task("mika", "Blocked item", "manual", "none"))
+            .unwrap();
+        let old_time = timestamp::format(&(Utc::now() - Duration::seconds(90_000)));
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'blocked', updated_at = ?1 WHERE id = ?2",
+                params![old_time, id],
+            )
+            .unwrap();
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|a| a.anomaly_type == "stale_blocked")
+        );
+    }
+
+    #[test]
+    fn test_health_summary_agent_scoping() {
+        let db = db();
+        // Register a second agent
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO agents (id, name) VALUES ('other', 'Other')",
+                [],
+            )
+            .unwrap();
+        // Create a stuck callback for "other" agent
+        let id = db
+            .create_task(&new_task(
+                "other",
+                "Other build",
+                "callback",
+                "resume_agent",
+            ))
+            .unwrap();
+        let old_time = timestamp::format(&(Utc::now() - Duration::seconds(700)));
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+                params![old_time, id],
+            )
+            .unwrap();
+
+        // Mika should see no anomalies
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(summary.anomalies.is_empty());
+
+        // Other should see the stuck callback
+        let summary = db.get_task_health_summary("other").unwrap();
+        assert_eq!(summary.anomalies.len(), 1);
+        assert_eq!(summary.anomalies[0].anomaly_type, "stuck_callback");
+    }
+
+    #[test]
+    fn test_health_summary_anomaly_cap() {
+        let db = db();
+        // Create 15 stuck callbacks — only 10 should be returned
+        for i in 0..15 {
+            let id = db
+                .create_task(&new_task(
+                    "mika",
+                    &format!("Build {i}"),
+                    "callback",
+                    "resume_agent",
+                ))
+                .unwrap();
+            let old_time = timestamp::format(&(Utc::now() - Duration::seconds(700 + i * 60)));
+            db.conn
+                .execute(
+                    "UPDATE tasks SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+                    params![old_time, id],
+                )
+                .unwrap();
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(summary.anomalies.len() <= 10);
+    }
+
+    #[test]
+    fn test_format_age_hours_minutes() {
+        let now = Utc::now();
+        let ts = timestamp::format(&(now - Duration::seconds(7200 + 1320)));
+        assert_eq!(format_age(&ts, now), "2h 22m");
+    }
+
+    #[test]
+    fn test_format_age_days() {
+        let now = Utc::now();
+        let ts = timestamp::format(&(now - Duration::seconds(86_400 * 5)));
+        assert_eq!(format_age(&ts, now), "5d");
+    }
+
+    #[test]
+    fn test_format_age_invalid_timestamp() {
+        let now = Utc::now();
+        assert_eq!(format_age("not-a-timestamp", now), "unknown");
     }
 }

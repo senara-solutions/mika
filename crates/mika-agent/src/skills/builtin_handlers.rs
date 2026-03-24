@@ -30,6 +30,7 @@ static DOC_SKILLS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/skills.md
 static DOC_RUNTIME_STRUCTURE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/docs/runtime-structure.md"));
 static DOC_SLASH_COMMANDS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/slash-commands.md"));
+static DOC_TASK_SYSTEM: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/task-system.md"));
 
 /// Known builtin function names, used for startup validation.
 pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "run_gh", "run_gws", "web_search"];
@@ -143,8 +144,9 @@ async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> 
         "slash-commands" => {
             ToolOutput::success(strip_frontmatter(DOC_SLASH_COMMANDS).to_string())
         }
+        "task-system" => ToolOutput::success(strip_frontmatter(DOC_TASK_SYSTEM).to_string()),
         _ => ToolOutput::error(
-            "Invalid topic. Use one of: architecture, api-spec, browser-control, cli-reference, configuration, deployment, getting-started, runtime-structure, skills, slash-commands."
+            "Invalid topic. Use one of: architecture, api-spec, browser-control, cli-reference, configuration, deployment, getting-started, runtime-structure, skills, slash-commands, task-system."
                 .to_string(),
         ),
     }
@@ -559,6 +561,7 @@ mod tests {
             "runtime-structure",
             "skills",
             "slash-commands",
+            "task-system",
         ] {
             let input = serde_json::json!({"topic": topic});
             let output = get_documentation(&input, &ctx).await;

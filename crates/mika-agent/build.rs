@@ -10,6 +10,7 @@ const DOCS: &[&str] = &[
     "runtime-structure.md",
     "skills.md",
     "slash-commands.md",
+    "task-system.md",
 ];
 
 fn main() {

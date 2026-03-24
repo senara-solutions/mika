@@ -27,6 +27,24 @@ pub mod action_type {
     pub const NONE: &str = "none";
 }
 
+/// Anomaly detection thresholds for task health checks (heartbeat prompt injection).
+///
+/// These are intentionally hardcoded constants. If per-customer configurability is
+/// needed in the future, extract them into `Settings` or the preferences table.
+pub mod health_thresholds {
+    /// Callback task stuck at `completed` (not delivered) for longer than this is anomalous.
+    pub const STUCK_CALLBACK_SECS: i64 = 600; // 10 minutes
+
+    /// Manual work item `blocked` with no `updated_at` change for longer than this is anomalous.
+    pub const STALE_BLOCKED_SECS: i64 = 86_400; // 24 hours
+
+    /// Task `in_progress` for longer than this (when no `estimated_duration_secs`) is anomalous.
+    pub const LONG_RUNNING_DEFAULT_SECS: i64 = 3_600; // 1 hour
+
+    /// Maximum number of anomalies to include in the heartbeat prompt.
+    pub const MAX_ANOMALIES: usize = 10;
+}
+
 /// String constants for task trigger type values stored in the `tasks.trigger_type` column.
 pub mod trigger_type {
     pub const TIME: &str = "time";
