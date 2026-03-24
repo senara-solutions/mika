@@ -30,6 +30,11 @@ const MAX_TOOL_STEPS: usize = 10;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Maximum bytes for callback results injected into the system prompt via
+/// `format_callback_framing()`. Results exceeding this are truncated to prevent
+/// oversized prompts from consuming the agent timeout during serialization.
+/// Full results remain available in task logs.
+const CALLBACK_RESULT_MAX_BYTES: usize = 10_240;
 /// Per-agent timeout for team sub-agents (matches AGENT_TOTAL_TIMEOUT_SECS).
 /// Since team agents run in parallel, the constraint is fitting within the global
 /// team run budget (max of agent times, not sum).
@@ -69,6 +74,26 @@ pub fn format_callback_framing(label: &str, task_id: &str, result: &str, failed:
         "A background task has FAILED."
     } else {
         "A background task has completed."
+    };
+    // Truncate oversized results to prevent prompt serialization from consuming
+    // the agent timeout (see #259). Full result is available in task logs.
+    const TRUNCATION_SUFFIX: &str = "\n...\n[truncated — full result available in task logs]";
+    let truncated;
+    let result = if result.len() > CALLBACK_RESULT_MAX_BYTES {
+        warn!(
+            original_bytes = result.len(),
+            truncated_to = CALLBACK_RESULT_MAX_BYTES,
+            "callback result truncated before prompt injection"
+        );
+        let cut = CALLBACK_RESULT_MAX_BYTES.saturating_sub(TRUNCATION_SUFFIX.len());
+        let mut boundary = cut;
+        while boundary > 0 && !result.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        truncated = format!("{}{}", &result[..boundary], TRUNCATION_SUFFIX);
+        truncated.as_str()
+    } else {
+        result
     };
     format!(
         "{status_line}\n\n\
@@ -3166,5 +3191,47 @@ mod tests {
         assert!(result.contains("Process exited with code 128: fatal error"));
         assert!(result.contains("<callback_result trust=\"untrusted\">"));
         assert!(!result.contains("has completed"));
+    }
+
+    #[test]
+    fn test_format_callback_framing_short_result_not_truncated() {
+        let short = "a".repeat(CALLBACK_RESULT_MAX_BYTES);
+        let result = format_callback_framing("task", "id-1", &short, false);
+        assert!(result.contains(&short));
+        assert!(!result.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_format_callback_framing_long_result_truncated() {
+        let long = "x".repeat(CALLBACK_RESULT_MAX_BYTES + 5000);
+        let result = format_callback_framing("task", "id-2", &long, false);
+        assert!(!result.contains(&long));
+        assert!(result.contains("[truncated — full result available in task logs]"));
+        // The truncated content should be present (up to the cut boundary)
+        let suffix_len = "\n...\n[truncated — full result available in task logs]".len();
+        let prefix = &"x".repeat(CALLBACK_RESULT_MAX_BYTES - suffix_len);
+        assert!(result.contains(prefix));
+    }
+
+    #[test]
+    fn test_format_callback_framing_truncation_utf8_safe() {
+        // Place a 4-byte emoji so it straddles the cut point, forcing the
+        // char-boundary walk-back loop to execute.
+        // cut = CALLBACK_RESULT_MAX_BYTES - suffix_len ≈ 10_185
+        // Emoji at byte (cut-1) spans (cut-1)..(cut+2), so cut lands mid-emoji.
+        let suffix_len = "\n...\n[truncated — full result available in task logs]".len();
+        let cut = CALLBACK_RESULT_MAX_BYTES - suffix_len;
+        let mut s = "a".repeat(cut - 1); // one byte before the cut point
+        s.push('🦀'); // 4-byte char that straddles the cut boundary
+        // Pad with enough trailing data to exceed CALLBACK_RESULT_MAX_BYTES
+        let pad = CALLBACK_RESULT_MAX_BYTES - s.len() + 1;
+        s.push_str(&"z".repeat(pad));
+        assert!(s.len() > CALLBACK_RESULT_MAX_BYTES);
+        let result = format_callback_framing("task", "id-3", &s, true);
+        assert!(result.contains("[truncated"));
+        // The emoji should NOT be in the output (it was at the boundary)
+        assert!(!result.contains('🦀'));
+        // Content up to the emoji should be preserved
+        assert!(result.contains(&"a".repeat(cut - 1)));
     }
 }
