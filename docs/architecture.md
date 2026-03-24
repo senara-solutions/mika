@@ -220,6 +220,10 @@ All 24 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `get_session_messages` | Retrieve messages from a past conversation session. Useful for replaying or summarizing old conversations. Non-orchestrator agents can only access their own sessions. | Introspection |
 | `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
 | `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
+| `create_work_item` | Create a trackable work item with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | Work Items |
+| `update_work_item_status` | Update work item status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | Work Items |
+| `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. | Work Items |
+| `check_work_item` | Read work item details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Work Items |
 
 ### Management Tools
 
