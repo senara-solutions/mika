@@ -81,3 +81,8 @@
 - name: dashboard
   color: "7057ff"
   description: Observability dashboard (React SPA)
+
+# ── Automation ──────────────────────────────────────────────────────────────
+- name: auto-merge
+  color: "0e8a16"
+  description: QA can merge PR after PASS verdict
