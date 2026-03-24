@@ -33,7 +33,7 @@ Follow the team engine pattern (engine.rs lines 920-1042):
 | Field | Value | Rationale |
 |-------|-------|-----------|
 | `session_id` | `delegate-{uuid}` (already generated) | Matches prefix convention; enables pruning |
-| `channel_type` | `"system"` | Non-interactive, matches silent dispatcher convention |
+| `channel_type` | `"delegate"` | Distinguishes delegation from autonomous background sessions |
 | `metadata` | `{"trigger": "delegate", "orchestrator": "<agent_id>", "work_item_id": "<id>"}` | Dashboard context |
 | `parent_session_id` | `ctx.session_id` (orchestrator's session) | Session hierarchy tracing |
 | `trace_id` on messages | `ctx.trace_id` (orchestrator's) | Correlates in `unified_timeline` |
