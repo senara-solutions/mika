@@ -171,6 +171,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![],

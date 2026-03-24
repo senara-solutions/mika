@@ -154,6 +154,7 @@ async fn run_a2a_agent(
         mcp_manager: agent_state.mcp_manager.as_ref(),
         global_home_dir: Some(&state.global_home_dir),
         is_callback_turn: false,
+        settings: Some(&state.settings),
         trace_id: Some(task_id.to_string()),
     };
 

@@ -198,6 +198,7 @@ pub async fn run(
         mcp_manager: mcp_manager.as_ref(),
         global_home_dir: Some(&ctx.global_home),
         is_callback_turn: false,
+        settings: Some(&ctx.settings),
         trace_id: None,
     })
     .await;

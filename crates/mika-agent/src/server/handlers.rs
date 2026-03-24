@@ -240,6 +240,7 @@ pub async fn handle_message(
                 mcp_manager: a.mcp_manager.as_ref(),
                 global_home_dir: Some(&s.global_home_dir),
                 is_callback_turn: false,
+                settings: Some(&s.settings),
                 trace_id: Some(req.request_id.clone()),
             };
 

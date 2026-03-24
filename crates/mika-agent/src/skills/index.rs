@@ -355,6 +355,27 @@ impl SkillDiagnostic {
     }
 }
 
+/// Emit startup warnings for skills with `[llm]` overrides that reference
+/// providers without configured API keys. Call after `scan_skills_dir()`.
+pub fn warn_missing_llm_api_keys(entries: &[SkillEntry], settings: &mika_common::config::Settings) {
+    for entry in entries {
+        if let Some(ref provider_str) = entry.manifest.llm.provider
+            && let Ok(pk) = provider_str.parse::<ProviderKind>()
+        {
+            let (_, api_key, _) = settings.provider_fields(pk);
+            // Ollama doesn't require an API key
+            if pk != ProviderKind::Ollama && api_key.filter(|k| !k.trim().is_empty()).is_none() {
+                warn!(
+                    skill = %entry.manifest.skill.name,
+                    provider = %provider_str,
+                    "skill declares [llm].provider but no API key is configured for this provider — \
+                     LLM calls will fail when this skill is active"
+                );
+            }
+        }
+    }
+}
+
 /// Validate a single skill directory and return diagnostics.
 pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
     let mut diags = Vec::new();
@@ -415,6 +436,37 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
             .take(60)
             .collect::<String>()
     )));
+
+    // 3b. Validate [llm] section if present
+    if !manifest.llm.is_empty() {
+        if let Some(ref provider_str) = manifest.llm.provider {
+            match provider_str.parse::<ProviderKind>() {
+                Ok(pk) => {
+                    diags.push(SkillDiagnostic::ok(format!(
+                        "[llm] provider '{}' is valid",
+                        pk.config_prefix()
+                    )));
+                }
+                Err(_) => {
+                    diags.push(SkillDiagnostic::fail(format!(
+                        "[llm] provider '{}' is not a valid provider. \
+                         Valid providers: anthropic, openai, openrouter, groq, ollama, \
+                         mistral, google, deepseek, minimax, kimi, qwen",
+                        provider_str
+                    )));
+                }
+            }
+        }
+        if let Some(ref model_str) = manifest.llm.model {
+            if model_str.trim().is_empty() {
+                diags.push(SkillDiagnostic::warn(
+                    "[llm] model is empty — will use provider default".to_string(),
+                ));
+            } else {
+                diags.push(SkillDiagnostic::ok(format!("[llm] model '{}'", model_str)));
+            }
+        }
+    }
 
     // 4. Check tools.json if present
     let tools_path = skill_dir.join("tools.json");
@@ -602,6 +654,12 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                                     if raw.get("triggers").is_some() {
                                         diags.push(SkillDiagnostic::warn(format!(
                                             "provider '{subdir_name}/skill.toml' contains [triggers] section which is ignored — triggers cannot be overridden per-provider"
+                                        )));
+                                    }
+                                    // [llm] belongs only in root skill.toml
+                                    if raw.get("llm").is_some() {
+                                        diags.push(SkillDiagnostic::warn(format!(
+                                            "provider '{subdir_name}/skill.toml' contains [llm] section which is ignored — [llm] overrides belong in the root skill.toml only"
                                         )));
                                     }
                                 }
@@ -1985,6 +2043,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2020,6 +2079,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2051,6 +2111,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2082,6 +2143,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2666,6 +2728,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2713,6 +2776,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2750,6 +2814,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2801,6 +2866,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2858,6 +2924,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2912,6 +2979,7 @@ mod tests {
                     max_prompt_size: None,
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],

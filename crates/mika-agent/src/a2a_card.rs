@@ -86,6 +86,7 @@ mod tests {
             triggers: Triggers {
                 keywords: keywords.clone(),
             },
+            llm: Default::default(),
         };
         let toml_str = toml::to_string(&manifest).unwrap();
         std::fs::write(skill_dir.join("skill.toml"), toml_str).unwrap();
