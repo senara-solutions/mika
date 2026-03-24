@@ -41,6 +41,11 @@ pub struct GatewaySettings {
     /// Optional log file path for mika-gateway (maps to MIKA_GATEWAY_LOG_FILE)
     #[serde(default)]
     pub gateway_log_file: Option<String>,
+
+    /// Namespace where agent pods run (for FQDN construction).
+    /// Maps to MIKA_AGENTS_NAMESPACE env var. Default: "mika-agents".
+    #[serde(default = "default_agents_namespace")]
+    pub agents_namespace: String,
 }
 
 fn default_port() -> u16 {
@@ -53,6 +58,10 @@ fn default_log_level() -> String {
 
 fn default_log_format() -> String {
     "json".to_string()
+}
+
+fn default_agents_namespace() -> String {
+    "mika-agents".to_string()
 }
 
 impl GatewaySettings {
@@ -141,6 +150,7 @@ impl std::fmt::Debug for GatewaySettings {
             .field("log_format", &self.log_format)
             .field("agent_base_url", &self.agent_base_url)
             .field("gateway_log_file", &self.gateway_log_file)
+            .field("agents_namespace", &self.agents_namespace)
             .finish()
     }
 }
@@ -205,6 +215,7 @@ mod tests {
                 log_format: "json".to_string(),
                 agent_base_url: None,
                 gateway_log_file: None,
+                agents_namespace: "mika-agents".to_string(),
             }
         );
         assert!(!debug.contains("pass"));

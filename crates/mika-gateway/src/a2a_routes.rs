@@ -75,7 +75,11 @@ pub async fn handle_a2a_proxy(
     }
 
     // Forward to agent container
-    let container = crate::routes::container_url_str(&customer_id, state.agent_base_url.as_deref());
+    let container = crate::routes::container_url_str(
+        &customer_id,
+        state.agent_base_url.as_deref(),
+        &state.agents_namespace,
+    );
     let forward_url = format!("{container}/a2a/{agent_name}");
     debug!(forward_url = %forward_url, method = %request.method, "proxying A2A request");
 
@@ -203,7 +207,11 @@ pub async fn handle_a2a_agent_card(
     }
 
     // Forward to agent container
-    let container = crate::routes::container_url_str(&customer_id, state.agent_base_url.as_deref());
+    let container = crate::routes::container_url_str(
+        &customer_id,
+        state.agent_base_url.as_deref(),
+        &state.agents_namespace,
+    );
     let forward_url = format!("{container}/a2a/{agent_name}/agent.json");
 
     let resp = match state

@@ -494,6 +494,7 @@ variables are required:
 | `MIKA_LOG_LEVEL` | No | Log level (default: `info`) |
 | `MIKA_LOG_FORMAT` | No | Stdout log format: `json` (default) or `pretty` |
 | `MIKA_AGENT_BASE_URL` | No | Override agent container URL for local E2E testing |
+| `MIKA_AGENTS_NAMESPACE` | No | K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution. |
 | `MIKA_GATEWAY_LOG_FILE` | No | Optional log file path |
 
 Both `MIKA_INTERNAL_TOKEN` and `MIKA_TELEGRAM_WEBHOOK_SECRET` must be exactly 64
