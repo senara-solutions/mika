@@ -247,6 +247,17 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          when action is required — never assume a tool_history entry means the work is already done.\n",
     );
     prompt.push_str(
+        "- **Grounding rule:** NEVER claim the state of a downstream or adjacent system \
+         (PR status, CI pipeline, deploy, merge readiness, branch health) unless a tool \
+         result in this conversation explicitly confirms that exact state. A successful \
+         tool result confirms only the specific action that tool performed — do not \
+         extrapolate.\n  \
+         BAD: Build tool returns \"Compilation succeeded\" → you say \"PR is ready for review.\"\n  \
+         GOOD: Build tool returns \"Compilation succeeded\" → you say \"The build passed.\"\n  \
+         If you need downstream status, call the appropriate tool (e.g., check_work_item, \
+         query_timeline) to verify it first.\n",
+    );
+    prompt.push_str(
         "- **Confirmation before action:** When the user asks an informational or status question \
          (e.g., \"can you list...\", \"what are...\", \"show me...\", \"did you...\", \
          \"what happened with...\", \"is X done?\", \"what's the status?\"), answer the question \
@@ -1665,5 +1676,31 @@ notify = true
         assert!(prompt.contains("Do not interpret questions as implicit requests"));
         assert!(prompt.contains("retry failed operations"));
         assert!(prompt.contains("relaunch tasks"));
+    }
+
+    #[test]
+    fn test_prompt_includes_grounding_guardrail() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            identity: &identity,
+            soul_content: "",
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("Grounding rule"));
+        assert!(prompt.contains("NEVER claim the state of a downstream or adjacent system"));
+        assert!(prompt.contains("do not extrapolate"));
+        // Verify bad/good examples are present
+        assert!(prompt.contains("BAD:"));
+        assert!(prompt.contains("GOOD:"));
     }
 }
