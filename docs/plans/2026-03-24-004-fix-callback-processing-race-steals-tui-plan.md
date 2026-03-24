@@ -1,7 +1,7 @@
 ---
 title: "fix: callback processing race steals TUI notifications and skips mika-qa review"
 type: fix
-status: active
+status: completed
 date: 2026-03-24
 issue: 264
 ---
