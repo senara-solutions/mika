@@ -162,6 +162,9 @@ Gateway mode (`mika-gateway` binary) additionally requires:
 - `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for Telegram webhook delivery
 - `MIKA_INTERNAL_TOKEN` — Shared 64-char hex bearer token (same as server mode)
 
+Optional (gateway):
+- `MIKA_AGENTS_NAMESPACE` — K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution (`http://mika-{id}.{ns}.svc.cluster.local:8080`). Override for environment-scoped namespaces (e.g. `mika-agents-prd`).
+
 ## Pending Work
 
 - **Deployment:** Production deployment guide, Docker image CI, Kubernetes/cloud manifests

@@ -40,6 +40,8 @@ pub struct AppState {
     pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
     /// Optional override for agent container base URL (local E2E testing).
     pub agent_base_url: Option<String>,
+    /// Namespace where agent pods run (for FQDN DNS resolution).
+    pub agents_namespace: String,
     /// Counter for periodic outbound_messages cleanup (every ~100 webhook calls).
     pub webhook_counter: Arc<AtomicU64>,
 }
@@ -50,6 +52,7 @@ impl std::fmt::Debug for AppState {
             .field("internal_token", &"[REDACTED]")
             .field("webhook_secret", &"[REDACTED]")
             .field("agent_base_url", &self.agent_base_url)
+            .field("agents_namespace", &self.agents_namespace)
             .field("webhook_counter", &self.webhook_counter)
             .finish_non_exhaustive()
     }
@@ -247,20 +250,28 @@ pub(crate) async fn handle_webhook(
 
 /// Compute container URL deterministically from customer ID.
 /// When `agent_base_url` is set, routes all traffic there (local E2E testing).
-/// Otherwise uses internal DNS — no user-controlled URLs (SSRF-safe).
-fn container_url(customer_id: &Uuid, agent_base_url: &Option<String>) -> String {
+/// Otherwise uses FQDN with the agents namespace for cross-namespace DNS resolution.
+fn container_url(
+    customer_id: &Uuid,
+    agent_base_url: &Option<String>,
+    agents_namespace: &str,
+) -> String {
     match agent_base_url {
         Some(base) => base.clone(),
-        None => format!("http://mika-{customer_id}:8080"),
+        None => format!("http://mika-{customer_id}.{agents_namespace}.svc.cluster.local:8080"),
     }
 }
 
 /// Compute container URL from a string customer ID.
 /// Used by A2A proxy routes where customer_id comes from the URL path.
-pub(crate) fn container_url_str(customer_id: &str, agent_base_url: Option<&str>) -> String {
+pub(crate) fn container_url_str(
+    customer_id: &str,
+    agent_base_url: Option<&str>,
+    agents_namespace: &str,
+) -> String {
     match agent_base_url {
         Some(base) => base.to_string(),
-        None => format!("http://mika-{customer_id}:8080"),
+        None => format!("http://mika-{customer_id}.{agents_namespace}.svc.cluster.local:8080"),
     }
 }
 
@@ -392,7 +403,7 @@ async fn handle_text_message(
         );
     }
 
-    let url = container_url(&row.id, &state.agent_base_url);
+    let url = container_url(&row.id, &state.agent_base_url, &state.agents_namespace);
     let request_id = Uuid::new_v4().to_string();
 
     // Forward to container
@@ -515,7 +526,7 @@ async fn handle_photo_message(
     // Use caption or synthetic text for captionless photos
     let text = caption.unwrap_or("[Photo]");
 
-    let url = container_url(&row.id, &state.agent_base_url);
+    let url = container_url(&row.id, &state.agent_base_url, &state.agents_namespace);
     let request_id = Uuid::new_v4().to_string();
 
     // Forward to container with images array (longer timeout for large payloads)
@@ -584,7 +595,7 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
             info!(customer_id = %row.id, chat_id, "customer paired successfully");
 
             // Forward synthetic "Hello!" to container for onboarding
-            let url = container_url(&row.id, &state.agent_base_url);
+            let url = container_url(&row.id, &state.agent_base_url, &state.agents_namespace);
             let request_id = Uuid::new_v4().to_string();
 
             let _ = state
@@ -949,14 +960,21 @@ mod tests {
     #[test]
     fn test_container_url_default() {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        let url = container_url(&id, &None);
-        assert_eq!(url, "http://mika-12345678-1234-1234-1234-123456789abc:8080");
+        let url = container_url(&id, &None, "mika-agents");
+        assert_eq!(
+            url,
+            "http://mika-12345678-1234-1234-1234-123456789abc.mika-agents.svc.cluster.local:8080"
+        );
     }
 
     #[test]
     fn test_container_url_override() {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        let url = container_url(&id, &Some("http://localhost:8080".to_string()));
+        let url = container_url(
+            &id,
+            &Some("http://localhost:8080".to_string()),
+            "mika-agents",
+        );
         assert_eq!(url, "http://localhost:8080");
     }
 
@@ -1030,5 +1048,30 @@ mod tests {
         // Invalid: special characters
         assert!(!is_valid_agent_name("agent!"));
         assert!(!is_valid_agent_name("agent name"));
+    }
+
+    #[test]
+    fn test_container_url_env_scoped_namespace() {
+        let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let url = container_url(&id, &None, "mika-agents-prd");
+        assert_eq!(
+            url,
+            "http://mika-12345678-1234-1234-1234-123456789abc.mika-agents-prd.svc.cluster.local:8080"
+        );
+    }
+
+    #[test]
+    fn test_container_url_str_uses_fqdn() {
+        let url = container_url_str("abc-123", None, "mika-agents");
+        assert_eq!(
+            url,
+            "http://mika-abc-123.mika-agents.svc.cluster.local:8080"
+        );
+    }
+
+    #[test]
+    fn test_container_url_str_base_url_overrides() {
+        let url = container_url_str("abc-123", Some("http://localhost:9090"), "mika-agents");
+        assert_eq!(url, "http://localhost:9090");
     }
 }

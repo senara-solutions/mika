@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         // Pool of 20 connections provides sufficient headroom.
         webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
         agent_base_url: settings.agent_base_url.clone(),
+        agents_namespace: settings.agents_namespace.clone(),
         webhook_counter: Arc::new(AtomicU64::new(0)),
     };
 
