@@ -598,6 +598,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             embedding_client: None,
             brave_api_key: None,
+            github_token: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
         })

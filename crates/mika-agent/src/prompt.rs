@@ -397,8 +397,16 @@ Core memory tracks key people briefly — the people table is the full record.\n
     prompt.push_str(
         "- Use create_work_item to track significant pieces of work (feature implementations, \
          research projects, items waiting on external input). Check list_work_items before creating \
-         to avoid duplicates. Use update_work_item_status to progress work items through their lifecycle \
-         (pending → in_progress → blocked → completed).\n",
+         to avoid duplicates.\n\
+         - Work item status management follows two patterns:\n\
+           - **Direct update:** When the user explicitly requests a status change (\"mark it done\", \
+         \"cancel the task\"), call update_work_item_status directly. The tool validates transitions — \
+         terminal states (completed, cancelled) are final and cannot be changed.\n\
+           - **Inspect first:** When the user asks about a work item's state (\"check the task\", \
+         \"is the PR merged?\"), call check_work_item to read details and any linked GitHub PR/issue \
+         status. Present findings and wait for the user's decision before changing status.\n\
+         - Status transitions: pending can go to any status; in_progress can go to blocked/completed/cancelled; \
+         blocked can go to in_progress/completed/cancelled. Completed and cancelled are terminal.\n",
     );
     prompt.push_str(
         "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \

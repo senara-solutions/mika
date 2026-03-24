@@ -647,6 +647,8 @@ pub struct AgentParams<'a> {
     pub user_images: &'a [LlmImage],
     /// Brave Search API key (optional; enables web_search builtin skill).
     pub brave_api_key: Option<&'a str>,
+    /// GitHub token for checking PR/issue status on work items (optional).
+    pub github_token: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
     /// Optional MCP manager for external tool servers.
@@ -875,6 +877,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
+        github_token: params.github_token,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: false,
@@ -1291,6 +1294,7 @@ pub struct SilentAgentParams<'a> {
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
+    pub github_token: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
     /// Settings for per-skill LLM provider overrides.
@@ -1538,6 +1542,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
+        github_token: params.github_token,
         skills_dirty: params.skills_dirty,
         is_reflection,
         is_task_context: true,
@@ -1633,6 +1638,7 @@ pub struct TeamAgentParams<'a> {
     pub session_id: &'a str,
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
+    pub github_token: Option<&'a str>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
     /// Settings for per-skill LLM provider overrides.
@@ -1764,6 +1770,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
+        github_token: params.github_token,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: true,

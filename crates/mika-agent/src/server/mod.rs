@@ -198,6 +198,7 @@ async fn init_agent(
     http_client: &reqwest::Client,
     embedding_client: Option<EmbeddingClient>,
     brave_api_key: Option<String>,
+    github_token: Option<String>,
     disable_bundled_skills: bool,
 ) -> Result<AgentState> {
     let db_path = home::container_db_path(global_home);
@@ -242,6 +243,7 @@ async fn init_agent(
         message_sender: Some(engine_sender),
         embedding_client: embedding_client.clone(),
         brave_api_key,
+        github_token,
         skills_dirty: skills_dirty.clone(),
         agent_lock: Some(agent_lock.clone()),
     });
@@ -421,6 +423,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
+                settings.investigate_github_token.clone(),
                 settings.disable_bundled_skills,
             )
             .await?;
@@ -440,6 +443,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
+                settings.investigate_github_token.clone(),
                 settings.disable_bundled_skills,
             )
             .await
@@ -498,6 +502,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         startup_time: std::time::Instant::now(),
         http_client,
         brave_api_key: settings.brave_api_key.clone(),
+        github_token: settings.investigate_github_token.clone(),
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
         dashboard_db,
@@ -634,6 +639,7 @@ mod tests {
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             brave_api_key: None,
+            github_token: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
         });
@@ -681,6 +687,7 @@ mod tests {
             startup_time: std::time::Instant::now(),
             http_client: reqwest::Client::new(),
             brave_api_key: None,
+            github_token: None,
             global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             settings: Settings {
                 llm_provider: mika_common::llm::ProviderKind::Anthropic,

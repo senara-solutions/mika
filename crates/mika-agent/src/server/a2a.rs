@@ -150,6 +150,7 @@ async fn run_a2a_agent(
         thinking: None,
         user_images: &[],
         brave_api_key: state.brave_api_key.as_deref(),
+        github_token: state.github_token.as_deref(),
         skills_dirty: &agent_state.skills_dirty,
         mcp_manager: agent_state.mcp_manager.as_ref(),
         global_home_dir: Some(&state.global_home_dir),

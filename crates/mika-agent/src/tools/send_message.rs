@@ -138,6 +138,7 @@ mod tests {
             message_sender: Some(mock.clone()),
             embedding_client: None,
             brave_api_key: None,
+            github_token: None,
             skills_dirty: &skills_dirty,
             is_reflection: false,
             is_task_context: false,

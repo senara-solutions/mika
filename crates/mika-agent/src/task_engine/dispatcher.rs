@@ -39,6 +39,7 @@ pub struct TaskDispatcher {
     pub home_dir: PathBuf,
     pub embedding_client: Option<EmbeddingClient>,
     pub brave_api_key: Option<String>,
+    pub github_token: Option<String>,
     pub skills_dirty: Arc<AtomicBool>,
     /// Per-agent lock used when running a silent agent turn.
     /// When `Some`, `dispatch_run_skill` uses `try_lock` and defers if busy.
@@ -235,6 +236,7 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: None,
             trace_id: Some(trace_id.clone()),
@@ -321,6 +323,7 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: None,
             trace_id: Some(trace_id.clone()),
@@ -500,6 +503,7 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: None,
             trace_id: Some(trace_id.clone()),
@@ -639,6 +643,7 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: None,
             trace_id: Some(trace_id.clone()),
@@ -756,6 +761,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             embedding_client: None,
             brave_api_key: None,
+            github_token: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
         }

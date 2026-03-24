@@ -1,6 +1,7 @@
 mod a2a_call;
 mod cancel_reminder;
 mod cancel_task;
+mod check_work_item;
 mod complete_task;
 mod create_agent;
 mod create_reminder;
@@ -71,6 +72,7 @@ pub struct ToolContext<'a> {
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
+    pub github_token: Option<&'a str>,
     /// Shared flag: set to `true` by skill-modifying tools after successful writes.
     /// The agent loop coordinator checks this before each turn and rebuilds the
     /// SkillRegistry if set, enabling hot-reload without restart.
@@ -467,6 +469,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(create_work_item::CreateWorkItemTool));
     registry.register(Box::new(update_work_item_status::UpdateWorkItemStatusTool));
     registry.register(Box::new(list_work_items::ListWorkItemsTool));
+    registry.register(Box::new(check_work_item::CheckWorkItemTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));

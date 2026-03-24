@@ -194,6 +194,7 @@ pub async fn run(
         thinking: None,
         user_images: &[],
         brave_api_key: ctx.settings.brave_api_key.as_deref(),
+        github_token: ctx.settings.investigate_github_token.as_deref(),
         skills_dirty: &skills_dirty,
         mcp_manager: mcp_manager.as_ref(),
         global_home_dir: Some(&ctx.global_home),

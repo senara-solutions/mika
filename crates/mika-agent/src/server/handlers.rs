@@ -236,6 +236,7 @@ pub async fn handle_message(
                 thinking: None,
                 user_images: &user_images,
                 brave_api_key: s.brave_api_key.as_deref(),
+                github_token: s.github_token.as_deref(),
                 skills_dirty: &a.skills_dirty,
                 mcp_manager: a.mcp_manager.as_ref(),
                 global_home_dir: Some(&s.global_home_dir),
