@@ -1214,18 +1214,17 @@ async fn execute_tool(
     if let Some(skill_tool) = dispatch.skill_tools.get(name) {
         // Builtin skill handlers dispatch to Rust functions with ToolContext access
         if let ToolHandler::Builtin { function } = &skill_tool.handler {
+            let timeout = dispatch.skill_timeout;
             return match tokio::time::timeout(
-                std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+                std::time::Duration::from_secs(timeout),
                 builtin_handlers::execute(function, input, dispatch.ctx),
             )
             .await
             {
                 Ok(output) => output,
                 Err(_) => {
-                    warn!(tool = %name, "builtin handler timed out");
-                    ToolOutput::error(format!(
-                        "Builtin tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
-                    ))
+                    warn!(tool = %name, timeout_secs = timeout, "builtin handler timed out");
+                    ToolOutput::error(format!("Builtin tool '{name}' timed out after {timeout}s"))
                 }
             };
         }
