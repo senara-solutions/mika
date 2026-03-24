@@ -60,7 +60,7 @@ let delegate_metadata = serde_json::json!({
     "work_item_id": work_item_id
 }).to_string();
 if let Err(e) = async_db
-    .create_session_with_parent(&session_id, agent_name, "system",
+    .create_session_with_parent(&session_id, agent_name, "delegate",
         Some(&delegate_metadata), Some(ctx.session_id))
     .await
 {
