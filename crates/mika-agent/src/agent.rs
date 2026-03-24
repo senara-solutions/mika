@@ -30,6 +30,11 @@ const MAX_TOOL_STEPS: usize = 10;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Maximum bytes for callback results injected into the system prompt via
+/// `format_callback_framing()`. Results exceeding this are truncated to prevent
+/// oversized prompts from consuming the agent timeout during serialization.
+/// Full results remain available in task logs.
+const CALLBACK_RESULT_MAX_BYTES: usize = 10_240;
 /// Per-agent timeout for team sub-agents (matches AGENT_TOTAL_TIMEOUT_SECS).
 /// Since team agents run in parallel, the constraint is fitting within the global
 /// team run budget (max of agent times, not sum).
@@ -69,6 +74,23 @@ pub fn format_callback_framing(label: &str, task_id: &str, result: &str, failed:
         "A background task has FAILED."
     } else {
         "A background task has completed."
+    };
+    // Truncate oversized results to prevent prompt serialization from consuming
+    // the agent timeout (see #259). Full result is available in task logs.
+    let truncated;
+    let result = if result.len() > CALLBACK_RESULT_MAX_BYTES {
+        let cut = CALLBACK_RESULT_MAX_BYTES.saturating_sub(3);
+        let mut boundary = cut;
+        while boundary > 0 && !result.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        truncated = format!(
+            "{}\n...\n[truncated — full result available in task logs]",
+            &result[..boundary]
+        );
+        truncated.as_str()
+    } else {
+        result
     };
     format!(
         "{status_line}\n\n\
@@ -3160,5 +3182,37 @@ mod tests {
         assert!(result.contains("Process exited with code 128: fatal error"));
         assert!(result.contains("<callback_result trust=\"untrusted\">"));
         assert!(!result.contains("has completed"));
+    }
+
+    #[test]
+    fn test_format_callback_framing_short_result_not_truncated() {
+        let short = "a".repeat(CALLBACK_RESULT_MAX_BYTES);
+        let result = format_callback_framing("task", "id-1", &short, false);
+        assert!(result.contains(&short));
+        assert!(!result.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_format_callback_framing_long_result_truncated() {
+        let long = "x".repeat(CALLBACK_RESULT_MAX_BYTES + 5000);
+        let result = format_callback_framing("task", "id-2", &long, false);
+        assert!(!result.contains(&long));
+        assert!(result.contains("[truncated — full result available in task logs]"));
+        // The truncated content should be present (up to the boundary)
+        let prefix = &"x".repeat(CALLBACK_RESULT_MAX_BYTES - 3);
+        assert!(result.contains(prefix));
+    }
+
+    #[test]
+    fn test_format_callback_framing_truncation_utf8_safe() {
+        // Place a 4-byte emoji right at the truncation boundary to test
+        // that we walk back to a valid char boundary.
+        let mut s = "a".repeat(CALLBACK_RESULT_MAX_BYTES - 2);
+        s.push('🦀'); // 4-byte char that straddles the boundary
+        s.push_str("zzz");
+        assert!(s.len() > CALLBACK_RESULT_MAX_BYTES);
+        let result = format_callback_framing("task", "id-3", &s, true);
+        assert!(result.contains("[truncated"));
+        // Should not panic — the test passing is the assertion
     }
 }
