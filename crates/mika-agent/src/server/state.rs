@@ -55,6 +55,7 @@ pub struct AppState {
     pub startup_time: std::time::Instant,
     pub http_client: reqwest::Client,
     pub brave_api_key: Option<String>,
+    pub github_token: Option<String>,
     pub global_home_dir: PathBuf,
     pub settings: Settings,
     /// Unscoped database handle for dashboard API endpoints (cross-agent queries).

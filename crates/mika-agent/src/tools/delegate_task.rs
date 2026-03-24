@@ -271,6 +271,7 @@ impl Tool for DelegateTaskTool {
             session_id: &session_id,
             embedding_client: embedding_client.as_ref(),
             brave_api_key: self.settings.brave_api_key.as_deref(),
+            github_token: self.settings.investigate_github_token.as_deref(),
             skills_dirty: &skills_dirty,
             settings: Some(&self.settings),
             mcp_manager: None,

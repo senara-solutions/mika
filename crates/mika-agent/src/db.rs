@@ -2376,6 +2376,36 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Get a manual (work item) task by ID, scoped to the given agent.
+    pub fn get_manual_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'",
+            Self::TASK_COLUMNS
+        );
+        self.conn
+            .query_row(&sql, params![id, agent_id], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Count child tasks for a given parent task (manual work items only).
+    pub fn count_child_tasks(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT status, COUNT(*) FROM tasks
+             WHERE parent_task_id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'
+             GROUP BY status",
+        )?;
+        let rows = stmt.query_map(params![parent_task_id, agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn get_schedulable_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks

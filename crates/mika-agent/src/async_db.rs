@@ -225,6 +225,18 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task(&i, &a)).await
     }
 
+    pub async fn get_manual_task(&self, id: &str) -> Result<Option<Task>> {
+        let i = id.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_manual_task(&i, &a)).await
+    }
+
+    pub async fn count_child_tasks(&self, parent_task_id: &str) -> Result<Vec<(String, i64)>> {
+        let p = parent_task_id.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_child_tasks(&p, &a)).await
+    }
+
     pub async fn get_schedulable_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_schedulable_tasks(&id)).await

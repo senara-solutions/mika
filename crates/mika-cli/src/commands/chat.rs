@@ -111,6 +111,7 @@ async fn spawn_agent_worker(
     );
 
     let brave_api_key = ctx.settings.brave_api_key.clone();
+    let github_token = ctx.settings.investigate_github_token.clone();
 
     // Connect to MCP servers
     let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
@@ -125,6 +126,7 @@ async fn spawn_agent_worker(
         message_sender: message_sender.clone(),
         embedding_client: embedding_client.clone(),
         brave_api_key: brave_api_key.clone(),
+        github_token: github_token.clone(),
         skills_dirty: skills_dirty.clone(),
         // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
         // concurrently with user message processing (both use the same AsyncDatabase,
@@ -182,6 +184,7 @@ async fn spawn_agent_worker(
     let worker_session = session_id.clone();
     let worker_embedding = embedding_client;
     let worker_brave_key = brave_api_key;
+    let worker_github_token = github_token;
     let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
     let mut worker_mcp = mcp_manager;
@@ -238,6 +241,7 @@ async fn spawn_agent_worker(
                         thinking,
                         user_images: &image_sources,
                         brave_api_key: worker_brave_key.as_deref(),
+                        github_token: worker_github_token.as_deref(),
                         skills_dirty: &worker_dirty,
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),
@@ -332,6 +336,7 @@ async fn spawn_agent_worker(
                         thinking: None,
                         user_images: &[],
                         brave_api_key: worker_brave_key.as_deref(),
+                        github_token: worker_github_token.as_deref(),
                         skills_dirty: &worker_dirty,
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),

@@ -13,6 +13,36 @@ const VALID_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
+/// Permitted status transitions. Terminal states (completed, cancelled) have no outbound edges.
+const VALID_TRANSITIONS: &[(&str, &[&str])] = &[
+    (
+        "pending",
+        &["in_progress", "blocked", "completed", "cancelled"],
+    ),
+    ("in_progress", &["blocked", "completed", "cancelled"]),
+    ("blocked", &["in_progress", "completed", "cancelled"]),
+    ("completed", &[]),
+    ("cancelled", &[]),
+];
+
+/// Check whether transitioning from `from` to `to` is permitted.
+fn is_valid_transition(from: &str, to: &str) -> bool {
+    VALID_TRANSITIONS
+        .iter()
+        .find(|(s, _)| *s == from)
+        .map(|(_, targets)| targets.contains(&to))
+        .unwrap_or(false)
+}
+
+/// Return the list of statuses reachable from `from`.
+fn allowed_transitions(from: &str) -> &'static [&'static str] {
+    VALID_TRANSITIONS
+        .iter()
+        .find(|(s, _)| *s == from)
+        .map(|(_, targets)| *targets)
+        .unwrap_or(&[])
+}
+
 /// Maximum metadata JSON size (10 KB).
 const MAX_METADATA_LEN: usize = 10_240;
 
@@ -29,7 +59,9 @@ impl Tool for UpdateWorkItemStatusTool {
             name: "update_work_item_status".to_string(),
             description: "Update the status of a work item (manual task). \
                 Only works on manual work items, not system tasks (reminders, callbacks, etc.). \
-                Free transitions allowed — any status can move to any other status. \
+                Transitions are validated: pending can go to any status; in_progress can go to \
+                blocked/completed/cancelled; blocked can go to in_progress/completed/cancelled. \
+                Completed and cancelled are terminal — cannot be changed. \
                 Every transition is logged as an audit event. \
                 Optionally attach or merge structured metadata (JSON object) on the work item."
                 .to_string(),
@@ -111,52 +143,54 @@ impl Tool for UpdateWorkItemStatusTool {
             }
         }
 
-        // Update the task status (only works for manual/work item tasks)
-        let old_status = match ctx.db.update_manual_task_status(task_id, status).await? {
-            Some(old) => old,
-            None => {
+        // Look up the work item to get the current status for transition validation
+        let task = match ctx.db.get_task(task_id).await? {
+            Some(t) if t.trigger_type == "manual" => t,
+            Some(_) | None => {
                 return Ok(ToolOutput::error(format!(
                     "Work item '{task_id}' not found. Only manual (work item) tasks can be updated with this tool."
                 )));
             }
         };
 
-        // Merge and persist metadata if provided
-        if let Some(new_meta) = metadata_input {
-            let merged = if let Ok(Some(task)) = ctx.db.get_task_unscoped(task_id).await {
-                if let Some(existing_str) = &task.metadata {
-                    if let Ok(mut existing) = serde_json::from_str::<Value>(existing_str) {
-                        if let (Some(existing_obj), Some(new_obj)) =
-                            (existing.as_object_mut(), new_meta.as_object())
-                        {
-                            for (k, v) in new_obj {
-                                existing_obj.insert(k.clone(), v.clone());
-                            }
-                        }
-                        existing
-                    } else {
-                        new_meta.clone()
-                    }
-                } else {
-                    new_meta.clone()
-                }
-            } else {
-                new_meta.clone()
-            };
+        let old_status = task.status.clone();
 
-            let merged_str = serde_json::to_string(&merged)?;
-            ctx.db
-                .update_work_item_metadata(task_id, &merged_str)
-                .await?;
-        }
-
+        // Same-status is a no-op (skip transition validation)
         if old_status == status {
+            if let Some(new_meta) = metadata_input {
+                merge_and_persist_metadata(task_id, new_meta, ctx).await?;
+            }
             let mut response =
                 format!("Work item {task_id} is already '{status}'. No status change.");
             if metadata_input.is_some() {
                 response.push_str(" Metadata updated.");
             }
             return Ok(ToolOutput::success(response));
+        }
+
+        // Validate the transition against the state machine
+        if !is_valid_transition(&old_status, status) {
+            let allowed = allowed_transitions(&old_status);
+            return if allowed.is_empty() {
+                Ok(ToolOutput::error(format!(
+                    "Cannot transition from '{old_status}' to '{status}'. \
+                     '{old_status}' is a terminal state — completed and cancelled work items cannot be changed."
+                )))
+            } else {
+                Ok(ToolOutput::error(format!(
+                    "Cannot transition from '{old_status}' to '{status}'. \
+                     Valid transitions from '{old_status}': {}.",
+                    allowed.join(", ")
+                )))
+            };
+        }
+
+        // Perform the status update
+        ctx.db.update_manual_task_status(task_id, status).await?;
+
+        // Merge and persist metadata if provided
+        if let Some(new_meta) = metadata_input {
+            merge_and_persist_metadata(task_id, new_meta, ctx).await?;
         }
 
         // Log audit event
@@ -182,6 +216,40 @@ impl Tool for UpdateWorkItemStatusTool {
 
         Ok(ToolOutput::success(response))
     }
+}
+
+/// Shallow-merge `new_meta` into the work item's existing metadata and persist.
+async fn merge_and_persist_metadata(
+    task_id: &str,
+    new_meta: &Value,
+    ctx: &ToolContext<'_>,
+) -> Result<()> {
+    let merged = if let Ok(Some(task)) = ctx.db.get_task_unscoped(task_id).await {
+        if let Some(existing_str) = &task.metadata {
+            if let Ok(mut existing) = serde_json::from_str::<Value>(existing_str) {
+                if let (Some(existing_obj), Some(new_obj)) =
+                    (existing.as_object_mut(), new_meta.as_object())
+                {
+                    for (k, v) in new_obj {
+                        existing_obj.insert(k.clone(), v.clone());
+                    }
+                }
+                existing
+            } else {
+                new_meta.clone()
+            }
+        } else {
+            new_meta.clone()
+        }
+    } else {
+        new_meta.clone()
+    };
+
+    let merged_str = serde_json::to_string(&merged)?;
+    ctx.db
+        .update_work_item_metadata(task_id, &merged_str)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -472,5 +540,239 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("JSON object"));
+    }
+
+    #[tokio::test]
+    async fn test_valid_forward_transitions() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // pending → in_progress
+        let id = create_work_item(&harness, "Forward 1").await;
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "in_progress"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "pending→in_progress failed: {}",
+            result.content
+        );
+
+        // in_progress → blocked
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "blocked"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "in_progress→blocked failed: {}",
+            result.content
+        );
+
+        // blocked → completed
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "completed"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "blocked→completed failed: {}",
+            result.content
+        );
+
+        // pending → completed (skip in_progress)
+        let id2 = create_work_item(&harness, "Forward 2").await;
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id2, "status": "completed"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "pending→completed failed: {}",
+            result.content
+        );
+
+        // pending → cancelled
+        let id3 = create_work_item(&harness, "Forward 3").await;
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id3, "status": "cancelled"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "pending→cancelled failed: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocked_to_in_progress_allowed() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "Unblock item").await;
+
+        // pending → blocked
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "blocked"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // blocked → in_progress (un-block)
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "in_progress"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "blocked→in_progress failed: {}",
+            result.content
+        );
+        assert!(result.content.contains("blocked → in_progress"));
+    }
+
+    #[tokio::test]
+    async fn test_rejected_backward_transition() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "No regress").await;
+
+        // pending → in_progress
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "in_progress"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // in_progress → pending (should be rejected)
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "pending"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "in_progress→pending should be rejected");
+        assert!(result.content.contains("Cannot transition"));
+        assert!(
+            result
+                .content
+                .contains("Valid transitions from 'in_progress'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_state_cannot_transition() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // Test completed → anything
+        let id = create_work_item(&harness, "Completed item").await;
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "completed"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        for target in &["pending", "in_progress", "blocked", "cancelled"] {
+            let result = tool
+                .execute(serde_json::json!({"task_id": id, "status": target}), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                result.is_error,
+                "completed→{target} should be rejected, got: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("terminal state"),
+                "expected terminal state message for completed→{target}, got: {}",
+                result.content
+            );
+        }
+
+        // Test cancelled → anything
+        let id2 = create_work_item(&harness, "Cancelled item").await;
+        tool.execute(
+            serde_json::json!({"task_id": id2, "status": "cancelled"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        for target in &["pending", "in_progress", "blocked", "completed"] {
+            let result = tool
+                .execute(serde_json::json!({"task_id": id2, "status": target}), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                result.is_error,
+                "cancelled→{target} should be rejected, got: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("terminal state"),
+                "expected terminal state message for cancelled→{target}, got: {}",
+                result.content
+            );
+        }
+    }
+
+    #[test]
+    fn test_transition_helpers() {
+        // is_valid_transition
+        assert!(is_valid_transition("pending", "in_progress"));
+        assert!(is_valid_transition("pending", "completed"));
+        assert!(is_valid_transition("pending", "cancelled"));
+        assert!(is_valid_transition("blocked", "in_progress"));
+        assert!(!is_valid_transition("in_progress", "pending"));
+        assert!(!is_valid_transition("completed", "pending"));
+        assert!(!is_valid_transition("cancelled", "in_progress"));
+        assert!(!is_valid_transition("unknown", "pending"));
+
+        // allowed_transitions
+        assert_eq!(
+            allowed_transitions("pending"),
+            &["in_progress", "blocked", "completed", "cancelled"]
+        );
+        assert_eq!(
+            allowed_transitions("in_progress"),
+            &["blocked", "completed", "cancelled"]
+        );
+        assert_eq!(
+            allowed_transitions("blocked"),
+            &["in_progress", "completed", "cancelled"]
+        );
+        assert!(allowed_transitions("completed").is_empty());
+        assert!(allowed_transitions("cancelled").is_empty());
+        assert!(allowed_transitions("unknown").is_empty());
     }
 }
