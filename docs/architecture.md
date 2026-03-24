@@ -571,7 +571,12 @@ background runs.
 Each background run is framed by a `SilentTrigger` variant (see Section 9 §
 SilentTrigger Variants). Callback results are wrapped in
 `<callback_result trust="untrusted">` XML-like delimiters before LLM injection
-to mitigate prompt injection from external result payloads.
+to mitigate prompt injection from external result payloads. Results exceeding
+10 KB (`CALLBACK_RESULT_MAX_BYTES = 10_240`) are truncated at a UTF-8
+char boundary with a `[truncated — full result available in task logs]` suffix;
+a `warn!` is emitted when truncation activates. The 100 KB cap at the API/tool
+layer (`/tasks/{id}/complete`, `complete_task` tool) remains unchanged — the
+10 KB truncation applies only at the prompt injection point.
 
 
 ## 11. Conversation Compaction
