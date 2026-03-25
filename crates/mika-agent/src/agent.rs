@@ -555,7 +555,7 @@ async fn run_loop(
             let id = uuid::Uuid::new_v4().to_string();
             match &llm_result {
                 Ok(resp) => {
-                    let _ = db
+                    if let Err(e) = db
                         .save_llm_call(
                             &id,
                             session_id,
@@ -571,10 +571,13 @@ async fn run_loop(
                             "success",
                             None,
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(error = %e, "failed to save llm_call record");
+                    }
                 }
                 Err(e) => {
-                    let _ = db
+                    if let Err(db_err) = db
                         .save_llm_call(
                             &id,
                             session_id,
@@ -590,7 +593,10 @@ async fn run_loop(
                             "error",
                             Some(&e.to_string()),
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(error = %db_err, "failed to save llm_call error record");
+                    }
                 }
             }
             Some(id)
@@ -1348,7 +1354,7 @@ async fn process_tool_calls(
                 } else {
                     None
                 };
-                let _ = db
+                if let Err(e) = db
                     .save_tool_call(
                         &tool_id,
                         session_id,
@@ -1365,7 +1371,10 @@ async fn process_tool_calls(
                         tool_latency_ms,
                         err_msg,
                     )
-                    .await;
+                    .await
+                {
+                    warn!(tool = %name, error = %e, "failed to save tool_call record");
+                }
             }
 
             let image_count = output.images.len();

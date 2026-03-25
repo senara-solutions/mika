@@ -3389,6 +3389,19 @@ impl Database {
     /// Maximum stored input/output size for tool calls (50KB).
     const TOOL_CALL_MAX_CHARS: usize = 50_000;
 
+    /// Truncate a string at a UTF-8 safe boundary, avoiding panics on multi-byte characters.
+    fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
+        if s.len() <= max_bytes {
+            return s.to_string();
+        }
+        // Walk backwards from max_bytes to find a valid char boundary
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}... (truncated at {} bytes)", &s[..end], max_bytes)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn save_llm_call(
         &self,
@@ -3453,29 +3466,11 @@ impl Database {
         latency_ms: u64,
         error_message: Option<&str>,
     ) -> Result<()> {
-        // Truncate large inputs/outputs to prevent DB bloat
-        let truncated_input = input.map(|s| {
-            if s.len() > Self::TOOL_CALL_MAX_CHARS {
-                format!(
-                    "{}... (truncated at {} chars)",
-                    &s[..Self::TOOL_CALL_MAX_CHARS],
-                    Self::TOOL_CALL_MAX_CHARS
-                )
-            } else {
-                s.to_string()
-            }
-        });
-        let truncated_output = output.map(|s| {
-            if s.len() > Self::TOOL_CALL_MAX_CHARS {
-                format!(
-                    "{}... (truncated at {} chars)",
-                    &s[..Self::TOOL_CALL_MAX_CHARS],
-                    Self::TOOL_CALL_MAX_CHARS
-                )
-            } else {
-                s.to_string()
-            }
-        });
+        // Truncate large inputs/outputs to prevent DB bloat.
+        // Uses char_indices for UTF-8 safe boundary (byte slicing panics on multi-byte chars).
+        let truncated_input = input.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_CHARS));
+        let truncated_output =
+            output.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_CHARS));
         self.conn.execute(
             "INSERT INTO tool_calls (id, agent_id, session_id, trace_id, llm_call_id,
              step, tool_name, tool_source, skill_name, input, output,

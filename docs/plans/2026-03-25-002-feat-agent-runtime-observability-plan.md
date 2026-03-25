@@ -1,7 +1,7 @@
 ---
 title: "feat: agent runtime observability — LLM calls, tool calls, skills loading"
 type: feat
-status: active
+status: completed
 date: 2026-03-25
 origin: docs/brainstorms/2026-03-25-agent-runtime-observability-brainstorm.md
 ---
@@ -119,8 +119,8 @@ Three critical categories of runtime data are either not stored or aggressively 
 - [x] Schema v15 migration + clean-slate creation
 - [x] All 1175 existing tests pass
 - [x] Clippy clean
-- [ ] UTF-8 safe truncation in `save_tool_call()` (SpecFlow finding — byte slicing can panic on multi-byte chars)
-- [ ] Add `warn!` on `save_llm_call` / `save_tool_call` failures instead of silent drop
+- [x] UTF-8 safe truncation in `save_tool_call()` (SpecFlow finding — byte slicing can panic on multi-byte chars)
+- [x] Add `warn!` on `save_llm_call` / `save_tool_call` failures instead of silent drop
 
 ## Dependencies & Risks
 
