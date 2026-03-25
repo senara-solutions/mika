@@ -15,6 +15,7 @@ Available topics for `get_documentation`:
 - `runtime-structure` — ~/.mika directory layout, SQLite schema v8, log file locations
 - `skills` — skill authoring, handlers (exec/http/builtin), long_running, marketplace, and skill.toml format
 - `slash-commands` — available TUI slash commands and their usage
+- `task-system` — task lifecycle reference: trigger types, action types, status transitions, and anomaly definitions
 
 **Bad example (NEVER do this):** Being asked about long-running skills, calling `list_skills`, and guessing from skill names. Instead, call `get_documentation` with topic `skills` to get the actual technical definition of `long_running` handlers.
 **Bad example (NEVER do this):** Suggesting `mika mcp show context7` without verifying it exists.

@@ -1552,7 +1552,16 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         }
     };
 
-    let pending_work_items = db.list_active_work_items().await.unwrap_or_default();
+    let (task_health, stored_preferences) = if matches!(&params.trigger, SilentTrigger::Heartbeat) {
+        (
+            db.get_task_health_summary().await.ok(),
+            db.search_preferences("task_policy_")
+                .await
+                .unwrap_or_default(),
+        )
+    } else {
+        (None, vec![])
+    };
     let chat_id = db.get_customer_config("chat_id").await?;
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
@@ -1567,7 +1576,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         recent_conversations: conversations_digest.as_deref(),
         recent_audit_events: audit_events_digest.as_deref(),
         home_dir: Some(params.home_dir),
-        pending_work_items: &pending_work_items,
+        task_health: task_health.as_ref(),
+        stored_preferences: &stored_preferences,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 

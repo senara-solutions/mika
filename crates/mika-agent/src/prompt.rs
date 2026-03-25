@@ -1,4 +1,6 @@
-use crate::db::{Commitment, CoreMemoryEntry, Task, core_memory_section_names};
+use crate::db::{
+    Commitment, CoreMemoryEntry, Preference, TaskHealthSummary, core_memory_section_names,
+};
 use chrono::{DateTime, NaiveTime, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
@@ -484,8 +486,32 @@ pub struct SilentPromptContext<'a> {
     pub recent_audit_events: Option<&'a str>,
     /// Agent home directory. When set, file tool instructions include the absolute path.
     pub home_dir: Option<&'a std::path::Path>,
-    /// Pending/in_progress/blocked work items for heartbeat awareness.
-    pub pending_work_items: &'a [Task],
+    /// Task health summary: active work items + anomalous task states.
+    pub task_health: Option<&'a TaskHealthSummary>,
+    /// Stored user preferences for autonomous action during heartbeat.
+    pub stored_preferences: &'a [Preference],
+}
+
+/// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
+/// and newlines to prevent prompt structure manipulation.
+fn sanitize_label(s: &str) -> String {
+    s.chars()
+        .take(200)
+        .filter(|c| !matches!(c, '<' | '>' | '\n' | '\r'))
+        .collect()
+}
+
+/// Sanitize and format a reference URL for prompt output.
+fn sanitize_ref_url(url: Option<&str>) -> String {
+    url.map(|u| {
+        let sanitized: String = u
+            .chars()
+            .take(200)
+            .filter(|c| !matches!(c, '<' | '>' | '\n' | '\r'))
+            .collect();
+        format!(", ref: {sanitized}")
+    })
+    .unwrap_or_default()
 }
 
 /// Build a system prompt for silent mode (heartbeat/reminder).
@@ -558,34 +584,76 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     }
     prompt.push('\n');
 
-    // Pending work items (labels sanitized to prevent prompt injection)
-    if !ctx.pending_work_items.is_empty() {
-        prompt.push_str("## Pending Work Items\n");
-        prompt.push_str("<pending-work-items>\n");
-        for item in ctx.pending_work_items {
-            let created_dt = crate::timestamp::parse(&item.created_at).unwrap_or(ctx.current_utc);
-            let age_days = ctx.current_utc.signed_duration_since(created_dt).num_days();
-            // Sanitize label: truncate to 200 chars and strip angle brackets
-            let label = item.label.chars().take(200).collect::<String>();
-            let label = label.replace(['<', '>'], "");
-            let ref_url = item
-                .reference_url
-                .as_deref()
-                .map(|u| {
-                    let u = u.chars().take(200).collect::<String>();
-                    format!(" ref:{}", u.replace(['<', '>'], ""))
-                })
-                .unwrap_or_default();
-            writeln!(
-                prompt,
-                "- [{status}] {id}: {label} (age: {age_days}d{ref_url})",
-                status = item.status,
-                id = item.id,
-            )
-            .unwrap();
+    // Task health: active work items + anomalies (labels sanitized to prevent prompt injection)
+    if let Some(health) = ctx.task_health {
+        let has_items = !health.active_work_items.is_empty();
+        let has_anomalies = !health.anomalies.is_empty();
+        if has_items || has_anomalies {
+            prompt.push_str("## Task Health\n");
+            prompt.push_str("<task-health>\n");
+
+            if has_items {
+                prompt.push_str("<active-work-items>\n");
+                for item in &health.active_work_items {
+                    let created_dt =
+                        crate::timestamp::parse(&item.created_at).unwrap_or(ctx.current_utc);
+                    let age_days = ctx.current_utc.signed_duration_since(created_dt).num_days();
+                    let label = sanitize_label(&item.label);
+                    let ref_url = sanitize_ref_url(item.reference_url.as_deref());
+                    writeln!(
+                        prompt,
+                        "- [{status}] {id}: {label} (age: {age_days}d{ref_url})",
+                        status = item.status,
+                        id = item.id,
+                    )
+                    .unwrap();
+                }
+                prompt.push_str("</active-work-items>\n");
+            }
+
+            if has_anomalies {
+                prompt.push_str("<anomalies>\n");
+                for a in &health.anomalies {
+                    let label = sanitize_label(&a.label);
+                    let ref_suffix = sanitize_ref_url(a.reference_url.as_deref());
+                    writeln!(
+                        prompt,
+                        "- [{anomaly}] {id}: {label} ({age}{ref_suffix})",
+                        anomaly = a.anomaly_type,
+                        id = a.task_id,
+                        age = a.age_description,
+                    )
+                    .unwrap();
+                }
+                prompt.push_str("</anomalies>\n");
+            }
+
+            prompt.push_str("\n<task-health-instructions>\n");
+            prompt.push_str(
+                "Review the task health summary above. For each anomaly:\n\
+                 1. If a stored preference covers this action pattern, take it autonomously and include \"(per your standing preference)\" in any notification.\n\
+                 2. Otherwise, notify the user via send_message with the anomaly details and suggest an action.\n\
+                 3. For github_linked items, call check_work_item to inspect the linked PR/issue status before notifying.\n\
+                 4. Include the task ID in all notifications so the user can reference it.\n\
+                 5. Present findings as \"as of this check\" — task states may have changed since the query ran.\n\
+                 6. After taking a corrective action that the user confirmed, ask: \"Should I always do this automatically in the future? I can remember this as a standing preference.\"\n\
+                 7. If the user confirms, store the policy via store_fact with category \"preference\" and a key prefixed with \"task_policy_\".\n\
+                 8. You can only see and act on your own tasks. Never attempt to query or modify tasks belonging to other agents.\n",
+            );
+            prompt.push_str("</task-health-instructions>\n");
+            prompt.push_str("</task-health>\n\n");
         }
-        prompt.push_str("</pending-work-items>\n");
-        prompt.push_str("Review these work items. If any are stale or need attention, consider notifying the user.\n\n");
+    }
+
+    // Stored preferences for autonomous task actions
+    if !ctx.stored_preferences.is_empty() {
+        prompt.push_str("<stored-preferences>\n");
+        for pref in ctx.stored_preferences {
+            let cat = sanitize_label(&pref.category);
+            let val = sanitize_label(&pref.value);
+            writeln!(prompt, "- {cat}: {val}").unwrap();
+        }
+        prompt.push_str("</stored-preferences>\n\n");
     }
 
     // Trigger-specific context
@@ -805,7 +873,8 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -831,7 +900,8 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -865,7 +935,8 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1000,7 +1071,8 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1025,7 +1097,8 @@ mod tests {
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1334,7 +1407,8 @@ max_iterations = 3
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1357,7 +1431,8 @@ max_iterations = 3
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1380,7 +1455,8 @@ max_iterations = 3
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1485,7 +1561,8 @@ notify = true
             recent_conversations: Some("User discussed Series A fundraise with Alice."),
             recent_audit_events: Some("update_core_memory: current_priorities -> fundraise"),
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1511,12 +1588,144 @@ notify = true
             recent_conversations: None,
             recent_audit_events: None,
             home_dir: None,
-            pending_work_items: &[],
+            task_health: None,
+            stored_preferences: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
         assert!(!prompt.contains("## Today's Conversations"));
         assert!(!prompt.contains("## Recent Audit Events"));
+    }
+
+    #[test]
+    fn test_silent_prompt_includes_task_health_with_anomalies() {
+        use crate::db::{Task, TaskHealthAnomaly, TaskHealthSummary};
+        let identity = test_identity();
+        let health = TaskHealthSummary {
+            active_work_items: vec![Task {
+                id: "abc-123".to_string(),
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Fix auth flow".to_string(),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                status: "in_progress".to_string(),
+                process_id: None,
+                input_context: None,
+                result: None,
+                created_by_session: None,
+                created_trace_id: None,
+                execution_trace_id: None,
+                created_at: "2026-02-24T10:00:00Z".to_string(),
+                updated_at: "2026-02-24T10:00:00Z".to_string(),
+                fired_at: None,
+                completed_at: None,
+                reference_url: Some("https://github.com/org/repo/issues/42".to_string()),
+                source: None,
+                metadata: None,
+            }],
+            anomalies: vec![TaskHealthAnomaly {
+                task_id: "def-456".to_string(),
+                label: "Build deployment".to_string(),
+                trigger_type: "callback".to_string(),
+                status: "completed".to_string(),
+                anomaly_type: "stuck_callback".to_string(),
+                age_description: "stuck 3h 22m".to_string(),
+                reference_url: None,
+            }],
+        };
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: Some(&health),
+            stored_preferences: &[],
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("<task-health>"));
+        assert!(prompt.contains("</task-health>"));
+        assert!(prompt.contains("<active-work-items>"));
+        assert!(prompt.contains("Fix auth flow"));
+        assert!(prompt.contains("<anomalies>"));
+        assert!(prompt.contains("stuck_callback"));
+        assert!(prompt.contains("Build deployment"));
+        assert!(prompt.contains("<task-health-instructions>"));
+        assert!(prompt.contains("stored preference"));
+    }
+
+    #[test]
+    fn test_silent_prompt_omits_task_health_when_none() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(!prompt.contains("<task-health>"));
+    }
+
+    #[test]
+    fn test_silent_prompt_includes_stored_preferences() {
+        use crate::db::Preference;
+        let identity = test_identity();
+        let prefs = vec![Preference {
+            category: "task_policy_merged_pr".to_string(),
+            value: "Auto-complete when PR is merged".to_string(),
+            updated_at: "2026-02-24T10:00:00Z".to_string(),
+        }];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &prefs,
+        };
+
+        let prompt = build_silent_prompt(&ctx);
+        assert!(prompt.contains("<stored-preferences>"));
+        assert!(prompt.contains("task_policy_merged_pr"));
+        assert!(prompt.contains("Auto-complete when PR is merged"));
     }
 
     #[test]

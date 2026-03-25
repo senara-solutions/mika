@@ -16,7 +16,8 @@
             "getting-started",
             "runtime-structure",
             "skills",
-            "slash-commands"
+            "slash-commands",
+            "task-system"
           ],
           "description": "Which documentation topic to retrieve"
         }

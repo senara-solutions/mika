@@ -10,8 +10,8 @@ use tokio::sync::oneshot;
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
     NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats,
-    SkillOverride, Task, TaskFilters, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
-    TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    SkillOverride, Task, TaskFilters, TaskHealthSummary, TeamRow, TeamRunFilters, TeamRunRow,
+    TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -339,6 +339,11 @@ impl AsyncDatabase {
     pub async fn list_active_work_items(&self) -> Result<Vec<Task>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.list_active_work_items(&a)).await
+    }
+
+    pub async fn get_task_health_summary(&self) -> Result<TaskHealthSummary> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_task_health_summary(&a)).await
     }
 
     pub async fn mark_tasks_expired(&self, now: &str) -> Result<usize> {
