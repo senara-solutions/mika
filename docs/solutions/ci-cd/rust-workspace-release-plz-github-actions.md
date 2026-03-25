@@ -146,6 +146,11 @@ New lints introduced: `io_other_error`, `collapsible_if` with let-chains, `vec_i
 
 `mika-cli` depends on `mika-agent` depends on `mika-common`. release-plz handles dependency-ordered publishing natively and treats "already published" as success, making re-runs idempotent.
 
+### Pipeline Artifacts Gate vs release-plz PRs
+
+**Symptom:** The `pipeline-artifacts` CI job fails on every release-plz PR because it requires a plan doc (`docs/plans/*.md`) in the diff.
+**Fix:** Add `!startsWith(github.head_ref, 'release-plz-')` to the job's `if` condition. Any CI job that enforces dev-workflow conventions must exclude automated bot branches.
+
 ### Concurrency Groups
 
 Multiple rapid pushes to `main` can cause concurrent release-plz runs that conflict. Each job uses a `concurrency` group with `cancel-in-progress: false` to queue runs sequentially.
