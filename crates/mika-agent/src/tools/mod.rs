@@ -466,8 +466,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(read_agent_file::ReadAgentFileTool));
     registry.register(Box::new(list_agent_files::ListAgentFilesTool));
     registry.register(Box::new(list_tasks::ListTasksTool));
-    registry.register(Box::new(create_work_item::CreateWorkItemTool));
-    registry.register(Box::new(update_work_item_status::UpdateWorkItemStatusTool));
+    // Work item read-only tools — available to all agents (including delegates)
     registry.register(Box::new(list_work_items::ListWorkItemsTool));
     registry.register(Box::new(check_work_item::CheckWorkItemTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
@@ -522,6 +521,13 @@ pub fn management_tools_if_needed(
         tools.push(Box::new(update_team::UpdateTeamTool {
             home_dir: home_dir.to_path_buf(),
         }));
+        // Work item write tools — orchestrator-only (delegates receive
+        // work_item_id from the orchestrator via delegate_task and never
+        // need to create or update work items themselves).
+        tools.push(Box::new(create_work_item::CreateWorkItemTool));
+        tools.push(Box::new(
+            update_work_item_status::UpdateWorkItemStatusTool,
+        ));
     }
 
     tools
