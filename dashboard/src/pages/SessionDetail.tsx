@@ -2,8 +2,8 @@ import { useState, Fragment, useMemo } from 'react'
 import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
-import { useSessionLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
-import { useSessionToolCalls, useSessionSkills, type ToolCallRow } from '../api/toolCalls.ts'
+import { useSessionLlmCalls } from '../api/llmCalls.ts'
+import { useSessionToolCalls, useSessionSkills } from '../api/toolCalls.ts'
 import { CopyButton, Pagination, EmptyState, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,

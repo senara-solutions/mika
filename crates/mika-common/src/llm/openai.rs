@@ -176,10 +176,10 @@ impl OpenAiCompatibleProvider {
         }
 
         // Dev-mode body logging (gated by MIKA_LOG_LLM_BODIES / mika::llm_debug target)
-        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
-            if let Ok(body_json) = serde_json::to_string(request) {
-                debug!(target: "mika::llm_debug", body = %body_json, provider = %self.provider_kind, "llm request body");
-            }
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG)
+            && let Ok(body_json) = serde_json::to_string(request)
+        {
+            debug!(target: "mika::llm_debug", body = %body_json, provider = %self.provider_kind, "llm request body");
         }
 
         let response = self

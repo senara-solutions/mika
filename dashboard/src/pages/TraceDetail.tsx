@@ -1,8 +1,8 @@
 import { useState, Fragment } from 'react'
 import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
-import { useTraceLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
-import { useTraceToolCalls, type ToolCallRow } from '../api/toolCalls.ts'
+import { useTraceLlmCalls } from '../api/llmCalls.ts'
+import { useTraceToolCalls } from '../api/toolCalls.ts'
 import { CopyButton as UiCopyButton, EmptyState, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
