@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 16;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -417,6 +417,7 @@ pub struct LlmCallRow {
     pub stop_reason: Option<String>,
     pub status: String,
     pub error_message: Option<String>,
+    pub step: u32,
     pub created_at: String,
 }
 
@@ -444,6 +445,7 @@ pub struct ToolCallRow {
 pub struct LlmCallFilters {
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
+    pub trace_id: Option<String>,
     pub model: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
@@ -453,6 +455,7 @@ pub struct LlmCallFilters {
 pub struct ToolCallFilters {
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
+    pub trace_id: Option<String>,
     pub tool_name: Option<String>,
     pub success: Option<bool>,
     pub from: Option<String>,
@@ -692,6 +695,10 @@ impl Database {
             self.migrate_v14_to_v15()?;
             info!(version = 15, "database migrated to v15");
         }
+        if (3..=15).contains(&version) {
+            self.migrate_v15_to_v16()?;
+            info!(version = 16, "database migrated to v16");
+        }
         Ok(())
     }
 
@@ -748,7 +755,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (15);
+            INSERT INTO schema_version (version) VALUES (16);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1079,6 +1086,7 @@ impl Database {
                 stop_reason TEXT,
                 status TEXT NOT NULL DEFAULT 'success',
                 error_message TEXT,
+                step INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_llm_calls_trace ON llm_calls(trace_id);
@@ -2289,6 +2297,21 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v15_to_v16(&self) -> Result<()> {
+        info!("migrating database schema v15 → v16 (add step column to llm_calls)");
+
+        if !self.column_exists("llm_calls", "step")? {
+            self.conn.execute_batch(
+                "ALTER TABLE llm_calls ADD COLUMN step INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (16)", [])?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -3419,12 +3442,13 @@ impl Database {
         stop_reason: Option<&str>,
         status: &str,
         error_message: Option<&str>,
+        step: u32,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO llm_calls (id, agent_id, session_id, trace_id, provider, model,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             latency_ms, stop_reason, status, error_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             latency_ms, stop_reason, status, error_message, step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 id,
                 agent_id,
@@ -3440,6 +3464,7 @@ impl Database {
                 stop_reason,
                 status,
                 error_message,
+                step,
             ],
         )?;
         Ok(())
@@ -3523,7 +3548,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, created_at
+                    latency_ms, stop_reason, status, error_message, step, created_at
              FROM llm_calls WHERE trace_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -3561,7 +3586,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, created_at
+                    latency_ms, stop_reason, status, error_message, step, created_at
              FROM llm_calls WHERE session_id = ?1
              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
@@ -3617,6 +3642,10 @@ impl Database {
             params_vec.push(Box::new(session_id.clone()));
             where_clauses.push(format!("session_id = ?{}", params_vec.len()));
         }
+        if let Some(ref trace_id) = filters.trace_id {
+            params_vec.push(Box::new(trace_id.clone()));
+            where_clauses.push(format!("trace_id = ?{}", params_vec.len()));
+        }
         if let Some(ref model) = filters.model {
             params_vec.push(Box::new(model.clone()));
             where_clauses.push(format!("model = ?{}", params_vec.len()));
@@ -3649,7 +3678,7 @@ impl Database {
         let query_sql = format!(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, created_at
+                    latency_ms, stop_reason, status, error_message, step, created_at
              FROM llm_calls {where_sql}
              ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
             params_vec.len() - 1,
@@ -3681,6 +3710,10 @@ impl Database {
         if let Some(ref session_id) = filters.session_id {
             params_vec.push(Box::new(session_id.clone()));
             where_clauses.push(format!("session_id = ?{}", params_vec.len()));
+        }
+        if let Some(ref trace_id) = filters.trace_id {
+            params_vec.push(Box::new(trace_id.clone()));
+            where_clauses.push(format!("trace_id = ?{}", params_vec.len()));
         }
         if let Some(ref tool_name) = filters.tool_name {
             params_vec.push(Box::new(tool_name.clone()));
@@ -3751,7 +3784,8 @@ impl Database {
             stop_reason: r.get(11)?,
             status: r.get(12)?,
             error_message: r.get(13)?,
-            created_at: r.get(14)?,
+            step: r.get(14)?,
+            created_at: r.get(15)?,
         })
     }
 

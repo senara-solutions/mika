@@ -570,6 +570,7 @@ async fn run_loop(
                             Some(&format!("{:?}", resp.stop_reason)),
                             "success",
                             None,
+                            step as u32,
                         )
                         .await
                     {
@@ -592,6 +593,7 @@ async fn run_loop(
                             None,
                             "error",
                             Some(&e.to_string()),
+                            step as u32,
                         )
                         .await
                     {

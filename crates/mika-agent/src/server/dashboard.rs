@@ -654,6 +654,7 @@ pub async fn handle_team_runs_list(
 pub struct LlmCallsQuery {
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
+    pub trace_id: Option<String>,
     pub model: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
@@ -670,6 +671,7 @@ pub async fn handle_llm_calls(
     let filters = db::LlmCallFilters {
         agent_id: q.agent_id,
         session_id: q.session_id,
+        trace_id: q.trace_id,
         model: q.model,
         from: q.from,
         to: q.to,
@@ -699,6 +701,7 @@ pub async fn handle_llm_calls(
 pub struct ToolCallsQuery {
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
+    pub trace_id: Option<String>,
     pub tool_name: Option<String>,
     pub success: Option<bool>,
     pub from: Option<String>,
@@ -716,6 +719,7 @@ pub async fn handle_tool_calls(
     let filters = db::ToolCallFilters {
         agent_id: q.agent_id,
         session_id: q.session_id,
+        trace_id: q.trace_id,
         tool_name: q.tool_name,
         success: q.success,
         from: q.from,

@@ -16,11 +16,13 @@ export interface LlmCallRow {
   stop_reason: string | null
   status: string
   error_message: string | null
+  step: number
   created_at: string
 }
 
 export interface LlmCallsFilters {
   agent_id?: string
+  trace_id?: string
   model?: string
   from?: number
   to?: number
