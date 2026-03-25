@@ -1680,6 +1680,7 @@ impl AsyncDatabase {
         stop_reason: Option<&str>,
         status: &str,
         error_message: Option<&str>,
+        step: u32,
     ) -> Result<()> {
         let (a, i, sid, tid, p, m, sr, st, em) = (
             self.agent_id.clone(),
@@ -1708,6 +1709,7 @@ impl AsyncDatabase {
                 sr.as_deref(),
                 &st,
                 em.as_deref(),
+                step,
             )
         })
         .await
