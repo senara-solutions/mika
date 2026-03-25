@@ -492,19 +492,24 @@ pub struct SilentPromptContext<'a> {
     pub stored_preferences: &'a [Preference],
 }
 
-/// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets.
+/// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
+/// and newlines to prevent prompt structure manipulation.
 fn sanitize_label(s: &str) -> String {
     s.chars()
         .take(200)
-        .collect::<String>()
-        .replace(['<', '>'], "")
+        .filter(|c| !matches!(c, '<' | '>' | '\n' | '\r'))
+        .collect()
 }
 
 /// Sanitize and format a reference URL for prompt output.
 fn sanitize_ref_url(url: Option<&str>) -> String {
     url.map(|u| {
-        let u = u.chars().take(200).collect::<String>();
-        format!(", ref: {}", u.replace(['<', '>'], ""))
+        let sanitized: String = u
+            .chars()
+            .take(200)
+            .filter(|c| !matches!(c, '<' | '>' | '\n' | '\r'))
+            .collect();
+        format!(", ref: {sanitized}")
     })
     .unwrap_or_default()
 }

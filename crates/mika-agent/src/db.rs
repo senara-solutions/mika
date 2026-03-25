@@ -2669,12 +2669,48 @@ impl Database {
         let now = Utc::now();
         let mut anomalies: Vec<TaskHealthAnomaly> = Vec::new();
 
+        // Helper: query anomaly rows and return them as TaskHealthAnomaly values.
+        // `describe_age` receives the 5th SELECT column (a timestamp or ignored)
+        // and returns the human-readable age_description for each anomaly.
+        let query_anomalies = |sql: &str,
+                               sql_params: &[&dyn rusqlite::types::ToSql],
+                               anomaly_type: &str,
+                               describe_age: &dyn Fn(&str) -> String|
+         -> Result<Vec<TaskHealthAnomaly>> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(sql_params, |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (id, label, trigger_type, status, ts_col, reference_url) = row?;
+                result.push(TaskHealthAnomaly {
+                    task_id: id,
+                    label,
+                    trigger_type,
+                    status,
+                    anomaly_type: anomaly_type.to_string(),
+                    age_description: describe_age(&ts_col),
+                    reference_url,
+                });
+            }
+            Ok(result)
+        };
+
         // 1. Stuck callbacks: completed but not delivered for > threshold
         {
             let threshold = timestamp::format(
                 &(now - Duration::seconds(health_thresholds::STUCK_CALLBACK_SECS)),
             );
-            let mut stmt = self.conn.prepare(
+            let limit = health_thresholds::MAX_ANOMALIES as i64;
+            anomalies.extend(query_anomalies(
                 "SELECT id, label, trigger_type, status, updated_at, reference_url
                  FROM tasks
                  WHERE agent_id = ?1
@@ -2683,41 +2719,18 @@ impl Database {
                    AND updated_at < ?2
                  ORDER BY updated_at ASC
                  LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                params![agent_id, threshold, health_thresholds::MAX_ANOMALIES as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                    ))
-                },
-            )?;
-            for row in rows {
-                let (id, label, trigger_type, status, updated_at, reference_url) = row?;
-                let age = format_age(&updated_at, now);
-                anomalies.push(TaskHealthAnomaly {
-                    task_id: id,
-                    label,
-                    trigger_type,
-                    status,
-                    anomaly_type: "stuck_callback".to_string(),
-                    age_description: format!("stuck {age}"),
-                    reference_url,
-                });
-            }
+                &[&agent_id, &threshold as &dyn rusqlite::types::ToSql, &limit],
+                "stuck_callback",
+                &|ts| format!("stuck {}", format_age(ts, now)),
+            )?);
         }
 
         // 2. Failed recurring tasks
         {
             let since = timestamp::format(&(now - Duration::seconds(86_400)));
-            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
             if remaining > 0 {
-                let mut stmt = self.conn.prepare(
+                anomalies.extend(query_anomalies(
                     "SELECT id, label, trigger_type, status, updated_at, reference_url
                      FROM tasks
                      WHERE agent_id = ?1
@@ -2726,30 +2739,10 @@ impl Database {
                        AND updated_at > ?2
                      ORDER BY updated_at DESC
                      LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![agent_id, since, remaining as i64], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (id, label, trigger_type, status, updated_at, reference_url) = row?;
-                    let age = format_age(&updated_at, now);
-                    anomalies.push(TaskHealthAnomaly {
-                        task_id: id,
-                        label,
-                        trigger_type,
-                        status,
-                        anomaly_type: "failed_recurring".to_string(),
-                        age_description: format!("failed {age} ago"),
-                        reference_url,
-                    });
-                }
+                    &[&agent_id, &since as &dyn rusqlite::types::ToSql, &remaining],
+                    "failed_recurring",
+                    &|ts| format!("failed {} ago", format_age(ts, now)),
+                )?);
             }
         }
 
@@ -2758,9 +2751,9 @@ impl Database {
             let threshold = timestamp::format(
                 &(now - Duration::seconds(health_thresholds::LONG_RUNNING_DEFAULT_SECS)),
             );
-            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
             if remaining > 0 {
-                let mut stmt = self.conn.prepare(
+                anomalies.extend(query_anomalies(
                     "SELECT id, label, trigger_type, status, fired_at, reference_url
                      FROM tasks
                      WHERE agent_id = ?1
@@ -2770,30 +2763,14 @@ impl Database {
                        AND fired_at < ?2
                      ORDER BY fired_at ASC
                      LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![agent_id, threshold, remaining as i64], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (id, label, trigger_type, status, fired_at, reference_url) = row?;
-                    let age = format_age(&fired_at, now);
-                    anomalies.push(TaskHealthAnomaly {
-                        task_id: id,
-                        label,
-                        trigger_type,
-                        status,
-                        anomaly_type: "long_running".to_string(),
-                        age_description: format!("running for {age}"),
-                        reference_url,
-                    });
-                }
+                    &[
+                        &agent_id,
+                        &threshold as &dyn rusqlite::types::ToSql,
+                        &remaining,
+                    ],
+                    "long_running",
+                    &|ts| format!("running for {}", format_age(ts, now)),
+                )?);
             }
         }
 
@@ -2802,9 +2779,9 @@ impl Database {
             let threshold = timestamp::format(
                 &(now - Duration::seconds(health_thresholds::STALE_BLOCKED_SECS)),
             );
-            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
             if remaining > 0 {
-                let mut stmt = self.conn.prepare(
+                anomalies.extend(query_anomalies(
                     "SELECT id, label, trigger_type, status, updated_at, reference_url
                      FROM tasks
                      WHERE agent_id = ?1
@@ -2813,38 +2790,22 @@ impl Database {
                        AND updated_at < ?2
                      ORDER BY updated_at ASC
                      LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![agent_id, threshold, remaining as i64], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (id, label, trigger_type, status, updated_at, reference_url) = row?;
-                    let age = format_age(&updated_at, now);
-                    anomalies.push(TaskHealthAnomaly {
-                        task_id: id,
-                        label,
-                        trigger_type,
-                        status,
-                        anomaly_type: "stale_blocked".to_string(),
-                        age_description: format!("blocked for {age}"),
-                        reference_url,
-                    });
-                }
+                    &[
+                        &agent_id,
+                        &threshold as &dyn rusqlite::types::ToSql,
+                        &remaining,
+                    ],
+                    "stale_blocked",
+                    &|ts| format!("blocked for {}", format_age(ts, now)),
+                )?);
             }
         }
 
         // 5. GitHub-linked manual work items (active, with reference_url containing github.com)
         {
-            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
             if remaining > 0 {
-                let mut stmt = self.conn.prepare(
+                anomalies.extend(query_anomalies(
                     "SELECT id, label, trigger_type, status, created_at, reference_url
                      FROM tasks
                      WHERE agent_id = ?1
@@ -2853,29 +2814,10 @@ impl Database {
                        AND reference_url LIKE '%github.com%'
                      ORDER BY created_at DESC
                      LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(params![agent_id, remaining as i64], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (id, label, trigger_type, status, _created_at, reference_url) = row?;
-                    anomalies.push(TaskHealthAnomaly {
-                        task_id: id,
-                        label,
-                        trigger_type,
-                        status,
-                        anomaly_type: "github_linked".to_string(),
-                        age_description: "has linked GitHub PR".to_string(),
-                        reference_url,
-                    });
-                }
+                    &[&agent_id, &remaining as &dyn rusqlite::types::ToSql],
+                    "github_linked",
+                    &|_| "has linked GitHub PR".to_string(),
+                )?);
             }
         }
 

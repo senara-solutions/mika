@@ -1552,8 +1552,16 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         }
     };
 
-    let task_health = db.get_task_health_summary().await.ok();
-    let stored_preferences = db.list_preferences().await.unwrap_or_default();
+    let (task_health, stored_preferences) = if matches!(&params.trigger, SilentTrigger::Heartbeat) {
+        (
+            db.get_task_health_summary().await.ok(),
+            db.search_preferences("task_policy_")
+                .await
+                .unwrap_or_default(),
+        )
+    } else {
+        (None, vec![])
+    };
     let chat_id = db.get_customer_config("chat_id").await?;
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
