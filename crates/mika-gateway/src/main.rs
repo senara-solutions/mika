@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
         settings.gateway_log_file.as_deref().map(Path::new),
         log_format,
         None::<mika_common::logging::NoopLayer>,
+        false, // log_llm_bodies: gateway doesn't make LLM calls
     );
 
     if is_pretty {

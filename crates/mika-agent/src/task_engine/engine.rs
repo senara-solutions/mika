@@ -125,6 +125,19 @@ impl TaskEngine {
             Err(e) => warn!(error = %e, "failed to prune old sessions"),
         }
 
+        // 5. Prune LLM call and tool call records older than 30 days
+        const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
+        match self.db.prune_old_llm_calls(THIRTY_DAYS_SECS).await {
+            Ok(n) if n > 0 => info!(count = n, "pruned old llm_calls on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to prune old llm_calls"),
+        }
+        match self.db.prune_old_tool_calls(THIRTY_DAYS_SECS).await {
+            Ok(n) if n > 0 => info!(count = n, "pruned old tool_calls on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to prune old tool_calls"),
+        }
+
         debug!(
             loaded = count,
             queue_len = self.queue.len(),

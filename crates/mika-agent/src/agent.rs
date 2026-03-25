@@ -506,6 +506,8 @@ async fn run_loop(
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
     required_tools: &HashSet<String>,
+    store_llm_calls: bool,
+    store_tool_calls: bool,
 ) -> Result<LoopResult> {
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
@@ -544,7 +546,65 @@ async fn run_loop(
             );
         }
 
-        let response = llm.send_message(request).await?;
+        let llm_call_start = std::time::Instant::now();
+        let llm_result = llm.send_message(request).await;
+        let llm_call_latency_ms = llm_call_start.elapsed().as_millis() as u64;
+
+        // Record the LLM call in the database (success or error)
+        let llm_call_id = if store_llm_calls {
+            let id = uuid::Uuid::new_v4().to_string();
+            match &llm_result {
+                Ok(resp) => {
+                    if let Err(e) = db
+                        .save_llm_call(
+                            &id,
+                            session_id,
+                            Some(tool_ctx.trace_id),
+                            llm.provider_name(),
+                            llm.model_name(),
+                            resp.usage.input_tokens,
+                            resp.usage.output_tokens,
+                            resp.usage.cache_read_input_tokens,
+                            resp.usage.cache_creation_input_tokens,
+                            llm_call_latency_ms,
+                            Some(&format!("{:?}", resp.stop_reason)),
+                            "success",
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to save llm_call record");
+                    }
+                }
+                Err(e) => {
+                    if let Err(db_err) = db
+                        .save_llm_call(
+                            &id,
+                            session_id,
+                            Some(tool_ctx.trace_id),
+                            llm.provider_name(),
+                            llm.model_name(),
+                            0,
+                            0,
+                            None,
+                            None,
+                            llm_call_latency_ms,
+                            None,
+                            "error",
+                            Some(&e.to_string()),
+                        )
+                        .await
+                    {
+                        warn!(error = %db_err, "failed to save llm_call error record");
+                    }
+                }
+            }
+            Some(id)
+        } else {
+            None
+        };
+
+        let response = llm_result?;
 
         if mode.is_conversation() {
             last_usage = Some(response.usage.clone());
@@ -698,6 +758,10 @@ async fn run_loop(
                     step as u32,
                     mcp_manager,
                     long_running_ctx,
+                    db,
+                    session_id,
+                    store_tool_calls,
+                    llm_call_id.as_deref(),
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -1109,6 +1173,25 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             trace_id: trace_id.to_string(),
         })
     };
+    // Store loaded skills in session metadata for observability
+    {
+        let skill_names: Vec<&str> = params
+            .skills
+            .skills()
+            .iter()
+            .map(|s| s.manifest.skill.name.as_str())
+            .collect();
+        let skills_meta = serde_json::json!({
+            "loaded_skills": skill_names,
+            "skill_count": skill_names.len(),
+        });
+        let _ = db
+            .update_session_metadata(session_id, &skills_meta.to_string())
+            .await;
+    }
+
+    let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
+    let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let result = run_loop(
         effective_llm,
         tools,
@@ -1122,6 +1205,8 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         params.mcp_manager,
         lr_ctx.as_ref(),
         &required_tools,
+        store_llm,
+        store_tools,
     )
     .await?;
 
@@ -1217,6 +1302,10 @@ async fn process_tool_calls(
     step: u32,
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
+    db: &AsyncDatabase,
+    session_id: &str,
+    store_tool_calls: bool,
+    llm_call_id: Option<&str>,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -1238,7 +1327,56 @@ async fn process_tool_calls(
                 mcp_manager,
                 long_running_ctx,
             };
+            let tool_start = std::time::Instant::now();
             let output = execute_tool(&dispatch, name, arguments.clone()).await;
+            let tool_latency_ms = tool_start.elapsed().as_millis() as u64;
+
+            // Record full tool call in database
+            if store_tool_calls {
+                let tool_id = uuid::Uuid::new_v4().to_string();
+                let (tool_source, tool_skill_name) = if tools.get(name).is_some() {
+                    ("builtin", None)
+                } else if let Some(st) = skill_tools.get(name.as_str()) {
+                    let sn = st
+                        .skill_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    ("skill", Some(sn))
+                } else {
+                    ("mcp", None)
+                };
+                let non_zero = !output.is_error && has_non_zero_exit_prefix(&output.content);
+                let input_json = serde_json::to_string(arguments).unwrap_or_default();
+                let err_msg = if output.is_error {
+                    Some(output.content.as_str())
+                } else {
+                    None
+                };
+                if let Err(e) = db
+                    .save_tool_call(
+                        &tool_id,
+                        session_id,
+                        Some(tool_ctx.trace_id),
+                        llm_call_id,
+                        step,
+                        name,
+                        tool_source,
+                        tool_skill_name.as_deref(),
+                        Some(&input_json),
+                        Some(&output.content),
+                        !output.is_error && !non_zero,
+                        non_zero,
+                        tool_latency_ms,
+                        err_msg,
+                    )
+                    .await
+                {
+                    warn!(tool = %name, error = %e, "failed to save tool_call record");
+                }
+            }
+
             let image_count = output.images.len();
             let output_summary = if image_count > 0 {
                 truncate_summary(
@@ -1726,6 +1864,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     // Silent mode uses safe_always_on_skills (builtin handlers only) — no skills
     // in this path declare required_tools, so pass an empty set.
     let no_required_tools = HashSet::new();
+    let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
+    let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     run_loop(
         effective_llm,
         tools,
@@ -1739,6 +1879,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         None, // MCP tools excluded from silent mode
         None, // long_running not supported in silent mode
         &no_required_tools,
+        store_llm,
+        store_tools,
     )
     .await?;
 
@@ -1956,6 +2098,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     };
 
     let mode = LoopMode::Team;
+    let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
+    let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let result = run_loop(
         effective_llm,
         tools,
@@ -1969,6 +2113,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         params.mcp_manager,
         None, // long_running: team agents will be wired in Phase 4
         &required_tools,
+        store_llm,
+        store_tools,
     )
     .await?;
 

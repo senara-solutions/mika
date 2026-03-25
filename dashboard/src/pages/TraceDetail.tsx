@@ -1,7 +1,9 @@
 import { useState, Fragment } from 'react'
 import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
-import { EmptyState, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
+import { useTraceLlmCalls } from '../api/llmCalls.ts'
+import { useTraceToolCalls } from '../api/toolCalls.ts'
+import { CopyButton as UiCopyButton, EmptyState, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
@@ -16,6 +18,7 @@ import {
   ChevronRight,
   ChevronDown,
   Search,
+  Brain,
 } from 'lucide-react'
 
 // ===== Shared helpers (mirrors SessionDetail patterns) =====
@@ -79,6 +82,56 @@ function truncateText(text: string, maxLen = 80): string {
   const cleaned = text.endsWith('...') ? text.slice(0, -3) : text
   if (cleaned.length <= maxLen) return text
   return cleaned.slice(0, maxLen) + '...'
+}
+
+function formatTokens(n: number | null): string {
+  if (n == null) return '-'
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+function formatLatency(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
+  return `${ms}ms`
+}
+
+function llmStatusBadge(status: string) {
+  switch (status) {
+    case 'success':
+      return (
+        <span className="inline-flex items-center gap-1 text-emerald-400">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+          <span className="text-[10px]">success</span>
+        </span>
+      )
+    case 'error':
+      return (
+        <span className="inline-flex items-center gap-1 text-red-400">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+          <span className="text-[10px]">error</span>
+        </span>
+      )
+    default:
+      return (
+        <span className="inline-flex items-center gap-1 text-muted/60">
+          <span className="w-1.5 h-1.5 rounded-full bg-muted/40" />
+          <span className="text-[10px]">{status}</span>
+        </span>
+      )
+  }
+}
+
+function toolSourceBadge(source: string) {
+  switch (source) {
+    case 'builtin':
+      return 'bg-accent/15 text-accent/80'
+    case 'skill':
+      return 'bg-purple-400/15 text-purple-400'
+    case 'mcp':
+      return 'bg-amber-400/15 text-amber-400'
+    default:
+      return 'bg-white/[0.06] text-muted/60'
+  }
 }
 
 function CopyButton({
@@ -432,7 +485,10 @@ export default function TraceDetail() {
   const { traceId } = useParams<{ traceId: string }>()
   const { data: events, isLoading: eventsLoading, error: eventsError } = useTraceDetail(traceId ?? '')
   const { data: messages, isLoading: messagesLoading, error: messagesError } = useTraceMessages(traceId ?? '')
+  const { data: llmCalls } = useTraceLlmCalls(traceId ?? '')
+  const { data: toolCalls } = useTraceToolCalls(traceId ?? '')
   const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
+  const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(new Set())
 
   const openInvestigation = (
     messageId: number,
@@ -539,6 +595,167 @@ export default function TraceDetail() {
               <EventCard key={`evt-${i}`} event={item.event} />
             ),
           )}
+        </div>
+      )}
+
+      {/* LLM Calls section */}
+      {llmCalls && llmCalls.length > 0 && (
+        <div className="mt-8">
+          <div className="flex items-center gap-2 mb-3">
+            <Brain size={16} className="text-muted/40" />
+            <h3 className="text-heading text-sm font-semibold">
+              LLM Calls
+            </h3>
+            <span className="text-[10px] text-muted/40">
+              {llmCalls.length} call{llmCalls.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+          <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+                  <th className="text-left px-4 py-3 font-medium">Timestamp</th>
+                  <th className="text-left px-4 py-3 font-medium">Provider</th>
+                  <th className="text-left px-4 py-3 font-medium">Model</th>
+                  <th className="text-right px-4 py-3 font-medium">Input</th>
+                  <th className="text-right px-4 py-3 font-medium">Output</th>
+                  <th className="text-right px-4 py-3 font-medium">Latency</th>
+                  <th className="text-left px-4 py-3 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.03]">
+                {llmCalls.map((row) => (
+                  <tr key={row.id} className="hover:bg-white/[0.02] transition-colors">
+                    <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
+                      {formatTimestamp(row.created_at)}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-heading font-medium">{row.provider}</td>
+                    <td className="px-4 py-3 text-xs text-muted font-mono max-w-[200px] truncate">{row.model}</td>
+                    <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.input_tokens)}</td>
+                    <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.output_tokens)}</td>
+                    <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">{formatLatency(row.latency_ms)}</td>
+                    <td className="px-4 py-3">{llmStatusBadge(row.status)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Tool Calls section */}
+      {toolCalls && toolCalls.length > 0 && (
+        <div className="mt-8">
+          <div className="flex items-center gap-2 mb-3">
+            <Wrench size={16} className="text-muted/40" />
+            <h3 className="text-heading text-sm font-semibold">
+              Tool Calls
+            </h3>
+            <span className="text-[10px] text-muted/40">
+              {toolCalls.length} call{toolCalls.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+          <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+                  <th className="w-8 px-2 py-3" />
+                  <th className="text-left px-4 py-3 font-medium">Tool</th>
+                  <th className="text-left px-4 py-3 font-medium">Source</th>
+                  <th className="text-left px-4 py-3 font-medium">Skill</th>
+                  <th className="text-left px-4 py-3 font-medium">Status</th>
+                  <th className="text-right px-4 py-3 font-medium">Latency</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.03]">
+                {toolCalls.map((row) => {
+                  const isOpen = expandedToolCalls.has(row.id)
+                  return (
+                    <Fragment key={row.id}>
+                      <tr
+                        onClick={() => {
+                          setExpandedToolCalls((prev) => {
+                            const next = new Set(prev)
+                            if (next.has(row.id)) { next.delete(row.id) } else { next.add(row.id) }
+                            return next
+                          })
+                        }}
+                        className="hover:bg-white/[0.02] transition-colors cursor-pointer"
+                      >
+                        <td className="px-2 py-3 text-muted/30">
+                          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-heading font-mono font-medium">{row.tool_name}</td>
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${toolSourceBadge(row.tool_source)}`}>
+                            {row.tool_source}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-muted/60">
+                          {row.skill_name ?? <span className="text-muted/30">-</span>}
+                        </td>
+                        <td className="px-4 py-3">
+                          {row.success ? (
+                            <span className="inline-flex items-center gap-1 text-emerald-400">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                              <span className="text-[10px]">ok</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-red-400">
+                              <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                              <span className="text-[10px]">fail</span>
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
+                          {formatLatency(row.latency_ms)}
+                        </td>
+                      </tr>
+                      {isOpen && (
+                        <tr>
+                          <td colSpan={6} className="px-6 py-4 bg-white/[0.02]">
+                            <div className="space-y-3">
+                              {row.input && (
+                                <div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-[10px] text-muted/40 uppercase tracking-wider">Input</span>
+                                    <UiCopyButton text={row.input} title="Copy input" />
+                                  </div>
+                                  <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+                                    {row.input}
+                                  </div>
+                                </div>
+                              )}
+                              {row.output && (
+                                <div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-[10px] text-muted/40 uppercase tracking-wider">Output</span>
+                                    <UiCopyButton text={row.output} title="Copy output" />
+                                  </div>
+                                  <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+                                    {row.output}
+                                  </div>
+                                </div>
+                              )}
+                              {row.error_message && (
+                                <div>
+                                  <span className="text-[10px] text-red-400/60 uppercase tracking-wider">Error</span>
+                                  <div className="font-mono text-xs text-red-400/80 pl-2 border-l border-red-400/20 mt-1 whitespace-pre-wrap break-all">
+                                    {row.error_message}
+                                  </div>
+                                </div>
+                              )}
+                              <div className="text-[10px] text-muted/30">Step {row.step}</div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 

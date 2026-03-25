@@ -8,6 +8,8 @@ import AgentDetail from './pages/AgentDetail.tsx'
 import Sessions from './pages/Sessions.tsx'
 import SessionDetail from './pages/SessionDetail.tsx'
 import Tasks from './pages/Tasks.tsx'
+import LlmCalls from './pages/LlmCalls.tsx'
+import ToolCalls from './pages/ToolCalls.tsx'
 import DevRuns from './pages/DevRuns.tsx'
 import DevRunDetail from './pages/DevRunDetail.tsx'
 import TeamRuns from './pages/TeamRuns.tsx'
@@ -26,6 +28,8 @@ export default function App() {
         <Route path="sessions" element={<Sessions />} />
         <Route path="sessions/:sessionId" element={<SessionDetail />} />
         <Route path="tasks" element={<Tasks />} />
+        <Route path="llm-calls" element={<LlmCalls />} />
+        <Route path="tool-calls" element={<ToolCalls />} />
         <Route path="dev-runs" element={<DevRuns />} />
         <Route path="dev-runs/:taskId" element={<DevRunDetail />} />
         <Route path="team-runs" element={<TeamRuns />} />

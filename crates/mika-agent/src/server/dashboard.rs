@@ -648,6 +648,207 @@ pub async fn handle_team_runs_list(
     .into_response()
 }
 
+// ===== LLM Calls =====
+
+#[derive(Debug, Deserialize)]
+pub struct LlmCallsQuery {
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// GET /api/v1/llm-calls — paginated LLM call list with filters.
+pub async fn handle_llm_calls(
+    State(state): State<AppState>,
+    Query(q): Query<LlmCallsQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, _) = resolve_pagination(q.page, q.per_page);
+    let filters = db::LlmCallFilters {
+        agent_id: q.agent_id,
+        session_id: q.session_id,
+        model: q.model,
+        from: q.from,
+        to: q.to,
+    };
+
+    let (data, total) = match state
+        .dashboard_db
+        .query_llm_calls(filters, page, per_page)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data,
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+// ===== Tool Calls =====
+
+#[derive(Debug, Deserialize)]
+pub struct ToolCallsQuery {
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub success: Option<bool>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// GET /api/v1/tool-calls — paginated tool call list with filters.
+pub async fn handle_tool_calls(
+    State(state): State<AppState>,
+    Query(q): Query<ToolCallsQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, _) = resolve_pagination(q.page, q.per_page);
+    let filters = db::ToolCallFilters {
+        agent_id: q.agent_id,
+        session_id: q.session_id,
+        tool_name: q.tool_name,
+        success: q.success,
+        from: q.from,
+        to: q.to,
+    };
+
+    let (data, total) = match state
+        .dashboard_db
+        .query_tool_calls(filters, page, per_page)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data,
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+// ===== Trace-level LLM/Tool queries =====
+
+/// GET /api/v1/traces/:trace_id/llm-calls
+pub async fn handle_trace_llm_calls(
+    State(state): State<AppState>,
+    Path(trace_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.query_llm_calls_by_trace(&trace_id).await {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
+/// GET /api/v1/traces/:trace_id/tool-calls
+pub async fn handle_trace_tool_calls(
+    State(state): State<AppState>,
+    Path(trace_id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .dashboard_db
+        .query_tool_calls_by_trace(&trace_id)
+        .await
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
+// ===== Session-level LLM/Tool/Skills queries =====
+
+#[derive(Debug, Deserialize)]
+pub struct SessionPaginationQuery {
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// GET /api/v1/sessions/:id/llm-calls
+pub async fn handle_session_llm_calls(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<SessionPaginationQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, _) = resolve_pagination(q.page, q.per_page);
+    let (data, total) = match state
+        .dashboard_db
+        .query_llm_calls_by_session(&session_id, page, per_page)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data,
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+/// GET /api/v1/sessions/:id/tool-calls
+pub async fn handle_session_tool_calls(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<SessionPaginationQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, _) = resolve_pagination(q.page, q.per_page);
+    let (data, total) = match state
+        .dashboard_db
+        .query_tool_calls_by_session(&session_id, page, per_page)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data,
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+/// GET /api/v1/sessions/:id/skills — loaded skills from session metadata.
+pub async fn handle_session_skills(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_session(&session_id).await {
+        Ok(Some(session)) => {
+            let skills_meta: serde_json::Value = session
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+                .unwrap_or(serde_json::json!({"loaded_skills": [], "skill_count": 0}));
+            Json(skills_meta).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
