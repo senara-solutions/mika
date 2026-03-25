@@ -572,6 +572,22 @@ Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handle
 skills for security — only builtin-handler skills are available in autonomous
 background runs.
 
+**Task health awareness (heartbeat only):** During heartbeat runs,
+`get_task_health_summary()` detects anomalous task states across all trigger
+types and injects them into the system prompt as a `<task-health>` block:
+
+- **Stuck callbacks:** `completed` but not `delivered` for >10 minutes
+- **Failed recurring:** Recurring tasks in `failed` status (last 24h)
+- **Long-running:** Tasks `in_progress` for >1 hour
+- **Stale blocked:** Manual work items `blocked` with no activity for >24 hours
+- **GitHub-linked:** Active work items with GitHub PR/issue reference URLs
+
+Active manual work items (pending/in_progress/blocked) are included in the
+same block. Anomalies are capped at 10 (`health_thresholds::MAX_ANOMALIES`).
+Task policy preferences (`task_policy_*` prefix) are also injected as a
+`<stored-preferences>` block for autonomous action. Both are gated to
+`SilentTrigger::Heartbeat` only — other trigger types skip health data.
+
 Each background run is framed by a `SilentTrigger` variant (see Section 9 §
 SilentTrigger Variants). Callback results are wrapped in
 `<callback_result trust="untrusted">` XML-like delimiters before LLM injection
