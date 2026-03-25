@@ -172,6 +172,7 @@ mod tests {
                 },
                 triggers: Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![],

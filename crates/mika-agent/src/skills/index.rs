@@ -470,6 +470,7 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
 
     // 4. Check tools.json if present
     let tools_path = skill_dir.join("tools.json");
+    let mut skill_tool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     if tools_path.exists() {
         if let Ok(meta) = std::fs::metadata(&tools_path)
             && meta.len() > MAX_TOOLS_JSON_SIZE
@@ -488,6 +489,8 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                             "tools.json valid — {} tool(s)",
                             tools.len()
                         )));
+                        // Collect tool names for required_tools validation (step 5b)
+                        skill_tool_names = tools.iter().map(|t| t.name.clone()).collect();
 
                         // 5. Check exec handler commands exist and are executable
                         for tool in &tools {
@@ -542,6 +545,18 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                     "cannot read tools.json: {e}"
                 )));
             }
+        }
+    }
+
+    // 5b. Validate [constraints] required_tools against known tool names
+    for required in &manifest.constraints.required_tools {
+        if !skill_tool_names.contains(required) {
+            // Advisory warning — the tool might be a builtin or MCP tool
+            diags.push(SkillDiagnostic::warn(format!(
+                "[constraints] required_tools references '{}' which is not in this skill's \
+                 tools.json — this is OK if it's a builtin or MCP tool",
+                required
+            )));
         }
     }
 
@@ -2044,6 +2059,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2080,6 +2096,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2112,6 +2129,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2144,6 +2162,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2729,6 +2748,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2777,6 +2797,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2815,6 +2836,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2867,6 +2889,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2925,6 +2948,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2980,6 +3004,7 @@ mod tests {
                 },
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],

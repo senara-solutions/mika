@@ -3,7 +3,7 @@ use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent,
     LlmRole, LlmStopReason, LlmToolDefinition, LlmToolResultBlock, LlmToolResultContent, LlmUsage,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -486,6 +486,12 @@ fn strip_prior_images(messages: &mut [LlmMessage]) {
 ///
 /// Iterates up to `MAX_TOOL_STEPS`, dispatching tool calls and collecting the
 /// final text response. Behavior is parameterized by `LoopMode`.
+///
+/// `required_tools` specifies tool names (from matched skills' `[constraints]` sections)
+/// that must be called at least once before the engine accepts the assistant's response.
+/// If the assistant produces a text response without calling all required tools, the
+/// engine rejects the response and re-prompts (once). This prevents the model from
+/// fabricating results instead of actually using tools. See #270.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     llm: &dyn LlmProvider,
@@ -499,12 +505,17 @@ async fn run_loop(
     db: &AsyncDatabase,
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
+    required_tools: &HashSet<String>,
 ) -> Result<LoopResult> {
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
     let mut last_usage = None;
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
+    // Track which tools have been called across all steps for required_tools enforcement.
+    let mut tools_called: HashSet<String> = HashSet::new();
+    // Whether we already injected a required-tools correction. Only allow one retry.
+    let mut required_tools_retry_done = false;
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -548,6 +559,52 @@ async fn run_loop(
                 let text = response.text();
 
                 if !text.is_empty() {
+                    // Required-tools enforcement: if matched skills declared required_tools
+                    // and the agent hasn't called all of them yet, reject the response and
+                    // re-prompt. Only one retry is allowed to prevent infinite loops.
+                    // Only enforced on EndTurn — MaxTokens and ContentFilter are unrecoverable
+                    // (re-prompting won't help if the context window is full or content was
+                    // filtered). See #270.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !required_tools.is_empty()
+                        && !required_tools_retry_done
+                    {
+                        let missing: Vec<&String> = required_tools
+                            .iter()
+                            .filter(|t| !tools_called.contains(t.as_str()))
+                            .collect();
+                        if !missing.is_empty() {
+                            required_tools_retry_done = true;
+                            let missing_names: Vec<&str> =
+                                missing.iter().map(|s| s.as_str()).collect();
+                            warn!(
+                                step,
+                                ?missing_names,
+                                label = mode.label(),
+                                "agent responded without calling required tools — re-prompting"
+                            );
+                            // Push the assistant's response so the model sees what it tried
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            // Inject a correction telling the model which tools it must call
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(format!(
+                                    "[Your response was rejected because you did not call the required \
+                                     tool(s): {}. You MUST call these tools with real data before \
+                                     producing your response. Do not fabricate or assume results — \
+                                     call the tools now.]",
+                                    missing_names.join(", ")
+                                )),
+                            });
+                            continue;
+                        }
+                    }
+
                     if mode.saves_to_db() {
                         let metadata = tool_calls_metadata_json(&all_tool_summaries);
                         db.save_message_with_metadata(
@@ -625,6 +682,12 @@ async fn run_loop(
             }
             LlmStopReason::ToolUse => {
                 tool_use_occurred = true;
+                // Record tool names for required_tools enforcement before dispatching
+                for block in &response.content {
+                    if let LlmResponseContent::ToolCall { name, .. } = block {
+                        tools_called.insert(name.clone());
+                    }
+                }
                 let step_summaries = process_tool_calls(
                     response.content,
                     tools,
@@ -894,6 +957,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
+    let required_tools = collect_required_tools(&matched);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -1057,6 +1121,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         db,
         params.mcp_manager,
         lr_ctx.as_ref(),
+        &required_tools,
     )
     .await?;
 
@@ -1658,6 +1723,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     };
 
     let mode = LoopMode::Silent;
+    // Silent mode uses safe_always_on_skills (builtin handlers only) — no skills
+    // in this path declare required_tools, so pass an empty set.
+    let no_required_tools = HashSet::new();
     run_loop(
         effective_llm,
         tools,
@@ -1670,6 +1738,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         db,
         None, // MCP tools excluded from silent mode
         None, // long_running not supported in silent mode
+        &no_required_tools,
     )
     .await?;
 
@@ -1836,6 +1905,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
+    let required_tools = collect_required_tools(&matched);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -1898,6 +1968,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         params.db,
         params.mcp_manager,
         None, // long_running: team agents will be wired in Phase 4
+        &required_tools,
     )
     .await?;
 
@@ -2113,6 +2184,18 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &
         .unwrap_or(TOOL_TIMEOUT_SECS)
 }
 
+/// Collect the union of all `required_tools` from matched skills' `[constraints]` sections.
+///
+/// Returns the set of tool names that must be called at least once before the engine
+/// accepts the assistant's response. See #270.
+fn collect_required_tools(matched: &[&SkillEntry]) -> HashSet<String> {
+    matched
+        .iter()
+        .flat_map(|e| e.manifest.constraints.required_tools.iter())
+        .cloned()
+        .collect()
+}
+
 /// Inject matched skill prompt snippets into the system prompt and resolve
 /// tool definitions. Always includes all builtin tools plus skill-defined tools.
 ///
@@ -2293,6 +2376,16 @@ mod tests {
     // -- Skill helper tests --
 
     fn make_skill_entry(name: &str, timeout: u64, tool_names: &[&str]) -> SkillEntry {
+        make_skill_entry_with_constraints(name, timeout, tool_names, &[])
+    }
+
+    fn make_skill_entry_with_constraints(
+        name: &str,
+        timeout: u64,
+        tool_names: &[&str],
+        required_tools: &[&str],
+    ) -> SkillEntry {
+        use crate::skills::manifest::Constraints;
         SkillEntry {
             manifest: SkillManifest {
                 skill: SkillInfo {
@@ -2308,6 +2401,9 @@ mod tests {
                     keywords: vec![name.to_string()],
                 },
                 llm: Default::default(),
+                constraints: Constraints {
+                    required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
+                },
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![name.to_lowercase()],
@@ -3393,5 +3489,34 @@ mod tests {
         );
         assert!(ctx.contains("Analyze the data"));
         assert!(!ctx.contains("delegate_task"));
+    }
+
+    // -- collect_required_tools tests (#270) --
+
+    #[test]
+    fn test_collect_required_tools_empty_when_no_constraints() {
+        let s1 = make_skill_entry("search", 30, &["web_search"]);
+        let s2 = make_skill_entry("calc", 10, &["calculate"]);
+        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        let required = collect_required_tools(&matched);
+        assert!(required.is_empty());
+    }
+
+    #[test]
+    fn test_collect_required_tools_union_across_skills() {
+        // Two skills with different required_tools — result is the union, deduped
+        let s1 = make_skill_entry_with_constraints("qa-review", 30, &["run_gh"], &["run_gh"]);
+        let s2 = make_skill_entry_with_constraints(
+            "code-check",
+            30,
+            &["run_lint"],
+            &["run_lint", "run_gh"],
+        );
+        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        let required = collect_required_tools(&matched);
+        // run_gh + run_lint, deduplicated
+        assert_eq!(required.len(), 2);
+        assert!(required.contains("run_gh"));
+        assert!(required.contains("run_lint"));
     }
 }

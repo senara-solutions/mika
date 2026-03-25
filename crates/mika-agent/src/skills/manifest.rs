@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 /// [llm]
 /// provider = "openai"       # optional — overrides agent active provider
 /// model    = "gpt-4o-mini"  # optional — overrides provider default model
+///
+/// [constraints]
+/// required_tools = ["run_gh"]  # optional — tools that must be called before response
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillManifest {
@@ -27,6 +30,10 @@ pub struct SkillManifest {
     /// where this skill is active. Only valid in root `skill.toml`, not variant dirs.
     #[serde(default)]
     pub llm: LlmOverride,
+    /// Optional constraints on agent behavior when this skill is active.
+    /// Used to enforce tool execution before accepting a response.
+    #[serde(default)]
+    pub constraints: Constraints,
 }
 
 /// Per-skill LLM provider and model preferences.
@@ -49,6 +56,28 @@ impl LlmOverride {
     /// Returns `true` if no LLM override is configured.
     pub fn is_empty(&self) -> bool {
         self.provider.is_none() && self.model.is_none()
+    }
+}
+
+/// Constraints on agent behavior when a skill is active.
+///
+/// Declared in the `[constraints]` section of `skill.toml`. Currently supports:
+/// - `required_tools`: Tool names that must be called at least once before the agent
+///   engine accepts the assistant's response. If the assistant produces a response
+///   without calling all required tools, the engine rejects the response and re-prompts.
+///   This prevents the model from fabricating results instead of actually using tools.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Constraints {
+    /// Tool names that must be called at least once before the response is accepted.
+    /// Names can reference skill-defined tools, builtin tools, or MCP tools.
+    #[serde(default)]
+    pub required_tools: Vec<String>,
+}
+
+impl Constraints {
+    /// Returns `true` if no constraints are configured.
+    pub fn is_empty(&self) -> bool {
+        self.required_tools.is_empty()
     }
 }
 
@@ -535,7 +564,59 @@ mod tests {
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert!(manifest.llm.is_empty());
+        assert!(manifest.constraints.is_empty());
         assert_eq!(manifest.skill.name, "web-search");
         assert!(manifest.skill.always_on);
+    }
+
+    // -- [constraints] section tests --
+
+    #[test]
+    fn test_parse_constraints_required_tools() {
+        let toml_str = r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [constraints]
+            required_tools = ["run_gh", "web_search"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.constraints.is_empty());
+        assert_eq!(
+            manifest.constraints.required_tools,
+            vec!["run_gh", "web_search"]
+        );
+    }
+
+    #[test]
+    fn test_parse_no_constraints_defaults_empty() {
+        // Backward compat: skill.toml without [constraints] should parse fine
+        let toml_str = r#"
+            [skill]
+            name = "simple"
+            description = "No constraints"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.constraints.is_empty());
+        assert!(manifest.constraints.required_tools.is_empty());
+    }
+
+    #[test]
+    fn test_constraints_coexists_with_llm_section() {
+        let toml_str = r#"
+            [skill]
+            name = "review"
+            description = "Code review skill"
+
+            [llm]
+            provider = "anthropic"
+
+            [constraints]
+            required_tools = ["run_gh"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.llm.provider.as_deref(), Some("anthropic"));
+        assert_eq!(manifest.constraints.required_tools, vec!["run_gh"]);
     }
 }
