@@ -2,6 +2,87 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0](https://github.com/senara-solutions/mika/releases/tag/v0.2.0) — 2026-03-20
+
+### Added
+
+- [#198] embed dashboard SPA in mika-server binary
+- [#71] refactor all consumers to use LlmProvider trait
+- add LlmProvider trait and multi-provider abstractions
+- custom compact log formatter with startup banner for pretty mode
+- strip file paths, line numbers, and targets from pretty log output
+- add MIKA_LOG_FORMAT env var for human-readable server/gateway logs
+- team workspace restructure and CLI unification
+- *(skill)* add Google Workspace builtin skill via gws CLI ([#75](https://github.com/senara-solutions/mika/pull/75))
+- add skill dependency resolution at install time ([#216](https://github.com/senara-solutions/mika/pull/216))
+- *(skills)* raise prompt snippet size limit and make it configurable per-skill
+- add --last-run flag and enhance teams log output
+- [#182] add browser control via Playwright MCP integration
+- add public documentation site with Starlight
+- *(server)* add paginated tasks and team-runs dashboard API endpoints
+- strengthen trace_id structural linkage (schema v11)
+- delegated agent Telegram delivery, agent identification, and reply routing
+- *(skills)* add local source support for mika skills install with --link mode
+- [#196] show previous run context in TUI when using --last-run or --run-id
+- add --model flag to `mika ask` and `mika chat` for one-shot LLM override
+- add guided wizards for agent and team creation
+- [#178] dashboard markdown rendering & session lifecycle fixes
+- add --format text|json flag to mika ask
+
+### Changed
+
+- **BREAKING** unify LLM API key — remove MIKA_ANTHROPIC_API_KEY
+- [#71] rename claude_model/claude_max_tokens to llm_model/llm_max_tokens
+- remove MIKA_GOOGLE_TOKEN, use native gws keyring auth
+- address code review findings for embedded dashboard
+- address review findings for failed callback delivery
+- **BREAKING** convert all timestamps from Unix i64 to ISO 8601 TEXT strings
+- address review findings — docs, dispatcher helper, comments
+- resolve code review findings (670-673)
+- remove redundant telegram_chat_id from TeamAgentParams
+- remove builtin calendar skill
+- extract shared CLI helpers and fix flag=value bypass
+- rename --session to --session-id and --parent-task to --parent-task-id
+
+### Documentation
+
+- add pre-1.0 breaking changes policy
+- update dashboard dev command to use dev:dashboard script
+- sync crate-local docs for v0.1.7 publish
+- update documentation for team workspace restructure
+
+### Fixed
+
+- address code review findings from PR #193
+- [#71] address review findings for multi-provider LLM
+- [#71] address review findings for multi-provider LLM
+- address code review findings for team workspace restructure
+- guard update_task_failed against terminal states and add signal distinction
+- skip stale failed callbacks to prevent conversation flooding
+- runtime dashboard toggle API and TUI footer buttons
+- embedded dashboard white page and add root landing route
+- [#203] deliver failed callback tasks to agent
+- clippy cmp_owned warning in cron test
+- link callback tasks to work items and document claude-pilot security fixes
+- strengthen confirmation-before-action guardrail for status questions
+- make TimelineRow.agent_id optional to handle team_workspace NULL values
+- [#182] address pattern review findings
+- [#182] address review findings — SSRF guidance and credential clarity
+- address review findings — UTF-8 safe truncation, DRY filter builders
+- observability polish — request_id linkage, session cleanup ([#162](https://github.com/senara-solutions/mika/pull/162))
+- inject referenced run context into orchestrator prompt via --run-id
+- wire trace_id through callbacks and team resume, add team_workspace to unified_timeline
+- pass agent_name in CLI sender and auto-relay delegate text responses
+- add diagnostic tracing to delegate send_message flow and improve tool description
+- pass explicit chat_id to delegate agent sender for correct Telegram prefixing
+- scan parent directory for sibling skills during dependency resolution
+- resolve clippy collapsible_if warning in --link validation
+- /rewind N not updating TUI display
+- [#196] address review findings for previous run context display
+- [#178] address review findings — session lifecycle and iteration numbering
+- plumb --run-id through chat --team path
+- suppress stderr logs for mika ask command
+
 ## [0.1.6](https://github.com/senara-solutions/mika/releases/tag/v0.1.6) — 2026-03-13
 
 ### Added
