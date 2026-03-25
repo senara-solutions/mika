@@ -3642,13 +3642,11 @@ impl Database {
         };
 
         let count_sql = format!("SELECT COUNT(*) FROM llm_calls {where_sql}");
-        let total: u64 = self
-            .conn
-            .query_row(
-                &count_sql,
-                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
-                |r| r.get(0),
-            )?;
+        let total: u64 = self.conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )?;
 
         let offset = (page.saturating_sub(1)) * per_page;
         params_vec.push(Box::new(per_page));
@@ -3713,13 +3711,11 @@ impl Database {
         };
 
         let count_sql = format!("SELECT COUNT(*) FROM tool_calls {where_sql}");
-        let total: u64 = self
-            .conn
-            .query_row(
-                &count_sql,
-                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
-                |r| r.get(0),
-            )?;
+        let total: u64 = self.conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )?;
 
         let offset = (page.saturating_sub(1)) * per_page;
         params_vec.push(Box::new(per_page));

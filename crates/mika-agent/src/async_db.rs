@@ -1836,11 +1836,7 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn update_session_metadata(
-        &self,
-        session_id: &str,
-        metadata: &str,
-    ) -> Result<()> {
+    pub async fn update_session_metadata(&self, session_id: &str, metadata: &str) -> Result<()> {
         let (sid, m) = (session_id.to_owned(), metadata.to_owned());
         self.with_db(move |db| db.update_session_metadata(&sid, &m))
             .await

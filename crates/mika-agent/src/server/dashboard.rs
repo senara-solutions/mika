@@ -675,7 +675,11 @@ pub async fn handle_llm_calls(
         to: q.to,
     };
 
-    let (data, total) = match state.dashboard_db.query_llm_calls(filters, page, per_page).await {
+    let (data, total) = match state
+        .dashboard_db
+        .query_llm_calls(filters, page, per_page)
+        .await
+    {
         Ok(result) => result,
         Err(e) => return internal_error(e).into_response(),
     };
