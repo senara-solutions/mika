@@ -83,6 +83,7 @@ mod tests {
                     keywords: keywords.iter().map(|s| s.to_string()).collect(),
                 },
                 llm: Default::default(),
+                constraints: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: keywords.iter().map(|s| s.to_lowercase()).collect(),
