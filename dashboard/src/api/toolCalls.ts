@@ -22,6 +22,7 @@ export interface ToolCallRow {
 
 export interface ToolCallsFilters {
   agent_id?: string
+  trace_id?: string
   tool_name?: string
   success?: string
   from?: number
