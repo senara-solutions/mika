@@ -188,7 +188,7 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ### Builtin Tools
 
-All 24 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
+All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
 | Tool | Description | Category |
@@ -220,17 +220,15 @@ All 24 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `get_session_messages` | Retrieve messages from a past conversation session. Useful for replaying or summarizing old conversations. Non-orchestrator agents can only access their own sessions. | Introspection |
 | `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
 | `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
-| `create_work_item` | Create a trackable work item with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | Work Items |
-| `update_work_item_status` | Update work item status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | Work Items |
 | `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. | Work Items |
 | `check_work_item` | Read work item details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Work Items |
 
 ### Management Tools
 
-10 tools for multi-agent and team workflows, registered via
+12 tools for multi-agent and team workflows, registered via
 `management_tools_if_needed()`. `create_agent`, `list_agents`, and `create_team` are always
 registered (enabling agent and team bootstrapping from a single-agent setup). The
-remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
+remaining 9 tools (including work item write tools) are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
 | Tool | Description | Timeout | Always registered |
 |------|-------------|---------|-------------------|
@@ -244,6 +242,8 @@ remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_em
 | `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
 | `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
 | `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
+| `create_work_item` | Create a trackable work item with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | default (30s) | No |
+| `update_work_item_status` | Update work item status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,
 preventing infinite delegation chains.
