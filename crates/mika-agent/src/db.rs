@@ -3386,8 +3386,8 @@ impl Database {
 
     // ===== LLM Calls =====
 
-    /// Maximum stored input/output size for tool calls (50KB).
-    const TOOL_CALL_MAX_CHARS: usize = 50_000;
+    /// Maximum stored input/output size for tool calls (50KB, measured in bytes).
+    const TOOL_CALL_MAX_BYTES: usize = 50_000;
 
     /// Truncate a string at a UTF-8 safe boundary, avoiding panics on multi-byte characters.
     fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
@@ -3468,9 +3468,9 @@ impl Database {
     ) -> Result<()> {
         // Truncate large inputs/outputs to prevent DB bloat.
         // Uses char_indices for UTF-8 safe boundary (byte slicing panics on multi-byte chars).
-        let truncated_input = input.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_CHARS));
+        let truncated_input = input.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_BYTES));
         let truncated_output =
-            output.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_CHARS));
+            output.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_BYTES));
         self.conn.execute(
             "INSERT INTO tool_calls (id, agent_id, session_id, trace_id, llm_call_id,
              step, tool_name, tool_source, skill_name, input, output,

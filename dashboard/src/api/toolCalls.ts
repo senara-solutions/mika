@@ -31,9 +31,8 @@ export interface ToolCallsFilters {
 }
 
 export interface SkillSummary {
-  name: string
-  source: string
-  handler_type: string
+  loaded_skills: string[]
+  skill_count: number
 }
 
 export function useToolCalls(filters: ToolCallsFilters) {
@@ -62,7 +61,7 @@ export function useSessionToolCalls(sessionId: string, page = 1, perPage = 50) {
 }
 
 export function useSessionSkills(sessionId: string) {
-  return useQuery<SkillSummary[]>({
+  return useQuery<SkillSummary>({
     queryKey: ['session-skills', sessionId],
     queryFn: () => apiFetch(`/sessions/${sessionId}/skills`),
     enabled: !!sessionId,

@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
-import { useSessionToolCalls, useSessionSkills, type ToolCallRow, type SkillSummary } from '../api/toolCalls.ts'
+import { useSessionToolCalls, useSessionSkills, type ToolCallRow } from '../api/toolCalls.ts'
 import { CopyButton, Pagination, EmptyState, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
@@ -810,7 +810,7 @@ export default function SessionDetail() {
           { key: 'messages' as SessionTab, label: 'Messages', icon: <Bot size={14} />, count: messages?.total },
           { key: 'llm-calls' as SessionTab, label: 'LLM Calls', icon: <Brain size={14} />, count: llmCallsData?.total },
           { key: 'tool-calls' as SessionTab, label: 'Tool Calls', icon: <Wrench size={14} />, count: toolCallsData?.total },
-          { key: 'skills' as SessionTab, label: 'Skills', icon: <Puzzle size={14} />, count: skills?.length },
+          { key: 'skills' as SessionTab, label: 'Skills', icon: <Puzzle size={14} />, count: skills?.skill_count },
         ]).map((tab) => (
           <button
             key={tab.key}
@@ -1078,7 +1078,7 @@ export default function SessionDetail() {
         )
       ) : activeTab === 'skills' ? (
         /* Skills tab */
-        !skills || skills.length === 0 ? (
+        !skills || skills.loaded_skills.length === 0 ? (
           <EmptyState message="No skills loaded for this session" />
         ) : (
           <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">
@@ -1086,20 +1086,12 @@ export default function SessionDetail() {
               <thead>
                 <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
                   <th className="text-left px-4 py-3 font-medium">Skill Name</th>
-                  <th className="text-left px-4 py-3 font-medium">Source</th>
-                  <th className="text-left px-4 py-3 font-medium">Handler Type</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.03]">
-                {skills.map((skill) => (
-                  <tr key={skill.name} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="px-4 py-3 text-xs text-heading font-mono font-medium">{skill.name}</td>
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${toolSourceBadge(skill.source)}`}>
-                        {skill.source}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted/60">{skill.handler_type}</td>
+                {skills.loaded_skills.map((name) => (
+                  <tr key={name} className="hover:bg-white/[0.02] transition-colors">
+                    <td className="px-4 py-3 text-xs text-heading font-mono font-medium">{name}</td>
                   </tr>
                 ))}
               </tbody>

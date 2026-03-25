@@ -17,14 +17,14 @@ impl Tool for QueryTimelineTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "query_timeline".to_string(),
-            description: "Query the unified timeline of events across all subsystems (messages, audit events, tasks). Returns recent activity sorted by time. Non-orchestrator agents are scoped to their own agent_id.".to_string(),
+            description: "Query the unified timeline of events across all subsystems (messages, audit events, tasks, LLM calls, tool calls, team workspace events). Returns recent activity sorted by time. Non-orchestrator agents are scoped to their own agent_id.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "event_type": {
                         "type": "string",
-                        "description": "Optional filter by event type: 'message', 'audit', or 'task'.",
-                        "enum": ["message", "audit", "task"]
+                        "description": "Optional filter by event type: 'message', 'audit', 'task', 'llm_call', 'tool_call', or 'team_workspace'.",
+                        "enum": ["message", "audit", "task", "llm_call", "tool_call", "team_workspace"]
                     },
                     "session_id": {
                         "type": "string",
