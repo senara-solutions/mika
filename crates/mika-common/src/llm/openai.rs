@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::error::LlmError;
 use super::types::*;
@@ -84,20 +84,20 @@ struct OpenAiFunctionDef {
 
 // -- Response types --
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessage,
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: u64,
@@ -175,6 +175,13 @@ impl OpenAiCompatibleProvider {
             headers.insert(AUTHORIZATION, auth);
         }
 
+        // Dev-mode body logging (gated by MIKA_LOG_LLM_BODIES / mika::llm_debug target)
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
+            if let Ok(body_json) = serde_json::to_string(request) {
+                debug!(target: "mika::llm_debug", body = %body_json, provider = %self.provider_kind, "llm request body");
+            }
+        }
+
         let response = self
             .client
             .post(self.chat_url())
@@ -206,6 +213,11 @@ impl OpenAiCompatibleProvider {
             .json()
             .await
             .map_err(|e| LlmError::ParseError(format!("failed to parse response: {e}")))?;
+
+        // Dev-mode body logging
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
+            debug!(target: "mika::llm_debug", body = ?resp, provider = %self.provider_kind, "llm response body");
+        }
 
         Ok(resp)
     }

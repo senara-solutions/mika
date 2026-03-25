@@ -1661,6 +1661,190 @@ impl AsyncDatabase {
         let i = id.to_owned();
         self.with_db(move |db| db.a2a_delete_push_config(&i)).await
     }
+
+    // -- Observability: LLM Calls + Tool Calls --
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_llm_call(
+        &self,
+        id: &str,
+        session_id: &str,
+        trace_id: Option<&str>,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        latency_ms: u64,
+        stop_reason: Option<&str>,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let (a, i, sid, tid, p, m, sr, st, em) = (
+            self.agent_id.clone(),
+            id.to_owned(),
+            session_id.to_owned(),
+            trace_id.map(|s| s.to_owned()),
+            provider.to_owned(),
+            model.to_owned(),
+            stop_reason.map(|s| s.to_owned()),
+            status.to_owned(),
+            error_message.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.save_llm_call(
+                &i,
+                &a,
+                &sid,
+                tid.as_deref(),
+                &p,
+                &m,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                latency_ms,
+                sr.as_deref(),
+                &st,
+                em.as_deref(),
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_tool_call(
+        &self,
+        id: &str,
+        session_id: &str,
+        trace_id: Option<&str>,
+        llm_call_id: Option<&str>,
+        step: u32,
+        tool_name: &str,
+        tool_source: &str,
+        skill_name: Option<&str>,
+        input: Option<&str>,
+        output: Option<&str>,
+        success: bool,
+        non_zero_exit: bool,
+        latency_ms: u64,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let (a, i, sid, tid, lid, tn, ts, sn, inp, out, em) = (
+            self.agent_id.clone(),
+            id.to_owned(),
+            session_id.to_owned(),
+            trace_id.map(|s| s.to_owned()),
+            llm_call_id.map(|s| s.to_owned()),
+            tool_name.to_owned(),
+            tool_source.to_owned(),
+            skill_name.map(|s| s.to_owned()),
+            input.map(|s| s.to_owned()),
+            output.map(|s| s.to_owned()),
+            error_message.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.save_tool_call(
+                &i,
+                &a,
+                &sid,
+                tid.as_deref(),
+                lid.as_deref(),
+                step,
+                &tn,
+                &ts,
+                sn.as_deref(),
+                inp.as_deref(),
+                out.as_deref(),
+                success,
+                non_zero_exit,
+                latency_ms,
+                em.as_deref(),
+            )
+        })
+        .await
+    }
+
+    pub async fn prune_old_llm_calls(&self, retention_secs: i64) -> Result<usize> {
+        self.with_db(move |db| db.prune_old_llm_calls(retention_secs))
+            .await
+    }
+
+    pub async fn prune_old_tool_calls(&self, retention_secs: i64) -> Result<usize> {
+        self.with_db(move |db| db.prune_old_tool_calls(retention_secs))
+            .await
+    }
+
+    pub async fn query_llm_calls_by_trace(
+        &self,
+        trace_id: &str,
+    ) -> Result<Vec<crate::db::LlmCallRow>> {
+        let t = trace_id.to_owned();
+        self.with_db(move |db| db.query_llm_calls_by_trace(&t))
+            .await
+    }
+
+    pub async fn query_tool_calls_by_trace(
+        &self,
+        trace_id: &str,
+    ) -> Result<Vec<crate::db::ToolCallRow>> {
+        let t = trace_id.to_owned();
+        self.with_db(move |db| db.query_tool_calls_by_trace(&t))
+            .await
+    }
+
+    pub async fn query_llm_calls_by_session(
+        &self,
+        session_id: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<crate::db::LlmCallRow>, u64)> {
+        let s = session_id.to_owned();
+        self.with_db(move |db| db.query_llm_calls_by_session(&s, page, per_page))
+            .await
+    }
+
+    pub async fn query_tool_calls_by_session(
+        &self,
+        session_id: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<crate::db::ToolCallRow>, u64)> {
+        let s = session_id.to_owned();
+        self.with_db(move |db| db.query_tool_calls_by_session(&s, page, per_page))
+            .await
+    }
+
+    pub async fn query_llm_calls(
+        &self,
+        filters: crate::db::LlmCallFilters,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<crate::db::LlmCallRow>, u64)> {
+        self.with_db(move |db| db.query_llm_calls(&filters, page, per_page))
+            .await
+    }
+
+    pub async fn query_tool_calls(
+        &self,
+        filters: crate::db::ToolCallFilters,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<crate::db::ToolCallRow>, u64)> {
+        self.with_db(move |db| db.query_tool_calls(&filters, page, per_page))
+            .await
+    }
+
+    pub async fn update_session_metadata(
+        &self,
+        session_id: &str,
+        metadata: &str,
+    ) -> Result<()> {
+        let (sid, m) = (session_id.to_owned(), metadata.to_owned());
+        self.with_db(move |db| db.update_session_metadata(&sid, &m))
+            .await
+    }
 }
 
 #[cfg(test)]

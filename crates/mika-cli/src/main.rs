@@ -164,8 +164,16 @@ async fn main() -> Result<()> {
     } else {
         LogOutput::PrettyAndFile
     };
-    let _log_guard =
-        mika_common::logging::init_pretty(&log_level, log_dir.as_deref(), log_output, otel_layer);
+    let log_llm_bodies = std::env::var("MIKA_LOG_LLM_BODIES")
+        .ok()
+        .is_some_and(|v| v == "true" || v == "1");
+    let _log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        log_dir.as_deref(),
+        log_output,
+        otel_layer,
+        log_llm_bodies,
+    );
 
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat
@@ -270,11 +278,15 @@ fn init_team_logging(
         .map(|s| mika_common::telemetry::try_init_otel(&s))
         .unwrap_or((None, None));
     let log_dir = team::team_dir(global_home, team_name).join("logs");
+    let log_llm_bodies = std::env::var("MIKA_LOG_LLM_BODIES")
+        .ok()
+        .is_some_and(|v| v == "true" || v == "1");
     let log_guard = mika_common::logging::init_pretty(
         &log_level,
         Some(&log_dir),
         LogOutput::FileOnly,
         otel_layer,
+        log_llm_bodies,
     );
     (log_guard, telemetry_guard)
 }
@@ -294,11 +306,15 @@ fn init_team_logging(
         .map(|s| mika_common::telemetry::try_init_otel(&s))
         .unwrap_or((None, None));
     let log_dir = team::team_dir(global_home, team_name).join("logs");
+    let log_llm_bodies = std::env::var("MIKA_LOG_LLM_BODIES")
+        .ok()
+        .is_some_and(|v| v == "true" || v == "1");
     let log_guard = mika_common::logging::init_pretty(
         &log_level,
         Some(&log_dir),
         LogOutput::FileOnly,
         otel_layer,
+        log_llm_bodies,
     );
     (log_guard, telemetry_guard)
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::oauth::OAuthTokenManager;
 
@@ -494,6 +494,13 @@ impl ClaudeClient {
             );
         }
 
+        // Dev-mode body logging (gated by MIKA_LOG_LLM_BODIES / mika::llm_debug target)
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
+            if let Ok(body_json) = serde_json::to_string(request) {
+                debug!(target: "mika::llm_debug", body = %body_json, "llm request body (anthropic)");
+            }
+        }
+
         let response = self
             .client
             .post(API_URL)
@@ -523,6 +530,11 @@ impl ClaudeClient {
 
         let response: MessagesResponse =
             response.json().await.map_err(ClaudeApiError::ParseError)?;
+
+        // Dev-mode body logging
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
+            debug!(target: "mika::llm_debug", body = ?response, "llm response body (anthropic)");
+        }
 
         Ok(response)
     }

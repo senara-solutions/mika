@@ -29,6 +29,18 @@ impl SkillRegistry {
                 "skipped invalid skill(s) at startup — run `mika skills validate` for details"
             );
         }
+        // Log successfully loaded skills
+        let loaded_names: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        tracing::info!(
+            count = loaded_names.len(),
+            skipped = result.skipped_count,
+            names = ?loaded_names,
+            "skills loaded"
+        );
         Self {
             skills: result.entries,
             skipped_count: result.skipped_count,

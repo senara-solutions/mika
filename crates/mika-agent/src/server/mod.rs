@@ -104,6 +104,29 @@ fn build_router(state: AppState) -> Router {
             "/team-runs/{run_id}/summary",
             get(dashboard::handle_team_run_summary),
         )
+        // Observability: LLM calls and tool calls
+        .route("/llm-calls", get(dashboard::handle_llm_calls))
+        .route("/tool-calls", get(dashboard::handle_tool_calls))
+        .route(
+            "/traces/{trace_id}/llm-calls",
+            get(dashboard::handle_trace_llm_calls),
+        )
+        .route(
+            "/traces/{trace_id}/tool-calls",
+            get(dashboard::handle_trace_tool_calls),
+        )
+        .route(
+            "/sessions/{id}/llm-calls",
+            get(dashboard::handle_session_llm_calls),
+        )
+        .route(
+            "/sessions/{id}/tool-calls",
+            get(dashboard::handle_session_tool_calls),
+        )
+        .route(
+            "/sessions/{id}/skills",
+            get(dashboard::handle_session_skills),
+        )
         .route("/dev-runs", get(dashboard_dev_runs::handle_dev_runs_list))
         .route(
             "/dev-runs/{task_id}",
@@ -749,6 +772,9 @@ mod tests {
                 telemetry_enabled: false,
                 otlp_endpoint: None,
                 otlp_auth_header: None,
+                store_llm_calls: true,
+                store_tool_calls: true,
+                log_llm_bodies: false,
             },
             dashboard_db,
             investigation_lock: Arc::new(tokio::sync::Mutex::new(())),

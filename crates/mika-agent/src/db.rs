@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -52,7 +52,19 @@ const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
         CASE WHEN length(content) > 200 THEN substr(content, 1, 200) || '...' \
              ELSE content END AS summary, \
         created_at \
-    FROM team_workspace";
+    FROM team_workspace \
+    UNION ALL \
+    SELECT trace_id, session_id, agent_id, 'llm_call' AS event_type, \
+        provider || '/' || model AS event_subtype, \
+        'tokens: ' || input_tokens || ' -> ' || output_tokens || ' (' || latency_ms || 'ms, ' || status || ')' AS summary, \
+        created_at \
+    FROM llm_calls \
+    UNION ALL \
+    SELECT trace_id, session_id, agent_id, 'tool_call' AS event_type, \
+        tool_name AS event_subtype, \
+        CASE WHEN success THEN 'ok' ELSE 'err' END || ' (' || latency_ms || 'ms)' AS summary, \
+        created_at \
+    FROM tool_calls";
 
 /// Check if an anyhow error is a SQLite UNIQUE constraint violation.
 pub fn is_unique_violation(err: &anyhow::Error) -> bool {
@@ -387,6 +399,66 @@ pub struct SkillOverride {
     pub always_on: Option<bool>,
 }
 
+// ===== Observability Types =====
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmCallRow {
+    pub id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub trace_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub latency_ms: u64,
+    pub stop_reason: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallRow {
+    pub id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub trace_id: Option<String>,
+    pub llm_call_id: Option<String>,
+    pub step: u32,
+    pub tool_name: String,
+    pub tool_source: String,
+    pub skill_name: Option<String>,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub success: bool,
+    pub non_zero_exit: bool,
+    pub latency_ms: u64,
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LlmCallFilters {
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallFilters {
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub success: Option<bool>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
 // ===== Dashboard Types =====
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -616,6 +688,10 @@ impl Database {
             self.migrate_v13_to_v14()?;
             info!(version = 14, "database migrated to v14");
         }
+        if (3..=14).contains(&version) {
+            self.migrate_v14_to_v15()?;
+            info!(version = 15, "database migrated to v15");
+        }
         Ok(())
     }
 
@@ -626,6 +702,8 @@ impl Database {
         let drops = [
             "DROP TABLE IF EXISTS fts_search",
             "DROP TABLE IF EXISTS vec_search",
+            "DROP TABLE IF EXISTS tool_calls",
+            "DROP TABLE IF EXISTS llm_calls",
             "DROP TABLE IF EXISTS a2a_push_notification_configs",
             "DROP TABLE IF EXISTS a2a_artifacts",
             "DROP TABLE IF EXISTS a2a_messages",
@@ -670,7 +748,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (14);
+            INSERT INTO schema_version (version) VALUES (15);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -984,6 +1062,52 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_description
                 ON events(agent_id, description COLLATE NOCASE, event_date)
                 WHERE event_date IS NOT NULL;
+
+            -- Observability: LLM call tracking
+            CREATE TABLE llm_calls (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                trace_id TEXT,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT,
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_llm_calls_trace ON llm_calls(trace_id);
+            CREATE INDEX idx_llm_calls_session ON llm_calls(session_id);
+            CREATE INDEX idx_llm_calls_agent_created ON llm_calls(agent_id, created_at);
+
+            -- Observability: Tool call tracking (full I/O)
+            CREATE TABLE tool_calls (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                trace_id TEXT,
+                llm_call_id TEXT,
+                step INTEGER NOT NULL DEFAULT 0,
+                tool_name TEXT NOT NULL,
+                tool_source TEXT NOT NULL DEFAULT 'builtin',
+                skill_name TEXT,
+                input TEXT,
+                output TEXT,
+                success INTEGER NOT NULL DEFAULT 1,
+                non_zero_exit INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_tool_calls_trace ON tool_calls(trace_id);
+            CREATE INDEX idx_tool_calls_session ON tool_calls(session_id);
+            CREATE INDEX idx_tool_calls_llm_call ON tool_calls(llm_call_id);
+            CREATE INDEX idx_tool_calls_agent_created ON tool_calls(agent_id, created_at);
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -2105,6 +2229,66 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v14_to_v15(&self) -> Result<()> {
+        info!("migrating database schema v14 → v15 (llm_calls + tool_calls tables)");
+
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS llm_calls (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                trace_id TEXT,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT,
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_trace ON llm_calls(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_agent_created ON llm_calls(agent_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                trace_id TEXT,
+                llm_call_id TEXT,
+                step INTEGER NOT NULL DEFAULT 0,
+                tool_name TEXT NOT NULL,
+                tool_source TEXT NOT NULL DEFAULT 'builtin',
+                skill_name TEXT,
+                input TEXT,
+                output TEXT,
+                success INTEGER NOT NULL DEFAULT 1,
+                non_zero_exit INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_trace ON tool_calls(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_llm_call ON tool_calls(llm_call_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_created ON tool_calls(agent_id, created_at);",
+        )?;
+
+        // Recreate unified_timeline VIEW with new UNION ALL legs
+        self.conn
+            .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (15)", [])?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -3198,6 +3382,416 @@ impl Database {
             params![cutoff],
         )?;
         Ok(n)
+    }
+
+    // ===== LLM Calls =====
+
+    /// Maximum stored input/output size for tool calls (50KB).
+    const TOOL_CALL_MAX_CHARS: usize = 50_000;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_llm_call(
+        &self,
+        id: &str,
+        agent_id: &str,
+        session_id: &str,
+        trace_id: Option<&str>,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        latency_ms: u64,
+        stop_reason: Option<&str>,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO llm_calls (id, agent_id, session_id, trace_id, provider, model,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             latency_ms, stop_reason, status, error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                id,
+                agent_id,
+                session_id,
+                trace_id,
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                latency_ms,
+                stop_reason,
+                status,
+                error_message,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ===== Tool Calls =====
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_tool_call(
+        &self,
+        id: &str,
+        agent_id: &str,
+        session_id: &str,
+        trace_id: Option<&str>,
+        llm_call_id: Option<&str>,
+        step: u32,
+        tool_name: &str,
+        tool_source: &str,
+        skill_name: Option<&str>,
+        input: Option<&str>,
+        output: Option<&str>,
+        success: bool,
+        non_zero_exit: bool,
+        latency_ms: u64,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        // Truncate large inputs/outputs to prevent DB bloat
+        let truncated_input = input.map(|s| {
+            if s.len() > Self::TOOL_CALL_MAX_CHARS {
+                format!(
+                    "{}... (truncated at {} chars)",
+                    &s[..Self::TOOL_CALL_MAX_CHARS],
+                    Self::TOOL_CALL_MAX_CHARS
+                )
+            } else {
+                s.to_string()
+            }
+        });
+        let truncated_output = output.map(|s| {
+            if s.len() > Self::TOOL_CALL_MAX_CHARS {
+                format!(
+                    "{}... (truncated at {} chars)",
+                    &s[..Self::TOOL_CALL_MAX_CHARS],
+                    Self::TOOL_CALL_MAX_CHARS
+                )
+            } else {
+                s.to_string()
+            }
+        });
+        self.conn.execute(
+            "INSERT INTO tool_calls (id, agent_id, session_id, trace_id, llm_call_id,
+             step, tool_name, tool_source, skill_name, input, output,
+             success, non_zero_exit, latency_ms, error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                id,
+                agent_id,
+                session_id,
+                trace_id,
+                llm_call_id,
+                step,
+                tool_name,
+                tool_source,
+                skill_name,
+                truncated_input,
+                truncated_output,
+                success,
+                non_zero_exit,
+                latency_ms,
+                error_message,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Prune LLM calls older than `retention_secs`.
+    pub fn prune_old_llm_calls(&self, retention_secs: i64) -> Result<usize> {
+        let cutoff = timestamp::now_minus(Duration::seconds(retention_secs));
+        let n = self.conn.execute(
+            "DELETE FROM llm_calls WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    /// Prune tool calls older than `retention_secs`.
+    pub fn prune_old_tool_calls(&self, retention_secs: i64) -> Result<usize> {
+        let cutoff = timestamp::now_minus(Duration::seconds(retention_secs));
+        let n = self.conn.execute(
+            "DELETE FROM tool_calls WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    // ===== LLM Call Queries (Dashboard) =====
+
+    pub fn query_llm_calls_by_trace(&self, trace_id: &str) -> Result<Vec<LlmCallRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, provider, model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    latency_ms, stop_reason, status, error_message, created_at
+             FROM llm_calls WHERE trace_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![trace_id], Self::row_to_llm_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn query_tool_calls_by_trace(&self, trace_id: &str) -> Result<Vec<ToolCallRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                    step, tool_name, tool_source, skill_name,
+                    input, output, success, non_zero_exit,
+                    latency_ms, error_message, created_at
+             FROM tool_calls WHERE trace_id = ?1 ORDER BY created_at ASC, step ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![trace_id], Self::row_to_tool_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn query_llm_calls_by_session(
+        &self,
+        session_id: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<LlmCallRow>, u64)> {
+        let total: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM llm_calls WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let offset = (page.saturating_sub(1)) * per_page;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, provider, model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    latency_ms, stop_reason, status, error_message, created_at
+             FROM llm_calls WHERE session_id = ?1
+             ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, per_page, offset], Self::row_to_llm_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
+    }
+
+    pub fn query_tool_calls_by_session(
+        &self,
+        session_id: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<ToolCallRow>, u64)> {
+        let total: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tool_calls WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let offset = (page.saturating_sub(1)) * per_page;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                    step, tool_name, tool_source, skill_name,
+                    input, output, success, non_zero_exit,
+                    latency_ms, error_message, created_at
+             FROM tool_calls WHERE session_id = ?1
+             ORDER BY created_at DESC, step ASC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![session_id, per_page, offset],
+                Self::row_to_tool_call,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
+    }
+
+    pub fn query_llm_calls(
+        &self,
+        filters: &LlmCallFilters,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<LlmCallRow>, u64)> {
+        let mut where_clauses = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ref agent_id) = filters.agent_id {
+            params_vec.push(Box::new(agent_id.clone()));
+            where_clauses.push(format!("agent_id = ?{}", params_vec.len()));
+        }
+        if let Some(ref session_id) = filters.session_id {
+            params_vec.push(Box::new(session_id.clone()));
+            where_clauses.push(format!("session_id = ?{}", params_vec.len()));
+        }
+        if let Some(ref model) = filters.model {
+            params_vec.push(Box::new(model.clone()));
+            where_clauses.push(format!("model = ?{}", params_vec.len()));
+        }
+        if let Some(ref from) = filters.from {
+            params_vec.push(Box::new(from.clone()));
+            where_clauses.push(format!("created_at >= ?{}", params_vec.len()));
+        }
+        if let Some(ref to) = filters.to {
+            params_vec.push(Box::new(to.clone()));
+            where_clauses.push(format!("created_at <= ?{}", params_vec.len()));
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM llm_calls {where_sql}");
+        let total: u64 = self
+            .conn
+            .query_row(
+                &count_sql,
+                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+                |r| r.get(0),
+            )?;
+
+        let offset = (page.saturating_sub(1)) * per_page;
+        params_vec.push(Box::new(per_page));
+        params_vec.push(Box::new(offset));
+        let query_sql = format!(
+            "SELECT id, agent_id, session_id, trace_id, provider, model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    latency_ms, stop_reason, status, error_message, created_at
+             FROM llm_calls {where_sql}
+             ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+            params_vec.len() - 1,
+            params_vec.len()
+        );
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+                Self::row_to_llm_call,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
+    }
+
+    pub fn query_tool_calls(
+        &self,
+        filters: &ToolCallFilters,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<ToolCallRow>, u64)> {
+        let mut where_clauses = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ref agent_id) = filters.agent_id {
+            params_vec.push(Box::new(agent_id.clone()));
+            where_clauses.push(format!("agent_id = ?{}", params_vec.len()));
+        }
+        if let Some(ref session_id) = filters.session_id {
+            params_vec.push(Box::new(session_id.clone()));
+            where_clauses.push(format!("session_id = ?{}", params_vec.len()));
+        }
+        if let Some(ref tool_name) = filters.tool_name {
+            params_vec.push(Box::new(tool_name.clone()));
+            where_clauses.push(format!("tool_name = ?{}", params_vec.len()));
+        }
+        if let Some(success) = filters.success {
+            params_vec.push(Box::new(success));
+            where_clauses.push(format!("success = ?{}", params_vec.len()));
+        }
+        if let Some(ref from) = filters.from {
+            params_vec.push(Box::new(from.clone()));
+            where_clauses.push(format!("created_at >= ?{}", params_vec.len()));
+        }
+        if let Some(ref to) = filters.to {
+            params_vec.push(Box::new(to.clone()));
+            where_clauses.push(format!("created_at <= ?{}", params_vec.len()));
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM tool_calls {where_sql}");
+        let total: u64 = self
+            .conn
+            .query_row(
+                &count_sql,
+                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+                |r| r.get(0),
+            )?;
+
+        let offset = (page.saturating_sub(1)) * per_page;
+        params_vec.push(Box::new(per_page));
+        params_vec.push(Box::new(offset));
+        let query_sql = format!(
+            "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                    step, tool_name, tool_source, skill_name,
+                    input, output, success, non_zero_exit,
+                    latency_ms, error_message, created_at
+             FROM tool_calls {where_sql}
+             ORDER BY created_at DESC, step ASC LIMIT ?{} OFFSET ?{}",
+            params_vec.len() - 1,
+            params_vec.len()
+        );
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+                Self::row_to_tool_call,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
+    }
+
+    fn row_to_llm_call(r: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCallRow> {
+        Ok(LlmCallRow {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            session_id: r.get(2)?,
+            trace_id: r.get(3)?,
+            provider: r.get(4)?,
+            model: r.get(5)?,
+            input_tokens: r.get(6)?,
+            output_tokens: r.get(7)?,
+            cache_read_tokens: r.get(8)?,
+            cache_write_tokens: r.get(9)?,
+            latency_ms: r.get(10)?,
+            stop_reason: r.get(11)?,
+            status: r.get(12)?,
+            error_message: r.get(13)?,
+            created_at: r.get(14)?,
+        })
+    }
+
+    fn row_to_tool_call(r: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallRow> {
+        Ok(ToolCallRow {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            session_id: r.get(2)?,
+            trace_id: r.get(3)?,
+            llm_call_id: r.get(4)?,
+            step: r.get(5)?,
+            tool_name: r.get(6)?,
+            tool_source: r.get(7)?,
+            skill_name: r.get(8)?,
+            input: r.get(9)?,
+            output: r.get(10)?,
+            success: r.get(11)?,
+            non_zero_exit: r.get(12)?,
+            latency_ms: r.get(13)?,
+            error_message: r.get(14)?,
+            created_at: r.get(15)?,
+        })
+    }
+
+    /// Update session metadata column.
+    pub fn update_session_metadata(&self, session_id: &str, metadata: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET metadata = ?1 WHERE id = ?2",
+            params![metadata, session_id],
+        )?;
+        Ok(())
     }
 
     // ===== Messages =====
@@ -7354,9 +7948,9 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_14() {
+    fn test_schema_version_is_current() {
         let db = db();
-        assert_eq!(db.schema_version().unwrap(), 14);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

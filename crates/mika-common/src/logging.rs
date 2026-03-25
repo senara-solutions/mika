@@ -210,12 +210,16 @@ pub fn init<OL>(
     log_file: Option<&Path>,
     log_format: LogFormat,
     otel_layer: Option<OL>,
+    log_llm_bodies: bool,
 ) -> Option<WorkerGuard>
 where
     OL: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
-    let filter =
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    if log_llm_bodies {
+        filter = filter.add_directive("mika::llm_debug=debug".parse().unwrap());
+    }
 
     // Note: the match arms look duplicative, but tracing_subscriber's type-level layer
     // composition creates distinct types for each combination, preventing shared setup.
@@ -312,12 +316,16 @@ pub fn init_pretty<OL>(
     log_dir: Option<&Path>,
     output: LogOutput,
     otel_layer: Option<OL>,
+    log_llm_bodies: bool,
 ) -> Option<WorkerGuard>
 where
     OL: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
-    let filter =
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    if log_llm_bodies {
+        filter = filter.add_directive("mika::llm_debug=debug".parse().unwrap());
+    }
 
     match (log_dir, output) {
         (Some(dir), LogOutput::PrettyAndFile) => {

@@ -230,6 +230,9 @@ pub mod test_helpers {
             telemetry_enabled: false,
             otlp_endpoint: None,
             otlp_auth_header: None,
+            store_llm_calls: true,
+            store_tool_calls: true,
+            log_llm_bodies: false,
         }
     }
 }

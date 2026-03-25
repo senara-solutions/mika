@@ -286,6 +286,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Enable embedded dashboard SPA at /dashboard/ (default: false)",
     },
+    // -- Observability --
+    ConfigKeyInfo {
+        key: "store_llm_calls",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_STORE_LLM_CALLS"),
+        secret: false,
+        description: "Store LLM call metadata in SQLite (default: true)",
+    },
+    ConfigKeyInfo {
+        key: "store_tool_calls",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_STORE_TOOL_CALLS"),
+        secret: false,
+        description: "Store full tool call I/O in SQLite (default: true)",
+    },
+    ConfigKeyInfo {
+        key: "log_llm_bodies",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_LOG_LLM_BODIES"),
+        secret: false,
+        description: "Log full LLM request/response bodies at debug level (default: false)",
+    },
     // -- Env backend (.env secrets) --
     ConfigKeyInfo {
         key: "openai_api_key",
@@ -418,6 +440,10 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
             .map(|s| s.expose_secret().to_string()),
         "home_dir" => Some(settings.home_dir.display().to_string()),
         "db_path" => Some(settings.db_path.display().to_string()),
+        // Observability
+        "store_llm_calls" => Some(settings.store_llm_calls.to_string()),
+        "store_tool_calls" => Some(settings.store_tool_calls.to_string()),
+        "log_llm_bodies" => Some(settings.log_llm_bodies.to_string()),
         // DB keys (timezone, thinking_level) not available from Settings
         _ => None,
     }
@@ -587,9 +613,25 @@ pub struct Settings {
     #[serde(default)]
     pub otlp_auth_header: Option<SecretString>,
 
+    /// Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
+    #[serde(default = "default_true")]
+    pub store_llm_calls: bool,
+
+    /// Store full tool call input/output in SQLite (default: true)
+    #[serde(default = "default_true")]
+    pub store_tool_calls: bool,
+
+    /// Log full LLM request/response bodies at debug level (default: false)
+    #[serde(default)]
+    pub log_llm_bodies: bool,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_llm_provider() -> ProviderKind {

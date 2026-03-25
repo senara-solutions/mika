@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
         settings.server_log_file.as_deref(),
         log_format,
         otel_layer,
+        settings.log_llm_bodies,
     );
 
     mika_agent::server::run_server(&settings).await

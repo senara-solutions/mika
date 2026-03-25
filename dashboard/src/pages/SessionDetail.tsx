@@ -2,6 +2,8 @@ import { useState, Fragment, useMemo } from 'react'
 import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
+import { useSessionLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
+import { useSessionToolCalls, useSessionSkills, type ToolCallRow, type SkillSummary } from '../api/toolCalls.ts'
 import { CopyButton, Pagination, EmptyState, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
@@ -18,6 +20,8 @@ import {
   Search,
   Users,
   Target,
+  Brain,
+  Puzzle,
 } from 'lucide-react'
 
 type TimelineItem =
@@ -266,6 +270,58 @@ function ToolCallsTable({
 }
 
 
+function formatTokens(n: number | null): string {
+  if (n == null) return '-'
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+function formatLatency(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
+  return `${ms}ms`
+}
+
+function llmStatusBadge(status: string) {
+  switch (status) {
+    case 'success':
+      return (
+        <span className="inline-flex items-center gap-1 text-emerald-400">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+          <span className="text-[10px]">success</span>
+        </span>
+      )
+    case 'error':
+      return (
+        <span className="inline-flex items-center gap-1 text-red-400">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+          <span className="text-[10px]">error</span>
+        </span>
+      )
+    default:
+      return (
+        <span className="inline-flex items-center gap-1 text-muted/60">
+          <span className="w-1.5 h-1.5 rounded-full bg-muted/40" />
+          <span className="text-[10px]">{status}</span>
+        </span>
+      )
+  }
+}
+
+function toolSourceBadge(source: string) {
+  switch (source) {
+    case 'builtin':
+      return 'bg-accent/15 text-accent/80'
+    case 'skill':
+      return 'bg-purple-400/15 text-purple-400'
+    case 'mcp':
+      return 'bg-amber-400/15 text-amber-400'
+    default:
+      return 'bg-white/[0.06] text-muted/60'
+  }
+}
+
+type SessionTab = 'messages' | 'llm-calls' | 'tool-calls' | 'skills'
+
 function AgentAvatar({ name }: { name: string }) {
   const color = getAgentColor(name)
   return (
@@ -347,6 +403,10 @@ function roleConfig(role: string) {
 export default function SessionDetail() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const [page, setPage] = useState(1)
+  const [activeTab, setActiveTab] = useState<SessionTab>('messages')
+  const [llmCallsPage, setLlmCallsPage] = useState(1)
+  const [toolCallsPage, setToolCallsPage] = useState(1)
+  const [expandedToolCallIds, setExpandedToolCallIds] = useState<Set<string>>(new Set())
   const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
 
   const { data: session, isLoading: sessionLoading, isError: sessionError, error: sessionErr } = useSessionDetail(sessionId ?? '')
@@ -354,6 +414,9 @@ export default function SessionDetail() {
     sessionId ?? '',
     page,
   )
+  const { data: llmCallsData, isLoading: llmCallsLoading } = useSessionLlmCalls(sessionId ?? '', llmCallsPage)
+  const { data: toolCallsData, isLoading: toolCallsLoading } = useSessionToolCalls(sessionId ?? '', toolCallsPage)
+  const { data: skills } = useSessionSkills(sessionId ?? '')
 
   const isTeamSession = session?.channel_type === 'team'
   // Team session IDs follow the pattern "team-{run_id}"
@@ -741,7 +804,33 @@ export default function SessionDetail() {
         </div>
       )}
 
-      {/* Content area — single column for both team and regular */}
+      {/* Tabs */}
+      <div className="flex items-center gap-1 mb-4 border-b border-white/[0.05]">
+        {([
+          { key: 'messages' as SessionTab, label: 'Messages', icon: <Bot size={14} />, count: messages?.total },
+          { key: 'llm-calls' as SessionTab, label: 'LLM Calls', icon: <Brain size={14} />, count: llmCallsData?.total },
+          { key: 'tool-calls' as SessionTab, label: 'Tool Calls', icon: <Wrench size={14} />, count: toolCallsData?.total },
+          { key: 'skills' as SessionTab, label: 'Skills', icon: <Puzzle size={14} />, count: skills?.length },
+        ]).map((tab) => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveTab(tab.key)}
+            className={`flex items-center gap-2 px-4 py-2.5 text-xs font-medium transition-colors border-b-2 -mb-px ${
+              activeTab === tab.key
+                ? 'border-accent text-accent-light'
+                : 'border-transparent text-muted/60 hover:text-muted hover:border-white/[0.1]'
+            }`}
+          >
+            {tab.icon}
+            {tab.label}
+            {tab.count != null && tab.count > 0 && (
+              <span className="text-[10px] text-muted/40 ml-0.5">({tab.count})</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
       {isLoading ? (
         <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
       ) : isError ? (
@@ -750,43 +839,274 @@ export default function SessionDetail() {
           <p className="text-heading text-sm font-medium mb-1">Failed to load session</p>
           <p className="text-muted/60 text-xs">{errorMessage}</p>
         </div>
-      ) : isTeamSession ? (
-        teamTimeline.length === 0 ? (
+      ) : activeTab === 'messages' ? (
+        /* Messages tab */
+        isTeamSession ? (
+          teamTimeline.length === 0 ? (
+            <EmptyState message="No messages in this session" />
+          ) : (
+            <>
+              <div className="space-y-3">
+                {teamTimeline.map((item) => {
+                  if (item.kind === 'workspace') {
+                    const rendered = renderWorkspaceEntry(item.entry)
+                    return rendered ? <div key={`ws-${item.entry.id}`}>{rendered}</div> : null
+                  }
+                  return <div key={`msg-${item.msg.id}`}>{renderTeamMessageCard(item.msg)}</div>
+                })}
+              </div>
+              <Pagination
+                page={page}
+                perPage={50}
+                total={messages?.total ?? 0}
+                onPageChange={setPage}
+              />
+            </>
+          )
+        ) : !messages || messages.data.length === 0 ? (
           <EmptyState message="No messages in this session" />
         ) : (
           <>
             <div className="space-y-3">
-              {teamTimeline.map((item) => {
-                if (item.kind === 'workspace') {
-                  const rendered = renderWorkspaceEntry(item.entry)
-                  return rendered ? <div key={`ws-${item.entry.id}`}>{rendered}</div> : null
-                }
-                return <div key={`msg-${item.msg.id}`}>{renderTeamMessageCard(item.msg)}</div>
-              })}
+              {messages.data.map((msg) => renderRegularMessageCard(msg))}
             </div>
             <Pagination
               page={page}
               perPage={50}
-              total={messages?.total ?? 0}
+              total={messages.total}
               onPageChange={setPage}
             />
           </>
         )
-      ) : !messages || messages.data.length === 0 ? (
-        <EmptyState message="No messages in this session" />
-      ) : (
-        <>
-          <div className="space-y-3">
-            {messages.data.map((msg) => renderRegularMessageCard(msg))}
+      ) : activeTab === 'llm-calls' ? (
+        /* LLM Calls tab */
+        llmCallsLoading ? (
+          <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        ) : !llmCallsData || llmCallsData.data.length === 0 ? (
+          <EmptyState message="No LLM calls recorded for this session" />
+        ) : (
+          <>
+            <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+                    <th className="text-left px-4 py-3 font-medium">Timestamp</th>
+                    <th className="text-left px-4 py-3 font-medium">Provider</th>
+                    <th className="text-left px-4 py-3 font-medium">Model</th>
+                    <th className="text-right px-4 py-3 font-medium">Input</th>
+                    <th className="text-right px-4 py-3 font-medium">Output</th>
+                    <th className="text-right px-4 py-3 font-medium">Cache R</th>
+                    <th className="text-right px-4 py-3 font-medium">Latency</th>
+                    <th className="text-left px-4 py-3 font-medium">Status</th>
+                    <th className="text-left px-4 py-3 font-medium">Trace</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/[0.03]">
+                  {llmCallsData.data.map((row) => (
+                    <tr key={row.id} className="hover:bg-white/[0.02] transition-colors">
+                      <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
+                        {formatTimestamp(row.created_at)}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-heading font-medium">{row.provider}</td>
+                      <td className="px-4 py-3 text-xs text-muted font-mono max-w-[200px] truncate">{row.model}</td>
+                      <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.input_tokens)}</td>
+                      <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.output_tokens)}</td>
+                      <td className="px-4 py-3 text-xs text-muted/40 font-mono text-right">{formatTokens(row.cache_read_tokens)}</td>
+                      <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">{formatLatency(row.latency_ms)}</td>
+                      <td className="px-4 py-3">{llmStatusBadge(row.status)}</td>
+                      <td className="px-4 py-3">
+                        {row.trace_id ? (
+                          <Link
+                            to={`/traces/${row.trace_id}`}
+                            className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
+                          >
+                            {row.trace_id.slice(0, 8)}...
+                          </Link>
+                        ) : (
+                          <span className="text-muted/30 text-xs">-</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pagination
+              page={llmCallsPage}
+              perPage={50}
+              total={llmCallsData.total}
+              onPageChange={setLlmCallsPage}
+            />
+          </>
+        )
+      ) : activeTab === 'tool-calls' ? (
+        /* Tool Calls tab */
+        toolCallsLoading ? (
+          <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        ) : !toolCallsData || toolCallsData.data.length === 0 ? (
+          <EmptyState message="No tool calls recorded for this session" />
+        ) : (
+          <>
+            <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+                    <th className="w-8 px-2 py-3" />
+                    <th className="text-left px-4 py-3 font-medium">Timestamp</th>
+                    <th className="text-left px-4 py-3 font-medium">Tool</th>
+                    <th className="text-left px-4 py-3 font-medium">Source</th>
+                    <th className="text-left px-4 py-3 font-medium">Skill</th>
+                    <th className="text-left px-4 py-3 font-medium">Status</th>
+                    <th className="text-right px-4 py-3 font-medium">Latency</th>
+                    <th className="text-left px-4 py-3 font-medium">Trace</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/[0.03]">
+                  {toolCallsData.data.map((row) => {
+                    const isOpen = expandedToolCallIds.has(row.id)
+                    return (
+                      <Fragment key={row.id}>
+                        <tr
+                          onClick={() => {
+                            setExpandedToolCallIds((prev) => {
+                              const next = new Set(prev)
+                              if (next.has(row.id)) { next.delete(row.id) } else { next.add(row.id) }
+                              return next
+                            })
+                          }}
+                          className="hover:bg-white/[0.02] transition-colors cursor-pointer"
+                        >
+                          <td className="px-2 py-3 text-muted/30">
+                            {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                          </td>
+                          <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
+                            {formatTimestamp(row.created_at)}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-heading font-mono font-medium max-w-[180px] truncate">
+                            {row.tool_name}
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${toolSourceBadge(row.tool_source)}`}>
+                              {row.tool_source}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-xs text-muted/60">
+                            {row.skill_name ?? <span className="text-muted/30">-</span>}
+                          </td>
+                          <td className="px-4 py-3">
+                            {row.success ? (
+                              <span className="inline-flex items-center gap-1 text-emerald-400">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                                <span className="text-[10px]">ok</span>
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 text-red-400">
+                                <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                                <span className="text-[10px]">fail</span>
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
+                            {formatLatency(row.latency_ms)}
+                          </td>
+                          <td className="px-4 py-3">
+                            {row.trace_id ? (
+                              <Link
+                                to={`/traces/${row.trace_id}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
+                              >
+                                {row.trace_id.slice(0, 8)}...
+                              </Link>
+                            ) : (
+                              <span className="text-muted/30 text-xs">-</span>
+                            )}
+                          </td>
+                        </tr>
+                        {isOpen && (
+                          <tr>
+                            <td colSpan={8} className="px-6 py-4 bg-white/[0.02]">
+                              <div className="space-y-3">
+                                {row.input && (
+                                  <div>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[10px] text-muted/40 uppercase tracking-wider">Input</span>
+                                      <CopyButton text={row.input} title="Copy input" />
+                                    </div>
+                                    <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+                                      {row.input}
+                                    </div>
+                                  </div>
+                                )}
+                                {row.output && (
+                                  <div>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[10px] text-muted/40 uppercase tracking-wider">Output</span>
+                                      <CopyButton text={row.output} title="Copy output" />
+                                    </div>
+                                    <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+                                      {row.output}
+                                    </div>
+                                  </div>
+                                )}
+                                {row.error_message && (
+                                  <div>
+                                    <span className="text-[10px] text-red-400/60 uppercase tracking-wider">Error</span>
+                                    <div className="font-mono text-xs text-red-400/80 pl-2 border-l border-red-400/20 mt-1 whitespace-pre-wrap break-all">
+                                      {row.error_message}
+                                    </div>
+                                  </div>
+                                )}
+                                <div className="text-[10px] text-muted/30">Step {row.step}</div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <Pagination
+              page={toolCallsPage}
+              perPage={50}
+              total={toolCallsData.total}
+              onPageChange={setToolCallsPage}
+            />
+          </>
+        )
+      ) : activeTab === 'skills' ? (
+        /* Skills tab */
+        !skills || skills.length === 0 ? (
+          <EmptyState message="No skills loaded for this session" />
+        ) : (
+          <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+                  <th className="text-left px-4 py-3 font-medium">Skill Name</th>
+                  <th className="text-left px-4 py-3 font-medium">Source</th>
+                  <th className="text-left px-4 py-3 font-medium">Handler Type</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.03]">
+                {skills.map((skill) => (
+                  <tr key={skill.name} className="hover:bg-white/[0.02] transition-colors">
+                    <td className="px-4 py-3 text-xs text-heading font-mono font-medium">{skill.name}</td>
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${toolSourceBadge(skill.source)}`}>
+                        {skill.source}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-xs text-muted/60">{skill.handler_type}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-          <Pagination
-            page={page}
-            perPage={50}
-            total={messages.total}
-            onPageChange={setPage}
-          />
-        </>
-      )}
+        )
+      ) : null}
 
       {investigationScope && (
         <InvestigationPanel

@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router'
-import { Activity, Bot, MessageSquare, Search, CheckSquare, Hammer, Users } from 'lucide-react'
+import { Activity, Bot, MessageSquare, Search, CheckSquare, Hammer, Users, Brain, Wrench } from 'lucide-react'
 
 const navItems = [
   { to: '/', label: 'Event Timeline', icon: Activity },
@@ -7,6 +7,8 @@ const navItems = [
   { to: '/sessions', label: 'Sessions', icon: MessageSquare },
   { to: '/traces', label: 'Traces', icon: Search },
   { to: '/tasks', label: 'Tasks', icon: CheckSquare },
+  { to: '/llm-calls', label: 'LLM Calls', icon: Brain },
+  { to: '/tool-calls', label: 'Tool Calls', icon: Wrench },
   { to: '/dev-runs', label: 'Dev Runs', icon: Hammer },
   { to: '/team-runs', label: 'Team Runs', icon: Users },
 ]
