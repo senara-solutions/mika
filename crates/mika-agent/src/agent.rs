@@ -1190,8 +1190,8 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             .await;
     }
 
-    let store_llm = params.settings.map_or(true, |s| s.store_llm_calls);
-    let store_tools = params.settings.map_or(true, |s| s.store_tool_calls);
+    let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
+    let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let result = run_loop(
         effective_llm,
         tools,
@@ -1864,8 +1864,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     // Silent mode uses safe_always_on_skills (builtin handlers only) — no skills
     // in this path declare required_tools, so pass an empty set.
     let no_required_tools = HashSet::new();
-    let store_llm = params.settings.map_or(true, |s| s.store_llm_calls);
-    let store_tools = params.settings.map_or(true, |s| s.store_tool_calls);
+    let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
+    let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     run_loop(
         effective_llm,
         tools,
@@ -2098,8 +2098,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     };
 
     let mode = LoopMode::Team;
-    let store_llm = params.settings.map_or(true, |s| s.store_llm_calls);
-    let store_tools = params.settings.map_or(true, |s| s.store_tool_calls);
+    let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
+    let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let result = run_loop(
         effective_llm,
         tools,
