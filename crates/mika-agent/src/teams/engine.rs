@@ -174,7 +174,7 @@ impl TeamEngine {
             tool_registry: Arc::new(res.tool_registry),
             callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
-            github_token: settings.investigate_github_token.clone(),
+            github_token: settings.agent_github_token().map(String::from),
             team_db,
             goal_msg_id: None,
             trace_id: mika_common::trace::generate_trace_id(),
@@ -215,7 +215,7 @@ impl TeamEngine {
             tool_registry: Arc::new(res.tool_registry),
             callback: None, // No callback on resume — events go through task system
             brave_api_key: settings.brave_api_key.clone(),
-            github_token: settings.investigate_github_token.clone(),
+            github_token: settings.agent_github_token().map(String::from),
             team_db,
             goal_msg_id: None,
             trace_id,

@@ -331,6 +331,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Server internal auth token",
     },
     ConfigKeyInfo {
+        key: "github_token",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_TOKEN"),
+        secret: true,
+        description: "GitHub token for agent operations (context injection, work item enrichment, PR merge)",
+    },
+    ConfigKeyInfo {
         key: "investigate_github_token",
         backend: ConfigBackend::Env,
         env_var: Some("MIKA_INVESTIGATE_GITHUB_TOKEN"),
@@ -432,6 +439,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
 
         // Non-provider secrets/settings
         "brave_api_key" => settings.brave_api_key.clone(),
+        "github_token" => settings.github_token.clone(),
         "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
         "internal_token" => settings
@@ -585,6 +593,11 @@ pub struct Settings {
     #[serde(default)]
     pub server_log_file: Option<PathBuf>,
 
+    /// GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge).
+    /// Falls back to `investigate_github_token` if not set.
+    #[serde(default)]
+    pub github_token: Option<String>,
+
     /// GitHub Personal Access Token for investigation panel issue creation (optional)
     #[serde(default)]
     pub investigate_github_token: Option<String>,
@@ -675,6 +688,14 @@ pub struct ActiveLlmConfig {
 }
 
 impl Settings {
+    /// Resolve the GitHub token for agent operations.
+    /// Prefers `MIKA_GITHUB_TOKEN`, falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
+    pub fn agent_github_token(&self) -> Option<&str> {
+        self.github_token
+            .as_deref()
+            .or(self.investigate_github_token.as_deref())
+    }
+
     /// Return `(model_field, api_key_field, base_url_field)` references for a given provider.
     pub fn provider_fields(
         &self,
@@ -980,6 +1001,10 @@ impl std::fmt::Debug for Settings {
             .field(
                 "brave_api_key",
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "investigate_github_token",

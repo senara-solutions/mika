@@ -111,7 +111,7 @@ async fn spawn_agent_worker(
     );
 
     let brave_api_key = ctx.settings.brave_api_key.clone();
-    let github_token = ctx.settings.investigate_github_token.clone();
+    let github_token = ctx.settings.agent_github_token().map(String::from);
 
     // Connect to MCP servers
     let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;

@@ -126,7 +126,8 @@ existing shell environment variables. File permissions are set to `0600`.
 MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
 MIKA_OPENAI_API_KEY=sk-...        # Also used for Layer 3 vector search
 MIKA_BRAVE_API_KEY=BSA...
-MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...
+MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PRs, issues, context injection)
+MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...  # Investigation panel only (issue creation)
 MIKA_GITHUB_REPO=owner/repo
 ```
 
@@ -135,10 +136,26 @@ preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
 `~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
 server mode.
 
+### GitHub token for agent operations
+
+`MIKA_GITHUB_TOKEN` enables agent-level GitHub operations: context injection (fetching
+PR diffs), work item enrichment (PR/issue status), and dev-run PR merges. If not set,
+falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
+
+1. Create a GitHub Personal Access Token:
+   - **Fine-grained token** (recommended): Settings → Developer settings →
+     Fine-grained tokens → select your repo → Permissions → Pull requests: Read and Write,
+     Issues: Read and Write, Contents: Read
+2. Add to `~/.mika/.env`:
+   ```sh
+   MIKA_GITHUB_TOKEN=ghp_your_token_here
+   ```
+
 ### GitHub issue creation (dashboard investigation)
 
 The investigation panel can create GitHub issues when both `MIKA_INVESTIGATE_GITHUB_TOKEN`
-and `MIKA_GITHUB_REPO` are set. Steps:
+and `MIKA_GITHUB_REPO` are set. This token is separate from `MIKA_GITHUB_TOKEN` — the
+investigation panel uses only `MIKA_INVESTIGATE_GITHUB_TOKEN`. Steps:
 
 1. Create a GitHub Personal Access Token:
    - **Fine-grained token** (recommended): Settings → Developer settings →
@@ -254,7 +271,8 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
-| `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
+| `github_token` | `Option<String>` | None | `MIKA_GITHUB_TOKEN` | GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge). Needs Pull requests R/W, Issues R/W, Contents R scopes. Falls back to `investigate_github_token` if not set. |
+| `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool only. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
 | `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
@@ -431,7 +449,8 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key (LLM + Layer 3 vector search) |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
-| `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
+| `MIKA_GITHUB_TOKEN` | No | GitHub token for agent operations (falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`) |
+| `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation only |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 

@@ -137,6 +137,13 @@ fn run_cli_prompts(
     }
 
     // 3. GitHub integration (optional)
+    if interactive && !secret_is_set("MIKA_GITHUB_TOKEN") {
+        *env_written |= prompt_optional_secret(
+            home_dir,
+            "MIKA_GITHUB_TOKEN",
+            "  GitHub token for agent operations — PRs R/W, Issues R/W, Contents R (optional, press Enter to skip)",
+        )?;
+    }
     if interactive && !secret_is_set("MIKA_INVESTIGATE_GITHUB_TOKEN") {
         *env_written |= prompt_optional_secret(
             home_dir,
@@ -448,6 +455,7 @@ fn run_compose_generation() -> Result<()> {
         lines.push(format!("MIKA_OPENAI_API_KEY={openai_key}"));
     }
     if !github_token.is_empty() {
+        lines.push(format!("MIKA_GITHUB_TOKEN={github_token}"));
         lines.push(format!("MIKA_INVESTIGATE_GITHUB_TOKEN={github_token}"));
     }
     if !github_repo.is_empty() {
