@@ -2618,6 +2618,24 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Get IDs of pending callback tasks for a given session.
+    ///
+    /// Used by `mika ask` to detect background tasks that were spawned during the
+    /// agent loop but won't be consumed until TUI or server starts. See #265.
+    pub fn get_pending_callbacks_for_session(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM tasks
+             WHERE created_by_session = ?1
+               AND trigger_type = 'callback'
+               AND status = 'pending'
+             ORDER BY created_at ASC",
+        )?;
+        let ids = stmt
+            .query_map(params![session_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
     /// Count child tasks for a given parent task (manual work items only).
     pub fn count_child_tasks(
         &self,

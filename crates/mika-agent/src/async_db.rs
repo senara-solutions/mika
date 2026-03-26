@@ -231,6 +231,12 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_manual_task(&i, &a)).await
     }
 
+    pub async fn get_pending_callbacks_for_session(&self, session_id: &str) -> Result<Vec<String>> {
+        let s = session_id.to_owned();
+        self.with_db(move |db| db.get_pending_callbacks_for_session(&s))
+            .await
+    }
+
     pub async fn count_child_tasks(&self, parent_task_id: &str) -> Result<Vec<(String, i64)>> {
         let p = parent_task_id.to_owned();
         let a = self.agent_id.clone();

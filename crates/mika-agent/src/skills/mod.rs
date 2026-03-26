@@ -61,8 +61,8 @@ impl SkillRegistry {
     }
 
     /// Match skills against a user message.
-    /// Only returns enabled skills.
-    pub fn match_message(&self, user_message: &str) -> Vec<&SkillEntry> {
+    /// Only returns enabled skills, annotated with match reason.
+    pub fn match_message(&self, user_message: &str) -> Vec<matcher::MatchedSkill<'_>> {
         matcher::match_skills(&self.skills, user_message)
     }
 
@@ -203,7 +203,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = SkillRegistry::from_dir(tmp.path());
         assert!(!registry.has_skills());
-        assert!(registry.match_message("hello").is_empty());
+        let matched = registry.match_message("hello");
+        assert!(matched.is_empty());
     }
 
     #[test]
