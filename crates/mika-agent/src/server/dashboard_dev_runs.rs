@@ -153,13 +153,13 @@ pub async fn handle_dev_run_merge(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    let github_token = match &state.settings.investigate_github_token {
-        Some(token) if !token.is_empty() => token.clone(),
+    let github_token = match state.settings.agent_github_token() {
+        Some(token) if !token.is_empty() => token.to_string(),
         _ => {
             return (
                 StatusCode::PRECONDITION_FAILED,
                 Json(serde_json::json!({
-                    "error": "MIKA_INVESTIGATE_GITHUB_TOKEN is not configured"
+                    "error": "MIKA_GITHUB_TOKEN (or MIKA_INVESTIGATE_GITHUB_TOKEN) is not configured"
                 })),
             )
                 .into_response();
