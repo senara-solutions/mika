@@ -21,6 +21,7 @@ use crate::skills::builtin_handlers;
 use crate::skills::executor;
 use crate::skills::index::{ResolvedSkillTool, SkillEntry};
 use crate::skills::manifest::ToolHandler;
+use crate::skills::matcher::{MatchReason, MatchedSkill};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
@@ -1009,9 +1010,10 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.user_message);
+    let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve per-skill LLM override (if any matched skill declares [llm])
-    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    let skill_llm_override = resolve_skill_llm_override(&matched_entries, params.settings, llm);
     let effective_llm: &dyn LlmProvider = match &skill_llm_override {
         Some(override_llm) => override_llm.as_ref(),
         None => llm,
@@ -1020,9 +1022,9 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
     let mut skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
-    let skill_tool_map = build_skill_tool_map(&matched);
-    let skill_timeout = max_skill_timeout(&matched, provider, model);
+        inject_skills_and_resolve_tools(&matched_entries, tools, &mut system, provider, model);
+    let skill_tool_map = build_skill_tool_map(&matched_entries);
+    let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched);
 
     // Append MCP tool definitions (if any MCP servers are connected)
@@ -2035,9 +2037,10 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     // Match skills and resolve tool definitions
     let matched = params.skills.match_message(params.task_message);
+    let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve per-skill LLM override
-    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    let skill_llm_override = resolve_skill_llm_override(&matched_entries, params.settings, llm);
     let effective_llm: &dyn LlmProvider = match &skill_llm_override {
         Some(override_llm) => override_llm.as_ref(),
         None => llm,
@@ -2046,9 +2049,9 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
     let mut skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
-    let skill_tool_map = build_skill_tool_map(&matched);
-    let skill_timeout = max_skill_timeout(&matched, provider, model);
+        inject_skills_and_resolve_tools(&matched_entries, tools, &mut system, provider, model);
+    let skill_tool_map = build_skill_tool_map(&matched_entries);
+    let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched);
 
     // Append MCP tool definitions (if any MCP servers are connected)
@@ -2332,14 +2335,18 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &
         .unwrap_or(TOOL_TIMEOUT_SECS)
 }
 
-/// Collect the union of all `required_tools` from matched skills' `[constraints]` sections.
+/// Collect the union of all `required_tools` from keyword-matched skills' `[constraints]` sections.
 ///
-/// Returns the set of tool names that must be called at least once before the engine
-/// accepts the assistant's response. See #270.
-fn collect_required_tools(matched: &[&SkillEntry]) -> HashSet<String> {
+/// Only skills that matched via keyword contribute to the required set. Skills matched
+/// solely via `always_on` or pulled in as dependencies do NOT enforce their constraints.
+/// This prevents always-on skills (like self-dev) from requiring tools on every message —
+/// constraints are only enforced when the user's message actually triggered the skill's
+/// keywords. See #265, #270.
+fn collect_required_tools(matched: &[MatchedSkill<'_>]) -> HashSet<String> {
     matched
         .iter()
-        .flat_map(|e| e.manifest.constraints.required_tools.iter())
+        .filter(|m| m.reason == MatchReason::Keyword)
+        .flat_map(|m| m.entry.manifest.constraints.required_tools.iter())
         .cloned()
         .collect()
 }
@@ -3639,20 +3646,29 @@ mod tests {
         assert!(!ctx.contains("delegate_task"));
     }
 
-    // -- collect_required_tools tests (#270) --
+    // -- collect_required_tools tests (#270, #265) --
 
     #[test]
     fn test_collect_required_tools_empty_when_no_constraints() {
         let s1 = make_skill_entry("search", 30, &["web_search"]);
         let s2 = make_skill_entry("calc", 10, &["calculate"]);
-        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        let matched = vec![
+            MatchedSkill {
+                entry: &s1,
+                reason: MatchReason::Keyword,
+            },
+            MatchedSkill {
+                entry: &s2,
+                reason: MatchReason::Keyword,
+            },
+        ];
         let required = collect_required_tools(&matched);
         assert!(required.is_empty());
     }
 
     #[test]
-    fn test_collect_required_tools_union_across_skills() {
-        // Two skills with different required_tools — result is the union, deduped
+    fn test_collect_required_tools_union_across_keyword_matched_skills() {
+        // Two keyword-matched skills with different required_tools — result is the union
         let s1 = make_skill_entry_with_constraints("qa-review", 30, &["run_gh"], &["run_gh"]);
         let s2 = make_skill_entry_with_constraints(
             "code-check",
@@ -3660,11 +3676,103 @@ mod tests {
             &["run_lint"],
             &["run_lint", "run_gh"],
         );
-        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
+        let matched = vec![
+            MatchedSkill {
+                entry: &s1,
+                reason: MatchReason::Keyword,
+            },
+            MatchedSkill {
+                entry: &s2,
+                reason: MatchReason::Keyword,
+            },
+        ];
         let required = collect_required_tools(&matched);
-        // run_gh + run_lint, deduplicated
         assert_eq!(required.len(), 2);
         assert!(required.contains("run_gh"));
         assert!(required.contains("run_lint"));
+    }
+
+    #[test]
+    fn test_collect_required_tools_ignores_always_on_matched_skills() {
+        // Skill matched via always_on should NOT contribute required_tools (#265)
+        let s1 = make_skill_entry_with_constraints(
+            "self-dev",
+            30,
+            &["run_claude_pilot"],
+            &["run_claude_pilot"],
+        );
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::AlwaysOn,
+        }];
+        let required = collect_required_tools(&matched);
+        assert!(
+            required.is_empty(),
+            "always_on skills should not enforce required_tools"
+        );
+    }
+
+    #[test]
+    fn test_collect_required_tools_ignores_dependency_matched_skills() {
+        // Skill pulled in as a dependency should NOT contribute required_tools
+        let s1 = make_skill_entry_with_constraints(
+            "claude-pilot",
+            30,
+            &["run_claude_pilot"],
+            &["run_claude_pilot"],
+        );
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::Dependency,
+        }];
+        let required = collect_required_tools(&matched);
+        assert!(
+            required.is_empty(),
+            "dependency skills should not enforce required_tools"
+        );
+    }
+
+    #[test]
+    fn test_collect_required_tools_keyword_match_on_always_on_skill_enforces() {
+        // When an always_on skill is matched via keyword, its required_tools ARE enforced
+        let s1 = make_skill_entry_with_constraints(
+            "self-dev",
+            30,
+            &["run_claude_pilot"],
+            &["run_claude_pilot"],
+        );
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::Keyword,
+        }];
+        let required = collect_required_tools(&matched);
+        assert_eq!(required.len(), 1);
+        assert!(required.contains("run_claude_pilot"));
+    }
+
+    #[test]
+    fn test_collect_required_tools_mixed_reasons() {
+        // Mix of keyword and always_on matches — only keyword contributes
+        let s1 = make_skill_entry_with_constraints(
+            "self-dev",
+            30,
+            &["run_claude_pilot"],
+            &["run_claude_pilot"],
+        );
+        let s2 = make_skill_entry_with_constraints("qa-check", 30, &["run_tests"], &["run_tests"]);
+        let matched = vec![
+            MatchedSkill {
+                entry: &s1,
+                reason: MatchReason::AlwaysOn,
+            },
+            MatchedSkill {
+                entry: &s2,
+                reason: MatchReason::Keyword,
+            },
+        ];
+        let required = collect_required_tools(&matched);
+        assert_eq!(required.len(), 1);
+        assert!(required.contains("run_tests"));
+        assert!(!required.contains("run_claude_pilot"));
     }
 }

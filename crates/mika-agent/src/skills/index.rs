@@ -560,6 +560,21 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
+    // 5c. Warn if always_on skill with no keywords declares required_tools (#265)
+    // Such constraints will never be enforced because required_tools only triggers
+    // when a skill is matched via keyword, not just always_on.
+    if manifest.skill.always_on
+        && manifest.triggers.keywords.is_empty()
+        && !manifest.constraints.required_tools.is_empty()
+    {
+        diags.push(SkillDiagnostic::warn(
+            "[constraints] required_tools declared on always_on skill with no keywords — \
+             constraints will only be enforced when the skill matches via keyword. \
+             Add keywords to [triggers] or the required_tools will never be enforced."
+                .to_string(),
+        ));
+    }
+
     // 6. Check prompt snippet size against effective limit
     let snippet_path = skill_dir.join("system_prompt.md");
     if snippet_path.exists() {

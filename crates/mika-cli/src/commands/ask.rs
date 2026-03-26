@@ -15,6 +15,8 @@ use crate::init;
 struct AskJsonResponse {
     role: &'static str,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_tasks: Vec<String>,
 }
 
 pub async fn run(
@@ -211,15 +213,40 @@ pub async fn run(
 
     let output = output?;
 
+    // Check for pending callback tasks spawned during the agent loop (#265).
+    // In `mika ask` there is no TaskEngine to poll for callbacks — the user needs
+    // TUI or server to receive results from long-running background tasks.
+    let pending_callbacks = match ctx
+        .async_db
+        .get_pending_callbacks_for_session(&session_id)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to check pending callbacks");
+            vec![]
+        }
+    };
+
     match format {
-        OutputFormat::Text => match output.text {
-            Some(text) => println!("{text}"),
-            None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
-        },
+        OutputFormat::Text => {
+            match output.text {
+                Some(text) => println!("{text}"),
+                None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
+            }
+            if !pending_callbacks.is_empty() {
+                eprintln!(
+                    "\n[mika] {} background task(s) started. \
+                     Open TUI (`mika`) or start server to receive results.",
+                    pending_callbacks.len()
+                );
+            }
+        }
         OutputFormat::Json => {
             let response = AskJsonResponse {
                 role: "assistant",
                 content: output.text,
+                pending_tasks: pending_callbacks,
             };
             println!("{}", serde_json::to_string(&response)?);
         }
@@ -404,6 +431,7 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: Some("Hello, world!".to_string()),
+            pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(json, r#"{"role":"assistant","content":"Hello, world!"}"#);
@@ -414,6 +442,7 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: None,
+            pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(json, r#"{"role":"assistant","content":null}"#);
@@ -424,10 +453,37 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: Some("Line 1\nLine 2\t\"quoted\"".to_string()),
+            pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["role"], "assistant");
         assert_eq!(parsed["content"], "Line 1\nLine 2\t\"quoted\"");
+    }
+
+    #[test]
+    fn test_json_response_with_pending_tasks() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("I've started the implementation.".to_string()),
+            pending_tasks: vec!["task-abc-123".to_string(), "task-def-456".to_string()],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["role"], "assistant");
+        assert!(parsed["pending_tasks"].is_array());
+        assert_eq!(parsed["pending_tasks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_json_response_omits_empty_pending_tasks() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Done.".to_string()),
+            pending_tasks: vec![],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        // pending_tasks should be omitted entirely when empty
+        assert!(!json.contains("pending_tasks"));
     }
 }
