@@ -32,3 +32,6 @@ compound-engineering.local.md
 .claude/worktrees
 .claude/scheduled_tasks.lock
 node_modules
+
+# Lefthook
+lefthook-local.yml

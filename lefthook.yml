@@ -1,0 +1,55 @@
+# Lefthook — pre-commit quality gates for mika (Rust + TypeScript)
+# https://github.com/evilmartians/lefthook
+#
+# Install: lefthook install
+# Run manually: lefthook run pre-commit
+
+pre-commit:
+  parallel: true
+  commands:
+    rust-fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+      stage_fixed: true
+
+    rust-clippy:
+      glob: "*.rs"
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      stage_fixed: true
+
+    dashboard-lint:
+      glob: "dashboard/**/*.{ts,tsx,js,jsx}"
+      run: npm run lint -w dashboard
+      stage_fixed: true
+
+    dashboard-typecheck:
+      glob: "dashboard/**/*.{ts,tsx}"
+      run: npx tsc --noEmit -p dashboard/tsconfig.json
+
+    ui-typecheck:
+      glob: "packages/ui/**/*.{ts,tsx}"
+      run: npx tsc --noEmit -p packages/ui/tsconfig.json
+
+    toml-syntax:
+      glob: "*.toml"
+      run: >
+        for f in {staged_files}; do
+          python3 -c "import tomllib; tomllib.load(open('$f','rb'))" 2>&1 || exit 1;
+        done
+
+    no-secrets:
+      glob: "*.{rs,ts,tsx,js,jsx,toml,json,sh,env}"
+      exclude: "lefthook*.yml"
+      run: >
+        grep -rn -E '(sk-ant-api|sk-ant-oat|AKIA[A-Z0-9]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY)' {staged_files}
+        && echo "Potential secret detected!" && exit 1 || true
+
+    no-large-files:
+      run: >
+        for f in {staged_files}; do
+          size=$(wc -c < "$f" 2>/dev/null || echo 0);
+          if [ "$size" -gt 1048576 ]; then
+            echo "File $f is $(( size / 1024 ))KB — exceeds 1MB limit";
+            exit 1;
+          fi;
+        done
