@@ -133,6 +133,7 @@ mod tests {
             session_id: "test-session",
             trace_id: "00000000000000000000000000000000",
             home_dir: std::path::Path::new("/tmp"),
+            global_home_dir: None,
             core_memory_edit_count: &harness.counter,
             is_onboarding: false,
             message_sender: Some(mock.clone()),

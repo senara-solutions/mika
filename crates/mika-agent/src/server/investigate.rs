@@ -750,6 +750,7 @@ async fn run_investigation(
         session_id: &investigation_session_id,
         trace_id: &investigation_trace_id,
         home_dir: std::path::Path::new("/tmp"),
+        global_home_dir: None,
         core_memory_edit_count: &edit_count,
         is_onboarding: false,
         message_sender: None,

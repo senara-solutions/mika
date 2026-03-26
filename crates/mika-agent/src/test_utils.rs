@@ -38,6 +38,7 @@ pub mod test_helpers {
             session_id: "test-session",
             trace_id: "00000000000000000000000000000000",
             home_dir: std::path::Path::new(HOME_DIR),
+            global_home_dir: None,
             core_memory_edit_count: edit_count,
             is_onboarding,
             message_sender: None,
@@ -105,6 +106,7 @@ pub mod test_helpers {
                 session_id: "test-session",
                 trace_id: "00000000000000000000000000000000",
                 home_dir: std::path::Path::new("/tmp/mika-test"),
+                global_home_dir: None,
                 core_memory_edit_count: &self.counter,
                 is_onboarding: false,
                 message_sender: None,
@@ -126,6 +128,33 @@ pub mod test_helpers {
                 session_id: "test-session",
                 trace_id: "00000000000000000000000000000000",
                 home_dir: home,
+                global_home_dir: None,
+                core_memory_edit_count: &self.counter,
+                is_onboarding: false,
+                message_sender: None,
+                embedding_client: None,
+                brave_api_key: None,
+                github_token: None,
+                skills_dirty: &SKILLS_DIRTY,
+                is_reflection: false,
+                is_task_context: false,
+                is_callback_turn: false,
+            }
+        }
+        /// Create a ToolContext with custom home and global home directories.
+        /// Used for testing cross-agent file access.
+        pub fn ctx_with_home_and_global<'a>(
+            &'a self,
+            home: &'a std::path::Path,
+            global: &'a std::path::Path,
+        ) -> ToolContext<'a> {
+            static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+            ToolContext {
+                db: &self.db,
+                session_id: "test-session",
+                trace_id: "00000000000000000000000000000000",
+                home_dir: home,
+                global_home_dir: Some(global),
                 core_memory_edit_count: &self.counter,
                 is_onboarding: false,
                 message_sender: None,
