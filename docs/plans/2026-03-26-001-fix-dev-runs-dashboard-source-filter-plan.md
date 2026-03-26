@@ -1,7 +1,7 @@
 ---
 title: "fix: dev runs dashboard filters by source='self_dev', excluding github_issue-triggered runs"
 type: fix
-status: active
+status: completed
 date: 2026-03-26
 issue: "#277"
 ---
