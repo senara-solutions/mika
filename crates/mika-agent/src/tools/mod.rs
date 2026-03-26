@@ -525,9 +525,7 @@ pub fn management_tools_if_needed(
         // work_item_id from the orchestrator via delegate_task and never
         // need to create or update work items themselves).
         tools.push(Box::new(create_work_item::CreateWorkItemTool));
-        tools.push(Box::new(
-            update_work_item_status::UpdateWorkItemStatusTool,
-        ));
+        tools.push(Box::new(update_work_item_status::UpdateWorkItemStatusTool));
     }
 
     tools
