@@ -6371,7 +6371,7 @@ impl Database {
         Ok((data, count))
     }
 
-    // ===== Dashboard: Dev Runs (work items with source='self_dev') =====
+    // ===== Dashboard: Dev Runs (work items with dev-run sources) =====
 
     /// Update the metadata JSON on a manual (work item) task.
     /// Only works on `trigger_type='manual'` tasks. Returns false if not found.
@@ -6384,10 +6384,10 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Get a single dev run (work item with source='self_dev') by ID — unscoped by agent_id.
+    /// Get a single dev run (work item with a dev-run source) by ID — unscoped by agent_id.
     pub fn get_dev_run(&self, task_id: &str) -> Result<Option<Task>> {
         let sql = format!(
-            "SELECT {} FROM tasks WHERE id = ?1 AND trigger_type = 'manual' AND source = 'self_dev'",
+            "SELECT {} FROM tasks WHERE id = ?1 AND trigger_type = 'manual' AND source IN ('self_dev', 'github_issue')",
             Self::TASK_COLUMNS
         );
         self.conn
@@ -6396,7 +6396,7 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// List dev runs (work items with source='self_dev') with pagination and count.
+    /// List dev runs (work items with dev-run sources) with pagination and count.
     pub fn list_dev_runs_paginated_with_count(
         &self,
         status: Option<&str>,
@@ -6407,17 +6407,16 @@ impl Database {
 
         if let Some(s) = status {
             status_param = Some(s.to_string());
-            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev' AND status = ?1";
+            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') AND status = ?1";
             data_sql = format!(
-                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev' AND status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') AND status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
                 Self::TASK_COLUMNS
             );
         } else {
             status_param = None;
-            count_sql =
-                "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev'";
+            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue')";
             data_sql = format!(
-                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source = 'self_dev' ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
                 Self::TASK_COLUMNS
             );
         }
