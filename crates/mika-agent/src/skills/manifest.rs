@@ -34,6 +34,10 @@ pub struct SkillManifest {
     /// Used to enforce tool execution before accepting a response.
     #[serde(default)]
     pub constraints: Constraints,
+    /// Declarative context requirements. Each key maps to a `{{key}}` placeholder
+    /// in the system prompt. The engine pre-fetches the data before the LLM turn.
+    #[serde(default)]
+    pub context: std::collections::HashMap<String, ContextRequirement>,
 }
 
 /// Per-skill LLM provider and model preferences.
@@ -79,6 +83,33 @@ impl Constraints {
     pub fn is_empty(&self) -> bool {
         self.required_tools.is_empty()
     }
+}
+
+/// A single context requirement declared in `[context.*]` sections of `skill.toml`.
+///
+/// Skills declare what data the engine should pre-fetch before the LLM turn.
+/// The engine resolves each requirement by dispatching to a handler matched by `context_type`.
+///
+/// Example in `skill.toml`:
+/// ```toml
+/// [context.pr_diff]
+/// type = "gh_pr_diff"
+/// required = true
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ContextRequirement {
+    /// Engine-owned context type identifier (e.g., "gh_pr_diff").
+    /// Matched to a built-in handler at runtime.
+    #[serde(rename = "type")]
+    pub context_type: String,
+    /// If true (the default), the declaring skill is excluded from the turn
+    /// when this context cannot be resolved. If false, the placeholder remains empty.
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Core skill metadata from the `[skill]` section.
@@ -618,5 +649,93 @@ mod tests {
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(manifest.llm.provider.as_deref(), Some("anthropic"));
         assert_eq!(manifest.constraints.required_tools, vec!["run_gh"]);
+    }
+
+    // -- [context] section tests --
+
+    #[test]
+    fn test_parse_context_section() {
+        let toml_str = r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [context.pr_diff]
+            type = "gh_pr_diff"
+            required = true
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.context.len(), 1);
+        let req = manifest.context.get("pr_diff").unwrap();
+        assert_eq!(req.context_type, "gh_pr_diff");
+        assert!(req.required);
+    }
+
+    #[test]
+    fn test_parse_no_context_defaults_empty() {
+        let toml_str = r#"
+            [skill]
+            name = "simple"
+            description = "No context"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.context.is_empty());
+    }
+
+    #[test]
+    fn test_context_required_defaults_to_true() {
+        let toml_str = r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [context.pr_diff]
+            type = "gh_pr_diff"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        let req = manifest.context.get("pr_diff").unwrap();
+        assert!(req.required);
+    }
+
+    #[test]
+    fn test_context_required_false() {
+        let toml_str = r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [context.pr_diff]
+            type = "gh_pr_diff"
+            required = false
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        let req = manifest.context.get("pr_diff").unwrap();
+        assert!(!req.required);
+    }
+
+    #[test]
+    fn test_context_coexists_with_constraints_and_llm() {
+        let toml_str = r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [llm]
+            provider = "deepseek"
+
+            [constraints]
+            required_tools = ["run_gh"]
+
+            [context.pr_diff]
+            type = "gh_pr_diff"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.llm.provider.as_deref(), Some("deepseek"));
+        assert_eq!(manifest.constraints.required_tools, vec!["run_gh"]);
+        assert_eq!(manifest.context.len(), 1);
+        assert_eq!(
+            manifest.context.get("pr_diff").unwrap().context_type,
+            "gh_pr_diff"
+        );
     }
 }

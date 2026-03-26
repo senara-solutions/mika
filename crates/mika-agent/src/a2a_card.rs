@@ -88,6 +88,7 @@ mod tests {
             },
             llm: Default::default(),
             constraints: Default::default(),
+            context: std::collections::HashMap::new(),
         };
         let toml_str = toml::to_string(&manifest).unwrap();
         std::fs::write(skill_dir.join("skill.toml"), toml_str).unwrap();

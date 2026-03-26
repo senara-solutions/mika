@@ -575,6 +575,87 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         ));
     }
 
+    // 5d. Validate [context] section
+    for (key, req) in &manifest.context {
+        if !super::context::KNOWN_CONTEXT_TYPES.contains(&req.context_type.as_str()) {
+            diags.push(SkillDiagnostic::fail(format!(
+                "[context.{}] declares unknown type '{}'. Known types: {:?}",
+                key,
+                req.context_type,
+                super::context::KNOWN_CONTEXT_TYPES
+            )));
+        } else {
+            diags.push(SkillDiagnostic::ok(format!(
+                "[context.{}] type '{}' is valid (required={})",
+                key, req.context_type, req.required
+            )));
+        }
+    }
+
+    // 5e. Cross-check {{key}} placeholders in prompts against [context.*] declarations
+    {
+        let placeholder_re = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
+        // Collect placeholders from the root prompt snippet
+        let snippet_content =
+            std::fs::read_to_string(skill_dir.join("system_prompt.md")).unwrap_or_default();
+        let mut all_placeholders: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for cap in placeholder_re.captures_iter(&snippet_content) {
+            all_placeholders.insert(cap.get(1).unwrap().as_str().to_string());
+        }
+        // Also check model-specific prompt variants
+        if let Ok(rd) = std::fs::read_dir(skill_dir) {
+            for dir_entry in rd.flatten() {
+                let sub_path = dir_entry.path();
+                if sub_path.is_dir() {
+                    // Check provider/model subdirectories for system_prompt.md
+                    if let Ok(sub_rd) = std::fs::read_dir(&sub_path) {
+                        for sub_entry in sub_rd.flatten() {
+                            let model_prompt = sub_entry.path().join("system_prompt.md");
+                            if model_prompt.exists()
+                                && let Ok(content) = std::fs::read_to_string(&model_prompt)
+                            {
+                                for cap in placeholder_re.captures_iter(&content) {
+                                    all_placeholders
+                                        .insert(cap.get(1).unwrap().as_str().to_string());
+                                }
+                            }
+                        }
+                    }
+                    // Also check direct system_prompt.md in provider dir
+                    let provider_prompt = sub_path.join("system_prompt.md");
+                    if provider_prompt.exists()
+                        && let Ok(content) = std::fs::read_to_string(&provider_prompt)
+                    {
+                        for cap in placeholder_re.captures_iter(&content) {
+                            all_placeholders.insert(cap.get(1).unwrap().as_str().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Placeholders without context declarations → Fail
+        for ph in &all_placeholders {
+            if !manifest.context.contains_key(ph) {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "Prompt uses {{{{{}}}}} but no [context.{}] section declares it. \
+                     Add [context.{}] to skill.toml or remove the placeholder.",
+                    ph, ph, ph
+                )));
+            }
+        }
+        // Context declarations without placeholders → Warn
+        for key in manifest.context.keys() {
+            if !all_placeholders.contains(key) {
+                diags.push(SkillDiagnostic::warn(format!(
+                    "[context.{}] declared but no {{{{{}}}}} placeholder found in any prompt variant. \
+                     The context will be fetched but never used.",
+                    key, key
+                )));
+            }
+        }
+    }
+
     // 6. Check prompt snippet size against effective limit
     let snippet_path = skill_dir.join("system_prompt.md");
     if snippet_path.exists() {
@@ -2075,6 +2156,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2112,6 +2194,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2145,6 +2228,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2178,6 +2262,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2764,6 +2849,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2813,6 +2899,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2852,6 +2939,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2905,6 +2993,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2964,6 +3053,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3020,6 +3110,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3200,6 +3291,170 @@ mod tests {
         assert!(
             nesting_warn.is_some(),
             "Expected warning for deep nesting. Got: {diags:?}"
+        );
+    }
+
+    // -- [context] validation tests --
+
+    #[test]
+    fn test_validate_skill_context_known_type_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("qa-review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [context.pr_diff]
+            type = "gh_pr_diff"
+            required = true
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("system_prompt.md"),
+            "Review the diff: {{pr_diff}}",
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let ok_diag = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Ok && d.message.contains("[context.pr_diff]"));
+        assert!(
+            ok_diag.is_some(),
+            "Expected OK diag for valid context. Got: {diags:?}"
+        );
+        // No fail diagnostics related to context
+        let fail_ctx = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Fail && d.message.contains("[context"));
+        assert!(
+            fail_ctx.is_none(),
+            "Unexpected FAIL for valid context. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_context_unknown_type_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("bad-context");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "bad-context"
+            description = "Unknown context type"
+
+            [context.data]
+            type = "nonexistent_type"
+            "#,
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail_diag = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Fail && d.message.contains("unknown type"));
+        assert!(
+            fail_diag.is_some(),
+            "Expected FAIL for unknown context type. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_context_placeholder_without_declaration_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("orphan-placeholder");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "orphan-placeholder"
+            description = "Prompt with undeclared placeholder"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("system_prompt.md"),
+            "Use this data: {{undeclared_var}}",
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail_diag = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Fail
+                && d.message.contains("{{undeclared_var}}")
+                && d.message.contains("no [context.undeclared_var]")
+        });
+        assert!(
+            fail_diag.is_some(),
+            "Expected FAIL for undeclared placeholder. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_context_declaration_without_placeholder_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("unused-context");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "unused-context"
+            description = "Context declared but not used"
+
+            [context.pr_diff]
+            type = "gh_pr_diff"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "No placeholders here.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let warn_diag = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("[context.pr_diff] declared")
+                && d.message.contains("never used")
+        });
+        assert!(
+            warn_diag.is_some(),
+            "Expected WARN for unused context declaration. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_no_context_no_placeholders_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("clean");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "clean"
+            description = "No context, no placeholders"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Just a prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        // No context-related fails or warns
+        let ctx_issues = diags.iter().filter(|d| {
+            (d.level == DiagnosticLevel::Fail || d.level == DiagnosticLevel::Warn)
+                && (d.message.contains("[context") || d.message.contains("{{"))
+        });
+        assert_eq!(
+            ctx_issues.count(),
+            0,
+            "Expected no context issues. Got: {diags:?}"
         );
     }
 }
