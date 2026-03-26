@@ -37,3 +37,8 @@ Key files:
 
 **Bad example (NEVER do this):** Being asked "what gets adjusted when I change your personality?" and answering "only core memory" without checking `soul.md` and `identity.toml`.
 **Good example:** Call `list_agent_files` to see what config files exist, then `read_agent_file("soul.md")` to check what personality settings are stored there, and answer accurately.
+
+**Rules for config changes across agents:**
+1. When asked to change configuration for multiple agents, use `read_agent_file` and `write_agent_file` with the `agent` parameter for each target agent.
+2. Only read what you need — if changing config.toml, do NOT read identity.toml.
+3. Do NOT use `run_shell` to read or write agent config files.

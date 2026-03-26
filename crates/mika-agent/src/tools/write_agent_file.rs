@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, validate_and_resolve_path};
+use super::{
+    MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path,
+};
 
 /// Maximum file size for reading existing content during confirmation flow (100 KB).
 const MAX_EXISTING_SIZE: u64 = 100 * 1024;
@@ -36,6 +38,10 @@ impl Tool for WriteAgentFileTool {
                     "confirm": {
                         "type": "boolean",
                         "description": "Set to true to confirm overwriting an existing file. Required when the file already exists."
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Target agent name (orchestrator-only). Omit to use your own home directory."
                     }
                 },
                 "required": ["path", "content"]
@@ -45,6 +51,7 @@ impl Tool for WriteAgentFileTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
+        let agent_param = input["agent"].as_str();
 
         let content = input["content"].as_str().unwrap_or("");
         if content.is_empty() {
@@ -60,13 +67,20 @@ impl Tool for WriteAgentFileTool {
 
         let confirm = input["confirm"].as_bool().unwrap_or(false);
 
-        let full_path = match validate_and_resolve_path(path, ctx.home_dir, true).await {
+        // Resolve base directory (own home or target agent's home)
+        let base_dir = match resolve_agent_home(agent_param, ctx).await {
+            Ok(dir) => dir,
+            Err(e) => return Ok(e),
+        };
+
+        let full_path = match validate_and_resolve_path(path, &base_dir, true).await {
             Ok(p) => p,
             Err(e) => {
-                // If the path was absolute, hint that run_shell can write outside the home dir
+                // If the path was absolute, hint about agent parameter or run_shell
                 if Path::new(path).is_absolute() {
                     return Ok(ToolOutput::error(format!(
-                        "{} For paths outside your home directory, use run_shell instead.",
+                        "{} For other agents' files, use the `agent` parameter. \
+                         For paths outside any agent's home directory, use run_shell.",
                         e.content
                     )));
                 }
@@ -90,6 +104,12 @@ impl Tool for WriteAgentFileTool {
         }
 
         if file_exists && !confirm {
+            // Build the retry hint including agent param if cross-agent
+            let agent_hint = match agent_param {
+                Some(name) if !name.is_empty() => format!(" and agent: \"{}\"", name.trim()),
+                _ => String::new(),
+            };
+
             // Read existing content and return it for the agent to review
             match tokio::fs::metadata(&full_path).await {
                 Ok(meta) => {
@@ -97,7 +117,7 @@ impl Tool for WriteAgentFileTool {
                     if size > MAX_EXISTING_SIZE {
                         return Ok(ToolOutput::error(format!(
                             "File already exists at '{}' ({size} bytes, too large to preview). \
-                             Call again with confirm: true to overwrite.",
+                             Call again with confirm: true{agent_hint} to overwrite.",
                             full_path.display()
                         )));
                     }
@@ -107,14 +127,14 @@ impl Tool for WriteAgentFileTool {
                             return Ok(ToolOutput::error(format!(
                                 "File already exists at '{}' ({size} bytes). \
                                  Current content is shown below. \
-                                 Call again with confirm: true to overwrite.\n\n{existing}",
+                                 Call again with confirm: true{agent_hint} to overwrite.\n\n{existing}",
                                 full_path.display()
                             )));
                         }
                         Err(e) => {
                             return Ok(ToolOutput::error(format!(
                                 "File already exists at '{}' but could not be read: {e}. \
-                                 Call again with confirm: true to overwrite.",
+                                 Call again with confirm: true{agent_hint} to overwrite.",
                                 full_path.display()
                             )));
                         }
@@ -424,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_absolute_path_hints_run_shell() {
+    async fn test_absolute_path_hints_agent_param_and_run_shell() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -437,8 +457,8 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
         assert!(
-            output.content.contains("use run_shell instead"),
-            "expected run_shell hint, got: {}",
+            output.content.contains("agent") && output.content.contains("run_shell"),
+            "expected agent param and run_shell hints, got: {}",
             output.content
         );
     }
@@ -461,6 +481,91 @@ mod tests {
             "traversal error should not mention run_shell, got: {}",
             output.content
         );
+    }
+
+    // --- Cross-agent file access tests ---
+
+    fn setup_cross_agent_dirs(tmp: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let global = tmp.path().join("mika-home");
+        let mika_home = global.join("agents").join("mika");
+        let other_home = global.join("agents").join("work");
+        fs::create_dir_all(&mika_home).unwrap();
+        fs::create_dir_all(&other_home).unwrap();
+        fs::write(mika_home.join("config.toml"), "[config]").unwrap();
+        fs::write(other_home.join("config.toml"), "model = \"old\"").unwrap();
+        (global, mika_home)
+    }
+
+    #[tokio::test]
+    async fn test_cross_agent_write_confirmation_includes_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (global, mika_home) = setup_cross_agent_dirs(&tmp);
+
+        let tool = WriteAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home_and_global(&mika_home, &global);
+        let input = serde_json::json!({
+            "path": "config.toml",
+            "content": "model = \"new\"",
+            "agent": "work"
+        });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("File already exists"));
+        assert!(
+            output.content.contains("agent: \"work\""),
+            "confirmation should include agent hint, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cross_agent_write_with_confirm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (global, mika_home) = setup_cross_agent_dirs(&tmp);
+
+        let tool = WriteAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home_and_global(&mika_home, &global);
+        let input = serde_json::json!({
+            "path": "config.toml",
+            "content": "model = \"new\"",
+            "confirm": true,
+            "agent": "work"
+        });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        let other_home = global.join("agents").join("work");
+        let written = fs::read_to_string(other_home.join("config.toml")).unwrap();
+        assert_eq!(written, "model = \"new\"");
+    }
+
+    #[tokio::test]
+    async fn test_cross_agent_write_blocked_non_orchestrator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("mika-home");
+        let other_home = global.join("agents").join("work");
+        let writer_home = global.join("agents").join("writer");
+        fs::create_dir_all(&other_home).unwrap();
+        fs::create_dir_all(&writer_home).unwrap();
+        fs::write(other_home.join("config.toml"), "data").unwrap();
+        fs::write(writer_home.join("config.toml"), "data").unwrap();
+
+        let tool = WriteAgentFileTool;
+        let harness = TestHarness::with_agent("writer");
+        let ctx = harness.ctx_with_home_and_global(&writer_home, &global);
+        let input = serde_json::json!({
+            "path": "config.toml",
+            "content": "evil",
+            "agent": "work"
+        });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("orchestrator"));
     }
 
     #[tokio::test]

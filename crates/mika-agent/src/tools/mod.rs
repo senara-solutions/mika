@@ -67,6 +67,9 @@ pub struct ToolContext<'a> {
     pub session_id: &'a str,
     pub trace_id: &'a str,
     pub home_dir: &'a Path,
+    /// Global Mika home directory (e.g. `~/.mika/`), used for cross-agent file access.
+    /// `None` for team agents, delegates, and contexts where cross-agent access is blocked.
+    pub global_home_dir: Option<&'a Path>,
     pub core_memory_edit_count: &'a AtomicU32,
     pub is_onboarding: bool,
     pub message_sender: Option<Arc<dyn MessageSender>>,
@@ -254,6 +257,59 @@ pub(crate) fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
         }
     }
     false
+}
+
+/// Resolve the base directory for file operations, optionally targeting another agent.
+///
+/// When `agent_param` is `None` or empty, returns `ctx.home_dir` (current agent).
+/// When provided, validates the agent exists and that the caller is an orchestrator,
+/// then returns the target agent's home directory.
+///
+/// Returns `Ok(PathBuf)` on success or `Err(ToolOutput)` with a descriptive error.
+pub(crate) async fn resolve_agent_home(
+    agent_param: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> std::result::Result<PathBuf, ToolOutput> {
+    let agent_name = match agent_param {
+        None | Some("") => return Ok(ctx.home_dir.to_path_buf()),
+        Some(name) => name.trim(),
+    };
+
+    // Require global_home_dir for cross-agent access
+    let global_home = match ctx.global_home_dir {
+        Some(home) => home,
+        None => {
+            return Err(ToolOutput::error(
+                "Cross-agent file access is not available in this context.",
+            ));
+        }
+    };
+
+    // Check if targeting self (short-circuit to avoid unnecessary orchestrator check)
+    let current_agent = ctx.db.agent_id();
+    if agent_name == current_agent {
+        return Ok(ctx.home_dir.to_path_buf());
+    }
+
+    // Orchestrator guard: only orchestrators can access other agents' files
+    if !is_orchestrator(global_home, current_agent) {
+        return Err(ToolOutput::error(
+            "Only orchestrator agents can access other agents' files.",
+        ));
+    }
+
+    // Validate agent exists (also serves as path traversal protection —
+    // agent_exists checks for config.toml in the resolved directory)
+    if !mika_common::agent::agent_exists(global_home, agent_name) {
+        let agents = mika_common::agent::list_agents(global_home);
+        return Err(ToolOutput::error(format!(
+            "Agent '{}' not found. Available agents: {}",
+            agent_name,
+            agents.join(", ")
+        )));
+    }
+
+    Ok(mika_common::agent::agent_dir(global_home, agent_name))
 }
 
 /// Validate a relative path and resolve it to a full path within `base_dir`.

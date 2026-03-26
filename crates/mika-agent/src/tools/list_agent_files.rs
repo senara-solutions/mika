@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::time::SystemTime;
 
-use super::{Tool, ToolContext, ToolOutput, validate_and_resolve_path};
+use super::{Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path};
 
 /// Maximum number of entries returned by list_agent_files.
 const MAX_ENTRIES: usize = 500;
@@ -30,6 +30,10 @@ impl Tool for ListAgentFilesTool {
                     "path": {
                         "type": "string",
                         "description": "Relative path to a subdirectory within the agent's home directory. Omit, leave empty, or pass '~' to list the home directory root."
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Target agent name (orchestrator-only). Omit to use your own home directory."
                     }
                 },
                 "required": []
@@ -39,6 +43,13 @@ impl Tool for ListAgentFilesTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("").trim();
+        let agent_param = input["agent"].as_str();
+
+        // Resolve base directory (own home or target agent's home)
+        let base_dir = match resolve_agent_home(agent_param, ctx).await {
+            Ok(dir) => dir,
+            Err(e) => return Ok(e),
+        };
 
         // Treat bare ~ as home root (same as empty path)
         let path = if path == "~" || path == "~/" {
@@ -48,9 +59,9 @@ impl Tool for ListAgentFilesTool {
         };
 
         let list_dir = if path.is_empty() {
-            ctx.home_dir.to_path_buf()
+            base_dir
         } else {
-            match validate_and_resolve_path(path, ctx.home_dir, false).await {
+            match validate_and_resolve_path(path, &base_dir, false).await {
                 Ok(p) => p,
                 Err(e) => return Ok(e),
             }
@@ -384,6 +395,57 @@ mod tests {
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("top.md"));
         assert!(output.content.contains("deep.md"));
+    }
+
+    // --- Cross-agent file access tests ---
+
+    fn setup_cross_agent_dirs(tmp: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let global = tmp.path().join("mika-home");
+        let mika_home = global.join("agents").join("mika");
+        let other_home = global.join("agents").join("work");
+        fs::create_dir_all(&mika_home).unwrap();
+        fs::create_dir_all(&other_home).unwrap();
+        fs::write(mika_home.join("config.toml"), "[config]").unwrap();
+        fs::write(other_home.join("config.toml"), "model = \"sonnet\"").unwrap();
+        fs::write(other_home.join("soul.md"), "work soul").unwrap();
+        (global, mika_home)
+    }
+
+    #[tokio::test]
+    async fn test_cross_agent_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (global, mika_home) = setup_cross_agent_dirs(&tmp);
+
+        let tool = ListAgentFilesTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home_and_global(&mika_home, &global);
+        let input = serde_json::json!({ "agent": "work" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(output.content.contains("config.toml"));
+        assert!(output.content.contains("soul.md"));
+    }
+
+    #[tokio::test]
+    async fn test_cross_agent_list_blocked_non_orchestrator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("mika-home");
+        let other_home = global.join("agents").join("work");
+        let lister_home = global.join("agents").join("lister");
+        fs::create_dir_all(&other_home).unwrap();
+        fs::create_dir_all(&lister_home).unwrap();
+        fs::write(other_home.join("config.toml"), "data").unwrap();
+        fs::write(lister_home.join("config.toml"), "data").unwrap();
+
+        let tool = ListAgentFilesTool;
+        let harness = TestHarness::with_agent("lister");
+        let ctx = harness.ctx_with_home_and_global(&lister_home, &global);
+        let input = serde_json::json!({ "agent": "work" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("orchestrator"));
     }
 
     #[test]

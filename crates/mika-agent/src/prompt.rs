@@ -462,6 +462,25 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- You can list files in your home directory with list_agent_files. \
          Omit path or pass an empty string to list the root. Pass a relative subdirectory path to list that directory.\n",
     );
+    prompt.push_str(
+        "- NEVER use run_shell (cat, echo, heredoc, tee, sed) to read or write files inside \
+         your home directory or any agent's home directory. Always use read_agent_file, \
+         write_agent_file, and list_agent_files instead — they provide audit logging, \
+         overwrite confirmation, and path validation that shell commands bypass. \
+         Only use run_shell for paths outside agent home directories \
+         (e.g., ~/.local/bin/, ~/.config/).\n",
+    );
+    // Cross-agent file access guidance for orchestrators
+    if let Some(home_dir) = ctx.global_home_dir {
+        let agents = agent::list_agents(home_dir);
+        if agents.len() > 1 {
+            prompt.push_str(
+                "- As an orchestrator, you can read, write, and list files in other agents' home \
+                 directories by passing the `agent` parameter to file tools. For example: \
+                 read_agent_file(path=\"config.toml\", agent=\"chase-hughes\") reads that agent's config.\n",
+            );
+        }
+    }
 
     prompt
 }

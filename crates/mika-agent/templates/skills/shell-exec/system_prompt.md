@@ -16,14 +16,18 @@ When modifying config files (hyprland.conf, waybar config, bashrc, etc.):
 
 ## File writing
 
-Before writing to any file via shell (cat >, tee, sed -i, echo >, heredoc, etc.):
-- ALWAYS read the file first if it exists, to understand what you're replacing.
-- For files inside your home directory, prefer `write_agent_file` over shell writes — it enforces read-before-overwrite automatically.
-- When shell writes are necessary (e.g., binary data, piping, large files), use `cat <file>` or `head <file>` first.
+NEVER use shell commands (cat >, tee, sed -i, echo >, heredoc) to read or write files inside any agent's home directory. Use the builtin file tools instead:
 
-## Writing files outside your home directory
+- `read_agent_file` — read files (with optional `agent` parameter for other agents)
+- `write_agent_file` — write files with overwrite confirmation (with optional `agent` parameter)
+- `list_agent_files` — list directory contents (with optional `agent` parameter)
 
-Your `write_agent_file` tool is sandboxed to your home directory — it cannot reach paths like `~/.local/bin/`, `~/.config/`, etc. For file operations outside your home directory (and outside any team workspace), use `run_shell`.
+**Bad example:** `run_shell("cat ~/.mika/agents/chase-hughes/config.toml")` — bypasses audit logging.
+**Good example:** `read_agent_file(path="config.toml", agent="chase-hughes")` — audited, path-validated.
+
+## Writing files outside agent home directories
+
+Shell writes are ONLY appropriate for paths outside agent home directories (e.g., `~/.local/bin/`, `~/.config/`). When shell writes are necessary for non-agent paths, use `cat <file>` or `head <file>` first.
 
 Before writing via shell, check whether the target already exists:
 - **Target exists:** Show the user the exact command you'll run and what it overwrites. Wait for explicit confirmation before executing. Example: "~/.config/hypr/hyprland.conf exists and contains a quickclaw keybinding. I'll replace it with quickmika. Here's the change: [show diff]. Shall I proceed?"

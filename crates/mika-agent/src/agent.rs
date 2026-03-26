@@ -1092,6 +1092,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         session_id: params.session_id,
         trace_id,
         home_dir: params.home_dir,
+        global_home_dir: params.global_home_dir,
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: params.is_onboarding,
         message_sender: params.message_sender.clone(),
@@ -1835,6 +1836,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         session_id: params.session_id,
         trace_id: &trace_id,
         home_dir: params.home_dir,
+        global_home_dir: None, // Silent mode: cross-agent file access not needed
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
         message_sender: params.message_sender.clone(),
@@ -2072,6 +2074,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         session_id: params.session_id,
         trace_id: &trace_id,
         home_dir: params.home_dir,
+        global_home_dir: None, // Team agents: cross-agent file access blocked
         core_memory_edit_count: &core_memory_edit_count,
         is_onboarding: false,
         message_sender: params.message_sender.clone(),
