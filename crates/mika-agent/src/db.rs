@@ -6380,8 +6380,7 @@ impl Database {
             );
         } else {
             status_param = None;
-            count_sql =
-                "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue')";
+            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue')";
             data_sql = format!(
                 "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
                 Self::TASK_COLUMNS
