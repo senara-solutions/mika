@@ -1,4 +1,5 @@
 pub mod builtin_handlers;
+pub mod context;
 pub mod executor;
 pub mod git;
 pub mod index;
@@ -185,6 +186,7 @@ mod tests {
                 triggers: Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![],

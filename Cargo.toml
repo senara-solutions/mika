@@ -31,6 +31,9 @@ sqlite-vec = "=0.1.7-alpha.10"
 # Zero-copy conversions (f32 slices → bytes for sqlite-vec)
 zerocopy = "0.7"
 
+# Regex
+regex = "1"
+
 # Configuration
 config = "0.15"
 toml = "0.9"

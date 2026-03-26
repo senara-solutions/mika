@@ -18,6 +18,7 @@ use crate::messaging::MessageSender;
 use crate::prompt;
 use crate::skills::SkillRegistry;
 use crate::skills::builtin_handlers;
+use crate::skills::context;
 use crate::skills::executor;
 use crate::skills::index::{ResolvedSkillTool, SkillEntry};
 use crate::skills::manifest::ToolHandler;
@@ -1009,7 +1010,17 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     }
 
     // Match skills and resolve tool definitions
-    let matched = params.skills.match_message(params.user_message);
+    let mut matched = params.skills.match_message(params.user_message);
+    let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
+
+    // Resolve context requirements before LLM override
+    // (excluded skills shouldn't affect LLM selection)
+    let (resolved_context, context_exclude) =
+        context::resolve_contexts(&matched_entries, params.user_message, params.github_token).await;
+    // Remove skills excluded by failed context resolution
+    for &idx in context_exclude.iter().rev() {
+        matched.remove(idx);
+    }
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve per-skill LLM override (if any matched skill declares [llm])
@@ -1021,8 +1032,14 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
-    let mut skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched_entries, tools, &mut system, provider, model);
+    let mut skill_tool_defs = inject_skills_and_resolve_tools(
+        &matched_entries,
+        tools,
+        &mut system,
+        provider,
+        model,
+        &resolved_context,
+    );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched);
@@ -1808,8 +1825,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
+    let no_context = HashMap::new();
     let skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model);
+        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model, &no_context);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
 
@@ -2036,7 +2054,16 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     system.push('\n');
 
     // Match skills and resolve tool definitions
-    let matched = params.skills.match_message(params.task_message);
+    let mut matched = params.skills.match_message(params.task_message);
+    let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
+
+    // Resolve context requirements before LLM override
+    let (resolved_context, context_exclude) =
+        context::resolve_contexts(&matched_entries, params.task_message, params.github_token).await;
+    // Remove skills excluded by failed context resolution
+    for &idx in context_exclude.iter().rev() {
+        matched.remove(idx);
+    }
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve per-skill LLM override
@@ -2048,8 +2075,14 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
-    let mut skill_tool_defs =
-        inject_skills_and_resolve_tools(&matched_entries, tools, &mut system, provider, model);
+    let mut skill_tool_defs = inject_skills_and_resolve_tools(
+        &matched_entries,
+        tools,
+        &mut system,
+        provider,
+        model,
+        &resolved_context,
+    );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched);
@@ -2363,6 +2396,7 @@ fn inject_skills_and_resolve_tools(
     system: &mut String,
     provider_name: &str,
     model_name: &str,
+    resolved_context: &HashMap<String, context::ContextBlock>,
 ) -> Vec<mika_common::claude::ToolDefinition> {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
@@ -2373,6 +2407,13 @@ fn inject_skills_and_resolve_tools(
     for entry in matched {
         // Two-level prompt resolution via SkillEntry helper (model → root)
         let prompt = entry.resolve_prompt(provider_name, model_name);
+
+        // Apply context variable replacements (e.g., {{pr_diff}})
+        let prompt = if !resolved_context.is_empty() {
+            context::apply_context_replacements(prompt, resolved_context)
+        } else {
+            prompt.to_string()
+        };
 
         if !prompt.is_empty() {
             write!(
@@ -2559,6 +2600,7 @@ mod tests {
                 constraints: Constraints {
                     required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
                 },
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![name.to_lowercase()],
@@ -2663,12 +2705,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = "Base prompt.".to_string();
 
+        let no_ctx = HashMap::new();
         let defs = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "anthropic",
             "claude-sonnet-4-6",
+            &no_ctx,
         );
 
         // Should append skill snippet to system prompt
@@ -2711,12 +2755,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
+        let no_ctx = HashMap::new();
         let defs = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "anthropic",
             "claude-sonnet-4-6",
+            &no_ctx,
         );
 
         // "overlap" should appear exactly once (builtin wins)
@@ -2732,12 +2778,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = "Base.".to_string();
 
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "anthropic",
             "claude-sonnet-4-6",
+            &no_ctx,
         );
 
         // Should NOT add skill context section when snippet is empty
@@ -2754,12 +2802,14 @@ mod tests {
         let mut system = String::new();
 
         // No model variant — should fall back to root
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "groq",
             "llama-3.3-70b-versatile",
+            &no_ctx,
         );
 
         assert!(system.contains("Root prompt for search."));
@@ -2773,12 +2823,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = "Base.".to_string();
 
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "anthropic",
             "claude-sonnet-4-6",
+            &no_ctx,
         );
 
         // Should NOT add any skill context section
@@ -2797,12 +2849,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "anthropic",
             "claude-sonnet-4-6",
+            &no_ctx,
         );
 
         assert!(system.contains("Sonnet-specific prompt."));
@@ -2822,12 +2876,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "anthropic",
             "claude-opus-4",
+            &no_ctx,
         );
 
         assert!(system.contains("Root prompt."));
@@ -2843,12 +2899,14 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![&entry];
         let mut system = String::new();
 
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "groq",
             "llama-3.3-70b-versatile",
+            &no_ctx,
         );
 
         assert!(system.contains("Root prompt."));
@@ -2867,12 +2925,14 @@ mod tests {
         let mut system = String::new();
 
         // Model name contains a slash — sanitize_model_dir_name should match
+        let no_ctx = HashMap::new();
         inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
             "openrouter",
             "anthropic/claude-sonnet-4",
+            &no_ctx,
         );
 
         assert!(system.contains("OpenRouter model prompt."));

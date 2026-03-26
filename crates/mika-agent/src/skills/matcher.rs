@@ -119,6 +119,7 @@ mod tests {
                 },
                 llm: Default::default(),
                 constraints: Default::default(),
+                context: std::collections::HashMap::new(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: keywords.iter().map(|s| s.to_lowercase()).collect(),
