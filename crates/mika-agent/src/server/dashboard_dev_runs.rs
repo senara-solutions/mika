@@ -21,6 +21,7 @@ use super::state::AppState;
 pub struct DevRunResponse {
     pub id: String,
     pub agent_id: String,
+    pub source: Option<String>,
     pub label: String,
     pub status: String,
     pub reference_url: Option<String>,
@@ -72,6 +73,7 @@ impl From<Task> for DevRunResponse {
         Self {
             id: t.id,
             agent_id: t.agent_id,
+            source: t.source,
             label: t.label,
             status: t.status,
             reference_url: t.reference_url,

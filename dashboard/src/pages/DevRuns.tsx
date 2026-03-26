@@ -83,6 +83,7 @@ export default function DevRuns() {
               <thead>
                 <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
                   <th className="text-left px-4 py-3 font-medium">Label</th>
+                  <th className="text-left px-4 py-3 font-medium">Source</th>
                   <th className="text-left px-4 py-3 font-medium">Branch</th>
                   <th className="text-left px-4 py-3 font-medium">Status</th>
                   <th className="text-left px-4 py-3 font-medium">PR</th>
@@ -110,6 +111,17 @@ export default function DevRuns() {
                         >
                           issue
                         </a>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {run.source === 'github_issue' ? (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                          Issue
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-purple-500/10 text-purple-400 border border-purple-500/20">
+                          Self Dev
+                        </span>
                       )}
                     </td>
                     <td className="px-4 py-3 text-xs text-heading font-mono">

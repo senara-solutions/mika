@@ -4,6 +4,7 @@ import { apiFetch, TOKEN, API_BASE, type PaginatedResponse } from './client.ts'
 export interface DevRun {
   id: string
   agent_id: string
+  source: string | null
   label: string
   status: string
   reference_url: string | null
