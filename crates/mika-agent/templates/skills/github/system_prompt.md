@@ -12,7 +12,7 @@ You have access to the GitHub CLI (`gh`) via the `run_gh` tool. Use it to intera
 ### Pull Requests
 - List open PRs: `["pr", "list", "--state", "open"]`
 - View PR details: `["pr", "view", "42"]`
-- View PR diff: `["pr", "diff", "42"]`
+- View PR diff: `["pr", "diff", "42"]` — shows the full diff; does NOT support `--` file path filtering (to review specific files, fetch the full diff and search within it)
 - Create a PR: `["pr", "create", "--title", "Title", "--body", "Description"]`
 - Merge a PR: `["pr", "merge", "42", "--merge"]` (confirm with user first!)
 - List PR checks: `["pr", "checks", "42"]`

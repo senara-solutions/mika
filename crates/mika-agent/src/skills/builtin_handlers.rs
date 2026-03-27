@@ -277,16 +277,24 @@ fn format_brave_results(body: &serde_json::Value, query: &str) -> ToolOutput {
 /// Shared validation steps: string rejection, array parsing, empty check, length limit.
 /// Returns the validated args for handler-specific checks (allowlist, blocked flags).
 fn parse_command_array(input: &serde_json::Value) -> Result<Vec<String>, ToolOutput> {
-    // Reject string format with a migration hint
-    if input.get("command").is_some_and(|v| v.is_string()) {
-        return Err(ToolOutput::error(
-            "The 'command' parameter must be a JSON array of strings, not a single string."
-                .to_string(),
-        ));
-    }
-
-    let args: Vec<String> = match input.get("command").and_then(|v| v.as_array()) {
-        Some(arr) => {
+    let args: Vec<String> = match input.get("command") {
+        Some(cmd) if cmd.is_string() => {
+            // LLMs sometimes serialize arrays as JSON strings — attempt coercion
+            match serde_json::from_str::<Vec<String>>(cmd.as_str().unwrap()) {
+                Ok(parsed) => {
+                    tracing::debug!("coerced string command parameter to array");
+                    parsed
+                }
+                Err(_) => {
+                    return Err(ToolOutput::error(
+                        "The 'command' parameter must be a JSON array of strings, not a single string."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Some(cmd) if cmd.is_array() => {
+            let arr = cmd.as_array().unwrap();
             let mut args = Vec::with_capacity(arr.len());
             for item in arr {
                 match item.as_str() {
@@ -300,7 +308,7 @@ fn parse_command_array(input: &serde_json::Value) -> Result<Vec<String>, ToolOut
             }
             args
         }
-        None => {
+        _ => {
             return Err(ToolOutput::error(
                 "Missing or invalid 'command' parameter.".to_string(),
             ));
@@ -1137,6 +1145,84 @@ mod tests {
         let output = run_gh(&input, &ctx).await;
         assert!(output.is_error);
         assert!(output.content.contains("JSON array of strings"));
+    }
+
+    #[test]
+    fn test_parse_command_array_coerces_valid_json_string() {
+        let input = serde_json::json!({
+            "command": "[\"pr\", \"list\", \"--state\", \"open\"]"
+        });
+        let result = parse_command_array(&input).unwrap();
+        assert_eq!(result, vec!["pr", "list", "--state", "open"]);
+    }
+
+    #[test]
+    fn test_parse_command_array_rejects_plain_string() {
+        let input = serde_json::json!({"command": "pr list --state open"});
+        let result = parse_command_array(&input);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("JSON array of strings")
+        );
+    }
+
+    #[test]
+    fn test_parse_command_array_rejects_mixed_type_json_string() {
+        let input = serde_json::json!({"command": "[\"pr\", 42]"});
+        let result = parse_command_array(&input);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("JSON array of strings")
+        );
+    }
+
+    #[test]
+    fn test_parse_command_array_coerces_single_element_json_string() {
+        let input = serde_json::json!({"command": "[\"pr\"]"});
+        let result = parse_command_array(&input).unwrap();
+        assert_eq!(result, vec!["pr"]);
+    }
+
+    #[test]
+    fn test_parse_command_array_rejects_empty_json_string_array() {
+        let input = serde_json::json!({"command": "[]"});
+        let result = parse_command_array(&input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_gh_input_coerces_json_string_through_full_validation() {
+        // Coerced array must pass through the same allowlist + blocked-flag checks
+        let input = serde_json::json!({
+            "command": "[\"pr\", \"list\", \"--state\", \"open\"]"
+        });
+        let result = validate_gh_input(&input).unwrap();
+        assert_eq!(result.args, vec!["pr", "list", "--state", "open"]);
+    }
+
+    #[test]
+    fn test_validate_gh_input_coerced_string_blocked_subcommand() {
+        // Coerced array must still be rejected by the allowlist
+        let input = serde_json::json!({"command": "[\"auth\", \"login\"]"});
+        let result = validate_gh_input(&input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("not allowed"));
+    }
+
+    #[test]
+    fn test_validate_gws_input_coerces_json_string() {
+        let input = serde_json::json!({
+            "command": "[\"gmail\", \"messages\", \"list\"]"
+        });
+        let result = validate_gws_input(&input).unwrap();
+        assert_eq!(result, vec!["gmail", "messages", "list"]);
     }
 
     #[tokio::test]
