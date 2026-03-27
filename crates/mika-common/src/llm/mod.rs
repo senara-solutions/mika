@@ -52,6 +52,13 @@ static INTERNAL_TAG_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// collapsed. If the result is empty or whitespace-only after stripping, returns
 /// an empty string — callers should convert to `None` as appropriate.
 pub fn strip_internal_tags(text: &str) -> String {
+    // Fast path: no angle bracket means no XML tags possible.
+    // Most LLM responses contain no internal tags, so this avoids
+    // regex evaluation entirely in the common case.
+    if !text.contains('<') {
+        return text.trim().to_string();
+    }
+
     let mut result = text.to_string();
     for re in INTERNAL_TAG_RES.iter() {
         result = re.replace_all(&result, "").into_owned();

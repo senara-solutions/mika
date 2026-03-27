@@ -2182,7 +2182,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
         let text = match continuation {
             Ok(Ok(resp)) => {
-                let t = resp.text();
+                let t = mika_common::llm::strip_internal_tags(&resp.text());
                 if t.is_empty() {
                     format_step_exceeded_fallback(&result.tool_call_summaries)
                 } else {
