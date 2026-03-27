@@ -34,6 +34,7 @@ base64.workspace = true
 rand.workspace = true
 url.workspace = true
 hex.workspace = true
+regex.workspace = true
 
 [features]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]

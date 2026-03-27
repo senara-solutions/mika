@@ -620,7 +620,7 @@ async fn run_loop(
 
         match response.stop_reason {
             LlmStopReason::EndTurn | LlmStopReason::MaxTokens | LlmStopReason::ContentFilter => {
-                let text = response.text();
+                let text = mika_common::llm::strip_internal_tags(&response.text());
 
                 if !text.is_empty() {
                     // Required-tools enforcement: if matched skills declared required_tools
@@ -1256,7 +1256,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
         let (text, continuation_usage) = match continuation {
             Ok(Ok(resp)) => {
-                let t = resp.text();
+                let t = mika_common::llm::strip_internal_tags(&resp.text());
                 let u = Some(resp.usage);
                 if t.is_empty() {
                     (

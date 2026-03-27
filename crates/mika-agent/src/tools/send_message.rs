@@ -48,15 +48,21 @@ impl Tool for SendMessageTool {
             )));
         }
 
+        // Strip any internal metadata tags the LLM may have echoed
+        let cleaned = mika_common::llm::strip_internal_tags(text);
+        if cleaned.is_empty() {
+            return Ok(ToolOutput::success("Message was empty after processing."));
+        }
+
         // Persist the outbound message for conversation history
         ctx.db
-            .save_message(ctx.session_id, "assistant", text, Some(ctx.trace_id))
+            .save_message(ctx.session_id, "assistant", &cleaned, Some(ctx.trace_id))
             .await?;
 
         match &ctx.message_sender {
             Some(sender) => {
                 debug!("send_message: delivering via configured sender");
-                sender.send(text).await?;
+                sender.send(&cleaned).await?;
                 debug!("send_message: delivered successfully");
                 Ok(ToolOutput::success("Message sent."))
             }
