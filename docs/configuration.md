@@ -129,6 +129,7 @@ MIKA_BRAVE_API_KEY=BSA...
 MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PRs, issues, context injection)
 MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...  # Investigation panel only (issue creation)
 MIKA_GITHUB_REPO=owner/repo
+GH_TOKEN=ghp_...                       # gh CLI in Claude Code agent sessions (via claude-pilot)
 ```
 
 Run `mika setup` to interactively configure secrets (API keys, tokens) and
@@ -150,6 +151,18 @@ falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
    ```sh
    MIKA_GITHUB_TOKEN=ghp_your_token_here
    ```
+
+### GitHub token for `gh` CLI in agent sessions
+
+`GH_TOKEN` is used by the `gh` CLI in Claude Code sessions spawned via claude-pilot.
+Without it, `gh` falls back to the host user's `~/.config/gh/hosts.yml` (personal account).
+This token is not prefixed with `MIKA_*`, so it survives the skill executor's env scrub
+and reaches Claude Code via `process.env` inheritance.
+
+Add to `~/.mika/.env`:
+```sh
+GH_TOKEN=ghp_your_token_here
+```
 
 ### GitHub issue creation (dashboard investigation)
 
