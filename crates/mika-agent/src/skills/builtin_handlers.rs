@@ -66,7 +66,7 @@ pub async fn execute(
 ) -> ToolOutput {
     let mut output = match function {
         "get_documentation" => get_documentation(&input, ctx).await,
-        "git_ops" => git_ops(&input).await,
+        "git_ops" => git_ops(&input, ctx).await,
         "run_gh" => run_gh(&input, ctx).await,
         "run_gws" => run_gws(&input, ctx).await,
         "web_search" => web_search(&input, ctx).await,
@@ -485,6 +485,20 @@ fn validate_git_ops_input(input: &serde_json::Value) -> Result<GitOpsInput, Tool
         .unwrap_or("origin/main")
         .to_string();
 
+    // Reject base refs starting with '-' to prevent git argument injection
+    if base.starts_with('-') {
+        return Err(ToolOutput::error(
+            "Invalid base ref: must not start with '-'.".to_string(),
+        ));
+    }
+
+    // Reject relative paths — repo_path must be absolute
+    if !std::path::Path::new(&repo_path).is_absolute() {
+        return Err(ToolOutput::error(format!(
+            "repo_path must be an absolute path (got '{repo_path}')."
+        )));
+    }
+
     let push = input.get("push").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Reject push on non-rebase operations
@@ -582,7 +596,7 @@ fn extract_remote(base: &str) -> &str {
 }
 
 /// Execute a git maintenance operation (fetch, rebase, or merge).
-async fn git_ops(input: &serde_json::Value) -> ToolOutput {
+async fn git_ops(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput {
     let params = match validate_git_ops_input(input) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1412,6 +1426,28 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_git_ops_base_starting_with_dash_rejected() {
+        let input = serde_json::json!({
+            "operation": "rebase",
+            "repo_path": "/tmp/repo",
+            "base": "--exec=malicious"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_relative_path_rejected() {
+        let input = serde_json::json!({"operation": "fetch", "repo_path": "relative/path"});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must be an absolute path"));
+    }
+
+    #[test]
     fn test_validate_git_ops_defaults() {
         let input = serde_json::json!({"operation": "fetch", "repo_path": "/tmp/repo"});
         let result = validate_git_ops_input(&input).unwrap();
@@ -1491,10 +1527,15 @@ mod tests {
             .current_dir(repo)
             .output()
             .unwrap();
-        let output = git_ops(&serde_json::json!({
-            "operation": "fetch",
-            "repo_path": repo
-        }))
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "fetch",
+                "repo_path": repo
+            }),
+            &ctx,
+        )
         .await;
         // No remote configured → fetch fails
         assert!(output.is_error);
