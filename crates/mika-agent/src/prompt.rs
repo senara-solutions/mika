@@ -267,6 +267,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          workflows, retry failed operations, or relaunch tasks. If a follow-up action may be \
          useful, suggest it and wait for explicit confirmation before proceeding.\n",
     );
+    prompt.push_str(
+        "- **No internal tags in responses:** Never include internal XML tags like <context>, \
+         <callback_result>, <task-health>, or <rewind_reversals> in your responses. \
+         These are system metadata injected for your context — they are not for user display.\n",
+    );
     let section_names = core_memory_section_names();
     write!(
         prompt,

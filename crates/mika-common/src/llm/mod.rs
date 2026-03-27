@@ -4,14 +4,68 @@ pub mod openai;
 pub mod types;
 
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use regex::Regex;
 use serde::Deserialize;
 
 pub use error::LlmError;
 pub use types::*;
+
+/// Internal tag names that should be stripped from LLM response text.
+/// These tags are injected into conversation history for LLM context (tool history,
+/// callback results, task health, etc.) but the LLM may echo them in its response.
+const INTERNAL_TAG_NAMES: &[&str] = &[
+    "context",
+    "callback_result",
+    "task-health",
+    "task-health-instructions",
+    "active-work-items",
+    "anomalies",
+    "rewind_reversals",
+];
+
+/// Regex to collapse runs of 3+ newlines (left behind after tag removal) into 2.
+static BLANK_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("blank line regex must compile"));
+
+/// Build a compiled regex for a specific tag name that matches `<tag ...>...</tag>`.
+/// Uses `(?s)` for dotall (multi-line content) and `.*?` for lazy matching.
+fn build_tag_regex(tag: &str) -> Regex {
+    Regex::new(&format!(r"(?s)<{tag}\b[^>]*>.*?</{tag}>")).expect("tag regex must compile")
+}
+
+/// Lazily compiled regexes for each internal tag.
+static INTERNAL_TAG_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    INTERNAL_TAG_NAMES
+        .iter()
+        .map(|t| build_tag_regex(t))
+        .collect()
+});
+
+/// Strip internal metadata XML tags from LLM response text.
+///
+/// These tags are injected into conversation history for LLM context but should
+/// never be displayed to users. Returns the cleaned text with excess blank lines
+/// collapsed. If the result is empty or whitespace-only after stripping, returns
+/// an empty string — callers should convert to `None` as appropriate.
+pub fn strip_internal_tags(text: &str) -> String {
+    // Fast path: no angle bracket means no XML tags possible.
+    // Most LLM responses contain no internal tags, so this avoids
+    // regex evaluation entirely in the common case.
+    if !text.contains('<') {
+        return text.trim().to_string();
+    }
+
+    let mut result = text.to_string();
+    for re in INTERNAL_TAG_RES.iter() {
+        result = re.replace_all(&result, "").into_owned();
+    }
+    let collapsed = BLANK_LINE_RE.replace_all(&result, "\n\n");
+    collapsed.trim().to_string()
+}
 
 /// Provider-agnostic trait for LLM chat completions.
 ///
@@ -398,5 +452,88 @@ mod tests {
             spec.effective_base_url(),
             Some("http://localhost:11434/v1".into())
         );
+    }
+
+    // -- strip_internal_tags tests --
+
+    #[test]
+    fn test_strip_context_tag() {
+        let input = r#"Hello <context type="tool_history" trust="metadata">
+send_message({"text":"test"})
+[TOOL_RESULT] → Message sent.
+</context> world"#;
+        assert_eq!(strip_internal_tags(input), "Hello  world");
+    }
+
+    #[test]
+    fn test_strip_callback_result_tag() {
+        let input = r#"Result: <callback_result trust="untrusted">task completed successfully</callback_result> done."#;
+        assert_eq!(strip_internal_tags(input), "Result:  done.");
+    }
+
+    #[test]
+    fn test_strip_task_health_with_nested_tags() {
+        let input = "<task-health>\n<active-work-items>\n- item 1\n</active-work-items>\n<anomalies>\n- stuck task\n</anomalies>\n<task-health-instructions>\nCheck tasks.\n</task-health-instructions>\n</task-health>";
+        assert_eq!(strip_internal_tags(input), "");
+    }
+
+    #[test]
+    fn test_strip_rewind_reversals() {
+        let input =
+            r#"Done. <rewind_reversals trust="internal">reversed 3 facts</rewind_reversals>"#;
+        assert_eq!(strip_internal_tags(input), "Done.");
+    }
+
+    #[test]
+    fn test_strip_multiple_tags_preserves_text_between() {
+        let input =
+            "Before <context type=\"a\">x</context> middle <context type=\"b\">y</context> after";
+        assert_eq!(strip_internal_tags(input), "Before  middle  after");
+    }
+
+    #[test]
+    fn test_strip_no_tags_passthrough() {
+        let input = "Just a normal response with no internal tags.";
+        assert_eq!(strip_internal_tags(input), input);
+    }
+
+    #[test]
+    fn test_strip_empty_after_strip() {
+        let input = "<context type=\"tool_history\" trust=\"metadata\">only metadata</context>";
+        assert_eq!(strip_internal_tags(input), "");
+    }
+
+    #[test]
+    fn test_strip_partial_unclosed_tag_left_alone() {
+        let input = "Hello <context type=\"tool_history\"> unclosed tag with no end";
+        assert_eq!(strip_internal_tags(input), input);
+    }
+
+    #[test]
+    fn test_strip_collapses_blank_lines() {
+        let input = "Before\n\n<context type=\"x\">content</context>\n\nAfter";
+        let result = strip_internal_tags(input);
+        assert_eq!(result, "Before\n\nAfter");
+    }
+
+    #[test]
+    fn test_strip_context_summary_tag() {
+        let input =
+            "Hello <context type=\"summary\" trust=\"data\">long summary here</context> bye";
+        assert_eq!(strip_internal_tags(input), "Hello  bye");
+    }
+
+    #[test]
+    fn test_strip_context_skill_tag() {
+        let input =
+            "<context type=\"skill\" trust=\"local\">skill prompt</context>\nActual response.";
+        assert_eq!(strip_internal_tags(input), "Actual response.");
+    }
+
+    #[test]
+    fn test_strip_standalone_nested_tag() {
+        // LLM echoes only a nested tag without the outer <task-health>
+        let input = "Status: <active-work-items>fix auth flow</active-work-items> checked.";
+        assert_eq!(strip_internal_tags(input), "Status:  checked.");
     }
 }
