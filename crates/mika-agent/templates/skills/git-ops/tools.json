@@ -1,0 +1,33 @@
+[
+  {
+    "name": "git_ops",
+    "description": "Execute a git maintenance operation (fetch, rebase, or merge) on a repository. Use for syncing branches, rebasing onto main, and fetching updates. NOT for branching, committing, or creating PRs.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["fetch", "rebase", "merge"],
+          "description": "The git operation to perform: 'fetch' downloads remote refs, 'rebase' replays commits onto a base (auto-aborts on conflict), 'merge' fast-forwards to a base (fails if not fast-forwardable)"
+        },
+        "repo_path": {
+          "type": "string",
+          "description": "Absolute path to the git repository directory"
+        },
+        "base": {
+          "type": "string",
+          "description": "Remote ref to target (e.g. 'origin/main', 'upstream/develop'). Default: 'origin/main'"
+        },
+        "push": {
+          "type": "boolean",
+          "description": "Force-push with lease after a successful rebase. Only allowed with 'rebase' operation. Rejected on 'merge' and 'fetch'. Refuses to push to main/master branches. Default: false"
+        }
+      },
+      "required": ["operation", "repo_path"]
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "git_ops"
+    }
+  }
+]

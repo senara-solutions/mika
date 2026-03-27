@@ -33,7 +33,13 @@ static DOC_SLASH_COMMANDS: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/s
 static DOC_TASK_SYSTEM: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/task-system.md"));
 
 /// Known builtin function names, used for startup validation.
-pub const KNOWN_BUILTINS: &[&str] = &["get_documentation", "run_gh", "run_gws", "web_search"];
+pub const KNOWN_BUILTINS: &[&str] = &[
+    "get_documentation",
+    "git_ops",
+    "run_gh",
+    "run_gws",
+    "web_search",
+];
 
 /// Maximum output size from a builtin handler (matches executor::MAX_OUTPUT_LEN).
 const MAX_OUTPUT_LEN: usize = 10_000;
@@ -60,6 +66,7 @@ pub async fn execute(
 ) -> ToolOutput {
     let mut output = match function {
         "get_documentation" => get_documentation(&input, ctx).await,
+        "git_ops" => git_ops(&input).await,
         "run_gh" => run_gh(&input, ctx).await,
         "run_gws" => run_gws(&input, ctx).await,
         "web_search" => web_search(&input, ctx).await,
@@ -392,6 +399,327 @@ async fn spawn_and_collect(
             result.push_str(&stdout);
         }
         ToolOutput::success(result)
+    }
+}
+
+// -- Git ops handler --
+
+/// Protected branch names that cannot be force-pushed.
+const GIT_OPS_PROTECTED_BRANCHES: &[&str] = &["main", "master"];
+
+/// Result of running a git subprocess, preserving success/failure status
+/// separately from the output content (unlike `spawn_and_collect` which always
+/// returns `is_error: false`).
+struct GitResult {
+    content: String,
+    success: bool,
+}
+
+/// Build and run a git command with MIKA_* env scrubbing and `GIT_TERMINAL_PROMPT=0`.
+/// Returns structured result preserving the exit status.
+async fn run_git(repo_path: &str, args: &[&str]) -> GitResult {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.current_dir(repo_path);
+    cmd.args(args);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    super::executor::scrub_mika_env_vars(&mut cmd);
+
+    let output = spawn_and_collect(cmd, "git", "Is git installed?").await;
+
+    // spawn_and_collect always returns is_error=false. Detect failure via
+    // "Exit code:" or "Killed by signal:" prefix in content.
+    let success = !output.content.starts_with("Exit code:")
+        && !output.content.starts_with("Killed by signal:")
+        && !output.content.starts_with("Failed to spawn git:");
+
+    GitResult {
+        content: output.content,
+        success,
+    }
+}
+
+/// Validate `git_ops` input and extract parameters.
+#[derive(Debug)]
+struct GitOpsInput {
+    operation: String,
+    repo_path: String,
+    base: String,
+    push: bool,
+}
+
+fn validate_git_ops_input(input: &serde_json::Value) -> Result<GitOpsInput, ToolOutput> {
+    let operation = input
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| {
+            ToolOutput::error(
+                "Missing required 'operation' parameter. Must be one of: fetch, rebase, merge."
+                    .to_string(),
+            )
+        })?;
+
+    if !["fetch", "rebase", "merge"].contains(&operation.as_str()) {
+        return Err(ToolOutput::error(format!(
+            "Unknown operation '{operation}'. Must be one of: fetch, rebase, merge."
+        )));
+    }
+
+    let repo_path = input
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| {
+            ToolOutput::error(
+                "Missing required 'repo_path' parameter. Must be an absolute path to a git repository."
+                    .to_string(),
+            )
+        })?;
+
+    let base = input
+        .get("base")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("origin/main")
+        .to_string();
+
+    let push = input.get("push").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Reject push on non-rebase operations
+    if push && operation != "rebase" {
+        return Err(ToolOutput::error(format!(
+            "push=true is only allowed with 'rebase' operation, not '{operation}'."
+        )));
+    }
+
+    Ok(GitOpsInput {
+        operation,
+        repo_path,
+        base,
+        push,
+    })
+}
+
+/// Run pre-flight checks on the repository:
+/// - Path exists and is a directory
+/// - Is a git repository
+/// - Working tree is clean (for rebase/merge)
+/// - No rebase/merge in progress
+async fn git_ops_preflight(repo_path: &str, operation: &str) -> Result<(), ToolOutput> {
+    // Check path exists and is a directory
+    let path = std::path::Path::new(repo_path);
+    if !path.exists() {
+        return Err(ToolOutput::error(format!(
+            "Path does not exist: {repo_path}"
+        )));
+    }
+    if !path.is_dir() {
+        return Err(ToolOutput::error(format!(
+            "Path is not a directory: {repo_path}"
+        )));
+    }
+
+    // Check it's a git repo
+    let result = run_git(repo_path, &["rev-parse", "--git-dir"]).await;
+    if !result.success {
+        return Err(ToolOutput::error(format!(
+            "Not a git repository: {repo_path}"
+        )));
+    }
+
+    // For rebase/merge, check working tree is clean
+    if operation == "rebase" || operation == "merge" {
+        let status_result = run_git(repo_path, &["status", "--porcelain"]).await;
+        if status_result.success && !status_result.content.trim().is_empty() {
+            return Err(ToolOutput::error(format!(
+                "Working tree has uncommitted changes. Commit or stash them first.\n{}",
+                status_result.content.trim()
+            )));
+        }
+
+        // Check for in-progress rebase or merge
+        let git_dir = path.join(".git");
+        // Handle worktrees where .git is a file, not a directory
+        let git_dir = if git_dir.is_file() {
+            // In a worktree, .git is a file containing "gitdir: <path>"
+            match std::fs::read_to_string(&git_dir) {
+                Ok(content) => {
+                    let gitdir_path = content.trim().strip_prefix("gitdir: ").unwrap_or("").trim();
+                    if gitdir_path.is_empty() {
+                        git_dir
+                    } else {
+                        std::path::PathBuf::from(gitdir_path)
+                    }
+                }
+                Err(_) => git_dir,
+            }
+        } else {
+            git_dir
+        };
+
+        if git_dir.join("rebase-apply").exists() || git_dir.join("rebase-merge").exists() {
+            return Err(ToolOutput::error(
+                "A rebase is already in progress. Run 'git rebase --abort' or 'git rebase --continue' first."
+                    .to_string(),
+            ));
+        }
+        if git_dir.join("MERGE_HEAD").exists() {
+            return Err(ToolOutput::error(
+                "A merge is already in progress. Run 'git merge --abort' or complete the merge first."
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the remote name from a base ref like "origin/main" -> "origin".
+fn extract_remote(base: &str) -> &str {
+    base.split('/').next().unwrap_or("origin")
+}
+
+/// Execute a git maintenance operation (fetch, rebase, or merge).
+async fn git_ops(input: &serde_json::Value) -> ToolOutput {
+    let params = match validate_git_ops_input(input) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    if let Err(e) = git_ops_preflight(&params.repo_path, &params.operation).await {
+        return e;
+    }
+
+    let remote = extract_remote(&params.base);
+
+    match params.operation.as_str() {
+        "fetch" => git_ops_fetch(&params.repo_path, remote).await,
+        "rebase" => git_ops_rebase(&params.repo_path, remote, &params.base, params.push).await,
+        "merge" => git_ops_merge(&params.repo_path, remote, &params.base).await,
+        _ => ToolOutput::error(format!("Unknown operation: {}", params.operation)),
+    }
+}
+
+/// Fetch from a remote.
+async fn git_ops_fetch(repo_path: &str, remote: &str) -> ToolOutput {
+    let result = run_git(repo_path, &["fetch", remote]).await;
+
+    if result.success {
+        let mut msg = format!("Fetch from '{remote}' completed successfully.");
+        if !result.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", result.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!("Fetch from '{remote}' failed.\n{}", result.content))
+    }
+}
+
+/// Rebase onto a base ref with auto-abort on conflict.
+async fn git_ops_rebase(repo_path: &str, remote: &str, base: &str, push: bool) -> ToolOutput {
+    // Step 1: Fetch
+    let fetch = run_git(repo_path, &["fetch", remote]).await;
+    if !fetch.success {
+        return ToolOutput::error(format!("Fetch from '{remote}' failed.\n{}", fetch.content));
+    }
+
+    // Step 2: Rebase
+    let rebase = run_git(repo_path, &["rebase", base]).await;
+
+    if !rebase.success {
+        // Auto-abort to leave repo clean
+        let _ = run_git(repo_path, &["rebase", "--abort"]).await;
+
+        return ToolOutput::error(format!(
+            "Rebase onto '{base}' failed (conflicts detected). \
+             Rebase was automatically aborted — working tree is clean.\n\n{}",
+            rebase.content
+        ));
+    }
+
+    let mut msg = format!("Rebase onto '{base}' completed successfully.");
+    if !rebase.content.trim().is_empty() {
+        let _ = write!(msg, "\n{}", rebase.content.trim());
+    }
+
+    // Step 3: Push if requested
+    if push {
+        match git_ops_push(repo_path).await {
+            Ok(push_msg) => {
+                let _ = write!(msg, "\n\n{push_msg}");
+            }
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "{msg}\n\nRebase succeeded but push failed:\n{}",
+                    e.content
+                ));
+            }
+        }
+    }
+
+    ToolOutput::success(msg)
+}
+
+/// Fast-forward merge onto a base ref.
+async fn git_ops_merge(repo_path: &str, remote: &str, base: &str) -> ToolOutput {
+    // Step 1: Fetch
+    let fetch = run_git(repo_path, &["fetch", remote]).await;
+    if !fetch.success {
+        return ToolOutput::error(format!("Fetch from '{remote}' failed.\n{}", fetch.content));
+    }
+
+    // Step 2: Merge --ff-only
+    let merge = run_git(repo_path, &["merge", "--ff-only", base]).await;
+
+    if merge.success {
+        let mut msg = format!("Fast-forward merge of '{base}' completed successfully.");
+        if !merge.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", merge.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!(
+            "Fast-forward merge of '{base}' failed. \
+             The branch may have diverged — try rebasing first.\n\n{}",
+            merge.content
+        ))
+    }
+}
+
+/// Force-push with lease after a successful rebase.
+/// Refuses to push to protected branches (main/master).
+/// Returns Ok(message) on success, Err(ToolOutput) on failure.
+async fn git_ops_push(repo_path: &str) -> Result<String, ToolOutput> {
+    // Check current branch — refuse to push to main/master
+    let branch_result = run_git(repo_path, &["branch", "--show-current"]).await;
+    let branch = branch_result.content.trim().to_string();
+
+    if branch.is_empty() {
+        return Err(ToolOutput::error(
+            "Cannot push: HEAD is detached. Check out a branch first.".to_string(),
+        ));
+    }
+
+    if GIT_OPS_PROTECTED_BRANCHES.contains(&branch.as_str()) {
+        return Err(ToolOutput::error(format!(
+            "Refusing to force-push to protected branch '{branch}'. \
+             Check out a feature branch first."
+        )));
+    }
+
+    let push = run_git(repo_path, &["push", "--force-with-lease"]).await;
+
+    if push.success {
+        Ok(format!(
+            "Force-push (with lease) to '{branch}' completed successfully."
+        ))
+    } else {
+        Err(ToolOutput::error(format!(
+            "Force-push to '{branch}' failed.\n{}",
+            push.content
+        )))
     }
 }
 
@@ -1006,6 +1334,171 @@ mod tests {
     fn test_strip_frontmatter_empty_frontmatter() {
         let content = "---\n---\n\n# Doc\n";
         assert_eq!(strip_frontmatter(content), "# Doc\n");
+    }
+
+    // -- git_ops tests --
+
+    #[test]
+    fn test_git_ops_in_known_builtins() {
+        assert!(KNOWN_BUILTINS.contains(&"git_ops"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_missing_operation() {
+        let input = serde_json::json!({"repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing required 'operation'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_unknown_operation() {
+        let input = serde_json::json!({"operation": "cherry-pick", "repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Unknown operation 'cherry-pick'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_missing_repo_path() {
+        let input = serde_json::json!({"operation": "fetch"});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing required 'repo_path'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_push_on_merge_rejected() {
+        let input =
+            serde_json::json!({"operation": "merge", "repo_path": "/tmp/repo", "push": true});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.content
+                .contains("push=true is only allowed with 'rebase'")
+        );
+    }
+
+    #[test]
+    fn test_validate_git_ops_push_on_fetch_rejected() {
+        let input =
+            serde_json::json!({"operation": "fetch", "repo_path": "/tmp/repo", "push": true});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.content
+                .contains("push=true is only allowed with 'rebase'")
+        );
+    }
+
+    #[test]
+    fn test_validate_git_ops_valid_rebase_with_push() {
+        let input = serde_json::json!({
+            "operation": "rebase",
+            "repo_path": "/tmp/repo",
+            "base": "origin/develop",
+            "push": true
+        });
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "rebase");
+        assert_eq!(result.repo_path, "/tmp/repo");
+        assert_eq!(result.base, "origin/develop");
+        assert!(result.push);
+    }
+
+    #[test]
+    fn test_validate_git_ops_defaults() {
+        let input = serde_json::json!({"operation": "fetch", "repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.base, "origin/main");
+        assert!(!result.push);
+    }
+
+    #[test]
+    fn test_extract_remote() {
+        assert_eq!(extract_remote("origin/main"), "origin");
+        assert_eq!(extract_remote("upstream/develop"), "upstream");
+        assert_eq!(extract_remote("origin"), "origin");
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_preflight_nonexistent_path() {
+        let result = git_ops_preflight("/nonexistent/path/to/repo", "fetch").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Path does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_preflight_not_a_directory() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let result = git_ops_preflight(path, "fetch").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_preflight_not_a_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let result = git_ops_preflight(path, "fetch").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Not a git repository"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_preflight_dirty_tree_blocks_rebase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        // Init a git repo with one commit
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        // Create an uncommitted file
+        std::fs::write(tmp.path().join("dirty.txt"), "dirty").unwrap();
+        let result = git_ops_preflight(repo, "rebase").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("uncommitted changes"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_fetch_on_local_repo() {
+        // Fetch on a repo with no remote will fail — verifies error handling
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let output = git_ops(&serde_json::json!({
+            "operation": "fetch",
+            "repo_path": repo
+        }))
+        .await;
+        // No remote configured → fetch fails
+        assert!(output.is_error);
+        assert!(output.content.contains("failed"));
     }
 
     /// Verify crate-local fallback copies match workspace-root docs.

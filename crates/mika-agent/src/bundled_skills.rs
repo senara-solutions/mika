@@ -94,6 +94,12 @@ static GOOGLE_WORKSPACE_SKILL: BundledSkill = skill!("google-workspace", [
     ("tools.json" => "../templates/skills/google-workspace/tools.json"),
 ]);
 
+static GIT_OPS_SKILL: BundledSkill = skill!("git-ops", [
+    ("skill.toml" => "../templates/skills/git-ops/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/git-ops/system_prompt.md"),
+    ("tools.json" => "../templates/skills/git-ops/tools.json"),
+]);
+
 static GITHUB_SKILL: BundledSkill = skill!("github", [
     ("skill.toml" => "../templates/skills/github/skill.toml"),
     ("system_prompt.md" => "../templates/skills/github/system_prompt.md"),
@@ -125,6 +131,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &WEB_SEARCH_SKILL,
     &FILE_READER_SKILL,
     &SELF_KNOWLEDGE_SKILL,
+    &GIT_OPS_SKILL,
     &GOOGLE_WORKSPACE_SKILL,
     &GITHUB_SKILL,
     &MCP_SKILL,
