@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::claude::{
-    ClaudeClient, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest,
-    ToolDefinition, ToolResultBlock, ToolResultBody,
+    CacheControl, CachedToolDefinition, ClaudeClient, ContentBlock, ImageSource, Message,
+    MessageContent, MessagesRequest, SystemContentBlock, ToolDefinition, ToolResultBlock,
+    ToolResultBody,
 };
 
 use super::LlmProvider;
@@ -99,21 +100,37 @@ impl LlmProvider for AnthropicProvider {
 fn to_anthropic_request(req: &LlmRequest) -> MessagesRequest {
     let messages = req.messages.iter().map(to_anthropic_message).collect();
 
+    // Convert system string into a content block array with cache_control
+    // on the last block for Anthropic prompt caching.
+    let system = req
+        .system
+        .as_ref()
+        .map(|s| vec![SystemContentBlock::text_cached(s.clone())]);
+
+    // Translate tool definitions and mark the last one with cache_control
+    // for tool schema caching (stable across the conversation).
     let tools = req.tools.as_ref().map(|tools| {
-        tools
+        let mut defs: Vec<CachedToolDefinition> = tools
             .iter()
-            .map(|t| ToolDefinition {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.parameters.clone(),
+            .map(|t| CachedToolDefinition {
+                tool: ToolDefinition {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.parameters.clone(),
+                },
+                cache_control: None,
             })
-            .collect()
+            .collect();
+        if let Some(last) = defs.last_mut() {
+            last.cache_control = Some(CacheControl::ephemeral());
+        }
+        defs
     });
 
     MessagesRequest {
         model: req.model.clone(),
         max_tokens: req.max_tokens,
-        system: req.system.clone(),
+        system,
         messages,
         tools,
         thinking: req.thinking.clone(),
@@ -264,7 +281,12 @@ mod tests {
         let anthropic = to_anthropic_request(&req);
         assert_eq!(anthropic.model, "claude-sonnet-4-6");
         assert_eq!(anthropic.max_tokens, 4096);
-        assert_eq!(anthropic.system, Some("You are Mika.".into()));
+        // System should be converted to content block array with cache_control
+        let system = anthropic.system.unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].text, "You are Mika.");
+        assert!(system[0].cache_control.is_some());
+        assert_eq!(system[0].cache_control.as_ref().unwrap().kind, "ephemeral");
         assert_eq!(anthropic.messages.len(), 1);
         assert_eq!(anthropic.messages[0].role, "user");
     }
@@ -287,8 +309,11 @@ mod tests {
         let anthropic = to_anthropic_request(&req);
         let tools = anthropic.tools.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "search");
-        assert_eq!(tools[0].input_schema, json!({ "type": "object" }));
+        assert_eq!(tools[0].tool.name, "search");
+        assert_eq!(tools[0].tool.input_schema, json!({ "type": "object" }));
+        // Last (only) tool should have cache_control
+        assert!(tools[0].cache_control.is_some());
+        assert_eq!(tools[0].cache_control.as_ref().unwrap().kind, "ephemeral");
     }
 
     #[test]

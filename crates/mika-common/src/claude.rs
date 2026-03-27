@@ -63,15 +63,69 @@ pub enum ThinkingConfig {
     Enabled { budget_tokens: u32 },
 }
 
+/// Cache control annotation for Anthropic prompt caching.
+///
+/// When attached to a content block, tool definition, or system block,
+/// marks that element as a cache breakpoint. The API caches everything
+/// up to and including the annotated element.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl CacheControl {
+    /// Create an ephemeral cache control (default 5-minute TTL).
+    pub fn ephemeral() -> Self {
+        Self {
+            kind: "ephemeral".to_string(),
+        }
+    }
+}
+
+/// A content block within the `system` field of an Anthropic messages request.
+///
+/// The Anthropic API accepts `system` as either a plain string or an array
+/// of typed content blocks. Using content blocks allows attaching
+/// `cache_control` annotations for prompt caching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl SystemContentBlock {
+    /// Create a text system block without cache control.
+    pub fn text(content: String) -> Self {
+        Self {
+            block_type: "text".to_string(),
+            text: content,
+            cache_control: None,
+        }
+    }
+
+    /// Create a text system block with ephemeral cache control.
+    pub fn text_cached(content: String) -> Self {
+        Self {
+            block_type: "text".to_string(),
+            text: content,
+            cache_control: Some(CacheControl::ephemeral()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Vec<SystemContentBlock>>,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDefinition>>,
+    pub tools: Option<Vec<CachedToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
 }
@@ -155,6 +209,19 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+}
+
+/// A tool definition with optional `cache_control` for Anthropic prompt caching.
+///
+/// Wraps the base `ToolDefinition` via `#[serde(flatten)]` so the serialized
+/// output is a flat JSON object with all fields at the same level.
+/// Used in `MessagesRequest.tools` to enable cache breakpoints on tool schemas.
+#[derive(Debug, Clone, Serialize)]
+pub struct CachedToolDefinition {
+    #[serde(flatten)]
+    pub tool: ToolDefinition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 // -- Response types --
@@ -392,6 +459,8 @@ impl ClaudeClient {
                         model = %request.model,
                         input_tokens = response.usage.input_tokens,
                         output_tokens = response.usage.output_tokens,
+                        cache_read_tokens = response.usage.cache_read_input_tokens.unwrap_or(0),
+                        cache_write_tokens = response.usage.cache_creation_input_tokens.unwrap_or(0),
                         stop_reason = ?response.stop_reason,
                         "llm_call completed"
                     );
@@ -588,7 +657,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-6".into(),
             max_tokens: 4096,
-            system: Some("You are Mika.".into()),
+            system: Some(vec![SystemContentBlock::text("You are Mika.".into())]),
             messages: vec![Message {
                 role: "user".into(),
                 content: MessageContent::Text("Hello".into()),
@@ -599,6 +668,8 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("claude-sonnet"));
         assert!(json.contains("Hello"));
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("You are Mika."));
     }
 
     #[test]
@@ -913,5 +984,99 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image");
+    }
+
+    // -- Prompt caching tests --
+
+    #[test]
+    fn test_cache_control_serialization() {
+        let cc = CacheControl::ephemeral();
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_system_content_block_cached_serialization() {
+        let block = SystemContentBlock::text_cached("You are Mika.".into());
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "You are Mika.");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_system_content_block_uncached_omits_cache_control() {
+        let block = SystemContentBlock::text("You are Mika.".into());
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "You are Mika.");
+        assert!(json.get("cache_control").is_none());
+    }
+
+    #[test]
+    fn test_cached_tool_definition_with_cache_control() {
+        let tool = CachedToolDefinition {
+            tool: ToolDefinition {
+                name: "search".into(),
+                description: "Search".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            cache_control: Some(CacheControl::ephemeral()),
+        };
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["name"], "search");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_cached_tool_definition_without_cache_control_omits_field() {
+        let tool = CachedToolDefinition {
+            tool: ToolDefinition {
+                name: "search".into(),
+                description: "Search".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            cache_control: None,
+        };
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["name"], "search");
+        assert!(json.get("cache_control").is_none());
+    }
+
+    #[test]
+    fn test_messages_request_with_cached_system() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 4096,
+            system: Some(vec![SystemContentBlock::text_cached(
+                "You are Mika.".into(),
+            )]),
+            messages: vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("Hello".into()),
+            }],
+            tools: None,
+            thinking: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let system = json["system"].as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "You are Mika.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_messages_request_none_system_omits_field() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            tools: None,
+            thinking: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("system"));
     }
 }
