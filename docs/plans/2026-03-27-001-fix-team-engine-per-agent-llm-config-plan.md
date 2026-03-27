@@ -1,7 +1,7 @@
 ---
 title: "fix: Team engine uses global LLM provider, ignores per-agent config"
 type: fix
-status: active
+status: completed
 date: 2026-03-27
 issue: 285
 ---
