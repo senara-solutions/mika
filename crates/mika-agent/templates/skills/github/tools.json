@@ -9,7 +9,7 @@
           "type": "array",
           "items": { "type": "string" },
           "minItems": 1,
-          "description": "The gh subcommand and arguments as an array of strings (e.g., [\"pr\", \"list\", \"--state\", \"open\"], [\"issue\", \"create\", \"--title\", \"Bug\", \"--body\", \"Details\"])"
+          "description": "The gh subcommand and arguments as an array of strings (e.g., [\"pr\", \"list\", \"--state\", \"open\"], [\"issue\", \"create\", \"--title\", \"Bug\", \"--body\", \"Details\"]). Note: `gh pr diff` accepts only the PR number — it does not support `--` file path filtering."
         },
         "repo": {
           "type": "string",
