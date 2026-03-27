@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 16;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -699,6 +699,10 @@ impl Database {
             self.migrate_v15_to_v16()?;
             info!(version = 16, "database migrated to v16");
         }
+        if (3..=16).contains(&version) {
+            self.migrate_v16_to_v17()?;
+            info!(version = 17, "database migrated to v17");
+        }
         Ok(())
     }
 
@@ -755,7 +759,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (16);
+            INSERT INTO schema_version (version) VALUES (17);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -845,6 +849,11 @@ impl Database {
                 ON tasks(agent_id, created_at DESC)
                 WHERE trigger_type = 'manual'
                 AND status IN ('pending', 'in_progress', 'blocked');
+            CREATE UNIQUE INDEX idx_tasks_manual_active_ref_url
+                ON tasks(agent_id, reference_url)
+                WHERE trigger_type = 'manual'
+                AND reference_url IS NOT NULL
+                AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');
 
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
@@ -2312,6 +2321,48 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v16_to_v17(&self) -> Result<()> {
+        info!("migrating database schema v16 → v17 (add work item dedup index on reference_url)");
+
+        // Step 1: Cancel duplicate active work items with the same (agent_id, reference_url).
+        // Keep the earliest-created item per group, cancel the rest with a metadata breadcrumb.
+        self.conn.execute_batch(
+            "UPDATE tasks SET status = 'cancelled',
+                 metadata = json_set(COALESCE(metadata, '{}'), '$.cancelled_reason', 'dedup_migration_v17')
+             WHERE id IN (
+                 SELECT t.id FROM tasks t
+                 INNER JOIN (
+                     SELECT agent_id, reference_url, MIN(created_at) as earliest
+                     FROM tasks
+                     WHERE trigger_type = 'manual'
+                       AND reference_url IS NOT NULL
+                       AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+                     GROUP BY agent_id, reference_url
+                     HAVING COUNT(*) > 1
+                 ) dups ON t.agent_id = dups.agent_id
+                        AND t.reference_url = dups.reference_url
+                        AND t.created_at != dups.earliest
+                 WHERE t.trigger_type = 'manual'
+                   AND t.status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+             );",
+        )?;
+
+        // Step 2: Create partial unique index. NULLs are exempt (SQLite skips NULL in
+        // unique indexes), so label-only dedup is handled at the tool level.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_manual_active_ref_url
+             ON tasks(agent_id, reference_url)
+             WHERE trigger_type = 'manual'
+               AND reference_url IS NOT NULL
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');",
+        )?;
+
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (17)", [])?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -2852,6 +2903,127 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Find an active manual work item by agent_id and reference_url.
+    /// Used for dedup when `create_work_item` is called with a reference_url that
+    /// already has an active (non-terminal) work item.
+    pub fn find_active_work_item_by_ref_url(
+        &self,
+        agent_id: &str,
+        reference_url: &str,
+    ) -> Result<Option<Task>> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
+                        trigger_type, cron_expr, event_source, event_offset_secs,
+                        condition_expr, next_fire_at, timeout_at, action_type,
+                        action_config, status, process_id, input_context, result,
+                        created_by_session, created_trace_id, execution_trace_id,
+                        created_at, updated_at, fired_at, completed_at,
+                        reference_url, source, metadata
+                 FROM tasks
+                 WHERE agent_id = ?1 AND reference_url = ?2
+                   AND trigger_type = 'manual'
+                   AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+                 LIMIT 1",
+                params![agent_id, reference_url],
+                |r| {
+                    Ok(Task {
+                        id: r.get(0)?,
+                        agent_id: r.get(1)?,
+                        team_run_id: r.get(2)?,
+                        parent_task_id: r.get(3)?,
+                        depth: r.get(4)?,
+                        label: r.get(5)?,
+                        trigger_type: r.get(6)?,
+                        cron_expr: r.get(7)?,
+                        event_source: r.get(8)?,
+                        event_offset_secs: r.get(9)?,
+                        condition_expr: r.get(10)?,
+                        next_fire_at: r.get(11)?,
+                        timeout_at: r.get(12)?,
+                        action_type: r.get(13)?,
+                        action_config: r.get(14)?,
+                        status: r.get(15)?,
+                        process_id: r.get(16)?,
+                        input_context: r.get(17)?,
+                        result: r.get(18)?,
+                        created_by_session: r.get(19)?,
+                        created_trace_id: r.get(20)?,
+                        execution_trace_id: r.get(21)?,
+                        created_at: r.get(22)?,
+                        updated_at: r.get(23)?,
+                        fired_at: r.get(24)?,
+                        completed_at: r.get(25)?,
+                        reference_url: r.get(26)?,
+                        source: r.get(27)?,
+                        metadata: r.get(28)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Find an active manual work item by agent_id and label (case-insensitive).
+    /// Used as a fallback dedup path when `create_work_item` is called without a reference_url.
+    pub fn find_active_work_item_by_label(
+        &self,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<Option<Task>> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
+                        trigger_type, cron_expr, event_source, event_offset_secs,
+                        condition_expr, next_fire_at, timeout_at, action_type,
+                        action_config, status, process_id, input_context, result,
+                        created_by_session, created_trace_id, execution_trace_id,
+                        created_at, updated_at, fired_at, completed_at,
+                        reference_url, source, metadata
+                 FROM tasks
+                 WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+                   AND trigger_type = 'manual'
+                   AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+                 LIMIT 1",
+                params![agent_id, label],
+                |r| {
+                    Ok(Task {
+                        id: r.get(0)?,
+                        agent_id: r.get(1)?,
+                        team_run_id: r.get(2)?,
+                        parent_task_id: r.get(3)?,
+                        depth: r.get(4)?,
+                        label: r.get(5)?,
+                        trigger_type: r.get(6)?,
+                        cron_expr: r.get(7)?,
+                        event_source: r.get(8)?,
+                        event_offset_secs: r.get(9)?,
+                        condition_expr: r.get(10)?,
+                        next_fire_at: r.get(11)?,
+                        timeout_at: r.get(12)?,
+                        action_type: r.get(13)?,
+                        action_config: r.get(14)?,
+                        status: r.get(15)?,
+                        process_id: r.get(16)?,
+                        input_context: r.get(17)?,
+                        result: r.get(18)?,
+                        created_by_session: r.get(19)?,
+                        created_trace_id: r.get(20)?,
+                        execution_trace_id: r.get(21)?,
+                        created_at: r.get(22)?,
+                        updated_at: r.get(23)?,
+                        fired_at: r.get(24)?,
+                        completed_at: r.get(25)?,
+                        reference_url: r.get(26)?,
+                        source: r.get(27)?,
+                        metadata: r.get(28)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Get the depth of a task by ID (for computing child depth).

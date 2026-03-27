@@ -4,8 +4,33 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::db::NewTask;
+use crate::db::{NewTask, Task, is_unique_violation};
 use crate::task_engine::types::{action_type, trigger_type};
+
+/// Format a success response for a deduplicated work item (already exists).
+fn format_dedup_response(existing: &Task) -> String {
+    let mut response = format!(
+        "Work item already exists for this reference: {}\n\
+         Label: {}\n\
+         Status: {}\n\
+         Created: {}\n\n\
+         Reuse this work item ID for subsequent operations.",
+        existing.id, existing.label, existing.status, existing.created_at
+    );
+    if let Some(url) = &existing.reference_url {
+        // Insert reference line before the trailing advice
+        response = format!(
+            "Work item already exists for this reference: {}\n\
+             Label: {}\n\
+             Status: {}\n\
+             Reference: {}\n\
+             Created: {}\n\n\
+             Reuse this work item ID for subsequent operations.",
+            existing.id, existing.label, existing.status, url, existing.created_at
+        );
+    }
+    response
+}
 
 /// Maximum agent-created work items per session (Guard 5).
 const MAX_WORK_ITEMS_PER_SESSION: i64 = 5;
@@ -133,6 +158,46 @@ impl Tool for CreateWorkItemTool {
             0
         };
 
+        // Dedup: check for existing active work items before session cap and INSERT.
+        // Dedup returns existing items as success — it's not a "new creation" so it
+        // must run before the session cap guard to avoid blocking legitimate reuse.
+
+        // Dedup path A (reference_url provided): pre-check by URL
+        if let Some(url) = reference_url
+            && let Some(existing) = ctx.db.find_active_work_item_by_ref_url(url).await?
+        {
+            ctx.db
+                .log_audit_event(
+                    ctx.session_id,
+                    "create_work_item",
+                    &format!("task:{}", existing.id),
+                    None,
+                    Some(&format!("dedup_reused — {} (ref: {url})", existing.label)),
+                    None,
+                    Some(ctx.trace_id),
+                )
+                .await?;
+            return Ok(ToolOutput::success(format_dedup_response(&existing)));
+        }
+
+        // Dedup path B (label-only, no reference_url): pre-check by label
+        if reference_url.is_none()
+            && let Some(existing) = ctx.db.find_active_work_item_by_label(label).await?
+        {
+            ctx.db
+                .log_audit_event(
+                    ctx.session_id,
+                    "create_work_item",
+                    &format!("task:{}", existing.id),
+                    None,
+                    Some(&format!("dedup_reused — {}", existing.label)),
+                    None,
+                    Some(ctx.trace_id),
+                )
+                .await?;
+            return Ok(ToolOutput::success(format_dedup_response(&existing)));
+        }
+
         // Guard 5: Cap agent-created work items per session
         if source != Some("user_request") {
             let count = ctx.db.count_session_work_items(ctx.session_id).await?;
@@ -166,38 +231,110 @@ impl Tool for CreateWorkItemTool {
             metadata: None,
         };
 
-        let id = ctx.db.create_task(task).await?;
+        // Dedup path A (reference_url provided): attempt INSERT, catch UNIQUE violation
+        match ctx.db.create_task(task).await {
+            Ok(id) => {
+                // Log audit event for new creation
+                let after_value = if let Some(url) = reference_url {
+                    format!("created — {label} (ref: {url})")
+                } else {
+                    format!("created — {label}")
+                };
+                ctx.db
+                    .log_audit_event(
+                        ctx.session_id,
+                        "create_work_item",
+                        &format!("task:{id}"),
+                        None,
+                        Some(&*after_value),
+                        None,
+                        Some(ctx.trace_id),
+                    )
+                    .await?;
 
-        // Log audit event
-        let after_value = if let Some(url) = reference_url {
-            format!("created — {label} (ref: {url})")
-        } else {
-            format!("created — {label}")
-        };
-        ctx.db
-            .log_audit_event(
-                ctx.session_id,
-                "create_work_item",
-                &format!("task:{id}"),
-                None,
-                Some(&*after_value),
-                None,
-                Some(ctx.trace_id),
-            )
-            .await?;
-
-        let mut response = format!("Work item created: {id}\nLabel: {label}\nStatus: pending");
-        if let Some(url) = reference_url {
-            response.push_str(&format!("\nReference: {url}"));
+                let mut response =
+                    format!("Work item created: {id}\nLabel: {label}\nStatus: pending");
+                if let Some(url) = reference_url {
+                    response.push_str(&format!("\nReference: {url}"));
+                }
+                if let Some(src) = source {
+                    response.push_str(&format!("\nSource: {src}"));
+                }
+                if let Some(pid) = parent_task_id {
+                    response.push_str(&format!("\nParent: {pid}"));
+                }
+                Ok(ToolOutput::success(response))
+            }
+            Err(err) if reference_url.is_some() && is_unique_violation(&err) => {
+                // UNIQUE constraint on (agent_id, reference_url) fired — find the existing item
+                let url = reference_url.unwrap();
+                if let Some(existing) = ctx.db.find_active_work_item_by_ref_url(url).await? {
+                    // Log dedup reuse in audit
+                    ctx.db
+                        .log_audit_event(
+                            ctx.session_id,
+                            "create_work_item",
+                            &format!("task:{}", existing.id),
+                            None,
+                            Some(&format!("dedup_reused — {} (ref: {url})", existing.label)),
+                            None,
+                            Some(ctx.trace_id),
+                        )
+                        .await?;
+                    Ok(ToolOutput::success(format_dedup_response(&existing)))
+                } else {
+                    // Edge case: item transitioned to terminal between INSERT and SELECT.
+                    // Retry the INSERT once.
+                    let retry_task = NewTask {
+                        agent_id: ctx.db.agent_id.clone(),
+                        team_run_id: None,
+                        parent_task_id: parent_task_id.map(|s| s.to_string()),
+                        depth,
+                        label: label.to_string(),
+                        trigger_type: trigger_type::MANUAL.to_string(),
+                        cron_expr: None,
+                        event_source: None,
+                        event_offset_secs: None,
+                        condition_expr: None,
+                        next_fire_at: None,
+                        timeout_at: None,
+                        action_type: action_type::NONE.to_string(),
+                        action_config: "{}".to_string(),
+                        input_context: None,
+                        created_by_session: Some(ctx.session_id.to_string()),
+                        created_trace_id: Some(ctx.trace_id.to_string()),
+                        reference_url: Some(url.to_string()),
+                        source: source.map(|s| s.to_string()),
+                        metadata: None,
+                    };
+                    let id = ctx.db.create_task(retry_task).await?;
+                    let after_value =
+                        format!("created — {label} (ref: {url}, retry after dedup race)");
+                    ctx.db
+                        .log_audit_event(
+                            ctx.session_id,
+                            "create_work_item",
+                            &format!("task:{id}"),
+                            None,
+                            Some(&after_value),
+                            None,
+                            Some(ctx.trace_id),
+                        )
+                        .await?;
+                    let mut response =
+                        format!("Work item created: {id}\nLabel: {label}\nStatus: pending");
+                    response.push_str(&format!("\nReference: {url}"));
+                    if let Some(src) = source {
+                        response.push_str(&format!("\nSource: {src}"));
+                    }
+                    if let Some(pid) = parent_task_id {
+                        response.push_str(&format!("\nParent: {pid}"));
+                    }
+                    Ok(ToolOutput::success(response))
+                }
+            }
+            Err(err) => Err(err),
         }
-        if let Some(src) = source {
-            response.push_str(&format!("\nSource: {src}"));
-        }
-        if let Some(pid) = parent_task_id {
-            response.push_str(&format!("\nParent: {pid}"));
-        }
-
-        Ok(ToolOutput::success(response))
     }
 }
 
@@ -498,5 +635,312 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("not found"));
+    }
+
+    // ===== Dedup tests (issue #303) =====
+
+    #[tokio::test]
+    async fn test_create_work_item_dedup_by_reference_url() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let url = "https://github.com/org/repo/issues/303";
+
+        // First creation succeeds normally
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Fix issue #303",
+                    "reference_url": url,
+                    "source": "github_issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result1.is_error,
+            "first create failed: {}",
+            result1.content
+        );
+        assert!(result1.content.contains("Work item created"));
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Work item created: ")
+            .unwrap()
+            .to_string();
+
+        // Second creation with same URL returns existing item
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Fix issue #303 (retry)",
+                    "reference_url": url,
+                    "source": "github_issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error, "dedup failed: {}", result2.content);
+        assert!(
+            result2.content.contains("already exists"),
+            "expected dedup response, got: {}",
+            result2.content
+        );
+        assert!(
+            result2.content.contains(&id1),
+            "should return original ID {id1}, got: {}",
+            result2.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_dedup_by_label() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        // First creation (no reference_url)
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Research memory patterns",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Work item created: ")
+            .unwrap()
+            .to_string();
+
+        // Second creation with same label returns existing
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Research memory patterns",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error);
+        assert!(result2.content.contains("already exists"));
+        assert!(result2.content.contains(&id1));
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_dedup_case_insensitive_label() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        // Create with one casing
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Fix Login Bug",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Work item created: ")
+            .unwrap()
+            .to_string();
+
+        // Same label different casing → dedup
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "fix login bug",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error);
+        assert!(result2.content.contains("already exists"));
+        assert!(result2.content.contains(&id1));
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_allows_after_terminal() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let url = "https://github.com/org/repo/issues/99";
+
+        // Create and complete item
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Old task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Work item created: ")
+            .unwrap()
+            .to_string();
+        ctx.db.update_task_status(&id1, "completed").await.unwrap();
+
+        // New creation with same URL should succeed (old is terminal)
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Retry task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error, "failed: {}", result2.content);
+        assert!(
+            result2.content.contains("Work item created"),
+            "expected new creation, got: {}",
+            result2.content
+        );
+        // Should be a different ID
+        let id2 = result2
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Work item created: ")
+            .unwrap();
+        assert_ne!(id1, id2, "should be a new item, not the old completed one");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_dedup_cross_agent() {
+        // Different agents should be able to create items with the same reference_url
+        let harness1 = TestHarness::new();
+        let harness2 = TestHarness::with_agent("other-agent");
+        let ctx1 = harness1.ctx();
+        let ctx2 = harness2.ctx();
+        let tool = CreateWorkItemTool;
+
+        let url = "https://github.com/org/repo/issues/50";
+
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Agent 1 task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx1,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Agent 2 task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx2,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error, "cross-agent failed: {}", result2.content);
+        assert!(
+            result2.content.contains("Work item created"),
+            "different agent should create new item, got: {}",
+            result2.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_dedup_skips_session_counter() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        // Create 4 unique items (leaves 1 slot)
+        for i in 0..4 {
+            tool.execute(
+                serde_json::json!({"label": format!("Unique item {i}")}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Create item with URL
+        tool.execute(
+            serde_json::json!({
+                "label": "URL item",
+                "reference_url": "https://example.com/issue/1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Now at 5/5 cap
+
+        // Dedup hit on URL item should NOT consume a slot
+        let dedup_result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "URL item retry",
+                    "reference_url": "https://example.com/issue/1"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!dedup_result.is_error);
+        assert!(dedup_result.content.contains("already exists"));
+
+        // The cap is still at 5/5 — dedup didn't consume a slot.
+        // Verify by trying to create a truly new item (should fail, cap reached)
+        let over_cap = tool
+            .execute(serde_json::json!({"label": "Truly new item"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            over_cap.is_error,
+            "should be at cap, but got: {}",
+            over_cap.content
+        );
+        assert!(over_cap.content.contains("Maximum"));
     }
 }
