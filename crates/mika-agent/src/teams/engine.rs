@@ -33,12 +33,16 @@ struct AgentResources {
     skills: SkillRegistry,
     home_dir: PathBuf,
     embedding_client: Option<EmbeddingClient>,
+    /// Per-agent settings loaded via `Settings::load_for_agent()` cascade:
+    /// per-agent config.toml > global config.toml > defaults > env vars.
+    settings: Settings,
+    /// Per-agent LLM provider constructed from this agent's cascaded settings.
+    llm: Arc<dyn LlmProvider>,
 }
 
 /// Shared initialization resources produced by [`TeamEngine::init_resources`].
 struct EngineResources {
     agents: HashMap<String, AgentResources>,
-    llm: Arc<dyn LlmProvider>,
     tool_registry: ToolRegistry,
     workspace_dir: PathBuf,
 }
@@ -49,7 +53,6 @@ pub struct TeamEngine {
     run: TeamRun,
     workspace_dir: PathBuf,
     agents: Arc<HashMap<String, AgentResources>>,
-    llm: Arc<dyn LlmProvider>,
     tool_registry: Arc<ToolRegistry>,
     callback: Option<Arc<TeamEventCallback>>,
     brave_api_key: Option<String>,
@@ -101,6 +104,14 @@ impl TeamEngine {
             }
             let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
 
+            // Per-agent config cascade: per-agent config.toml > global config.toml > env vars.
+            // This ensures each team agent uses its own LLM provider/model settings (#285).
+            let agent_settings = Settings::load_for_agent(global_home, &home_dir)
+                .with_context(|| format!("failed to load config for agent '{}'", ta.name))?;
+            let agent_llm = agent_settings.make_llm_provider().with_context(|| {
+                format!("failed to create LLM provider for agent '{}'", ta.name)
+            })?;
+
             agents.insert(
                 ta.name.clone(),
                 AgentResources {
@@ -108,11 +119,11 @@ impl TeamEngine {
                     skills,
                     home_dir,
                     embedding_client: embedding_client.clone(),
+                    settings: agent_settings,
+                    llm: agent_llm,
                 },
             );
         }
-
-        let llm = settings.make_llm_provider()?;
 
         // Build tool registry once with base tools + workspace tools (#255)
         let mut tool_registry = tools::default_tools();
@@ -122,7 +133,6 @@ impl TeamEngine {
 
         Ok(EngineResources {
             agents,
-            llm,
             tool_registry,
             workspace_dir,
         })
@@ -170,7 +180,6 @@ impl TeamEngine {
             run,
             workspace_dir: res.workspace_dir,
             agents: Arc::new(res.agents),
-            llm: res.llm,
             tool_registry: Arc::new(res.tool_registry),
             callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
@@ -211,7 +220,6 @@ impl TeamEngine {
             run,
             workspace_dir: res.workspace_dir,
             agents: Arc::new(res.agents),
-            llm: res.llm,
             tool_registry: Arc::new(res.tool_registry),
             callback: None, // No callback on resume — events go through task system
             brave_api_key: settings.brave_api_key.clone(),
@@ -756,7 +764,6 @@ impl TeamEngine {
     async fn execute_tasks(&mut self) -> Result<bool> {
         // Prepare shared resources that will be moved into spawned tasks.
         let agents = Arc::clone(&self.agents);
-        let llm = self.llm.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let run_id = self.run.run_id.clone();
         let callback = self.callback.clone();
@@ -897,7 +904,6 @@ impl TeamEngine {
             });
 
             let agents = Arc::clone(&agents);
-            let llm = llm.clone();
             let tool_registry = Arc::clone(&tool_registry);
             let run_id = run_id.clone();
             let callback = callback.clone();
@@ -948,7 +954,7 @@ impl TeamEngine {
                             let child_task_id_ref = input.child_task_id.as_deref();
                             let params = TeamAgentParams {
                                 db: &resources.db,
-                                llm: llm.as_ref(),
+                                llm: resources.llm.as_ref(),
                                 tools: &tool_registry,
                                 skills: &resources.skills,
                                 home_dir: &resources.home_dir,
@@ -959,7 +965,7 @@ impl TeamEngine {
                                 brave_api_key: brave_api_key.as_deref(),
                                 github_token: github_token.as_deref(),
                                 skills_dirty: &skills_dirty,
-                                settings: None,
+                                settings: Some(&resources.settings),
                                 mcp_manager: None,
                                 agent_name,
                                 child_task_id: child_task_id_ref,
@@ -1295,7 +1301,7 @@ impl TeamEngine {
         let skills_dirty = AtomicBool::new(false);
         let params = TeamAgentParams {
             db: &resources.db,
-            llm: self.llm.as_ref(),
+            llm: resources.llm.as_ref(),
             tools: &self.tool_registry,
             skills: &resources.skills,
             home_dir: &resources.home_dir,
@@ -1306,7 +1312,7 @@ impl TeamEngine {
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             skills_dirty: &skills_dirty,
-            settings: None,
+            settings: Some(&resources.settings),
             mcp_manager: None,
             agent_name,
             child_task_id: None,
