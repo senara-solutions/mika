@@ -572,9 +572,12 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 
 ### Builtin-handler skills (keyword-triggered)
 
-| Skill              | Keywords                                              | Tools     | Prompt Snippet |
-|--------------------|-------------------------------------------------------|-----------|----------------|
-| google-workspace   | google, gmail, google calendar, google drive, gdrive  | `run_gws` | Yes            |
+| Skill              | Keywords                                                                                           | Tools      | Prompt Snippet |
+|--------------------|----------------------------------------------------------------------------------------------------|------------|----------------|
+| git-ops            | rebase, merge main, sync main, git sync, sync branch, fast-forward, git fetch, rebase onto, git rebase, git merge | `git_ops`  | Yes            |
+| google-workspace   | google, gmail, google calendar, google drive, gdrive                                               | `run_gws`  | Yes            |
+
+The **git-ops** skill provides `git_ops` for structured git maintenance operations (fetch, rebase, merge). It uses `tokio::process::Command` with `GIT_TERMINAL_PROMPT=0` and scrubs `MIKA_*` env vars from child processes. Supported operations: `fetch` (download remote refs), `rebase` (fetch + rebase onto base ref, auto-aborts on conflict), `merge` (fetch + fast-forward only merge). Optional `push: true` on rebase uses `--force-with-lease` with branch protection (refuses push to `main`/`master`). Pre-flight checks verify the repo path, clean working tree, and no in-progress rebase/merge. `timeout_secs = 120` for large repo operations.
 
 The **google-workspace** skill provides `run_gws` for interacting with Google Workspace (Gmail, Calendar, Drive) via the `gws` CLI. It uses a service allowlist (`gmail`, `calendar`, `drive`) and blocks credential/config-smuggling flags (`--token`, `--credentials-file`, `--config`, `--config-dir` including `--flag=value` forms). Scrubs `MIKA_*` env vars from child processes. Uses `gws`'s native keyring-based authentication (set up via `gws auth login`). Requires `gws` CLI installed (included in Docker image). `timeout_secs = 45` to accommodate first-call API schema discovery.
 
