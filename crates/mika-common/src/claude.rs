@@ -68,18 +68,20 @@ pub enum ThinkingConfig {
 /// When attached to a content block, tool definition, or system block,
 /// marks that element as a cache breakpoint. The API caches everything
 /// up to and including the annotated element.
+///
+/// Serializes as `{"type": "ephemeral"}` without runtime string allocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheControl {
-    #[serde(rename = "type")]
-    pub kind: String,
+#[serde(tag = "type")]
+pub enum CacheControl {
+    /// Ephemeral cache control (default 5-minute TTL).
+    #[serde(rename = "ephemeral")]
+    Ephemeral,
 }
 
 impl CacheControl {
     /// Create an ephemeral cache control (default 5-minute TTL).
     pub fn ephemeral() -> Self {
-        Self {
-            kind: "ephemeral".to_string(),
-        }
+        Self::Ephemeral
     }
 }
 
@@ -88,10 +90,12 @@ impl CacheControl {
 /// The Anthropic API accepts `system` as either a plain string or an array
 /// of typed content blocks. Using content blocks allows attaching
 /// `cache_control` annotations for prompt caching.
+///
+/// Uses `#[serde(tag = "type", rename = "text")]` so the `type` field is
+/// always `"text"` in serialized output without storing it at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "text")]
 pub struct SystemContentBlock {
-    #[serde(rename = "type")]
-    pub block_type: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
@@ -101,7 +105,6 @@ impl SystemContentBlock {
     /// Create a text system block without cache control.
     pub fn text(content: String) -> Self {
         Self {
-            block_type: "text".to_string(),
             text: content,
             cache_control: None,
         }
@@ -110,7 +113,6 @@ impl SystemContentBlock {
     /// Create a text system block with ephemeral cache control.
     pub fn text_cached(content: String) -> Self {
         Self {
-            block_type: "text".to_string(),
             text: content,
             cache_control: Some(CacheControl::ephemeral()),
         }

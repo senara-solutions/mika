@@ -286,7 +286,10 @@ mod tests {
         assert_eq!(system.len(), 1);
         assert_eq!(system[0].text, "You are Mika.");
         assert!(system[0].cache_control.is_some());
-        assert_eq!(system[0].cache_control.as_ref().unwrap().kind, "ephemeral");
+        assert!(matches!(
+            system[0].cache_control.as_ref().unwrap(),
+            CacheControl::Ephemeral
+        ));
         assert_eq!(anthropic.messages.len(), 1);
         assert_eq!(anthropic.messages[0].role, "user");
     }
@@ -313,7 +316,10 @@ mod tests {
         assert_eq!(tools[0].tool.input_schema, json!({ "type": "object" }));
         // Last (only) tool should have cache_control
         assert!(tools[0].cache_control.is_some());
-        assert_eq!(tools[0].cache_control.as_ref().unwrap().kind, "ephemeral");
+        assert!(matches!(
+            tools[0].cache_control.as_ref().unwrap(),
+            CacheControl::Ephemeral
+        ));
     }
 
     #[test]
