@@ -321,7 +321,7 @@ async fn spawn_agent_worker(
                     // Build framing message for the agent
                     let is_failed = original_status == "failed";
                     let framing =
-                        agent::format_callback_framing(&label, &task_id, &result, is_failed);
+                        agent::build_callback_trigger_context(&label, &task_id, &result, is_failed);
 
                     let is_onboarding = check_onboarding(&worker_db).await;
                     let callback_result = agent::run_agent(&AgentParams {
