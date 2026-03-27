@@ -40,8 +40,11 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 │       │   ├── web-search/
 │       │   ├── file-reader/
 │       │   ├── tmux/
+│       │   ├── git-ops/
+│       │   ├── google-workspace/
 │       │   ├── github/
 │       │   ├── mcp/
+│       │   ├── browser-control/
 │       │   ├── agents-teams/
 │       │   └── <marketplace-skill>/
 │       └── exports/                  # Conversation exports
