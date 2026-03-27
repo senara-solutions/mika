@@ -2324,15 +2324,19 @@ impl Database {
     fn migrate_v16_to_v17(&self) -> Result<()> {
         info!("migrating database schema v16 → v17 (add work item dedup index on reference_url)");
 
-        // Step 1: Cancel duplicate active work items with the same (agent_id, reference_url).
-        // Keep the earliest-created item per group, cancel the rest with a metadata breadcrumb.
+        // Wrap in transaction for atomicity (matches pattern in migrate_v7_to_v8, etc.)
         self.conn.execute_batch(
-            "UPDATE tasks SET status = 'cancelled',
+            "BEGIN IMMEDIATE;
+
+             -- Step 1: Cancel duplicate active work items with the same (agent_id, reference_url).
+             -- Keep the earliest-created item per group (by rowid for deterministic tiebreaking
+             -- when created_at timestamps collide), cancel the rest with a metadata breadcrumb.
+             UPDATE tasks SET status = 'cancelled',
                  metadata = json_set(COALESCE(metadata, '{}'), '$.cancelled_reason', 'dedup_migration_v17')
-             WHERE id IN (
-                 SELECT t.id FROM tasks t
+             WHERE rowid IN (
+                 SELECT t.rowid FROM tasks t
                  INNER JOIN (
-                     SELECT agent_id, reference_url, MIN(created_at) as earliest
+                     SELECT agent_id, reference_url, MIN(rowid) as keeper_rowid
                      FROM tasks
                      WHERE trigger_type = 'manual'
                        AND reference_url IS NOT NULL
@@ -2341,24 +2345,23 @@ impl Database {
                      HAVING COUNT(*) > 1
                  ) dups ON t.agent_id = dups.agent_id
                         AND t.reference_url = dups.reference_url
-                        AND t.created_at != dups.earliest
+                        AND t.rowid != dups.keeper_rowid
                  WHERE t.trigger_type = 'manual'
                    AND t.status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
-             );",
-        )?;
+             );
 
-        // Step 2: Create partial unique index. NULLs are exempt (SQLite skips NULL in
-        // unique indexes), so label-only dedup is handled at the tool level.
-        self.conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_manual_active_ref_url
+             -- Step 2: Create partial unique index. NULLs are exempt (SQLite skips NULL in
+             -- unique indexes), so label-only dedup is handled at the tool level.
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_manual_active_ref_url
              ON tasks(agent_id, reference_url)
              WHERE trigger_type = 'manual'
                AND reference_url IS NOT NULL
-               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');",
-        )?;
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');
 
-        self.conn
-            .execute("INSERT INTO schema_version (version) VALUES (17)", [])?;
+             INSERT INTO schema_version (version) VALUES (17);
+
+             COMMIT;",
+        )?;
 
         Ok(())
     }

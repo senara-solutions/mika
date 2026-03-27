@@ -12,23 +12,16 @@ fn format_dedup_response(existing: &Task) -> String {
     let mut response = format!(
         "Work item already exists for this reference: {}\n\
          Label: {}\n\
-         Status: {}\n\
-         Created: {}\n\n\
-         Reuse this work item ID for subsequent operations.",
-        existing.id, existing.label, existing.status, existing.created_at
+         Status: {}",
+        existing.id, existing.label, existing.status
     );
     if let Some(url) = &existing.reference_url {
-        // Insert reference line before the trailing advice
-        response = format!(
-            "Work item already exists for this reference: {}\n\
-             Label: {}\n\
-             Status: {}\n\
-             Reference: {}\n\
-             Created: {}\n\n\
-             Reuse this work item ID for subsequent operations.",
-            existing.id, existing.label, existing.status, url, existing.created_at
-        );
+        response.push_str(&format!("\nReference: {url}"));
     }
+    response.push_str(&format!(
+        "\nCreated: {}\n\nReuse this work item ID for subsequent operations.",
+        existing.created_at
+    ));
     response
 }
 
