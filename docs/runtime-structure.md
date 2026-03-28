@@ -70,7 +70,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 16
+**Current schema version:** 17
 
 **Timestamp format:** All timestamp columns use ISO 8601 TEXT (`%Y-%m-%dT%H:%M:%SZ`) — not Unix epoch integers. SQL defaults use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`. Fixed-width UTC format ensures correct lexicographic ordering.
 
@@ -149,6 +149,7 @@ Unique partial indexes (duplicate prevention):
 - `idx_tasks_unique_reminder` — one active reminder per (agent, label)
 - `idx_events_unique_description` — one event per (agent, description, date)
 - `idx_commitments_unique_pending` — one pending commitment per (agent, description, due_date)
+- `idx_tasks_manual_active_ref_url` — one active manual work item per (agent, reference_url); NULLs exempt
 
 Performance indexes: `idx_tasks_schedulable` (pending/recurring by next_fire_at), `idx_msg_session` (messages by session+time), `idx_msg_agent_created`, `idx_sessions_agent`.
 

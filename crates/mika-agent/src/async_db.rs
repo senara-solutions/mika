@@ -336,6 +336,23 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn find_active_work_item_by_ref_url(
+        &self,
+        reference_url: &str,
+    ) -> Result<Option<Task>> {
+        let a = self.agent_id.clone();
+        let url = reference_url.to_owned();
+        self.with_db(move |db| db.find_active_work_item_by_ref_url(&a, &url))
+            .await
+    }
+
+    pub async fn find_active_work_item_by_label(&self, label: &str) -> Result<Option<Task>> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.find_active_work_item_by_label(&a, &l))
+            .await
+    }
+
     pub async fn get_task_depth(&self, task_id: &str) -> Result<Option<i64>> {
         let a = self.agent_id.clone();
         let i = task_id.to_owned();
