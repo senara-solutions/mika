@@ -77,22 +77,19 @@ fn parse_github_ref(url: &str) -> Option<GitHubRef> {
     }
 }
 
-/// Fetch GitHub PR status via the REST API.
-async fn fetch_github_pr_status(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    number: u64,
-) -> Result<String, String> {
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}");
-
+/// Perform an authenticated GET request to the GitHub REST API.
+///
+/// Constructs a client with a 10-second timeout, sets standard headers,
+/// maps common HTTP error codes to human-readable messages, and returns
+/// the parsed JSON body.
+async fn github_get(token: &str, url: &str) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
     let response = client
-        .get(&url)
+        .get(url)
         .header("Authorization", format!("Bearer {token}"))
         .header("User-Agent", "mika-agent")
         .header("Accept", "application/vnd.github+json")
@@ -105,17 +102,28 @@ async fn fetch_github_pr_status(
         let msg = match status.as_u16() {
             401 => "token invalid or expired".to_string(),
             403 => "token lacks required permissions".to_string(),
-            404 => "PR not found or not accessible".to_string(),
+            404 => "not found or not accessible".to_string(),
             429 => "rate limit exceeded".to_string(),
             _ => format!("HTTP {status}"),
         };
         return Err(msg);
     }
 
-    let body: Value = response
+    response
         .json()
         .await
-        .map_err(|e| format!("failed to parse response: {e}"))?;
+        .map_err(|e| format!("failed to parse response: {e}"))
+}
+
+/// Fetch GitHub PR status via the REST API.
+async fn fetch_github_pr_status(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}");
+    let body = github_get(token, &url).await?;
 
     let state = body["state"].as_str().unwrap_or("unknown");
     let merged = body["merged"].as_bool().unwrap_or(false);
@@ -145,37 +153,7 @@ async fn fetch_github_issue_status(
     number: u64,
 ) -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", "mika-agent")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("GitHub API request failed: {e}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let msg = match status.as_u16() {
-            401 => "token invalid or expired".to_string(),
-            403 => "token lacks required permissions".to_string(),
-            404 => "issue not found or not accessible".to_string(),
-            429 => "rate limit exceeded".to_string(),
-            _ => format!("HTTP {status}"),
-        };
-        return Err(msg);
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse response: {e}"))?;
+    let body = github_get(token, &url).await?;
 
     let state = body["state"].as_str().unwrap_or("unknown");
     let state_reason = body["state_reason"].as_str();
