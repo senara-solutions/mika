@@ -1,3 +1,8 @@
+---
+title: Memory Classification
+description: Deterministic vs agent-triggered memory operation classification
+---
+
 # Memory Operation Classification
 
 **Date:** 2026-03-28
