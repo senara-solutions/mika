@@ -460,6 +460,8 @@ pub struct ToolCallFilters {
     pub success: Option<bool>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Keyword search in input/output fields (uses SQL LIKE).
+    pub keyword: Option<String>,
 }
 
 // ===== Dashboard Types =====
@@ -3923,6 +3925,14 @@ impl Database {
         if let Some(ref to) = filters.to {
             params_vec.push(Box::new(to.clone()));
             where_clauses.push(format!("created_at <= ?{}", params_vec.len()));
+        }
+        if let Some(ref keyword) = filters.keyword {
+            let like_pattern = format!("%{keyword}%");
+            params_vec.push(Box::new(like_pattern.clone()));
+            let p1 = params_vec.len();
+            params_vec.push(Box::new(like_pattern));
+            let p2 = params_vec.len();
+            where_clauses.push(format!("(input LIKE ?{p1} OR output LIKE ?{p2})"));
         }
 
         let where_sql = if where_clauses.is_empty() {
