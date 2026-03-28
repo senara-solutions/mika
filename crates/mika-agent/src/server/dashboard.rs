@@ -724,6 +724,7 @@ pub async fn handle_tool_calls(
         success: q.success,
         from: q.from,
         to: q.to,
+        keyword: None,
     };
 
     let (data, total) = match state

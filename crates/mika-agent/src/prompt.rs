@@ -272,6 +272,13 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          <callback_result>, <task-health>, or <rewind_reversals> in your responses. \
          These are system metadata injected for your context — they are not for user display.\n",
     );
+    prompt.push_str(
+        "- **Context priority:** When information from different sources conflicts, prefer in this order: \
+         current user message > core memory > active skill context > conversation summary > \
+         conversation history > search results. The user's latest message is always ground truth. \
+         Core memory is agent-curated and actively maintained. Conversation summaries are lossy \
+         derivatives of older history — treat them as helpful context, not authoritative.\n",
+    );
     let section_names = core_memory_section_names();
     write!(
         prompt,
@@ -430,6 +437,11 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \
          or long-running skills), you MUST first create a work item using create_work_item, then pass \
          the work_item_id to the delegation tool. The tool will reject calls without a valid work_item_id.\n",
+    );
+    prompt.push_str(
+        "- Use search_tool_history to recall results of past tool calls across sessions (by tool name, \
+         keyword, time range). This avoids re-running expensive external calls when you've already \
+         retrieved the same information recently.\n",
     );
     prompt.push_str(
         "- Some tools are long-running and return a task ID instead of immediate results. \
@@ -1935,5 +1947,29 @@ notify = true
         // Verify bad/good examples are present
         assert!(prompt.contains("BAD:"));
         assert!(prompt.contains("GOOD:"));
+    }
+
+    #[test]
+    fn test_prompt_includes_context_priority() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("Context priority:"));
+        assert!(prompt.contains("current user message > core memory > active skill context"));
+        assert!(prompt.contains("conversation summary"));
+        assert!(prompt.contains("conversation history > search results"));
     }
 }

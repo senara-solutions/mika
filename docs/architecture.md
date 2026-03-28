@@ -219,6 +219,7 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `query_timeline` | Query the unified timeline of events across all subsystems (messages, audit events, tasks). Returns recent activity sorted by time. Non-orchestrator agents scoped to own agent_id. | Introspection |
 | `get_session_messages` | Retrieve messages from a past conversation session. Useful for replaying or summarizing old conversations. Non-orchestrator agents can only access their own sessions. | Introspection |
 | `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
+| `search_tool_history` | Search past tool call history across sessions by tool name, keyword, time range, and success status. Returns truncated input/output (500 chars), 10KB output cap, 30-day retention. Non-orchestrator agents scoped to own tool calls. | Introspection |
 | `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
 | `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. | Work Items |
 | `check_work_item` | Read work item details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Work Items |

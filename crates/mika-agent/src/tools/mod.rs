@@ -31,6 +31,7 @@ mod read_agent_file;
 mod read_workspace;
 mod run_team;
 mod search_memory;
+mod search_tool_history;
 mod send_message;
 mod set_config;
 mod store_fact;
@@ -528,6 +529,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));
+    registry.register(Box::new(search_tool_history::SearchToolHistoryTool));
     registry
 }
 
