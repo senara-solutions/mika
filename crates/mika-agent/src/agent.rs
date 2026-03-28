@@ -1777,7 +1777,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         }
     };
 
-    let (task_health, stored_preferences) = if matches!(&params.trigger, SilentTrigger::Heartbeat) {
+    let (task_health, stored_preferences) = if matches!(
+        &params.trigger,
+        SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+    ) {
         (
             db.get_task_health_summary().await.ok(),
             db.search_preferences("task_policy_")
@@ -3707,6 +3710,82 @@ mod tests {
         );
         assert!(ctx.contains("Analyze the data"));
         assert!(!ctx.contains("delegate_task"));
+    }
+
+    // -- Task health injection guard tests (#314) --
+
+    #[test]
+    fn test_task_health_guard_includes_heartbeat() {
+        let trigger = SilentTrigger::Heartbeat;
+        let should_inject = matches!(
+            &trigger,
+            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+        );
+        assert!(
+            should_inject,
+            "Heartbeat trigger should receive task health"
+        );
+    }
+
+    #[test]
+    fn test_task_health_guard_includes_callback() {
+        let trigger = SilentTrigger::Callback {
+            task_id: "task-100".to_string(),
+            label: "long_running:run_claude_pilot".to_string(),
+            result: "PR created".to_string(),
+            failed: false,
+        };
+        let should_inject = matches!(
+            &trigger,
+            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+        );
+        assert!(should_inject, "Callback trigger should receive task health");
+    }
+
+    #[test]
+    fn test_task_health_guard_includes_failed_callback() {
+        let trigger = SilentTrigger::Callback {
+            task_id: "task-101".to_string(),
+            label: "long_running:run_shell".to_string(),
+            result: "Script failed".to_string(),
+            failed: true,
+        };
+        let should_inject = matches!(
+            &trigger,
+            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+        );
+        assert!(
+            should_inject,
+            "Failed callback trigger should also receive task health"
+        );
+    }
+
+    #[test]
+    fn test_task_health_guard_excludes_reflection() {
+        let trigger = SilentTrigger::Reflection;
+        let should_inject = matches!(
+            &trigger,
+            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+        );
+        assert!(
+            !should_inject,
+            "Reflection trigger should NOT receive task health"
+        );
+    }
+
+    #[test]
+    fn test_task_health_guard_excludes_skill_run() {
+        let trigger = SilentTrigger::SkillRun {
+            skill_name: "web-search".to_string(),
+        };
+        let should_inject = matches!(
+            &trigger,
+            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+        );
+        assert!(
+            !should_inject,
+            "SkillRun trigger should NOT receive task health"
+        );
     }
 
     // -- collect_required_tools tests (#270, #265) --
