@@ -41,18 +41,48 @@ pub async fn handle_root(State(state): State<AppState>) -> Response {
 }
 
 /// Enable the embedded dashboard at runtime.
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboard/enable",
+    responses(
+        (status = 200, description = "Dashboard enabled", body = inline(serde_json::Value),
+            example = json!({"enabled": true})),
+        (status = 401, description = "Missing or invalid Bearer token"),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn handle_enable(State(state): State<AppState>) -> Json<serde_json::Value> {
     state.dashboard_enabled.store(true, Ordering::Relaxed);
     Json(serde_json::json!({ "enabled": true }))
 }
 
 /// Disable the embedded dashboard at runtime.
+#[utoipa::path(
+    post,
+    path = "/api/v1/dashboard/disable",
+    responses(
+        (status = 200, description = "Dashboard disabled", body = inline(serde_json::Value),
+            example = json!({"enabled": false})),
+        (status = 401, description = "Missing or invalid Bearer token"),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn handle_disable(State(state): State<AppState>) -> Json<serde_json::Value> {
     state.dashboard_enabled.store(false, Ordering::Relaxed);
     Json(serde_json::json!({ "enabled": false }))
 }
 
 /// Return the current dashboard status.
+#[utoipa::path(
+    get,
+    path = "/api/v1/dashboard/status",
+    responses(
+        (status = 200, description = "Dashboard status", body = inline(serde_json::Value),
+            example = json!({"enabled": true, "has_assets": true, "has_token": true})),
+        (status = 401, description = "Missing or invalid Bearer token"),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn handle_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "enabled": state.dashboard_enabled.load(Ordering::Relaxed),
