@@ -58,75 +58,6 @@ paths:
           description: Agent is busy processing another message
       security:
       - bearer: []
-  /api/v1/dashboard/enable:
-    post:
-      tags:
-      - dashboard
-      summary: POST /api/v1/dashboard/enable — Enable the embedded dashboard at runtime.
-      operationId: handle_dashboard_enable
-      responses:
-        '200':
-          description: Dashboard enabled
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  enabled:
-                    type: boolean
-        '401':
-          description: Missing or invalid Bearer token
-      security:
-      - bearer: []
-      - dashboard_bearer: []
-  /api/v1/dashboard/disable:
-    post:
-      tags:
-      - dashboard
-      summary: POST /api/v1/dashboard/disable — Disable the embedded dashboard at runtime.
-      operationId: handle_dashboard_disable
-      responses:
-        '200':
-          description: Dashboard disabled
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  enabled:
-                    type: boolean
-        '401':
-          description: Missing or invalid Bearer token
-      security:
-      - bearer: []
-      - dashboard_bearer: []
-  /api/v1/dashboard/status:
-    get:
-      tags:
-      - dashboard
-      summary: GET /api/v1/dashboard/status — Return current dashboard state.
-      operationId: handle_dashboard_status
-      responses:
-        '200':
-          description: Dashboard status
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  enabled:
-                    type: boolean
-                  has_assets:
-                    type: boolean
-                    description: Whether dashboard assets were embedded at compile time
-                  has_token:
-                    type: boolean
-                    description: Whether MIKA_DASHBOARD_TOKEN is configured
-        '401':
-          description: Missing or invalid Bearer token
-      security:
-      - bearer: []
-      - dashboard_bearer: []
 components:
   schemas:
     AcceptedResponse:
@@ -199,8 +130,3 @@ components:
       scheme: bearer
       bearerFormat: token
       description: Shared secret between gateway and agent container (MIKA_INTERNAL_TOKEN)
-    dashboard_bearer:
-      type: http
-      scheme: bearer
-      bearerFormat: token
-      description: Read-only dashboard token (MIKA_DASHBOARD_TOKEN)
