@@ -9,8 +9,9 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed
 
 INPUT=$(cat)
 
-# Scrub sensitive env vars so subprocesses cannot leak them
-unset MIKA_LLM_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY MIKA_GITHUB_TOKEN MIKA_INVESTIGATE_GITHUB_TOKEN
+# Scrub all MIKA_* env vars so subprocesses cannot leak secrets
+# Mirrors the Rust executor's scrub_mika_env_vars() wildcard approach
+for _mika_var in $(env | grep '^MIKA_' | cut -d= -f1); do unset "$_mika_var"; done
 
 # Parse JSON fields
 COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')

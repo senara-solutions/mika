@@ -2,9 +2,16 @@
 title: Unified LLM API Key Consolidation
 category: architecture-patterns
 date: 2026-03-17
+status: superseded
+superseded_by: "Per-provider LLM config (#317) — MIKA_LLM_API_KEY deprecated, per-provider keys (MIKA_ANTHROPIC_API_KEY, etc.) are canonical"
 tags: [config, env-vars, breaking-change, multi-provider, simplification]
 related_modules: [mika-common/config, mika-cli/setup, mika-cli/doctor, mika-common/validation]
 ---
+
+> **Superseded:** This consolidation was reversed by the per-provider LLM config
+> plan (2026-03-22). `MIKA_LLM_API_KEY` is now deprecated and ignored.
+> Per-provider keys (`MIKA_ANTHROPIC_API_KEY`, `MIKA_OPENAI_API_KEY`, etc.) are
+> the canonical env vars. See #317.
 
 # Unified LLM API Key — Remove `MIKA_ANTHROPIC_API_KEY`
 

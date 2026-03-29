@@ -1,3 +1,8 @@
+---
+title: Architecture
+description: System architecture, memory model, agent loop, and component design
+---
+
 # Mika Architecture
 
 ## 1. Overview
@@ -58,10 +63,11 @@ from the `mika-agent` crate.
 
 | Crate | Path | Responsibility |
 |-------|------|---------------|
-| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum for key metadata), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 26 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, HTTP server binary (`mika-server`) |
+| `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum for key metadata), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), multi-provider LLM abstraction (`LlmProvider` trait, `AnthropicProvider`, `OpenAiCompatibleProvider`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
+| `mika-a2a` | `crates/mika-a2a/` | A2A (Agent-to-Agent) protocol v0.3 implementation: JSON-RPC request/response types, task state machine, SSE streaming, A2A client |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 27 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, A2A server endpoints, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`, `doctor`) |
-| `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay to Telegram. Stateless, env-var-only config. |
+| `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay with agent identification and reply routing. Env-var-only config. |
 
 
 ## 4. Agent Loop
@@ -88,8 +94,10 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 4. **Load recent messages** -- the last 20 conversation messages
    (`load_recent_messages(20, None)`).
 
-5. **Send request to Claude API** with system prompt, message history, and tool
-   definitions.
+5. **Send request to LLM provider** (via `LlmProvider` trait) with system prompt,
+   message history, and tool definitions. The provider translates between
+   provider-agnostic types (`LlmRequest`, `LlmResponse`) and the wire format
+   (Anthropic Messages API or OpenAI Chat Completions API).
 
 6. **Match `stop_reason`** from the Claude response:
    - `EndTurn` or `MaxTokens` -- save assistant text to DB, return response.
@@ -180,7 +188,7 @@ See [ADR-003](adr/003-layer3-hybrid-vector-search.md) for implementation details
 
 ### Builtin Tools
 
-All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
+All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 `default_tools()`:
 
 | Tool | Description | Category |
@@ -211,13 +219,17 @@ All 23 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `query_timeline` | Query the unified timeline of events across all subsystems (messages, audit events, tasks). Returns recent activity sorted by time. Non-orchestrator agents scoped to own agent_id. | Introspection |
 | `get_session_messages` | Retrieve messages from a past conversation session. Useful for replaying or summarizing old conversations. Non-orchestrator agents can only access their own sessions. | Introspection |
 | `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
+| `search_tool_history` | Search past tool call history across sessions by tool name, keyword, time range, and success status. Returns truncated input/output (500 chars), 10KB output cap, 30-day retention. Non-orchestrator agents scoped to own tool calls. | Introspection |
+| `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
+| `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. | Work Items |
+| `check_work_item` | Read work item details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Work Items |
 
 ### Management Tools
 
-10 tools for multi-agent and team workflows, registered via
+12 tools for multi-agent and team workflows, registered via
 `management_tools_if_needed()`. `create_agent`, `list_agents`, and `create_team` are always
 registered (enabling agent and team bootstrapping from a single-agent setup). The
-remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
+remaining 9 tools (including work item write tools) are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
 | Tool | Description | Timeout | Always registered |
 |------|-------------|---------|-------------------|
@@ -231,6 +243,8 @@ remaining 7 tools are added conditionally when `agents.len() > 1 || !teams.is_em
 | `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
 | `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
 | `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
+| `create_work_item` | Create a trackable work item with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | default (30s) | No |
+| `update_work_item_status` | Update work item status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,
 preventing infinite delegation chains.
@@ -431,7 +445,7 @@ Dispatch chain: builtins → skills → MCP → unknown error.
 
 ### Security
 
-- **Environment isolation:** Child processes cannot access `MIKA_LLM_API_KEY`,
+- **Environment isolation:** Child processes cannot access `MIKA_ANTHROPIC_API_KEY`,
   `MIKA_INTERNAL_TOKEN`, or any other Mika secrets.
 - **Header redaction:** Custom `Debug` impl on `McpServerConfig` redacts both header
   and env variable values in logs.
@@ -504,10 +518,10 @@ Agent-created callback tasks follow this end-to-end pattern:
    - **HTTP:** `POST /tasks/{id}/complete` with Bearer auth and `{"result": "..."}` body
 4. `update_task_completed` validates status (`AND status IN ('pending','in_progress')`) before writing — returns `false` if already completed (TOCTOU guard).
 5. **Delivery** depends on the path:
-   - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result }` → marks task `delivered` on success.
-   - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry.
+   - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result, failed }` → marks task `delivered` on success. The engine also periodically scans for undelivered callbacks (both completed and failed) via `dispatch_undelivered_callbacks()` every 60 ticks, ensuring failed callbacks from the background monitor are delivered even without an external trigger.
+   - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry (resetting to the original status, preserving `failed` vs `completed`). Failed tasks with empty results get a fallback message (`FAILED_TASK_FALLBACK`).
 
-The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered`.
+The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. The framing also includes a grounding instruction ("Report only what this result explicitly states") to prevent the agent from extrapolating downstream state (e.g., claiming PR readiness from a build success). When `failed=true`, the framing says "A background task has FAILED" to help the LLM distinguish success from failure. When a callback has a `parent_task_id`, the framing includes a "Parent work item: {id}" line so the agent can correlate the callback to the originating work item. `build_callback_trigger_context()` uses a single generic framing path for all callback types — workflow-specific behavior (e.g., claude-pilot → self-dev skill) is driven by active skill prompts, not the engine (#313). Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered` or `pending → failed → delivered`.
 
 ### SilentTrigger Variants
 
@@ -517,7 +531,7 @@ The result is wrapped in `<callback_result trust="untrusted">` delimiters via `f
 |---------|---------|---------------|
 | `Heartbeat` | Hourly heartbeat recurring task | Scheduled check-in, review commitments |
 | `Reflection` | Daily reflection recurring task | Memory reflection and consolidation |
-| `Callback { label, result }` | `resume_agent` dispatcher | Background task completed, inject result |
+| `Callback { label, result, failed, parent_task_id }` | `resume_agent` dispatcher | Background task completed/failed, inject result with parent work item context |
 | `SkillRun { skill_name }` | `run_skill` dispatcher | Run the named skill |
 
 ### Startup Maintenance
@@ -533,7 +547,7 @@ WHERE status IN ('pending', 'recurring_active');
 
 -- TUI callback polling efficiency
 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at)
-WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status = 'completed';
+WHERE trigger_type = 'callback' AND action_type = 'resume_agent' AND status IN ('completed', 'failed');
 
 -- Trace correlation (partial indexes — only non-NULL trace_ids)
 CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
@@ -559,10 +573,31 @@ Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handle
 skills for security — only builtin-handler skills are available in autonomous
 background runs.
 
+**Task health awareness (heartbeat only):** During heartbeat runs,
+`get_task_health_summary()` detects anomalous task states across all trigger
+types and injects them into the system prompt as a `<task-health>` block:
+
+- **Stuck callbacks:** `completed` but not `delivered` for >10 minutes
+- **Failed recurring:** Recurring tasks in `failed` status (last 24h)
+- **Long-running:** Tasks `in_progress` for >1 hour
+- **Stale blocked:** Manual work items `blocked` with no activity for >24 hours
+- **GitHub-linked:** Active work items with GitHub PR/issue reference URLs
+
+Active manual work items (pending/in_progress/blocked) are included in the
+same block. Anomalies are capped at 10 (`health_thresholds::MAX_ANOMALIES`).
+Task policy preferences (`task_policy_*` prefix) are also injected as a
+`<stored-preferences>` block for autonomous action. Both are gated to
+`SilentTrigger::Heartbeat` only — other trigger types skip health data.
+
 Each background run is framed by a `SilentTrigger` variant (see Section 9 §
 SilentTrigger Variants). Callback results are wrapped in
 `<callback_result trust="untrusted">` XML-like delimiters before LLM injection
-to mitigate prompt injection from external result payloads.
+to mitigate prompt injection from external result payloads. Results exceeding
+10 KB (`CALLBACK_RESULT_MAX_BYTES = 10_240`) are truncated at a UTF-8
+char boundary with a `[truncated — full result available in task logs]` suffix;
+a `warn!` is emitted when truncation activates. The 100 KB cap at the API/tool
+layer (`/tasks/{id}/complete`, `complete_task` tool) remains unchanged — the
+10 KB truncation applies only at the prompt injection point.
 
 
 ## 11. Conversation Compaction
@@ -640,6 +675,8 @@ This separation lets you give dashboard users a read-only token that cannot muta
 | `/api/v1/rewind/resolve` | POST | Internal token | Resolve recent exchanges for a session (returns anchor point and trace IDs) |
 | `/api/v1/rewind/preview` | POST | Internal token | Preview a rewind operation (messages to delete, reversals, task cancellations, warnings) |
 | `/api/v1/rewind/execute` | POST | Internal token | Execute a rewind (delete messages, reverse mutations, cancel tasks, inject context marker) |
+| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit) — dispatches `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe` |
+| `/a2a/{agent_name}/agent.json` | GET | Internal token | Returns A2A Agent Card (capabilities, skills, auth schemes) |
 
 ### Dashboard API (read-only)
 
@@ -659,6 +696,12 @@ Auth: accepts `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN`.
 | `/api/v1/sessions` | GET | Paginated sessions with optional agent_id/channel_type filters |
 | `/api/v1/sessions/{id}` | GET | Session detail |
 | `/api/v1/sessions/{id}/messages` | GET | Paginated messages for a session (base64 images stripped) |
+| `/api/v1/tasks` | GET | Paginated task list with filters (status, trigger_type, action_type, agent_id, team_run_id, source) |
+| `/api/v1/tasks/{id}` | GET | Single task detail (TaskResponse DTO with truncated previews) |
+| `/api/v1/team-runs` | GET | Paginated team run list with filters (team_name, status, from/to timestamps) |
+| `/api/v1/team-runs/{run_id}` | GET | Team run metadata |
+| `/api/v1/team-runs/{run_id}/workspace` | GET | Team workspace entries for a run |
+| `/api/v1/team-runs/{run_id}/summary` | GET | Enriched summary: run + agent results + task statuses + critic feedback |
 | `/api/v1/investigate` | POST | SSE streaming investigation endpoint — lightweight read-only agent loop (max 5 steps, 120s timeout, 64KB body limit) for analyzing agent behavior from the dashboard |
 
 Pagination: `?page=1&per_page=50` (max 200 per page, page clamped to 1–100,000).
@@ -689,12 +732,15 @@ Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
 | `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling, tool call summaries, and investigation side panel (SSE-powered agent analysis) |
 | `/traces` | Traces | Trace ID search |
 | `/traces/:id` | Trace Detail | All events for a trace |
+| `/tasks` | Tasks | Four-section view: Work Items, Team Run Tasks, Standalone Callbacks, Scheduled |
+| `/team-runs` | Team Runs | Filterable team run list with status and team name filters |
+| `/team-runs/:id` | Team Run Detail | Run summary, iteration timeline, workspace entries, cross-links to sessions |
 
 ### Development
 
 ```bash
 # Terminal 1: Start mika-server
-MIKA_LLM_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
+MIKA_ANTHROPIC_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
   MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-server
 
 # Terminal 2: Start dashboard dev server
@@ -712,7 +758,67 @@ Fonts: Plus Jakarta Sans (UI), JetBrains Mono (code/IDs).
 Subsystem colors: blue (messages), amber (audit), emerald (tasks).
 
 
-## 14. Failed Sends (Durable Outbox Pattern)
+## 14. A2A Protocol (Agent-to-Agent)
+
+Source: `crates/mika-a2a/` (protocol library), `crates/mika-agent/src/server/a2a.rs` (server handlers),
+`crates/mika-agent/src/a2a_db.rs` (persistence), `crates/mika-agent/src/a2a_card.rs` (Agent Card)
+
+Mika implements the A2A protocol v0.3 for agent-to-agent communication. This allows
+external agents to send tasks to Mika and receive results, and allows Mika to call
+external A2A agents via the `a2a_call` tool.
+
+### Protocol Library (`mika-a2a` crate)
+
+| Module | Responsibility |
+|--------|---------------|
+| `types.rs` | A2A protocol types: `AgentCard`, `Task`, `Message`, `Part`, `Artifact`, `TaskStatus`, `TaskState` |
+| `jsonrpc.rs` | JSON-RPC 2.0 request/response types, A2A method enum (`MessageSend`, `TaskGet`, `TaskCancel`, `TaskResubscribe`, `TaskPushNotificationSet`, `TaskPushNotificationGet`) |
+| `params.rs` | Typed parameter structs: `MessageSendParams`, `TaskIdParams`, `TaskQueryParams` |
+| `state_machine.rs` | `TaskStateMachine` — validates state transitions (submitted → working → completed/failed/canceled) |
+| `streaming.rs` | SSE streaming types: `StreamEvent`, `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent` |
+| `client.rs` | `A2aClient` — sends JSON-RPC requests to remote A2A endpoints with optional Bearer auth |
+
+### Server Endpoints (mika-server)
+
+A2A routes are merged into the main router with internal token auth (no CORS):
+
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit). Dispatches `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`. Returns SSE stream for `message/send`. |
+| `/a2a/{agent_name}/agent.json` | GET | Internal token | Returns the agent's A2A Agent Card (capabilities, skills, auth schemes) |
+
+### Gateway Proxy
+
+The gateway proxies A2A requests from external callers to the correct agent container,
+using API key authentication (SHA-256 hashed keys stored in Postgres `a2a_api_keys` table):
+
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `/a2a/{customer_id}/{agent_name}` | POST | A2A API key (Bearer) | Proxies JSON-RPC to agent container (2MB body limit) |
+| `/a2a/{customer_id}/{agent_name}/agent.json` | GET | None | Proxies Agent Card request |
+
+### Persistence (Orthogonal to Existing Tables)
+
+A2A uses the existing `tasks`, `sessions`, and `messages` tables for core state, with
+thin mapping tables for A2A-specific data:
+
+| Table | Purpose |
+|-------|---------|
+| `a2a_task_map` | Maps A2A task IDs to internal task IDs and session IDs. Includes optional `context_id`. |
+| `a2a_artifacts` | Stores A2A artifacts (files, data) associated with tasks |
+| `a2a_push_notification_configs` | Push notification configuration per task (URL, auth) |
+
+A2A tasks use `trigger_type='a2a'` and `action_type='resume_agent'` in the `tasks` table.
+Each A2A task gets its own session for message history.
+
+### Agent Card
+
+`build_agent_card()` in `a2a_card.rs` generates an `AgentCard` from the agent's skill
+registry. Skills are mapped to A2A skills with their keywords as `tags`. The card
+advertises `streaming` and `stateTransitionHistory` capabilities. Auth scheme: `bearer`.
+
+
+## 15. Failed Sends (Durable Outbox Pattern)
 
 When the outbound routing endpoint is unreachable, messages are not lost.
 
@@ -730,7 +836,7 @@ At the start of each `/message` handler, the server flushes up to 5 pending fail
 sends in a background task (does not block message processing).
 
 
-## 15. Multi-Agent Support
+## 16. Multi-Agent Support
 
 - Global home directory: `~/.mika/`
 - Agent homes: `~/.mika/agents/{name}/` (each with skills/, logs/)
@@ -753,6 +859,23 @@ personality, memory, and skills but receives only `default_tools()` (no manageme
 tools, no MCP) to prevent infinite delegation chains. The system prompt includes an
 "Agents & Teams" section listing available agents with their identities (emoji + name).
 
+**Telegram delivery for delegates:** `delegate_task` creates a fresh
+`GatewayMessageSender` with the delegate's `agent_name` (not the orchestrator's) and
+an explicit `chat_id` override looked up from the orchestrator's `customer_config`.
+This avoids cross-agent DB coupling (the delegate's agent-scoped queries would not
+find `chat_id` stored under the orchestrator's `agent_id`). The delegate's
+`telegram_configured` flag is derived from `message_sender.is_some()`. Team engine
+agents intentionally get `message_sender: None` — they communicate through the
+orchestrator pipeline, not directly to users.
+
+**Agent identification and reply routing:** Outbound messages carry `agent_name` in
+the gateway `/send` payload. The gateway prepends `[agent_name]` to Telegram text,
+validates the name at the trust boundary (alphanumeric + `-`/`_`, max 64 chars), and
+stores `(telegram_message_id, chat_id, agent_name)` in the `outbound_messages`
+Postgres table. When users reply to a specific message, the gateway looks up the
+originating agent and routes the reply to that agent in the container. Records older
+than 7 days are purged periodically (batched, every ~100 webhooks).
+
 ### Team Workflows
 
 Teams are defined in `~/.mika/teams/{name}/team.toml` and orchestrated by the
@@ -772,7 +895,7 @@ skip injection. The summary is available via `GET /api/v1/team-runs/:run_id/summ
 See [ADR-004](adr/004-multi-agent-teams-orchestration.md) for team orchestration.
 
 
-## 16. Observability & Telemetry
+## 17. Observability & Telemetry
 
 Mika follows an "always instrument, optionally export" pattern with two orthogonal
 correlation axes:
@@ -785,9 +908,9 @@ correlation axes:
 - **`session_id` / `agent_id`** (system-level): Identifies the conversation session and
   owning agent.
 
-The `unified_timeline` VIEW (`UNION ALL` across messages, audit_events, tasks) enables
-cross-subsystem queries by trace_id — e.g., "show all messages, audit events, and tasks
-from a single agent turn."
+The `unified_timeline` VIEW (`UNION ALL` across messages, audit_events, tasks,
+team_workspace) enables cross-subsystem queries by trace_id — e.g., "show all messages,
+audit events, tasks, and team orchestration entries from a single agent turn."
 
 Tracing spans are compiled unconditionally into the binary — no feature flags needed.
 Spans cover the agent loop (`agent_turn`), Claude API calls, per-tool execution, team
@@ -828,7 +951,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 9 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index)
+**Schema version:** 13 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index; v10: adds `trace_id TEXT` to `team_runs` for resume continuity, extends `unified_timeline` VIEW with `team_workspace` UNION ALL, adds `idx_team_ws_trace` partial index; v11: adds `execution_trace_id TEXT` to `tasks` with `idx_tasks_execution_trace` partial index, adds `parent_session_id TEXT` to `sessions` with `idx_sessions_parent` partial index, recreates `unified_timeline` VIEW with `COALESCE(execution_trace_id, created_trace_id)` for the task leg; v12: converts all timestamp columns from `INTEGER` (Unix epoch) to `TEXT` (ISO 8601 `%Y-%m-%dT%H:%M:%SZ`), full table rebuilds with `strftime()` data conversion, defaults changed from `unixepoch()` to `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`; v13: A2A protocol orthogonal persistence — adds `a2a` to tasks trigger_type CHECK, creates `a2a_task_map`, `a2a_artifacts`, `a2a_push_notification_configs` tables)
 
 ### Tables
 
@@ -837,7 +960,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `schema_version` | Migration tracking |
 | `agents` | Agent registry (name, display_name, model, active flag) |
 | `teams` | Team registry (name, display_name, orchestrator) |
-| `sessions` | Conversation sessions (`agent_id` FK, `channel_type`, timestamps) |
+| `sessions` | Conversation sessions (`agent_id` FK, `channel_type`, `parent_session_id`, timestamps) |
 | `messages` | Message history (`session_id` FK, `role`, `content`, `trace_id`, `metadata`) |
 | `core_memory` | Layer 1 persistent memory blocks (`agent_id` FK) |
 | `people` | Layer 2 people/contacts (`agent_id` FK) |
@@ -853,11 +976,14 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `search_content` | Unified search content for Layer 3 hybrid search |
 | `fts_search` | FTS5 virtual table for full-text search |
 | `vec_search` | sqlite-vec virtual table (vec0) for vector similarity |
-| `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`) |
-| `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint) |
+| `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`, `execution_trace_id`). Trigger types include `a2a` for A2A protocol tasks. |
+| `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint, trace_id) |
 | `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
 | `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
-| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks for cross-subsystem correlation by trace_id |
+| `a2a_task_map` | Maps A2A task IDs to internal task IDs and session IDs (`a2a_task_id` PK, `task_id` FK→tasks, `session_id` FK→sessions, `context_id`) |
+| `a2a_artifacts` | A2A artifacts (files, data) per task (`task_id` FK→a2a_task_map, `artifact_id`, `name`, `parts` JSON) |
+| `a2a_push_notification_configs` | Push notification config per A2A task (`task_id` FK→a2a_task_map, `url`, auth fields) |
+| `unified_timeline` | VIEW — UNION ALL across messages, audit_events, tasks, team_workspace for cross-subsystem correlation by trace_id (task leg uses `COALESCE(execution_trace_id, created_trace_id)`) |
 
 ### SQLite Pragmas
 

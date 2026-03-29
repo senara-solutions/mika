@@ -341,10 +341,9 @@ impl ClaudeClient {
             .filter(|k| !k.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "MIKA_LLM_API_KEY is required but not set. \
-                     Set it to your LLM provider's API key \
-                     (e.g., sk-ant-api03-... for Anthropic, sk-ant-oat01-... for OAuth, \
-                     or your provider's key)."
+                    "MIKA_ANTHROPIC_API_KEY is required but not set. \
+                     Set it to your Anthropic API key (sk-ant-api03-...) \
+                     or OAuth token (sk-ant-oat01-...)."
                 )
             })?;
 
@@ -501,7 +500,7 @@ impl ClaudeClient {
                                 "Authentication failed after token refresh. \
                                  Run `mika setup --mode oauth` to re-authorize."
                             } else {
-                                "Authentication failed. Check that MIKA_LLM_API_KEY is set to a valid Anthropic API key."
+                                "Authentication failed. Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key."
                             };
                             anyhow::Error::from(e).context(hint)
                         }

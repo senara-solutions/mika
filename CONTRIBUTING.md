@@ -8,7 +8,7 @@ Mika is developed using [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **jq** -- required by skill handler scripts
 - **Claude Code** + **compound engineering plugin** (recommended, not required)
 
-Build with `cargo build` and run tests with `cargo test`. Tests are fully mocked and do not require a `MIKA_LLM_API_KEY`.
+Build with `cargo build` and run tests with `cargo test`. Tests are fully mocked and do not require a `MIKA_ANTHROPIC_API_KEY`.
 
 ## Git Hooks
 
