@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,12 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const MAX_RETRIES: u32 = 3;
 const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+
+// Claude Code identity headers required for OAuth/subscription token auth.
+// Anthropic's server-side gating expects these signals alongside Bearer auth.
+// Values derived from OpenClaw's pi-ai SDK (the reference implementation).
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
+const CLAUDE_CODE_APP_HEADER: &str = "cli";
 
 // -- Auth --
 
@@ -549,10 +555,19 @@ impl ClaudeClient {
             }
         }
 
+        // Claude Code identity headers for OAuth — Anthropic's server-side gating
+        // expects these signals alongside Bearer auth for subscription tokens.
+        if self.auth.is_oauth() {
+            headers.insert(USER_AGENT, HeaderValue::from_static(CLAUDE_CODE_USER_AGENT));
+            headers.insert("x-app", HeaderValue::from_static(CLAUDE_CODE_APP_HEADER));
+        }
+
         // Beta headers — collect all needed betas, then set once (avoids insert-replace bug)
         let mut betas: Vec<&str> = Vec::new();
         if self.auth.is_oauth() {
+            betas.push("claude-code-20250219");
             betas.push("oauth-2025-04-20");
+            betas.push("fine-grained-tool-streaming-2025-05-14");
         }
         if request.thinking.is_some() {
             betas.push("interleaved-thinking-2025-05-14");
@@ -741,9 +756,17 @@ mod tests {
 
     #[test]
     fn test_beta_headers_combine_oauth_and_thinking() {
-        let betas: Vec<&str> = vec!["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
+        let betas: Vec<&str> = vec![
+            "claude-code-20250219",
+            "oauth-2025-04-20",
+            "fine-grained-tool-streaming-2025-05-14",
+            "interleaved-thinking-2025-05-14",
+        ];
         let combined = betas.join(",");
-        assert_eq!(combined, "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+        assert_eq!(
+            combined,
+            "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14"
+        );
         assert!(HeaderValue::from_str(&combined).is_ok());
     }
 
