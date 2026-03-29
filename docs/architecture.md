@@ -521,7 +521,7 @@ Agent-created callback tasks follow this end-to-end pattern:
    - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result, failed }` → marks task `delivered` on success. The engine also periodically scans for undelivered callbacks (both completed and failed) via `dispatch_undelivered_callbacks()` every 60 ticks, ensuring failed callbacks from the background monitor are delivered even without an external trigger.
    - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry (resetting to the original status, preserving `failed` vs `completed`). Failed tasks with empty results get a fallback message (`FAILED_TASK_FALLBACK`).
 
-The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. The framing also includes a grounding instruction ("Report only what this result explicitly states") to prevent the agent from extrapolating downstream state (e.g., claiming PR readiness from a build success). When `failed=true`, the framing says "A background task has FAILED" to help the LLM distinguish success from failure. Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered` or `pending → failed → delivered`.
+The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. The framing also includes a grounding instruction ("Report only what this result explicitly states") to prevent the agent from extrapolating downstream state (e.g., claiming PR readiness from a build success). When `failed=true`, the framing says "A background task has FAILED" to help the LLM distinguish success from failure. When a callback has a `parent_task_id`, the framing includes a "Parent work item: {id}" line so the agent can correlate the callback to the originating work item. `build_callback_trigger_context()` uses a single generic framing path for all callback types — workflow-specific behavior (e.g., claude-pilot → self-dev skill) is driven by active skill prompts, not the engine (#313). Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered` or `pending → failed → delivered`.
 
 ### SilentTrigger Variants
 
@@ -531,7 +531,7 @@ The result is wrapped in `<callback_result trust="untrusted">` delimiters via `f
 |---------|---------|---------------|
 | `Heartbeat` | Hourly heartbeat recurring task | Scheduled check-in, review commitments |
 | `Reflection` | Daily reflection recurring task | Memory reflection and consolidation |
-| `Callback { label, result, failed }` | `resume_agent` dispatcher | Background task completed/failed, inject result |
+| `Callback { label, result, failed, parent_task_id }` | `resume_agent` dispatcher | Background task completed/failed, inject result with parent work item context |
 | `SkillRun { skill_name }` | `run_skill` dispatcher | Run the named skill |
 
 ### Startup Maintenance
