@@ -7,6 +7,62 @@ info:
     identifier: MIT
   version: 0.1.0
 paths:
+  /api/v1/dashboard/disable:
+    post:
+      tags:
+      - embedded_dashboard
+      summary: Disable the embedded dashboard at runtime.
+      operationId: handle_disable
+      responses:
+        '200':
+          description: Dashboard disabled
+          content:
+            application/json:
+              schema: {}
+              example:
+                enabled: false
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
+  /api/v1/dashboard/enable:
+    post:
+      tags:
+      - embedded_dashboard
+      summary: Enable the embedded dashboard at runtime.
+      operationId: handle_enable
+      responses:
+        '200':
+          description: Dashboard enabled
+          content:
+            application/json:
+              schema: {}
+              example:
+                enabled: true
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
+  /api/v1/dashboard/status:
+    get:
+      tags:
+      - embedded_dashboard
+      summary: Return the current dashboard status.
+      operationId: handle_status
+      responses:
+        '200':
+          description: Dashboard status
+          content:
+            application/json:
+              schema: {}
+              example:
+                enabled: true
+                has_assets: true
+                has_token: true
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
   /health:
     get:
       tags:

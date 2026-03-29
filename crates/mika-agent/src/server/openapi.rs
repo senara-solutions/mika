@@ -3,6 +3,7 @@
 use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
+use super::embedded_dashboard;
 use super::handlers;
 use super::types;
 
@@ -16,6 +17,9 @@ use super::types;
     paths(
         handlers::handle_health,
         handlers::handle_message,
+        embedded_dashboard::handle_enable,
+        embedded_dashboard::handle_disable,
+        embedded_dashboard::handle_status,
     ),
     components(schemas(
         types::MessageRequest,
@@ -62,6 +66,18 @@ mod tests {
         let yaml = agent_openapi_yaml();
         assert!(yaml.contains("/health"), "missing /health endpoint");
         assert!(yaml.contains("/message"), "missing /message endpoint");
+        assert!(
+            yaml.contains("/api/v1/dashboard/enable"),
+            "missing /api/v1/dashboard/enable endpoint"
+        );
+        assert!(
+            yaml.contains("/api/v1/dashboard/disable"),
+            "missing /api/v1/dashboard/disable endpoint"
+        );
+        assert!(
+            yaml.contains("/api/v1/dashboard/status"),
+            "missing /api/v1/dashboard/status endpoint"
+        );
     }
 
     #[test]
