@@ -255,6 +255,10 @@ pub enum AgentRequest {
         /// Original task status before delivery ("completed" or "failed").
         /// Used by error-recovery to reset to the correct pre-delivery status.
         original_status: String,
+        /// The parent work item ID, if the callback task has a parent linkage.
+        /// Threaded through to `build_callback_trigger_context()` so the agent
+        /// knows which work item this callback relates to. See #313.
+        parent_task_id: Option<String>,
     },
     SetModel {
         model: String,
@@ -1494,6 +1498,7 @@ impl<'a> App<'a> {
                 result,
                 trace_id: task.created_trace_id,
                 original_status,
+                parent_task_id: task.parent_task_id,
             });
 
             self.status = AgentStatus::Thinking;

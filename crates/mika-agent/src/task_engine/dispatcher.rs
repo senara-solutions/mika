@@ -321,6 +321,7 @@ impl TaskDispatcher {
                 label: task.label.clone(),
                 result,
                 failed: is_failed,
+                parent_task_id: task.parent_task_id.clone(),
             },
             home_dir: &self.home_dir,
             session_id: &session_id,
