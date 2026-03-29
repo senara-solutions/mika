@@ -1,7 +1,7 @@
 ---
 title: "feat: Return user-friendly Telegram message when agent is offline"
 type: feat
-status: active
+status: completed
 date: 2026-03-29
 issue: "#309"
 ---
