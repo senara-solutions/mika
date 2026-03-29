@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
         team::validate_team_name(&team_name)?;
         let global_home = home::resolve_home_dir()?;
         mika_common::dotenv::load_dotenv(&global_home);
+        mika_common::dotenv::check_deprecated_env_vars();
 
         if !team::team_exists(&global_home, &team_name) {
             anyhow::bail!("Team '{team_name}' not found.");
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
     let global_home = home::resolve_home_dir().ok();
     if let Some(ref h) = global_home {
         mika_common::dotenv::load_dotenv(h);
+        mika_common::dotenv::check_deprecated_env_vars();
     }
 
     // Resolve log directory: ~/.mika/agents/{name}/logs/

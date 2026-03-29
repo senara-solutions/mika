@@ -1,3 +1,8 @@
+---
+title: Deployment
+description: Operator guide for deploying Mika in hosted mode with Docker
+---
+
 # Mika Deployment Guide
 
 Operator-focused documentation for deploying Mika in hosted mode.
@@ -51,6 +56,7 @@ docker build -f Dockerfile.agent -t mika-agent:dev .
 ```
 
 Build details:
+- **Dashboard builder:** `node:22-slim` — builds the React SPA (`npm ci && npm run build --prefix dashboard`). The built `dashboard/dist/` is copied into the Rust builder for embedding via `rust-embed`.
 - **Builder:** `rust:1.93-slim` with gcc, libc-dev, pkg-config (no OpenSSL — uses rustls)
 - **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, gh (GitHub CLI v2.65.0), and gws (Google Workspace CLI v0.13.3) — both with SHA256 checksum verification
 - **Binary:** `mika-server` (Axum HTTP server)
@@ -168,7 +174,7 @@ Each customer gets an agent container with a persistent volume for SQLite storag
 
 | Variable | Description |
 |----------|-------------|
-| `MIKA_LLM_API_KEY` | LLM API key (Anthropic, OpenAI, Groq, etc.) |
+| `MIKA_ANTHROPIC_API_KEY` | Anthropic API key (default provider). See docs for other provider keys. |
 | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery |
 | `MIKA_INTERNAL_TOKEN` | Shared 64-char hex bearer token |
 
@@ -247,7 +253,7 @@ docker logs mika-<uuid> --tail 100
 **Symptom:** Customer container restarts repeatedly.
 
 **Common causes:**
-- Missing or invalid `MIKA_LLM_API_KEY`
+- Missing or invalid `MIKA_ANTHROPIC_API_KEY`
 - Corrupted SQLite database
 - Missing persistent volume mount
 

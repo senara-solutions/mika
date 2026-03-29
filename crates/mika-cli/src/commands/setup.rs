@@ -42,7 +42,7 @@ pub async fn run(agent_name: &str, mode: SetupMode, api_key: Option<&str>) -> Re
     if let Some(key) = api_key {
         let key = key.trim();
         if !key.is_empty() {
-            mika_common::dotenv::set_env_var(&home_dir, "MIKA_LLM_API_KEY", key)?;
+            mika_common::dotenv::set_env_var(&home_dir, "MIKA_ANTHROPIC_API_KEY", key)?;
             println!("  API key saved to {}", home_dir.join(".env").display());
         }
         // If non-interactive and --api-key provided, skip the interactive wizard
@@ -63,7 +63,7 @@ pub async fn run(agent_name: &str, mode: SetupMode, api_key: Option<&str>) -> Re
         bail!(
             "mika setup requires an interactive terminal for first-time configuration. \
              Use `mika setup --api-key <key>` for non-interactive setup, \
-             or pre-set MIKA_LLM_API_KEY and other env vars."
+             or pre-set MIKA_ANTHROPIC_API_KEY and other env vars."
         );
     }
 
@@ -123,8 +123,12 @@ fn run_cli_prompts(
     config_written: &mut bool,
 ) -> Result<()> {
     // 1. LLM API key
-    if interactive && !secret_is_set("MIKA_LLM_API_KEY") {
-        *env_written |= prompt_optional_secret(home_dir, "MIKA_LLM_API_KEY", "  LLM API key")?;
+    if interactive && !secret_is_set("MIKA_ANTHROPIC_API_KEY") {
+        *env_written |= prompt_optional_secret(
+            home_dir,
+            "MIKA_ANTHROPIC_API_KEY",
+            "  Anthropic API key (skip if using another provider)",
+        )?;
     }
 
     // 2. Brave Search API key (optional)
@@ -268,16 +272,16 @@ async fn run_oauth_setup(home_dir: &Path) -> Result<()> {
     println!("  This will authorize Mika to use your Claude Pro/Max subscription.\n");
 
     // 1. Check for existing subscription token
-    let subscription_token = std::env::var("MIKA_LLM_API_KEY")
+    let subscription_token = std::env::var("MIKA_ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty() && mika_common::claude::is_oauth_token(k.trim()));
 
     let subscription_token = if let Some(token) = subscription_token {
-        println!("  Found OAuth subscription token in MIKA_LLM_API_KEY.");
+        println!("  Found OAuth subscription token in MIKA_ANTHROPIC_API_KEY.");
         token.trim().to_string()
     } else {
-        println!("  No subscription token found in MIKA_LLM_API_KEY.");
-        println!("  Run `claude setup-token` first to get one, then set MIKA_LLM_API_KEY.\n");
+        println!("  No subscription token found in MIKA_ANTHROPIC_API_KEY.");
+        println!("  Run `claude setup-token` first to get one, then set MIKA_ANTHROPIC_API_KEY.\n");
         let token = Password::new()
             .with_prompt("  Paste your subscription token (sk-ant-oat...)")
             .interact()?;
@@ -290,7 +294,7 @@ async fn run_oauth_setup(home_dir: &Path) -> Result<()> {
             );
         }
         // Persist the subscription token to .env for future use
-        mika_common::dotenv::set_env_var(home_dir, "MIKA_LLM_API_KEY", &token)?;
+        mika_common::dotenv::set_env_var(home_dir, "MIKA_ANTHROPIC_API_KEY", &token)?;
         token
     };
 
@@ -384,10 +388,12 @@ fn run_compose_generation() -> Result<()> {
     println!("  This will generate a .env file for docker-compose in the current directory.\n");
 
     // --- Required secrets ---
-    let api_key = Password::new().with_prompt("  LLM API key").interact()?;
+    let api_key = Password::new()
+        .with_prompt("  Anthropic API key")
+        .interact()?;
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        bail!("LLM API key is required");
+        bail!("Anthropic API key is required");
     }
 
     let telegram_token = Password::new()
@@ -447,7 +453,7 @@ fn run_compose_generation() -> Result<()> {
     // Shared
     lines.push("# ── Shared ──".to_string());
     lines.push(format!("MIKA_INTERNAL_TOKEN={internal_token}"));
-    lines.push(format!("MIKA_LLM_API_KEY={api_key}"));
+    lines.push(format!("MIKA_ANTHROPIC_API_KEY={api_key}"));
     if !brave_key.is_empty() {
         lines.push(format!("MIKA_BRAVE_API_KEY={brave_key}"));
     }

@@ -228,7 +228,7 @@ async fn connect_stdio(name: &str, config: &McpServerConfig) -> Result<McpConnec
     }
 
     // Only pass explicitly configured env vars -- do NOT inherit the full process
-    // environment. This prevents leaking MIKA_LLM_API_KEY and other secrets
+    // environment. This prevents leaking MIKA_ANTHROPIC_API_KEY and other secrets
     // to MCP server child processes.
     cmd.env_clear();
 

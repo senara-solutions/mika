@@ -20,6 +20,20 @@ pub fn load_dotenv(home_dir: &Path) {
     }
 }
 
+/// Check for deprecated environment variables and warn the user.
+///
+/// Call this after `load_dotenv()` so `.env` values are already in the process environment.
+/// Currently checks for `MIKA_LLM_API_KEY` which was superseded by per-provider keys
+/// (e.g., `MIKA_ANTHROPIC_API_KEY`).
+pub fn check_deprecated_env_vars() {
+    if std::env::var("MIKA_LLM_API_KEY").is_ok() {
+        warn!(
+            "MIKA_LLM_API_KEY is deprecated and ignored by the config system. \
+             Rename it to MIKA_ANTHROPIC_API_KEY in your ~/.mika/.env file."
+        );
+    }
+}
+
 /// Write or update a key in `{home_dir}/.env`. Creates the file if it doesn't exist.
 /// Sets file permissions to 0600 on Unix (secrets file).
 pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {

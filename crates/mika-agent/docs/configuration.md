@@ -1,3 +1,8 @@
+---
+title: Configuration
+description: Configuration files, environment variables, and config cascade
+---
+
 # Configuration Reference
 
 This document covers all configuration options for Mika, including the agent
@@ -118,11 +123,13 @@ existing shell environment variables. File permissions are set to `0600`.
 
 ```sh
 # ~/.mika/.env
-MIKA_LLM_API_KEY=sk-ant-api03-...
-MIKA_OPENAI_API_KEY=sk-...
+MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
+MIKA_OPENAI_API_KEY=sk-...        # Also used for Layer 3 vector search
 MIKA_BRAVE_API_KEY=BSA...
-MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...
+MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PRs, issues, context injection)
+MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...  # Investigation panel only (issue creation)
 MIKA_GITHUB_REPO=owner/repo
+GH_TOKEN=ghp_...                       # gh CLI in Claude Code agent sessions (via claude-pilot)
 ```
 
 Run `mika setup` to interactively configure secrets (API keys, tokens) and
@@ -130,10 +137,38 @@ preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
 `~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
 server mode.
 
+### GitHub token for agent operations
+
+`MIKA_GITHUB_TOKEN` enables agent-level GitHub operations: context injection (fetching
+PR diffs), work item enrichment (PR/issue status), and dev-run PR merges. If not set,
+falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
+
+1. Create a GitHub Personal Access Token:
+   - **Fine-grained token** (recommended): Settings → Developer settings →
+     Fine-grained tokens → select your repo → Permissions → Pull requests: Read and Write,
+     Issues: Read and Write, Contents: Read
+2. Add to `~/.mika/.env`:
+   ```sh
+   MIKA_GITHUB_TOKEN=ghp_your_token_here
+   ```
+
+### GitHub token for `gh` CLI in agent sessions
+
+`GH_TOKEN` is used by the `gh` CLI in Claude Code sessions spawned via claude-pilot.
+Without it, `gh` falls back to the host user's `~/.config/gh/hosts.yml` (personal account).
+This token is not prefixed with `MIKA_*`, so it survives the skill executor's env scrub
+and reaches Claude Code via `process.env` inheritance.
+
+Add to `~/.mika/.env`:
+```sh
+GH_TOKEN=ghp_your_token_here
+```
+
 ### GitHub issue creation (dashboard investigation)
 
 The investigation panel can create GitHub issues when both `MIKA_INVESTIGATE_GITHUB_TOKEN`
-and `MIKA_GITHUB_REPO` are set. Steps:
+and `MIKA_GITHUB_REPO` are set. This token is separate from `MIKA_GITHUB_TOKEN` — the
+investigation panel uses only `MIKA_INVESTIGATE_GITHUB_TOKEN`. Steps:
 
 1. Create a GitHub Personal Access Token:
    - **Fine-grained token** (recommended): Settings → Developer settings →
@@ -153,14 +188,16 @@ and `MIKA_GITHUB_REPO` are set. Steps:
 In `~/.mika/config.toml`:
 
 ```toml
-llm_model = "claude-opus-4-6"
+llm_provider = "anthropic"
+anthropic_model = "claude-opus-4-6"
 log_level = "debug"
 ```
 
-### Example: Override model via environment variable
+### Example: Override provider via environment variable
 
 ```sh
-export MIKA_LLM_MODEL=claude-haiku-4-5
+export MIKA_LLM_PROVIDER=openai
+export MIKA_OPENAI_MODEL=gpt-4-turbo
 ```
 
 The environment variable takes precedence over all config files and `.env`.
@@ -181,8 +218,8 @@ Prints a summary of current settings (model, max tokens, log level, auth status)
 Read a single configuration value:
 
 ```sh
-mika config get llm_model          # prints: claude-sonnet-4-6
-mika config get llm_model --verbose # prints: llm_model = claude-sonnet-4-6 (source: default, backend: File)
+mika config get llm_provider            # prints: anthropic
+mika config get llm_provider --verbose  # prints: llm_provider = anthropic (source: default, backend: File)
 ```
 
 The `--verbose` flag shows where the value comes from (env var, agent config.toml,
@@ -193,8 +230,9 @@ global config.toml, .env file, database, or default).
 Write a configuration value:
 
 ```sh
-mika config set llm_model claude-opus-4-6     # writes to agent config.toml
-mika config set llm_max_tokens 8192            # validated as integer
+mika config set llm_provider openai               # writes to agent config.toml
+mika config set anthropic_model claude-opus-4-6    # writes to agent config.toml
+mika config set llm_max_tokens 8192                # validated as integer
 mika config set llm_api_key                 # secret: prompts interactively, writes to .env
 ```
 
@@ -231,11 +269,14 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 
 | Field | Type | Default | Env Var | Description |
 |-------|------|---------|---------|-------------|
-| `llm_api_key` | `Option<String>` | None | `MIKA_LLM_API_KEY` | LLM API key (Anthropic, OpenAI, Groq, etc.). Auto-detected from prefix (`sk-ant-oat` = OAuth, otherwise = API key). Required for any command that calls the Claude API. |
-| `llm_model` | `String` | `claude-sonnet-4-6` | `MIKA_LLM_MODEL` | Claude model ID to use for inference. |
-| `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for Claude responses. |
+| `llm_provider` | `ProviderKind` | `anthropic` | `MIKA_LLM_PROVIDER` | Active LLM provider. One of: `anthropic`, `openai`, `openrouter`, `groq`, `ollama`, `mistral`, `google`, `deepseek`. Each provider has per-provider `{prefix}_model`, `{prefix}_api_key`, `{prefix}_base_url` fields. See [LLM Provider Configuration](#llm-provider-configuration). |
+| `{provider}_model` | `Option<String>` | Provider default | `MIKA_{PROVIDER}_MODEL` | Model ID for the provider. Falls back to provider's default model if not set. |
+| `{provider}_api_key` | `Option<String>` | None | `MIKA_{PROVIDER}_API_KEY` | API key for the provider. Stored in `.env`. `MIKA_OPENAI_API_KEY` is shared with embeddings. |
+| `{provider}_base_url` | `Option<String>` | Provider default | `MIKA_{PROVIDER}_BASE_URL` | Override base URL for the provider. Each provider has a built-in default. |
+| `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for LLM responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
+| `log_format` | `String` | `json` | `MIKA_LOG_FORMAT` | Stdout log format for mika-server and mika-gateway: `json` (default) or `pretty` (human-readable). CLI always uses pretty format regardless of this setting. File output always uses JSON. |
 | `routing_url` | `Option<String>` | None | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery. Required in server mode. |
 | `customer_id` | `Option<String>` | None | `MIKA_CUSTOMER_ID` | Customer identifier. Set per container in hosted deployments. |
 | `server_port` | `u16` | `8080` | `MIKA_SERVER_PORT` | HTTP server listen port. Only used in server mode (`mika-server`). |
@@ -243,11 +284,13 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
-| `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
+| `github_token` | `Option<String>` | None | `MIKA_GITHUB_TOKEN` | GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge). Needs Pull requests R/W, Issues R/W, Contents R scopes. Falls back to `investigate_github_token` if not set. |
+| `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool only. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
 | `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
 | `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
+| `dashboard_enabled` | `bool` | `false` | `MIKA_DASHBOARD_ENABLED` | Enable embedded dashboard SPA at `/dashboard/`. When enabled, the pre-built React dashboard is served from the binary via `rust-embed`. Requires `MIKA_DASHBOARD_TOKEN` for token injection. Build the dashboard before compiling: `npm run build --prefix dashboard` (`VITE_BASE_PATH` is set automatically). |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
 | `otlp_endpoint` | `Option<String>` | None | `MIKA_OTLP_ENDPOINT` | OTLP endpoint URL for trace export — must include `/v1/traces` (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` for Langfuse, `http://localhost:4318/v1/traces` for Jaeger). Required when `telemetry_enabled` is true. |
@@ -263,10 +306,17 @@ defaults to `~/.mika/`.
   `Debug` output (printed as `[REDACTED]`). The `mika config` command
   distinguishes between credential types: `OAuth token [REDACTED]` or
   `API key [REDACTED]`.
-- When `llm_api_key` contains an Anthropic credential, Mika detects the type
-  from the `sk-ant-oat` prefix and adjusts the HTTP auth scheme automatically
+- When `anthropic_api_key` contains an Anthropic credential, Mika detects the
+  type from the `sk-ant-oat` prefix and adjusts the HTTP auth scheme automatically
   (Bearer + `anthropic-beta` header for OAuth, `x-api-key` header for standard
   keys). For non-Anthropic providers, the key is sent as a Bearer token.
+- **OAuth PKCE flow:** When `MIKA_ANTHROPIC_API_KEY` starts with `sk-ant-oat`,
+  Mika uses an `OAuthTokenManager` that transparently exchanges the subscription
+  token for a short-lived access token via PKCE. Tokens are cached in
+  `~/.mika/oauth.json` (0600 permissions) and auto-refreshed 60 seconds before
+  expiry. Initial setup requires `mika setup --mode oauth` (interactive
+  browser-based authorization). A SHA-256 hash of the subscription token is
+  stored to detect token changes.
 - Secrets should be set in `~/.mika/.env` or via shell environment variables, never committed to config files.
 - `internal_token` is validated on load: if present, it must be exactly 64
   hex characters. Invalid values cause an immediate startup error.
@@ -402,17 +452,23 @@ For running `mika` (the TUI chat client), only the API key is required:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MIKA_LLM_API_KEY` | Yes | LLM API key (Anthropic, OpenAI, Groq, etc.) |
-| `MIKA_LLM_MODEL` | No | Override model (default: `claude-sonnet-4-6`) |
+| `MIKA_LLM_PROVIDER` | No | Active LLM provider (default: `anthropic`) |
+| `MIKA_{PROVIDER}_API_KEY` | Yes* | API key for the active provider |
+| `MIKA_{PROVIDER}_MODEL` | No | Override model for a provider |
+| `MIKA_{PROVIDER}_BASE_URL` | No | Override base URL for a provider |
 | `MIKA_LLM_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level (default: `info`) |
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
-| `MIKA_OPENAI_API_KEY` | No | OpenAI API key for Layer 3 vector search |
+| `MIKA_OPENAI_API_KEY` | No | OpenAI API key (LLM + Layer 3 vector search) |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
-| `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation |
+| `MIKA_GITHUB_TOKEN` | No | GitHub token for agent operations (falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`) |
+| `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation only |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
+
+\* Set the API key for the active provider. E.g., `MIKA_ANTHROPIC_API_KEY` for Anthropic, `MIKA_GROQ_API_KEY` for Groq. Ollama does not require an API key.
+| `MIKA_SERVER_URL` | No | mika-server URL for dashboard CLI commands (default: `http://localhost:8080`) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
@@ -424,21 +480,23 @@ are required for inter-service communication:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MIKA_LLM_API_KEY` | Yes | LLM API key (Anthropic, OpenAI, Groq, etc.) |
+| `MIKA_{PROVIDER}_API_KEY` | Yes | API key for the active LLM provider |
 | `MIKA_ROUTING_URL` | Yes | Gateway URL for outbound message delivery |
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for gateway auth |
 | `MIKA_CUSTOMER_ID` | Yes | Customer identifier for this container |
 | `MIKA_SERVER_PORT` | No | Listen port (default: `8080`) |
-| `MIKA_LLM_MODEL` | No | Override model |
+| `MIKA_LLM_PROVIDER` | No | Active LLM provider (default: `anthropic`) |
 | `MIKA_LLM_MAX_TOKENS` | No | Override max tokens |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level |
+| `MIKA_LOG_FORMAT` | No | Stdout log format: `json` (default) or `pretty` |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
+| `MIKA_DASHBOARD_ENABLED` | No | Enable embedded dashboard SPA at `/dashboard/` (default: `false`) |
 | `MIKA_CORS_ORIGIN` | No | Allowed origin for dashboard CORS (default: `http://localhost:5173`) |
-| `MIKA_DASHBOARD_TOKEN` | No | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `MIKA_INTERNAL_TOKEN`. |
+| `MIKA_DASHBOARD_TOKEN` | No | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). Required for embedded dashboard token injection. If unset, dashboard API routes accept `MIKA_INTERNAL_TOKEN`. |
 
 ### Token Generation
 
@@ -466,7 +524,9 @@ variables are required:
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for container auth |
 | `MIKA_GATEWAY_PORT` | No | Listen port (default: `8080`) |
 | `MIKA_LOG_LEVEL` | No | Log level (default: `info`) |
+| `MIKA_LOG_FORMAT` | No | Stdout log format: `json` (default) or `pretty` |
 | `MIKA_AGENT_BASE_URL` | No | Override agent container URL for local E2E testing |
+| `MIKA_AGENTS_NAMESPACE` | No | K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution. |
 | `MIKA_GATEWAY_LOG_FILE` | No | Optional log file path |
 
 Both `MIKA_INTERNAL_TOKEN` and `MIKA_TELEGRAM_WEBHOOK_SECRET` must be exactly 64
@@ -474,31 +534,115 @@ hexadecimal characters (32 bytes hex-encoded). Generate with `openssl rand -hex 
 
 ---
 
-## Model Configuration
+## LLM Provider Configuration
 
-Mika works with any Claude model ID. The following models have been tested:
+Mika supports 8 LLM providers via the `LlmProvider` trait. Each provider has its
+own `model`, `api_key`, and `base_url` fields. The active provider is selected by
+`llm_provider` in `config.toml`.
 
-| Model ID | Description |
-|----------|-------------|
-| `claude-sonnet-4-6` | Default. Good balance of speed and quality. |
-| `claude-opus-4-6` | Highest quality. Slower and more expensive. |
-| `claude-haiku-4-5` | Fastest and cheapest. Suitable for simple tasks. |
+### Supported providers
 
-### Switching models
+| Provider | Config value | Default Model | Default Base URL | API Key Env Var |
+|----------|-------------|---------------|------------------|-----------------|
+| Anthropic (default) | `anthropic` | `claude-sonnet-4-6` | `https://api.anthropic.com` | `MIKA_ANTHROPIC_API_KEY` |
+| OpenAI | `openai` | `gpt-4o` | `https://api.openai.com/v1` | `MIKA_OPENAI_API_KEY` |
+| OpenRouter | `openrouter` | `anthropic/claude-sonnet-4` | `https://openrouter.ai/api/v1` | `MIKA_OPENROUTER_API_KEY` |
+| Groq | `groq` | `llama-3.3-70b-versatile` | `https://api.groq.com/openai/v1` | `MIKA_GROQ_API_KEY` |
+| Ollama | `ollama` | `llama3` | `http://localhost:11434/v1` | `MIKA_OLLAMA_API_KEY` (optional) |
+| Mistral | `mistral` | `mistral-large-latest` | `https://api.mistral.ai/v1` | `MIKA_MISTRAL_API_KEY` |
+| Google AI | `google` | `gemini-2.5-flash` | `https://generativelanguage.googleapis.com/v1beta/openai` | `MIKA_GOOGLE_API_KEY` |
+| DeepSeek | `deepseek` | `deepseek-chat` | `https://api.deepseek.com` | `MIKA_DEEPSEEK_API_KEY` |
 
-**Via config file** (`~/.mika/config.toml`):
+### Per-provider configuration
+
+Each provider has three config keys with a `{provider}_` prefix:
+
+| Key pattern | Example | Description |
+|-------------|---------|-------------|
+| `{provider}_model` | `anthropic_model = "claude-opus-4-6"` | Override the default model |
+| `{provider}_api_key` | Set via `MIKA_ANTHROPIC_API_KEY` env var | API key (stored in `.env`) |
+| `{provider}_base_url` | `openai_base_url = "http://custom:8000/v1"` | Override the default base URL |
+
+### Switching providers
+
+**config.toml** (persisted):
 
 ```toml
-llm_model = "claude-opus-4-6"
+# ~/.mika/config.toml
+llm_provider = "anthropic"
+anthropic_model = "claude-opus-4-6"
 ```
 
-**Via environment variable:**
+**Environment variables** (override config.toml):
 
 ```sh
-export MIKA_LLM_MODEL=claude-opus-4-6
+export MIKA_LLM_PROVIDER=openai
+export MIKA_OPENAI_API_KEY=sk-...
+# Model defaults to gpt-4o, or override:
+export MIKA_OPENAI_MODEL=gpt-4-turbo
 ```
 
-The environment variable always wins if set, regardless of config file values.
+**Ollama (local, no key needed):**
+
+```sh
+export MIKA_LLM_PROVIDER=ollama
+# Model defaults to llama3, base URL defaults to localhost:11434
+```
+
+**Groq:**
+
+```sh
+export MIKA_LLM_PROVIDER=groq
+export MIKA_GROQ_API_KEY=gsk_...
+```
+
+**Google Gemini:**
+
+```sh
+export MIKA_LLM_PROVIDER=google
+export MIKA_GOOGLE_API_KEY=...
+export MIKA_GOOGLE_MODEL=gemini-2.5-pro
+```
+
+### Runtime switching
+
+In the TUI chat, use slash commands to switch providers and models at runtime:
+
+```
+/provider openai         # Switch to OpenAI (uses default model)
+/provider set model gpt-4-turbo  # Override model for current provider
+/model sonnet            # Switch model (aliases: sonnet, opus, haiku, gpt4o, deepseek, gemini)
+```
+
+Changes via `/provider` are persisted to `config.toml`. Changes via `/model` are
+persisted to the provider-specific model key in `config.toml`.
+
+### Provider capabilities
+
+Not all providers support all features. The `LlmProvider` trait reports capabilities:
+
+| Feature | Anthropic | OpenAI | OpenRouter | Groq | Ollama | Mistral | Google | DeepSeek |
+|---------|-----------|--------|------------|------|--------|---------|--------|----------|
+| Tool calling | Yes | Yes | Yes | Yes | Varies | Yes | Yes | Yes |
+| Vision/images | Yes | Yes | Yes | No | No | Yes | Yes | Yes |
+| Extended thinking | Yes | No | No | No | No | No | No | No |
+
+When using a provider that doesn't support tool calling, Mika's agent tools
+(memory, reminders, etc.) will not be available. The agent will operate in
+text-only mode.
+
+### Migration from v0.x
+
+If you're upgrading from a version that used `llm_model`, `llm_api_key`, and
+`llm_base_url`, update your configuration:
+
+| Old | New |
+|-----|-----|
+| `llm_model = "claude-sonnet-4-6"` | `llm_provider = "anthropic"` (model defaults to claude-sonnet-4-6) |
+| `llm_model = "openai/gpt-4o"` | `llm_provider = "openai"` + `openai_model = "gpt-4o"` |
+| `MIKA_LLM_API_KEY=sk-ant-...` | `MIKA_ANTHROPIC_API_KEY=sk-ant-...` |
+| `MIKA_LLM_API_KEY=sk-...` (OpenAI) | `MIKA_OPENAI_API_KEY=sk-...` |
+| `MIKA_LLM_BASE_URL=...` | `{provider}_base_url = "..."` in config.toml |
 
 ---
 

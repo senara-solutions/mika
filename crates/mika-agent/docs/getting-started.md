@@ -1,3 +1,8 @@
+---
+title: Getting Started
+description: Install Mika and run your first conversation
+---
+
 # Getting Started with Mika
 
 Mika is a conversation-first AI executive assistant that runs as a local CLI.
@@ -83,7 +88,7 @@ Get an API key from [console.anthropic.com](https://console.anthropic.com/). Usa
 is billed to your Anthropic account.
 
 ```sh
-export MIKA_LLM_API_KEY="sk-ant-api03-..."
+export MIKA_ANTHROPIC_API_KEY="sk-ant-api03-..."
 ```
 
 ### Option B: Claude subscription OAuth token
@@ -100,7 +105,7 @@ quota instead of a paid API key. This requires the [Claude Code CLI](https://doc
 2. Set the token (it starts with `sk-ant-oat`):
 
    ```sh
-   export MIKA_LLM_API_KEY="sk-ant-oat01-..."
+   export MIKA_ANTHROPIC_API_KEY="sk-ant-oat01-..."
    ```
 
 OAuth tokens expire periodically. When Mika reports an authentication error,
@@ -109,11 +114,10 @@ re-run `claude setup-token` to get a fresh token.
 ### Option C: Non-Anthropic provider
 
 Mika supports OpenAI, Groq, Ollama, and other OpenAI-compatible providers.
-Set both the model and key:
+Set the provider-specific key:
 
 ```sh
-export MIKA_LLM_MODEL=openai/gpt-4o
-export MIKA_LLM_API_KEY="sk-..."
+export MIKA_OPENAI_API_KEY="sk-..."
 ```
 
 See [Model Configuration](configuration.md#model-configuration) for all supported
@@ -128,7 +132,7 @@ Alternatively, set it as an environment variable in your shell profile
 (`~/.bashrc`, `~/.zshrc`, etc.):
 
 ```sh
-echo 'export MIKA_LLM_API_KEY="sk-ant-..."' >> ~/.zshrc
+echo 'export MIKA_ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -163,7 +167,7 @@ launches a guided wizard to configure secrets and preferences:
 ```
   Mika Setup
 
-  Anthropic API key: ••••••••••••
+  LLM API key: ••••••••••••
   Brave Search API key (optional, press Enter to skip):
   Enable telemetry? [y/N]: n
   Generated internal token for server mode.
@@ -173,7 +177,7 @@ launches a guided wizard to configure secrets and preferences:
 ```
 
 The wizard prompts for:
-1. **Anthropic API key** (masked input)
+1. **LLM API key** (masked input)
 2. **Brave Search API key** (optional, masked)
 3. **GitHub token for investigation** (optional, masked — enables dashboard issue creation)
 4. **GitHub repo** (optional, visible — `owner/repo` format for issue creation)
@@ -202,6 +206,7 @@ configuration and only prompts for missing values.
 | `cli` (default) | `mika setup` | Configure API keys, GitHub config, telemetry, internal token |
 | `server` | `mika setup --mode server` | CLI config + routing URL, dashboard token |
 | `compose` | `mika setup --mode compose` | Generate a `.env` for docker-compose in CWD |
+| `oauth` | `mika setup --mode oauth` | Exchange Claude Pro/Max subscription token (`sk-ant-oat*`) for access token via PKCE |
 
 **Non-interactive setup:** If stdin is not a terminal, `mika setup` requires all
 secrets to be pre-set via environment variables. Pre-set all `MIKA_*` vars before
@@ -269,7 +274,8 @@ The most commonly used commands:
 | `mika --team <name>`         | Launch TUI in team mode (mutually exclusive with `--agent`) |
 | `mika status`                | Show health info (messages, DB size, schema)      |
 | `mika memory`                | Inspect stored core memory                        |
-| `mika ask "<message>"`       | Send a message non-interactively                  |
+| `mika ask "<message>"`       | Send a message non-interactively (`--format json` for structured output, `--model <model>` to override LLM) |
+| `mika ask --team <name> "goal"` | Run a team workflow non-interactively (deliverable to stdout) |
 | `mika ask --task-id <uuid> "<result>"` | Complete a callback task (TUI delivers result to conversation) |
 | `mika tasks`                 | List scheduled tasks for the active agent         |
 | `mika skills`                | List, install, validate, and manage skills          |
@@ -305,6 +311,22 @@ echo "Summarize my pending tasks" | mika ask "-"
 cat meeting-notes.txt | mika ask "-"
 ```
 
+**JSON output for scripting:**
+
+Use `--format json` to get structured output compatible with the OpenAI message
+format. The response is a single JSON object on stdout:
+
+```sh
+mika ask --format json "What are my top priorities today?"
+# Output: {"role":"assistant","content":"Your top priorities are..."}
+```
+
+This is useful for piping into `jq` or consuming from other tools:
+
+```sh
+mika ask --format json "Summarize my day" | jq -r '.content'
+```
+
 **In scripts:**
 
 ```sh
@@ -312,6 +334,21 @@ cat meeting-notes.txt | mika ask "-"
 response=$(mika ask "What are my top priorities today?")
 echo "Mika says: $response"
 ```
+
+**Model override:**
+
+Use `--model <model>` to override the LLM model for a single invocation without
+changing the persistent config. Accepts aliases (`sonnet`, `opus`, `haiku`) or
+full model IDs (`claude-sonnet-4-6`) or provider-prefixed names (`openai/gpt-4o`):
+
+```sh
+mika ask --model sonnet "Quick question"
+mika ask --model openai/gpt-4o "Translate this to French"
+mika chat --model opus  # start an interactive session with Opus
+```
+
+The `--model` flag is mutually exclusive with `--team` (team runs use the
+configured model for all agents).
 
 Each `mika ask` invocation creates a fresh session. Mika still has access to all
 stored memory (people, commitments, preferences, events) but does not carry over
@@ -332,6 +369,42 @@ This is the entry point for background scripts that perform long-running work
 and need to resume an agent with their findings. The referenced task must have
 `trigger_type=callback` and be in `pending` or `in_progress` status.
 
+**Running a team workflow:**
+
+Use `--team <name>` to run a full team cycle (decompose → execute → review → deliver).
+Progress is printed to stderr; the deliverable is printed to stdout.
+
+```sh
+mika ask --team research "Analyze Q1 customer churn patterns"
+```
+
+Use `--run-id <uuid>` to reference a previous run's workspace and context:
+
+```sh
+mika ask --team research --run-id "550e8400-..." "Refine the analysis with regional data"
+```
+
+Or use `--last-run` to automatically continue from the most recent finished run:
+
+```sh
+mika ask --team research --last-run "Refine the analysis with regional data"
+```
+
+To find run UUIDs, use `mika teams log`:
+
+```sh
+mika teams log research           # text output with full UUIDs (default: 10 runs)
+mika teams log research -n 3      # show last 3 runs
+mika teams log research --format json  # machine-readable JSON output
+```
+
+With `--format json`, the response includes team run metadata:
+
+```sh
+mika ask --team research --format json "Summarize findings"
+# Output: {"role":"assistant","content":"...","team_run":{"run_id":"...","status":"completed","iterations":2}}
+```
+
 ---
 
 ## 9. Troubleshooting
@@ -344,8 +417,8 @@ mika doctor
 
 This checks home directory permissions, API key format, database integrity,
 `config.toml` parsing, optional keys (OpenAI, Brave), `jq` availability, MCP
-configuration, and installed skills. Add `--verify-api` to make a live Claude
-API call to confirm credentials work end-to-end. Use `--json` for
+configuration, and installed skills. Add `--verify-api` to make a live API
+call to the configured LLM provider to confirm credentials work end-to-end. Use `--json` for
 machine-readable output (e.g., in CI scripts).
 
 Exit code is non-zero if any check fails.

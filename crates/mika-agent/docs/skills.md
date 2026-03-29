@@ -1,3 +1,8 @@
+---
+title: Skills
+description: Skills extensibility mechanism, skill.toml format, and handler types
+---
+
 # Skills System
 
 Skills are Mika's extensibility mechanism. Each skill is a filesystem-based bundle that packages related tools, prompt instructions, and dispatch configuration into a single directory. Skills control which tools are available to the agent on each turn, how those tools are executed, and what additional system prompt context the agent receives.
@@ -40,7 +45,7 @@ Each immediate subdirectory of `~/.mika/skills/` is treated as a skill. The dire
 
 ## Manifest Reference (skill.toml)
 
-The manifest is a TOML file with two sections: `[skill]` (required) and `[triggers]` (optional).
+The manifest is a TOML file with three sections: `[skill]` (required), `[triggers]` (optional), and `[llm]` (optional).
 
 ### `[skill]` section
 
@@ -52,6 +57,7 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `always_on`    | bool   | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
 | `timeout_secs` | u64    | No       | `30`    | Per-tool execution timeout in seconds. |
 | `dependencies` | Array\<String\> | No | `[]` | Other skill names that should be loaded when this skill is active. One level only — no transitive resolution. |
+| `max_prompt_size` | u64 | No | `None` | Override the default 16KB size limit for `system_prompt.md`. Clamped to a 64KB ceiling to prevent abuse. |
 
 ### `[triggers]` section
 
@@ -60,6 +66,48 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `keywords` | Array<String>  | No       | `[]`    | Keywords for substring matching against user messages. Case-insensitive. |
 
 If the `[triggers]` section is omitted entirely, it defaults to an empty keyword list. A skill with no keywords and `always_on = false` will never activate.
+
+### `[llm]` section
+
+Optional per-skill LLM provider and model override. When set, the agent constructs a separate provider instance for turns where this skill is active, using the agent's per-provider credentials.
+
+| Field      | Type   | Required | Default | Description                                     |
+|------------|--------|----------|---------|-------------------------------------------------|
+| `provider` | String | No       | —       | Provider name matching a `ProviderKind` (e.g., `"openai"`, `"anthropic"`, `"groq"`). Case-insensitive. |
+| `model`    | String | No       | —       | Model identifier (e.g., `"gpt-4o-mini"`, `"claude-sonnet-4-6"`). |
+
+**Resolution order** (highest to lowest priority):
+
+1. `skill.toml` `[llm].provider` + `[llm].model` — explicit skill override
+2. Per-provider agent config (e.g., `anthropic.model` from config.toml)
+3. Agent global `llm_provider` + provider default model
+
+**Important:** The `[llm]` section belongs only in the **root** `skill.toml`. Provider variant directories already imply their provider — adding `[llm]` to variant `skill.toml` files is ignored with a validation warning.
+
+**Conflict resolution:** If multiple matched skills declare different `[llm]` overrides, the agent falls back to the default provider with a warning log. Skills with identical overrides are deduplicated.
+
+**Examples:**
+
+```toml
+# Provider only — use OpenAI with its configured or default model
+[llm]
+provider = "openai"
+
+# Model only — use this model on the agent's active provider
+[llm]
+model = "gpt-4o-mini"
+
+# Both — fully explicit override
+[llm]
+provider = "openai"
+model = "gpt-4o-mini"
+```
+
+The resolved provider/model feeds into the existing variant resolution system:
+- `resolve_prompt(provider, model)` selects the best prompt variant
+- `effective_timeout(provider, model)` selects the correct timeout
+
+This means `[llm].provider = "openai"` + `[llm].model = "gpt-4o-mini"` automatically selects `openai/gpt-4o-mini/system_prompt.md` if it exists, falling back to root `system_prompt.md`.
 
 ### Minimal valid manifest
 
@@ -333,6 +381,106 @@ This is injected as:
 
 If the file is missing or empty, no snippet is injected for that skill. Snippets are loaded asynchronously (`tokio::fs::read_to_string`) on each turn, so changes to the file take effect immediately without restarting Mika.
 
+### Size limit
+
+Prompt snippets are subject to a size limit to prevent excessive token usage. The default limit is **16KB**. Snippets that exceed the limit are silently skipped (with a warning in the log). To allow a larger prompt, set `max_prompt_size` in `skill.toml`:
+
+```toml
+[skill]
+name = "large-prompt-skill"
+description = "Skill with a large system prompt"
+max_prompt_size = 32768  # 32KB
+```
+
+The `max_prompt_size` value is clamped to a hard ceiling of **64KB** regardless of what is specified. Use `mika skills validate` to check whether a skill's prompt exceeds its effective limit.
+
+### Per-Provider and Per-Model Variant Directories
+
+Skills can ship model-tuned prompt variants alongside the root prompt. The variant hierarchy supports two levels of nesting: **provider** directories (matching `ProviderKind` values) and **model** subdirectories within each provider:
+
+```
+~/.mika/skills/web-search/
+├── skill.toml              # Root manifest (required)
+├── system_prompt.md        # Root prompt (fallback for all models)
+├── tools.json              # Tool definitions (NOT overridable per-variant)
+├── handlers/               # Handler scripts (NOT overridable per-variant)
+├── anthropic/              # Provider directory (overrides + model subdirs)
+│   ├── skill.toml          # Sparse overrides: timeout_secs, max_prompt_size (optional)
+│   └── claude-sonnet-4-6/  # Model variant directory
+│       ├── system_prompt.md  # Sonnet 4.6-specific prompt
+│       └── skill.toml        # Sparse overrides (optional)
+├── openai/
+│   ├── skill.toml          # OpenAI-wide timeout override
+│   └── gpt-4o/
+│       └── system_prompt.md  # GPT-4o-specific prompt
+└── openrouter/
+    └── anthropic--claude-sonnet-4/   # Slash in model name → '--' separator
+        └── system_prompt.md
+```
+
+**Important:** Provider-level `system_prompt.md` files are **not supported** and will be ignored. Models from the same provider (e.g., gpt-4o vs gpt-5) have different prompt requirements, so prompts must be specified at the model level. Provider directories hold only `skill.toml` overrides and model subdirectories.
+
+Valid provider directory names: `anthropic`, `openai`, `openrouter`, `groq`, `ollama`, `mistral`, `google`, `deepseek`, `minimax`, `kimi`, `qwen`. Subdirectories with non-matching names (e.g., `handlers/`, `.git/`) are silently ignored. Within provider directories, any subdirectory (except dotdirs like `.git/`) is treated as a model variant.
+
+**Model directory naming:** Model names map directly to directory names. For models containing slashes (common with OpenRouter, e.g., `anthropic/claude-sonnet-4`), replace `/` with `--` in the directory name: `anthropic--claude-sonnet-4`. The `sanitize_model_dir_name()` function applies this same transformation at lookup time, ensuring consistent matching.
+
+#### Resolution Order
+
+When injecting a skill's prompt, the agent loop resolves the best prompt using a two-level fallback:
+
+1. `{skill}/{provider}/{sanitized_model}/system_prompt.md` → model-specific (most specific)
+2. `{skill}/system_prompt.md` → root (fallback)
+
+The first match wins. The active provider comes from `llm.provider_name()` and the active model from `llm.model_name()`. For numeric config overrides (`timeout_secs`, `max_prompt_size`), a three-level fallback applies: model override > provider override > root manifest.
+
+#### Sparse Manifest Overrides
+
+A `skill.toml` inside a provider or model directory is **sparse** — it contains only the fields that differ from the root manifest. Fields absent from the variant retain their root values.
+
+**Overridable fields:** `timeout_secs`, `max_prompt_size`.
+
+**Not overridable per-variant:** `name`, `description`, `version`, `dependencies`, `[triggers]`, `tools.json`, handler scripts. These are identity/structural fields and must remain consistent across all variants.
+
+Example `openai/skill.toml` (provider-level):
+```toml
+[skill]
+timeout_secs = 60
+```
+
+Example `openai/gpt-4o/skill.toml` (model-level):
+```toml
+[skill]
+timeout_secs = 120
+```
+
+This gives GPT-4o a 120-second timeout, other OpenAI models get 60 seconds, and all non-OpenAI providers use the root manifest's value.
+
+#### Validation
+
+`mika skills validate` checks provider and model variant directories:
+
+- Warns if a provider subdirectory name looks like a misspelling of a known provider
+- Warns if a provider directory contains `system_prompt.md` (not supported — use model-level prompts instead)
+- Validates `system_prompt.md` size against the effective limit (at model level)
+- Validates `skill.toml` parseability (at both provider and model levels)
+- Warns if a variant `skill.toml` contains identity fields (`name`, `description`) or `[triggers]` — these are silently ignored at runtime
+- Warns if a variant directory contains `tools.json` (not supported at any variant level)
+- Warns if a provider directory is empty (no `skill.toml` or model subdirectories)
+- Warns if a model variant directory is empty (no `system_prompt.md` or `skill.toml`)
+- Warns about unexpected subdirectories deeper than the model level (only two levels of nesting supported: provider/model)
+
+#### Notes
+
+- All variants (provider and model) are loaded eagerly at startup — no filesystem access at request time
+- `SkillEntry` stores model variants in `model_prompts` and `model_overrides` maps, keyed by `"{provider}/{sanitized_model}"`
+- `resolve_prompt(provider, model)` implements two-level fallback (model → root); `effective_timeout(provider, model)` implements three-level fallback (model → provider → root)
+- Runtime provider/model switching (`/provider`, `/model` commands) selects the correct variant without re-scanning
+- Skills without variant directories work exactly as before (zero overhead)
+- `mika skills install` copies or symlinks the entire skill directory including all variant subdirectories
+- `mika skills list` shows `[variants: N]` badge (N = total distinct provider + model entries)
+- `mika skills info <name>` shows providers with model variants nested underneath (e.g., `anthropic (1 models)`)
+- TUI `/skill <name>` shows model variants nested under providers with tree-style indentation
+
 ---
 
 ## Tool Definitions (tools.json)
@@ -424,9 +572,12 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 
 ### Builtin-handler skills (keyword-triggered)
 
-| Skill              | Keywords                                              | Tools     | Prompt Snippet |
-|--------------------|-------------------------------------------------------|-----------|----------------|
-| google-workspace   | google, gmail, google calendar, google drive, gdrive  | `run_gws` | Yes            |
+| Skill              | Keywords                                                                                           | Tools      | Prompt Snippet |
+|--------------------|----------------------------------------------------------------------------------------------------|------------|----------------|
+| git-ops            | rebase, merge main, sync main, git sync, sync branch, fast-forward, git fetch, rebase onto, git rebase, git merge | `git_ops`  | Yes            |
+| google-workspace   | google, gmail, google calendar, google drive, gdrive                                               | `run_gws`  | Yes            |
+
+The **git-ops** skill provides `git_ops` for structured git maintenance operations (fetch, rebase, merge). It uses `tokio::process::Command` with `GIT_TERMINAL_PROMPT=0` and scrubs `MIKA_*` env vars from child processes. Supported operations: `fetch` (download remote refs), `rebase` (fetch + rebase onto base ref, auto-aborts on conflict), `merge` (fetch + fast-forward only merge). Optional `push: true` on rebase uses `--force-with-lease` with branch protection (refuses push to `main`/`master`). Pre-flight checks verify the repo path, clean working tree, and no in-progress rebase/merge. `timeout_secs = 120` for large repo operations.
 
 The **google-workspace** skill provides `run_gws` for interacting with Google Workspace (Gmail, Calendar, Drive) via the `gws` CLI. It uses a service allowlist (`gmail`, `calendar`, `drive`) and blocks credential/config-smuggling flags (`--token`, `--credentials-file`, `--config`, `--config-dir` including `--flag=value` forms). Scrubs `MIKA_*` env vars from child processes. Uses `gws`'s native keyring-based authentication (set up via `gws auth login`). Requires `gws` CLI installed (included in Docker image). `timeout_secs = 45` to accommodate first-call API schema discovery.
 
@@ -442,9 +593,10 @@ All bundled exec-handler scripts require `jq` for JSON input parsing and will fa
 |-----------------|---------------------------------------------------------------|----------------|
 | self-knowledge  | help, what can you do, capabilities, commands, how to use     | Yes            |
 | mcp             | mcp, model context protocol, mcp server, mcp tool              | Yes            |
+| browser-control | playwright, browse to, web page, navigate to, take screenshot, browser automation, fill form, web scraping | Yes |
 | agents-teams    | delegate, delegate task, run team, list agents, list teams, team workflow, team status, team history, multi-agent | Yes |
 
-These skills provide only system prompt guidance — they have no tools of their own. The **self-knowledge** skill (`always_on = true`) instructs the agent to use `get_documentation` before answering questions about its systems (architecture, CLI, API, skills, etc.) and to check its home directory files (`list_agent_files`, `read_agent_file`) before answering questions about its own configuration or internals (soul.md, identity.toml, mcp.json, installed skills). The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands. The **agents-teams** skill provides behavioral guidance for using the 6 management tools (`delegate_task`, `run_team`, `list_agents`, `list_teams`, `get_team_status`, `get_team_history`) — when to delegate vs run a team, delegate limitations, and timeout expectations.
+These skills provide only system prompt guidance — they have no tools of their own. The **self-knowledge** skill (`always_on = true`) instructs the agent to use `get_documentation` before answering questions about its systems (architecture, CLI, API, skills, etc.) and to check its home directory files (`list_agent_files`, `read_agent_file`) before answering questions about its own configuration or internals (soul.md, identity.toml, mcp.json, installed skills). The **mcp** skill explains how to configure external MCP servers via `mcp.json` and the `mika mcp` CLI commands. The **browser-control** skill guides the agent on using browser automation tools from a Playwright MCP server — snapshot-then-act workflow, ref-based interaction, step budgeting, and security boundaries (no credentials in tool params, no `file://` URLs, no internal network access). See [Browser Control](browser-control.md) for setup instructions. The **agents-teams** skill provides behavioral guidance for using the 6 management tools (`delegate_task`, `run_team`, `list_agents`, `list_teams`, `get_team_status`, `get_team_history`) — when to delegate vs run a team, delegate limitations, and timeout expectations.
 
 ---
 
@@ -463,17 +615,23 @@ mika skills install https://github.com/user/mika-skill-weather.git
 
 # Install under a different name (alias)
 mika skills install user/repo --name my-weather
+
+# From a local path (snapshot copy)
+mika skills install /path/to/my-skill
+mika skills install file:///path/to/my-skill
+
+# From a local path (live symlink — changes reflected immediately)
+mika skills install /path/to/my-skill --link
+
+# Local repo root with multiple skills (interactive picker)
+mika skills install /path/to/mika-skills --link
 ```
 
-The install process:
-1. Clones the repository (shallow clone)
-2. Scans for `skill.toml` files (up to 2 levels deep)
-3. If multiple skills found, presents an interactive picker
-4. Validates the manifest and checks for name collisions
-5. Copies the skill directory into `~/.mika/skills/<name>/`
-6. Records the installation in `marketplace.lock`
+**Git sources:** The install process clones the repository (shallow clone), scans for `skill.toml` files (up to 2 levels deep), presents an interactive picker if multiple skills are found, validates the manifest and checks for name collisions, copies the skill directory into `~/.mika/skills/<name>/`, and records the installation in `marketplace.lock`.
 
-Skills with exec handlers show a security warning before installation and require confirmation to proceed.
+**Local sources:** Accepts absolute paths or `file://` URIs. Without `--link`, files are copied (snapshot). With `--link`, a symlink is created so changes to the source directory are reflected immediately — ideal for skill development. `--link` is not supported with git sources.
+
+Skills with exec handlers show a security warning before installation and require confirmation to proceed. For `--link` installs, an additional note warns that handler scripts can be modified at any time.
 
 ### Updating Skills
 
@@ -485,7 +643,10 @@ mika skills update weather
 mika skills update
 ```
 
-Updates re-clone the source repo and replace the installed skill with the latest version. The lock file is updated with the new commit hash.
+Update behavior depends on the source type:
+- **Git sources:** Re-clones the repo and replaces the installed skill with the latest version. The lock file is updated with the new commit hash.
+- **Local snapshots:** Re-copies from the original source path. Fails with a clear message if the source directory no longer exists.
+- **Linked skills:** No-op — source changes are always current. The update summary reports these as "Linked (no-op)".
 
 ### Uninstalling Skills
 
@@ -497,10 +658,11 @@ This removes the skill directory and its lock file entry. Built-in skills cannot
 
 ### Skill Origins
 
-Skills have three possible origins, shown in `list_skills` output:
+Skills have four possible origins, shown in `list_skills` output:
 
 - **[built-in]** — Bundled with Mika, re-synced on startup
-- **[marketplace]** — Installed from a Git repository via `mika skills install`
+- **[marketplace]** — Installed from a Git repository or local path via `mika skills install`
+- **[marketplace/linked]** — Installed via `mika skills install --link` (symlink to source)
 - **[custom]** — Created locally via `mika skills create` or manually
 
 ### Publishing Skills
@@ -537,12 +699,30 @@ The installer scans up to 2 directory levels for `skill.toml` files. Ensure your
 Marketplace installations are tracked in `~/.mika/agents/<agent>/marketplace.lock`:
 
 ```toml
+# Git source
 [skills.weather]
 url = "https://github.com/user/mika-skill-weather.git"
 path = "."
 commit = "abc123def456"
 installed_at = "2026-03-02T10:30:00Z"
 updated_at = "2026-03-02T10:30:00Z"
+
+# Local snapshot
+[skills.my-dev-skill]
+url = "file:///home/user/projects/my-skill"
+path = "."
+commit = ""
+installed_at = "2026-03-19T10:00:00Z"
+updated_at = "2026-03-19T10:00:00Z"
+
+# Linked (symlink)
+[skills.self-dev]
+url = "file:///home/user/projects/mika-skills/self-dev"
+path = "."
+commit = ""
+linked = true
+installed_at = "2026-03-19T10:00:00Z"
+updated_at = "2026-03-19T10:00:00Z"
 ```
 
 ---

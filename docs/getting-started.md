@@ -88,7 +88,7 @@ Get an API key from [console.anthropic.com](https://console.anthropic.com/). Usa
 is billed to your Anthropic account.
 
 ```sh
-export MIKA_LLM_API_KEY="sk-ant-api03-..."
+export MIKA_ANTHROPIC_API_KEY="sk-ant-api03-..."
 ```
 
 ### Option B: Claude subscription OAuth token
@@ -105,7 +105,7 @@ quota instead of a paid API key. This requires the [Claude Code CLI](https://doc
 2. Set the token (it starts with `sk-ant-oat`):
 
    ```sh
-   export MIKA_LLM_API_KEY="sk-ant-oat01-..."
+   export MIKA_ANTHROPIC_API_KEY="sk-ant-oat01-..."
    ```
 
 OAuth tokens expire periodically. When Mika reports an authentication error,
@@ -114,11 +114,10 @@ re-run `claude setup-token` to get a fresh token.
 ### Option C: Non-Anthropic provider
 
 Mika supports OpenAI, Groq, Ollama, and other OpenAI-compatible providers.
-Set both the model and key:
+Set the provider-specific key:
 
 ```sh
-export MIKA_LLM_MODEL=openai/gpt-4o
-export MIKA_LLM_API_KEY="sk-..."
+export MIKA_OPENAI_API_KEY="sk-..."
 ```
 
 See [Model Configuration](configuration.md#model-configuration) for all supported
@@ -133,7 +132,7 @@ Alternatively, set it as an environment variable in your shell profile
 (`~/.bashrc`, `~/.zshrc`, etc.):
 
 ```sh
-echo 'export MIKA_LLM_API_KEY="sk-ant-..."' >> ~/.zshrc
+echo 'export MIKA_ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
 ```
 

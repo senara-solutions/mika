@@ -16,7 +16,7 @@ use std::time::Duration;
 fn spawn_server(port: u16) -> Child {
     let binary = env!("CARGO_BIN_EXE_mika-server");
     Command::new(binary)
-        .env("MIKA_LLM_API_KEY", "sk-ant-test-dummy-key-for-smoke")
+        .env("MIKA_ANTHROPIC_API_KEY", "sk-ant-test-dummy-key-for-smoke")
         .env("MIKA_INTERNAL_TOKEN", "aa".repeat(32)) // 64 hex chars
         .env("MIKA_ROUTING_URL", "http://localhost:19999")
         .env("MIKA_SERVER_PORT", port.to_string())

@@ -240,7 +240,7 @@ fn check_agent_dir(agent_home: &Path, agent_name: &str) -> CheckResult {
 
 fn check_api_key(global_home: &Path) -> CheckResult {
     // Check env var first (highest priority), then .env file
-    let (key_value, source) = if let Ok(val) = std::env::var("MIKA_LLM_API_KEY") {
+    let (key_value, source) = if let Ok(val) = std::env::var("MIKA_ANTHROPIC_API_KEY") {
         (Some(val), "env var")
     } else {
         // Try reading from .env file directly (don't call load_dotenv to avoid side effects)
@@ -252,7 +252,7 @@ fn check_api_key(global_home: &Path) -> CheckResult {
                     return None;
                 }
                 let (k, v) = trimmed.split_once('=')?;
-                if k.trim() == "MIKA_LLM_API_KEY" {
+                if k.trim() == "MIKA_ANTHROPIC_API_KEY" {
                     Some(v.trim().trim_matches('"').to_string())
                 } else {
                     None

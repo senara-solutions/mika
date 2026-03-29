@@ -1,3 +1,8 @@
+---
+title: Slash Commands
+description: TUI slash commands for navigation, memory, and agent control
+---
+
 # Slash Commands Reference
 
 ## Overview
@@ -433,6 +438,21 @@ Errors: `Cannot rewind while agent is busy.` or `No messages to rewind.`
 
 ---
 
+## Dashboard Controls
+
+The TUI footer bar shows a colored dot indicating dashboard status (green when
+enabled, red when disabled) with clickable `[start]`/`[stop]` and `[open]`
+buttons. Status is polled every ~5 seconds by querying the mika-server
+`GET /api/v1/dashboard/status` endpoint.
+
+Requires `MIKA_INTERNAL_TOKEN` or `MIKA_DASHBOARD_TOKEN` to be set. Server URL
+defaults to `http://localhost:8080`, overridable via `MIKA_SERVER_URL`.
+
+The CLI commands (`mika dashboard start/stop/status/open`) remain available for
+non-interactive use.
+
+---
+
 ## Team Mode
 
 When the TUI is launched with `mika --team <name>`, slash commands are restricted
@@ -443,7 +463,7 @@ to a safe subset. Agent-specific commands are disabled:
 | `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
 | `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
-| | `/undo`, `/rewind` |
+|  | `/undo`, `/rewind` |
 
 In team mode, `/status` and `/team` both show team info (name, orchestrator,
 agents). `/export` writes to the team directory instead of the agent home.

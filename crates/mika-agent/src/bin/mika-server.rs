@@ -4,13 +4,14 @@ use anyhow::{Context, Result};
 async fn main() -> Result<()> {
     let home_dir = mika_common::home::resolve_home_dir()?;
     mika_common::dotenv::load_dotenv(&home_dir);
+    mika_common::dotenv::check_deprecated_env_vars();
 
     if !mika_common::home::is_initialized(&home_dir) {
         mika_common::home::bootstrap_fresh_install(&home_dir)?;
     }
 
     let settings = mika_common::config::Settings::load(&home_dir)
-        .context("Failed to load config. Set MIKA_LLM_API_KEY (API key or OAuth token) and MIKA_INTERNAL_TOKEN.")?;
+        .context("Failed to load config. Set MIKA_ANTHROPIC_API_KEY (or your provider's key) and MIKA_INTERNAL_TOKEN.")?;
 
     // Build optional OTel export layer (feature-gated, graceful degradation)
     let (otel_layer, _telemetry_guard) = mika_common::telemetry::try_init_otel(&settings);
