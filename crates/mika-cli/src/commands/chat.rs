@@ -301,11 +301,13 @@ async fn spawn_agent_worker(
                     result,
                     trace_id,
                     original_status,
+                    parent_task_id,
                 } => {
                     // Save the callback result as a tool_result message
                     let metadata = serde_json::json!({
                         "callback_task_id": task_id,
                         "label": label,
+                        "parent_task_id": parent_task_id,
                     })
                     .to_string();
                     let _ = worker_db
@@ -320,8 +322,13 @@ async fn spawn_agent_worker(
 
                     // Build framing message for the agent
                     let is_failed = original_status == "failed";
-                    let framing =
-                        agent::build_callback_trigger_context(&label, &task_id, &result, is_failed);
+                    let framing = agent::build_callback_trigger_context(
+                        &label,
+                        &task_id,
+                        parent_task_id.as_deref(),
+                        &result,
+                        is_failed,
+                    );
 
                     let is_onboarding = check_onboarding(&worker_db).await;
                     let callback_result = agent::run_agent(&AgentParams {
