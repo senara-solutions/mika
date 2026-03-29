@@ -43,7 +43,7 @@ Replaced `pending_work_items: &[Task]` on `SilentPromptContext` with `task_healt
   - `stale_blocked` — manual work item `blocked` with no activity >24h
   - `github_linked` — active work item with GitHub reference URL
 - **Anomaly cap** at 10 (`MAX_ANOMALIES`) with priority ordering: stuck > failed > long > stale > github
-- **Heartbeat-only gating** — task health and preferences only loaded for `SilentTrigger::Heartbeat`, not reflection/callback/skill_run triggers
+- **Heartbeat and callback gating** — task health and preferences loaded for `SilentTrigger::Heartbeat` and `SilentTrigger::Callback`, not reflection/skill_run triggers. Callback turns benefit from work item context for correlating results to in-flight work items (#314)
 - **Preferences filtered** to `task_policy_*` prefix via `search_preferences("task_policy_")`
 
 **Helper extraction:** The 5 anomaly queries share a `query_anomalies` closure that handles row-mapping, iteration, and struct construction — eliminating ~130 lines of duplicated code.
@@ -56,7 +56,7 @@ Stored preferences injected as `<stored-preferences>` block with `<task-health-i
 
 1. **Follow the `<pending-work-items>` injection pattern** for any new structured data in heartbeat prompts: sanitize labels (200-char truncation, strip `<>` and newlines), cap result counts, use XML-tagged blocks.
 
-2. **Gate heartbeat-specific data to heartbeat triggers only** — don't inject directive instructions into callback/reflection/skill_run prompts where the agent has a different job.
+2. **Gate task health data to heartbeat and callback triggers only** — don't inject into reflection/skill_run prompts where the agent has a different job. Callback turns benefit from work item context for correlating results to in-flight work items (#314).
 
 3. **Filter injected preferences by purpose** — don't dump all preferences into every prompt. Use `search_preferences("prefix_")` to scope to the relevant category.
 
