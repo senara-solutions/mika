@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::{error, warn};
 
 use mika_common::claude::ToolDefinition;
 use mika_common::llm::ProviderKind;
@@ -280,7 +280,53 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                 "max_prompt_size exceeds ceiling, clamping"
             );
         }
-        let prompt_snippet = load_snippet_with_limit(&snippet_path, max_size);
+        let prompt_snippet = match load_snippet_with_limit(&snippet_path, max_size) {
+            SnippetLoadResult::Ok(content) => content,
+            SnippetLoadResult::Empty => String::new(),
+            SnippetLoadResult::Oversized { size, limit } => {
+                if manifest.skill.always_on {
+                    error!(
+                        skill = %manifest.skill.name,
+                        path = %snippet_path.display(),
+                        size,
+                        limit,
+                        "always_on skill prompt exceeds size limit — skill NOT loaded. \
+                         An always_on skill without its prompt is functionally broken. \
+                         Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
+                    );
+                    skipped_count += 1;
+                    continue;
+                }
+                error!(
+                    skill = %manifest.skill.name,
+                    path = %snippet_path.display(),
+                    size,
+                    limit,
+                    "prompt snippet exceeds size limit — prompt will be empty. \
+                     Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
+                );
+                String::new()
+            }
+            SnippetLoadResult::ReadError(e) => {
+                if manifest.skill.always_on {
+                    error!(
+                        skill = %manifest.skill.name,
+                        path = %snippet_path.display(),
+                        error = %e,
+                        "always_on skill prompt unreadable — skill NOT loaded"
+                    );
+                    skipped_count += 1;
+                    continue;
+                }
+                warn!(
+                    skill = %manifest.skill.name,
+                    path = %snippet_path.display(),
+                    error = %e,
+                    "cannot read prompt snippet"
+                );
+                String::new()
+            }
+        };
 
         // Check for .disabled marker file
         let enabled = !path.join(".disabled").exists();
@@ -668,10 +714,18 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         if let Ok(meta) = std::fs::metadata(&snippet_path) {
             let size = meta.len();
             if size > effective_limit {
-                diags.push(SkillDiagnostic::fail(format!(
-                    "system_prompt.md ({} bytes) exceeds limit ({} bytes) — snippet will be skipped at startup",
-                    size, effective_limit
-                )));
+                if manifest.skill.always_on {
+                    diags.push(SkillDiagnostic::fail(format!(
+                        "system_prompt.md ({} bytes) exceeds limit ({} bytes) — skill will be SKIPPED at startup \
+                         (always_on skills require their prompt to function)",
+                        size, effective_limit
+                    )));
+                } else {
+                    diags.push(SkillDiagnostic::fail(format!(
+                        "system_prompt.md ({} bytes) exceeds limit ({} bytes) — prompt will be EMPTY at startup",
+                        size, effective_limit
+                    )));
+                }
             } else if effective_limit > 0 && size > effective_limit * 3 / 4 {
                 diags.push(SkillDiagnostic::warn(format!(
                     "system_prompt.md ({} bytes) is above 75% of limit ({} bytes)",
@@ -1144,10 +1198,27 @@ fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> Variant
                 // Load model-specific prompt
                 let model_prompt_path = model_path.join("system_prompt.md");
                 if model_prompt_path.exists() {
-                    let snippet = load_snippet_with_limit(&model_prompt_path, max_size);
-                    if !snippet.is_empty() {
-                        model_prompts.insert(composite_key.clone(), snippet);
-                        model_has_content = true;
+                    match load_snippet_with_limit(&model_prompt_path, max_size) {
+                        SnippetLoadResult::Ok(content) => {
+                            model_prompts.insert(composite_key.clone(), content);
+                            model_has_content = true;
+                        }
+                        SnippetLoadResult::Oversized { size, limit } => {
+                            warn!(
+                                path = %model_prompt_path.display(),
+                                size,
+                                limit,
+                                "model variant prompt exceeds size limit — falling back to root prompt"
+                            );
+                        }
+                        SnippetLoadResult::ReadError(e) => {
+                            warn!(
+                                path = %model_prompt_path.display(),
+                                error = %e,
+                                "cannot read model variant prompt — falling back to root prompt"
+                            );
+                        }
+                        SnippetLoadResult::Empty => {}
                     }
                 }
 
@@ -1282,20 +1353,43 @@ fn load_tools_json(skill_dir: &Path) -> Vec<ResolvedSkillTool> {
         .collect()
 }
 
+/// Result of loading a prompt snippet file.
+#[derive(Debug)]
+pub enum SnippetLoadResult {
+    /// Successfully loaded the prompt content.
+    Ok(String),
+    /// File does not exist or is empty (legitimate — tool-only skills).
+    Empty,
+    /// File exceeds the configured size limit.
+    Oversized { size: u64, limit: u64 },
+    /// IO error reading the file.
+    ReadError(String),
+}
+
 /// Load a prompt snippet file with size limit enforcement.
-fn load_snippet_with_limit(path: &Path, max_size: u64) -> String {
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > max_size
-    {
-        warn!(
-            path = %path.display(),
-            size = meta.len(),
-            limit = max_size,
-            "prompt snippet exceeds size limit, skipping"
-        );
-        return String::new();
+fn load_snippet_with_limit(path: &Path, max_size: u64) -> SnippetLoadResult {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SnippetLoadResult::Empty,
+        Err(e) => return SnippetLoadResult::ReadError(e.to_string()),
+    };
+
+    if meta.len() > max_size {
+        return SnippetLoadResult::Oversized {
+            size: meta.len(),
+            limit: max_size,
+        };
     }
-    std::fs::read_to_string(path).unwrap_or_default()
+
+    if meta.len() == 0 {
+        return SnippetLoadResult::Empty;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(content) if content.is_empty() => SnippetLoadResult::Empty,
+        Ok(content) => SnippetLoadResult::Ok(content),
+        Err(e) => SnippetLoadResult::ReadError(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1491,8 +1585,8 @@ mod tests {
         let big_content = "x".repeat(17 * 1024);
         fs::write(&path, &big_content).unwrap();
 
-        let snippet = load_snippet_with_limit(&path, MAX_PROMPT_SNIPPET_SIZE);
-        assert_eq!(snippet, "");
+        let result = load_snippet_with_limit(&path, MAX_PROMPT_SNIPPET_SIZE);
+        assert!(matches!(result, SnippetLoadResult::Oversized { .. }));
     }
 
     #[test]
@@ -1503,8 +1597,11 @@ mod tests {
         let content = "x".repeat(10 * 1024);
         fs::write(&path, &content).unwrap();
 
-        let snippet = load_snippet_with_limit(&path, 32 * 1024);
-        assert_eq!(snippet.len(), 10 * 1024);
+        let result = load_snippet_with_limit(&path, 32 * 1024);
+        match result {
+            SnippetLoadResult::Ok(s) => assert_eq!(s.len(), 10 * 1024),
+            other => panic!("expected Ok, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1513,8 +1610,8 @@ mod tests {
         let path = tmp.path().join("system_prompt.md");
         fs::write(&path, "tiny").unwrap();
 
-        let snippet = load_snippet_with_limit(&path, 0);
-        assert_eq!(snippet, "");
+        let result = load_snippet_with_limit(&path, 0);
+        assert!(matches!(result, SnippetLoadResult::Oversized { .. }));
     }
 
     #[test]
@@ -1524,8 +1621,27 @@ mod tests {
         let content = "x".repeat(15 * 1024); // 15KB, under 16KB default
         fs::write(&path, &content).unwrap();
 
-        let snippet = load_snippet_with_limit(&path, MAX_PROMPT_SNIPPET_SIZE);
-        assert_eq!(snippet.len(), 15 * 1024);
+        let result = load_snippet_with_limit(&path, MAX_PROMPT_SNIPPET_SIZE);
+        match result {
+            SnippetLoadResult::Ok(s) => assert_eq!(s.len(), 15 * 1024),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_snippet_missing_file_returns_empty() {
+        let result = load_snippet_with_limit(Path::new("/nonexistent/prompt.md"), 16 * 1024);
+        assert!(matches!(result, SnippetLoadResult::Empty));
+    }
+
+    #[test]
+    fn test_snippet_empty_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("system_prompt.md");
+        fs::write(&path, "").unwrap();
+
+        let result = load_snippet_with_limit(&path, 16 * 1024);
+        assert!(matches!(result, SnippetLoadResult::Empty));
     }
 
     #[test]
@@ -1598,6 +1714,128 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].prompt_snippet, "");
+    }
+
+    #[test]
+    fn test_scan_skips_always_on_skill_with_oversized_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("self-dev");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "self-dev"
+            description = "Development workflow"
+            always_on = true
+            "#,
+        )
+        .unwrap();
+        // 29KB prompt — over 16KB default limit
+        let content = "x".repeat(29 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        // always_on skill with oversized prompt should be SKIPPED entirely
+        assert_eq!(scan.entries.len(), 0);
+        assert_eq!(scan.skipped_count, 1);
+    }
+
+    #[test]
+    fn test_scan_always_on_with_valid_prompt_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("memory");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "memory"
+            description = "Memory management"
+            always_on = true
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Remember things.").unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "Remember things.");
+        assert_eq!(scan.skipped_count, 0);
+    }
+
+    #[test]
+    fn test_scan_always_on_with_custom_size_loads_large_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("self-dev");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "self-dev"
+            description = "Development workflow"
+            always_on = true
+            max_prompt_size = 65536
+            "#,
+        )
+        .unwrap();
+        // 29KB prompt — over 16KB default but under 64KB ceiling
+        let content = "x".repeat(29 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet.len(), 29 * 1024);
+        assert_eq!(scan.skipped_count, 0);
+    }
+
+    #[test]
+    fn test_scan_always_on_without_prompt_file_loads() {
+        // Tool-only always_on skills (no prompt file) should still load
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("agents-teams");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "agents-teams"
+            description = "Agent management"
+            always_on = true
+            "#,
+        )
+        .unwrap();
+        // No system_prompt.md — tool-only skill
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "");
+        assert_eq!(scan.skipped_count, 0);
+    }
+
+    #[test]
+    fn test_scan_non_always_on_with_oversized_prompt_still_loads() {
+        // Non-always_on skills should still load with empty prompt (existing behavior)
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("optional");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "optional"
+            description = "Optional skill"
+            "#,
+        )
+        .unwrap();
+        let content = "x".repeat(17 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].prompt_snippet, "");
+        assert_eq!(scan.skipped_count, 0);
     }
 
     #[test]

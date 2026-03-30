@@ -126,6 +126,39 @@ impl SkillRegistry {
                 }
             }
         }
+
+        // Post-override validation: remove always_on skills with empty prompts
+        // caused by oversized prompt files. This catches the edge case where a DB
+        // override flips always_on=true on a skill whose prompt was already silently
+        // emptied during scan (because it was not always_on at scan time).
+        self.skills.retain(|entry| {
+            if entry.manifest.skill.always_on && entry.has_override && entry.prompt_snippet.is_empty()
+            {
+                // Check if the skill has a prompt file that exceeds its size limit
+                let snippet_path = entry.dir.join("system_prompt.md");
+                let effective_limit = entry
+                    .manifest
+                    .skill
+                    .max_prompt_size
+                    .map(|v| v.min(64 * 1024))
+                    .unwrap_or(16 * 1024);
+                if let Ok(meta) = std::fs::metadata(&snippet_path)
+                    && meta.len() > effective_limit
+                {
+                    tracing::error!(
+                        skill = %entry.manifest.skill.name,
+                        size = meta.len(),
+                        limit = effective_limit,
+                        "always_on skill (via DB override) has oversized prompt — removing from registry. \
+                         An always_on skill without its prompt is functionally broken. \
+                         Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
+                    );
+                    self.skipped_count += 1;
+                    return false;
+                }
+            }
+            true
+        });
     }
 
     /// Return always-on skills that are safe for silent/background mode.
@@ -517,5 +550,63 @@ mod tests {
         };
         // No dependencies declared — nothing to validate
         registry.apply_overrides(&[]);
+    }
+
+    #[test]
+    fn test_apply_overrides_removes_always_on_override_with_oversized_prompt() {
+        use crate::db::SkillOverride;
+        use std::fs;
+
+        // Create a real skill directory with an oversized prompt
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("big-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        // 20KB prompt exceeds 16KB default limit
+        let content = "x".repeat(20 * 1024);
+        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        // Simulate a skill that was loaded with empty prompt (not always_on at scan time)
+        let mut entry = make_entry("big-skill", false, true);
+        entry.dir = skill_dir;
+        entry.prompt_snippet = String::new(); // emptied due to oversized prompt
+
+        let mut registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![entry],
+        };
+
+        // DB override flips always_on to true
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "big-skill".to_string(),
+            always_on: Some(true),
+        }]);
+
+        // Skill should be removed: always_on + override + empty prompt + oversized file
+        assert!(registry.skills.is_empty());
+        assert_eq!(registry.skipped_count, 1);
+    }
+
+    #[test]
+    fn test_apply_overrides_keeps_always_on_override_with_no_prompt_file() {
+        use crate::db::SkillOverride;
+
+        // Skill with no prompt file (tool-only) — should NOT be removed
+        let mut entry = make_entry("tool-only", false, true);
+        entry.prompt_snippet = String::new();
+        // dir points to a non-existent path, so metadata check will fail → keep
+
+        let mut registry = SkillRegistry {
+            skipped_count: 0,
+            skills: vec![entry],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "tool-only".to_string(),
+            always_on: Some(true),
+        }]);
+
+        // Should still be present — no prompt file means tool-only, not broken
+        assert_eq!(registry.skills.len(), 1);
+        assert!(registry.skills[0].manifest.skill.always_on);
     }
 }
