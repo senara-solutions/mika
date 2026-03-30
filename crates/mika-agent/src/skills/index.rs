@@ -14,11 +14,11 @@ use super::manifest::{
 const MAX_SKILL_TOML_SIZE: u64 = 64 * 1024;
 
 /// Default maximum size for system_prompt.md snippets (16 KB).
-const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
+pub(super) const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
 
 /// Hard ceiling for per-skill `max_prompt_size` override (64 KB).
 /// Prevents marketplace skills from loading arbitrarily large prompts.
-const MAX_PROMPT_SIZE_CEILING: u64 = 64 * 1024;
+pub(super) const MAX_PROMPT_SIZE_CEILING: u64 = 64 * 1024;
 
 /// Maximum size for tools.json files (256 KB).
 const MAX_TOOLS_JSON_SIZE: u64 = 256 * 1024;
@@ -1379,10 +1379,6 @@ fn load_snippet_with_limit(path: &Path, max_size: u64) -> SnippetLoadResult {
             size: meta.len(),
             limit: max_size,
         };
-    }
-
-    if meta.len() == 0 {
-        return SnippetLoadResult::Empty;
     }
 
     match std::fs::read_to_string(path) {

@@ -140,8 +140,8 @@ impl SkillRegistry {
                     .manifest
                     .skill
                     .max_prompt_size
-                    .map(|v| v.min(64 * 1024))
-                    .unwrap_or(16 * 1024);
+                    .map(|v| v.min(index::MAX_PROMPT_SIZE_CEILING))
+                    .unwrap_or(index::MAX_PROMPT_SNIPPET_SIZE);
                 if let Ok(meta) = std::fs::metadata(&snippet_path)
                     && meta.len() > effective_limit
                 {
