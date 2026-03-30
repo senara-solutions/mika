@@ -12,7 +12,9 @@ build: ## Build release binaries with telemetry
 build-debug: ## Build debug binaries
 	cargo build
 
-build-dashboard: ## Build dashboard for production
+build-dashboard: ## Build dashboard for production (installs deps + builds shared UI lib)
+	npm ci
+	npm run build -w packages/ui
 	npm run build --prefix dashboard
 
 stop: ## Stop running mika-server and mika-gateway (via tmux C-c)
