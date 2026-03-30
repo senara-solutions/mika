@@ -1070,7 +1070,13 @@ pub async fn handle_investigate(
 
     // --- Start SSE stream ---
     let (tx, rx) = mpsc::channel::<Result<sse::Event, Infallible>>(64);
-    let llm = state.llm.clone();
+    // Investigation panel is not agent-scoped — use the default agent's LLM provider.
+    // The default agent is guaranteed to exist (validated in run_server).
+    let llm = state
+        .resolve_agent(&state.default_agent)
+        .expect("default agent must exist")
+        .llm
+        .clone();
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
     let lock = state.investigation_lock.clone();

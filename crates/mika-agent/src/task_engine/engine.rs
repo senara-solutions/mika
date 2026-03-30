@@ -608,6 +608,8 @@ mod tests {
     }
 
     fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = mika_common::config::Settings::load(tmp.path()).unwrap();
         Arc::new(TaskDispatcher {
             db,
             llm: mika_common::llm::dummy_provider(),
@@ -621,6 +623,7 @@ mod tests {
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
             cli_mode: false,
+            settings,
         })
     }
 
@@ -1004,6 +1007,8 @@ mod tests {
     async fn test_cli_mode_skips_callback_dispatch() {
         let db = test_db();
         // Create dispatcher with cli_mode: true
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = mika_common::config::Settings::load(tmp.path()).unwrap();
         let dispatcher = Arc::new(TaskDispatcher {
             db: db.clone(),
             llm: mika_common::llm::dummy_provider(),
@@ -1017,6 +1022,7 @@ mod tests {
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
             cli_mode: true,
+            settings,
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 

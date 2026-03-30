@@ -29,7 +29,6 @@ use mika_common::agent;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::home;
-use mika_common::llm::LlmProvider;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
@@ -209,12 +208,13 @@ fn build_router(state: AppState) -> Router {
 /// Initialize a single agent and return its AgentState with a running TaskEngine.
 ///
 /// Uses the shared container database at `{global_home}/data/mika.db`.
+/// Loads per-agent settings via `Settings::load_for_agent()` so each agent gets
+/// its own LLM provider (respecting per-agent `config.toml` overrides). See #323.
 #[allow(clippy::too_many_arguments)]
 async fn init_agent(
     agent_name: &str,
     agent_home: &std::path::Path,
     global_home: &std::path::Path,
-    llm: &Arc<dyn LlmProvider>,
     tool_registry: &Arc<crate::tools::ToolRegistry>,
     gateway_url: &str,
     internal_token: &secrecy::SecretString,
@@ -224,6 +224,9 @@ async fn init_agent(
     github_token: Option<String>,
     disable_bundled_skills: bool,
 ) -> Result<AgentState> {
+    // Load per-agent settings (global config.toml → agent config.toml → env vars)
+    let agent_settings = Settings::load_for_agent(global_home, agent_home)?;
+    let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let db = Database::open(&db_path)?;
@@ -259,7 +262,7 @@ async fn init_agent(
 
     let dispatcher = Arc::new(TaskDispatcher {
         db: async_db.clone(),
-        llm: llm.clone(),
+        llm: agent_llm.clone(),
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
         home_dir: agent_home.to_path_buf(),
@@ -272,6 +275,7 @@ async fn init_agent(
         // Server mode: engine dispatches callbacks via dispatch_undelivered_callbacks().
         // The agent_lock serializes concurrent dispatch attempts.
         cli_mode: false,
+        settings: agent_settings.clone(),
     });
 
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
@@ -302,6 +306,8 @@ async fn init_agent(
         home_dir: agent_home.to_path_buf(),
         embedding_client,
         mcp_manager,
+        settings: agent_settings,
+        llm: agent_llm,
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -388,7 +394,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         );
     }
 
-    let llm = settings.make_llm_provider()?;
     let http_client = reqwest::Client::new();
     let mut tool_registry = tools::default_tools();
     for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone()) {
@@ -442,7 +447,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 agent::DEFAULT_AGENT,
                 &default_home,
                 global_home,
-                &llm,
                 &tool_registry,
                 &gateway_url,
                 &internal_token,
@@ -462,7 +466,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 name,
                 &agent_home,
                 global_home,
-                &llm,
                 &tool_registry,
                 &gateway_url,
                 &internal_token,
@@ -519,7 +522,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,
-        llm,
         tools: tool_registry,
         ready: ready.clone(),
         internal_token,
@@ -652,6 +654,11 @@ mod tests {
     use secrecy::SecretString;
     use tower::ServiceExt;
 
+    fn test_settings() -> Settings {
+        let tmp = tempfile::tempdir().unwrap();
+        Settings::load(tmp.path()).unwrap()
+    }
+
     fn test_task_engine(
         db: AsyncDatabase,
     ) -> (Arc<tokio::sync::Mutex<TaskEngine>>, Arc<TaskDispatcher>) {
@@ -669,6 +676,7 @@ mod tests {
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
             cli_mode: false,
+            settings: test_settings(),
         });
         let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
             db,
@@ -697,6 +705,8 @@ mod tests {
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             mcp_manager: None,
+            settings: test_settings(),
+            llm: llm.clone(),
         };
 
         let mut agents = HashMap::new();
@@ -705,7 +715,6 @@ mod tests {
         AppState {
             agents: Arc::new(agents),
             default_agent: "mika".to_string(),
-            llm,
             tools: tools_reg,
             ready: Arc::new(AtomicBool::new(false)),
             internal_token: SecretString::from("test-token-secret"),
@@ -716,67 +725,7 @@ mod tests {
             brave_api_key: None,
             github_token: None,
             global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
-            settings: Settings {
-                llm_provider: mika_common::llm::ProviderKind::Anthropic,
-                llm_max_tokens: 4096,
-                anthropic_model: None,
-                anthropic_api_key: Some("test-key".to_string()),
-                anthropic_base_url: None,
-                openai_model: None,
-                openai_base_url: None,
-                openrouter_model: None,
-                openrouter_api_key: None,
-                openrouter_base_url: None,
-                groq_model: None,
-                groq_api_key: None,
-                groq_base_url: None,
-                ollama_model: None,
-                ollama_api_key: None,
-                ollama_base_url: None,
-                mistral_model: None,
-                mistral_api_key: None,
-                mistral_base_url: None,
-                google_model: None,
-                google_api_key: None,
-                google_base_url: None,
-                deepseek_model: None,
-                deepseek_api_key: None,
-                deepseek_base_url: None,
-                minimax_model: None,
-                minimax_api_key: None,
-                minimax_base_url: None,
-                kimi_model: None,
-                kimi_api_key: None,
-                kimi_base_url: None,
-                qwen_model: None,
-                qwen_api_key: None,
-                qwen_base_url: None,
-                db_path: std::path::PathBuf::from("/tmp/mika-test/data/mika.db"),
-                log_level: "info".to_string(),
-                log_format: "json".to_string(),
-                routing_url: None,
-                customer_id: None,
-                server_port: 8080,
-                internal_token: None,
-                dashboard_token: None,
-                openai_api_key: None,
-                embedding_model: "text-embedding-3-small".to_string(),
-                embedding_dimensions: 512,
-                brave_api_key: None,
-                github_token: None,
-                investigate_github_token: None,
-                github_repo: None,
-                home_dir: std::path::PathBuf::from("/tmp/mika-test"),
-                server_log_file: None,
-                dashboard_enabled: false,
-                disable_bundled_skills: false,
-                telemetry_enabled: false,
-                otlp_endpoint: None,
-                otlp_auth_header: None,
-                store_llm_calls: true,
-                store_tool_calls: true,
-                log_llm_bodies: false,
-            },
+            settings: test_settings(),
             dashboard_db,
             investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
             investigation_tools: Arc::new(tokio::sync::OnceCell::new()),

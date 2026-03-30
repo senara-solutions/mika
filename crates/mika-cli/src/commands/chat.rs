@@ -137,6 +137,7 @@ async fn spawn_agent_worker(
         // session-scoped queries and atomic claiming. Skip engine dispatch to prevent
         // the engine from stealing callbacks. See #264.
         cli_mode: true,
+        settings: ctx.settings.clone(),
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         ctx.async_db.clone(),

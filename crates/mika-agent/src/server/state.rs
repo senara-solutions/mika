@@ -30,6 +30,12 @@ pub struct AgentState {
     pub home_dir: PathBuf,
     pub embedding_client: Option<EmbeddingClient>,
     pub mcp_manager: Option<McpManager>,
+    /// Per-agent settings loaded via `Settings::load_for_agent(global_home, agent_home)`.
+    /// Ensures callback/heartbeat/reflection turns use the agent's LLM provider config,
+    /// not the global default. See #323.
+    pub settings: Settings,
+    /// Per-agent LLM provider built from `self.settings`.
+    pub llm: Arc<dyn LlmProvider>,
 }
 
 /// Shared application state for the Axum HTTP server.
@@ -44,7 +50,6 @@ pub struct AppState {
     pub agents: Arc<HashMap<String, Arc<AgentState>>>,
     /// Default agent name (resolved from active_agent file).
     pub default_agent: String,
-    pub llm: Arc<dyn LlmProvider>,
     pub tools: Arc<ToolRegistry>,
     pub ready: Arc<AtomicBool>,
     pub internal_token: SecretString,
