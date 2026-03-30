@@ -383,7 +383,7 @@ If the file is missing or empty, no snippet is injected for that skill. Snippets
 
 ### Size limit
 
-Prompt snippets are subject to a size limit to prevent excessive token usage. The default limit is **16KB**. Snippets that exceed the limit are silently skipped (with a warning in the log). To allow a larger prompt, set `max_prompt_size` in `skill.toml`:
+Prompt snippets are subject to a size limit to prevent excessive token usage. The default limit is **16KB**. For `always_on` skills, exceeding the limit causes the skill to be **skipped entirely** at startup (logged at `error!` level) — an `always_on` skill without its prompt is functionally broken. For non-`always_on` skills, the prompt is discarded (logged at `error!` level) but the skill still loads. To allow a larger prompt, set `max_prompt_size` in `skill.toml`:
 
 ```toml
 [skill]

@@ -35,8 +35,16 @@ The hard-coded `MAX_PROMPT_SNIPPET_SIZE` of 8KB silently skipped legitimate skil
 - `crates/mika-agent/src/skills/index.rs` — constants, `load_snippet_with_limit`, `scan_skills_dir`, `validate_skill`
 - `crates/mika-agent/src/skills/manifest.rs` — `SkillInfo.max_prompt_size: Option<u64>`
 
+## Follow-up: #331 — always_on enforcement
+
+The original fix still allowed oversized prompts to silently degrade `always_on` skills. #331 changed `load_snippet_with_limit()` to return a `SnippetLoadResult` enum (Ok/Empty/Oversized/ReadError) and added enforcement:
+
+- **`always_on` skills:** oversized prompt → skill skipped entirely at startup (`error!` log)
+- **Non-`always_on` skills:** oversized prompt → prompt discarded, skill still loads (`error!` log, upgraded from `warn!`)
+- **Post-override validation** in `apply_overrides()` catches DB overrides that flip `always_on=true` on skills with already-emptied prompts
+
 ## Prevention
 
 - When adding hard-coded limits, provide a per-item override mechanism from the start.
 - Use `mika skills validate` to catch oversized prompts before they silently fail at runtime.
-- The `validate_skill()` function now reports effective limit vs actual size, making diagnosis immediate.
+- The `validate_skill()` function now reports effective limit vs actual size with differentiated messaging for `always_on` vs non-`always_on` skills.
