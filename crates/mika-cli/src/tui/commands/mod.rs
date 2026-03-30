@@ -29,8 +29,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "clear",
         aliases: &[],
-        description: "Clear chat display (--all for DB)",
-        args_hint: Some("[--all]"),
+        description: "Clear chat and start a new session",
+        args_hint: None,
         completer: None,
     },
     SlashCommand {

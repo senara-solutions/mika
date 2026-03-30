@@ -185,7 +185,7 @@ async fn spawn_agent_worker(
     let worker_tools = tool_registry.clone();
     let mut worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
-    let worker_session = session_id.clone();
+    let mut worker_session = session_id.clone();
     let worker_embedding = embedding_client;
     let worker_brave_key = brave_api_key;
     let worker_github_token = github_token;
@@ -414,6 +414,9 @@ async fn spawn_agent_worker(
                         worker_llm = new_llm;
                         worker_settings = updated_settings;
                     }
+                }
+                AgentRequest::NewSession { session_id } => {
+                    worker_session = session_id;
                 }
                 AgentRequest::Quit => break,
             }

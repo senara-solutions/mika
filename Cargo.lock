@@ -1822,6 +1822,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "async-trait",
  "base64",
  "chrono",
  "chrono-tz",

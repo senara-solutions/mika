@@ -12,6 +12,9 @@ use crate::tui::app::{
 use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
 use crate::tui::input;
 
+/// Error message shown when the agent worker channel is closed.
+const WORKER_NOT_RESPONDING: &str = "Error: Agent worker is not responding. Try /exit and restart.";
+
 /// Commands allowed in team mode. New commands are blocked by default (safe failure mode).
 const TEAM_MODE_ALLOWED_COMMANDS: &[&str] = &[
     "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team", "status",
@@ -93,9 +96,41 @@ fn handle_help() -> String {
 }
 
 async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
+    // End the current session
+    let old_session = app.session_id.clone();
+    if let Err(e) = app.db.end_session(&old_session).await {
+        tracing::warn!(error = %e, "failed to end session on /clear");
+    }
+
+    // Create a new session
+    let new_session = uuid::Uuid::new_v4().to_string();
+    let agent_id = app.db.agent_id().to_owned();
+    if let Err(e) = app.db.create_session(&new_session, &agent_id, "cli").await {
+        tracing::warn!(error = %e, "failed to create new session on /clear");
+        // Continue anyway — the display clear still works
+    }
+
+    // Notify the agent worker of the new session
+    if app
+        .agent_tx
+        .send(AgentRequest::NewSession {
+            session_id: new_session.clone(),
+        })
+        .is_err()
+    {
+        return WORKER_NOT_RESPONDING.to_string();
+    }
+
+    // Update app state
+    app.session_id = new_session;
     app.messages.clear();
     app.scroll_offset = 0;
-    "Chat display cleared.".to_string()
+    app.last_seen_msg_id = 0;
+    app.context_tokens = None;
+    app.messages_layout = MessagesLayout::default();
+    app.needs_redraw = true;
+
+    "Chat cleared and session reset.".to_string()
 }
 
 async fn handle_compact(app: &mut App<'_>) -> String {
@@ -416,16 +451,8 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             if full_id == app.model {
                 return format!("Already using {display}.");
             }
-            app.model = full_id.to_string();
-            let _ = app.agent_tx.send(AgentRequest::SetModel {
-                model: full_id.to_string(),
-            });
-            app.needs_redraw = true;
 
-            // Persist to config.toml so the choice survives restarts.
-            // Write the provider-specific model key (e.g., anthropic_model).
-            let config_path = app.home_dir.join("config.toml");
-            // Parse provider/model if present to determine the right config key
+            // Parse provider/model to determine the right config key and provider for validation
             let (provider_prefix, model_name) = if let Some(slash_pos) = full_id.find('/') {
                 let prefix = &full_id[..slash_pos];
                 if prefix.parse::<mika_common::llm::ProviderKind>().is_ok() {
@@ -436,14 +463,46 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             } else {
                 ("anthropic", full_id)
             };
-            let model_key = format!("{provider_prefix}_model");
+
+            // Pre-validate: ensure the new model works with the provider
+            // Validate BEFORE persisting to avoid leaving dirty config on disk
+            let target_provider = provider_prefix
+                .parse::<mika_common::llm::ProviderKind>()
+                .unwrap_or(app.provider);
             if let Err(e) =
-                crate::commands::config::write_config_toml(&config_path, &model_key, model_name)
+                validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider)
             {
-                tracing::warn!(error = %e, "failed to persist model to config.toml");
+                return format!("Cannot switch to {display}: {e}");
             }
 
-            format!("Switched to {display} ({full_id}).")
+            // Persist to config.toml (only after validation succeeds)
+            let config_path = app.home_dir.join("config.toml");
+            let model_key = format!("{provider_prefix}_model");
+            let persist_warning = match crate::commands::config::write_config_toml(
+                &config_path,
+                &model_key,
+                model_name,
+            ) {
+                Ok(()) => String::new(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to persist model to config.toml");
+                    " (warning: failed to save — change won't survive restart)".to_string()
+                }
+            };
+
+            app.model = full_id.to_string();
+            if app
+                .agent_tx
+                .send(AgentRequest::SetModel {
+                    model: full_id.to_string(),
+                })
+                .is_err()
+            {
+                return WORKER_NOT_RESPONDING.to_string();
+            }
+            app.needs_redraw = true;
+
+            format!("Switched to {display} ({full_id}).{persist_warning}")
         }
         None => {
             let options: Vec<&str> = MODEL_ALIASES.iter().map(|&(a, _, _)| a).collect();
@@ -473,6 +532,9 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
     }
 
     // Handle subcommands: "set model <name>", "set api_key <value>", "set base_url <value>"
+    if args == "set" {
+        return "Usage: /provider set <model|api_key|base_url> <value>".to_string();
+    }
     if let Some(rest) = args.strip_prefix("set ") {
         let rest = rest.trim();
         if let Some((field, value)) = rest.split_once(' ') {
@@ -487,7 +549,11 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                     let env_key = format!("MIKA_{}_API_KEY", prefix.to_uppercase());
                     let global_home = &app.global_home;
                     match mika_common::dotenv::set_env_var(global_home, &env_key, value) {
-                        Ok(()) => return format!("Set {env_key} in .env"),
+                        Ok(()) => {
+                            return format!(
+                                "Set {env_key} in .env (restart required for changes to take effect)"
+                            );
+                        }
                         Err(e) => return format!("Error: {e}"),
                     }
                 }
@@ -502,8 +568,24 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                         } else {
                             format!("{}/{}", app.provider, value)
                         };
+
+                        // Pre-validate: load settings and try to build the provider
+                        if let Err(e) = validate_provider_switch_for(
+                            &app.home_dir,
+                            &app.global_home,
+                            app.provider,
+                        ) {
+                            return format!("Error: cannot use model {value}: {e}");
+                        }
+
                         app.model = full_id.clone();
-                        let _ = app.agent_tx.send(AgentRequest::SetModel { model: full_id });
+                        if app
+                            .agent_tx
+                            .send(AgentRequest::SetModel { model: full_id })
+                            .is_err()
+                        {
+                            return WORKER_NOT_RESPONDING.to_string();
+                        }
                         app.needs_redraw = true;
                     }
                     format!("Set {key} = \"{value}\"")
@@ -520,7 +602,14 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                 if new_provider == app.provider {
                     return format!("Already using {new_provider}.");
                 }
-                app.provider = new_provider;
+
+                // Pre-validate: load settings with the new provider and try to build it
+                let config_path = app.home_dir.join("config.toml");
+                match validate_provider_switch_for(&app.home_dir, &app.global_home, new_provider) {
+                    Ok(()) => {}
+                    Err(e) => return format!("Cannot switch to {new_provider}: {e}"),
+                }
+
                 let model = new_provider.default_model();
                 let full_id = if new_provider == ProviderKind::Anthropic {
                     model.to_string()
@@ -528,24 +617,47 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                     format!("{new_provider}/{model}")
                 };
                 app.model = full_id.clone();
-                let _ = app.agent_tx.send(AgentRequest::SetModel { model: full_id });
+                app.provider = new_provider;
+                if app
+                    .agent_tx
+                    .send(AgentRequest::SetModel { model: full_id })
+                    .is_err()
+                {
+                    return WORKER_NOT_RESPONDING.to_string();
+                }
                 app.needs_redraw = true;
 
                 // Persist provider switch to config.toml
-                let config_path = app.home_dir.join("config.toml");
-                if let Err(e) = crate::commands::config::write_config_toml(
+                let persist_warning = match crate::commands::config::write_config_toml(
                     &config_path,
                     "llm_provider",
                     &new_provider.to_string(),
                 ) {
-                    tracing::warn!(error = %e, "failed to persist provider to config.toml");
-                }
+                    Ok(()) => String::new(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to persist provider to config.toml");
+                        " (warning: failed to save — change won't survive restart)".to_string()
+                    }
+                };
 
-                format!("Switched to {new_provider} (model: {model}).")
+                format!("Switched to {new_provider} (model: {model}).{persist_warning}")
             }
             Err(e) => e,
         }
     }
+}
+
+/// Pre-validate that switching to a specific provider will work (API key present, etc.).
+fn validate_provider_switch_for(
+    home_dir: &std::path::Path,
+    global_home: &std::path::Path,
+    provider: mika_common::llm::ProviderKind,
+) -> Result<(), String> {
+    let mut settings = mika_common::config::Settings::load_for_agent(global_home, home_dir)
+        .map_err(|e| format!("failed to load settings: {e}"))?;
+    settings.llm_provider = provider;
+    settings.make_llm_provider().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 async fn handle_export(app: &mut App<'_>) -> String {
@@ -1148,6 +1260,101 @@ async fn handle_rewind_impl(
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use mika_agent::async_db::AsyncDatabase;
+    use mika_agent::db::Database;
+    use mika_agent::skills::SkillRegistry;
+    use mika_common::llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, ProviderKind};
+    use tokio::sync::mpsc;
+
+    /// Minimal no-op LLM provider for TUI handler tests.
+    /// We never call send_message in handler tests — this just satisfies the type.
+    struct NoopLlmProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoopLlmProvider {
+        async fn send_message(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            Err(LlmError::ProviderError("noop provider".to_string()))
+        }
+
+        fn model_name(&self) -> &str {
+            "noop"
+        }
+
+        fn provider_name(&self) -> &str {
+            "noop"
+        }
+
+        fn max_tokens(&self) -> u32 {
+            4096
+        }
+
+        fn supports_tool_calling(&self) -> bool {
+            false
+        }
+
+        async fn check_health(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// Test helper: construct a minimal App with captured agent_tx receiver.
+    /// Returns (App, agent_rx, temp_dir) — temp_dir must be kept alive for the test duration.
+    async fn test_app() -> (
+        App<'static>,
+        mpsc::UnboundedReceiver<AgentRequest>,
+        tempfile::TempDir,
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().to_path_buf();
+        let global_home = temp_dir.path().to_path_buf();
+
+        let db = Database::open_in_memory().unwrap();
+        let async_db = AsyncDatabase::new(db);
+
+        // Create a session for the app
+        let session_id = uuid::Uuid::new_v4().to_string();
+        async_db
+            .create_session(&session_id, "mika", "cli")
+            .await
+            .unwrap();
+
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+        let (_response_tx, response_rx) = mpsc::unbounded_channel();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(NoopLlmProvider);
+        let skills = Arc::new(SkillRegistry::empty());
+
+        let app = App::new(
+            agent_tx,
+            response_rx,
+            session_id,
+            "claude-sonnet-4-6".to_string(),
+            "Mika".to_string(),
+            async_db,
+            llm,
+            home_dir,
+            skills,
+            "mika".to_string(),
+            global_home,
+            ProviderKind::Anthropic,
+        );
+
+        (app, agent_rx, temp_dir)
+    }
+
+    /// Drain all pending requests from the agent channel.
+    fn drain_requests(rx: &mut mpsc::UnboundedReceiver<AgentRequest>) -> Vec<AgentRequest> {
+        let mut requests = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            requests.push(req);
+        }
+        requests
+    }
+
+    // --- Existing tests ---
+
     #[test]
     fn test_handle_help_contains_all_commands() {
         let output = handle_help();
@@ -1157,13 +1364,6 @@ mod tests {
         assert!(output.contains("/memory"));
         assert!(output.contains("/status"));
         assert!(output.contains("/skills"));
-    }
-
-    #[test]
-    fn test_handle_model() {
-        // We can't easily construct an App in tests, so just test the format
-        let output = format!("Current model: {}", "claude-sonnet-4-6");
-        assert!(output.contains("claude-sonnet-4-6"));
     }
 
     #[test]
@@ -1184,8 +1384,6 @@ mod tests {
 
     #[test]
     fn test_settable_config_keys_allowlist() {
-        // Validation now lives in mika_agent::config_keys (shared module).
-        // Verify we can still call the shared helpers from the CLI.
         assert!(is_settable_key("chat_id"));
         assert!(is_settable_key("timezone"));
         assert!(!is_settable_key("api_key"));
@@ -1194,7 +1392,6 @@ mod tests {
 
     #[test]
     fn test_team_mode_allowed_commands() {
-        // Verify all universal commands are in the allowlist
         for cmd in &[
             "help", "h", "?", "clear", "exit", "quit", "q", "export", "agents", "teams", "team",
             "status", "stat",
@@ -1208,7 +1405,6 @@ mod tests {
 
     #[test]
     fn test_team_mode_blocks_agent_commands() {
-        // Verify agent-specific commands are NOT in the allowlist
         for cmd in &[
             "compact", "memory", "model", "provider", "think", "soul", "config", "skills", "agent",
             "attach", "undo", "rewind",
@@ -1218,5 +1414,185 @@ mod tests {
                 "Expected '{cmd}' to be blocked in team mode"
             );
         }
+    }
+
+    // --- /clear tests ---
+
+    #[tokio::test]
+    async fn test_clear_creates_new_session() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let old_session = app.session_id.clone();
+
+        // Add a message to verify it gets cleared
+        app.messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: "hello".to_string(),
+            rendered: None,
+            channel: None,
+        });
+
+        let output = handle_clear(&mut app, "").await;
+
+        assert!(output.contains("session reset"));
+        assert_ne!(app.session_id, old_session, "session_id should change");
+        assert!(app.messages.is_empty(), "messages should be cleared");
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.last_seen_msg_id, 0);
+        assert!(app.context_tokens.is_none());
+        assert!(app.needs_redraw);
+    }
+
+    #[tokio::test]
+    async fn test_clear_sends_new_session_request() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+
+        handle_clear(&mut app, "").await;
+
+        let requests = drain_requests(&mut rx);
+        assert_eq!(requests.len(), 1, "should send exactly one request");
+        match &requests[0] {
+            AgentRequest::NewSession { session_id } => {
+                assert_eq!(
+                    session_id, &app.session_id,
+                    "session_id should match app's new session"
+                );
+            }
+            _ => panic!("expected NewSession request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_ends_old_session() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let old_session = app.session_id.clone();
+
+        handle_clear(&mut app, "").await;
+
+        // Verify old session is ended (has ended_at set)
+        let old = app.db.get_session(&old_session).await.unwrap();
+        assert!(
+            old.map(|s| s.ended_at.is_some()).unwrap_or(false),
+            "old session should have ended_at set"
+        );
+    }
+
+    // --- /model tests ---
+
+    #[test]
+    fn test_model_alias_resolves() {
+        let result = resolve_model_name("opus");
+        assert!(result.is_some());
+        let (full_id, _display) = result.unwrap();
+        assert!(full_id.contains("opus"), "should resolve to an opus model");
+    }
+
+    #[test]
+    fn test_model_unknown_returns_none() {
+        let result = resolve_model_name("nonexistent-model-xyz");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_model_no_args_shows_current() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        let output = handle_model(&mut app, "").await;
+
+        assert!(output.contains("Current model:"));
+        assert!(output.contains("claude-sonnet-4-6"));
+        assert!(output.contains("Usage: /model"));
+    }
+
+    #[tokio::test]
+    async fn test_model_unknown_returns_error() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let original_model = app.model.clone();
+
+        let output = handle_model(&mut app, "nonexistent-xyz").await;
+
+        assert!(output.contains("Unknown model"));
+        assert_eq!(
+            app.model, original_model,
+            "model should not change on error"
+        );
+    }
+
+    // --- /provider tests ---
+
+    #[tokio::test]
+    async fn test_provider_no_args_shows_list() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        let output = handle_provider(&mut app, "").await;
+
+        assert!(output.contains("Current provider:"));
+        assert!(output.contains("anthropic"));
+        assert!(output.contains("openai"));
+        assert!(output.contains("Usage: /provider"));
+    }
+
+    #[tokio::test]
+    async fn test_provider_already_using() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        let output = handle_provider(&mut app, "anthropic").await;
+
+        assert!(output.contains("Already using"));
+    }
+
+    #[tokio::test]
+    async fn test_provider_invalid_name() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        let original_provider = app.provider;
+
+        let output = handle_provider(&mut app, "nonexistent-provider").await;
+
+        // Should return an error message (from ProviderKind parse error)
+        // Should return an error, not a success
+        assert!(
+            !output.contains("Switched"),
+            "should not switch to invalid provider, got: {output}"
+        );
+        assert_eq!(
+            app.provider, original_provider,
+            "provider should not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_set_subcommand_usage() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        let output = handle_provider(&mut app, "set").await;
+
+        assert!(
+            output.contains("Usage:"),
+            "expected usage message, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_set_unknown_field() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        let output = handle_provider(&mut app, "set unknown_field value").await;
+
+        assert!(output.contains("Unknown field"));
+    }
+
+    // --- Channel send failure tests ---
+
+    #[tokio::test]
+    async fn test_clear_with_closed_channel_returns_error() {
+        let (mut app, rx, _tmp) = test_app().await;
+        // Drop the receiver to close the channel
+        drop(rx);
+
+        let output = handle_clear(&mut app, "").await;
+
+        assert!(
+            output.contains("not responding"),
+            "should report worker error: {output}"
+        );
     }
 }

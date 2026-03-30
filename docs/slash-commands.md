@@ -103,11 +103,11 @@ Example: `Available commands: /help (h, ?) -- List available commands ...`
 
 ### /clear
 
-Clear all messages from the chat display and reset the scroll position.
+Clear the chat display and start a new session.
 
 **Aliases:** None | **Arguments:** None
 
-Empties the in-memory message list and resets `scroll_offset` to 0. The underlying database conversation is not affected. A `--all` flag to also clear the database is planned but not yet implemented.
+Ends the current session, creates a new one with a fresh UUID, and notifies the agent worker. Clears all display messages, resets scroll position, context token tracking, and cross-channel polling watermarks. The agent starts fresh with no conversation history. Previous sessions remain in the database for audit and history purposes.
 
 ---
 
@@ -217,6 +217,50 @@ current model. With an argument, switches to that model immediately.
 
 Recognized shortcuts: `sonnet` = `claude-sonnet-4-6`, `opus` = `claude-opus-4-6`,
 `haiku` = `claude-haiku-4-5`. Full model IDs (e.g., `claude-sonnet-4-6`) also work.
+
+---
+
+### /provider
+
+Show or switch the active LLM provider. Supports per-field configuration for model,
+API key, and base URL.
+
+**Aliases:** None | **Arguments:** `[anthropic|openai|groq|ollama|...]` (optional)
+
+**Show current provider:**
+```
+/provider
+→ Current provider: anthropic
+
+Available providers:
+  anthropic — claude-sonnet-4-6 (current)
+  openai — gpt-4o
+  groq — llama-3.3-70b-versatile
+  ...
+```
+
+**Switch provider:**
+```
+/provider openai
+→ Switched to openai (model: gpt-4o).
+```
+
+Validates the provider configuration before switching — if the required API key is
+missing, the switch is blocked with a clear error message:
+```
+/provider openai
+→ Cannot switch to openai: Missing API key for provider openai
+```
+
+**Set provider fields:**
+```
+/provider set model gpt-4-turbo     → Set openai_model = "gpt-4-turbo"
+/provider set api_key sk-...        → Set MIKA_OPENAI_API_KEY in .env (restart required)
+/provider set base_url https://...  → Set openai_base_url = "https://..."
+```
+
+Provider switches are persisted to `config.toml`. If persistence fails, the switch
+still takes effect for the current session with a warning.
 
 ---
 
