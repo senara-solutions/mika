@@ -263,6 +263,10 @@ pub enum AgentRequest {
     SetModel {
         model: String,
     },
+    /// Session was reset (e.g., by /clear). Worker should update its session ID.
+    NewSession {
+        session_id: String,
+    },
     Quit,
 }
 
