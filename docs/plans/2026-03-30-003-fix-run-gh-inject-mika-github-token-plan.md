@@ -1,7 +1,7 @@
 ---
 title: "fix: run_gh should inject MIKA_GITHUB_TOKEN as GH_TOKEN"
 type: fix
-status: active
+status: completed
 date: 2026-03-30
 issue: "#346"
 ---
