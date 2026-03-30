@@ -60,4 +60,4 @@ When creating or labelling issues, use these labels (defined in `.github/labels.
 - Use `--json` and `--jq` for structured output when parsing results. Example: `["pr", "list", "--json", "number,title,state", "--jq", ".[] | \"\\(.number): \\(.title) [\\(.state)]\""]`
 - Use `--limit` to cap results and avoid overwhelming output. Large outputs are truncated at 10,000 characters.
 - ALWAYS confirm destructive or state-changing operations with the user before executing: merge, close, delete, create, label delete, label edit (rename).
-- If `run_gh` reports an authentication error, tell the user to run `gh auth login` or set the `GH_TOKEN` environment variable.
+- If `run_gh` reports an authentication error, tell the user to check that `MIKA_GITHUB_TOKEN` is set in `~/.mika/.env` (this is injected as `GH_TOKEN` automatically).

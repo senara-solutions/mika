@@ -129,7 +129,7 @@ MIKA_BRAVE_API_KEY=BSA...
 MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PRs, issues, context injection)
 MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...  # Investigation panel only (issue creation)
 MIKA_GITHUB_REPO=owner/repo
-GH_TOKEN=ghp_...                       # gh CLI in Claude Code agent sessions (via claude-pilot)
+# GH_TOKEN — do NOT set here; run_gh injects MIKA_GITHUB_TOKEN as GH_TOKEN automatically
 ```
 
 Run `mika setup` to interactively configure secrets (API keys, tokens) and
@@ -152,17 +152,24 @@ falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
    MIKA_GITHUB_TOKEN=ghp_your_token_here
    ```
 
-### GitHub token for `gh` CLI in agent sessions
+### GitHub token for `gh` CLI in Claude Code sessions
 
 `GH_TOKEN` is used by the `gh` CLI in Claude Code sessions spawned via claude-pilot.
 Without it, `gh` falls back to the host user's `~/.config/gh/hosts.yml` (personal account).
-This token is not prefixed with `MIKA_*`, so it survives the skill executor's env scrub
-and reaches Claude Code via `process.env` inheritance.
+This token is not prefixed with `MIKA_*`, so it survives the skill executor's env scrub.
 
-Add to `~/.mika/.env`:
-```sh
-GH_TOKEN=ghp_your_token_here
-```
+**Do NOT set `GH_TOKEN` in `~/.mika/.env`.** The `run_gh` builtin handler automatically
+injects `MIKA_GITHUB_TOKEN` as `GH_TOKEN` into `gh` child processes for platform identity
+separation. Setting `GH_TOKEN` in `.mika/.env` would collapse both identities (host and
+platform) into one, breaking the intended identity split:
+
+| Layer | Identity | Purpose |
+|-------|----------|---------|
+| Host `gh auth` / `GH_TOKEN` in shell | Developer account | Claude Code / claude-pilot: PR creation, git push |
+| `MIKA_GITHUB_TOKEN` (injected as `GH_TOKEN` by `run_gh`) | Platform account | Agent operations: QA reviews, PR comments, issue management |
+
+`GH_TOKEN` should only be set at the host level (e.g., shell profile, CI environment) for
+Claude Code sessions that need GitHub access via claude-pilot.
 
 ### GitHub issue creation (dashboard investigation)
 
