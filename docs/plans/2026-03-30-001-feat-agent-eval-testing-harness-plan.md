@@ -1,7 +1,7 @@
 ---
 title: "feat: Agent eval & testing harness"
 type: feat
-status: active
+status: completed
 date: 2026-03-30
 issue: "#329"
 ---
