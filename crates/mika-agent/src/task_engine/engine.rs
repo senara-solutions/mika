@@ -9,7 +9,9 @@ use tracing::{debug, info, warn};
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 
-use super::cron::next_fire_from_cron;
+use super::cron::{
+    extract_timezone_from_metadata, next_fire_from_cron, next_fire_from_cron_tz, parse_timezone,
+};
 use super::dispatcher::TaskDispatcher;
 use super::queue::QueuedTask;
 use super::types::{action_type, task_status, trigger_type};
@@ -114,6 +116,7 @@ impl TaskEngine {
                 task.cron_expr.as_deref(),
                 task.next_fire_at.as_deref(),
                 &now,
+                task.metadata.as_deref(),
             );
         }
 
@@ -322,6 +325,7 @@ impl TaskEngine {
                 task.cron_expr.as_deref(),
                 task.next_fire_at.as_deref(),
                 &now,
+                task.metadata.as_deref(),
             );
             added += 1;
         }
@@ -390,6 +394,7 @@ impl TaskEngine {
 
     /// Compute the fire timestamp and push a task onto the heap (used in both
     /// startup recovery and periodic scan).
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_queued_task(
         &mut self,
         task_id: &str,
@@ -398,19 +403,31 @@ impl TaskEngine {
         cron_expr: Option<&str>,
         next_fire_at: Option<&str>,
         now: &str,
+        metadata: Option<&str>,
     ) {
         if self.queued_ids.contains(task_id) {
             return;
         }
+        // Extract timezone from metadata for timezone-aware cron evaluation
+        let parsed_tz = extract_timezone_from_metadata(metadata)
+            .and_then(|tz_str| parse_timezone(&tz_str).ok());
+
         let fire_at = if trigger_type_str == trigger_type::RECURRING {
             match cron_expr {
-                Some(expr) => match next_fire_from_cron(expr, now) {
-                    Ok(ts) => ts,
-                    Err(e) => {
-                        warn!(task_id, error = %e, "failed to compute cron next fire");
-                        return;
+                Some(expr) => {
+                    let result = if let Some(ref tz) = parsed_tz {
+                        next_fire_from_cron_tz(expr, now, tz)
+                    } else {
+                        next_fire_from_cron(expr, now)
+                    };
+                    match result {
+                        Ok(ts) => ts,
+                        Err(e) => {
+                            warn!(task_id, error = %e, "failed to compute cron next fire");
+                            return;
+                        }
                     }
-                },
+                }
                 None => {
                     warn!(task_id, "recurring task missing cron_expr");
                     return;
@@ -479,12 +496,31 @@ impl TaskEngine {
             match result {
                 Ok(()) => {
                     if trigger_type_val == trigger_type::RECURRING {
+                        // Read timezone from task metadata for timezone-aware rescheduling
+                        let parsed_tz = match db.get_task(&task_id).await {
+                            Ok(Some(task)) => {
+                                extract_timezone_from_metadata(task.metadata.as_deref())
+                                    .and_then(|tz_str| parse_timezone(&tz_str).ok())
+                            }
+                            Ok(None) => None,
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "failed to read task for timezone metadata, falling back to UTC");
+                                None
+                            }
+                        };
+
                         // Recompute next fire time and re-enqueue
+                        let now_str = crate::timestamp::now();
                         let next = match cron_expr
                             .as_deref()
                             .ok_or_else(|| anyhow::anyhow!("recurring task missing cron_expr"))
-                            .and_then(|e| next_fire_from_cron(e, &crate::timestamp::now()))
-                        {
+                            .and_then(|e| {
+                                if let Some(ref tz) = parsed_tz {
+                                    next_fire_from_cron_tz(e, &now_str, tz)
+                                } else {
+                                    next_fire_from_cron(e, &now_str)
+                                }
+                            }) {
                             Ok(ts) => ts,
                             Err(e) => {
                                 warn!(task_id = %task_id, error = %e, "cannot reschedule recurring task, marking failed");

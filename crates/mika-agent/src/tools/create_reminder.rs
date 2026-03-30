@@ -1,12 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
+use chrono_tz::Tz;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::db::NewTask;
-use crate::task_engine::cron::next_fire_from_cron;
+use crate::task_engine::cron::{next_fire_from_cron, next_fire_from_cron_tz, parse_timezone};
 
 pub struct CreateReminderTool;
 
@@ -20,9 +21,9 @@ impl Tool for CreateReminderTool {
         ToolDefinition {
             name: "create_reminder".to_string(),
             description: "Schedule a reminder for the user. For one-shot reminders, \
-                provide fire_at (ISO 8601 datetime in UTC). For periodic reminders, \
-                provide cron_expr (6-field cron expression with seconds field first, \
-                e.g. '0 0 9 * * 1' for every Monday at 9am UTC). \
+                provide fire_at (local datetime) with timezone. For periodic reminders, \
+                provide cron_expr (6-field cron expression with seconds field first) with timezone. \
+                When timezone is provided, times are interpreted as local time and converted to UTC automatically. \
                 Parse the user's natural language into the appropriate format \
                 before calling this tool."
                 .to_string(),
@@ -31,7 +32,7 @@ impl Tool for CreateReminderTool {
                 "properties": {
                     "fire_at": {
                         "type": "string",
-                        "description": "ISO 8601 datetime (UTC) when the reminder should fire. Required for one-shot reminders, ignored for periodic."
+                        "description": "When the reminder should fire. With timezone: local datetime e.g. '2026-04-02T09:00:00'. Without timezone: ISO 8601 UTC e.g. '2026-04-02T01:00:00Z'. Required for one-shot reminders, ignored for periodic."
                     },
                     "message": {
                         "type": "string",
@@ -39,7 +40,11 @@ impl Tool for CreateReminderTool {
                     },
                     "cron_expr": {
                         "type": "string",
-                        "description": "6-field cron expression (seconds first) for periodic reminders. Example: '0 0 9 * * 1' = every Monday at 9am UTC, '0 0 18 * * *' = daily at 6pm UTC, '0 0 9 * * 1-5' = weekdays at 9am UTC."
+                        "description": "6-field cron expression (seconds first) for periodic reminders. When timezone is provided, the schedule is in local time. Example: '0 0 9 * * 1' = every Monday at 9am, '0 0 18 * * *' = daily at 6pm, '0 0 9 * * 1-5' = weekdays at 9am."
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone name (e.g. 'Asia/Singapore', 'America/New_York'). When provided, fire_at and cron_expr are interpreted as local time in this timezone. Use the user's configured timezone."
                     }
                 },
                 "required": ["message"]
@@ -51,6 +56,7 @@ impl Tool for CreateReminderTool {
         let fire_at = input["fire_at"].as_str().unwrap_or("");
         let message = input["message"].as_str().unwrap_or("");
         let cron_expr_input = input["cron_expr"].as_str().unwrap_or("");
+        let timezone_input = input["timezone"].as_str().unwrap_or("");
 
         if message.is_empty() {
             return Ok(ToolOutput::error("'message' is required."));
@@ -62,20 +68,42 @@ impl Tool for CreateReminderTool {
             )));
         }
 
+        // Validate timezone if provided
+        let validated_tz: Option<Tz> = if !timezone_input.is_empty() {
+            match parse_timezone(timezone_input) {
+                Ok(tz) => Some(tz),
+                Err(_) => {
+                    return Ok(ToolOutput::error(format!(
+                        "Invalid timezone '{}'. Use IANA timezone names, e.g. 'Asia/Singapore', 'America/New_York', 'Europe/London'.",
+                        timezone_input
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         // Determine scheduling mode: periodic (cron) or one-shot (fire_at)
-        let (trigger_type, cron_expr, next_fire_at, display) = if !cron_expr_input.is_empty() {
+        let (trigger_type, cron_expr, next_fire_at, display, metadata) = if !cron_expr_input
+            .is_empty()
+        {
             // Periodic reminder
             if cron_expr_input.len() > 128 {
                 return Ok(ToolOutput::error("'cron_expr' is too long."));
             }
 
             let now_str = crate::timestamp::now();
-            let next_fire = match next_fire_from_cron(cron_expr_input, &now_str) {
+            let cron_result = if let Some(ref tz) = validated_tz {
+                next_fire_from_cron_tz(cron_expr_input, &now_str, tz)
+            } else {
+                next_fire_from_cron(cron_expr_input, &now_str)
+            };
+            let next_fire = match cron_result {
                 Ok(ts) => ts,
                 Err(_) => {
                     return Ok(ToolOutput::error(
                         "Invalid cron expression. Use 6-field format (seconds first), \
-                         e.g. '0 0 9 * * 1' for every Monday at 9am UTC.",
+                             e.g. '0 0 9 * * 1' for every Monday at 9am.",
                     ));
                 }
             };
@@ -86,8 +114,12 @@ impl Tool for CreateReminderTool {
                 let next_dt = crate::timestamp::parse(&next_fire).unwrap_or(now_dt);
                 let interval = next_dt.signed_duration_since(now_dt).num_seconds();
                 if interval < 60 {
-                    // Check second interval to confirm (the first might be short due to alignment)
-                    if let Ok(second_fire) = next_fire_from_cron(cron_expr_input, &next_fire) {
+                    let second_result = if let Some(ref tz) = validated_tz {
+                        next_fire_from_cron_tz(cron_expr_input, &next_fire, tz)
+                    } else {
+                        next_fire_from_cron(cron_expr_input, &next_fire)
+                    };
+                    if let Ok(second_fire) = second_result {
                         let second_dt = crate::timestamp::parse(&second_fire).unwrap_or(next_dt);
                         let second_interval =
                             second_dt.signed_duration_since(next_dt).num_seconds();
@@ -100,11 +132,23 @@ impl Tool for CreateReminderTool {
                 }
             }
 
+            // Store timezone in metadata for recurring reminders
+            let meta = validated_tz
+                .as_ref()
+                .map(|_| serde_json::json!({"timezone": timezone_input}).to_string());
+
+            let display = if validated_tz.is_some() {
+                format!("periodic ({cron_expr_input}, {timezone_input})")
+            } else {
+                format!("periodic ({cron_expr_input})")
+            };
+
             (
                 "recurring",
                 Some(cron_expr_input.to_string()),
                 next_fire,
-                format!("periodic ({cron_expr_input})"),
+                display,
+                meta,
             )
         } else {
             // One-shot reminder
@@ -117,22 +161,70 @@ impl Tool for CreateReminderTool {
                 return Ok(ToolOutput::error("'fire_at' is too long."));
             }
 
-            let parsed = match chrono::DateTime::parse_from_rfc3339(fire_at) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(_) => {
-                    return Ok(ToolOutput::error(
-                        "Invalid ISO 8601 datetime. Use format like '2026-02-25T15:00:00Z'.",
-                    ));
+            let (parsed_utc, display_time) = if let Some(tz) = validated_tz {
+                // Timezone provided — interpret fire_at as local time
+                match NaiveDateTime::parse_from_str(fire_at, "%Y-%m-%dT%H:%M:%S") {
+                    Ok(naive) => {
+                        let local_dt = match naive.and_local_timezone(tz) {
+                            chrono::LocalResult::Single(dt) => dt,
+                            chrono::LocalResult::Ambiguous(dt, _) => dt, // Use earlier offset
+                            chrono::LocalResult::None => {
+                                return Ok(ToolOutput::error(
+                                    "The specified local time does not exist in this timezone (likely a DST gap). Try a time 1 hour later.",
+                                ));
+                            }
+                        };
+                        let utc_dt = local_dt.with_timezone(&Utc);
+                        let display = format!(
+                            "{} {} ({})",
+                            naive.format("%Y-%m-%d %H:%M:%S"),
+                            timezone_input,
+                            utc_dt.format("%Y-%m-%d %H:%M:%S UTC")
+                        );
+                        (utc_dt, display)
+                    }
+                    Err(_) => {
+                        // fire_at wasn't a naive datetime — check if it's offset-aware
+                        match chrono::DateTime::parse_from_rfc3339(fire_at) {
+                            Ok(_) => {
+                                // Conflict: user provided both timezone and offset-aware fire_at
+                                return Ok(ToolOutput::error(
+                                    "Conflicting timezone info: 'fire_at' already includes a UTC offset (e.g. 'Z' or '+08:00'), \
+                                     but 'timezone' was also provided. Either remove the 'timezone' parameter, \
+                                     or use a local datetime format like '2026-04-02T09:00:00' with 'timezone'.",
+                                ));
+                            }
+                            Err(_) => {
+                                return Ok(ToolOutput::error(
+                                    "Invalid datetime. With timezone, use local format like '2026-04-02T09:00:00'. \
+                                     Without timezone, use ISO 8601 UTC like '2026-04-02T01:00:00Z'.",
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No timezone — expect UTC (backward compatible)
+                match chrono::DateTime::parse_from_rfc3339(fire_at) {
+                    Ok(dt) => {
+                        let utc_dt = dt.with_timezone(&Utc);
+                        let display = utc_dt.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+                        (utc_dt, display)
+                    }
+                    Err(_) => {
+                        return Ok(ToolOutput::error(
+                            "Invalid ISO 8601 datetime. Use format like '2026-02-25T15:00:00Z', or provide a timezone parameter to use local time.",
+                        ));
+                    }
                 }
             };
 
-            if parsed <= Utc::now() {
+            if parsed_utc <= Utc::now() {
                 return Ok(ToolOutput::error("Reminder time must be in the future."));
             }
 
-            let timestamp = crate::timestamp::format(&parsed);
-            let display_time = parsed.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-            ("time", None, timestamp, display_time)
+            let timestamp = crate::timestamp::format(&parsed_utc);
+            ("time", None, timestamp, display_time, None)
         };
 
         let action_config = serde_json::json!({"text": message}).to_string();
@@ -156,7 +248,7 @@ impl Tool for CreateReminderTool {
             created_trace_id: Some(ctx.trace_id.to_string()),
             reference_url: None,
             source: None,
-            metadata: None,
+            metadata,
         };
 
         let id = match ctx.db.create_task(task).await {
@@ -500,5 +592,161 @@ mod tests {
 
         let tasks = harness.db.get_user_visible_tasks().await.unwrap();
         assert_eq!(tasks[0].trigger_type, "recurring");
+    }
+
+    // --- Timezone parameter tests ---
+
+    #[tokio::test]
+    async fn test_create_reminder_with_timezone_local_time() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // 2099-12-31 09:00 Asia/Singapore = 2099-12-31T01:00:00Z
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T09:00:00",
+                    "message": "Local time reminder",
+                    "timezone": "Asia/Singapore"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("scheduled"));
+        assert!(result.content.contains("Asia/Singapore"));
+
+        let tasks = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        // Stored as UTC
+        assert_eq!(
+            tasks[0].next_fire_at.as_deref(),
+            Some("2099-12-31T01:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_utc_backward_compat() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // UTC with Z suffix, no timezone — backward compatible
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "UTC reminder"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("scheduled"));
+        assert!(result.content.contains("UTC"));
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_invalid_timezone() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T09:00:00",
+                    "message": "Bad tz",
+                    "timezone": "Not/A/Timezone"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Invalid timezone"));
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_timezone_with_rfc3339_fallback() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // Providing both timezone and offset-aware fire_at should error
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Offset takes precedence",
+                    "timezone": "Asia/Singapore"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "expected error for conflicting timezone info"
+        );
+        assert!(
+            result.content.contains("Conflicting timezone info"),
+            "error should mention conflict: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_recurring_reminder_with_timezone() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // Recurring: "every day at 9am" in Asia/Singapore
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "cron_expr": "0 0 9 * * *",
+                    "message": "Daily 9am SGT",
+                    "timezone": "Asia/Singapore"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Periodic reminder"));
+        assert!(result.content.contains("Asia/Singapore"));
+
+        // Check metadata stores timezone
+        let tasks = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        let meta = tasks[0].metadata.as_ref().expect("metadata should exist");
+        let meta_json: serde_json::Value = serde_json::from_str(meta).unwrap();
+        assert_eq!(meta_json["timezone"], "Asia/Singapore");
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_naive_without_timezone_rejected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // Naive datetime without timezone should be rejected
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T09:00:00",
+                    "message": "No tz"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Invalid ISO 8601"));
     }
 }

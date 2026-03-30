@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::db::format_ts;
+use crate::task_engine::cron::{extract_timezone_from_metadata, parse_timezone};
 
 pub struct ListRemindersTool;
 
@@ -35,18 +36,40 @@ impl Tool for ListRemindersTool {
 
         let mut output = String::from("Active reminders:\n");
         for t in &tasks {
-            let fire_at = t
+            // Extract timezone from metadata if available
+            let tz_name = extract_timezone_from_metadata(t.metadata.as_deref());
+
+            let fire_at_display = t
                 .next_fire_at
                 .as_ref()
-                .map(|s| format_ts(s))
+                .map(|s| {
+                    // If timezone is available, show local time
+                    if let Some(ref tz_str) = tz_name
+                        && let Ok(tz) = parse_timezone(tz_str)
+                        && let Ok(utc_dt) = crate::timestamp::parse(s)
+                    {
+                        let local_dt = utc_dt.with_timezone(&tz);
+                        return format!("{} {}", local_dt.format("%Y-%m-%d %H:%M:%S"), tz_str);
+                    }
+                    // Fallback to UTC display
+                    format!("{} UTC", format_ts(s))
+                })
                 .unwrap_or_else(|| "unknown".to_string());
+
             if let Some(ref cron) = t.cron_expr {
+                let tz_label = tz_name
+                    .as_deref()
+                    .map(|tz| format!(", tz: {tz}"))
+                    .unwrap_or_default();
                 output.push_str(&format!(
-                    "- {}: \"{}\" next: {} (recurring: {})\n",
-                    t.id, t.label, fire_at, cron
+                    "- {}: \"{}\" next: {} (recurring: {}{})\n",
+                    t.id, t.label, fire_at_display, cron, tz_label
                 ));
             } else {
-                output.push_str(&format!("- {}: \"{}\" at {}\n", t.id, t.label, fire_at));
+                output.push_str(&format!(
+                    "- {}: \"{}\" at {}\n",
+                    t.id, t.label, fire_at_display
+                ));
             }
         }
 
