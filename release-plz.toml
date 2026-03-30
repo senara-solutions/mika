@@ -26,6 +26,13 @@ git_release_enable = false
 git_tag_enable = false
 
 [[package]]
+name = "mika-a2a"
+publish = true
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
 name = "mika-gateway"
 publish = false
 release = false
