@@ -1,11 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono_tz::Tz;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::db::format_ts;
+use crate::task_engine::cron::{extract_timezone_from_metadata, parse_timezone};
 
 pub struct ListRemindersTool;
 
@@ -37,11 +37,7 @@ impl Tool for ListRemindersTool {
         let mut output = String::from("Active reminders:\n");
         for t in &tasks {
             // Extract timezone from metadata if available
-            let tz_name = t.metadata.as_ref().and_then(|m| {
-                serde_json::from_str::<serde_json::Value>(m)
-                    .ok()
-                    .and_then(|v| v["timezone"].as_str().map(String::from))
-            });
+            let tz_name = extract_timezone_from_metadata(t.metadata.as_deref());
 
             let fire_at_display = t
                 .next_fire_at
@@ -49,7 +45,7 @@ impl Tool for ListRemindersTool {
                 .map(|s| {
                     // If timezone is available, show local time
                     if let Some(ref tz_str) = tz_name
-                        && let Ok(tz) = tz_str.parse::<Tz>()
+                        && let Ok(tz) = parse_timezone(tz_str)
                         && let Ok(utc_dt) = crate::timestamp::parse(s)
                     {
                         let local_dt = utc_dt.with_timezone(&tz);

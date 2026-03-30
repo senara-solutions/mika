@@ -9,7 +9,9 @@ use tracing::{debug, info, warn};
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 
-use super::cron::{next_fire_from_cron, next_fire_from_cron_tz};
+use super::cron::{
+    extract_timezone_from_metadata, next_fire_from_cron, next_fire_from_cron_tz, parse_timezone,
+};
 use super::dispatcher::TaskDispatcher;
 use super::queue::QueuedTask;
 use super::types::{action_type, task_status, trigger_type};
@@ -407,16 +409,13 @@ impl TaskEngine {
             return;
         }
         // Extract timezone from metadata for timezone-aware cron evaluation
-        let tz_from_meta = metadata.and_then(|m| {
-            serde_json::from_str::<serde_json::Value>(m)
-                .ok()
-                .and_then(|v| v["timezone"].as_str().map(String::from))
-        });
+        let parsed_tz = extract_timezone_from_metadata(metadata)
+            .and_then(|tz_str| parse_timezone(&tz_str).ok());
 
         let fire_at = if trigger_type_str == trigger_type::RECURRING {
             match cron_expr {
                 Some(expr) => {
-                    let result = if let Some(ref tz) = tz_from_meta {
+                    let result = if let Some(ref tz) = parsed_tz {
                         next_fire_from_cron_tz(expr, now, tz)
                     } else {
                         next_fire_from_cron(expr, now)
@@ -498,12 +497,11 @@ impl TaskEngine {
                 Ok(()) => {
                     if trigger_type_val == trigger_type::RECURRING {
                         // Read timezone from task metadata for timezone-aware rescheduling
-                        let tz_from_meta = match db.get_task(&task_id).await {
-                            Ok(Some(task)) => task.metadata.and_then(|m| {
-                                serde_json::from_str::<serde_json::Value>(&m)
-                                    .ok()
-                                    .and_then(|v| v["timezone"].as_str().map(String::from))
-                            }),
+                        let parsed_tz = match db.get_task(&task_id).await {
+                            Ok(Some(task)) => {
+                                extract_timezone_from_metadata(task.metadata.as_deref())
+                                    .and_then(|tz_str| parse_timezone(&tz_str).ok())
+                            }
                             _ => None,
                         };
 
@@ -513,7 +511,7 @@ impl TaskEngine {
                             .as_deref()
                             .ok_or_else(|| anyhow::anyhow!("recurring task missing cron_expr"))
                             .and_then(|e| {
-                                if let Some(ref tz) = tz_from_meta {
+                                if let Some(ref tz) = parsed_tz {
                                     next_fire_from_cron_tz(e, &now_str, tz)
                                 } else {
                                     next_fire_from_cron(e, &now_str)

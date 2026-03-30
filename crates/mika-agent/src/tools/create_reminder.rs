@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::db::NewTask;
-use crate::task_engine::cron::{next_fire_from_cron, next_fire_from_cron_tz};
+use crate::task_engine::cron::{next_fire_from_cron, next_fire_from_cron_tz, parse_timezone};
 
 pub struct CreateReminderTool;
 
@@ -70,7 +70,7 @@ impl Tool for CreateReminderTool {
 
         // Validate timezone if provided
         let validated_tz: Option<Tz> = if !timezone_input.is_empty() {
-            match timezone_input.parse::<Tz>() {
+            match parse_timezone(timezone_input) {
                 Ok(tz) => Some(tz),
                 Err(_) => {
                     return Ok(ToolOutput::error(format!(
@@ -93,25 +93,18 @@ impl Tool for CreateReminderTool {
             }
 
             let now_str = crate::timestamp::now();
-            let next_fire = if validated_tz.is_some() {
-                match next_fire_from_cron_tz(cron_expr_input, &now_str, timezone_input) {
-                    Ok(ts) => ts,
-                    Err(_) => {
-                        return Ok(ToolOutput::error(
-                            "Invalid cron expression. Use 6-field format (seconds first), \
-                                 e.g. '0 0 9 * * 1' for every Monday at 9am.",
-                        ));
-                    }
-                }
+            let cron_result = if let Some(ref tz) = validated_tz {
+                next_fire_from_cron_tz(cron_expr_input, &now_str, tz)
             } else {
-                match next_fire_from_cron(cron_expr_input, &now_str) {
-                    Ok(ts) => ts,
-                    Err(_) => {
-                        return Ok(ToolOutput::error(
-                            "Invalid cron expression. Use 6-field format (seconds first), \
-                                 e.g. '0 0 9 * * 1' for every Monday at 9am UTC.",
-                        ));
-                    }
+                next_fire_from_cron(cron_expr_input, &now_str)
+            };
+            let next_fire = match cron_result {
+                Ok(ts) => ts,
+                Err(_) => {
+                    return Ok(ToolOutput::error(
+                        "Invalid cron expression. Use 6-field format (seconds first), \
+                             e.g. '0 0 9 * * 1' for every Monday at 9am.",
+                    ));
                 }
             };
 
@@ -121,9 +114,8 @@ impl Tool for CreateReminderTool {
                 let next_dt = crate::timestamp::parse(&next_fire).unwrap_or(now_dt);
                 let interval = next_dt.signed_duration_since(now_dt).num_seconds();
                 if interval < 60 {
-                    // Check second interval to confirm (the first might be short due to alignment)
-                    let second_result = if validated_tz.is_some() {
-                        next_fire_from_cron_tz(cron_expr_input, &next_fire, timezone_input)
+                    let second_result = if let Some(ref tz) = validated_tz {
+                        next_fire_from_cron_tz(cron_expr_input, &next_fire, tz)
                     } else {
                         next_fire_from_cron(cron_expr_input, &next_fire)
                     };
@@ -141,8 +133,9 @@ impl Tool for CreateReminderTool {
             }
 
             // Store timezone in metadata for recurring reminders
-            let meta =
-                validated_tz.map(|_| serde_json::json!({"timezone": timezone_input}).to_string());
+            let meta = validated_tz
+                .as_ref()
+                .map(|_| serde_json::json!({"timezone": timezone_input}).to_string());
 
             let display = if validated_tz.is_some() {
                 format!("periodic ({cron_expr_input}, {timezone_input})")
