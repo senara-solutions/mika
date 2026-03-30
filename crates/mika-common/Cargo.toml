@@ -38,6 +38,7 @@ regex.workspace = true
 
 [features]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+test-utils = []
 
 [dependencies.opentelemetry]
 workspace = true

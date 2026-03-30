@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod error;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock;
 pub mod openai;
 pub mod types;
 
