@@ -390,7 +390,11 @@ Core memory tracks key people briefly — the people table is the full record.\n
     );
     prompt.push_str("- Mark commitments as completed or cancelled using the update_fact tool.\n");
     prompt.push_str(
-        "- You can create reminders with create_reminder: one-shot (fire_at in ISO 8601 UTC) or periodic (cron_expr, 6-field cron with seconds first, e.g. '0 0 9 * * 1' for every Monday 9am UTC).\n",
+        "- When creating reminders, ALWAYS pass the user's local time and their timezone:\n  \
+         - One-shot: fire_at in the user's local time (e.g. '2026-04-02T09:00:00'), timezone from the User timezone shown above (e.g. 'Asia/Singapore')\n  \
+         - Periodic: cron_expr in the user's local time (e.g. '0 0 9 * * 1' for Monday 9am local), timezone from the User timezone shown above\n  \
+         - If no User timezone is shown above, use UTC (fire_at with Z suffix, no timezone parameter)\n  \
+         - The tool handles UTC conversion automatically — do NOT convert times yourself\n",
     );
     prompt
         .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
@@ -1000,7 +1004,8 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Current Time"));
         assert!(prompt.contains("UTC: 2026-02-24T12:00:00Z"));
-        assert!(!prompt.contains("User timezone"));
+        // Timezone value should not be in the time section when not configured
+        assert!(!prompt.contains("User timezone: "));
     }
 
     #[test]
@@ -1046,7 +1051,7 @@ mod tests {
         // Builtin tool instructions are always in the base prompt
         assert!(prompt.contains("## Tool Usage"));
         assert!(prompt.contains("search_memory"));
-        assert!(prompt.contains("create_reminder"));
+        assert!(prompt.contains("creating reminders"));
         assert!(prompt.contains("update_fact"));
         // Base instruction also present
         assert!(prompt.contains("Never fabricate information"));
