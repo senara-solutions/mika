@@ -78,6 +78,26 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+  docs-sync:
+    name: Docs Sync
+    runs-on: ubuntu-22.04
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       !startsWith(github.head_ref, 'release-plz-'))
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Check crate-local docs are in sync
+        run: |
+          bash scripts/sync-agent-docs.sh
+          if ! git diff --exit-code crates/mika-agent/docs/; then
+            echo ""
+            echo "::error::Crate-local docs are out of sync with docs/"
+            echo "Run: bash scripts/sync-agent-docs.sh"
+            echo "Then commit the updated files in crates/mika-agent/docs/"
+            exit 1
+          fi
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04
