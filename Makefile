@@ -62,6 +62,7 @@ install: ## Copy release binaries to INSTALL_DIR
 			exit 1; \
 		fi; \
 		cp target/release/$$bin $(INSTALL_DIR)/$$bin; \
+		if [ "$$(uname)" = "Darwin" ]; then codesign -s - $(INSTALL_DIR)/$$bin; fi; \
 		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
 	done
 
