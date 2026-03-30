@@ -1,7 +1,7 @@
 ---
 title: "fix: Fail loudly when always_on skill prompt exceeds size limit"
 type: fix
-status: active
+status: completed
 date: 2026-03-30
 ---
 
