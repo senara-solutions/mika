@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+// Keep in sync with scripts/sync-agent-docs.sh DOCS array.
+// CI enforces this via the docs-sync job in .github/workflows/ci.yml.
 const DOCS: &[&str] = &[
     "architecture.md",
     "browser-control.md",

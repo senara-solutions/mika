@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Sync workspace-root docs to crate-local fallback copies for crates.io publishing.
 # Run before `cargo publish -p mika-agent`.
+# Keep DOCS list in sync with crates/mika-agent/build.rs DOCS constant.
+# CI enforces this via the docs-sync job in .github/workflows/ci.yml.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,6 +19,7 @@ DOCS=(
     runtime-structure.md
     skills.md
     slash-commands.md
+    task-system.md
 )
 
 for doc in "${DOCS[@]}"; do
