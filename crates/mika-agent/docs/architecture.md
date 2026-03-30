@@ -197,8 +197,8 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `store_fact` | Store a new structured fact (person, commitment, preference, or event) into Layer 2 tables. | Memory |
 | `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events). | Memory |
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
-| `create_reminder` | Schedule a one-shot reminder (`fire_at` ISO 8601 UTC) or periodic reminder (`cron_expr` 6-field cron with seconds first, e.g. `0 0 9 * * 1`). Minimum interval: 1 minute. Outputs full UUID. | Reminders |
-| `list_reminders` | List pending and future reminders. Shows cron expression for periodic reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
+| `create_reminder` | Schedule a one-shot reminder (`fire_at`) or periodic reminder (`cron_expr` 6-field cron with seconds first, e.g. `0 0 9 * * 1`). Optional `timezone` parameter (IANA name, e.g. `Asia/Singapore`) — when provided, `fire_at` and `cron_expr` are interpreted as local time and converted to UTC automatically. Without `timezone`, `fire_at` must be ISO 8601 UTC. Timezone stored in task `metadata` for recurring reminders so rescheduling respects DST. Minimum interval: 1 minute. Outputs full UUID. | Reminders |
+| `list_reminders` | List pending and future reminders. Shows local time when timezone metadata is available, UTC otherwise. Shows cron expression and timezone for periodic reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
 | `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
 | `list_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
 | `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
@@ -479,6 +479,7 @@ Source: `crates/mika-agent/src/task_engine/`
 | `engine.rs` | `TaskEngine` — min-heap `BinaryHeap<QueuedTask>` + 1-second tick loop |
 | `dispatcher.rs` | `TaskDispatcher` — matches `action_type` and executes tasks |
 | `queue.rs` | `QueuedTask` — heap entry with `next_fire_at` for ordering |
+| `cron.rs` | `next_fire_from_cron()` (UTC) and `next_fire_from_cron_tz()` (timezone-aware, accepts `&Tz`). Shared helpers: `extract_timezone_from_metadata()`, `parse_timezone()` |
 | `types.rs` | Constants: `task_status::*`, `action_type::*`, `trigger_type::*` (no magic strings) |
 | `mod.rs` | `ensure_recurring_task()` — idempotently registers built-in tasks at startup |
 
