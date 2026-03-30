@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.3.0](https://github.com/senara-solutions/mika/releases/tag/v0.3.0) — 2026-03-30
+
+### Fixed
+
+- deprecate MIKA_LLM_API_KEY and fix OAuth setup env var mismatch
+
 ## [0.2.0](https://github.com/senara-solutions/mika/releases/tag/v0.2.0) — 2026-03-25
 
 ### Added
