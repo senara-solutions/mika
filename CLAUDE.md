@@ -139,7 +139,7 @@ Optional (GitHub — investigation panel):
 - `MIKA_GITHUB_REPO` — Target repository in `owner/repo` format (e.g. `senara-solutions/mika`). Both `MIKA_INVESTIGATE_GITHUB_TOKEN` and this must be set to enable the `create_github_issue` investigation tool.
 
 Optional (gh CLI in agent sessions):
-- `GH_TOKEN` — GitHub PAT for `gh` CLI in Claude Code sessions spawned via claude-pilot. Not `MIKA_*`-prefixed so it survives env scrubbing. Without this, `gh` falls back to the host user's personal `~/.config/gh/hosts.yml`.
+- `GH_TOKEN` — GitHub PAT for `gh` CLI in Claude Code sessions spawned via claude-pilot. Not `MIKA_*`-prefixed so it survives env scrubbing. Without this, `gh` falls back to the host user's personal `~/.config/gh/hosts.yml`. Do NOT set in `~/.mika/.env` — agent `run_gh` operations inject `MIKA_GITHUB_TOKEN` as `GH_TOKEN` automatically for platform identity separation.
 
 Server mode additionally requires:
 - `MIKA_ROUTING_URL` — Gateway URL for outbound message delivery

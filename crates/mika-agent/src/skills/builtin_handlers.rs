@@ -810,7 +810,7 @@ fn validate_gh_input(input: &serde_json::Value) -> Result<GhArgs, ToolOutput> {
 ///
 /// Unlike the old shell-script handler, arguments are passed as an array to avoid
 /// shell word-splitting issues with quoted multi-word values.
-async fn run_gh(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput {
+async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
     let gh_args = match validate_gh_input(input) {
         Ok(args) => args,
         Err(err) => return err,
@@ -821,6 +821,12 @@ async fn run_gh(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput
 
     if let Some(ref repo) = gh_args.repo {
         cmd.arg("--repo").arg(repo);
+    }
+
+    // Inject platform GitHub token for agent identity separation.
+    // GH_TOKEN is not MIKA_*-prefixed, so it survives scrub_mika_env_vars.
+    if let Some(token) = ctx.github_token {
+        cmd.env("GH_TOKEN", token);
     }
 
     cmd.env("GH_PROMPT_DISABLED", "1");
