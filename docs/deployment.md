@@ -248,6 +248,18 @@ SQLite databases are stored as plaintext on encrypted volumes. Mika does not imp
 docker logs mika-<uuid> --tail 100
 ```
 
+### Agent Offline
+
+**Symptom:** User receives "Your Mika assistant is currently offline. Please contact your administrator or check your subscription status at console.getmika.ai."
+
+**Cause:** The gateway could not establish a TCP connection to the agent container. This happens when the container is scaled to zero, deprovisioned, or the DNS name does not resolve (e.g., pod not yet scheduled).
+
+**Resolution:**
+- Verify the agent pod is running: `kubectl get pods -n <agents-namespace> -l app=mika-<customer-id>`
+- Check if the Service exists: `kubectl get svc mika-<customer-id> -n <agents-namespace>`
+- If the container was intentionally scaled down, scale it back up
+- For DNS failures, verify the namespace matches `MIKA_AGENTS_NAMESPACE`
+
 ### Container Crash Loop
 
 **Symptom:** Customer container restarts repeatedly.

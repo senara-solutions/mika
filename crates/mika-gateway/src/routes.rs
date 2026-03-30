@@ -358,8 +358,10 @@ async fn handle_forward_result(
         }
         Err(e) => {
             reset_dedup(state, customer_id, update_id).await;
-            warn!(error = %e, %customer_id, "container unreachable for {msg_kind}, dedup reset");
-            reply_transient_error(&state.telegram, chat_id).await;
+            let is_connect = e.is_connect();
+            warn!(error = %e, %customer_id, is_connect, "container unreachable for {msg_kind}, dedup reset");
+            let msg = forward_error_message(is_connect);
+            let _ = state.telegram.send_message(chat_id, msg).await;
         }
     }
 }
@@ -885,6 +887,19 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+/// Classify a forwarding error into a user-facing reply message.
+/// Connect errors (connection refused, DNS failure) indicate the agent is offline.
+/// Other errors (timeout, broken pipe) are transient.
+fn forward_error_message(is_connect: bool) -> &'static str {
+    if is_connect {
+        "Your Mika assistant is currently offline. \
+         Please contact your administrator or check your subscription status \
+         at console.getmika.ai."
+    } else {
+        "I'm having trouble right now. Please try again in a moment."
+    }
+}
+
 /// Send a generic transient error reply (fire-and-forget).
 async fn reply_transient_error(telegram: &TelegramClient, chat_id: i64) {
     let _ = telegram
@@ -1073,5 +1088,31 @@ mod tests {
     fn test_container_url_str_base_url_overrides() {
         let url = container_url_str("abc-123", Some("http://localhost:9090"), "mika-agents");
         assert_eq!(url, "http://localhost:9090");
+    }
+
+    #[test]
+    fn test_forward_error_message_connect() {
+        let msg = forward_error_message(true);
+        assert!(
+            msg.contains("offline"),
+            "connect errors should mention offline"
+        );
+        assert!(
+            msg.contains("console.getmika.ai"),
+            "should include console URL"
+        );
+    }
+
+    #[test]
+    fn test_forward_error_message_other() {
+        let msg = forward_error_message(false);
+        assert!(
+            msg.contains("try again"),
+            "non-connect errors should suggest retry"
+        );
+        assert!(
+            !msg.contains("offline"),
+            "non-connect errors should not mention offline"
+        );
     }
 }
