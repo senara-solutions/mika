@@ -35,7 +35,11 @@ Before running the pipeline, set up an isolated worktree:
 6. `/mika-doc-audit`
 7. `/ce:compound`
 8. Run `bash scripts/verify-pipeline.sh` to verify pipeline artifacts exist. If it fails, read the error messages to identify missing artifacts, go back and produce them (run `/ce:plan` if no plan doc, `/ce:work` if no source changes), then re-run verification until it passes.
-9. Create a PR if one doesn't already exist. If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
+9. Create a PR if one doesn't already exist:
+   ```
+   gh pr create --assignee samidarko --reviewer mika-platform --title "<title>" --body "<body>"
+   ```
+   If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
 
 ## Cleanup
 
