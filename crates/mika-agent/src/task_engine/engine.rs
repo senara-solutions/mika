@@ -502,7 +502,11 @@ impl TaskEngine {
                                 extract_timezone_from_metadata(task.metadata.as_deref())
                                     .and_then(|tz_str| parse_timezone(&tz_str).ok())
                             }
-                            _ => None,
+                            Ok(None) => None,
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "failed to read task for timezone metadata, falling back to UTC");
+                                None
+                            }
                         };
 
                         // Recompute next fire time and re-enqueue

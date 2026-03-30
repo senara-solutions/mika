@@ -184,16 +184,20 @@ impl Tool for CreateReminderTool {
                         (utc_dt, display)
                     }
                     Err(_) => {
-                        // Fall through to RFC 3339 parsing (user might have passed offset-aware string)
+                        // fire_at wasn't a naive datetime — check if it's offset-aware
                         match chrono::DateTime::parse_from_rfc3339(fire_at) {
-                            Ok(dt) => {
-                                let utc_dt = dt.with_timezone(&Utc);
-                                let display = format!("{} UTC", utc_dt.format("%Y-%m-%d %H:%M:%S"));
-                                (utc_dt, display)
+                            Ok(_) => {
+                                // Conflict: user provided both timezone and offset-aware fire_at
+                                return Ok(ToolOutput::error(
+                                    "Conflicting timezone info: 'fire_at' already includes a UTC offset (e.g. 'Z' or '+08:00'), \
+                                     but 'timezone' was also provided. Either remove the 'timezone' parameter, \
+                                     or use a local datetime format like '2026-04-02T09:00:00' with 'timezone'.",
+                                ));
                             }
                             Err(_) => {
                                 return Ok(ToolOutput::error(
-                                    "Invalid datetime. With timezone, use local format like '2026-04-02T09:00:00'. Without timezone, use ISO 8601 UTC like '2026-04-02T01:00:00Z'.",
+                                    "Invalid datetime. With timezone, use local format like '2026-04-02T09:00:00'. \
+                                     Without timezone, use ISO 8601 UTC like '2026-04-02T01:00:00Z'.",
                                 ));
                             }
                         }
@@ -672,7 +676,7 @@ mod tests {
         let ctx = harness.ctx();
         let tool = CreateReminderTool;
 
-        // Even with timezone provided, if fire_at has offset, use the offset
+        // Providing both timezone and offset-aware fire_at should error
         let result = tool
             .execute(
                 serde_json::json!({
@@ -684,8 +688,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "got error: {}", result.content);
-        assert!(result.content.contains("scheduled"));
+        assert!(
+            result.is_error,
+            "expected error for conflicting timezone info"
+        );
+        assert!(
+            result.content.contains("Conflicting timezone info"),
+            "error should mention conflict: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
