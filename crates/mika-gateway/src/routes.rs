@@ -887,27 +887,28 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+/// User-facing message for transient errors (timeout, broken pipe, etc.).
+const TRANSIENT_ERROR_MSG: &str = "I'm having trouble right now. Please try again in a moment.";
+
+/// User-facing message when the agent container is unreachable (connection refused, DNS failure).
+const OFFLINE_ERROR_MSG: &str = "Your Mika assistant is currently offline. \
+     Please contact your administrator or check your subscription status \
+     at console.getmika.ai.";
+
 /// Classify a forwarding error into a user-facing reply message.
 /// Connect errors (connection refused, DNS failure) indicate the agent is offline.
 /// Other errors (timeout, broken pipe) are transient.
 fn forward_error_message(is_connect: bool) -> &'static str {
     if is_connect {
-        "Your Mika assistant is currently offline. \
-         Please contact your administrator or check your subscription status \
-         at console.getmika.ai."
+        OFFLINE_ERROR_MSG
     } else {
-        "I'm having trouble right now. Please try again in a moment."
+        TRANSIENT_ERROR_MSG
     }
 }
 
 /// Send a generic transient error reply (fire-and-forget).
 async fn reply_transient_error(telegram: &TelegramClient, chat_id: i64) {
-    let _ = telegram
-        .send_message(
-            chat_id,
-            "I'm having trouble right now. Please try again in a moment.",
-        )
-        .await;
+    let _ = telegram.send_message(chat_id, TRANSIENT_ERROR_MSG).await;
 }
 
 // -- DB row types (for sqlx runtime queries) --
