@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::Timelike;
+use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::LlmProvider;
 use std::path::PathBuf;
@@ -48,6 +49,10 @@ pub struct TaskDispatcher {
     /// CLI/TUI mode handles callbacks via `poll_callback_tasks()` instead,
     /// preventing a race where the engine steals callbacks from the TUI.
     pub cli_mode: bool,
+    /// Per-agent settings for constructing per-skill LLM overrides in silent mode.
+    /// Passed as `settings: Some(&self.settings)` to all `SilentAgentParams` constructions.
+    /// See #323.
+    pub settings: Settings,
 }
 
 impl TaskDispatcher {
@@ -242,7 +247,7 @@ impl TaskDispatcher {
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
-            settings: None,
+            settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
         };
 
@@ -330,7 +335,7 @@ impl TaskDispatcher {
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
-            settings: None,
+            settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
         };
 
@@ -510,7 +515,7 @@ impl TaskDispatcher {
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
-            settings: None,
+            settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
         };
 
@@ -650,7 +655,7 @@ impl TaskDispatcher {
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             skills_dirty: &self.skills_dirty,
-            settings: None,
+            settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
         };
 
@@ -757,6 +762,8 @@ mod tests {
     }
 
     fn test_dispatcher(db: AsyncDatabase) -> TaskDispatcher {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
         TaskDispatcher {
             db,
             llm: mika_common::llm::dummy_provider(),
@@ -770,6 +777,7 @@ mod tests {
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
             cli_mode: false,
+            settings,
         }
     }
 

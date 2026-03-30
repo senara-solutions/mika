@@ -222,7 +222,7 @@ pub async fn handle_message(
 
             let params = AgentParams {
                 db: &a.db,
-                llm: s.llm.as_ref(),
+                llm: a.llm.as_ref(),
                 tools: &s.tools,
                 skills: &skills,
                 user_message: &req.text,
@@ -241,7 +241,7 @@ pub async fn handle_message(
                 mcp_manager: a.mcp_manager.as_ref(),
                 global_home_dir: Some(&s.global_home_dir),
                 is_callback_turn: false,
-                settings: Some(&s.settings),
+                settings: Some(&a.settings),
                 trace_id: Some(req.request_id.clone()),
             };
 
@@ -270,7 +270,7 @@ pub async fn handle_message(
             // Spawn compaction outside the lock
             drop(_lock);
             let db = a.db.clone();
-            let llm = s.llm.clone();
+            let llm = a.llm.clone();
             tokio::spawn(
                 async move {
                     if let Err(e) = compaction::maybe_compact(&db, llm.as_ref()).await {

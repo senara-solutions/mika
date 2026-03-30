@@ -136,7 +136,7 @@ async fn run_a2a_agent(
 
     let params = AgentParams {
         db: &agent_state.db,
-        llm: state.llm.as_ref(),
+        llm: agent_state.llm.as_ref(),
         tools: &state.tools,
         skills: &skills,
         user_message: input_text,
@@ -155,7 +155,7 @@ async fn run_a2a_agent(
         mcp_manager: agent_state.mcp_manager.as_ref(),
         global_home_dir: Some(&state.global_home_dir),
         is_callback_turn: false,
-        settings: Some(&state.settings),
+        settings: Some(&agent_state.settings),
         trace_id: Some(task_id.to_string()),
     };
 
