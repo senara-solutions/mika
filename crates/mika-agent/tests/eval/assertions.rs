@@ -159,20 +159,20 @@ pub fn assert_tool_args_contain(
 
 /// Assert the agent loop took at most `max` steps.
 pub fn assert_max_steps(trace: &AgentTrace, max: usize) {
-    if trace.steps > max {
+    if trace.llm_call_count > max {
         panic!(
             "assert_max_steps failed: expected at most {} steps, got {}",
-            max, trace.steps
+            max, trace.llm_call_count
         );
     }
 }
 
 /// Assert the agent loop took exactly `expected` steps.
 pub fn assert_exact_steps(trace: &AgentTrace, expected: usize) {
-    if trace.steps != expected {
+    if trace.llm_call_count != expected {
         panic!(
             "assert_exact_steps failed: expected {} steps, got {}",
-            expected, trace.steps
+            expected, trace.llm_call_count
         );
     }
 }

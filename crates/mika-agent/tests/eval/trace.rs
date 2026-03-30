@@ -3,8 +3,8 @@
 use mika_agent::agent::AgentOutput;
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{LlmCallRow, ToolCallRow};
+use mika_common::llm::LlmRequest;
 use mika_common::llm::mock::MockLlmProvider;
-use mika_common::llm::{LlmProvider, LlmRequest};
 
 /// Complete execution trace of an agent run.
 ///
@@ -18,9 +18,8 @@ pub struct AgentTrace {
     pub llm_calls: Vec<LlmCallRow>,
     pub tool_calls: Vec<ToolCallRow>,
     pub captured_requests: Vec<LlmRequest>,
-    pub steps: usize,
-    pub provider: String,
-    pub model: String,
+    /// Number of LLM API calls made during the run (one per agent loop iteration).
+    pub llm_call_count: usize,
 }
 
 impl AgentTrace {
@@ -34,16 +33,14 @@ impl AgentTrace {
         let llm_calls = db.query_llm_calls_by_trace(trace_id).await?;
         let tool_calls = db.query_tool_calls_by_trace(trace_id).await?;
         let captured_requests = mock_provider.captured_requests();
-        let steps = llm_calls.len();
+        let llm_call_count = llm_calls.len();
 
         Ok(Self {
             output,
             llm_calls,
             tool_calls,
             captured_requests,
-            steps,
-            provider: mock_provider.provider_name().to_string(),
-            model: mock_provider.model_name().to_string(),
+            llm_call_count,
         })
     }
 

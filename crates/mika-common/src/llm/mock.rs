@@ -82,11 +82,6 @@ impl MockLlmProvider {
     pub fn calls_made(&self) -> usize {
         self.cursor.load(Ordering::SeqCst)
     }
-
-    /// Get the total number of responses configured.
-    pub fn total_responses(&self) -> usize {
-        self.responses.len()
-    }
 }
 
 #[async_trait]
@@ -107,21 +102,7 @@ impl LlmProvider for MockLlmProvider {
 
         match &self.responses[index] {
             MockResponse::Success(resp) => Ok(resp.clone()),
-            MockResponse::Error(err) => Err(match err {
-                LlmError::HttpError {
-                    status,
-                    message,
-                    retryable,
-                } => LlmError::HttpError {
-                    status: *status,
-                    message: message.clone(),
-                    retryable: *retryable,
-                },
-                LlmError::Transport(msg) => LlmError::Transport(msg.clone()),
-                LlmError::ParseError(msg) => LlmError::ParseError(msg.clone()),
-                LlmError::ProviderError(msg) => LlmError::ProviderError(msg.clone()),
-                LlmError::UnsupportedFeature(msg) => LlmError::UnsupportedFeature(msg.clone()),
-            }),
+            MockResponse::Error(err) => Err(err.clone()),
         }
     }
 
@@ -287,21 +268,6 @@ pub fn content_filter_response() -> MockResponse {
         reasoning: None,
         stop_reason: LlmStopReason::ContentFilter,
         usage: LlmUsage::default(),
-    })
-}
-
-/// Create a text response with custom usage stats.
-pub fn text_response_with_usage(text: &str, input_tokens: u64, output_tokens: u64) -> MockResponse {
-    MockResponse::Success(LlmResponse {
-        content: vec![LlmResponseContent::Text(text.to_string())],
-        reasoning: None,
-        stop_reason: LlmStopReason::EndTurn,
-        usage: LlmUsage {
-            input_tokens,
-            output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        },
     })
 }
 

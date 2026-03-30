@@ -5,7 +5,7 @@ use thiserror::Error;
 /// Each provider maps its native errors into this enum. The `retryable` field
 /// on `HttpError` lets the caller decide retry strategy without knowing
 /// provider-specific status codes.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum LlmError {
     #[error("LLM HTTP error (status {status}): {message}")]
     HttpError {
