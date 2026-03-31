@@ -37,10 +37,15 @@ use tower_http::trace::TraceLayer;
             }
         })
         .on_response(
-            |response: &http::Response<_>, latency: Duration, _span: &tracing::Span| {
+            |response: &http::Response<_>, latency: Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
+                let is_debug = span.metadata().is_some_and(|m| {
+                    *m.level() == tracing::Level::DEBUG
+                });
                 if status >= 500 {
                     tracing::warn!(status, ?latency, "response");
+                } else if is_debug {
+                    tracing::debug!(status, ?latency, "response");
                 } else {
                     tracing::info!(status, ?latency, "response");
                 }
@@ -57,7 +62,7 @@ fn is_health_probe(path: &str) -> bool {
 
 1. **Custom `make_span_with` instead of defaults:** mika-server uses plain `TraceLayer::new_for_http()` with defaults. The gateway needs the custom span factory to log health probes at DEBUG level (reducing noise from Kubernetes liveness/readiness checks that fire every few seconds).
 
-2. **Span-level filtering:** Health probe spans use `debug_span!` while operational routes use `info_span!`. When the tracing subscriber is configured at INFO level (typical production), DEBUG spans are elided entirely — no allocation, no callback invocation. The `on_response` closure uses `info!` unconditionally (plus `warn!` for 5xx) because span-level filtering handles suppression automatically.
+2. **Span-level filtering:** Health probe spans use `debug_span!` while operational routes use `info_span!`. The `on_response` callback checks the span's metadata level to match: health probe responses use `debug!`, operational responses use `info!`, and 5xx responses always use `warn!`. This ensures health probe traffic is fully suppressed at INFO log level — both the span and the response event.
 
 3. **No OTel target tagging:** Per the documented learning in `docs/solutions/integration-issues/langfuse-non-llm-span-filtering.md`, infrastructure spans must not use `target: "mika::otel"`. Tower-http's default span target is automatically excluded from the OTLP exporter's `filter::Targets` configuration.
 

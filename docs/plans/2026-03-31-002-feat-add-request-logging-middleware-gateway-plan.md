@@ -63,10 +63,13 @@ use tower_http::trace::TraceLayer;
         .on_response(
             |response: &http::Response<_>, latency: Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
-                // Log at the span's level — DEBUG for health, INFO for others
-                let _ = span;
+                let is_debug = span.metadata().is_some_and(|m| {
+                    *m.level() == tracing::Level::DEBUG
+                });
                 if status >= 500 {
                     tracing::warn!(status, ?latency, "response");
+                } else if is_debug {
+                    tracing::debug!(status, ?latency, "response");
                 } else {
                     tracing::info!(status, ?latency, "response");
                 }
@@ -87,7 +90,7 @@ fn is_health_probe(path: &str) -> bool {
 - **No Cargo.toml changes needed:** `tower-http` with the `"trace"` feature is already a workspace dependency, and `mika-gateway` already depends on `tower-http = { workspace = true }`.
 - **No new dependencies:** `http::Request` is available via axum re-export, `Duration` via `std::time::Duration` (already imported).
 - **Structured logging:** The gateway already initializes `tracing-subscriber` via `mika_common::logging::init()` with JSON (prod) or pretty (dev) format. `TraceLayer` spans and events automatically use the active subscriber — no additional configuration needed.
-- **`on_response` level strategy:** Using `tracing::info!` unconditionally in `on_response` (with `tracing::warn!` for 5xx) since the span level already controls visibility — DEBUG spans suppress their events when the subscriber is set to INFO level. This is simpler than trying to dynamically match the span's level in `on_response`.
+- **`on_response` level strategy:** The `on_response` callback checks the span's metadata level via `span.metadata()` to match the response log level to the request span level. Health probe responses use `debug!`, operational responses use `info!`, and 5xx responses always use `warn!`. This ensures health probe traffic is fully silent at INFO log level.
 
 ## Sources
 

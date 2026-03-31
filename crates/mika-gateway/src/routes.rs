@@ -110,10 +110,15 @@ pub fn build_router(state: AppState) -> Router {
                     }
                 })
                 .on_response(
-                    |response: &http::Response<_>, latency: Duration, _span: &tracing::Span| {
+                    |response: &http::Response<_>, latency: Duration, span: &tracing::Span| {
                         let status = response.status().as_u16();
+                        let is_debug = span
+                            .metadata()
+                            .is_some_and(|m| *m.level() == tracing::Level::DEBUG);
                         if status >= 500 {
                             tracing::warn!(status, ?latency, "response");
+                        } else if is_debug {
+                            tracing::debug!(status, ?latency, "response");
                         } else {
                             tracing::info!(status, ?latency, "response");
                         }
