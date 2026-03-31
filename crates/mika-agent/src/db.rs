@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 17;
+pub const CURRENT_SCHEMA_VERSION: i64 = 18;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -705,6 +705,10 @@ impl Database {
             self.migrate_v16_to_v17()?;
             info!(version = 17, "database migrated to v17");
         }
+        if (3..=17).contains(&version) {
+            self.migrate_v17_to_v18()?;
+            info!(version = 18, "database migrated to v18");
+        }
         Ok(())
     }
 
@@ -761,7 +765,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (17);
+            INSERT INTO schema_version (version) VALUES (18);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1075,7 +1079,8 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_reminder
                 ON tasks(agent_id, label COLLATE NOCASE)
                 WHERE status IN ('pending', 'in_progress', 'recurring_active')
-                AND action_type = 'send_message';
+                AND (action_type = 'send_message' OR action_type = 'resume_agent')
+                AND trigger_type NOT IN ('callback');
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_description
                 ON events(agent_id, description COLLATE NOCASE, event_date)
@@ -1176,7 +1181,8 @@ impl Database {
              CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_reminder
                 ON tasks(agent_id, label COLLATE NOCASE)
                 WHERE status IN ('pending', 'in_progress', 'recurring_active')
-                AND action_type = 'send_message';
+                AND (action_type = 'send_message' OR action_type = 'resume_agent')
+                AND trigger_type NOT IN ('callback');
 
              CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_description
                 ON events(agent_id, description COLLATE NOCASE, event_date)
@@ -1423,7 +1429,8 @@ impl Database {
              CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_reminder
                 ON tasks(agent_id, label COLLATE NOCASE)
                 WHERE status IN ('pending', 'in_progress', 'recurring_active')
-                AND action_type = 'send_message';
+                AND (action_type = 'send_message' OR action_type = 'resume_agent')
+                AND trigger_type NOT IN ('callback');
              CREATE INDEX IF NOT EXISTS idx_tasks_callback_delivery
                 ON tasks(agent_id, completed_at)
                 WHERE trigger_type='callback' AND action_type='resume_agent' AND status IN ('completed','failed');
@@ -1780,7 +1787,7 @@ impl Database {
                  CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
                  CREATE INDEX idx_tasks_manual_active ON tasks(agent_id, created_at DESC) WHERE trigger_type = 'manual' AND status IN ('pending', 'in_progress', 'blocked');
                  CREATE UNIQUE INDEX idx_tasks_unique_recurring ON tasks(agent_id, label COLLATE NOCASE) WHERE trigger_type = 'recurring' AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
-                 CREATE UNIQUE INDEX idx_tasks_unique_reminder ON tasks(agent_id, label COLLATE NOCASE) WHERE status IN ('pending', 'in_progress', 'recurring_active') AND action_type = 'send_message';
+                 CREATE UNIQUE INDEX idx_tasks_unique_reminder ON tasks(agent_id, label COLLATE NOCASE) WHERE status IN ('pending', 'in_progress', 'recurring_active') AND (action_type = 'send_message' OR action_type = 'resume_agent') AND trigger_type NOT IN ('callback');
                  CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at) WHERE trigger_type='callback' AND action_type='resume_agent' AND status IN ('completed','failed');")?;
 
             // --- messages ---
@@ -2170,7 +2177,8 @@ impl Database {
                 CREATE UNIQUE INDEX idx_tasks_unique_reminder
                     ON tasks(agent_id, label COLLATE NOCASE)
                     WHERE status IN ('pending', 'in_progress', 'recurring_active')
-                    AND action_type = 'send_message';")?;
+                    AND (action_type = 'send_message' OR action_type = 'resume_agent')
+                    AND trigger_type NOT IN ('callback');")?;
 
             // Create thin mapping table
             self.conn.execute_batch(
@@ -2361,6 +2369,30 @@ impl Database {
                AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');
 
              INSERT INTO schema_version (version) VALUES (17);
+
+             COMMIT;",
+        )?;
+
+        Ok(())
+    }
+
+    fn migrate_v17_to_v18(&self) -> Result<()> {
+        info!("migrating database schema v17 → v18 (widen reminder dedup index for resume_agent)");
+
+        // The old index only covered action_type = 'send_message'. The new index covers
+        // both 'send_message' and 'resume_agent' to prevent duplicate reminders regardless
+        // of action type. See #363.
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+
+             DROP INDEX IF EXISTS idx_tasks_unique_reminder;
+             CREATE UNIQUE INDEX idx_tasks_unique_reminder
+             ON tasks(agent_id, label COLLATE NOCASE)
+             WHERE status IN ('pending', 'in_progress', 'recurring_active')
+               AND (action_type = 'send_message' OR action_type = 'resume_agent')
+               AND trigger_type NOT IN ('callback');
+
+             INSERT INTO schema_version (version) VALUES (18);
 
              COMMIT;",
         )?;
@@ -3274,8 +3306,8 @@ impl Database {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
-               AND (action_type = 'send_message'
-                 OR (trigger_type = 'callback' AND action_type = 'resume_agent'))
+               AND action_type IN ('send_message', 'resume_agent')
+               AND trigger_type NOT IN ('callback')
                AND status IN ('pending', 'in_progress', 'recurring_active')
              ORDER BY next_fire_at ASC",
             Self::TASK_COLUMNS
@@ -3596,7 +3628,7 @@ impl Database {
         let cutoff = timestamp::now_minus(Duration::seconds(retention_secs));
         let n = self.conn.execute(
             "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1
-             AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%' OR id LIKE 'reflection-%' OR id LIKE 'team-%' OR id LIKE 'delegate-%')",
+             AND (id LIKE 'heartbeat-%' OR id LIKE 'callback-%' OR id LIKE 'skill-%' OR id LIKE 'reflection-%' OR id LIKE 'team-%' OR id LIKE 'delegate-%' OR id LIKE 'reminder-%')",
             params![cutoff],
         )?;
         Ok(n)

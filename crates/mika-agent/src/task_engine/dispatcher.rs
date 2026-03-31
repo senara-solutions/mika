@@ -264,25 +264,59 @@ impl TaskDispatcher {
         Ok(())
     }
 
-    /// Resume the agent after a callback task completes or fails.
+    /// Resume the agent after a callback task completes/fails, or when a reminder fires.
     ///
-    /// Reads `task.result` (set by the callback) and runs a silent agent turn with
-    /// the result injected as context. Uses `send_message` to deliver the response.
+    /// Two entry paths with different lifecycles:
+    /// - **Callback** (`trigger_type = "callback"`): reads `task.result`, marks delivered
+    ///   after dispatch, uses `SilentTrigger::Callback` with untrusted framing.
+    /// - **Reminder** (`trigger_type = "time"` or `"recurring"`): reads `action_config.text`,
+    ///   does NOT mark delivered (caller `fire_task` handles completion), uses
+    ///   `SilentTrigger::Reminder` with trusted framing. See #363.
     ///
     /// Returns `Err` with a specific message when the agent is busy so the caller
     /// can re-queue the task instead of losing the callback result.
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
-        let is_failed = task.status == "failed";
-        let result = match task.result.clone() {
-            Some(r) if !r.is_empty() => r,
-            _ if is_failed => crate::agent::FAILED_TASK_FALLBACK.to_string(),
-            _ => {
-                return Err(anyhow!(
-                    "resume_agent task {} has no result — callback may not have completed yet",
-                    task.id
-                )
-                .into());
-            }
+        let is_callback = task.trigger_type == "callback";
+
+        // Determine context and trigger based on entry path
+        let (trigger, session_prefix, session_trigger_meta) = if is_callback {
+            // Callback path: read from task.result
+            let is_failed = task.status == "failed";
+            let result = match task.result.clone() {
+                Some(r) if !r.is_empty() => r,
+                _ if is_failed => crate::agent::FAILED_TASK_FALLBACK.to_string(),
+                _ => {
+                    return Err(anyhow!(
+                        "resume_agent task {} has no result — callback may not have completed yet",
+                        task.id
+                    )
+                    .into());
+                }
+            };
+            (
+                SilentTrigger::Callback {
+                    task_id: task.id.clone(),
+                    label: task.label.clone(),
+                    result,
+                    failed: is_failed,
+                    parent_task_id: task.parent_task_id.clone(),
+                },
+                "callback",
+                r#"{"trigger": "callback"}"#,
+            )
+        } else {
+            // Reminder path: read from action_config.text
+            let config: serde_json::Value =
+                serde_json::from_str(&task.action_config).unwrap_or(serde_json::Value::Null);
+            let message = config["text"].as_str().unwrap_or(&task.label).to_string();
+            (
+                SilentTrigger::Reminder {
+                    task_id: task.id.clone(),
+                    message,
+                },
+                "reminder",
+                r#"{"trigger": "reminder"}"#,
+            )
         };
 
         // Acquire agent lock — return error if busy so caller can re-queue
@@ -298,9 +332,9 @@ impl TaskDispatcher {
             None
         };
 
-        let session_id = format!("callback-{}", uuid::Uuid::new_v4());
+        let session_id = format!("{session_prefix}-{}", uuid::Uuid::new_v4());
         let trace_id = mika_common::trace::generate_trace_id();
-        info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, label = %task.label, "resuming agent for callback task");
+        info!(task_id = %task.id, session_id = %session_id, trace_id = %trace_id, label = %task.label, path = session_prefix, "resuming agent for {} task", session_prefix);
 
         if let Err(e) = self
             .db
@@ -308,12 +342,12 @@ impl TaskDispatcher {
                 &session_id,
                 &task.agent_id,
                 "system",
-                Some(r#"{"trigger": "callback"}"#),
+                Some(session_trigger_meta),
                 task.created_by_session.as_deref(),
             )
             .await
         {
-            warn!(session_id = %session_id, error = %e, "failed to create session for callback");
+            warn!(session_id = %session_id, error = %e, "failed to create session for {}", session_prefix);
         }
 
         let params = SilentAgentParams {
@@ -321,13 +355,7 @@ impl TaskDispatcher {
             llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
-            trigger: SilentTrigger::Callback {
-                task_id: task.id.clone(),
-                label: task.label.clone(),
-                result,
-                failed: is_failed,
-                parent_task_id: task.parent_task_id.clone(),
-            },
+            trigger,
             home_dir: &self.home_dir,
             session_id: &session_id,
             message_sender: self.message_sender.clone(),
@@ -341,15 +369,16 @@ impl TaskDispatcher {
 
         if let Err(e) = run_silent_agent(&params).await {
             warn!(task_id = %task.id, error = %e, "resume_agent run failed");
-        } else {
-            // Mark delivered so TUI polling doesn't re-process this callback
+        } else if is_callback {
+            // Mark delivered so TUI polling doesn't re-process this callback.
+            // Only for callbacks — reminder lifecycle is managed by fire_task().
             if let Err(e) = self.db.mark_task_delivered(&task.id).await {
                 warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
             }
         }
 
         if let Err(e) = self.db.end_session(&session_id).await {
-            warn!(session_id = %session_id, error = %e, "failed to end callback session");
+            warn!(session_id = %session_id, error = %e, "failed to end {} session", session_prefix);
         }
 
         self.write_execution_trace(&task.id, &trace_id).await;
@@ -876,5 +905,86 @@ mod tests {
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_resume_agent_callback_no_result_returns_error() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "callback task".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(crate::timestamp::now()),
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: r#"{"text": "some context"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        // Callback with no result should error
+        let result = dispatcher.dispatch(&id).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no result"),
+            "should error about missing result for callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_resume_agent_reminder_reads_action_config() {
+        // Reminder-path resume_agent tasks read from action_config.text,
+        // not task.result. This test verifies the dispatcher accepts
+        // reminder tasks without a result field (the run_silent_agent
+        // call will fail in test because there's no real LLM, but
+        // the dispatch itself should not error).
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Check CI status".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(crate::timestamp::now()),
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: r#"{"text": "Check CI status and merge PR"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        // Should not error — reminder path reads from action_config
+        let result = dispatcher.dispatch(&id).await;
+        // The dispatch itself succeeds (run_silent_agent may fail internally
+        // but dispatch_resume_agent catches that with warn! and returns Ok)
+        assert!(
+            result.is_ok(),
+            "reminder resume_agent should not error: {:?}",
+            result
+        );
     }
 }

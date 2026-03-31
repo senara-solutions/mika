@@ -56,19 +56,25 @@ impl Tool for ListRemindersTool {
                 })
                 .unwrap_or_else(|| "unknown".to_string());
 
+            let action_badge = if t.action_type == "resume_agent" {
+                " [action]"
+            } else {
+                ""
+            };
+
             if let Some(ref cron) = t.cron_expr {
                 let tz_label = tz_name
                     .as_deref()
                     .map(|tz| format!(", tz: {tz}"))
                     .unwrap_or_default();
                 output.push_str(&format!(
-                    "- {}: \"{}\" next: {} (recurring: {}{})\n",
-                    t.id, t.label, fire_at_display, cron, tz_label
+                    "- {}: \"{}\" next: {} (recurring: {}{}){}\n",
+                    t.id, t.label, fire_at_display, cron, tz_label, action_badge
                 ));
             } else {
                 output.push_str(&format!(
-                    "- {}: \"{}\" at {}\n",
-                    t.id, t.label, fire_at_display
+                    "- {}: \"{}\" at {}{}\n",
+                    t.id, t.label, fire_at_display, action_badge
                 ));
             }
         }
@@ -177,6 +183,53 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Daily standup"));
         assert!(result.content.contains("recurring: 0 0 9 * * *"));
+    }
+
+    #[tokio::test]
+    async fn test_list_reminders_shows_action_badge() {
+        let harness = TestHarness::new();
+        // Create a resume_agent reminder
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Check CI and merge".to_string(),
+                trigger_type: "time".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some("2099-01-01T00:00:00Z".to_string()),
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: serde_json::json!({"text": "Check CI and merge"}).to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        // Also create a normal send_message reminder
+        add_reminder(&harness, "2099-06-15T12:00:00Z", "Normal reminder").await;
+
+        let ctx = harness.ctx();
+        let tool = ListRemindersTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Check CI and merge"));
+        assert!(result.content.contains("[action]"));
+        // Normal reminder should not have action badge
+        assert!(result.content.contains("Normal reminder"));
+        // Count occurrences of [action] — should be exactly 1
+        assert_eq!(result.content.matches("[action]").count(), 1);
     }
 
     #[tokio::test]
