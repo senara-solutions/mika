@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{self, HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -16,6 +16,7 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -96,7 +97,41 @@ pub fn build_router(state: AppState) -> Router {
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         ))
+        // Request logging — health probes at DEBUG, everything else at INFO
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &http::Request<_>| {
+                    let path = request.uri().path();
+                    let method = request.method();
+                    if is_health_probe(path) {
+                        tracing::debug_span!("http_request", %method, path)
+                    } else {
+                        tracing::info_span!("http_request", %method, path)
+                    }
+                })
+                .on_response(
+                    |response: &http::Response<_>, latency: Duration, span: &tracing::Span| {
+                        let status = response.status().as_u16();
+                        let is_debug = span
+                            .metadata()
+                            .is_some_and(|m| *m.level() == tracing::Level::DEBUG);
+                        if status >= 500 {
+                            tracing::warn!(status, ?latency, "response");
+                        } else if is_debug {
+                            tracing::debug!(status, ?latency, "response");
+                        } else {
+                            tracing::info!(status, ?latency, "response");
+                        }
+                    },
+                ),
+        )
         .with_state(state)
+}
+
+/// Returns `true` for Kubernetes health/readiness/liveness probe paths.
+/// These are logged at DEBUG level to reduce noise from frequent probe traffic.
+fn is_health_probe(path: &str) -> bool {
+    matches!(path, "/health" | "/readyz" | "/livez")
 }
 
 // -- Webhook handler --
@@ -933,6 +968,18 @@ mod tests {
         let mut bytes = [0u8; 32];
         rand::fill(&mut bytes);
         hex::encode(bytes)
+    }
+
+    #[test]
+    fn test_is_health_probe() {
+        assert!(is_health_probe("/health"));
+        assert!(is_health_probe("/readyz"));
+        assert!(is_health_probe("/livez"));
+        assert!(!is_health_probe("/webhook/telegram"));
+        assert!(!is_health_probe("/send"));
+        assert!(!is_health_probe("/a2a/customer/agent"));
+        assert!(!is_health_probe("/healthy")); // substring mismatch
+        assert!(!is_health_probe("/"));
     }
 
     #[test]
