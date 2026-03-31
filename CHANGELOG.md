@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1](https://github.com/senara-solutions/mika/releases/tag/v0.3.1) — 2026-03-31
+
+### Fixed
+
+- remove remaining fallback references in config field doc and reference table
+- remove MIKA_INVESTIGATE_GITHUB_TOKEN fallback from agent_github_token()
+
 ## [0.3.0](https://github.com/senara-solutions/mika/releases/tag/v0.3.0) — 2026-03-30
 
 ### Added
