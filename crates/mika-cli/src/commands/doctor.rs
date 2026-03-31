@@ -65,7 +65,7 @@ pub async fn run(args: DoctorArgs, agent_name: &str) -> Result<()> {
             "GitHub token (agent)",
             "MIKA_GITHUB_TOKEN",
             &global_home,
-            "agent GitHub operations use MIKA_INVESTIGATE_GITHUB_TOKEN fallback",
+            "agent GitHub operations disabled",
         ),
         check_optional_key(
             "GitHub token (investigation)",

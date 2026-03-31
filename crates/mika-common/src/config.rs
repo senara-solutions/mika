@@ -689,11 +689,9 @@ pub struct ActiveLlmConfig {
 
 impl Settings {
     /// Resolve the GitHub token for agent operations.
-    /// Prefers `MIKA_GITHUB_TOKEN`, falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
+    /// Returns `MIKA_GITHUB_TOKEN` only — no fallback to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
     pub fn agent_github_token(&self) -> Option<&str> {
-        self.github_token
-            .as_deref()
-            .or(self.investigate_github_token.as_deref())
+        self.github_token.as_deref()
     }
 
     /// Return `(model_field, api_key_field, base_url_field)` references for a given provider.

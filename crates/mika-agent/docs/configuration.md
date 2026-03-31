@@ -140,8 +140,7 @@ server mode.
 ### GitHub token for agent operations
 
 `MIKA_GITHUB_TOKEN` enables agent-level GitHub operations: context injection (fetching
-PR diffs), work item enrichment (PR/issue status), and dev-run PR merges. If not set,
-falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
+PR diffs), work item enrichment (PR/issue status), and dev-run PR merges.
 
 1. Create a GitHub Personal Access Token:
    - **Fine-grained token** (recommended): Settings → Developer settings →
@@ -469,7 +468,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key (LLM + Layer 3 vector search) |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
-| `MIKA_GITHUB_TOKEN` | No | GitHub token for agent operations (falls back to `MIKA_INVESTIGATE_GITHUB_TOKEN`) |
+| `MIKA_GITHUB_TOKEN` | No | GitHub token for agent operations |
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation only |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |

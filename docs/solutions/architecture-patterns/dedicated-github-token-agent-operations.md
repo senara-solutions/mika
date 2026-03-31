@@ -1,16 +1,17 @@
 ---
-title: "Dedicated GitHub token for agent operations with fallback"
+title: "Dedicated GitHub token for agent operations"
 category: architecture-patterns
 date: 2026-03-26
-tags: [config, env-var, github, token, fallback, settings]
-related_issues: [289]
+updated: 2026-03-31
+tags: [config, env-var, github, token, settings]
+related_issues: [289, 359]
 related_docs:
   - docs/solutions/architecture-patterns/config-key-rename-across-layers.md
   - docs/solutions/architecture-patterns/unified-llm-api-key-consolidation.md
   - docs/solutions/security-issues/env-var-leakage-exec-handler-child-processes.md
 ---
 
-# Dedicated GitHub token for agent operations with fallback
+# Dedicated GitHub token for agent operations
 
 ## Problem
 
@@ -24,38 +25,38 @@ No dedicated token existed for agent operations. When `github_token` was needed 
 
 ## Solution
 
-Added `MIKA_GITHUB_TOKEN` as a dedicated token for agent operations with graceful fallback to `MIKA_INVESTIGATE_GITHUB_TOKEN` for backward compatibility.
+Added `MIKA_GITHUB_TOKEN` as a dedicated token for agent operations. The two tokens serve strictly separate purposes with no fallback between them.
 
-### Key design decision: centralized fallback method
+### Key design decision: centralized method, no fallback
 
-Instead of scattering `.or()` logic across 8+ construction sites, added a single method on `Settings`:
+Instead of scattering token logic across 8+ construction sites, a single method on `Settings` returns the agent token:
 
 ```rust
 impl Settings {
     /// Resolve the GitHub token for agent operations.
-    /// Prefers MIKA_GITHUB_TOKEN, falls back to MIKA_INVESTIGATE_GITHUB_TOKEN.
+    /// Returns MIKA_GITHUB_TOKEN only — no fallback to MIKA_INVESTIGATE_GITHUB_TOKEN.
     pub fn agent_github_token(&self) -> Option<&str> {
-        self.github_token
-            .as_deref()
-            .or(self.investigate_github_token.as_deref())
+        self.github_token.as_deref()
     }
 }
 ```
 
-All construction sites call `settings.agent_github_token()` — no duplicated fallback logic.
+All construction sites call `settings.agent_github_token()` — no duplicated logic.
+
+**Why no fallback (#359):** The original implementation fell back to `MIKA_INVESTIGATE_GITHUB_TOKEN` for backward compatibility. This caused mika-qa to use the investigation PAT when `MIKA_GITHUB_TOKEN` was intentionally unset during a token swap, resulting in a self-approval attempt on a PR. Silent fallbacks mask configuration intent — when a token is deliberately unset, nothing should silently replace it.
 
 ### Token resolution matrix
 
 | Scenario | Agent operations | Investigation panel |
 |----------|-----------------|-------------------|
 | Both tokens set | `MIKA_GITHUB_TOKEN` | `MIKA_INVESTIGATE_GITHUB_TOKEN` |
-| Only new token | `MIKA_GITHUB_TOKEN` | None (graceful degradation) |
-| Only old token | `MIKA_INVESTIGATE_GITHUB_TOKEN` (fallback) | `MIKA_INVESTIGATE_GITHUB_TOKEN` |
+| Only agent token | `MIKA_GITHUB_TOKEN` | None (graceful degradation) |
+| Only investigate token | None (graceful degradation) | `MIKA_INVESTIGATE_GITHUB_TOKEN` |
 | Neither set | None | None |
 
 ### Investigation panel isolation
 
-`investigate.rs` was intentionally NOT changed — it continues reading `settings.investigate_github_token` directly. The fallback helper is only used for agent operation paths.
+`investigate.rs` reads `settings.investigate_github_token` directly — it does not use `agent_github_token()`. The two token paths are completely independent.
 
 ## 9-layer checklist followed
 
@@ -74,5 +75,6 @@ This change followed the proven pattern from `config-key-rename-across-layers.md
 ## Prevention
 
 - **Follow the 9-layer checklist** from `config-key-rename-across-layers.md` for any env var addition/rename.
-- **Use centralized helper methods** for token resolution with fallback — don't scatter `.or()` logic across construction sites.
+- **Use centralized helper methods** for token resolution — don't scatter logic across construction sites.
 - **Keep investigation panel isolated** — its token scope should never expand to cover agent operations.
+- **Never add silent fallbacks between tokens** — when a token is deliberately unset, the system should degrade gracefully, not silently substitute a different-scoped token.
