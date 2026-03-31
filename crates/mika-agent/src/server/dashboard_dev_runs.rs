@@ -159,7 +159,7 @@ pub async fn handle_dev_run_merge(
             return (
                 StatusCode::PRECONDITION_FAILED,
                 Json(serde_json::json!({
-                    "error": "MIKA_GITHUB_TOKEN (or MIKA_INVESTIGATE_GITHUB_TOKEN) is not configured"
+                    "error": "MIKA_GITHUB_TOKEN is not configured"
                 })),
             )
                 .into_response();
