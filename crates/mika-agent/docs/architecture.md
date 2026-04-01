@@ -106,16 +106,19 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
      message and tool results onto the request, strip images from prior turns
      to prevent memory accumulation, loop back to step 5.
 
-   **Step-awareness nudge:** At step 8 of 10 (conversation mode only), a nudge
-   is appended to the system prompt telling the model to prioritize completing
-   or summarizing its work.
+   **Step-awareness nudge:** At step `max_steps - 2`, a nudge is appended to the
+   system prompt telling the model to prioritize completing or summarizing its
+   work. All modes receive the nudge (conversation, team, and silent). Silent
+   mode uses tailored text encouraging `send_message` notification.
 
-   **Max-steps exceeded:** If the loop exhausts all 10 steps without producing
-   text, a continuation turn is attempted: tools are disabled, thinking is
-   disabled, and one final API call (60s timeout) forces the model to produce
-   a text summary of what it accomplished. If the continuation fails (API error,
-   timeout, empty response), a structured fallback shows the last 5 tool names
-   with status and invites the user to ask for continuation.
+   **Max-steps exceeded:** If the loop exhausts all steps without producing text,
+   a continuation turn is attempted via the shared `attempt_continuation_turn()`
+   helper: tools are disabled, thinking is disabled, and one final API call (60s
+   timeout) forces the model to produce a text summary. Used by Conversation,
+   Team, and Silent modes. In silent mode, the summary is sent to the user via
+   `message_sender` if available. If the continuation fails (API error, timeout,
+   empty response), a structured fallback shows the last 5 tool names with
+   status.
 
    **Multi-modal tool results:** Tools can return images alongside text via
    `ToolOutput::success_with_images()`. When images are present, the tool result
@@ -132,7 +135,9 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `MAX_TOOL_STEPS` | 10 | Maximum tool-use iterations per agent turn |
+| `MAX_TOOL_STEPS` | 10 | Default tool-use iterations (conversation, heartbeat, reflection, etc.) |
+| `MAX_CALLBACK_TOOL_STEPS` | 20 | Tool-use iterations for callback triggers (complex workflows) |
+| `MAX_TEAM_TOOL_STEPS` | 20 | Tool-use iterations for team sub-agents |
 | `TOOL_TIMEOUT_SECS` | 30 | Default per-tool execution timeout (overridable via `Tool::timeout_secs()`) |
 | `AGENT_TOTAL_TIMEOUT_SECS` | 300 | Total agent loop timeout (5 minutes) |
 | `CONTINUATION_TIMEOUT_SECS` | 60 | Continuation turn timeout after max steps |

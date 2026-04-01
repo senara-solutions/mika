@@ -38,7 +38,7 @@ These run automatically on every agent turn. The engine handles them in `prompt.
 | Message persistence | `agent.rs` via `save_message()` | After each user/assistant message | Every message persisted to `messages` table with session FK |
 | Audit event logging | Various write paths | On every memory mutation | Mutations logged to `audit_events` for rewind support |
 | Tool history context | History builder in `agent.rs` | Every turn | `<context type="tool_history">` blocks appended to assistant messages showing prior tool call summaries |
-| Step-awareness nudge | `agent.rs` | At tool step 8 of 10 | Injection encouraging the agent to wrap up (conversation mode only) |
+| Step-awareness nudge | `agent.rs` | At tool step `max_steps - 2` | Injection encouraging the agent to wrap up (all modes — silent mode text tailored for `send_message`) |
 
 ### Agent-Triggered Operations (LLM-Decides)
 
