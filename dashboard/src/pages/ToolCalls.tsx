@@ -149,8 +149,14 @@ export default function ToolCalls() {
                         <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
                           {formatTimestamp(row.created_at)}
                         </td>
-                        <td className="px-4 py-3 text-xs text-heading font-mono font-medium max-w-[180px] truncate">
-                          {row.tool_name}
+                        <td className="px-4 py-3 text-xs font-mono font-medium max-w-[180px] truncate">
+                          <Link
+                            to={`/tool-calls/${row.id}`}
+                            onClick={(e) => e.stopPropagation()}
+                            className="text-accent hover:text-accent-light transition-colors"
+                          >
+                            {row.tool_name}
+                          </Link>
                         </td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${sourceBadge(row.tool_source)}`}>

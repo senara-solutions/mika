@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch, TOKEN, API_BASE, type PaginatedResponse } from './client.ts'
+import { useQuery } from '@tanstack/react-query'
+import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface DevRun {
   id: string
@@ -44,26 +44,3 @@ export function useDevRun(taskId: string | undefined) {
   })
 }
 
-export function useMergeDevRun() {
-  const queryClient = useQueryClient()
-  return useMutation<{ merged: boolean; pr_url: string }, Error, string>({
-    mutationFn: async (taskId: string) => {
-      const url = new URL(`${API_BASE}/dev-runs/${taskId}/merge`, window.location.origin)
-      const res = await fetch(url.toString(), {
-        method: 'POST',
-        headers: {
-          ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
-        },
-      })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ error: res.statusText }))
-        throw new Error(body.error ?? `HTTP ${res.status}`)
-      }
-      return res.json()
-    },
-    onSuccess: (_data, taskId) => {
-      queryClient.invalidateQueries({ queryKey: ['dev-run', taskId] })
-      queryClient.invalidateQueries({ queryKey: ['dev-runs'] })
-    },
-  })
-}

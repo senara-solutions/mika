@@ -7,7 +7,6 @@ use axum::{
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use tracing::error;
 use utoipa::ToSchema;
 
 use crate::db::Task;
@@ -99,12 +98,6 @@ pub struct DevRunsQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct MergeResponse {
-    pub merged: bool,
-    pub pr_url: String,
-}
-
 // ===== Handlers =====
 
 /// GET /api/v1/dev-runs — paginated list of dev runs.
@@ -146,131 +139,4 @@ pub async fn handle_dev_run_detail(
             .into_response(),
         Err(e) => internal_error(e).into_response(),
     }
-}
-
-/// POST /api/v1/dev-runs/:task_id/merge — merge the dev run's PR via gh CLI.
-pub async fn handle_dev_run_merge(
-    State(state): State<AppState>,
-    Path(task_id): Path<String>,
-) -> impl IntoResponse {
-    let github_token = match state.settings.agent_github_token() {
-        Some(token) if !token.is_empty() => token.to_string(),
-        _ => {
-            return (
-                StatusCode::PRECONDITION_FAILED,
-                Json(serde_json::json!({
-                    "error": "MIKA_GITHUB_TOKEN is not configured"
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let task = match state.dashboard_db.get_dev_run(&task_id).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("dev run '{}' not found", task_id)})),
-            )
-                .into_response();
-        }
-        Err(e) => return internal_error(e).into_response(),
-    };
-
-    let pr_url = task
-        .metadata
-        .as_deref()
-        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-        .and_then(|v| {
-            v.get("claude_pilot")
-                .and_then(|cp| cp.get("pr_url"))
-                .and_then(|u| u.as_str())
-                .map(|s| s.to_string())
-        });
-
-    let pr_url = match pr_url {
-        Some(url) if !url.is_empty() => url,
-        _ => {
-            return (
-                StatusCode::PRECONDITION_FAILED,
-                Json(serde_json::json!({"error": "No PR URL in dev run metadata"})),
-            )
-                .into_response();
-        }
-    };
-
-    // Parse owner/repo and PR number from GitHub PR URL
-    let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
-    let (owner_repo, pr_number) = match parts.as_slice() {
-        [.., owner, repo, "pull", number] => (format!("{owner}/{repo}"), number.to_string()),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Cannot parse PR URL: {}", pr_url)})),
-            )
-                .into_response();
-        }
-    };
-
-    let output = match tokio::process::Command::new("gh")
-        .args([
-            "pr",
-            "merge",
-            &pr_number,
-            "--repo",
-            &owner_repo,
-            "--merge",
-            "--delete-branch",
-        ])
-        .env("GH_TOKEN", &github_token)
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            error!(error = %e, "failed to spawn gh pr merge");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to run gh: {}", e)})),
-            )
-                .into_response();
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!(pr_url = %pr_url, stderr = %stderr, "gh pr merge failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("gh pr merge failed: {}", stderr.trim())
-            })),
-        )
-            .into_response();
-    }
-
-    // Mark as completed (best effort — the merge already succeeded)
-    let _ = state
-        .dashboard_db
-        .with_db({
-            let id = task_id.clone();
-            move |db| {
-                db.conn.execute(
-                    "UPDATE tasks SET status = 'completed', \
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), \
-                     completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
-                     WHERE id = ?1 AND trigger_type = 'manual'",
-                    rusqlite::params![id],
-                )?;
-                Ok(())
-            }
-        })
-        .await;
-
-    Json(MergeResponse {
-        merged: true,
-        pr_url,
-    })
-    .into_response()
 }

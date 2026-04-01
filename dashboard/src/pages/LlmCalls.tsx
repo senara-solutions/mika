@@ -119,6 +119,7 @@ export default function LlmCalls() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+                  <th className="w-8 px-2 py-3" />
                   <th className="text-left px-4 py-3 font-medium">Timestamp</th>
                   <th className="text-left px-4 py-3 font-medium">Provider</th>
                   <th className="text-left px-4 py-3 font-medium">Model</th>
@@ -133,6 +134,15 @@ export default function LlmCalls() {
               <tbody className="divide-y divide-white/[0.03]">
                 {data.data.map((row) => (
                   <tr key={row.id} className="hover:bg-white/[0.02] transition-colors">
+                    <td className="px-2 py-3">
+                      <Link
+                        to={`/llm-calls/${row.id}`}
+                        className="text-accent/40 hover:text-accent transition-colors text-xs"
+                        title="View details"
+                      >
+                        &rarr;
+                      </Link>
+                    </td>
                     <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
                       {formatTimestamp(row.created_at)}
                     </td>

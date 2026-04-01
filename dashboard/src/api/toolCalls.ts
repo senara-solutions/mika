@@ -44,6 +44,14 @@ export function useToolCalls(filters: ToolCallsFilters) {
   })
 }
 
+export function useToolCall(id: string | undefined) {
+  return useQuery<ToolCallRow>({
+    queryKey: ['tool-call', id],
+    queryFn: () => apiFetch(`/tool-calls/${id}`),
+    enabled: !!id,
+  })
+}
+
 export function useTraceToolCalls(traceId: string) {
   return useQuery<ToolCallRow[]>({
     queryKey: ['trace-tool-calls', traceId],

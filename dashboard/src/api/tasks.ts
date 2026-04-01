@@ -26,6 +26,32 @@ export interface TaskItem {
   result_preview: string | null
 }
 
+/** Full task detail — returned by GET /api/v1/tasks/:id with untruncated fields. */
+export interface TaskDetailItem {
+  id: string
+  agent_id: string
+  label: string
+  trigger_type: string
+  action_type: string
+  status: string
+  team_run_id: string | null
+  parent_task_id: string | null
+  depth: number
+  source: string | null
+  reference_url: string | null
+  cron_expr: string | null
+  next_fire_at: string | null
+  fired_at: string | null
+  completed_at: string | null
+  created_by_session: string | null
+  created_trace_id: string | null
+  execution_trace_id: string | null
+  created_at: string
+  updated_at: string
+  action_config: string
+  result: string | null
+}
+
 export interface TasksFilters {
   status?: string
   trigger_type?: string
@@ -46,7 +72,7 @@ export function useTasks(filters: TasksFilters) {
 }
 
 export function useTask(taskId: string | undefined) {
-  return useQuery<TaskItem>({
+  return useQuery<TaskDetailItem>({
     queryKey: ['task', taskId],
     queryFn: () => apiFetch(`/tasks/${taskId}`),
     enabled: !!taskId,
