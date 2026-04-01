@@ -1,7 +1,7 @@
 ---
 title: "Dashboard: add RESTful detail pages for Tasks, LLM Calls, Tool Calls and fix Dev Run detail"
 type: feat
-status: active
+status: completed
 date: 2026-04-01
 issue: 361
 ---

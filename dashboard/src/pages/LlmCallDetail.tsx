@@ -4,7 +4,7 @@ import { CopyButton, formatRelativeTime } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatTokens(n: number | null): string {
-  if (n == null) return '—'
+  if (n == null) return '-'
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
   return String(n)
 }
