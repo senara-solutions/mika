@@ -45,11 +45,29 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist && touch dashboard/dist/.gitkeep
+
       - name: Build and upload mika
         uses: taiki-e/upload-rust-binary-action@f391289bcff6a7f36b6301c0a74199657bbb4561  # v1
         with:
           bin: mika
+          features: telemetry
           target: ${{ matrix.target }}
           archive: mika-$tag-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # mika-server is the HTTP server binary (from mika-agent crate).
+      # Dashboard assets are not embedded in release builds (empty placeholder);
+      # the /dashboard/ endpoint shows a branded "disabled" page.
+      # mika-gateway is excluded — deployed via Docker to Kubernetes, not as a standalone binary.
+      - name: Build and upload mika-server
+        uses: taiki-e/upload-rust-binary-action@f391289bcff6a7f36b6301c0a74199657bbb4561  # v1
+        with:
+          bin: mika-server
+          features: telemetry
+          target: ${{ matrix.target }}
+          archive: mika-server-$tag-$target
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}

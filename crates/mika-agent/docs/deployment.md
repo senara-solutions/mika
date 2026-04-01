@@ -114,18 +114,18 @@ Runs on every PR and push to `main`:
 
 Runs on push to `main` (after CI passes):
 - Creates a release PR with version bumps and changelog updates (conventional commits)
-- On merge of the release PR: publishes to crates.io and creates a git tag (`v{version}`)
+- On merge of the release PR: creates a git tag (`v{version}`) and GitHub Release (no crates.io publishing — all crates are `publish = false`)
 - Requires `RELEASE_PLZ_TOKEN` (PAT with `contents: write` and `pull-requests: write`)
-- Requires `CARGO_REGISTRY_TOKEN` for crates.io publishing
 
 **Important:** Uses a PAT (`RELEASE_PLZ_TOKEN`) instead of `GITHUB_TOKEN` so that the tag push triggers the release binary workflow.
 
 ### Release Binaries (`release.yml`)
 
 Triggered by `v*` tag push:
-- Builds cross-platform binaries: x86_64-linux, aarch64-linux (cross-compiled), x86_64-macos, aarch64-macos
-- Uploads to GitHub Releases with SHA256 checksums
-- Only builds the `mika` CLI binary (not gateway or server)
+- Builds cross-platform binaries with `--features telemetry`: x86_64-linux, aarch64-linux (cross-compiled), x86_64-macos, aarch64-macos
+- Uploads `mika` (CLI) and `mika-server` (HTTP server) to GitHub Releases with SHA256 checksums
+- `mika-gateway` excluded — deployed via Docker to Kubernetes, not as a standalone binary
+- Dashboard assets are not embedded in release builds (empty placeholder); the `/dashboard/` endpoint shows a branded "disabled" page
 
 ### Installer Script
 
