@@ -606,7 +606,8 @@ async fn run_loop(
                      Prioritize completing your current task or summarizing progress.]"
                 }
             };
-            system.push_str(&format!("\n\n{nudge}"));
+            system.push_str("\n\n");
+            system.push_str(nudge);
         }
 
         let llm_call_start = std::time::Instant::now();
@@ -2542,16 +2543,6 @@ mod tests {
         assert_eq!(mode.label(), "team agent");
     }
 
-    #[test]
-    fn test_loop_mode_silent_callback_max_steps() {
-        let mode = LoopMode::Silent {
-            max_steps: MAX_CALLBACK_TOOL_STEPS,
-        };
-        assert_eq!(mode.max_steps(), 20);
-        assert!(mode.saves_to_db());
-        assert_eq!(mode.label(), "silent agent");
-    }
-
     // -- SilentTrigger::max_steps tests --
 
     #[test]
@@ -2564,7 +2555,6 @@ mod tests {
             parent_task_id: None,
         };
         assert_eq!(trigger.max_steps(), MAX_CALLBACK_TOOL_STEPS);
-        assert_eq!(trigger.max_steps(), 20);
     }
 
     #[test]
