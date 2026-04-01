@@ -14,12 +14,13 @@ publish = false
 changelog_path = "CHANGELOG.md"
 changelog_include = ["mika-agent", "mika-cli"]
 
+# mika-agent excluded from packaging (release = false) because rust-embed
+# references ../../dashboard/dist/ which breaks cargo package --verify.
+# Its commits still appear in the changelog via mika-common's changelog_include.
 [[package]]
 name = "mika-agent"
 publish = false
-changelog_update = false
-git_release_enable = false
-git_tag_enable = false
+release = false
 
 [[package]]
 name = "mika-cli"
