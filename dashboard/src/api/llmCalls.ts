@@ -38,6 +38,14 @@ export function useLlmCalls(filters: LlmCallsFilters) {
   })
 }
 
+export function useLlmCall(id: string | undefined) {
+  return useQuery<LlmCallRow>({
+    queryKey: ['llm-call', id],
+    queryFn: () => apiFetch(`/llm-calls/${id}`),
+    enabled: !!id,
+  })
+}
+
 export function useTraceLlmCalls(traceId: string) {
   return useQuery<LlmCallRow[]>({
     queryKey: ['trace-llm-calls', traceId],

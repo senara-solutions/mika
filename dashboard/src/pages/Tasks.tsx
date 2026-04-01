@@ -14,7 +14,12 @@ function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
         {indent > 0 && (
           <span style={{ paddingLeft: `${indent * 1.5}rem` }} className="inline-block" />
         )}
-        {task.label}
+        <Link
+          to={`/tasks/${task.id}`}
+          className="text-accent hover:text-accent-light transition-colors"
+        >
+          {task.label}
+        </Link>
       </td>
       <td className="px-4 py-3">
         <Link
@@ -125,7 +130,13 @@ function ExpandableTaskRow({
           {indent > 0 && (
             <span style={{ paddingLeft: `${indent * 1.5}rem` }} className="inline-block" />
           )}
-          {task.label}
+          <Link
+            to={`/tasks/${task.id}`}
+            className="text-accent hover:text-accent-light transition-colors"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {task.label}
+          </Link>
         </td>
         <td className="px-4 py-3">
           <Link
@@ -400,7 +411,12 @@ function ScheduledSection() {
                   <TaskStatusBadge status={t.status} />
                 </td>
                 <td className="px-4 py-3 text-xs text-heading max-w-[300px] truncate">
-                  {t.label}
+                  <Link
+                    to={`/tasks/${t.id}`}
+                    className="text-accent hover:text-accent-light transition-colors"
+                  >
+                    {t.label}
+                  </Link>
                 </td>
                 <td className="px-4 py-3">
                   <Link

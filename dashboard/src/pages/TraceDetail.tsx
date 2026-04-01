@@ -630,7 +630,11 @@ export default function TraceDetail() {
                       {formatTimestamp(row.created_at)}
                     </td>
                     <td className="px-4 py-3 text-xs text-heading font-medium">{row.provider}</td>
-                    <td className="px-4 py-3 text-xs text-muted font-mono max-w-[200px] truncate">{row.model}</td>
+                    <td className="px-4 py-3 text-xs font-mono max-w-[200px] truncate">
+                      <Link to={`/llm-calls/${row.id}`} className="text-accent hover:text-accent-light transition-colors">
+                        {row.model}
+                      </Link>
+                    </td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.input_tokens)}</td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.output_tokens)}</td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">{formatLatency(row.latency_ms)}</td>
@@ -685,7 +689,15 @@ export default function TraceDetail() {
                         <td className="px-2 py-3 text-muted/30">
                           {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                         </td>
-                        <td className="px-4 py-3 text-xs text-heading font-mono font-medium">{row.tool_name}</td>
+                        <td className="px-4 py-3 text-xs font-mono font-medium">
+                          <Link
+                            to={`/tool-calls/${row.id}`}
+                            onClick={(e) => e.stopPropagation()}
+                            className="text-accent hover:text-accent-light transition-colors"
+                          >
+                            {row.tool_name}
+                          </Link>
+                        </td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${toolSourceBadge(row.tool_source)}`}>
                             {row.tool_source}
