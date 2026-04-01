@@ -3,8 +3,10 @@ use chrono::Timelike;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::LlmProvider;
+use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use tracing::{debug, info, warn};
 
@@ -354,6 +356,14 @@ impl TaskDispatcher {
             .await
         {
             warn!(session_id = %session_id, error = %e, "failed to create session for {}", session_prefix);
+        }
+
+        // Best-effort: extract structured metadata from the callback result text
+        // and persist it to the parent work item BEFORE the silent agent runs.
+        // This guarantees at minimum session_id, cost_usd, duration_ms, and turns
+        // are captured even if the agent exhausts its step budget.
+        if is_callback {
+            try_extract_callback_metadata(&self.db, task).await;
         }
 
         let params = SilentAgentParams {
@@ -774,6 +784,131 @@ impl TaskDispatcher {
     }
 }
 
+/// Extract metadata from callback result text and persist to parent work item.
+///
+/// This is a best-effort, fire-and-forget operation. Failures are logged
+/// but do not block the callback dispatch. Runs BEFORE the silent agent
+/// to guarantee base metadata is captured even if the agent exhausts its
+/// step budget.
+async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
+    // 1. Check parent_task_id exists
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+
+    // 2. Verify parent is a manual work item
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t)) if t.trigger_type == "manual" => t,
+        _ => return,
+    };
+
+    // 3. Parse result text
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    if extracted.is_null() {
+        return;
+    }
+
+    // 4. Shallow merge with existing metadata
+    let merged = match &parent.metadata {
+        Some(existing) => {
+            if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
+                if let Some(base_obj) = base.as_object_mut()
+                    && let Some(new_obj) = extracted.as_object()
+                {
+                    for (k, v) in new_obj {
+                        base_obj.insert(k.clone(), v.clone());
+                    }
+                }
+                base
+            } else {
+                extracted
+            }
+        }
+        None => extracted,
+    };
+
+    // 5. Persist
+    match db
+        .update_work_item_metadata(&parent_id, &merged.to_string())
+        .await
+    {
+        Ok(true) => info!(
+            parent_task_id = %parent_id,
+            callback_task_id = %task.id,
+            "engine: persisted callback metadata to work item"
+        ),
+        Ok(false) => warn!(
+            parent_task_id = %parent_id,
+            "engine: parent work item not found for metadata write"
+        ),
+        Err(e) => warn!(
+            parent_task_id = %parent_id,
+            error = %e,
+            "engine: failed to persist callback metadata"
+        ),
+    }
+}
+
+/// Parse structured fields from callback result text.
+///
+/// Expected format (lines from claude-pilot `run.sh`):
+/// ```text
+/// claude-pilot completed (status: done).
+/// Session: <session_id>
+/// Turns: <N>
+/// Cost: $<amount>
+/// Duration: <N>ms
+/// ```
+///
+/// Fields default to `"unknown"` in the handler when not available;
+/// this parser skips `"unknown"` values to avoid polluting metadata.
+fn extract_callback_fields(result: &str) -> serde_json::Value {
+    static RE_SESSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Session:\s*(\S+)").unwrap());
+    static RE_TURNS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Turns:\s*(\d+)").unwrap());
+    static RE_COST: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Cost:\s*\$([0-9]+(?:\.[0-9]+)?)").unwrap());
+    static RE_DURATION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Duration:\s*(\d+)ms").unwrap());
+
+    let mut map = serde_json::Map::new();
+
+    if let Some(cap) = RE_SESSION.captures(result) {
+        let val = &cap[1];
+        if val != "unknown" {
+            map.insert("session_id".into(), serde_json::Value::String(val.into()));
+        }
+    }
+    if let Some(cap) = RE_TURNS.captures(result)
+        && let Ok(n) = cap[1].parse::<u64>()
+    {
+        map.insert("turns".into(), serde_json::Value::Number(n.into()));
+    }
+    if let Some(cap) = RE_COST.captures(result) {
+        let val = &cap[1];
+        if val != "unknown" {
+            map.insert("cost_usd".into(), serde_json::Value::String(val.into()));
+        }
+    }
+    if let Some(cap) = RE_DURATION.captures(result)
+        && let Ok(n) = cap[1].parse::<u64>()
+    {
+        map.insert("duration_ms".into(), serde_json::Value::Number(n.into()));
+    }
+
+    if map.is_empty() {
+        serde_json::Value::Null
+    } else {
+        // Nest under "claude_pilot" key to match self-dev prompt schema
+        serde_json::json!({ "claude_pilot": map })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,5 +1127,278 @@ mod tests {
             "reminder resume_agent should not error: {:?}",
             result
         );
+    }
+
+    // ── extract_callback_fields tests ──
+
+    #[test]
+    fn test_extract_success_format() {
+        let result = "claude-pilot completed (status: done).\n\
+                       Session: abc-123-def\n\
+                       Turns: 91\n\
+                       Cost: $7.07\n\
+                       Duration: 996000ms";
+        let extracted = extract_callback_fields(result);
+        let cp = &extracted["claude_pilot"];
+        assert_eq!(cp["session_id"], "abc-123-def");
+        assert_eq!(cp["turns"], 91);
+        assert_eq!(cp["cost_usd"], "7.07");
+        assert_eq!(cp["duration_ms"], 996000);
+    }
+
+    #[test]
+    fn test_extract_pipeline_failure_format() {
+        let result = "PIPELINE FAILURE: zero commits produced.\n\
+                       Session: sess-456\n\
+                       Turns: 45\n\
+                       Cost: $3.50\n\
+                       Duration: 500000ms";
+        let extracted = extract_callback_fields(result);
+        let cp = &extracted["claude_pilot"];
+        assert_eq!(cp["session_id"], "sess-456");
+        assert_eq!(cp["turns"], 45);
+        assert_eq!(cp["cost_usd"], "3.50");
+        assert_eq!(cp["duration_ms"], 500000);
+    }
+
+    #[test]
+    fn test_extract_partial_fields() {
+        let result = "claude-pilot completed (status: done).\n\
+                       Session: my-session\n\
+                       Cost: $1.23";
+        let extracted = extract_callback_fields(result);
+        let cp = &extracted["claude_pilot"];
+        assert_eq!(cp["session_id"], "my-session");
+        assert_eq!(cp["cost_usd"], "1.23");
+        assert!(cp.get("turns").is_none());
+        assert!(cp.get("duration_ms").is_none());
+    }
+
+    #[test]
+    fn test_extract_unknown_values_skipped() {
+        let result = "claude-pilot completed (status: done).\n\
+                       Session: unknown\n\
+                       Turns: 10\n\
+                       Cost: $unknown\n\
+                       Duration: 5000ms";
+        let extracted = extract_callback_fields(result);
+        let cp = &extracted["claude_pilot"];
+        // "unknown" session and cost should be skipped
+        assert!(cp.get("session_id").is_none());
+        assert_eq!(cp["turns"], 10);
+        // Cost regex won't match "$unknown" since it expects digits
+        assert!(cp.get("cost_usd").is_none());
+        assert_eq!(cp["duration_ms"], 5000);
+    }
+
+    #[test]
+    fn test_extract_garbage_returns_null() {
+        let result = "some random text with no structured fields";
+        let extracted = extract_callback_fields(result);
+        assert!(extracted.is_null());
+    }
+
+    #[test]
+    fn test_extract_empty_returns_null() {
+        assert!(extract_callback_fields("").is_null());
+    }
+
+    #[tokio::test]
+    async fn test_try_extract_callback_metadata_writes_to_parent() {
+        let db = test_db();
+
+        // Create a manual work item (parent)
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement feature #123".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        // Create a callback task (child) with result text
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+
+        // Simulate callback completion with result
+        db.update_task_completed(
+            &callback_id,
+            Some(
+                "claude-pilot completed (status: done).\n\
+                 Session: test-session-id\n\
+                 Turns: 91\n\
+                 Cost: $7.07\n\
+                 Duration: 996000ms",
+            ),
+        )
+        .await
+        .unwrap();
+
+        // Load the callback task and run extraction
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_extract_callback_metadata(&db, &task).await;
+
+        // Verify metadata was written to parent
+        let parent_task = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(parent_task.metadata.as_ref().unwrap()).unwrap();
+        let cp = &metadata["claude_pilot"];
+        assert_eq!(cp["session_id"], "test-session-id");
+        assert_eq!(cp["turns"], 91);
+        assert_eq!(cp["cost_usd"], "7.07");
+        assert_eq!(cp["duration_ms"], 996000);
+    }
+
+    #[tokio::test]
+    async fn test_try_extract_callback_metadata_merges_with_existing() {
+        let db = test_db();
+
+        // Create a manual work item with existing metadata
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement feature #456".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: Some(r#"{"pipeline_retry_count": 1}"#.to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        // Create callback task
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+
+        db.update_task_completed(
+            &callback_id,
+            Some(
+                "claude-pilot completed (status: done).\n\
+                 Session: sess-789\n\
+                 Turns: 50\n\
+                 Cost: $4.00\n\
+                 Duration: 300000ms",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_extract_callback_metadata(&db, &task).await;
+
+        // Verify metadata was merged (existing key preserved, new key added)
+        let parent_task = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(parent_task.metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(metadata["pipeline_retry_count"], 1);
+        assert_eq!(metadata["claude_pilot"]["session_id"], "sess-789");
+        assert_eq!(metadata["claude_pilot"]["turns"], 50);
+    }
+
+    #[tokio::test]
+    async fn test_try_extract_callback_metadata_noop_no_parent() {
+        let db = test_db();
+
+        // Callback task with no parent_task_id — should be a no-op
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some("Session: abc\nTurns: 10"))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        // Should not panic or error — just returns early
+        try_extract_callback_metadata(&db, &task).await;
     }
 }
