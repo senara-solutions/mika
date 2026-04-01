@@ -29,6 +29,7 @@ use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::ProviderKind;
 
 const MAX_TOOL_STEPS: usize = 10;
+const MAX_CALLBACK_TOOL_STEPS: usize = 20;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
@@ -179,7 +180,9 @@ enum LoopMode {
     /// Standard conversation: captures thinking, tracks usage, saves to DB, follows up on empty.
     Conversation,
     /// Silent background task: saves to DB but no thinking/usage/follow-up.
-    Silent,
+    /// The `max_steps` field allows per-trigger step limits (e.g., callbacks get more
+    /// steps than heartbeats). See `SilentTrigger::max_steps()`.
+    Silent { max_steps: usize },
     /// Team sub-agent: follows up on empty but no thinking/usage/DB saves.
     Team,
 }
@@ -194,12 +197,13 @@ impl LoopMode {
     }
 
     fn saves_to_db(&self) -> bool {
-        matches!(self, Self::Conversation | Self::Silent)
+        matches!(self, Self::Conversation | Self::Silent { .. })
     }
 
     fn max_steps(&self) -> usize {
         match self {
             Self::Team => MAX_TEAM_TOOL_STEPS,
+            Self::Silent { max_steps } => *max_steps,
             _ => MAX_TOOL_STEPS,
         }
     }
@@ -207,7 +211,7 @@ impl LoopMode {
     fn label(&self) -> &'static str {
         match self {
             Self::Conversation => "agent",
-            Self::Silent => "silent agent",
+            Self::Silent { .. } => "silent agent",
             Self::Team => "team agent",
         }
     }
@@ -396,6 +400,85 @@ fn format_step_exceeded_fallback(summaries: &[ToolCallSummary]) -> String {
     msg
 }
 
+/// Result of a continuation turn after max steps are exceeded.
+struct ContinuationResult {
+    /// The summary text (either LLM-generated or the structured fallback).
+    text: String,
+    /// LLM usage from the continuation call, if it succeeded.
+    usage: Option<LlmUsage>,
+}
+
+/// Attempt a continuation turn after the agent exceeded max tool steps.
+///
+/// Strips the step-awareness nudge, disables tools and thinking, then makes one
+/// final LLM call asking for a summary. Falls back to `format_step_exceeded_fallback`
+/// if the API call fails or times out. Used by Conversation, Team, and Silent modes.
+async fn attempt_continuation_turn(
+    request: &mut LlmRequest,
+    llm: &dyn LlmProvider,
+    loop_result: &LoopResult,
+    label: &str,
+) -> ContinuationResult {
+    // Strip the step-awareness nudge from the system prompt so the continuation
+    // turn does not see stale "2 steps remaining" text.
+    if let Some(ref mut system) = request.system {
+        system.truncate(loop_result.system_prompt_original_len);
+    }
+    request.tools = None;
+    request.thinking = None;
+    request.messages.push(LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Text(
+            "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
+        ),
+    });
+
+    let continuation = tokio::time::timeout(
+        Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
+        llm.send_message(request),
+    )
+    .await;
+
+    match continuation {
+        Ok(Ok(resp)) => {
+            let t = mika_common::llm::strip_internal_tags(&resp.text());
+            let u = Some(resp.usage);
+            if t.is_empty() {
+                ContinuationResult {
+                    text: format_step_exceeded_fallback(&loop_result.tool_call_summaries),
+                    usage: u,
+                }
+            } else {
+                ContinuationResult { text: t, usage: u }
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(
+                error = %e,
+                tool_calls = loop_result.tool_call_summaries.len(),
+                label,
+                "continuation turn API error after max steps"
+            );
+            ContinuationResult {
+                text: format_step_exceeded_fallback(&loop_result.tool_call_summaries),
+                usage: None,
+            }
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                tool_calls = loop_result.tool_call_summaries.len(),
+                label,
+                "continuation turn timed out after max steps"
+            );
+            ContinuationResult {
+                text: format_step_exceeded_fallback(&loop_result.tool_call_summaries),
+                usage: None,
+            }
+        }
+    }
+}
+
 /// Result from the shared tool-step loop.
 struct LoopResult {
     text: Option<String>,
@@ -508,15 +591,22 @@ async fn run_loop(
             strip_prior_images(&mut request.messages);
         }
 
-        // Nudge the model to wrap up when approaching the step limit
-        if matches!(mode, LoopMode::Conversation | LoopMode::Team)
-            && step == max_steps - 2
+        // Nudge the model to wrap up when approaching the step limit.
+        // All modes get the nudge — silent callbacks need it most (#375).
+        if step == max_steps - 2
             && let Some(ref mut system) = request.system
         {
-            system.push_str(
-                "\n\n[SYSTEM: You have 2 tool steps remaining before the limit. \
-                 Prioritize completing your current task or summarizing progress.]",
-            );
+            let nudge = match mode {
+                LoopMode::Silent { .. } => {
+                    "[SYSTEM: You have 2 tool steps remaining before the limit. \
+                     Prioritize completing your current action or notifying the user via send_message.]"
+                }
+                _ => {
+                    "[SYSTEM: You have 2 tool steps remaining before the limit. \
+                     Prioritize completing your current task or summarizing progress.]"
+                }
+            };
+            system.push_str(&format!("\n\n{nudge}"));
         }
 
         let llm_call_start = std::time::Instant::now();
@@ -1212,73 +1302,21 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     .await?;
 
     if result.max_steps_exceeded {
-        // Attempt a continuation turn: disable tools, force a text summary.
-        // Strip the step-awareness nudge from the system prompt so the continuation
-        // turn does not see stale "2 steps remaining" text.
-        if let Some(ref mut system) = request.system {
-            system.truncate(result.system_prompt_original_len);
-        }
-        request.tools = None;
-        request.thinking = None;
-        request.messages.push(LlmMessage {
-            role: LlmRole::User,
-            content: LlmContent::Text(
-                "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
-            ),
-        });
-
-        let continuation = tokio::time::timeout(
-            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
-            llm.send_message(&request),
-        )
-        .await;
-
-        let (text, continuation_usage) = match continuation {
-            Ok(Ok(resp)) => {
-                let t = mika_common::llm::strip_internal_tags(&resp.text());
-                let u = Some(resp.usage);
-                if t.is_empty() {
-                    (
-                        format_step_exceeded_fallback(&result.tool_call_summaries),
-                        u,
-                    )
-                } else {
-                    (t, u)
-                }
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, tool_calls = result.tool_call_summaries.len(), "continuation turn API error after max steps");
-                (
-                    format_step_exceeded_fallback(&result.tool_call_summaries),
-                    None,
-                )
-            }
-            Err(_) => {
-                warn!(
-                    timeout_secs = CONTINUATION_TIMEOUT_SECS,
-                    tool_calls = result.tool_call_summaries.len(),
-                    "continuation turn timed out after max steps"
-                );
-                (
-                    format_step_exceeded_fallback(&result.tool_call_summaries),
-                    None,
-                )
-            }
-        };
+        let cont = attempt_continuation_turn(&mut request, llm, &result, "agent").await;
 
         let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
         db.save_message_with_metadata(
             session_id,
             "assistant",
-            &text,
+            &cont.text,
             metadata.as_deref(),
             Some(trace_id),
         )
         .await?;
         return Ok(AgentOutput {
-            text: Some(text),
+            text: Some(cont.text),
             thinking: result.thinking,
-            usage: continuation_usage.or(result.usage),
+            usage: cont.usage.or(result.usage),
         });
     }
 
@@ -1586,6 +1624,20 @@ pub enum SilentTrigger {
     },
 }
 
+impl SilentTrigger {
+    /// Returns the max tool steps budget for this trigger type.
+    ///
+    /// Callbacks get a higher budget (`MAX_CALLBACK_TOOL_STEPS`) because complex
+    /// callback workflows (e.g., PR discovery → QA delegation → verdict processing
+    /// → status update) routinely need 12-15+ steps. See #375.
+    fn max_steps(&self) -> usize {
+        match self {
+            Self::Callback { .. } => MAX_CALLBACK_TOOL_STEPS,
+            _ => MAX_TOOL_STEPS,
+        }
+    }
+}
+
 /// Parameters for running the silent agent loop (heartbeat/reminders).
 pub struct SilentAgentParams<'a> {
     pub db: &'a AsyncDatabase,
@@ -1877,6 +1929,11 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         skills_dirty: params.skills_dirty,
         is_reflection,
         is_task_context: true,
+        // Intentionally false: silent callback loop prevention relies on
+        // `long_running: None` (blocks long-running task spawning) and
+        // `is_task_context: true` (blocks top-level work item creation).
+        // `is_callback_turn` is only meaningful in the Conversation mode path
+        // (TUI poll_callback_tasks) where it additionally gates create_work_item.
         is_callback_turn: false,
     };
 
@@ -1895,13 +1952,22 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         thinking: None,
     };
 
-    let mode = LoopMode::Silent;
+    let mode = LoopMode::Silent {
+        max_steps: params.trigger.max_steps(),
+    };
     // Silent mode uses safe_always_on_skills (builtin handlers only) — no skills
     // in this path declare required_tools, so pass an empty set.
     let no_required_tools = HashSet::new();
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
-    run_loop(
+    let trigger_label = match &params.trigger {
+        SilentTrigger::Heartbeat => "heartbeat",
+        SilentTrigger::Reflection => "reflection",
+        SilentTrigger::Callback { .. } => "callback",
+        SilentTrigger::SkillRun { .. } => "skill_run",
+        SilentTrigger::Reminder { .. } => "reminder",
+    };
+    let result = run_loop(
         effective_llm,
         tools,
         &skill_tool_map,
@@ -1918,6 +1984,30 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         store_tools,
     )
     .await?;
+
+    // Continuation turn: if the agent ran out of tool steps, attempt one final
+    // summary turn and notify the user. Without this, the callback result would
+    // be silently swallowed. See #375.
+    if result.max_steps_exceeded {
+        warn!(
+            trigger = trigger_label,
+            max_steps = params.trigger.max_steps(),
+            session_id = params.session_id,
+            "silent agent exceeded max tool steps"
+        );
+
+        let cont =
+            attempt_continuation_turn(&mut request, effective_llm, &result, trigger_label).await;
+
+        if let Some(ref sender) = params.message_sender {
+            let _ = sender
+                .send(&format!(
+                    "[Background task exceeded tool step limit]\n\n{}",
+                    cont.text
+                ))
+                .await;
+        }
+    }
 
     // Post-loop: record reflection results and optionally notify user
     if is_reflection {
@@ -2171,51 +2261,15 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     .await?;
 
     if result.max_steps_exceeded {
-        // Continuation turn: strip tools, ask agent to summarize what it accomplished.
-        // Same pattern as the CLI conversation loop.
-        if let Some(ref mut system) = request.system {
-            system.truncate(result.system_prompt_original_len);
-        }
-        request.tools = None;
-        request.thinking = None;
-        request.messages.push(LlmMessage {
-            role: LlmRole::User,
-            content: LlmContent::Text(
-                "[You ran out of tool steps. Summarize what you accomplished and what remains undone. Be concise.]".to_string(),
-            ),
-        });
-
-        let continuation = tokio::time::timeout(
-            Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
-            llm.send_message(&request),
-        )
-        .await;
-
-        let text = match continuation {
-            Ok(Ok(resp)) => {
-                let t = mika_common::llm::strip_internal_tags(&resp.text());
-                if t.is_empty() {
-                    format_step_exceeded_fallback(&result.tool_call_summaries)
-                } else {
-                    t
-                }
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "team agent continuation turn API error");
-                format_step_exceeded_fallback(&result.tool_call_summaries)
-            }
-            Err(_) => {
-                warn!(
-                    timeout_secs = CONTINUATION_TIMEOUT_SECS,
-                    "team agent continuation turn timed out"
-                );
-                format_step_exceeded_fallback(&result.tool_call_summaries)
-            }
-        };
+        let cont = attempt_continuation_turn(&mut request, llm, &result, "team agent").await;
 
         // Auto-complete child task if this agent was spawned as part of a team task tree
         if let Some(task_id) = params.child_task_id {
-            match params.db.update_task_completed(task_id, Some(&text)).await {
+            match params
+                .db
+                .update_task_completed(task_id, Some(&cont.text))
+                .await
+            {
                 Ok(false) => warn!(
                     task_id,
                     "child task completion had no effect (already completed or agent_id mismatch)"
@@ -2225,7 +2279,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
             }
         }
 
-        return Ok(Some(text));
+        return Ok(Some(cont.text));
     }
 
     // Auto-complete child task if this agent was spawned as part of a team task tree
@@ -2469,11 +2523,14 @@ mod tests {
 
     #[test]
     fn test_loop_mode_silent_properties() {
-        let mode = LoopMode::Silent;
+        let mode = LoopMode::Silent {
+            max_steps: MAX_TOOL_STEPS,
+        };
         assert!(!mode.is_conversation());
         assert!(!mode.follow_up_on_empty());
         assert!(mode.saves_to_db());
         assert_eq!(mode.label(), "silent agent");
+        assert_eq!(mode.max_steps(), MAX_TOOL_STEPS);
     }
 
     #[test]
@@ -2483,6 +2540,52 @@ mod tests {
         assert!(mode.follow_up_on_empty());
         assert!(!mode.saves_to_db());
         assert_eq!(mode.label(), "team agent");
+    }
+
+    #[test]
+    fn test_loop_mode_silent_callback_max_steps() {
+        let mode = LoopMode::Silent {
+            max_steps: MAX_CALLBACK_TOOL_STEPS,
+        };
+        assert_eq!(mode.max_steps(), 20);
+        assert!(mode.saves_to_db());
+        assert_eq!(mode.label(), "silent agent");
+    }
+
+    // -- SilentTrigger::max_steps tests --
+
+    #[test]
+    fn test_silent_trigger_callback_gets_higher_step_limit() {
+        let trigger = SilentTrigger::Callback {
+            task_id: "test-task".to_string(),
+            label: "test".to_string(),
+            result: "done".to_string(),
+            failed: false,
+            parent_task_id: None,
+        };
+        assert_eq!(trigger.max_steps(), MAX_CALLBACK_TOOL_STEPS);
+        assert_eq!(trigger.max_steps(), 20);
+    }
+
+    #[test]
+    fn test_silent_trigger_non_callback_gets_default_step_limit() {
+        assert_eq!(SilentTrigger::Heartbeat.max_steps(), MAX_TOOL_STEPS);
+        assert_eq!(SilentTrigger::Reflection.max_steps(), MAX_TOOL_STEPS);
+        assert_eq!(
+            SilentTrigger::SkillRun {
+                skill_name: "test".to_string()
+            }
+            .max_steps(),
+            MAX_TOOL_STEPS
+        );
+        assert_eq!(
+            SilentTrigger::Reminder {
+                task_id: "test".to_string(),
+                message: "test".to_string()
+            }
+            .max_steps(),
+            MAX_TOOL_STEPS
+        );
     }
 
     // -- check_onboarding tests --
