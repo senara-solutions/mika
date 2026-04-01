@@ -1,7 +1,7 @@
 ---
 title: "feat: mika-dev auto-retry on fixable QA blocks"
 type: feat
-status: active
+status: completed
 date: 2026-04-02
 issue: "#377"
 repos: [mika-skills]
