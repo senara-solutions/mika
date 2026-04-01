@@ -1,7 +1,7 @@
 ---
 title: "feat: Add task-id correlation to intermediate long-running skill calls"
 type: feat
-status: active
+status: completed
 date: 2026-04-01
 origin: docs/brainstorms/2026-03-31-task-correlation-on-intermediate-calls-brainstorm.md
 issue: 358
