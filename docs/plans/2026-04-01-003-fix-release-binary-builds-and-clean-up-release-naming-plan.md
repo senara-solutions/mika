@@ -1,7 +1,7 @@
 ---
 title: "Fix release binary builds and clean up release naming"
 type: fix
-status: active
+status: completed
 date: 2026-04-01
 issue: "#372"
 ---
