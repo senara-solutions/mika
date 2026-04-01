@@ -57,11 +57,11 @@ Maintainer merges release PR
     |
     v
 release-plz.yml [release job]
-    |  publishes crates (mika-common -> mika-agent -> mika-cli)
-    |  creates git tag (v0.2.0) using PAT
+    |  creates git tag (v0.2.0) and GitHub Release using PAT
+    |  (no crates.io publishing — all crates are publish = false)
     v
 release.yml (triggered by v* tag)
-    |  builds mika binary for 4 targets
+    |  builds mika + mika-server binaries for 4 targets (with telemetry)
     |  uploads .tar.gz + .sha256 to GitHub Release
     v
 End user: curl install.sh | sh
@@ -90,7 +90,7 @@ Uses `taiki-e/setup-cross-toolchain-action` (conditional on `matrix.target == 'a
 
 **4. Build Matrix**
 
-Only the `mika` CLI binary is built for distribution. `mika-server` and `mika-gateway` are Docker-only deployments.
+Both `mika` CLI and `mika-server` HTTP server binaries are built for distribution (with `--features telemetry`). `mika-gateway` is Docker-only deployment. Release binaries use an empty `dashboard/dist/` placeholder — the embedded dashboard shows a "disabled" page; full dashboard embedding requires a Node.js build step (tracked as follow-up).
 
 | Target | Runner | Notes |
 |--------|--------|-------|
@@ -142,7 +142,9 @@ Fork safety via `if: github.repository_owner == 'senara-solutions'` on all relea
 
 New lints introduced: `io_other_error`, `collapsible_if` with let-chains, `vec_init_then_push`, `needless_borrow`, `print_literal`, `new_without_default`. Fixed across all 4 crates. Bulk fix with `cargo clippy --fix --allow-dirty` for mechanical changes (let-chains).
 
-### Workspace Crate Publishing Order
+### Workspace Crate Publishing Order (Historical)
+
+> **Note:** All crates are now `publish = false` — no crates.io publishing. This section is retained for historical context.
 
 `mika-cli` depends on `mika-agent` depends on `mika-common`. release-plz handles dependency-ordered publishing natively and treats "already published" as success, making re-runs idempotent.
 
@@ -180,7 +182,8 @@ Multiple rapid pushes to `main` can cause concurrent release-plz runs that confl
 | Secret | Purpose |
 |--------|---------|
 | `RELEASE_PLZ_TOKEN` | PAT with `contents:write` + `pull_requests:write`. Required for tag-triggered downstream workflows. |
-| `CARGO_REGISTRY_TOKEN` | crates.io API token scoped to `mika-common`, `mika-agent`, `mika-cli` |
+
+> **Note:** `CARGO_REGISTRY_TOKEN` was removed — all crates are `publish = false` (no crates.io publishing). The secret can be deleted from GitHub repository settings.
 
 ## Files Changed
 
