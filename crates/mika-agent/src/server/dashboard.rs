@@ -230,7 +230,14 @@ pub async fn handle_agent_sessions(
 
     let (data, total) = match state
         .dashboard_db
-        .list_sessions_paginated_with_count(Some(agent_id.clone()), None, None, per_page, offset)
+        .list_sessions_paginated_with_count(
+            Some(agent_id.clone()),
+            None,
+            None,
+            None,
+            per_page,
+            offset,
+        )
         .await
     {
         Ok(result) => result,
@@ -279,6 +286,8 @@ pub struct SessionsQuery {
     pub agent_id: Option<String>,
     pub channel_type: Option<String>,
     pub session_id: Option<String>,
+    /// Filter sessions by correlated task_id (stored in session metadata JSON).
+    pub task_id: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -296,6 +305,7 @@ pub async fn handle_sessions_list(
             q.agent_id,
             q.channel_type,
             q.session_id,
+            q.task_id,
             per_page,
             offset,
         )

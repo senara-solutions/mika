@@ -15,14 +15,18 @@ use crate::init;
 struct AskJsonResponse {
     role: &'static str,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pending_tasks: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     message: &str,
     agent_name: &str,
     task_id: Option<&str>,
+    task_complete: bool,
     session_id: Option<&str>,
     parent_task_id: Option<&str>,
     format: &OutputFormat,
@@ -58,9 +62,16 @@ pub async fn run(
             ctx.async_db.agent_id()
         );
     }
+    // Store task_id in session metadata for observability correlation
+    let session_metadata = task_id.map(|tid| format!(r#"{{"task_id":"{}"}}"#, tid));
     if let Err(e) = ctx
         .async_db
-        .create_session(&session_id, ctx.async_db.agent_id(), "cli")
+        .create_session_with_metadata(
+            &session_id,
+            ctx.async_db.agent_id(),
+            "cli",
+            session_metadata.as_deref(),
+        )
         .await
     {
         tracing::warn!(error = %e, "failed to create session");
@@ -87,69 +98,99 @@ pub async fn run(
         anyhow::bail!("Empty message. Provide a message argument or pipe via stdin with \"-\".");
     }
 
-    const MAX_CALLBACK_RESULT: usize = 100_000; // 100KB, matches server limit
-    if task_id.is_some() && user_message.len() > MAX_CALLBACK_RESULT {
-        anyhow::bail!(
-            "Callback result too large: {} bytes (max: {MAX_CALLBACK_RESULT})",
-            user_message.len()
-        );
-    }
-
-    // If --task-id is provided, mark the task as completed and exit.
-    // The TUI tick loop (or server dispatcher) handles delivery to the user.
+    // --task-complete path: validate and complete the callback task, then exit.
+    // --task-id without --task-complete: correlation only — validate existence, then
+    // fall through to the normal agent loop with task_id in session/trace metadata.
     if let Some(tid) = task_id {
-        let task = match ctx.async_db.get_task(tid).await {
-            Ok(Some(task)) => task,
+        if task_complete {
+            // Completion path: size limit + existing completion logic
+            const MAX_CALLBACK_RESULT: usize = 100_000; // 100KB, matches server limit
+            if user_message.len() > MAX_CALLBACK_RESULT {
+                anyhow::bail!(
+                    "Callback result too large: {} bytes (max: {MAX_CALLBACK_RESULT})",
+                    user_message.len()
+                );
+            }
+
+            let task = match ctx.async_db.get_task(tid).await {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    anyhow::bail!("Task '{}' not found.", tid);
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to load task '{}': {}", tid, e);
+                }
+            };
+
+            if task.trigger_type != "callback" {
+                anyhow::bail!(
+                    "Task '{}' has trigger_type '{}', not 'callback'. \
+                     --task-id --task-complete is only for callback tasks.",
+                    tid,
+                    task.trigger_type
+                );
+            }
+            if !matches!(task.status.as_str(), "pending" | "in_progress") {
+                anyhow::bail!(
+                    "Task '{}' has status '{}' and cannot be completed.",
+                    tid,
+                    task.status
+                );
+            }
+            if !ctx
+                .async_db
+                .update_task_completed(tid, Some(&user_message))
+                .await?
+            {
+                anyhow::bail!(
+                    "Task '{}' could not be completed: already in a terminal state.",
+                    tid
+                );
+            }
+
+            // Check if all siblings are done and parent task should be dispatched.
+            if let Ok(Some(parent_id)) = ctx.async_db.try_complete_parent_on_sibling_done(tid).await
+            {
+                tracing::info!(
+                    task_id = tid,
+                    parent_id = %parent_id,
+                    "All sibling tasks complete; parent task ready for dispatch"
+                );
+            }
+
+            // End the session so the dashboard doesn't show it as "ongoing"
+            if let Err(e) = ctx.async_db.end_session(&session_id).await {
+                tracing::warn!(error = %e, "failed to end session");
+            }
+            return Ok(());
+        }
+
+        // Correlation-only path: validate task exists, emit deprecation warning if needed
+        match ctx.async_db.get_task(tid).await {
+            Ok(Some(task)) => {
+                // Deprecation bridge: warn if this looks like an old-style completion call
+                if task.trigger_type == "callback"
+                    && matches!(task.status.as_str(), "pending" | "in_progress")
+                {
+                    tracing::warn!(
+                        task_id = tid,
+                        "DEPRECATED: --task-id without --task-complete no longer completes \
+                         callback tasks. Add --task-complete to preserve completion behavior."
+                    );
+                    eprintln!(
+                        "[mika] WARNING: --task-id without --task-complete no longer completes \
+                         callback tasks. Add --task-complete to preserve completion behavior."
+                    );
+                }
+            }
             Ok(None) => {
                 anyhow::bail!("Task '{}' not found.", tid);
             }
             Err(e) => {
-                anyhow::bail!("Failed to load task '{}': {}", tid, e);
+                tracing::warn!(error = %e, task_id = tid, "failed to validate task existence");
             }
-        };
-
-        if task.trigger_type != "callback" {
-            anyhow::bail!(
-                "Task '{}' has trigger_type '{}', not 'callback'. \
-                 --task-id is only for callback tasks.",
-                tid,
-                task.trigger_type
-            );
         }
-        if !matches!(task.status.as_str(), "pending" | "in_progress") {
-            anyhow::bail!(
-                "Task '{}' has status '{}' and cannot be completed.",
-                tid,
-                task.status
-            );
-        }
-        if !ctx
-            .async_db
-            .update_task_completed(tid, Some(&user_message))
-            .await?
-        {
-            anyhow::bail!(
-                "Task '{}' could not be completed: already in a terminal state.",
-                tid
-            );
-        }
-
-        // Check if all siblings are done and parent task should be dispatched.
-        // In CLI one-shot mode we can't run the dispatcher, but we mark the
-        // parent ready so the next TaskEngine tick (in TUI or server) picks it up.
-        if let Ok(Some(parent_id)) = ctx.async_db.try_complete_parent_on_sibling_done(tid).await {
-            tracing::info!(
-                task_id = tid,
-                parent_id = %parent_id,
-                "All sibling tasks complete; parent task ready for dispatch"
-            );
-        }
-
-        // End the session so the dashboard doesn't show it as "ongoing"
-        if let Err(e) = ctx.async_db.end_session(&session_id).await {
-            tracing::warn!(error = %e, "failed to end session");
-        }
-        return Ok(());
+        // Fall through to normal agent loop with task_id in session metadata + trace
     }
 
     // Prepend work item context if --parent-task-id is provided
@@ -203,6 +244,7 @@ pub async fn run(
         is_callback_turn: false,
         settings: Some(&ctx.settings),
         trace_id: None,
+        correlated_task_id: task_id.map(|s| s.to_string()),
     })
     .await;
 
@@ -246,6 +288,7 @@ pub async fn run(
             let response = AskJsonResponse {
                 role: "assistant",
                 content: output.text,
+                task_id: task_id.map(|s| s.to_string()),
                 pending_tasks: pending_callbacks,
             };
             println!("{}", serde_json::to_string(&response)?);
@@ -431,6 +474,7 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: Some("Hello, world!".to_string()),
+            task_id: None,
             pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -442,6 +486,7 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: None,
+            task_id: None,
             pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -453,6 +498,7 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: Some("Line 1\nLine 2\t\"quoted\"".to_string()),
+            task_id: None,
             pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -466,6 +512,7 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: Some("I've started the implementation.".to_string()),
+            task_id: None,
             pending_tasks: vec!["task-abc-123".to_string(), "task-def-456".to_string()],
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -480,10 +527,40 @@ mod tests {
         let response = AskJsonResponse {
             role: "assistant",
             content: Some("Done.".to_string()),
+            task_id: None,
             pending_tasks: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
         // pending_tasks should be omitted entirely when empty
         assert!(!json.contains("pending_tasks"));
+    }
+
+    #[test]
+    fn test_json_response_with_task_id() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Permission granted.".to_string()),
+            task_id: Some("abc-123-def".to_string()),
+            pending_tasks: vec![],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["role"], "assistant");
+        assert_eq!(parsed["task_id"], "abc-123-def");
+        // pending_tasks should be omitted when empty
+        assert!(parsed.get("pending_tasks").is_none());
+    }
+
+    #[test]
+    fn test_json_response_omits_none_task_id() {
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Hello.".to_string()),
+            task_id: None,
+            pending_tasks: vec![],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        // task_id should be omitted when None
+        assert!(!json.contains("task_id"));
     }
 }

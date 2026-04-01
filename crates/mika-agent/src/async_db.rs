@@ -1400,6 +1400,7 @@ impl AsyncDatabase {
         agent_id: Option<String>,
         channel_type: Option<String>,
         session_id: Option<String>,
+        task_id: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionWithStats>> {
@@ -1408,6 +1409,7 @@ impl AsyncDatabase {
                 agent_id.as_deref(),
                 channel_type.as_deref(),
                 session_id.as_deref(),
+                task_id.as_deref(),
                 limit,
                 offset,
             )
@@ -1420,12 +1422,14 @@ impl AsyncDatabase {
         agent_id: Option<String>,
         channel_type: Option<String>,
         session_id: Option<String>,
+        task_id: Option<String>,
     ) -> Result<u64> {
         self.with_db(move |db| {
             db.count_sessions(
                 agent_id.as_deref(),
                 channel_type.as_deref(),
                 session_id.as_deref(),
+                task_id.as_deref(),
             )
         })
         .await
@@ -1503,6 +1507,7 @@ impl AsyncDatabase {
         agent_id: Option<String>,
         channel_type: Option<String>,
         session_id: Option<String>,
+        task_id: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SessionWithStats>, u64)> {
@@ -1511,6 +1516,7 @@ impl AsyncDatabase {
                 agent_id.as_deref(),
                 channel_type.as_deref(),
                 session_id.as_deref(),
+                task_id.as_deref(),
                 limit,
                 offset,
             )

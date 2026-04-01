@@ -855,6 +855,10 @@ pub struct AgentParams<'a> {
     pub settings: Option<&'a Settings>,
     /// Optional external trace_id (e.g. from HTTP request_id). If None, a new one is generated.
     pub trace_id: Option<String>,
+    /// Optional task_id for observability correlation. When a `mika ask` call is associated
+    /// with a long-running task (e.g., intermediate permission requests), this field links
+    /// the agent turn to that task in traces and session metadata.
+    pub correlated_task_id: Option<String>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -889,6 +893,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
+    let correlated_task_id = params.correlated_task_id.as_deref().unwrap_or("");
     let span = info_span!(
         target: "mika::otel",
         "agent_turn",
@@ -896,6 +901,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         mode = "conversation",
         trace_id = %trace_id,
         channel = %params.channel_type,
+        correlated_task_id = %correlated_task_id,
     );
 
     let timeout_result = tokio::time::timeout(

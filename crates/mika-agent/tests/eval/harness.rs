@@ -68,6 +68,7 @@ impl EvalHarness {
             is_callback_turn: self.is_callback_turn,
             settings: Some(&self.settings),
             trace_id: Some(self.trace_id.clone()),
+            correlated_task_id: None,
         };
 
         let output = run_agent(&params).await?;
