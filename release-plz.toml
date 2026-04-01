@@ -9,29 +9,34 @@ pr_labels = ["release"]
 
 [[package]]
 name = "mika-common"
+publish = false
 changelog_path = "CHANGELOG.md"
 changelog_include = ["mika-agent", "mika-cli"]
 
 [[package]]
 name = "mika-agent"
+publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
 
 [[package]]
 name = "mika-cli"
+publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
 
 [[package]]
 name = "mika-a2a"
+publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
 
 [[package]]
 name = "mika-gateway"
+publish = false
 release = false
 
 [changelog]
