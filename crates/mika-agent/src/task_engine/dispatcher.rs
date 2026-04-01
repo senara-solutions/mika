@@ -890,10 +890,8 @@ fn extract_callback_fields(result: &str) -> serde_json::Value {
         map.insert("turns".into(), serde_json::Value::Number(n.into()));
     }
     if let Some(cap) = RE_COST.captures(result) {
-        let val = &cap[1];
-        if val != "unknown" {
-            map.insert("cost_usd".into(), serde_json::Value::String(val.into()));
-        }
+        // Regex already rejects non-numeric input (e.g. "$unknown")
+        map.insert("cost_usd".into(), serde_json::Value::String(cap[1].into()));
     }
     if let Some(cap) = RE_DURATION.captures(result)
         && let Ok(n) = cap[1].parse::<u64>()
