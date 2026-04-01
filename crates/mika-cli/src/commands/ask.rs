@@ -38,6 +38,16 @@ pub async fn run(
         ctx.override_model(model)?;
     }
 
+    // Validate task_id format — reject empty or excessively long values
+    if let Some(tid) = task_id {
+        if tid.is_empty() {
+            anyhow::bail!("--task-id value must not be empty");
+        }
+        if tid.len() > 128 {
+            anyhow::bail!("--task-id value too long: {} bytes (max: 128)", tid.len());
+        }
+    }
+
     // Use provided session ID or generate a new one.
     // When --session-id is passed (e.g., from claude-asked-relay), messages from the
     // same Claude Code run share a session for grouping and introspection.
@@ -63,7 +73,7 @@ pub async fn run(
         );
     }
     // Store task_id in session metadata for observability correlation
-    let session_metadata = task_id.map(|tid| format!(r#"{{"task_id":"{}"}}"#, tid));
+    let session_metadata = task_id.map(|tid| serde_json::json!({"task_id": tid}).to_string());
     if let Err(e) = ctx
         .async_db
         .create_session_with_metadata(

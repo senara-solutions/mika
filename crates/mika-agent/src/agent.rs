@@ -893,7 +893,6 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    let correlated_task_id = params.correlated_task_id.as_deref().unwrap_or("");
     let span = info_span!(
         target: "mika::otel",
         "agent_turn",
@@ -901,8 +900,11 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         mode = "conversation",
         trace_id = %trace_id,
         channel = %params.channel_type,
-        correlated_task_id = %correlated_task_id,
+        correlated_task_id = tracing::field::Empty,
     );
+    if let Some(ref task_id) = params.correlated_task_id {
+        span.record("correlated_task_id", task_id.as_str());
+    }
 
     let timeout_result = tokio::time::timeout(
         Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
