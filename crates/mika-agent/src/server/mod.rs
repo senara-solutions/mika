@@ -105,7 +105,9 @@ fn build_router(state: AppState) -> Router {
         )
         // Observability: LLM calls and tool calls
         .route("/llm-calls", get(dashboard::handle_llm_calls))
+        .route("/llm-calls/{id}", get(dashboard::handle_llm_call_detail))
         .route("/tool-calls", get(dashboard::handle_tool_calls))
+        .route("/tool-calls/{id}", get(dashboard::handle_tool_call_detail))
         .route(
             "/traces/{trace_id}/llm-calls",
             get(dashboard::handle_trace_llm_calls),
@@ -130,10 +132,6 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/dev-runs/{task_id}",
             get(dashboard_dev_runs::handle_dev_run_detail),
-        )
-        .route(
-            "/dev-runs/{task_id}/merge",
-            post(dashboard_dev_runs::handle_dev_run_merge),
         )
         .route(
             "/investigate",

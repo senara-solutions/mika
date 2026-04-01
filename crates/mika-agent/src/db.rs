@@ -4016,6 +4016,35 @@ impl Database {
         Ok((rows, total))
     }
 
+    pub fn get_llm_call_by_id(&self, id: &str) -> Result<Option<LlmCallRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, session_id, trace_id, provider, model,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                        latency_ms, stop_reason, status, error_message, step, created_at
+                 FROM llm_calls WHERE id = ?1",
+                params![id],
+                Self::row_to_llm_call,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_tool_call_by_id(&self, id: &str) -> Result<Option<ToolCallRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                        step, tool_name, tool_source, skill_name,
+                        input, output, success, non_zero_exit,
+                        latency_ms, error_message, created_at
+                 FROM tool_calls WHERE id = ?1",
+                params![id],
+                Self::row_to_tool_call,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn row_to_llm_call(r: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCallRow> {
         Ok(LlmCallRow {
             id: r.get(0)?,

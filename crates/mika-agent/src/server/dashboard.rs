@@ -581,13 +581,69 @@ pub async fn handle_tasks_list(
     .into_response()
 }
 
-/// GET /api/v1/tasks/:id — single task detail.
+/// Full task detail response with untruncated action_config and result.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskDetailResponse {
+    pub id: String,
+    pub agent_id: String,
+    pub label: String,
+    pub trigger_type: String,
+    pub action_type: String,
+    pub status: String,
+    pub team_run_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: i64,
+    pub source: Option<String>,
+    pub reference_url: Option<String>,
+    pub cron_expr: Option<String>,
+    pub next_fire_at: Option<String>,
+    pub fired_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_by_session: Option<String>,
+    pub created_trace_id: Option<String>,
+    pub execution_trace_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub action_config: String,
+    pub result: Option<String>,
+}
+
+impl From<Task> for TaskDetailResponse {
+    fn from(t: Task) -> Self {
+        Self {
+            id: t.id,
+            agent_id: t.agent_id,
+            label: t.label,
+            trigger_type: t.trigger_type,
+            action_type: t.action_type,
+            status: t.status,
+            team_run_id: t.team_run_id,
+            parent_task_id: t.parent_task_id,
+            depth: t.depth,
+            source: t.source,
+            reference_url: t.reference_url,
+            cron_expr: t.cron_expr,
+            next_fire_at: t.next_fire_at,
+            fired_at: t.fired_at,
+            completed_at: t.completed_at,
+            created_by_session: t.created_by_session,
+            created_trace_id: t.created_trace_id,
+            execution_trace_id: t.execution_trace_id,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+            action_config: t.action_config,
+            result: t.result,
+        }
+    }
+}
+
+/// GET /api/v1/tasks/:id — single task detail with full action_config and result.
 pub async fn handle_task_detail(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
     match state.dashboard_db.get_task_unscoped(&task_id).await {
-        Ok(Some(task)) => Json(TaskResponse::from(task)).into_response(),
+        Ok(Some(task)) => Json(TaskDetailResponse::from(task)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("task '{}' not found", task_id)})),
@@ -753,6 +809,38 @@ pub async fn handle_tool_calls(
         per_page,
     })
     .into_response()
+}
+
+/// GET /api/v1/llm-calls/:id — single LLM call detail.
+pub async fn handle_llm_call_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_llm_call_by_id(&id).await {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("LLM call '{}' not found", id)})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
+/// GET /api/v1/tool-calls/:id — single tool call detail.
+pub async fn handle_tool_call_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_tool_call_by_id(&id).await {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("tool call '{}' not found", id)})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
 }
 
 // ===== Trace-level LLM/Tool queries =====

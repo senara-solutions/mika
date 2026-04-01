@@ -1867,6 +1867,16 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_llm_call_by_id(&self, id: &str) -> Result<Option<crate::db::LlmCallRow>> {
+        let id = id.to_owned();
+        self.with_db(move |db| db.get_llm_call_by_id(&id)).await
+    }
+
+    pub async fn get_tool_call_by_id(&self, id: &str) -> Result<Option<crate::db::ToolCallRow>> {
+        let id = id.to_owned();
+        self.with_db(move |db| db.get_tool_call_by_id(&id)).await
+    }
+
     pub async fn update_session_metadata(&self, session_id: &str, metadata: &str) -> Result<()> {
         let (sid, m) = (session_id.to_owned(), metadata.to_owned());
         self.with_db(move |db| db.update_session_metadata(&sid, &m))
