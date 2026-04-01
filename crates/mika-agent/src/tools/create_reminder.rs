@@ -45,6 +45,11 @@ impl Tool for CreateReminderTool {
                     "timezone": {
                         "type": "string",
                         "description": "IANA timezone name (e.g. 'Asia/Singapore', 'America/New_York'). When provided, fire_at and cron_expr are interpreted as local time in this timezone. Use the user's configured timezone."
+                    },
+                    "action_type": {
+                        "type": "string",
+                        "enum": ["send_message", "resume_agent"],
+                        "description": "What happens when the reminder fires. 'send_message' (default): sends the message as a notification to the user. 'resume_agent': wakes the agent to perform the action described in the message (e.g. check CI status, query APIs, run tools). Use 'resume_agent' when the reminder requires the agent to take action, not just deliver a static notification."
                     }
                 },
                 "required": ["message"]
@@ -57,6 +62,7 @@ impl Tool for CreateReminderTool {
         let message = input["message"].as_str().unwrap_or("");
         let cron_expr_input = input["cron_expr"].as_str().unwrap_or("");
         let timezone_input = input["timezone"].as_str().unwrap_or("");
+        let action_type_input = input["action_type"].as_str().unwrap_or("send_message");
 
         if message.is_empty() {
             return Ok(ToolOutput::error("'message' is required."));
@@ -65,6 +71,14 @@ impl Tool for CreateReminderTool {
             return Ok(ToolOutput::error(format!(
                 "'message' too long: {} characters (max: {MAX_INPUT_LEN})",
                 message.len()
+            )));
+        }
+
+        // Validate action_type
+        if action_type_input != "send_message" && action_type_input != "resume_agent" {
+            return Ok(ToolOutput::error(format!(
+                "Invalid action_type '{}'. Must be 'send_message' or 'resume_agent'.",
+                action_type_input
             )));
         }
 
@@ -241,7 +255,7 @@ impl Tool for CreateReminderTool {
             condition_expr: None,
             next_fire_at: Some(next_fire_at),
             timeout_at: None,
-            action_type: "send_message".to_string(),
+            action_type: action_type_input.to_string(),
             action_config,
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
@@ -258,9 +272,7 @@ impl Tool for CreateReminderTool {
                 let detail = if let Ok(tasks) = ctx.db.get_user_visible_tasks().await {
                     tasks
                         .iter()
-                        .find(|t| {
-                            t.label.eq_ignore_ascii_case(message) && t.action_type == "send_message"
-                        })
+                        .find(|t| t.label.eq_ignore_ascii_case(message))
                         .map(|t| {
                             let time_info = t
                                 .next_fire_at
@@ -298,10 +310,15 @@ impl Tool for CreateReminderTool {
             )
             .await?;
 
-        let response = if trigger_type == "recurring" {
-            format!("Periodic reminder {id} created (cron: {display}).")
+        let action_label = if action_type_input == "resume_agent" {
+            " (action: agent will wake and act)"
         } else {
-            format!("Reminder {id} scheduled for {display}.")
+            ""
+        };
+        let response = if trigger_type == "recurring" {
+            format!("Periodic reminder {id} created (cron: {display}){action_label}.")
+        } else {
+            format!("Reminder {id} scheduled for {display}{action_label}.")
         };
 
         Ok(ToolOutput::success(response))
@@ -748,5 +765,147 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid ISO 8601"));
+    }
+
+    // --- action_type tests (#363) ---
+
+    #[tokio::test]
+    async fn test_create_reminder_resume_agent_action_type() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Check CI status and merge PR",
+                    "action_type": "resume_agent"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("scheduled"));
+        assert!(result.content.contains("agent will wake and act"));
+
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].action_type, "resume_agent");
+        assert_eq!(reminders[0].label, "Check CI status and merge PR");
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_default_action_type_is_send_message() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Meeting in 15 min"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].action_type, "send_message");
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_invalid_action_type() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "test",
+                    "action_type": "run_skill"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Invalid action_type"));
+    }
+
+    #[tokio::test]
+    async fn test_create_reminder_dedup_across_action_types() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        // Create a send_message reminder
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Check PR status"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        // Try to create same label with resume_agent — should be blocked by DB unique constraint
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Check PR status",
+                    "action_type": "resume_agent"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.content.contains("already exists"),
+            "expected 'already exists', got: '{}' (is_error: {})",
+            result.content,
+            result.is_error
+        );
+
+        let reminders = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(reminders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_recurring_reminder_resume_agent() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateReminderTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "cron_expr": "0 0 9 * * 1-5",
+                    "message": "Check open PRs and report status",
+                    "action_type": "resume_agent"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Periodic reminder"));
+        assert!(result.content.contains("agent will wake and act"));
+
+        let tasks = harness.db.get_user_visible_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].trigger_type, "recurring");
+        assert_eq!(tasks[0].action_type, "resume_agent");
     }
 }

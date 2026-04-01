@@ -399,6 +399,12 @@ Core memory tracks key people briefly — the people table is the full record.\n
     prompt
         .push_str("- You can list and cancel reminders with list_reminders and cancel_reminder.\n");
     prompt.push_str(
+        "- Reminders support two action types: use action_type='send_message' (default) for static \
+         notifications the user should see, and action_type='resume_agent' when the reminder \
+         requires you to take action (e.g. check CI status, query an API, run tools). \
+         resume_agent wakes you up to act on the reminder; send_message just delivers text.\n",
+    );
+    prompt.push_str(
         "- You can create new skills using create_skill to extend your capabilities with custom prompt snippets.\n",
     );
     prompt.push_str(

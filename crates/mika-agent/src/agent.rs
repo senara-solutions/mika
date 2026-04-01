@@ -1569,6 +1569,13 @@ pub enum SilentTrigger {
     SkillRun {
         skill_name: String,
     },
+    /// A user-created reminder fired and the agent should perform the requested action.
+    /// Unlike `Callback`, the message is user-authored (trusted) and not wrapped in
+    /// untrusted-framing tags. See #363.
+    Reminder {
+        task_id: String,
+        message: String,
+    },
 }
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
@@ -1605,6 +1612,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::Reflection => "reflection",
         SilentTrigger::Callback { .. } => "callback",
         SilentTrigger::SkillRun { .. } => "skill_run",
+        SilentTrigger::Reminder { .. } => "reminder",
     };
 
     let silent_span = info_span!(
@@ -1757,11 +1765,20 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
                  If the skill produces output that should be shared with the user, use send_message."
             )
         }
+        SilentTrigger::Reminder { task_id, message } => {
+            format!(
+                "A REMINDER you previously set has fired (task: {task_id}).\n\n\
+                 Reminder message: {message}\n\n\
+                 This is a task you scheduled yourself to perform. Execute the requested action \
+                 using the tools available to you. When done, use send_message to notify the user \
+                 with the results. If the action fails, still notify the user with what happened."
+            )
+        }
     };
 
     let (task_health, stored_preferences) = if matches!(
         &params.trigger,
-        SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+        SilentTrigger::Heartbeat | SilentTrigger::Callback { .. } | SilentTrigger::Reminder { .. }
     ) {
         (
             db.get_task_health_summary().await.ok(),
@@ -1823,6 +1840,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::Reflection => "[reflection trigger]".to_string(),
         SilentTrigger::Callback { label, .. } => format!("[callback: {label}]"),
         SilentTrigger::SkillRun { skill_name } => format!("[skill_run: {skill_name}]"),
+        SilentTrigger::Reminder { message, .. } => format!("[reminder: {message}]"),
     };
 
     let messages = vec![LlmMessage {
@@ -3702,7 +3720,9 @@ mod tests {
         let trigger = SilentTrigger::Heartbeat;
         let should_inject = matches!(
             &trigger,
-            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+            SilentTrigger::Heartbeat
+                | SilentTrigger::Callback { .. }
+                | SilentTrigger::Reminder { .. }
         );
         assert!(
             should_inject,
@@ -3721,7 +3741,9 @@ mod tests {
         };
         let should_inject = matches!(
             &trigger,
-            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+            SilentTrigger::Heartbeat
+                | SilentTrigger::Callback { .. }
+                | SilentTrigger::Reminder { .. }
         );
         assert!(should_inject, "Callback trigger should receive task health");
     }
@@ -3737,7 +3759,9 @@ mod tests {
         };
         let should_inject = matches!(
             &trigger,
-            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+            SilentTrigger::Heartbeat
+                | SilentTrigger::Callback { .. }
+                | SilentTrigger::Reminder { .. }
         );
         assert!(
             should_inject,
@@ -3750,7 +3774,9 @@ mod tests {
         let trigger = SilentTrigger::Reflection;
         let should_inject = matches!(
             &trigger,
-            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+            SilentTrigger::Heartbeat
+                | SilentTrigger::Callback { .. }
+                | SilentTrigger::Reminder { .. }
         );
         assert!(
             !should_inject,
@@ -3765,12 +3791,29 @@ mod tests {
         };
         let should_inject = matches!(
             &trigger,
-            SilentTrigger::Heartbeat | SilentTrigger::Callback { .. }
+            SilentTrigger::Heartbeat
+                | SilentTrigger::Callback { .. }
+                | SilentTrigger::Reminder { .. }
         );
         assert!(
             !should_inject,
             "SkillRun trigger should NOT receive task health"
         );
+    }
+
+    #[test]
+    fn test_task_health_guard_includes_reminder() {
+        let trigger = SilentTrigger::Reminder {
+            task_id: "task-200".to_string(),
+            message: "Check CI status".to_string(),
+        };
+        let should_inject = matches!(
+            &trigger,
+            SilentTrigger::Heartbeat
+                | SilentTrigger::Callback { .. }
+                | SilentTrigger::Reminder { .. }
+        );
+        assert!(should_inject, "Reminder trigger should receive task health");
     }
 
     // -- collect_required_tools tests (#270, #265) --
