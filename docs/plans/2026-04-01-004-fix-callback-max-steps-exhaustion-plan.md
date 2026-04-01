@@ -1,7 +1,7 @@
 ---
 title: "fix: mika-dev callback phase hits max_steps=10 before acting on QA verdict"
 type: fix
-status: active
+status: completed
 date: 2026-04-01
 issue: "#375"
 ---
