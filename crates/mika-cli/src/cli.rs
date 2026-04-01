@@ -147,10 +147,15 @@ pub struct AskArgs {
 
     /// The message to send (use "-" to read from stdin)
     pub message: String,
-    /// Mark a callback task complete with this message as the result before running the agent.
-    /// Used by background processes: mika ask --task-id <uuid> "findings..."
+    /// Correlate this message with a task for observability. Without --task-complete,
+    /// only records the task-id in session/trace metadata. With --task-complete, marks
+    /// the callback task as completed.
     #[arg(long, conflicts_with = "team")]
     pub task_id: Option<String>,
+    /// Signal that the task should be marked as completed (requires --task-id).
+    /// Without this flag, --task-id is correlation-only.
+    #[arg(long, requires = "task_id", conflicts_with = "team")]
+    pub task_complete: bool,
     /// Link this message to a parent work item (metadata threading).
     /// Used by claude-asked relay: mika ask --parent-task-id <uuid> "question"
     #[arg(long)]

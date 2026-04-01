@@ -253,6 +253,7 @@ async fn spawn_agent_worker(
                         is_callback_turn: false,
                         settings: Some(&worker_settings),
                         trace_id: None,
+                        correlated_task_id: None,
                     })
                     .await;
 
@@ -355,6 +356,7 @@ async fn spawn_agent_worker(
                         is_callback_turn: true,
                         settings: Some(&worker_settings),
                         trace_id: trace_id.clone(),
+                        correlated_task_id: None,
                     })
                     .await;
 

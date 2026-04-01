@@ -207,6 +207,7 @@ async fn main() -> Result<()> {
                 &args.message,
                 &agent_name,
                 args.task_id.as_deref(),
+                args.task_complete,
                 cli.session_id.as_deref(),
                 args.parent_task_id.as_deref(),
                 &args.format,

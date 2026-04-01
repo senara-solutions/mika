@@ -230,7 +230,7 @@ When `long_running` is true:
 - Stdout is redirected to `/dev/null` (output is not captured).
 - A callback task is created and the tool returns immediately with "task created".
 - `__mika_task_id` and `__mika_agent` are injected into the input JSON on stdin.
-- The script must deliver results via `mika ask --task-id <uuid> "result text"` when complete.
+- The script must deliver results via `mika ask --task-id <uuid> --task-complete "result text"` when complete. Intermediate calls (e.g., permission requests) can pass `--task-id` without `--task-complete` for observability correlation only.
 - `estimated_duration_secs` is used to compute a timeout: `estimated * 3`, clamped to 600..7,776,000 seconds.
 
 #### Returning Images from Exec Handlers

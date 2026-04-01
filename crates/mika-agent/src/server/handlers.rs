@@ -243,6 +243,7 @@ pub async fn handle_message(
                 is_callback_turn: false,
                 settings: Some(&a.settings),
                 trace_id: Some(req.request_id.clone()),
+                correlated_task_id: None,
             };
 
             match agent::run_agent(&params).await {
