@@ -1,5 +1,6 @@
 [workspace]
 git_only = true
+publish_no_verify = true
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
