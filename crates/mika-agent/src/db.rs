@@ -3302,6 +3302,12 @@ impl Database {
     }
 
     /// Get all pending user-visible tasks (reminders and callbacks, excludes heartbeat/reflection).
+    /// Returns user-visible reminder tasks (both `send_message` and `resume_agent`).
+    ///
+    /// Intentionally excludes `trigger_type = 'callback'` tasks: those are system-internal
+    /// tasks created by long-running exec handlers, not user-created reminders. Callback
+    /// delivery is handled separately by `get_undelivered_callback_tasks()` (server mode)
+    /// and `poll_callback_tasks()` (CLI mode). See #363.
     pub fn get_user_visible_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks

@@ -308,7 +308,13 @@ impl TaskDispatcher {
             // Reminder path: read from action_config.text
             let config: serde_json::Value =
                 serde_json::from_str(&task.action_config).unwrap_or(serde_json::Value::Null);
-            let message = config["text"].as_str().unwrap_or(&task.label).to_string();
+            let message = match config["text"].as_str() {
+                Some(text) => text.to_string(),
+                None => {
+                    warn!(task_id = %task.id, "reminder task missing text in action_config, falling back to label");
+                    task.label.clone()
+                }
+            };
             (
                 SilentTrigger::Reminder {
                     task_id: task.id.clone(),

@@ -57,7 +57,7 @@ impl Tool for ListRemindersTool {
                 .unwrap_or_else(|| "unknown".to_string());
 
             let action_badge = if t.action_type == "resume_agent" {
-                " [action]"
+                " [auto]"
             } else {
                 ""
             };
@@ -225,11 +225,11 @@ mod tests {
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Check CI and merge"));
-        assert!(result.content.contains("[action]"));
+        assert!(result.content.contains("[auto]"));
         // Normal reminder should not have action badge
         assert!(result.content.contains("Normal reminder"));
-        // Count occurrences of [action] — should be exactly 1
-        assert_eq!(result.content.matches("[action]").count(), 1);
+        // Count occurrences of [auto] — should be exactly 1
+        assert_eq!(result.content.matches("[auto]").count(), 1);
     }
 
     #[tokio::test]
