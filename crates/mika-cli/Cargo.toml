@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 description = "CLI for Mika — AI executive assistant with persistent memory"
 repository.workspace = true
 homepage.workspace = true

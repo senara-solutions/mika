@@ -2,32 +2,33 @@
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
 semver_check = false
 pr_labels = ["release"]
 
 [[package]]
 name = "mika-common"
-publish = true
+publish = false
 changelog_path = "CHANGELOG.md"
 changelog_include = ["mika-agent", "mika-cli"]
 
 [[package]]
 name = "mika-agent"
-publish = true
+publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
 
 [[package]]
 name = "mika-cli"
-publish = true
+publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
 
 [[package]]
 name = "mika-a2a"
-publish = true
+publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
