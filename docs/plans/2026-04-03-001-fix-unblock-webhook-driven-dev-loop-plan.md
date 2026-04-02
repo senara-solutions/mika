@@ -1,7 +1,7 @@
 ---
 title: "fix: unblock webhook-driven dev loop"
 type: fix
-status: active
+status: completed
 date: 2026-04-03
 ---
 
