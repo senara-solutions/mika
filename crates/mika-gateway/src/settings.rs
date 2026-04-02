@@ -46,6 +46,17 @@ pub struct GatewaySettings {
     /// Maps to MIKA_AGENTS_NAMESPACE env var. Default: "mika-agents".
     #[serde(default = "default_agents_namespace")]
     pub agents_namespace: String,
+
+    /// Secret for validating inbound GitHub App webhooks (HMAC-SHA256).
+    /// Optional — when absent, `POST /webhook/github` returns 404.
+    /// GitHub webhook secrets are arbitrary strings (not hex-constrained).
+    #[serde(default)]
+    pub github_webhook_secret: Option<SecretString>,
+
+    /// GitHub App ID for bot self-event filtering.
+    /// Optional — when absent, bot filtering is skipped.
+    #[serde(default)]
+    pub github_app_id: Option<u64>,
 }
 
 fn default_port() -> u16 {
@@ -151,6 +162,11 @@ impl std::fmt::Debug for GatewaySettings {
             .field("agent_base_url", &self.agent_base_url)
             .field("gateway_log_file", &self.gateway_log_file)
             .field("agents_namespace", &self.agents_namespace)
+            .field(
+                "github_webhook_secret",
+                &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("github_app_id", &self.github_app_id)
             .finish()
     }
 }
@@ -216,11 +232,14 @@ mod tests {
                 agent_base_url: None,
                 gateway_log_file: None,
                 agents_namespace: "mika-agents".to_string(),
+                github_webhook_secret: Some(SecretString::from("gh-webhook-secret")),
+                github_app_id: Some(12345),
             }
         );
         assert!(!debug.contains("pass"));
         assert!(!debug.contains("ABC"));
         assert!(!debug.contains("token-123"));
+        assert!(!debug.contains("gh-webhook-secret"));
         assert!(debug.contains("[REDACTED]"));
     }
 }

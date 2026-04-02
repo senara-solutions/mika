@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::a2a_routes;
+use crate::github;
 use crate::telegram::{
     ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_agent_prefix,
     parse_update,
@@ -45,6 +46,13 @@ pub struct AppState {
     pub agents_namespace: String,
     /// Counter for periodic outbound_messages cleanup (every ~100 webhook calls).
     pub webhook_counter: Arc<AtomicU64>,
+    /// Secret for validating inbound GitHub App webhooks (HMAC-SHA256).
+    /// When `None`, `POST /webhook/github` returns 404.
+    pub github_webhook_secret: Option<SecretString>,
+    /// GitHub App ID for bot self-event filtering.
+    pub github_app_id: Option<u64>,
+    /// LRU cache for GitHub webhook delivery ID deduplication.
+    pub github_delivery_cache: Arc<std::sync::Mutex<lru::LruCache<String, ()>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -55,6 +63,11 @@ impl std::fmt::Debug for AppState {
             .field("agent_base_url", &self.agent_base_url)
             .field("agents_namespace", &self.agents_namespace)
             .field("webhook_counter", &self.webhook_counter)
+            .field(
+                "github_webhook_secret",
+                &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("github_app_id", &self.github_app_id)
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +91,11 @@ pub fn build_router(state: AppState) -> Router {
                     require_bearer_token,
                 ))
                 .layer(RequestBodyLimitLayer::new(256 * 1024)),
+        )
+        // Webhook: GitHub App sends events here (validated by HMAC-SHA256 signature)
+        .route(
+            "/webhook/github",
+            post(github::handle_github_webhook).layer(RequestBodyLimitLayer::new(256 * 1024)),
         )
         // A2A protocol proxy (API key auth)
         .route(
