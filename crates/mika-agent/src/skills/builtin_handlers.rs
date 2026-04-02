@@ -823,14 +823,15 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         cmd.arg("--repo").arg(repo);
     }
 
-    // Inject platform GitHub token for agent identity separation.
-    // GH_TOKEN is not MIKA_*-prefixed, so it survives scrub_mika_env_vars.
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    super::executor::scrub_mika_env_vars(&mut cmd);
+
+    // Inject platform GitHub token for agent identity separation AFTER scrub.
+    // scrub_mika_env_vars removes GH_TOKEN (defense-in-depth against .env leak),
+    // so we must re-add the correct platform token here. See #380.
     if let Some(token) = ctx.github_token {
         cmd.env("GH_TOKEN", token);
     }
-
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
 
     spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await
 }

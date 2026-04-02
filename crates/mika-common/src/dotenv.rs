@@ -20,18 +20,72 @@ pub fn load_dotenv(home_dir: &Path) {
     }
 }
 
-/// Check for deprecated environment variables and warn the user.
+/// Check for deprecated and misplaced environment variables, warn the user, and
+/// actively remove dangerous ones from the process environment.
 ///
 /// Call this after `load_dotenv()` so `.env` values are already in the process environment.
-/// Currently checks for `MIKA_LLM_API_KEY` which was superseded by per-provider keys
-/// (e.g., `MIKA_ANTHROPIC_API_KEY`).
-pub fn check_deprecated_env_vars() {
+///
+/// Checks:
+/// - `MIKA_LLM_API_KEY` — deprecated, superseded by per-provider keys
+/// - `GH_TOKEN` in `.env` file — misplaced, causes identity collision (see #380)
+pub fn check_env_warnings(home_dir: &Path) {
+    // 1. Deprecated: MIKA_LLM_API_KEY
     if std::env::var("MIKA_LLM_API_KEY").is_ok() {
         warn!(
             "MIKA_LLM_API_KEY is deprecated and ignored by the config system. \
              Rename it to MIKA_ANTHROPIC_API_KEY in your ~/.mika/.env file."
         );
     }
+
+    // 2. Misplaced: GH_TOKEN in .env file
+    //
+    // If GH_TOKEN is defined in the .env file, dotenvy loads it into the process
+    // environment, overriding the host's `gh auth` identity for ALL child processes.
+    // This collapses the developer/platform identity separation and causes
+    // self-approval blocks in the autonomous dev loop.
+    //
+    // Detection: we check the .env file text directly (not process env) to avoid
+    // false positives when GH_TOKEN is legitimately set in the host shell.
+    if env_file_contains_key(home_dir, "GH_TOKEN") {
+        warn!(
+            "GH_TOKEN found in {}/.env — this overrides your host `gh auth` identity \
+             and breaks the developer/platform identity separation. Removed from process \
+             environment. Use MIKA_GITHUB_TOKEN for agent GitHub operations instead. \
+             See docs/configuration.md for the identity matrix.",
+            home_dir.display()
+        );
+        // Actively remove to prevent identity collision in child processes.
+        // Safe because: run_gh explicitly injects MIKA_GITHUB_TOKEN as GH_TOKEN,
+        // MCP uses env_clear(), and scrub_mika_env_vars + GH_TOKEN scrub covers
+        // exec handlers.
+        unsafe { std::env::remove_var("GH_TOKEN") };
+    }
+}
+
+/// Check whether a `.env` file in `home_dir` contains a given key assignment.
+///
+/// Parses the file as text looking for uncommented `KEY=...` lines.
+/// Returns `false` if the file doesn't exist or can't be read.
+fn env_file_contains_key(home_dir: &Path, key: &str) -> bool {
+    let env_path = home_dir.join(".env");
+    let content = match std::fs::read_to_string(&env_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Strip optional "export " prefix (dotenvy supports this syntax)
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if let Some((k, _)) = trimmed.split_once('=')
+            && k.trim() == key
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Write or update a key in `{home_dir}/.env`. Creates the file if it doesn't exist.
@@ -249,5 +303,117 @@ mod tests {
         assert!(set_env_var(tmp.path(), "has space", "value").is_err());
         assert!(set_env_var(tmp.path(), "has=equals", "value").is_err());
         assert!(set_env_var(tmp.path(), "has-dash", "value").is_err());
+    }
+
+    // --- env_file_contains_key tests ---
+
+    #[test]
+    fn test_env_file_contains_key_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MIKA_ANTHROPIC_API_KEY=sk-ant-xxx\nGH_TOKEN=ghp_abc123\n",
+        )
+        .unwrap();
+
+        assert!(env_file_contains_key(tmp.path(), "GH_TOKEN"));
+        assert!(env_file_contains_key(tmp.path(), "MIKA_ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_env_file_contains_key_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MIKA_ANTHROPIC_API_KEY=sk-ant-xxx\n",
+        )
+        .unwrap();
+
+        assert!(!env_file_contains_key(tmp.path(), "GH_TOKEN"));
+    }
+
+    #[test]
+    fn test_env_file_contains_key_commented_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "# GH_TOKEN=ghp_old_value\nMIKA_ANTHROPIC_API_KEY=sk-ant-xxx\n",
+        )
+        .unwrap();
+
+        // Commented-out lines should NOT match
+        assert!(!env_file_contains_key(tmp.path(), "GH_TOKEN"));
+    }
+
+    #[test]
+    fn test_env_file_contains_key_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No .env file exists
+        assert!(!env_file_contains_key(tmp.path(), "GH_TOKEN"));
+    }
+
+    #[test]
+    fn test_env_file_contains_key_export_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "export GH_TOKEN=ghp_abc123\n").unwrap();
+
+        // "export GH_TOKEN=..." should be detected (dotenvy supports this syntax)
+        assert!(env_file_contains_key(tmp.path(), "GH_TOKEN"));
+    }
+
+    #[test]
+    fn test_env_file_contains_key_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "").unwrap();
+
+        assert!(!env_file_contains_key(tmp.path(), "GH_TOKEN"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_warnings_removes_gh_token_from_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "GH_TOKEN=ghp_leaked_token\nMIKA_ANTHROPIC_API_KEY=sk-ant-xxx\n",
+        )
+        .unwrap();
+
+        // Simulate dotenvy having loaded GH_TOKEN into the process env
+        unsafe { std::env::set_var("GH_TOKEN", "ghp_leaked_token") };
+
+        check_env_warnings(tmp.path());
+
+        // GH_TOKEN should have been removed from the process environment
+        assert!(
+            std::env::var("GH_TOKEN").is_err(),
+            "GH_TOKEN should be removed from process env after check_env_warnings"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_warnings_no_removal_when_not_in_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MIKA_ANTHROPIC_API_KEY=sk-ant-xxx\n",
+        )
+        .unwrap();
+
+        // GH_TOKEN set from host shell (not from .env file)
+        unsafe { std::env::set_var("GH_TOKEN", "ghp_host_shell_token") };
+
+        check_env_warnings(tmp.path());
+
+        // GH_TOKEN from host shell should NOT be removed
+        assert_eq!(
+            std::env::var("GH_TOKEN").ok(),
+            Some("ghp_host_shell_token".to_string()),
+            "GH_TOKEN from host shell should be preserved"
+        );
+
+        // Cleanup
+        unsafe { std::env::remove_var("GH_TOKEN") };
     }
 }
