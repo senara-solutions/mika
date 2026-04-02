@@ -2,6 +2,7 @@
 export { default as StatusBadge } from './components/StatusBadge.tsx'
 export { default as Pagination } from './components/Pagination.tsx'
 export { default as EmptyState } from './components/EmptyState.tsx'
+export type { EmptyStateProps } from './components/EmptyState.tsx'
 export { default as CopyButton } from './components/CopyButton.tsx'
 export { default as MarkdownContent } from './components/MarkdownContent.tsx'
 export { default as TaskStatusBadge } from './components/TaskStatusBadge.tsx'

@@ -7,6 +7,9 @@
   --color-accent-light: #9d8fff;
   --color-heading: #e8ecf2;
   --color-muted: #a0a8b8;
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
 }
 
 html {
