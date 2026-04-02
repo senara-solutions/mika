@@ -23,7 +23,7 @@ Added an optional `[llm]` section to `skill.toml` with `provider` and `model` fi
 
 ### Key design decisions
 
-1. **Turn-level scope**: The override applies to the entire `run_loop()` invocation (up to 10 tool steps). `run_loop()` takes a single `&dyn LlmProvider` — per-tool-call switching would require a major refactor.
+1. **Turn-level scope**: The override applies to the entire `run_loop()` invocation (up to 20 tool steps). `run_loop()` takes a single `&dyn LlmProvider` — per-tool-call switching would require a major refactor.
 
 2. **Conflict resolution**: When multiple matched skills have different `[llm]` overrides, the agent falls back to the default provider with a `warn!`. Same overrides are deduplicated. This is the safe default — ambiguous intent should not silently pick a winner.
 
