@@ -15,6 +15,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 ~/.mika/                              # Global home (0700)
 ├── .env                              # Secrets (0600), loaded by dotenvy
 ├── oauth.json                        # OAuth PKCE tokens (0600), auto-refreshed
+├── github_app_token.json             # GitHub App installation token cache (0600), ~1h expiry
 ├── config.toml                       # Global config (shared across agents)
 ├── active_agent                      # Plain text: active agent name
 ├── data/

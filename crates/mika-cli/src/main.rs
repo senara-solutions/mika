@@ -16,6 +16,22 @@ use mika_common::team;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Lightweight commands: early-exit before agent resolution, logging, and telemetry.
+    // These need only dotenv + Settings + GitHubApp — fast startup for credential helper usage.
+    match &cli.command {
+        Some(Commands::Token(args)) => {
+            let home_dir = home::resolve_home_dir()?;
+            mika_common::dotenv::load_dotenv(&home_dir);
+            return commands::token::run(&args.command, &home_dir).await;
+        }
+        Some(Commands::CredentialHelper(args)) => {
+            let home_dir = home::resolve_home_dir()?;
+            mika_common::dotenv::load_dotenv(&home_dir);
+            return commands::credential_helper::run(&args.operation, &home_dir).await;
+        }
+        _ => {}
+    }
+
     // Team mode: branch early, before agent resolution.
     // --team is mutually exclusive with --agent (enforced by clap on each level).
     // Merge top-level and subcommand-level --team flag.
@@ -228,6 +244,8 @@ async fn main() -> Result<()> {
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
         Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
         Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
+        // Handled by early-exit above — unreachable, but listed for exhaustive match.
+        Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
     }
 }
 
@@ -430,6 +448,8 @@ mod tests {
             "teams",
             "doctor",
             "dashboard",
+            "token",
+            "credential-helper",
         ] {
             assert!(
                 markdown.contains(name),

@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use secrecy::ExposeSecret;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -23,10 +24,17 @@ const IAT_BACKDATE: Duration = Duration::from_secs(60);
 /// JWT lifetime (GitHub maximum: 10 minutes).
 const JWT_LIFETIME: Duration = Duration::from_secs(600);
 
-/// Cached installation token with expiry.
+/// Cached installation token with expiry (in-memory).
 struct CachedToken {
     token: String,
     expires_at: SystemTime,
+}
+
+/// File-based token cache format (JSON, persisted at `~/.mika/github_app_token.json`).
+#[derive(Serialize, Deserialize)]
+struct FileCachedToken {
+    token: String,
+    expires_at: String, // RFC 3339
 }
 
 /// GitHub App authentication manager.
@@ -139,6 +147,118 @@ impl GitHubApp {
         let result = new_token.token.clone();
         *cache = Some(new_token);
         Ok(result)
+    }
+
+    /// Get a valid installation token, with file-based caching for CLI processes.
+    ///
+    /// Short-lived CLI processes (e.g., `mika credential-helper`) lose the in-memory
+    /// cache between invocations. This method adds a file-based cache layer:
+    ///
+    /// 1. Read file cache → if valid, return immediately
+    /// 2. Fall through to in-memory cache / JWT exchange
+    /// 3. Write result to file cache (0o600 permissions)
+    ///
+    /// File cache failures are non-fatal — falls through to the normal token exchange.
+    pub async fn installation_token_with_file_cache(&self, cache_path: &Path) -> Result<String> {
+        // Try file cache first
+        if let Some(token) = Self::read_file_cache(cache_path) {
+            return Ok(token);
+        }
+
+        // Fall through to in-memory cache / JWT exchange
+        let token = self.installation_token().await?;
+
+        // Read the actual expiry from the in-memory cache (populated by installation_token)
+        let expires_at = {
+            let cache = self.cache.read().await;
+            cache.as_ref().map(|c| c.expires_at)
+        };
+
+        // Best-effort write to file cache with actual expiry
+        if let Some(expires_at) = expires_at {
+            Self::write_file_cache(cache_path, &token, expires_at);
+        }
+
+        Ok(token)
+    }
+
+    /// Read a token from the file cache if it exists and is still valid.
+    fn read_file_cache(cache_path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(cache_path).ok()?;
+        let cached: FileCachedToken = serde_json::from_str(&content).ok()?;
+
+        // Parse expiry and check validity (same 5-minute buffer as in-memory cache)
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&cached.expires_at).ok()?;
+        let expires_secs: u64 = expires_at.timestamp().try_into().ok()?;
+        let expires_at_st = UNIX_EPOCH + Duration::from_secs(expires_secs);
+
+        let in_memory = CachedToken {
+            token: cached.token,
+            expires_at: expires_at_st,
+        };
+
+        if Self::is_valid(&in_memory) {
+            Some(in_memory.token)
+        } else {
+            None
+        }
+    }
+
+    /// Write a token to the file cache with restrictive permissions.
+    ///
+    /// Uses atomic write (temp file + rename) with 0o600 permissions set at
+    /// file creation time (via `OpenOptionsExt::mode`) to eliminate the TOCTOU
+    /// race between write and chmod.
+    fn write_file_cache(cache_path: &Path, token: &str, expires_at: SystemTime) {
+        let expires_at_rfc3339 = {
+            let secs = expires_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            chrono::DateTime::from_timestamp(secs as i64, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
+        };
+
+        if expires_at_rfc3339.is_empty() {
+            return;
+        }
+
+        let cached = FileCachedToken {
+            token: token.to_string(),
+            expires_at: expires_at_rfc3339,
+        };
+
+        let Ok(json) = serde_json::to_string_pretty(&cached) else {
+            return;
+        };
+
+        // Write atomically: create temp file with 0o600, write, then rename.
+        let tmp_path = cache_path.with_extension("tmp");
+        let write_ok = {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .and_then(|mut f| f.write_all(json.as_bytes()))
+                    .is_ok()
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp_path, &json).is_ok()
+            }
+        };
+
+        if write_ok && std::fs::rename(&tmp_path, cache_path).is_err() {
+            // Clean up temp file on failed rename
+            let _ = std::fs::remove_file(&tmp_path);
+        }
     }
 
     /// Check whether a cached token is still valid (has more than `EXPIRY_BUFFER` remaining).
@@ -415,6 +535,80 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             expires_at: SystemTime::now() - Duration::from_secs(60),
         };
         assert!(!GitHubApp::is_valid(&expired_token));
+    }
+
+    #[test]
+    fn test_file_cache_write_and_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("github_app_token.json");
+
+        // Write a token with 30-minute expiry (well within the 5-minute buffer)
+        let expires_at = SystemTime::now() + Duration::from_secs(1800);
+        GitHubApp::write_file_cache(&cache_path, "ghs_test_token_123", expires_at);
+
+        // Read it back — should succeed (token is fresh)
+        let result = GitHubApp::read_file_cache(&cache_path);
+        assert_eq!(result.as_deref(), Some("ghs_test_token_123"));
+
+        // Verify file permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&cache_path).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600, "File should be owner-only");
+        }
+    }
+
+    #[test]
+    fn test_file_cache_expired_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("github_app_token.json");
+
+        // Write a token that expired 10 minutes ago
+        let expired = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let cached = FileCachedToken {
+            token: "ghs_expired".to_string(),
+            expires_at: expired.to_rfc3339(),
+        };
+        std::fs::write(&cache_path, serde_json::to_string(&cached).unwrap()).unwrap();
+
+        // Should return None — token is expired
+        assert!(GitHubApp::read_file_cache(&cache_path).is_none());
+    }
+
+    #[test]
+    fn test_file_cache_within_expiry_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("github_app_token.json");
+
+        // Write a token that expires in 3 minutes (within 5-minute buffer)
+        let near_expiry = chrono::Utc::now() + chrono::Duration::minutes(3);
+        let cached = FileCachedToken {
+            token: "ghs_near_expiry".to_string(),
+            expires_at: near_expiry.to_rfc3339(),
+        };
+        std::fs::write(&cache_path, serde_json::to_string(&cached).unwrap()).unwrap();
+
+        // Should return None — within expiry buffer
+        assert!(GitHubApp::read_file_cache(&cache_path).is_none());
+    }
+
+    #[test]
+    fn test_file_cache_nonexistent_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("nonexistent.json");
+
+        assert!(GitHubApp::read_file_cache(&cache_path).is_none());
+    }
+
+    #[test]
+    fn test_file_cache_corrupt_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("github_app_token.json");
+
+        std::fs::write(&cache_path, "not valid json").unwrap();
+
+        assert!(GitHubApp::read_file_cache(&cache_path).is_none());
     }
 
     #[test]

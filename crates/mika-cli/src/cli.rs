@@ -65,6 +65,11 @@ pub enum Commands {
     Doctor(DoctorArgs),
     /// Manage the dashboard dev server
     Dashboard(DashboardArgs),
+    /// Manage tokens (GitHub App installation tokens)
+    Token(TokenArgs),
+    /// Git credential helper (used by git, not directly by users)
+    #[command(name = "credential-helper")]
+    CredentialHelper(CredentialHelperArgs),
 }
 
 impl Commands {
@@ -86,7 +91,9 @@ impl Commands {
             Commands::Setup { .. }
             | Commands::Doctor(_)
             | Commands::Teams(_)
-            | Commands::Dashboard(_) => None,
+            | Commands::Dashboard(_)
+            | Commands::Token(_)
+            | Commands::CredentialHelper(_) => None,
         }
     }
 
@@ -107,7 +114,9 @@ impl Commands {
             | Commands::Agents(_)
             | Commands::Doctor(_)
             | Commands::Teams(_)
-            | Commands::Dashboard(_) => None,
+            | Commands::Dashboard(_)
+            | Commands::Token(_)
+            | Commands::CredentialHelper(_) => None,
         }
     }
 }
@@ -495,6 +504,24 @@ pub enum DashboardCommand {
     Status,
     /// Open dashboard in browser
     Open,
+}
+
+#[derive(clap::Args)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+#[derive(Subcommand)]
+pub enum TokenCommand {
+    /// Print a GitHub App installation token to stdout
+    Github,
+}
+
+#[derive(clap::Args)]
+pub struct CredentialHelperArgs {
+    /// Operation: get, store, or erase
+    pub operation: String,
 }
 
 #[derive(Subcommand)]
