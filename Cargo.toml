@@ -120,7 +120,7 @@ rmcp = { version = "0.17", default-features = false, features = [
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
 
 # Embedded assets
-rust-embed = "8"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 
 # URL parsing
 url = "2"
