@@ -1,7 +1,7 @@
 ---
 title: "feat: github_app module — JWT signing, installation token generation and caching"
 type: feat
-status: active
+status: completed
 date: 2026-04-02
 issue: "#381"
 parent: "senara-solutions/mika-platform#3"
@@ -139,22 +139,22 @@ Three consumers of `github_token` today — all continue to work via the same `T
 
 ## Acceptance Criteria
 
-- [ ] `jsonwebtoken` crate added to `mika-common/Cargo.toml`
-- [ ] `github_app.rs` module in `mika-common/src/` with `GitHubApp` struct, `CachedToken`, `from_settings()`, `installation_token()`, `generate_jwt()`
-- [ ] Three new `Settings` fields: `github_app_id: Option<u64>`, `github_app_private_key: Option<SecretString>`, `github_app_installation_id: Option<u64>`
-- [ ] `ConfigKeyInfo` entries for all 3 new fields (`secret: true` for private key, `secret: false` for IDs)
-- [ ] Manual `Debug` impl on `Settings` redacts `github_app_private_key`
-- [ ] Custom `Debug` impl on `GitHubApp` redacts private key and cached token
-- [ ] `get_effective_value()` match arms for all 3 new keys
-- [ ] `GitHubApp` threaded through `AppState`/`AgentState` as `Option<Arc<GitHubApp>>`
-- [ ] Token resolution at agent turn start (eager) — resolved string borrowed into `ToolContext.github_token`
-- [ ] `run_gh` uses installation token when available (no code change needed — flows via `ToolContext.github_token`)
-- [ ] Context injection (`fetch_pr_diff`) uses installation token (no code change needed — flows via resolved token)
-- [ ] `mika doctor` checks: validates all 3 vars, decodes base64 and parses PEM
-- [ ] `.env.example` updated with new section
-- [ ] `docs/configuration.md` updated
-- [ ] `CLAUDE.md` environment variables section updated
-- [ ] Unit tests: JWT claim structure, base64 decode errors, PEM parse errors, cache expiry logic, partial config detection, `from_settings()` with complete/incomplete config
+- [x] `jsonwebtoken` crate added to `mika-common/Cargo.toml`
+- [x] `github_app.rs` module in `mika-common/src/` with `GitHubApp` struct, `CachedToken`, `from_settings()`, `installation_token()`, `generate_jwt()`
+- [x] Three new `Settings` fields: `github_app_id: Option<u64>`, `github_app_private_key: Option<SecretString>`, `github_app_installation_id: Option<u64>`
+- [x] `ConfigKeyInfo` entries for all 3 new fields (`secret: true` for private key, `secret: false` for IDs)
+- [x] Manual `Debug` impl on `Settings` redacts `github_app_private_key`
+- [x] Custom `Debug` impl on `GitHubApp` redacts private key and cached token
+- [x] `get_effective_value()` match arms for all 3 new keys
+- [x] `GitHubApp` threaded through `AppState`/`AgentState` as `Option<Arc<GitHubApp>>`
+- [x] Token resolution at agent turn start (eager) — resolved string borrowed into `ToolContext.github_token`
+- [x] `run_gh` uses installation token when available (no code change needed — flows via `ToolContext.github_token`)
+- [x] Context injection (`fetch_pr_diff`) uses installation token (no code change needed — flows via resolved token)
+- [x] `mika doctor` checks: validates all 3 vars, decodes base64 and parses PEM
+- [x] `.env.example` updated with new section
+- [x] `docs/configuration.md` updated
+- [x] `CLAUDE.md` environment variables section updated
+- [x] Unit tests: JWT claim structure, base64 decode errors, PEM parse errors, cache expiry logic, partial config detection, `from_settings()` with complete/incomplete config
 
 ## Implementation Plan
 

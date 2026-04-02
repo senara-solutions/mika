@@ -123,19 +123,19 @@ impl GitHubApp {
         // Fast path: read lock
         {
             let cache = self.cache.read().await;
-            if let Some(ref cached) = *cache {
-                if Self::is_valid(cached) {
-                    return Ok(cached.token.clone());
-                }
+            if let Some(ref cached) = *cache
+                && Self::is_valid(cached)
+            {
+                return Ok(cached.token.clone());
             }
         }
 
         // Slow path: write lock + double-check
         let mut cache = self.cache.write().await;
-        if let Some(ref cached) = *cache {
-            if Self::is_valid(cached) {
-                return Ok(cached.token.clone());
-            }
+        if let Some(ref cached) = *cache
+            && Self::is_valid(cached)
+        {
+            return Ok(cached.token.clone());
         }
 
         let jwt = self.generate_jwt()?;

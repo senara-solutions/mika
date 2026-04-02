@@ -477,10 +477,10 @@ fn check_github_app(global_home: &Path) -> CheckResult {
 
     // Helper to read an env var or .env file key
     let read_key = |env_var: &str| -> Option<String> {
-        if let Ok(val) = std::env::var(env_var) {
-            if !val.trim().is_empty() {
-                return Some(val);
-            }
+        if let Ok(val) = std::env::var(env_var)
+            && !val.trim().is_empty()
+        {
+            return Some(val);
         }
         let env_path = global_home.join(".env");
         if let Ok(content) = std::fs::read_to_string(&env_path) {
@@ -489,12 +489,12 @@ fn check_github_app(global_home: &Path) -> CheckResult {
                 if trimmed.starts_with('#') || trimmed.is_empty() {
                     continue;
                 }
-                if let Some((k, v)) = trimmed.split_once('=') {
-                    if k.trim() == env_var {
-                        let val = v.trim().trim_matches('"');
-                        if !val.is_empty() {
-                            return Some(val.to_string());
-                        }
+                if let Some((k, v)) = trimmed.split_once('=')
+                    && k.trim() == env_var
+                {
+                    let val = v.trim().trim_matches('"');
+                    if !val.is_empty() {
+                        return Some(val.to_string());
                     }
                 }
             }

@@ -533,7 +533,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         http_client,
         brave_api_key: settings.brave_api_key.clone(),
         github_token: settings.agent_github_token().map(String::from),
-        github_app: mika_common::github_app::GitHubApp::from_settings(&settings),
+        github_app: mika_common::github_app::GitHubApp::from_settings(settings),
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
         dashboard_db,

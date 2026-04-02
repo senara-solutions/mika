@@ -948,6 +948,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            github_app: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
             cli_mode: false,
