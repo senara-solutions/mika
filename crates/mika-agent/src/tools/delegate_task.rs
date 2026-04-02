@@ -16,6 +16,8 @@ pub struct DelegateTaskTool {
     pub home_dir: PathBuf,
     pub settings: Settings,
     pub http_client: reqwest::Client,
+    /// Shared GitHub App instance (avoids duplicate `from_settings` calls with separate caches).
+    pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
 }
 
 #[async_trait]
@@ -272,6 +274,7 @@ impl Tool for DelegateTaskTool {
             embedding_client: embedding_client.as_ref(),
             brave_api_key: self.settings.brave_api_key.as_deref(),
             github_token: self.settings.agent_github_token(),
+            github_app: self.github_app.as_deref(),
             skills_dirty: &skills_dirty,
             settings: Some(&self.settings),
             mcp_manager: None,
@@ -341,6 +344,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -359,6 +363,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -384,6 +389,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -419,6 +425,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -449,6 +456,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -472,6 +480,7 @@ mod tests {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -497,6 +506,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -519,6 +529,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool
@@ -542,6 +553,7 @@ mod tests {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
             http_client: reqwest::Client::new(),
+            github_app: None,
         };
 
         let result = tool

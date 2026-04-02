@@ -79,6 +79,7 @@ pub async fn run(args: DoctorArgs, agent_name: &str) -> Result<()> {
             &global_home,
             "dashboard issue creation disabled",
         ),
+        check_github_app(&global_home),
         check_jq(),
         check_mcp(&agent_home),
         check_skills(&agent_home),
@@ -466,6 +467,118 @@ fn check_optional_key(
         status: CheckStatus::Warn,
         message: format!("{label} — not set ({disabled_feature})"),
         details: None,
+    }
+}
+
+/// Check GitHub App configuration: validates that all 3 env vars are set and the
+/// private key is valid base64-encoded PEM. Reports partial config as a warning.
+fn check_github_app(global_home: &Path) -> CheckResult {
+    let name = "github_app".to_string();
+
+    // Helper to read an env var or .env file key
+    let read_key = |env_var: &str| -> Option<String> {
+        if let Ok(val) = std::env::var(env_var)
+            && !val.trim().is_empty()
+        {
+            return Some(val);
+        }
+        let env_path = global_home.join(".env");
+        if let Ok(content) = std::fs::read_to_string(&env_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=')
+                    && k.trim() == env_var
+                {
+                    let val = v.trim().trim_matches('"');
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let app_id = read_key("MIKA_GITHUB_APP_ID");
+    let private_key = read_key("MIKA_GITHUB_APP_PRIVATE_KEY");
+    let installation_id = read_key("MIKA_GITHUB_APP_INSTALLATION_ID");
+
+    let set_count = [&app_id, &private_key, &installation_id]
+        .iter()
+        .filter(|v| v.is_some())
+        .count();
+
+    match set_count {
+        0 => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: "GitHub App — not configured (using PAT fallback if available)".into(),
+            details: None,
+        },
+        3 => {
+            // All set — validate the private key
+            let key_b64 = private_key.unwrap();
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64.as_bytes()) {
+                Err(e) => CheckResult {
+                    name,
+                    status: CheckStatus::Fail,
+                    message: format!(
+                        "GitHub App — MIKA_GITHUB_APP_PRIVATE_KEY: base64 decode failed: {e}"
+                    ),
+                    details: Some(
+                        "Encode with: base64 -w0 < your-app.pem".to_string(),
+                    ),
+                },
+                Ok(pem_bytes) => {
+                    match jsonwebtoken::EncodingKey::from_rsa_pem(&pem_bytes) {
+                        Ok(_) => CheckResult {
+                            name,
+                            status: CheckStatus::Ok,
+                            message: format!(
+                                "GitHub App — configured (app_id={}, installation_id={})",
+                                app_id.unwrap_or_default(),
+                                installation_id.unwrap_or_default()
+                            ),
+                            details: None,
+                        },
+                        Err(e) => CheckResult {
+                            name,
+                            status: CheckStatus::Fail,
+                            message: format!(
+                                "GitHub App — MIKA_GITHUB_APP_PRIVATE_KEY: RSA PEM parse failed: {e}"
+                            ),
+                            details: Some(
+                                "Ensure the key is a PKCS#1 RSA private key PEM (GitHub default export format)".to_string(),
+                            ),
+                        },
+                    }
+                }
+            }
+        }
+        _ => {
+            let mut missing = Vec::new();
+            if app_id.is_none() {
+                missing.push("MIKA_GITHUB_APP_ID");
+            }
+            if private_key.is_none() {
+                missing.push("MIKA_GITHUB_APP_PRIVATE_KEY");
+            }
+            if installation_id.is_none() {
+                missing.push("MIKA_GITHUB_APP_INSTALLATION_ID");
+            }
+            CheckResult {
+                name,
+                status: CheckStatus::Warn,
+                message: format!(
+                    "GitHub App — incomplete config (missing: {})",
+                    missing.join(", ")
+                ),
+                details: Some("All 3 env vars are required for GitHub App auth".to_string()),
+            }
+        }
     }
 }
 

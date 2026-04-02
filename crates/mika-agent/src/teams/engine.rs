@@ -57,6 +57,7 @@ pub struct TeamEngine {
     callback: Option<Arc<TeamEventCallback>>,
     brave_api_key: Option<String>,
     github_token: Option<String>,
+    github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     /// Team-level database for persisting runs and messages.
     team_db: AsyncDatabase,
     /// Message ID of the root goal message (set after insert).
@@ -139,6 +140,7 @@ impl TeamEngine {
     }
 
     /// Create a new engine for a team run.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         team: TeamDefinition,
         goal: &str,
@@ -147,6 +149,7 @@ impl TeamEngine {
         callback: Option<TeamEventCallback>,
         team_db: AsyncDatabase,
         reference_run_id: Option<&str>,
+        github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -184,6 +187,7 @@ impl TeamEngine {
             callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
             github_token: settings.agent_github_token().map(String::from),
+            github_app,
             team_db,
             goal_msg_id: None,
             trace_id: mika_common::trace::generate_trace_id(),
@@ -198,6 +202,7 @@ impl TeamEngine {
         global_home: &Path,
         settings: &Settings,
         team_db: AsyncDatabase,
+        github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     ) -> Result<Self> {
         let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
 
@@ -224,6 +229,7 @@ impl TeamEngine {
             callback: None, // No callback on resume — events go through task system
             brave_api_key: settings.brave_api_key.clone(),
             github_token: settings.agent_github_token().map(String::from),
+            github_app,
             team_db,
             goal_msg_id: None,
             trace_id,
@@ -770,6 +776,7 @@ impl TeamEngine {
         let team_name = self.run.team_name.clone();
         let brave_api_key = self.brave_api_key.clone();
         let github_token = self.github_token.clone();
+        let github_app = self.github_app.clone();
         let team_db = self.team_db.clone();
 
         // Build per-task parameters upfront from self (avoids borrowing self in spawned tasks).
@@ -910,6 +917,7 @@ impl TeamEngine {
             let team_name = team_name.clone();
             let brave_api_key = brave_api_key.clone();
             let github_token = github_token.clone();
+            let github_app = github_app.clone();
             let team_db = team_db.clone();
             let trace_id = self.trace_id.clone();
 
@@ -964,6 +972,7 @@ impl TeamEngine {
                                 embedding_client: resources.embedding_client.as_ref(),
                                 brave_api_key: brave_api_key.as_deref(),
                                 github_token: github_token.as_deref(),
+                                github_app: github_app.as_deref(),
                                 skills_dirty: &skills_dirty,
                                 settings: Some(&resources.settings),
                                 mcp_manager: None,
@@ -1311,6 +1320,7 @@ impl TeamEngine {
             embedding_client: resources.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
             skills_dirty: &skills_dirty,
             settings: Some(&resources.settings),
             mcp_manager: None,

@@ -18,6 +18,8 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 pub struct RunTeamTool {
     pub home_dir: PathBuf,
     pub settings: Settings,
+    /// Shared GitHub App instance (avoids duplicate `from_settings` calls with separate caches).
+    pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
 }
 
 #[async_trait]
@@ -131,6 +133,7 @@ impl Tool for RunTeamTool {
             callback,
             team_db.clone(),
             None,
+            self.github_app.clone(),
         )
         .await;
         team_db.shutdown();
@@ -169,6 +172,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -186,6 +190,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -204,6 +209,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -224,6 +230,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -245,6 +252,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool

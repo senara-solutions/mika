@@ -257,6 +257,7 @@ async fn init_agent(
 
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let github_app = mika_common::github_app::GitHubApp::from_settings(&agent_settings);
 
     let dispatcher = Arc::new(TaskDispatcher {
         db: async_db.clone(),
@@ -268,6 +269,7 @@ async fn init_agent(
         embedding_client: embedding_client.clone(),
         brave_api_key,
         github_token,
+        github_app: github_app.clone(),
         skills_dirty: skills_dirty.clone(),
         agent_lock: Some(agent_lock.clone()),
         // Server mode: engine dispatches callbacks via dispatch_undelivered_callbacks().
@@ -306,6 +308,7 @@ async fn init_agent(
         mcp_manager,
         settings: agent_settings,
         llm: agent_llm,
+        github_app,
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -393,8 +396,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     }
 
     let http_client = reqwest::Client::new();
+    let global_github_app = mika_common::github_app::GitHubApp::from_settings(settings);
     let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone()) {
+    for tool in tools::management_tools_if_needed(
+        global_home,
+        settings,
+        http_client.clone(),
+        global_github_app.clone(),
+    ) {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
@@ -529,6 +538,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         http_client,
         brave_api_key: settings.brave_api_key.clone(),
         github_token: settings.agent_github_token().map(String::from),
+        github_app: global_github_app,
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
         dashboard_db,
@@ -671,6 +681,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            github_app: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,
             cli_mode: false,
@@ -705,6 +716,7 @@ mod tests {
             mcp_manager: None,
             settings: test_settings(),
             llm: llm.clone(),
+            github_app: None,
         };
 
         let mut agents = HashMap::new();
@@ -722,6 +734,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             brave_api_key: None,
             github_token: None,
+            github_app: None,
             global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             settings: test_settings(),
             dashboard_db,

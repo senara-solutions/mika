@@ -4,8 +4,10 @@ pub mod types;
 
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
 
 use mika_common::config::Settings;
+use mika_common::github_app::GitHubApp;
 use mika_common::team;
 
 use crate::async_db::AsyncDatabase;
@@ -21,6 +23,7 @@ use self::types::{TeamEventCallback, TeamRun};
 /// If `reference_run_id` is provided, the referenced run's workspace is made available
 /// as read-only context to workspace tools, and the referenced run's summary overrides
 /// the auto-detected "last completed run" in the orchestrator prompt.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_team(
     team_name: &str,
     goal: &str,
@@ -29,6 +32,7 @@ pub async fn run_team(
     callback: Option<TeamEventCallback>,
     team_db: AsyncDatabase,
     reference_run_id: Option<&str>,
+    github_app: Option<Arc<GitHubApp>>,
 ) -> Result<TeamRun> {
     let def = team::load_team(global_home, team_name)?;
     team::validate_team(global_home, &def)?;
@@ -41,6 +45,7 @@ pub async fn run_team(
         callback,
         team_db,
         reference_run_id,
+        github_app,
     )?;
     engine.execute().await
 }
@@ -51,6 +56,7 @@ pub async fn run_team(
 /// (agent delegations) have completed. Deserializes the team state from
 /// the checkpoint, injects child results as agent responses, and continues
 /// from the specified phase (typically Review → Deliver).
+#[allow(clippy::too_many_arguments)]
 pub async fn resume_team_run(
     _team_run_id: &str,
     team_name: &str,
@@ -59,6 +65,7 @@ pub async fn resume_team_run(
     child_results: &str,
     global_home: &Path,
     db: &AsyncDatabase,
+    github_app: Option<Arc<GitHubApp>>,
 ) -> Result<()> {
     tracing::info!(
         team_name = team_name,
@@ -81,7 +88,8 @@ pub async fn resume_team_run(
     let resume_db = crate::db::Database::open(&db_path)?;
     let team_db = AsyncDatabase::new_with_agent(resume_db, &db.agent_id);
 
-    let engine = TeamEngine::new_for_resume(def, run, global_home, &settings, team_db).await?;
+    let engine =
+        TeamEngine::new_for_resume(def, run, global_home, &settings, team_db, github_app).await?;
     let _run = engine.execute_from_phase(next_phase, child_results).await?;
 
     Ok(())

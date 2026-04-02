@@ -212,9 +212,12 @@ pub async fn run(
 
     // Normal ask mode — full conversation agent
     let mut tool_registry = tools::default_tools();
-    for tool in
-        tools::management_tools_if_needed(&ctx.global_home, &ctx.settings, reqwest::Client::new())
-    {
+    for tool in tools::management_tools_if_needed(
+        &ctx.global_home,
+        &ctx.settings,
+        reqwest::Client::new(),
+        ctx.github_app.clone(),
+    ) {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
@@ -248,6 +251,7 @@ pub async fn run(
         user_images: &[],
         brave_api_key: ctx.settings.brave_api_key.as_deref(),
         github_token: ctx.settings.agent_github_token(),
+        github_app: ctx.github_app.as_deref(),
         skills_dirty: &skills_dirty,
         mcp_manager: mcp_manager.as_ref(),
         global_home_dir: Some(&ctx.global_home),
@@ -432,6 +436,7 @@ pub async fn run_team_ask(
 
     let team_db = crate::commands::teams::open_container_db_async(global_home)?;
 
+    let github_app = mika_common::github_app::GitHubApp::from_settings(&settings);
     let run = mika_agent::teams::run_team(
         team_name,
         &goal,
@@ -440,6 +445,7 @@ pub async fn run_team_ask(
         Some(Box::new(callback)),
         team_db.clone(),
         run_id,
+        github_app,
     )
     .await?;
     team_db.shutdown();

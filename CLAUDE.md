@@ -23,7 +23,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 ## Directory Structure
 
-- `crates/mika-common/` — Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum, `get_effective_value`/`lookup_config_key` helpers), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` load/read/write via dotenvy), Claude API client, OAuth PKCE token exchange (`oauth.rs` — PKCE flow, `OAuthTokenManager` with `tokio::sync::RwLock` caching, `~/.mika/oauth.json` persistence), logging, telemetry (feature-gated OTel export), home directory, `MockLlmProvider` (`llm/mock.rs` — sequence-based mock for deterministic agent loop testing, gated behind `test-utils` feature)
+- `crates/mika-common/` — Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum, `get_effective_value`/`lookup_config_key` helpers), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` load/read/write via dotenvy), Claude API client, OAuth PKCE token exchange (`oauth.rs` — PKCE flow, `OAuthTokenManager` with `tokio::sync::RwLock` caching, `~/.mika/oauth.json` persistence), GitHub App authentication (`github_app.rs` — RS256 JWT signing, installation token exchange and caching with `tokio::sync::RwLock` double-checked locking, `GitHubApp::from_settings()` constructor), logging, telemetry (feature-gated OTel export), home directory, `MockLlmProvider` (`llm/mock.rs` — sequence-based mock for deterministic agent loop testing, gated behind `test-utils` feature)
 - `crates/mika-a2a/` — A2A (Agent-to-Agent) protocol v0.3 implementation: JSON-RPC types, task state machine (submitted → working → completed/failed/canceled), SSE streaming, A2A client
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpoints, HTTP server binary
 - `crates/mika-gateway/` — Telegram webhook router: Postgres customer registry, message routing, pairing flow, outbound relay, A2A protocol proxy with API key auth. `build.rs` forces recompilation when `migrations/` directory changes (prevents stale `sqlx::migrate!()` embeds from incremental compilation cache).
@@ -131,7 +131,12 @@ See `.env.example` for the full list. Per-provider API keys (set the one for you
 Optional (web search):
 - `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
 
-Optional (GitHub — agent operations):
+Optional (GitHub App — preferred over PAT for agent operations):
+- `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for GitHub App authentication.
+- `MIKA_GITHUB_APP_PRIVATE_KEY` — GitHub App private key (base64-encoded PEM). Encode with: `base64 -w0 < your-app.pem`
+- `MIKA_GITHUB_APP_INSTALLATION_ID` — GitHub App installation ID for the org (u64). All 3 vars must be set; when configured, installation tokens replace PAT for `run_gh`, context injection, and work item enrichment. Falls back to PAT on exchange failure.
+
+Optional (GitHub — agent operations, fallback when App not configured):
 - `MIKA_GITHUB_TOKEN` — GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge). Needs Pull requests R/W, Issues R/W, Contents R scopes.
 
 Optional (GitHub — investigation panel):

@@ -3,6 +3,7 @@ pub mod claude;
 pub mod config;
 pub mod dotenv;
 pub mod embedding;
+pub mod github_app;
 pub mod home;
 pub mod llm;
 pub mod logging;

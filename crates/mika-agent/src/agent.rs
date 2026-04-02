@@ -932,6 +932,9 @@ pub struct AgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// GitHub token for checking PR/issue status on work items (optional).
     pub github_token: Option<&'a str>,
+    /// GitHub App authentication manager (optional). When present, installation
+    /// tokens are preferred over `github_token` PAT via `resolve_github_token()`.
+    pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
     /// Optional MCP manager for external tool servers.
@@ -1079,14 +1082,26 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         system.push_str("\n</context>\n");
     }
 
+    // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
+    // Reused for both context injection and ToolContext.
+    let resolved_github_token = if let Some(settings) = params.settings {
+        settings.resolve_github_token(params.github_app).await
+    } else {
+        params.github_token.map(String::from)
+    };
+
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.user_message);
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve context requirements before LLM override
     // (excluded skills shouldn't affect LLM selection)
-    let (resolved_context, context_exclude) =
-        context::resolve_contexts(&matched_entries, params.user_message, params.github_token).await;
+    let (resolved_context, context_exclude) = context::resolve_contexts(
+        &matched_entries,
+        params.user_message,
+        resolved_github_token.as_deref(),
+    )
+    .await;
     // Remove skills excluded by failed context resolution
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);
@@ -1187,7 +1202,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
-        github_token: params.github_token,
+        github_token: resolved_github_token.as_deref(),
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: false,
@@ -1652,6 +1667,8 @@ pub struct SilentAgentParams<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// GitHub App authentication manager (optional).
+    pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
     /// Settings for per-skill LLM provider overrides.
@@ -1914,6 +1931,14 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         .trace_id
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
+
+    // Resolve GitHub token: prefer GitHub App installation token, fall back to PAT.
+    let resolved_github_token = if let Some(settings) = params.settings {
+        settings.resolve_github_token(params.github_app).await
+    } else {
+        params.github_token.map(String::from)
+    };
+
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db,
@@ -1926,7 +1951,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
-        github_token: params.github_token,
+        github_token: resolved_github_token.as_deref(),
         skills_dirty: params.skills_dirty,
         is_reflection,
         is_task_context: true,
@@ -2069,6 +2094,8 @@ pub struct TeamAgentParams<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// GitHub App authentication manager (optional).
+    pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
     /// Settings for per-skill LLM provider overrides.
@@ -2157,13 +2184,24 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     system.push_str(params.team_context);
     system.push('\n');
 
+    // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
+    let team_resolved_github_token = if let Some(settings) = params.settings {
+        settings.resolve_github_token(params.github_app).await
+    } else {
+        params.github_token.map(String::from)
+    };
+
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.task_message);
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve context requirements before LLM override
-    let (resolved_context, context_exclude) =
-        context::resolve_contexts(&matched_entries, params.task_message, params.github_token).await;
+    let (resolved_context, context_exclude) = context::resolve_contexts(
+        &matched_entries,
+        params.task_message,
+        team_resolved_github_token.as_deref(),
+    )
+    .await;
     // Remove skills excluded by failed context resolution
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);
@@ -2206,6 +2244,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         .trace_id
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
+
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db: params.db,
@@ -2218,7 +2257,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
-        github_token: params.github_token,
+        github_token: team_resolved_github_token.as_deref(),
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: true,

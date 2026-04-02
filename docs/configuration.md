@@ -126,7 +126,10 @@ existing shell environment variables. File permissions are set to `0600`.
 MIKA_ANTHROPIC_API_KEY=sk-ant-api03-...
 MIKA_OPENAI_API_KEY=sk-...        # Also used for Layer 3 vector search
 MIKA_BRAVE_API_KEY=BSA...
-MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PRs, issues, context injection)
+MIKA_GITHUB_APP_ID=123456              # GitHub App (preferred over PAT)
+MIKA_GITHUB_APP_PRIVATE_KEY=<base64>   # base64 -w0 < your-app.pem
+MIKA_GITHUB_APP_INSTALLATION_ID=78901234
+MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PAT fallback)
 MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...  # Investigation panel only (issue creation)
 MIKA_GITHUB_REPO=owner/repo
 # GH_TOKEN — do NOT set here; run_gh injects MIKA_GITHUB_TOKEN as GH_TOKEN automatically
@@ -137,10 +140,37 @@ preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
 `~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
 server mode.
 
-### GitHub token for agent operations
+### GitHub App authentication (preferred)
+
+GitHub App installation tokens are preferred over Personal Access Tokens for agent
+operations. They are short-lived (1 hour), org-scoped, and auditable.
+
+1. Register a GitHub App on your organization (Settings → Developer settings → GitHub Apps)
+2. Note the **App ID** and **Installation ID** (visible after installing on the org)
+3. Download the private key PEM file and base64-encode it:
+   ```sh
+   base64 -w0 < your-app.pem
+   ```
+4. Add to `~/.mika/.env`:
+   ```sh
+   MIKA_GITHUB_APP_ID=123456
+   MIKA_GITHUB_APP_PRIVATE_KEY=<paste base64 output here>
+   MIKA_GITHUB_APP_INSTALLATION_ID=78901234
+   ```
+
+All 3 env vars must be set. The private key is validated at startup — base64 decode
+and RSA PEM parse errors are reported immediately. When configured, Mika generates
+RS256 JWTs and exchanges them for installation tokens with automatic caching
+(5-minute pre-expiry refresh). If the token exchange fails, Mika falls back to
+`MIKA_GITHUB_TOKEN` PAT with a warning.
+
+Run `mika doctor` to verify the configuration.
+
+### GitHub token for agent operations (PAT fallback)
 
 `MIKA_GITHUB_TOKEN` enables agent-level GitHub operations: context injection (fetching
-PR diffs), work item enrichment (PR/issue status), and dev-run PR merges.
+PR diffs), work item enrichment (PR/issue status), and dev-run PR merges. When a
+GitHub App is configured (see above), the App's installation token takes precedence.
 
 1. Create a GitHub Personal Access Token:
    - **Fine-grained token** (recommended): Settings → Developer settings →

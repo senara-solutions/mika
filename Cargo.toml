@@ -125,6 +125,9 @@ rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 # URL parsing
 url = "2"
 
+# JWT
+jsonwebtoken = "9"
+
 # Utilities
 rand = "0.9"
 hex = "0.4"
