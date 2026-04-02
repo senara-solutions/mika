@@ -1,7 +1,7 @@
 ---
 title: "fix: clear token separation — remove GH_TOKEN from .mika/.env, verify run_gh injection"
 type: fix
-status: active
+status: completed
 date: 2026-04-02
 issue: "#380"
 ---
