@@ -100,11 +100,7 @@ impl GitHubApp {
 
     /// Construct directly for testing (bypasses Settings).
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn new(
-        app_id: u64,
-        signing_key: EncodingKey,
-        installation_id: u64,
-    ) -> Arc<Self> {
+    pub fn new(app_id: u64, signing_key: EncodingKey, installation_id: u64) -> Arc<Self> {
         Arc::new(Self {
             app_id,
             signing_key,
@@ -199,7 +195,9 @@ impl GitHubApp {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let body_preview: String = body.chars().take(200).collect();
-            anyhow::bail!("GitHub installation token exchange failed (HTTP {status}): {body_preview}");
+            anyhow::bail!(
+                "GitHub installation token exchange failed (HTTP {status}): {body_preview}"
+            );
         }
 
         #[derive(serde::Deserialize)]
@@ -389,7 +387,10 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             .unwrap()
             .as_secs();
         let diff = now.abs_diff(iat + IAT_BACKDATE.as_secs());
-        assert!(diff < 5, "iat should be ~60s before current time, diff={diff}");
+        assert!(
+            diff < 5,
+            "iat should be ~60s before current time, diff={diff}"
+        );
     }
 
     #[test]

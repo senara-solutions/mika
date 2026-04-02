@@ -212,9 +212,12 @@ pub async fn run(
 
     // Normal ask mode — full conversation agent
     let mut tool_registry = tools::default_tools();
-    for tool in
-        tools::management_tools_if_needed(&ctx.global_home, &ctx.settings, reqwest::Client::new(), ctx.github_app.clone())
-    {
+    for tool in tools::management_tools_if_needed(
+        &ctx.global_home,
+        &ctx.settings,
+        reqwest::Client::new(),
+        ctx.github_app.clone(),
+    ) {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);

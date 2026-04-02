@@ -1096,8 +1096,12 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
     // Resolve context requirements before LLM override
     // (excluded skills shouldn't affect LLM selection)
-    let (resolved_context, context_exclude) =
-        context::resolve_contexts(&matched_entries, params.user_message, resolved_github_token.as_deref()).await;
+    let (resolved_context, context_exclude) = context::resolve_contexts(
+        &matched_entries,
+        params.user_message,
+        resolved_github_token.as_deref(),
+    )
+    .await;
     // Remove skills excluded by failed context resolution
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);
@@ -2192,8 +2196,12 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve context requirements before LLM override
-    let (resolved_context, context_exclude) =
-        context::resolve_contexts(&matched_entries, params.task_message, team_resolved_github_token.as_deref()).await;
+    let (resolved_context, context_exclude) = context::resolve_contexts(
+        &matched_entries,
+        params.task_message,
+        team_resolved_github_token.as_deref(),
+    )
+    .await;
     // Remove skills excluded by failed context resolution
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);

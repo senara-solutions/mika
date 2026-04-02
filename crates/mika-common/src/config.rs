@@ -1074,7 +1074,10 @@ impl std::fmt::Debug for Settings {
                 "github_app_private_key",
                 &self.github_app_private_key.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("github_app_installation_id", &self.github_app_installation_id)
+            .field(
+                "github_app_installation_id",
+                &self.github_app_installation_id,
+            )
             .field("server_log_file", &self.server_log_file)
             .field("dashboard_enabled", &self.dashboard_enabled)
             .field("disable_bundled_skills", &self.disable_bundled_skills)

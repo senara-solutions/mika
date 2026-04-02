@@ -398,7 +398,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let http_client = reqwest::Client::new();
     let global_github_app = mika_common::github_app::GitHubApp::from_settings(settings);
     let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone(), global_github_app.clone()) {
+    for tool in tools::management_tools_if_needed(
+        global_home,
+        settings,
+        http_client.clone(),
+        global_github_app.clone(),
+    ) {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);

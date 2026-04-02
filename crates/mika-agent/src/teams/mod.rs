@@ -86,7 +86,8 @@ pub async fn resume_team_run(
     let resume_db = crate::db::Database::open(&db_path)?;
     let team_db = AsyncDatabase::new_with_agent(resume_db, &db.agent_id);
 
-    let engine = TeamEngine::new_for_resume(def, run, global_home, &settings, team_db, github_app).await?;
+    let engine =
+        TeamEngine::new_for_resume(def, run, global_home, &settings, team_db, github_app).await?;
     let _run = engine.execute_from_phase(next_phase, child_results).await?;
 
     Ok(())
