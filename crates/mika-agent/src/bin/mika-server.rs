@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 async fn main() -> Result<()> {
     let home_dir = mika_common::home::resolve_home_dir()?;
     mika_common::dotenv::load_dotenv(&home_dir);
-    mika_common::dotenv::check_deprecated_env_vars();
+    mika_common::dotenv::check_env_warnings(&home_dir);
 
     if !mika_common::home::is_initialized(&home_dir) {
         mika_common::home::bootstrap_fresh_install(&home_dir)?;

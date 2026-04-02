@@ -22,7 +22,16 @@ use crate::tools::{ImageData, ToolOutput};
 /// Maximum output size from a skill tool (10,000 characters).
 const MAX_OUTPUT_LEN: usize = 10_000;
 
-/// Scrub all `MIKA_*` environment variables from a tokio Command (defense-in-depth).
+/// Non-`MIKA_*` env vars that must also be scrubbed from child processes.
+///
+/// `GH_TOKEN` is removed to prevent identity collision: if it leaked from
+/// `~/.mika/.env` via dotenvy, it would override the host's `gh auth` identity
+/// in ALL child processes. `run_gh` explicitly re-injects the correct platform
+/// token AFTER this scrub. See issue #380.
+const EXTRA_SCRUB_VARS: &[&str] = &["GH_TOKEN"];
+
+/// Scrub all `MIKA_*` environment variables (and [`EXTRA_SCRUB_VARS`]) from a
+/// tokio Command (defense-in-depth).
 ///
 /// Prevents leaking secrets like `MIKA_ANTHROPIC_API_KEY`, `MIKA_INTERNAL_TOKEN`,
 /// and `MIKA_OPENAI_API_KEY` to child processes.
@@ -32,9 +41,13 @@ pub(crate) fn scrub_mika_env_vars(cmd: &mut tokio::process::Command) {
             cmd.env_remove(&key);
         }
     }
+    for key in EXTRA_SCRUB_VARS {
+        cmd.env_remove(key);
+    }
 }
 
-/// Scrub all `MIKA_*` environment variables from a std Command (defense-in-depth).
+/// Scrub all `MIKA_*` environment variables (and [`EXTRA_SCRUB_VARS`]) from a
+/// std Command (defense-in-depth).
 ///
 /// Same as [`scrub_mika_env_vars`] but for synchronous `std::process::Command`.
 pub(crate) fn scrub_mika_env_vars_std(cmd: &mut std::process::Command) {
@@ -42,6 +55,9 @@ pub(crate) fn scrub_mika_env_vars_std(cmd: &mut std::process::Command) {
         if key.starts_with("MIKA_") {
             cmd.env_remove(&key);
         }
+    }
+    for key in EXTRA_SCRUB_VARS {
+        cmd.env_remove(key);
     }
 }
 
