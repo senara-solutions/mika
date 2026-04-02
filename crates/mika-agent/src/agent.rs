@@ -1643,13 +1643,14 @@ pub enum SilentTrigger {
 impl SilentTrigger {
     /// Returns the max tool steps budget for this trigger type.
     ///
-    /// Callbacks get a higher budget (`MAX_CALLBACK_TOOL_STEPS`) because complex
-    /// callback workflows (e.g., PR discovery → QA delegation → verdict processing
-    /// → status update) routinely need 12-15+ steps. See #375.
+    /// Callbacks and Reminders get a higher budget (`MAX_CALLBACK_TOOL_STEPS`)
+    /// because both serve as continuation mechanisms for complex autonomous
+    /// workflows (e.g., PR discovery → QA delegation → verdict processing
+    /// → status update) that routinely need 12-15+ steps. See #375, #397.
     fn max_steps(&self) -> usize {
         match self {
-            Self::Callback { .. } => MAX_CALLBACK_TOOL_STEPS,
-            _ => MAX_TOOL_STEPS,
+            Self::Callback { .. } | Self::Reminder { .. } => MAX_CALLBACK_TOOL_STEPS,
+            Self::Heartbeat | Self::Reflection | Self::SkillRun { .. } => MAX_TOOL_STEPS,
         }
     }
 }
@@ -2594,6 +2595,12 @@ mod tests {
             parent_task_id: None,
         };
         assert_eq!(trigger.max_steps(), MAX_CALLBACK_TOOL_STEPS);
+
+        let reminder = SilentTrigger::Reminder {
+            task_id: "test".to_string(),
+            message: "check CI".to_string(),
+        };
+        assert_eq!(reminder.max_steps(), MAX_CALLBACK_TOOL_STEPS);
     }
 
     #[test]
@@ -2603,14 +2610,6 @@ mod tests {
         assert_eq!(
             SilentTrigger::SkillRun {
                 skill_name: "test".to_string()
-            }
-            .max_steps(),
-            MAX_TOOL_STEPS
-        );
-        assert_eq!(
-            SilentTrigger::Reminder {
-                task_id: "test".to_string(),
-                message: "test".to_string()
             }
             .max_steps(),
             MAX_TOOL_STEPS
