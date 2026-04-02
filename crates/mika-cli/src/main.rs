@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
         Some(Commands::Token(args)) => {
             let home_dir = home::resolve_home_dir()?;
             mika_common::dotenv::load_dotenv(&home_dir);
-            return commands::token::run(args.command.clone(), &home_dir).await;
+            return commands::token::run(&args.command, &home_dir).await;
         }
         Some(Commands::CredentialHelper(args)) => {
             let home_dir = home::resolve_home_dir()?;

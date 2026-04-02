@@ -512,7 +512,7 @@ pub struct TokenArgs {
     pub command: TokenCommand,
 }
 
-#[derive(Clone, Subcommand)]
+#[derive(Subcommand)]
 pub enum TokenCommand {
     /// Print a GitHub App installation token to stdout
     Github,

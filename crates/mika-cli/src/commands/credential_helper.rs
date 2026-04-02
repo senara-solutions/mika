@@ -24,7 +24,8 @@ pub async fn run(operation: &str, home_dir: &std::path::Path) -> Result<()> {
     }
 
     // Parse git credential protocol from stdin
-    let (protocol, host) = parse_credential_request()?;
+    let stdin = std::io::stdin();
+    let (protocol, host) = parse_credential_request(stdin.lock())?;
 
     // Security filter: only respond for github.com HTTPS
     if protocol.as_deref() != Some("https") || host.as_deref() != Some("github.com") {
@@ -47,16 +48,15 @@ pub async fn run(operation: &str, home_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Parse the git credential protocol request from stdin.
+/// Parse the git credential protocol request from a reader.
 ///
 /// Git sends key=value pairs, one per line, terminated by an empty line.
 /// We extract `protocol` and `host` fields.
-fn parse_credential_request() -> Result<(Option<String>, Option<String>)> {
-    let stdin = std::io::stdin();
+fn parse_credential_request(reader: impl BufRead) -> Result<(Option<String>, Option<String>)> {
     let mut protocol = None;
     let mut host = None;
 
-    for line in stdin.lock().lines() {
+    for line in reader.lines() {
         let line = line?;
         if line.is_empty() {
             break;
@@ -87,65 +87,47 @@ async fn get_installation_token(home_dir: &std::path::Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::Cursor;
+
     #[test]
     fn test_parse_credential_request_basic() {
-        // Simulate stdin with a pipe
-        let input = "protocol=https\nhost=github.com\n\n";
-        let (protocol, host) = parse_from_str(input);
+        let input = Cursor::new("protocol=https\nhost=github.com\n\n");
+        let (protocol, host) = parse_credential_request(input).unwrap();
         assert_eq!(protocol.as_deref(), Some("https"));
         assert_eq!(host.as_deref(), Some("github.com"));
     }
 
     #[test]
     fn test_parse_credential_request_with_path() {
-        let input = "protocol=https\nhost=github.com\npath=senara-solutions/mika.git\n\n";
-        let (protocol, host) = parse_from_str(input);
+        let input =
+            Cursor::new("protocol=https\nhost=github.com\npath=senara-solutions/mika.git\n\n");
+        let (protocol, host) = parse_credential_request(input).unwrap();
         assert_eq!(protocol.as_deref(), Some("https"));
         assert_eq!(host.as_deref(), Some("github.com"));
     }
 
     #[test]
     fn test_parse_credential_request_non_github() {
-        let input = "protocol=https\nhost=gitlab.com\n\n";
-        let (protocol, host) = parse_from_str(input);
+        let input = Cursor::new("protocol=https\nhost=gitlab.com\n\n");
+        let (protocol, host) = parse_credential_request(input).unwrap();
         assert_eq!(protocol.as_deref(), Some("https"));
         assert_eq!(host.as_deref(), Some("gitlab.com"));
     }
 
     #[test]
     fn test_parse_credential_request_ssh() {
-        let input = "protocol=ssh\nhost=github.com\n\n";
-        let (protocol, host) = parse_from_str(input);
+        let input = Cursor::new("protocol=ssh\nhost=github.com\n\n");
+        let (protocol, host) = parse_credential_request(input).unwrap();
         assert_eq!(protocol.as_deref(), Some("ssh"));
         assert_eq!(host.as_deref(), Some("github.com"));
     }
 
     #[test]
     fn test_parse_credential_request_empty() {
-        let input = "\n";
-        let (protocol, host) = parse_from_str(input);
+        let input = Cursor::new("\n");
+        let (protocol, host) = parse_credential_request(input).unwrap();
         assert!(protocol.is_none());
         assert!(host.is_none());
-    }
-
-    /// Helper: parse credential request from a string (simulates stdin).
-    fn parse_from_str(input: &str) -> (Option<String>, Option<String>) {
-        let mut protocol = None;
-        let mut host = None;
-
-        for line in input.lines() {
-            if line.is_empty() {
-                break;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                match key {
-                    "protocol" => protocol = Some(value.to_string()),
-                    "host" => host = Some(value.to_string()),
-                    _ => {}
-                }
-            }
-        }
-
-        (protocol, host)
     }
 }

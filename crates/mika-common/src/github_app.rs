@@ -168,8 +168,16 @@ impl GitHubApp {
         // Fall through to in-memory cache / JWT exchange
         let token = self.installation_token().await?;
 
-        // Best-effort write to file cache
-        Self::write_file_cache(cache_path, &token);
+        // Read the actual expiry from the in-memory cache (populated by installation_token)
+        let expires_at = {
+            let cache = self.cache.read().await;
+            cache.as_ref().map(|c| c.expires_at)
+        };
+
+        // Best-effort write to file cache with actual expiry
+        if let Some(expires_at) = expires_at {
+            Self::write_file_cache(cache_path, &token, expires_at);
+        }
 
         Ok(token)
     }
@@ -197,30 +205,59 @@ impl GitHubApp {
     }
 
     /// Write a token to the file cache with restrictive permissions.
-    fn write_file_cache(cache_path: &Path, token: &str) {
-        // Compute expiry: installation tokens are valid for ~1 hour.
-        // We use 55 minutes from now as a conservative estimate since we don't
-        // know the exact expiry from this code path (the in-memory cache has it,
-        // but the file cache is a simpler layer).
-        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(55);
-        let cached = FileCachedToken {
-            token: token.to_string(),
-            expires_at: expires_at.to_rfc3339(),
+    ///
+    /// Uses atomic write (temp file + rename) with 0o600 permissions set at
+    /// file creation time (via `OpenOptionsExt::mode`) to eliminate the TOCTOU
+    /// race between write and chmod.
+    fn write_file_cache(cache_path: &Path, token: &str, expires_at: SystemTime) {
+        let expires_at_rfc3339 = {
+            let secs = expires_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            chrono::DateTime::from_timestamp(secs as i64, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
         };
 
-        if let Ok(json) = serde_json::to_string_pretty(&cached) {
-            // Write atomically: write to temp file, then rename
-            let tmp_path = cache_path.with_extension("tmp");
-            if std::fs::write(&tmp_path, &json).is_ok() {
-                // Set restrictive permissions (owner-only read/write)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
-                }
-                let _ = std::fs::rename(&tmp_path, cache_path);
+        if expires_at_rfc3339.is_empty() {
+            return;
+        }
+
+        let cached = FileCachedToken {
+            token: token.to_string(),
+            expires_at: expires_at_rfc3339,
+        };
+
+        let Ok(json) = serde_json::to_string_pretty(&cached) else {
+            return;
+        };
+
+        // Write atomically: create temp file with 0o600, write, then rename.
+        let tmp_path = cache_path.with_extension("tmp");
+        let write_ok = {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .and_then(|mut f| f.write_all(json.as_bytes()))
+                    .is_ok()
             }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp_path, &json).is_ok()
+            }
+        };
+
+        if write_ok && std::fs::rename(&tmp_path, cache_path).is_err() {
+            // Clean up temp file on failed rename
+            let _ = std::fs::remove_file(&tmp_path);
         }
     }
 
@@ -505,8 +542,9 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
         let tmp = tempfile::tempdir().unwrap();
         let cache_path = tmp.path().join("github_app_token.json");
 
-        // Write a token
-        GitHubApp::write_file_cache(&cache_path, "ghs_test_token_123");
+        // Write a token with 30-minute expiry (well within the 5-minute buffer)
+        let expires_at = SystemTime::now() + Duration::from_secs(1800);
+        GitHubApp::write_file_cache(&cache_path, "ghs_test_token_123", expires_at);
 
         // Read it back — should succeed (token is fresh)
         let result = GitHubApp::read_file_cache(&cache_path);

@@ -6,7 +6,7 @@ use crate::cli::TokenCommand;
 ///
 /// Lightweight path: loads dotenv + Settings + GitHubApp only.
 /// No tracing, no DB, no agent resolution.
-pub async fn run(command: TokenCommand, home_dir: &std::path::Path) -> Result<()> {
+pub async fn run(command: &TokenCommand, home_dir: &std::path::Path) -> Result<()> {
     match command {
         TokenCommand::Github => github(home_dir).await,
     }
