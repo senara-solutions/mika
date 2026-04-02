@@ -172,6 +172,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -189,6 +190,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -207,6 +209,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -227,6 +230,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: PathBuf::from("/tmp"),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool
@@ -248,6 +252,7 @@ mod tests {
         let tool = RunTeamTool {
             home_dir: tmp.path().to_path_buf(),
             settings: dummy_settings(),
+            github_app: None,
         };
 
         let result = tool

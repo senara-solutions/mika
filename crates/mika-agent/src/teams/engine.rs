@@ -140,6 +140,7 @@ impl TeamEngine {
     }
 
     /// Create a new engine for a team run.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         team: TeamDefinition,
         goal: &str,

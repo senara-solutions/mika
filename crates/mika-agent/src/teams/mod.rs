@@ -23,6 +23,7 @@ use self::types::{TeamEventCallback, TeamRun};
 /// If `reference_run_id` is provided, the referenced run's workspace is made available
 /// as read-only context to workspace tools, and the referenced run's summary overrides
 /// the auto-detected "last completed run" in the orchestrator prompt.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_team(
     team_name: &str,
     goal: &str,
@@ -55,6 +56,7 @@ pub async fn run_team(
 /// (agent delegations) have completed. Deserializes the team state from
 /// the checkpoint, injects child results as agent responses, and continues
 /// from the specified phase (typically Review → Deliver).
+#[allow(clippy::too_many_arguments)]
 pub async fn resume_team_run(
     _team_run_id: &str,
     team_name: &str,
