@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2](https://github.com/senara-solutions/mika/releases/tag/v0.3.2) — 2026-04-02
+
+### Added
+
+- *(agent)* mika-dev auto-retry on fixable QA blocks (#377)
+- *(agent)* persist work item metadata at callback time (#376)
+
+### Fixed
+
+- *(agent)* raise callback max_steps to 20 with continuation turn fallback (#378)
+- *(ci)* use build.rs + OUT_DIR for dashboard asset embedding (#387)
+- *(ci)* use pinned Rust toolchain in release-plz workflow (#394)
+- clear GH_TOKEN identity separation — active removal + defense-in-depth scrub (#388)
+
 ## [0.3.1](https://github.com/senara-solutions/mika/releases/tag/v0.3.1) — 2026-03-31
 
 ### Fixed

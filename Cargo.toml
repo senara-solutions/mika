@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 description = "AI executive assistant with persistent memory"
@@ -139,9 +139,9 @@ serial_test = "3"
 dashmap = "6"
 
 # Workspace crates
-mika-common = { path = "crates/mika-common", version = "0.3.1" }
-mika-agent = { path = "crates/mika-agent", version = "0.3.1" }
-mika-a2a = { path = "crates/mika-a2a", version = "0.3.1" }
+mika-common = { path = "crates/mika-common", version = "0.3.2" }
+mika-agent = { path = "crates/mika-agent", version = "0.3.2" }
+mika-a2a = { path = "crates/mika-a2a", version = "0.3.2" }
 
 [profile.release]
 lto = true
