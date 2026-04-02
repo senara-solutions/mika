@@ -257,6 +257,7 @@ async fn init_agent(
 
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let github_app = mika_common::github_app::GitHubApp::from_settings(&agent_settings);
 
     let dispatcher = Arc::new(TaskDispatcher {
         db: async_db.clone(),
@@ -268,7 +269,7 @@ async fn init_agent(
         embedding_client: embedding_client.clone(),
         brave_api_key,
         github_token,
-        github_app: mika_common::github_app::GitHubApp::from_settings(&agent_settings),
+        github_app: github_app.clone(),
         skills_dirty: skills_dirty.clone(),
         agent_lock: Some(agent_lock.clone()),
         // Server mode: engine dispatches callbacks via dispatch_undelivered_callbacks().
@@ -294,8 +295,6 @@ async fn init_agent(
             None
         }
     };
-
-    let github_app = mika_common::github_app::GitHubApp::from_settings(&agent_settings);
 
     let agent_state = AgentState {
         db: async_db,
@@ -397,8 +396,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     }
 
     let http_client = reqwest::Client::new();
+    let global_github_app = mika_common::github_app::GitHubApp::from_settings(settings);
     let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone()) {
+    for tool in tools::management_tools_if_needed(global_home, settings, http_client.clone(), global_github_app.clone()) {
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
@@ -533,7 +533,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         http_client,
         brave_api_key: settings.brave_api_key.clone(),
         github_token: settings.agent_github_token().map(String::from),
-        github_app: mika_common::github_app::GitHubApp::from_settings(settings),
+        github_app: global_github_app,
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
         dashboard_db,

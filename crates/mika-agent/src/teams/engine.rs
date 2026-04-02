@@ -148,6 +148,7 @@ impl TeamEngine {
         callback: Option<TeamEventCallback>,
         team_db: AsyncDatabase,
         reference_run_id: Option<&str>,
+        github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -185,7 +186,7 @@ impl TeamEngine {
             callback: callback.map(Arc::new),
             brave_api_key: settings.brave_api_key.clone(),
             github_token: settings.agent_github_token().map(String::from),
-            github_app: mika_common::github_app::GitHubApp::from_settings(settings),
+            github_app,
             team_db,
             goal_msg_id: None,
             trace_id: mika_common::trace::generate_trace_id(),
@@ -200,6 +201,7 @@ impl TeamEngine {
         global_home: &Path,
         settings: &Settings,
         team_db: AsyncDatabase,
+        github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     ) -> Result<Self> {
         let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
 
@@ -226,7 +228,7 @@ impl TeamEngine {
             callback: None, // No callback on resume — events go through task system
             brave_api_key: settings.brave_api_key.clone(),
             github_token: settings.agent_github_token().map(String::from),
-            github_app: mika_common::github_app::GitHubApp::from_settings(settings),
+            github_app,
             team_db,
             goal_msg_id: None,
             trace_id,

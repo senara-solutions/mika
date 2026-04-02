@@ -2237,13 +2237,6 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
 
-    // Resolve GitHub token: prefer GitHub App installation token, fall back to PAT.
-    let resolved_github_token = if let Some(settings) = params.settings {
-        settings.resolve_github_token(params.github_app).await
-    } else {
-        params.github_token.map(String::from)
-    };
-
     let core_memory_edit_count = AtomicU32::new(0);
     let tool_ctx = ToolContext {
         db: params.db,
@@ -2256,7 +2249,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         message_sender: params.message_sender.clone(),
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
-        github_token: resolved_github_token.as_deref(),
+        github_token: team_resolved_github_token.as_deref(),
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: true,

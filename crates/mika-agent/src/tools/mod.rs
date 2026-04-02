@@ -543,6 +543,7 @@ pub fn management_tools_if_needed(
     home_dir: &Path,
     settings: &Settings,
     http_client: reqwest::Client,
+    github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(create_agent::CreateAgentTool {
@@ -565,11 +566,13 @@ pub fn management_tools_if_needed(
         tools.push(Box::new(run_team::RunTeamTool {
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
+            github_app: github_app.clone(),
         }));
         tools.push(Box::new(delegate_task::DelegateTaskTool {
             home_dir: home_dir.to_path_buf(),
             settings: settings.clone(),
             http_client,
+            github_app,
         }));
         tools.push(Box::new(get_team_status::GetTeamStatusTool));
         tools.push(Box::new(get_team_history::GetTeamHistoryTool));

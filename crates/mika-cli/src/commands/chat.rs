@@ -87,7 +87,7 @@ async fn spawn_agent_worker(
     }
     let mut tool_registry = tools::default_tools();
     for tool in
-        tools::management_tools_if_needed(&ctx.global_home, &ctx.settings, reqwest::Client::new())
+        tools::management_tools_if_needed(&ctx.global_home, &ctx.settings, reqwest::Client::new(), ctx.github_app.clone())
     {
         tool_registry.register(tool);
     }
@@ -719,6 +719,7 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
             }
         };
 
+        let github_app = mika_common::github_app::GitHubApp::from_settings(&settings);
         while let Some(request) = team_rx_worker.recv().await {
             match request {
                 TeamRequest::Goal(goal) => {
@@ -735,6 +736,7 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
                         Some(Box::new(callback)),
                         worker_team_db.clone(),
                         worker_run_id.as_deref(),
+                        github_app.clone(),
                     )
                     .await
                     {

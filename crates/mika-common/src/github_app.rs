@@ -198,7 +198,8 @@ impl GitHubApp {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub installation token exchange failed (HTTP {status}): {body}");
+            let body_preview: String = body.chars().take(200).collect();
+            anyhow::bail!("GitHub installation token exchange failed (HTTP {status}): {body_preview}");
         }
 
         #[derive(serde::Deserialize)]
@@ -215,7 +216,11 @@ impl GitHubApp {
         let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
             .context("failed to parse expires_at")?;
 
-        let expires_at = UNIX_EPOCH + Duration::from_secs(expires_at.timestamp() as u64);
+        let expires_secs: u64 = expires_at
+            .timestamp()
+            .try_into()
+            .context("expires_at before UNIX epoch")?;
+        let expires_at = UNIX_EPOCH + Duration::from_secs(expires_secs);
 
         info!("GitHub App installation token refreshed");
 

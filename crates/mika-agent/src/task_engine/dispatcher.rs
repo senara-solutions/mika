@@ -501,6 +501,7 @@ impl TaskDispatcher {
             &serde_json::to_string(&child_results)?,
             &self.home_dir,
             &self.db,
+            self.github_app.clone(),
         )
         .await
     }
