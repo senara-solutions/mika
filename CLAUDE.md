@@ -131,7 +131,12 @@ See `.env.example` for the full list. Per-provider API keys (set the one for you
 Optional (web search):
 - `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
 
-Optional (GitHub — agent operations):
+Optional (GitHub App — preferred over PAT for agent operations):
+- `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for GitHub App authentication.
+- `MIKA_GITHUB_APP_PRIVATE_KEY` — GitHub App private key (base64-encoded PEM). Encode with: `base64 -w0 < your-app.pem`
+- `MIKA_GITHUB_APP_INSTALLATION_ID` — GitHub App installation ID for the org (u64). All 3 vars must be set; when configured, installation tokens replace PAT for `run_gh`, context injection, and work item enrichment. Falls back to PAT on exchange failure.
+
+Optional (GitHub — agent operations, fallback when App not configured):
 - `MIKA_GITHUB_TOKEN` — GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge). Needs Pull requests R/W, Issues R/W, Contents R scopes.
 
 Optional (GitHub — investigation panel):
