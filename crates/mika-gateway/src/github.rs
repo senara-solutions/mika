@@ -1,8 +1,8 @@
 //! GitHub webhook handler for mika-gateway.
 //!
 //! Receives GitHub App webhook events at `POST /webhook/github`, validates the
-//! HMAC-SHA256 signature, applies bot self-event filtering, routes to the correct
-//! agent name, and forwards to the agent container via `POST {container_url}/message`.
+//! HMAC-SHA256 signature, routes to the correct agent name, and forwards to the
+//! agent container via `POST {container_url}/message`.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -79,7 +79,6 @@ pub struct GitHubUser {
 #[derive(Debug, serde::Deserialize)]
 pub struct GitHubInstallation {
     pub id: u64,
-    pub app_id: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -977,6 +976,49 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         // Routable event accepted — forwarding happens async
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Regression test for #403: GitHub sends minimal `installation` objects
+    /// without `app_id` on some event types. After removing the dead `app_id`
+    /// field from `GitHubInstallation`, these payloads must parse successfully.
+    #[tokio::test]
+    async fn test_webhook_minimal_installation_parses() {
+        let app = test_router(Some("test-secret"));
+        let body = br#"{
+            "action": "opened",
+            "sender": {"login": "octocat", "type": "User"},
+            "issue": {"number": 42, "title": "Feature request",
+                      "html_url": "https://github.com/org/repo/issues/42",
+                      "body": "test body"},
+            "repository": {"full_name": "org/repo"},
+            "installation": {"id": 12345}
+        }"#;
+        let req = make_request("test-secret", body, "issues", "minimal-install-uuid");
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should parse and route successfully with minimal installation object
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Verify that payloads still including `app_id` in the installation object
+    /// parse correctly after the field was removed from the struct (serde ignores
+    /// unknown fields by default).
+    #[tokio::test]
+    async fn test_webhook_installation_with_extra_fields_parses() {
+        let app = test_router(Some("test-secret"));
+        let body = br#"{
+            "action": "opened",
+            "sender": {"login": "octocat", "type": "User"},
+            "issue": {"number": 42, "title": "Feature request",
+                      "html_url": "https://github.com/org/repo/issues/42",
+                      "body": "test body"},
+            "repository": {"full_name": "org/repo"},
+            "installation": {"id": 12345, "app_id": 67890, "node_id": "MDIzOk"}
+        }"#;
+        let req = make_request("test-secret", body, "issues", "extra-fields-uuid");
+
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

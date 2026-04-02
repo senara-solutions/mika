@@ -119,7 +119,7 @@ SSH sessions), pass the `--headless` flag:
 ## 7. Limitations
 
 - **Step budget:** Browser tasks are step-intensive. Mika's agent loop allows
-  up to 10 tool steps per turn. Complex multi-page workflows may require
+  up to 20 tool steps per turn. Complex multi-page workflows may require
   multiple conversation turns.
 - **Team agents:** MCP tools are not currently available in team agent mode.
   Browser automation works in CLI chat, `mika ask`, and server mode only.

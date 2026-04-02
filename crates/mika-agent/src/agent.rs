@@ -28,7 +28,7 @@ use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::ProviderKind;
 
-const MAX_TOOL_STEPS: usize = 10;
+const MAX_TOOL_STEPS: usize = 20;
 const MAX_CALLBACK_TOOL_STEPS: usize = 20;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
@@ -180,8 +180,8 @@ enum LoopMode {
     /// Standard conversation: captures thinking, tracks usage, saves to DB, follows up on empty.
     Conversation,
     /// Silent background task: saves to DB but no thinking/usage/follow-up.
-    /// The `max_steps` field allows per-trigger step limits (e.g., callbacks get more
-    /// steps than heartbeats). See `SilentTrigger::max_steps()`.
+    /// The `max_steps` field allows per-trigger step limits via
+    /// `SilentTrigger::max_steps()`.
     Silent { max_steps: usize },
     /// Team sub-agent: follows up on empty but no thinking/usage/DB saves.
     Team,
@@ -1643,10 +1643,9 @@ pub enum SilentTrigger {
 impl SilentTrigger {
     /// Returns the max tool steps budget for this trigger type.
     ///
-    /// Callbacks and Reminders get a higher budget (`MAX_CALLBACK_TOOL_STEPS`)
-    /// because both serve as continuation mechanisms for complex autonomous
-    /// workflows (e.g., PR discovery → QA delegation → verdict processing
-    /// → status update) that routinely need 12-15+ steps. See #375, #397.
+    /// All trigger types currently share the same 20-step budget. Callbacks and
+    /// Reminders use `MAX_CALLBACK_TOOL_STEPS` (separate constant) to allow
+    /// independent adjustment if needed in the future. See #375, #386, #397.
     fn max_steps(&self) -> usize {
         match self {
             Self::Callback { .. } | Self::Reminder { .. } => MAX_CALLBACK_TOOL_STEPS,
