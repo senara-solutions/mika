@@ -1,7 +1,7 @@
 ---
 title: "feat: HTTPS git push with installation token — credential helper and mika token CLI"
 type: feat
-status: active
+status: completed
 date: 2026-04-02
 issue: "#383"
 parent: "senara-solutions/mika-platform#3 (Phase 3)"
