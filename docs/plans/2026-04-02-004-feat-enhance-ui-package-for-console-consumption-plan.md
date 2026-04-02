@@ -1,7 +1,7 @@
 ---
 title: "feat(ui): enhance @senara-solutions/ui for console consumption"
 type: feat
-status: active
+status: completed
 date: 2026-04-02
 issue: "#392"
 ---
