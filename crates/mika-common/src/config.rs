@@ -351,6 +351,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "GitHub repo (owner/repo) for issue creation",
     },
+    // -- GitHub App --
+    ConfigKeyInfo {
+        key: "github_app_id",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_APP_ID"),
+        secret: false,
+        description: "GitHub App ID for mika-dev-bot",
+    },
+    ConfigKeyInfo {
+        key: "github_app_private_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_APP_PRIVATE_KEY"),
+        secret: true,
+        description: "GitHub App private key (base64-encoded PEM)",
+    },
+    ConfigKeyInfo {
+        key: "github_app_installation_id",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_APP_INSTALLATION_ID"),
+        secret: false,
+        description: "GitHub App installation ID for the org",
+    },
     // Database backend (customer_config table)
     ConfigKeyInfo {
         key: "timezone",
@@ -442,6 +464,12 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "github_token" => settings.github_token.clone(),
         "investigate_github_token" => settings.investigate_github_token.clone(),
         "github_repo" => settings.github_repo.clone(),
+        "github_app_id" => settings.github_app_id.map(|v| v.to_string()),
+        "github_app_private_key" => settings
+            .github_app_private_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
+        "github_app_installation_id" => settings.github_app_installation_id.map(|v| v.to_string()),
         "internal_token" => settings
             .internal_token
             .as_ref()
@@ -606,6 +634,19 @@ pub struct Settings {
     #[serde(default)]
     pub github_repo: Option<String>,
 
+    /// GitHub App ID (optional; enables GitHub App authentication).
+    #[serde(default)]
+    pub github_app_id: Option<u64>,
+
+    /// GitHub App private key, base64-encoded PEM (optional).
+    /// Encode with: `base64 -w0 < your-app.pem`
+    #[serde(default)]
+    pub github_app_private_key: Option<SecretString>,
+
+    /// GitHub App installation ID for the org (optional).
+    #[serde(default)]
+    pub github_app_installation_id: Option<u64>,
+
     /// Enable embedded dashboard SPA at /dashboard/ (default: false)
     #[serde(default)]
     pub dashboard_enabled: bool,
@@ -692,6 +733,25 @@ impl Settings {
     /// Returns `MIKA_GITHUB_TOKEN` only — no fallback to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
     pub fn agent_github_token(&self) -> Option<&str> {
         self.github_token.as_deref()
+    }
+
+    /// Resolve the best available GitHub token for agent operations.
+    ///
+    /// Prefers GitHub App installation token (short-lived, org-scoped) over
+    /// `MIKA_GITHUB_TOKEN` PAT. Falls back to PAT on App token exchange failure.
+    pub async fn resolve_github_token(
+        &self,
+        github_app: Option<&crate::github_app::GitHubApp>,
+    ) -> Option<String> {
+        if let Some(app) = github_app {
+            match app.installation_token().await {
+                Ok(token) => return Some(token),
+                Err(e) => {
+                    tracing::warn!("GitHub App token exchange failed: {e}. Falling back to PAT.");
+                }
+            }
+        }
+        self.github_token.clone()
     }
 
     /// Return `(model_field, api_key_field, base_url_field)` references for a given provider.
@@ -1009,6 +1069,12 @@ impl std::fmt::Debug for Settings {
                 &self.investigate_github_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("github_repo", &self.github_repo)
+            .field("github_app_id", &self.github_app_id)
+            .field(
+                "github_app_private_key",
+                &self.github_app_private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("github_app_installation_id", &self.github_app_installation_id)
             .field("server_log_file", &self.server_log_file)
             .field("dashboard_enabled", &self.dashboard_enabled)
             .field("disable_bundled_skills", &self.disable_bundled_skills)
