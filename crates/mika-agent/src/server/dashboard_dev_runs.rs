@@ -59,7 +59,10 @@ impl From<Task> for DevRunResponse {
                     cp.get("pr_url")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
-                    cp.get("cost_usd").and_then(|v| v.as_f64()),
+                    cp.get("cost_usd").and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    }),
                     cp.get("duration_ms").and_then(|v| v.as_u64()),
                     cp.get("turns").and_then(|v| v.as_u64()).map(|n| n as u32),
                     cp.get("session_id")
