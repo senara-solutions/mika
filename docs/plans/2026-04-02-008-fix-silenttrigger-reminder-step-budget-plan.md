@@ -1,7 +1,7 @@
 ---
 title: "fix: SilentTrigger::Reminder gets 10-step budget, should match Callback's 20"
 type: fix
-status: active
+status: completed
 date: 2026-04-02
 ---
 
