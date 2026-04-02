@@ -155,12 +155,12 @@ PR diffs), work item enrichment (PR/issue status), and dev-run PR merges.
 
 `GH_TOKEN` is used by the `gh` CLI in Claude Code sessions spawned via claude-pilot.
 Without it, `gh` falls back to the host user's `~/.config/gh/hosts.yml` (personal account).
-This token is not prefixed with `MIKA_*`, so it survives the skill executor's env scrub.
 
-**Do NOT set `GH_TOKEN` in `~/.mika/.env`.** The `run_gh` builtin handler automatically
-injects `MIKA_GITHUB_TOKEN` as `GH_TOKEN` into `gh` child processes for platform identity
-separation. Setting `GH_TOKEN` in `.mika/.env` would collapse both identities (host and
-platform) into one, breaking the intended identity split:
+**Do NOT set `GH_TOKEN` in `~/.mika/.env`.** If detected there at startup,
+`check_env_warnings()` actively removes it from the process environment and emits a warning.
+Additionally, `scrub_mika_env_vars()` scrubs `GH_TOKEN` from exec handler child processes
+via `EXTRA_SCRUB_VARS` as defense-in-depth. The `run_gh` builtin handler re-injects
+`MIKA_GITHUB_TOKEN` as `GH_TOKEN` AFTER the scrub for correct platform identity separation.
 
 | Layer | Identity | Purpose |
 |-------|----------|---------|
