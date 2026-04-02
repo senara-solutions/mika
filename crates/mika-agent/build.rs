@@ -84,17 +84,19 @@ fn copy_dashboard_assets(manifest_dir: &str, out_dir: &str) {
     }
 }
 
-/// Recursively copy files from `src` to `dst`, skipping dotfiles.
+/// Recursively copy files from `src` to `dst`, skipping dotfiles and symlinks.
 /// Emits `cargo:rerun-if-changed` for each copied file.
 /// Returns the number of files copied.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> usize {
     let mut count = 0;
     let entries = match fs::read_dir(src) {
         Ok(entries) => entries,
-        Err(_) => return 0,
+        Err(e) => panic!("failed to read directory {}: {e}", src.display()),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry
+            .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", src.display()));
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
 
@@ -103,10 +105,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> usize {
             continue;
         }
 
+        // Skip symlinks to prevent embedding unintended files (defense-in-depth)
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|e| panic!("cannot stat {}: {e}", entry.path().display()));
+        if file_type.is_symlink() {
+            println!(
+                "cargo:warning=Skipping symlink in dashboard dist: {}",
+                entry.path().display()
+            );
+            continue;
+        }
+
         let src_path = entry.path();
         let dst_path = dst.join(&file_name);
 
-        if src_path.is_dir() {
+        if file_type.is_dir() {
             fs::create_dir_all(&dst_path).unwrap();
             count += copy_dir_recursive(&src_path, &dst_path);
         } else {
