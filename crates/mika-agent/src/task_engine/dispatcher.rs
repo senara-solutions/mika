@@ -43,6 +43,8 @@ pub struct TaskDispatcher {
     pub embedding_client: Option<EmbeddingClient>,
     pub brave_api_key: Option<String>,
     pub github_token: Option<String>,
+    /// GitHub App authentication manager (optional).
+    pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     pub skills_dirty: Arc<AtomicBool>,
     /// Per-agent lock used when running a silent agent turn.
     /// When `Some`, `dispatch_run_skill` uses `try_lock` and defers if busy.
@@ -248,6 +250,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
@@ -378,6 +381,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
@@ -559,6 +563,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
@@ -699,6 +704,7 @@ impl TaskDispatcher {
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),

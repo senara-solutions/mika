@@ -4,6 +4,7 @@ use mika_agent::db::Database;
 use mika_agent::messaging::{GatewayMessageSender, MessageSender};
 use mika_agent::startup;
 use mika_common::config::Settings;
+use mika_common::github_app::GitHubApp;
 use mika_common::home;
 use mika_common::llm::LlmProvider;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ pub struct DbContext {
     /// The global Mika home directory (e.g. ~/.mika/).
     /// In multi-agent mode this differs from `home_dir` (which is the agent's dir).
     pub global_home: PathBuf,
+    /// GitHub App authentication manager (optional).
+    pub github_app: Option<Arc<GitHubApp>>,
 }
 
 impl Drop for DbContext {
@@ -111,11 +114,13 @@ pub fn init_for_agent(agent_name: &str) -> Result<AppContext> {
 /// Initialize database-only context for a named agent.
 pub fn init_db_only_for_agent(agent_name: &str) -> Result<DbContext> {
     let (settings, async_db, home_dir, global_home) = init_base_for_agent(agent_name)?;
+    let github_app = GitHubApp::from_settings(&settings);
     Ok(DbContext {
         settings,
         async_db,
         home_dir,
         global_home,
+        github_app,
     })
 }
 

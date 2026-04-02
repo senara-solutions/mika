@@ -127,6 +127,7 @@ async fn spawn_agent_worker(
         embedding_client: embedding_client.clone(),
         brave_api_key: brave_api_key.clone(),
         github_token: github_token.clone(),
+        github_app: ctx.github_app.clone(),
         skills_dirty: skills_dirty.clone(),
         // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
         // concurrently with user message processing (both use the same AsyncDatabase,
@@ -190,6 +191,7 @@ async fn spawn_agent_worker(
     let worker_embedding = embedding_client;
     let worker_brave_key = brave_api_key;
     let worker_github_token = github_token;
+    let worker_github_app = ctx.github_app.clone();
     let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
     let mut worker_mcp = mcp_manager;
@@ -247,6 +249,7 @@ async fn spawn_agent_worker(
                         user_images: &image_sources,
                         brave_api_key: worker_brave_key.as_deref(),
                         github_token: worker_github_token.as_deref(),
+                        github_app: worker_github_app.as_deref(),
                         skills_dirty: &worker_dirty,
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),
@@ -350,6 +353,7 @@ async fn spawn_agent_worker(
                         user_images: &[],
                         brave_api_key: worker_brave_key.as_deref(),
                         github_token: worker_github_token.as_deref(),
+                        github_app: worker_github_app.as_deref(),
                         skills_dirty: &worker_dirty,
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),

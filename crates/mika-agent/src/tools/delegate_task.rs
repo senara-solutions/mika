@@ -260,6 +260,7 @@ impl Tool for DelegateTaskTool {
             tracing::warn!(session = %session_id, error = %e, "failed to persist delegate task message");
         }
 
+        let delegate_github_app = mika_common::github_app::GitHubApp::from_settings(&self.settings);
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
             llm: llm.as_ref(),
@@ -272,6 +273,7 @@ impl Tool for DelegateTaskTool {
             embedding_client: embedding_client.as_ref(),
             brave_api_key: self.settings.brave_api_key.as_deref(),
             github_token: self.settings.agent_github_token(),
+            github_app: delegate_github_app.as_deref(),
             skills_dirty: &skills_dirty,
             settings: Some(&self.settings),
             mcp_manager: None,

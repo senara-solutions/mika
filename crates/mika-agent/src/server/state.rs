@@ -8,6 +8,7 @@ use mika_a2a::streaming::StreamEvent;
 use mika_common::agent;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::github_app::GitHubApp;
 use mika_common::llm::LlmProvider;
 use secrecy::SecretString;
 use tokio::sync::{OnceCell, broadcast};
@@ -36,6 +37,9 @@ pub struct AgentState {
     pub settings: Settings,
     /// Per-agent LLM provider built from `self.settings`.
     pub llm: Arc<dyn LlmProvider>,
+    /// GitHub App authentication manager (optional). When present, installation
+    /// tokens are preferred over `MIKA_GITHUB_TOKEN` PAT for agent operations.
+    pub github_app: Option<Arc<GitHubApp>>,
 }
 
 /// Shared application state for the Axum HTTP server.
@@ -61,6 +65,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub brave_api_key: Option<String>,
     pub github_token: Option<String>,
+    /// GitHub App authentication manager (optional, shared across agents).
+    pub github_app: Option<Arc<GitHubApp>>,
     pub global_home_dir: PathBuf,
     pub settings: Settings,
     /// Unscoped database handle for dashboard API endpoints (cross-agent queries).
