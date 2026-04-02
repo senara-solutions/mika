@@ -136,7 +136,7 @@ Source: `crates/mika-agent/src/agent.rs` -- `run_agent()` / `run_agent_inner()`
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `MAX_TOOL_STEPS` | 10 | Default tool-use iterations (conversation, heartbeat, reflection, etc.) |
-| `MAX_CALLBACK_TOOL_STEPS` | 20 | Tool-use iterations for callback triggers (complex workflows) |
+| `MAX_CALLBACK_TOOL_STEPS` | 20 | Tool-use iterations for callback and reminder triggers (complex workflows) |
 | `MAX_TEAM_TOOL_STEPS` | 20 | Tool-use iterations for team sub-agents |
 | `TOOL_TIMEOUT_SECS` | 30 | Default per-tool execution timeout (overridable via `Tool::timeout_secs()`) |
 | `AGENT_TOTAL_TIMEOUT_SECS` | 300 | Total agent loop timeout (5 minutes) |
