@@ -77,6 +77,8 @@ fn env_file_contains_key(home_dir: &Path, key: &str) -> bool {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        // Strip optional "export " prefix (dotenvy supports this syntax)
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
         if let Some((k, _)) = trimmed.split_once('=')
             && k.trim() == key
         {
@@ -348,6 +350,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No .env file exists
         assert!(!env_file_contains_key(tmp.path(), "GH_TOKEN"));
+    }
+
+    #[test]
+    fn test_env_file_contains_key_export_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "export GH_TOKEN=ghp_abc123\n").unwrap();
+
+        // "export GH_TOKEN=..." should be detected (dotenvy supports this syntax)
+        assert!(env_file_contains_key(tmp.path(), "GH_TOKEN"));
     }
 
     #[test]

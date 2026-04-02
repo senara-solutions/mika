@@ -12,6 +12,8 @@ INPUT=$(cat)
 # Scrub all MIKA_* env vars so subprocesses cannot leak secrets
 # Mirrors the Rust executor's scrub_mika_env_vars() wildcard approach
 for _mika_var in $(env | grep '^MIKA_' | cut -d= -f1); do unset "$_mika_var"; done
+# Scrub GH_TOKEN to prevent identity collision if leaked from .env (#380)
+unset GH_TOKEN 2>/dev/null
 
 # Parse JSON fields
 COMMAND=$(printf '%s\n' "$INPUT" | jq -r '.command // empty')
