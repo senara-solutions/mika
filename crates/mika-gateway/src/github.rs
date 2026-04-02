@@ -177,6 +177,16 @@ pub fn is_bot_self_event(event: &GitHubWebhookEvent, app_id: Option<u64>) -> boo
 
 // -- Message text formatting --
 
+/// Truncate text to `max_chars`, appending a truncation indicator if truncated.
+fn truncate_body(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}\n\n[truncated]")
+    }
+}
+
 /// Format a GitHub webhook event into a markdown summary suitable for the agent's context.
 ///
 /// Includes event type, action, repository, relevant titles/bodies, and URLs.
@@ -196,12 +206,7 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .and_then(|i| i.title.as_deref())
                 .unwrap_or("(no title)");
             let url = issue.and_then(|i| i.html_url.as_deref()).unwrap_or("");
-            let body = issue
-                .and_then(|i| i.body.as_deref())
-                .unwrap_or("")
-                .chars()
-                .take(2000)
-                .collect::<String>();
+            let body = truncate_body(issue.and_then(|i| i.body.as_deref()).unwrap_or(""), 2000);
 
             let mut text =
                 format!("[GitHub] Issue {action}: {repo_name}#{number} — {title}\n{url}");
@@ -227,12 +232,7 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .map(|u| u.login.as_str())
                 .unwrap_or("unknown");
             let comment_url = comment.and_then(|c| c.html_url.as_deref()).unwrap_or("");
-            let body = comment
-                .and_then(|c| c.body.as_deref())
-                .unwrap_or("")
-                .chars()
-                .take(2000)
-                .collect::<String>();
+            let body = truncate_body(comment.and_then(|c| c.body.as_deref()).unwrap_or(""), 2000);
 
             format!(
                 "[GitHub] New comment on {repo_name}#{number} ({title}) by @{commenter}\n{comment_url}\n\n{body}"
@@ -247,12 +247,7 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .and_then(|p| p.head.as_ref())
                 .and_then(|h| h.ref_name.as_deref())
                 .unwrap_or("unknown");
-            let body = pr
-                .and_then(|p| p.body.as_deref())
-                .unwrap_or("")
-                .chars()
-                .take(2000)
-                .collect::<String>();
+            let body = truncate_body(pr.and_then(|p| p.body.as_deref()).unwrap_or(""), 2000);
 
             let mut text = format!(
                 "[GitHub] PR {action}: {repo_name}#{number} — {title} (branch: {branch})\n{url}"
@@ -273,12 +268,7 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .unwrap_or("unknown");
             let state = review.and_then(|r| r.state.as_deref()).unwrap_or("unknown");
             let review_url = review.and_then(|r| r.html_url.as_deref()).unwrap_or("");
-            let body = review
-                .and_then(|r| r.body.as_deref())
-                .unwrap_or("")
-                .chars()
-                .take(2000)
-                .collect::<String>();
+            let body = truncate_body(review.and_then(|r| r.body.as_deref()).unwrap_or(""), 2000);
 
             let mut text = format!(
                 "[GitHub] PR review ({state}) on {repo_name}#{number} ({title}) by @{reviewer}\n{review_url}"
@@ -382,14 +372,19 @@ pub(crate) async fn handle_github_webhook(
     }
 
     // 6. Idempotency via X-GitHub-Delivery LRU cache
-    if !delivery_id.is_empty()
-        && let Ok(mut cache) = state.github_delivery_cache.lock()
-        && cache.put(delivery_id.clone(), ()).is_some()
-    {
-        debug!(delivery_id = %delivery_id, "GitHub webhook duplicate delivery, skipping");
-        return StatusCode::OK;
+    if !delivery_id.is_empty() {
+        match state.github_delivery_cache.lock() {
+            Ok(mut cache) => {
+                if cache.put(delivery_id.clone(), ()).is_some() {
+                    debug!(delivery_id = %delivery_id, "GitHub webhook duplicate delivery, skipping");
+                    return StatusCode::OK;
+                }
+            }
+            Err(_) => {
+                warn!("GitHub delivery cache lock poisoned, skipping dedup (fail-open)");
+            }
+        }
     }
-    // If lock is poisoned, proceed anyway (fail-open for availability)
 
     // 7. Parse body
     let event: GitHubWebhookEvent = match serde_json::from_slice(&body) {
@@ -1105,5 +1100,20 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // Routable event accepted — forwarding happens async
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -- Body truncation tests --
+
+    #[test]
+    fn test_truncate_body_short() {
+        assert_eq!(truncate_body("hello", 2000), "hello");
+    }
+
+    #[test]
+    fn test_truncate_body_long() {
+        let long = "a".repeat(2500);
+        let result = truncate_body(&long, 2000);
+        assert!(result.starts_with(&"a".repeat(2000)));
+        assert!(result.ends_with("[truncated]"));
     }
 }
