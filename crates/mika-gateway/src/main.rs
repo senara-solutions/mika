@@ -86,11 +86,6 @@ async fn main() -> Result<()> {
     // Log GitHub webhook configuration status
     if settings.github_webhook_secret.is_some() {
         info!("GitHub webhook endpoint enabled (MIKA_GITHUB_WEBHOOK_SECRET configured)");
-        if settings.github_app_id.is_some() {
-            info!("GitHub bot self-event filtering enabled (MIKA_GITHUB_APP_ID configured)");
-        } else {
-            info!("GitHub bot self-event filtering disabled (MIKA_GITHUB_APP_ID not set)");
-        }
     } else {
         info!("GitHub webhook endpoint disabled (MIKA_GITHUB_WEBHOOK_SECRET not set)");
     }
@@ -110,7 +105,6 @@ async fn main() -> Result<()> {
         agents_namespace: settings.agents_namespace.clone(),
         webhook_counter: Arc::new(AtomicU64::new(0)),
         github_webhook_secret: settings.github_webhook_secret.clone(),
-        github_app_id: settings.github_app_id,
         github_delivery_cache: github::new_delivery_cache(),
     };
 

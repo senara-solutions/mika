@@ -55,9 +55,8 @@ pub(crate) async fn handle_github_webhook(
     // 4. Handle ping event
     // 5. Dedup via X-GitHub-Delivery LRU cache
     // 6. serde_json::from_slice::<GitHubWebhookEvent>(&body)
-    // 7. Bot self-event filter (match app_id + sender.type == "Bot")
-    // 8. Route to agent via static map
-    // 9. Async dispatch (tokio::spawn + semaphore permit)
+    // 7. Route to agent via static map
+    // 8. Async dispatch (tokio::spawn + semaphore permit)
     StatusCode::OK
 }
 ```
@@ -73,7 +72,7 @@ pub(crate) async fn handle_github_webhook(
 1. **Optional config** — `MIKA_GITHUB_WEBHOOK_SECRET` is `Option<SecretString>`. When absent, the route returns 404 (no breaking change for existing deployments).
 2. **In-memory LRU cache** for delivery ID dedup (10k entries via `lru` crate), not Postgres. Simpler and sufficient since GitHub retries are rare.
 3. **Single-tenant routing** — forwards to `agent_base_url` with `channel: "github"` and `chat_id: 0`. Multi-tenant routing deferred.
-4. **Bot self-event filtering** — matches `installation.app_id` against `MIKA_GITHUB_APP_ID` config + `sender.type == "Bot"`, not `sender.login` suffix (more reliable, doesn't filter legitimate bots like Dependabot).
+4. **Bot self-event filtering removed (#401)** — originally filtered events from the app's own bot user via `installation.app_id` matching. Removed because mika-dev and mika-qa share one GitHub App identity but subscribe to disjoint event types. No routing path delivers an agent's own action back to itself. Loop prevention is guaranteed by the routing table partitioning, not identity filtering.
 5. **Shared webhook semaphore** — reuses the existing 30-permit semaphore for unified backpressure.
 
 ### Dependencies added
@@ -81,10 +80,7 @@ pub(crate) async fn handle_github_webhook(
 - `lru = "0.12"` — delivery UUID dedup cache
 
 ### Config fields added to `GatewaySettings`
-- `github_webhook_secret: Option<SecretString>` — `#[serde(default)]`
-- `github_app_id: Option<u64>` — `#[serde(default)]`
-
-Both redacted in `Debug` impls (AppState and GatewaySettings).
+- `github_webhook_secret: Option<SecretString>` — `#[serde(default)]`, redacted in `Debug` impls
 
 ## Prevention / Best Practices
 
@@ -94,7 +90,7 @@ Both redacted in `Debug` impls (AppState and GatewaySettings).
 
 3. **GitHub webhook secrets are arbitrary strings.** Do NOT apply hex-token validation (`validate_hex_token`) to GitHub secrets. They use a separate validation path.
 
-4. **Bot self-event filtering should match `app_id`, not `sender.login`.** The `sender.login` suffix `[bot]` is shared by many GitHub Apps (Dependabot, Renovate). Matching the specific `installation.app_id` against the configured app ID is more precise.
+4. **Bot self-event filtering was removed (#401).** When multiple agents share one GitHub App identity but subscribe to disjoint event types, identity-based filtering blocks legitimate cross-agent communication. The routing table partitioning is the correct loop-prevention mechanism. Future: per-agent App tokens (Option 3) would allow re-enabling if audit trails or permission scopes are needed.
 
 5. **LRU cache poisoned-lock handling.** When using `std::sync::Mutex` for an LRU cache in an async context, always handle the poisoned case explicitly with a warning log. The fail-open pattern is correct for availability, but silent failure is not.
 
