@@ -95,8 +95,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> usize {
     };
 
     for entry in entries {
-        let entry = entry
-            .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", src.display()));
+        let entry =
+            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", src.display()));
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
 
