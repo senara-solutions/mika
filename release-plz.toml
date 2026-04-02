@@ -1,6 +1,4 @@
 [workspace]
-git_only = true
-publish_no_verify = true
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
@@ -11,20 +9,22 @@ pr_labels = ["release"]
 [[package]]
 name = "mika-common"
 publish = false
+release = true
 changelog_path = "CHANGELOG.md"
 changelog_include = ["mika-agent", "mika-cli"]
 
-# mika-agent excluded from packaging (release = false) because rust-embed
-# references ../../dashboard/dist/ which breaks cargo package --verify.
-# Its commits still appear in the changelog via mika-common's changelog_include.
 [[package]]
 name = "mika-agent"
 publish = false
-release = false
+release = true
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false
 
 [[package]]
 name = "mika-cli"
 publish = false
+release = true
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
@@ -32,6 +32,7 @@ git_tag_enable = false
 [[package]]
 name = "mika-a2a"
 publish = false
+release = true
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
