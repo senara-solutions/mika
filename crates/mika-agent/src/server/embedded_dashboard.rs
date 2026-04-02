@@ -11,9 +11,12 @@ use rust_embed::Embed;
 use super::state::AppState;
 
 /// Embedded dashboard assets from the pre-built React SPA.
-/// If `dashboard/dist/` does not exist at compile time, this embeds zero files.
+/// Assets are copied into `$OUT_DIR/dashboard_dist/` by `build.rs`, keeping the
+/// embedded path within the crate boundary (required for `cargo package --verify`).
+/// If the dashboard has not been built, zero files are embedded.
 #[derive(Embed)]
-#[folder = "../../dashboard/dist/"]
+#[folder = "$OUT_DIR/dashboard_dist/"]
+#[allow_missing = true]
 struct DashboardAssets;
 
 /// Build the dashboard route group.

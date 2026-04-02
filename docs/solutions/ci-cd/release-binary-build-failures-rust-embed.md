@@ -80,15 +80,15 @@ Belt-and-suspenders: also add `publish = false` to each crate's `Cargo.toml` to 
 ## Gotchas
 
 - **Transitive dependency:** Even if you only build the `mika` CLI, it depends on `mika-agent` which triggers the `rust-embed` derive macro. Any workflow that compiles any binary in this workspace needs the `dashboard/dist/` directory.
-- **Empty vs missing:** `rust-embed` with an empty directory embeds zero files (graceful). A missing directory fails compilation. The placeholder trick (`touch .gitkeep`) ensures the directory exists.
+- **Empty vs missing (legacy):** Before #374, `rust-embed` with an empty directory embedded zero files (graceful) but a missing directory failed compilation. After #374, `build.rs` copies `dashboard/dist/` into `OUT_DIR/dashboard_dist/` and `#[allow_missing = true]` ensures compilation succeeds even if the directory is missing. CI placeholders (`mkdir -p dashboard/dist`) are kept for clarity but are no longer strictly required.
 - **Two upload steps, not one:** `taiki-e/upload-rust-binary-action` with `bin: mika,mika-server` would create a single combined archive. Separate steps create separate archives, which is correct for independent binaries.
 - **Features parameter:** `features: telemetry` in the upload action maps to `--features telemetry` in cargo. Both `mika-cli` and `mika-agent` declare this feature and propagate it to `mika-common`.
 
 ## Prevention
 
-- When adding new compile-time asset embedding (via `rust-embed`, `include_dir`, etc.), ensure ALL CI workflows that run `cargo build` create the required directories.
+- The `build.rs` + `OUT_DIR` pattern (#374) makes the dashboard embedding resilient to missing `dashboard/dist/`. CI placeholders are kept as belt-and-suspenders but `#[allow_missing]` prevents build failures.
+- When adding new compile-time asset embedding (via `rust-embed`, `include_dir`, etc.), prefer the `OUT_DIR` copy pattern used for docs and dashboard assets in `crates/mika-agent/build.rs`.
 - Keep a checklist of workflows that need the placeholder: `ci.yml`, `release-plz.yml`, `release.yml`.
-- The `release-plz.yml` dashboard placeholder already served as the pattern — the fix was copying it to `release.yml`.
 
 ## Related
 
