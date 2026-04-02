@@ -49,8 +49,6 @@ pub struct AppState {
     /// Secret for validating inbound GitHub App webhooks (HMAC-SHA256).
     /// When `None`, `POST /webhook/github` returns 404.
     pub github_webhook_secret: Option<SecretString>,
-    /// GitHub App ID for bot self-event filtering.
-    pub github_app_id: Option<u64>,
     /// LRU cache for GitHub webhook delivery ID deduplication.
     pub github_delivery_cache: Arc<std::sync::Mutex<lru::LruCache<String, ()>>>,
 }
@@ -67,7 +65,6 @@ impl std::fmt::Debug for AppState {
                 "github_webhook_secret",
                 &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("github_app_id", &self.github_app_id)
             .finish_non_exhaustive()
     }
 }

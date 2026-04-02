@@ -157,24 +157,6 @@ pub fn route_event(
     }
 }
 
-// -- Bot self-event filtering --
-
-/// Check if a webhook event was triggered by the GitHub App's own bot user.
-///
-/// Primary check: match `installation.app_id` against the configured `MIKA_GITHUB_APP_ID`
-/// and verify the sender is a Bot type. This prevents infinite loops where the app's
-/// own actions trigger webhook processing.
-pub fn is_bot_self_event(event: &GitHubWebhookEvent, app_id: Option<u64>) -> bool {
-    if let (Some(installation), Some(configured_app_id)) = (&event.installation, app_id)
-        && installation.app_id == configured_app_id
-        && let Some(sender) = &event.sender
-        && sender.user_type.as_deref() == Some("Bot")
-    {
-        return true;
-    }
-    false
-}
-
 // -- Message text formatting --
 
 /// Truncate text to `max_chars`, appending a truncation indicator if truncated.
@@ -395,13 +377,14 @@ pub(crate) async fn handle_github_webhook(
         }
     };
 
-    // 8. Bot self-event filter
-    if is_bot_self_event(&event, state.github_app_id) {
-        debug!(event_type, "GitHub webhook bot self-event filtered");
-        return StatusCode::OK;
-    }
+    // Self-event filter intentionally removed: mika-dev and mika-qa share one GitHub
+    // App identity but subscribe to disjoint event types. No routing path exists that
+    // would deliver an agent's own action back to itself. Loop prevention is guaranteed
+    // by the routing table, not by identity filtering.
+    // Future: give mika-qa a dedicated App token (Option 3) if per-agent audit trails
+    // or permission scopes become necessary.
 
-    // 9. Route to agent
+    // 8. Route to agent
     let check_conclusion = event
         .check_suite
         .as_ref()
@@ -677,92 +660,6 @@ mod tests {
         assert_eq!(route_event("issues", None, None), None);
     }
 
-    // -- Bot self-event filtering tests --
-
-    fn make_event(
-        sender_login: &str,
-        sender_type: Option<&str>,
-        app_id: Option<u64>,
-    ) -> GitHubWebhookEvent {
-        GitHubWebhookEvent {
-            action: Some("opened".to_string()),
-            sender: Some(GitHubUser {
-                login: sender_login.to_string(),
-                user_type: sender_type.map(|s| s.to_string()),
-            }),
-            installation: app_id.map(|id| GitHubInstallation { id: 1, app_id: id }),
-            check_suite: None,
-            issue: None,
-            pull_request: None,
-            comment: None,
-            review: None,
-            repository: None,
-        }
-    }
-
-    #[test]
-    fn test_is_bot_self_event_matching_app_id() {
-        let event = make_event("mika-app[bot]", Some("Bot"), Some(12345));
-        assert!(is_bot_self_event(&event, Some(12345)));
-    }
-
-    #[test]
-    fn test_is_bot_self_event_different_app_id() {
-        let event = make_event("other-app[bot]", Some("Bot"), Some(99999));
-        assert!(!is_bot_self_event(&event, Some(12345)));
-    }
-
-    #[test]
-    fn test_is_bot_self_event_human_sender() {
-        let event = make_event("octocat", Some("User"), Some(12345));
-        assert!(!is_bot_self_event(&event, Some(12345)));
-    }
-
-    #[test]
-    fn test_is_bot_self_event_no_installation() {
-        let event = GitHubWebhookEvent {
-            action: Some("opened".to_string()),
-            sender: Some(GitHubUser {
-                login: "mika-app[bot]".to_string(),
-                user_type: Some("Bot".to_string()),
-            }),
-            installation: None,
-            check_suite: None,
-            issue: None,
-            pull_request: None,
-            comment: None,
-            review: None,
-            repository: None,
-        };
-        assert!(!is_bot_self_event(&event, Some(12345)));
-    }
-
-    #[test]
-    fn test_is_bot_self_event_no_configured_app_id() {
-        let event = make_event("mika-app[bot]", Some("Bot"), Some(12345));
-        assert!(!is_bot_self_event(&event, None));
-    }
-
-    #[test]
-    fn test_is_bot_self_event_no_sender() {
-        let event = GitHubWebhookEvent {
-            action: Some("completed".to_string()),
-            sender: None,
-            installation: Some(GitHubInstallation {
-                id: 1,
-                app_id: 12345,
-            }),
-            check_suite: None,
-            issue: None,
-            pull_request: None,
-            comment: None,
-            review: None,
-            repository: None,
-        };
-        // No sender means we can't confirm it's a bot
-        assert!(!is_bot_self_event(&event, Some(12345)));
-    }
-
     // -- Message text formatting tests --
 
     #[test]
@@ -884,7 +781,7 @@ mod tests {
 
     /// Build a minimal test router with only the GitHub webhook route.
     /// Does NOT require Postgres or Telegram client.
-    fn test_router(webhook_secret: Option<&str>, app_id: Option<u64>) -> axum::Router {
+    fn test_router(webhook_secret: Option<&str>) -> axum::Router {
         use crate::routes::AppState;
         use crate::telegram::TelegramClient;
         use secrecy::SecretString;
@@ -912,7 +809,6 @@ mod tests {
             agents_namespace: "mika-agents".to_string(),
             webhook_counter: Arc::new(AtomicU64::new(0)),
             github_webhook_secret: webhook_secret.map(|s| SecretString::from(s.to_string())),
-            github_app_id: app_id,
             github_delivery_cache: new_delivery_cache(),
         };
 
@@ -941,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_ping_returns_200() {
-        let app = test_router(Some("test-secret"), None);
+        let app = test_router(Some("test-secret"));
         let body = br#"{"zen": "Keep it logically awesome."}"#;
         let req = make_request("test-secret", body, "ping", "ping-uuid-1");
 
@@ -951,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_invalid_signature_returns_401() {
-        let app = test_router(Some("test-secret"), None);
+        let app = test_router(Some("test-secret"));
         let body = br#"{"action": "opened"}"#;
         // Sign with wrong secret
         let sig = compute_signature(b"wrong-secret", body);
@@ -970,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_missing_signature_returns_401() {
-        let app = test_router(Some("test-secret"), None);
+        let app = test_router(Some("test-secret"));
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/webhook/github")
@@ -985,7 +881,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_unconfigured_returns_404() {
-        let app = test_router(None, None); // No webhook secret
+        let app = test_router(None); // No webhook secret
         let body = br#"{"action": "opened"}"#;
         let req = make_request("irrelevant", body, "issues", "uuid-1");
 
@@ -1022,7 +918,6 @@ mod tests {
             agents_namespace: "mika-agents".to_string(),
             webhook_counter: Arc::new(AtomicU64::new(0)),
             github_webhook_secret: Some(SecretString::from("test-secret")),
-            github_app_id: None,
             github_delivery_cache: delivery_cache.clone(),
         };
 
@@ -1049,25 +944,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webhook_bot_self_event_filtered() {
-        let app = test_router(Some("test-secret"), Some(12345));
-        let body = br#"{
-            "action": "opened",
-            "sender": {"login": "mika-app[bot]", "type": "Bot"},
-            "installation": {"id": 1, "app_id": 12345},
-            "issue": {"number": 1, "title": "Test"},
-            "repository": {"full_name": "org/repo"}
-        }"#;
-        let req = make_request("test-secret", body, "issues", "bot-uuid-1");
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        // Event was filtered (bot self-event) — 200 returned without forwarding
-    }
-
-    #[tokio::test]
     async fn test_webhook_unroutable_event_returns_200() {
-        let app = test_router(Some("test-secret"), None);
+        let app = test_router(Some("test-secret"));
         let body = br#"{"action": "closed"}"#;
         let req = make_request("test-secret", body, "issues", "unroutable-uuid");
 
@@ -1078,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_malformed_json_returns_400() {
-        let app = test_router(Some("test-secret"), None);
+        let app = test_router(Some("test-secret"));
         let body = b"not json at all {{{";
         let req = make_request("test-secret", body, "issues", "bad-json-uuid");
 
@@ -1088,7 +966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_routable_event_returns_200() {
-        let app = test_router(Some("test-secret"), None);
+        let app = test_router(Some("test-secret"));
         let body = br#"{
             "action": "opened",
             "sender": {"login": "octocat", "type": "User"},

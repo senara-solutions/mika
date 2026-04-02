@@ -52,11 +52,6 @@ pub struct GatewaySettings {
     /// GitHub webhook secrets are arbitrary strings (not hex-constrained).
     #[serde(default)]
     pub github_webhook_secret: Option<SecretString>,
-
-    /// GitHub App ID for bot self-event filtering.
-    /// Optional — when absent, bot filtering is skipped.
-    #[serde(default)]
-    pub github_app_id: Option<u64>,
 }
 
 fn default_port() -> u16 {
@@ -166,7 +161,6 @@ impl std::fmt::Debug for GatewaySettings {
                 "github_webhook_secret",
                 &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("github_app_id", &self.github_app_id)
             .finish()
     }
 }
@@ -233,7 +227,6 @@ mod tests {
                 gateway_log_file: None,
                 agents_namespace: "mika-agents".to_string(),
                 github_webhook_secret: Some(SecretString::from("gh-webhook-secret")),
-                github_app_id: Some(12345),
             }
         );
         assert!(!debug.contains("pass"));
