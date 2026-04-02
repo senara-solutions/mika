@@ -22,7 +22,8 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
+      - name: Install Rust toolchain
+        run: rustup show  # reads rust-toolchain.toml
       - name: Create dashboard dist placeholder
         run: mkdir -p dashboard/dist
       - uses: release-plz/action@f708778669256143d984cce4b23592637532e040  # v0.5
@@ -45,7 +46,8 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
+      - name: Install Rust toolchain
+        run: rustup show  # reads rust-toolchain.toml
       - name: Create dashboard dist placeholder
         run: mkdir -p dashboard/dist
       - uses: release-plz/action@f708778669256143d984cce4b23592637532e040  # v0.5
