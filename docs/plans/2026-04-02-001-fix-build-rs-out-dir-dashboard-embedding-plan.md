@@ -1,7 +1,7 @@
 ---
 title: "fix: use build.rs + OUT_DIR for dashboard asset embedding"
 type: fix
-status: active
+status: completed
 date: 2026-04-02
 ---
 
