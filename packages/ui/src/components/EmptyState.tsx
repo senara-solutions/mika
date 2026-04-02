@@ -14,13 +14,13 @@ export default function EmptyState({
   icon,
   variant = 'minimal',
 }: EmptyStateProps) {
-  const showIcon = icon !== null
-  const iconElement = icon === undefined ? <Inbox size={32} /> : icon
+  // undefined = default Inbox icon, null = no icon, ReactNode = custom icon
+  const resolvedIcon = icon === null ? null : (icon ?? <Inbox size={32} />)
 
   const content = (
     <>
-      {showIcon && iconElement && (
-        <div className="mb-3">{iconElement}</div>
+      {resolvedIcon && (
+        <div className="mb-3">{resolvedIcon}</div>
       )}
       {title && (
         <p className="text-sm font-medium text-heading mb-1">{title}</p>
