@@ -23,12 +23,15 @@ Use `rust-embed` to compile `dashboard/dist/` into the mika-server binary at bui
 
 ```rust
 #[derive(Embed)]
-#[folder = "../../dashboard/dist/"]
+#[folder = "$OUT_DIR/dashboard_dist/"]
+#[allow_missing = true]
 struct DashboardAssets;
 ```
 
-- If `dashboard/dist/` is empty at compile time, zero files are embedded (graceful degradation)
-- The folder must exist — add `dashboard/dist/.gitkeep` tracked via `.gitignore` exception
+- `build.rs` copies `dashboard/dist/` into `OUT_DIR/dashboard_dist/` at build time, keeping the embedded path within the crate boundary (required for `cargo package --verify`)
+- The `interpolate-folder-path` feature on `rust-embed` enables `$OUT_DIR` expansion via `shellexpand` at proc-macro time
+- `#[allow_missing = true]` ensures compilation succeeds with zero embedded files when the dashboard has not been built
+- `build.rs` filters dotfiles (`.gitkeep`, `.DS_Store`) and skips symlinks during copy (defense-in-depth)
 - `DashboardAssets::iter()` and `DashboardAssets::get()` are trait methods from `rust_embed::Embed` — the trait must be in scope
 
 **2. Token injection via serde_json (not string interpolation)**
@@ -91,7 +94,7 @@ COPY --from=dashboard-builder /app/dashboard/dist dashboard/dist
 
 ## Prevention
 
-- **Build sequencing**: Never use `build.rs` to invoke npm/vite. Keep Rust and Node.js build systems decoupled. Dockerfile handles sequencing naturally.
+- **Build sequencing**: `build.rs` copies already-built dashboard assets into `OUT_DIR` but never invokes npm/vite. The Rust and Node.js build systems remain decoupled. Dockerfile handles sequencing naturally.
 - **Token security**: Always use `serde_json` for embedding data in `<script>` tags. Never use string interpolation for HTML contexts.
 - **Cross-platform**: Avoid Linux-specific APIs (`/proc`, `libc::kill`) in CLI code that ships on macOS. Use portable alternatives.
 - **API deduplication**: When CLI and TUI need the same functionality, extract shared functions immediately — don't create `_pub` wrapper variants of private functions.
