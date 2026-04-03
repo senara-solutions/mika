@@ -22,20 +22,28 @@ async fn main() -> Result<()> {
     match &cli.command {
         Some(Commands::Token(args)) => {
             let global_home = home::resolve_home_dir()?;
-            mika_common::dotenv::load_dotenv(&global_home);
             let agent_home = cli
                 .agent
                 .as_deref()
                 .map(|name| home::resolve_agent_home(&global_home, name));
+            // Load per-agent .env first (dotenvy won't override), then global as fallback
+            if let Some(ref ah) = agent_home {
+                mika_common::dotenv::load_dotenv(ah);
+            }
+            mika_common::dotenv::load_dotenv(&global_home);
             return commands::token::run(&args.command, &global_home, agent_home.as_deref()).await;
         }
         Some(Commands::CredentialHelper(args)) => {
             let global_home = home::resolve_home_dir()?;
-            mika_common::dotenv::load_dotenv(&global_home);
             let agent_home = cli
                 .agent
                 .as_deref()
                 .map(|name| home::resolve_agent_home(&global_home, name));
+            // Load per-agent .env first (dotenvy won't override), then global as fallback
+            if let Some(ref ah) = agent_home {
+                mika_common::dotenv::load_dotenv(ah);
+            }
+            mika_common::dotenv::load_dotenv(&global_home);
             return commands::credential_helper::run(
                 &args.operation,
                 &global_home,
