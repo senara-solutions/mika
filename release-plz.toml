@@ -7,37 +7,16 @@ git_release_name = "v{{ version }}"
 semver_check = false
 pr_labels = ["release"]
 
-# mika-common is the only released package. It drives the unified version,
-# changelog, git tag, and GitHub release. All other crates are publish = false
-# and release = false because cargo package can't resolve workspace deps
-# (e.g., mika-a2a ^0.3.2) from crates.io where they were never published.
-# Their commits flow into the changelog via changelog_include.
+# Only mika-common is declared — release-plz ignores all other workspace
+# members. mika-common has no workspace deps so cargo package succeeds.
+# Commits from mika-agent, mika-cli, and mika-a2a flow into the changelog
+# via changelog_include.
 [[package]]
 name = "mika-common"
 publish = false
 release = true
 changelog_path = "CHANGELOG.md"
 changelog_include = ["mika-agent", "mika-cli", "mika-a2a"]
-
-[[package]]
-name = "mika-agent"
-publish = false
-release = false
-
-[[package]]
-name = "mika-cli"
-publish = false
-release = false
-
-[[package]]
-name = "mika-a2a"
-publish = false
-release = false
-
-[[package]]
-name = "mika-gateway"
-publish = false
-release = false
 
 [changelog]
 header = """# Changelog\n\nAll notable changes to this project will be documented in this file.\n"""
