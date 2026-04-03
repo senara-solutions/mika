@@ -1,7 +1,16 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
-## [v0.4.0](https://github.com/senara-solutions/mika/releases/tag/vv0.4.0) — 2026-04-03
+## [v0.5.0](https://github.com/senara-solutions/mika/releases/tag/v0.5.0) — 2026-04-03
+
+### Added
+
+- *(tui)* skill visibility and /clear cleanup (#415)
+
+### Fixed
+
+- *(ci)* add git identity for release tag creation
+## [v0.4.0](https://github.com/senara-solutions/mika/releases/tag/v0.4.0) — 2026-04-03
 
 ### Added
 
@@ -22,7 +31,9 @@ All notable changes to this project will be documented in this file.
 - *(ci)* declare only mika-common in release-plz.toml
 - *(ci)* replace release-plz with git-cliff release workflow
 - *(ci)* fix YAML syntax in release workflow
-## [v0.3.2](https://github.com/senara-solutions/mika/releases/tag/vv0.3.2) — 2026-04-02
+- *(ci)* fix double-v in changelog release URL
+- *(ci)* exclude release/* branches from pipeline artifact checks
+## [v0.3.2](https://github.com/senara-solutions/mika/releases/tag/v0.3.2) — 2026-04-02
 
 ### Added
 
@@ -56,7 +67,7 @@ All notable changes to this project will be documented in this file.
 - *(ci)* use pinned Rust toolchain in release-plz workflow (#394)
 - *(ci)* revert release-plz to crates.io comparison mode
 - *(ci)* remove dist from dashboard/.gitignore
-## [v0.3.1](https://github.com/senara-solutions/mika/releases/tag/vv0.3.1) — 2026-03-31
+## [v0.3.1](https://github.com/senara-solutions/mika/releases/tag/v0.3.1) — 2026-03-31
 
 ### Added
 
@@ -78,7 +89,7 @@ All notable changes to this project will be documented in this file.
 - *(gateway)* match on_response log level to span level for health probes
 - remove MIKA_INVESTIGATE_GITHUB_TOKEN fallback from agent_github_token()
 - remove remaining fallback references in config field doc and reference table
-## [v0.3.0](https://github.com/senara-solutions/mika/releases/tag/vv0.3.0) — 2026-03-30
+## [v0.3.0](https://github.com/senara-solutions/mika/releases/tag/v0.3.0) — 2026-03-30
 
 ### Added
 
@@ -404,7 +415,7 @@ All notable changes to this project will be documented in this file.
 - use per-agent LLM provider in server mode (#323)
 - [#350] add timezone support to reminders to prevent off-by-one day errors
 - [#350] address QA HOLD-2 and HOLD-3 on timezone reminder PR
-## [v0.1.6](https://github.com/senara-solutions/mika/releases/tag/vv0.1.6) — 2026-03-13
+## [v0.1.6](https://github.com/senara-solutions/mika/releases/tag/v0.1.6) — 2026-03-13
 
 ### Added
 
@@ -602,7 +613,7 @@ All notable changes to this project will be documented in this file.
 ### Security
 
 - *(server)* separate dashboard token from mutation endpoints
-## [v0.1.4](https://github.com/senara-solutions/mika/releases/tag/vv0.1.4) — 2026-03-07
+## [v0.1.4](https://github.com/senara-solutions/mika/releases/tag/v0.1.4) — 2026-03-07
 
 ### Added
 
@@ -763,7 +774,7 @@ All notable changes to this project will be documented in this file.
 - remove agent_id filtering from task tree traversal queries
 - don't load agent chat history in team mode TUI
 - use orchestrator agent_id for invoke_orchestrator parent task
-## [v0.1.1](https://github.com/senara-solutions/mika/releases/tag/vv0.1.1) — 2026-03-01
+## [v0.1.1](https://github.com/senara-solutions/mika/releases/tag/v0.1.1) — 2026-03-01
 
 ### Added
 
