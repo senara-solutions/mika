@@ -10,7 +10,7 @@ pub mod matcher;
 
 use std::path::Path;
 
-use self::index::SkillEntry;
+use self::index::{SkillEntry, SkippedSkill};
 use crate::db::SkillOverride;
 
 /// Registry of discovered skills, built once at startup.
@@ -18,6 +18,7 @@ use crate::db::SkillOverride;
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
     skipped_count: usize,
+    skipped: Vec<SkippedSkill>,
 }
 
 impl SkillRegistry {
@@ -45,6 +46,7 @@ impl SkillRegistry {
         Self {
             skills: result.entries,
             skipped_count: result.skipped_count,
+            skipped: result.skipped,
         }
     }
 
@@ -53,12 +55,28 @@ impl SkillRegistry {
         Self {
             skills: Vec::new(),
             skipped_count: 0,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Create a registry with pre-populated skipped skills (for testing/display).
+    pub fn with_skipped(skipped: Vec<SkippedSkill>) -> Self {
+        let skipped_count = skipped.len();
+        Self {
+            skills: Vec::new(),
+            skipped_count,
+            skipped,
         }
     }
 
     /// Number of skill directories that were skipped during scan (invalid, legacy, etc.).
     pub fn skipped_count(&self) -> usize {
         self.skipped_count
+    }
+
+    /// Details of skills that were skipped during scan (name + reason).
+    pub fn skipped(&self) -> &[SkippedSkill] {
+        &self.skipped
     }
 
     /// Match skills against a user message.
@@ -131,6 +149,9 @@ impl SkillRegistry {
         // caused by oversized prompt files. This catches the edge case where a DB
         // override flips always_on=true on a skill whose prompt was already silently
         // emptied during scan (because it was not always_on at scan time).
+        //
+        // Collect removed skills into `skipped` for TUI visibility.
+        let mut removed = Vec::new();
         self.skills.retain(|entry| {
             if entry.manifest.skill.always_on && entry.has_override && entry.prompt_snippet.is_empty()
             {
@@ -153,12 +174,21 @@ impl SkillRegistry {
                          An always_on skill without its prompt is functionally broken. \
                          Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
                     );
-                    self.skipped_count += 1;
+                    removed.push(SkippedSkill {
+                        name: entry.manifest.skill.name.clone(),
+                        reason: format!(
+                            "removed: always_on override but prompt oversized ({}B, limit {}B)",
+                            meta.len(),
+                            effective_limit
+                        ),
+                    });
                     return false;
                 }
             }
             true
         });
+        self.skipped_count += removed.len();
+        self.skipped.extend(removed);
     }
 
     /// Return always-on skills that are safe for silent/background mode.
@@ -252,6 +282,7 @@ mod tests {
     fn test_always_on_skills() {
         let registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
                 make_entry("reminders", false, true),
@@ -268,6 +299,7 @@ mod tests {
     fn test_always_on_skills_filters_disabled() {
         let registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
                 make_entry("disabled-skill", true, false),
@@ -334,6 +366,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
         };
 
@@ -389,6 +422,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![safe_with_dep, exec_dep],
         };
 
@@ -405,6 +439,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
                 make_entry("tmux", false, true),
@@ -428,6 +463,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![make_entry("Web-Search", false, true)],
         };
 
@@ -446,6 +482,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
 
@@ -464,6 +501,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
 
@@ -482,6 +520,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
                 make_entry("shell-exec", true, true),
@@ -502,6 +541,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_silent_on_valid() {
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["tmux"]),
                 make_entry("tmux", false, true),
@@ -515,6 +555,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_warns_on_missing() {
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![make_entry_with_deps(
                 "self-dev",
                 true,
@@ -530,6 +571,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_case_insensitive() {
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["TMUX"]),
                 make_entry("tmux", false, true),
@@ -543,6 +585,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_no_deps_no_warn() {
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![
                 make_entry("web-search", true, true),
                 make_entry("tmux", false, true),
@@ -572,6 +615,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![entry],
         };
 
@@ -597,6 +641,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped_count: 0,
+            skipped: Vec::new(),
             skills: vec![entry],
         };
 

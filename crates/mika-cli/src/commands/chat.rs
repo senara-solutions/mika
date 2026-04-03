@@ -527,6 +527,31 @@ pub async fn run(
     // Load persisted thinking level ("off" resolves to None → stays default)
     app.load_thinking_level().await;
 
+    // Surface skipped skills as a startup warning so the user knows
+    let skipped_skills = app.skills.skipped();
+    if !skipped_skills.is_empty() {
+        use std::fmt::Write;
+        let count = skipped_skills.len();
+        let mut warning = format!("\u{26a0} {count} skill(s) skipped at startup:\n");
+        let max_display = 5;
+        for entry in skipped_skills.iter().take(max_display) {
+            let _ = writeln!(warning, "  \u{2022} {}: {}", entry.name, entry.reason);
+        }
+        if count > max_display {
+            let _ = writeln!(
+                warning,
+                "  ... and {} more. Run `mika skills validate` for details.",
+                count - max_display
+            );
+        }
+        app.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: warning.trim_end().to_string(),
+            rendered: None,
+            channel: None,
+        });
+    }
+
     // Initialize cross-channel polling watermark
     app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
 

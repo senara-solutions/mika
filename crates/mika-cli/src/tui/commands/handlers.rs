@@ -6,7 +6,7 @@ use mika_common::home;
 use mika_common::team;
 
 use crate::tui::app::{
-    AgentRequest, AgentStatus, App, ChatMessage, ChatRole, MessagesLayout,
+    AgentRequest, AgentStatus, App, ChatMessage, ChatRole, MessagesLayout, SelectionState,
     callback_label_from_metadata,
 };
 use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
@@ -121,13 +121,31 @@ async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
         return WORKER_NOT_RESPONDING.to_string();
     }
 
-    // Update app state
+    // Drain any pending responses from the old session to prevent ghost messages
+    while app.agent_rx.try_recv().is_ok() {}
+
+    // Update app state — session
     app.session_id = new_session;
     app.messages.clear();
     app.scroll_offset = 0;
     app.last_seen_msg_id = 0;
     app.context_tokens = None;
     app.messages_layout = MessagesLayout::default();
+
+    // Response state
+    app.pending_response = None;
+    app.reveal_index = 0;
+    app.status = AgentStatus::Idle;
+
+    // Input state
+    app.pending_images.clear();
+    app.pending_command = None;
+
+    // UI state
+    app.has_new_message = false;
+    app.selection_state = SelectionState::None;
+    app.pending_task_count = 0;
+
     app.needs_redraw = true;
 
     "Chat cleared and session reset.".to_string()
@@ -752,7 +770,9 @@ async fn handle_export(app: &mut App<'_>) -> String {
 
 fn handle_skills(app: &App<'_>) -> String {
     let skills = app.skills.skills();
-    if skills.is_empty() {
+    let skipped = app.skills.skipped();
+
+    if skills.is_empty() && skipped.is_empty() {
         return "No skills loaded.".to_string();
     }
 
@@ -775,12 +795,20 @@ fn handle_skills(app: &App<'_>) -> String {
     always_on.sort_by_key(|e| !e.enabled);
     on_demand.sort_by_key(|e| !e.enabled);
 
-    let mut out = format!("Loaded skills ({}):\n", skills.len());
+    let mut out = if skipped.is_empty() {
+        format!("Loaded skills ({}):\n", skills.len())
+    } else {
+        format!(
+            "Loaded skills ({}, {} skipped):\n",
+            skills.len(),
+            skipped.len()
+        )
+    };
 
     let format_entry = |out: &mut String, entry: &mika_agent::skills::index::SkillEntry| {
         let tool_count = entry.skill_tools.len();
         let tool_info = if tool_count == 0 {
-            "—".to_string()
+            "\u{2014}".to_string()
         } else if tool_count == 1 {
             "1 tool".to_string()
         } else {
@@ -802,7 +830,7 @@ fn handle_skills(app: &App<'_>) -> String {
         };
         let _ = writeln!(
             out,
-            "  ● {:<width$}  {:<9}  {}{}{}{}",
+            "  \u{25cf} {:<width$}  {:<9}  {}{}{}{}",
             entry.manifest.skill.name,
             tool_info,
             entry.manifest.skill.description,
@@ -824,6 +852,13 @@ fn handle_skills(app: &App<'_>) -> String {
         let _ = writeln!(out, "\n  ON DEMAND");
         for entry in &on_demand {
             format_entry(&mut out, entry);
+        }
+    }
+
+    if !skipped.is_empty() {
+        let _ = writeln!(out, "\n  SKIPPED");
+        for entry in skipped {
+            let _ = writeln!(out, "  \u{2717} {}  {}", entry.name, entry.reason);
         }
     }
 
@@ -1578,6 +1613,177 @@ mod tests {
         let output = handle_provider(&mut app, "set unknown_field value").await;
 
         assert!(output.contains("Unknown field"));
+    }
+
+    // --- /clear comprehensive state reset tests ---
+
+    #[tokio::test]
+    async fn test_clear_resets_all_state_fields() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        // Set all fields to non-default values
+        app.pending_response = Some("partial response text".to_string());
+        app.reveal_index = 42;
+        app.has_new_message = true;
+        app.selection_state = SelectionState::Selected {
+            start: crate::tui::app::MessagePosition {
+                message_idx: 0,
+                text_pos: crate::tui::app::TextPosition {
+                    line: 0,
+                    char_offset: 0,
+                },
+            },
+            end: crate::tui::app::MessagePosition {
+                message_idx: 0,
+                text_pos: crate::tui::app::TextPosition {
+                    line: 0,
+                    char_offset: 5,
+                },
+            },
+        };
+        app.pending_command = Some("/model opus".to_string());
+        app.pending_task_count = 3;
+        app.status = AgentStatus::Thinking;
+
+        handle_clear(&mut app, "").await;
+
+        assert!(
+            app.pending_response.is_none(),
+            "pending_response should be None"
+        );
+        assert_eq!(app.reveal_index, 0, "reveal_index should be 0");
+        assert!(!app.has_new_message, "has_new_message should be false");
+        assert!(
+            matches!(app.selection_state, SelectionState::None),
+            "selection_state should be None"
+        );
+        assert!(
+            app.pending_command.is_none(),
+            "pending_command should be None"
+        );
+        assert_eq!(app.pending_task_count, 0, "pending_task_count should be 0");
+        assert_eq!(app.status, AgentStatus::Idle, "status should be Idle");
+    }
+
+    #[tokio::test]
+    async fn test_clear_while_thinking() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Thinking;
+
+        handle_clear(&mut app, "").await;
+
+        assert_eq!(app.status, AgentStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_clear_while_responding() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Responding(42);
+        app.pending_response = Some("partial output being revealed".to_string());
+        app.reveal_index = 10;
+
+        handle_clear(&mut app, "").await;
+
+        assert_eq!(app.status, AgentStatus::Idle);
+        assert!(app.pending_response.is_none());
+        assert_eq!(app.reveal_index, 0);
+    }
+
+    #[tokio::test]
+    async fn test_clear_with_pending_images() {
+        use crate::tui::attachment::ImageAttachment;
+
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.pending_images.push(ImageAttachment {
+            base64_data: "dGVzdA==".to_string(),
+            media_type: "image/png".to_string(),
+            size_bytes: 4,
+            label: "test.png".to_string(),
+        });
+
+        handle_clear(&mut app, "").await;
+
+        assert!(
+            app.pending_images.is_empty(),
+            "pending_images should be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_preserves_preferences() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.thinking_level = Some((8192, "medium"));
+        let original_model = app.model.clone();
+        let original_provider = app.provider;
+
+        handle_clear(&mut app, "").await;
+
+        assert_eq!(
+            app.thinking_level,
+            Some((8192, "medium")),
+            "thinking_level should be preserved"
+        );
+        assert_eq!(app.model, original_model, "model should be preserved");
+        assert_eq!(
+            app.provider, original_provider,
+            "provider should be preserved"
+        );
+    }
+
+    // --- /skills skipped section tests ---
+
+    #[tokio::test]
+    async fn test_skills_shows_skipped_section() {
+        use mika_agent::skills::index::SkippedSkill;
+
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.skills = Arc::new(SkillRegistry::with_skipped(vec![
+            SkippedSkill {
+                name: "broken-skill".to_string(),
+                reason: "broken symlink".to_string(),
+            },
+            SkippedSkill {
+                name: "bad-manifest".to_string(),
+                reason: "invalid TOML: unexpected key".to_string(),
+            },
+        ]));
+
+        let output = handle_skills(&app);
+
+        assert!(output.contains("SKIPPED"), "should have SKIPPED section");
+        assert!(
+            output.contains("broken-skill"),
+            "should show broken skill name"
+        );
+        assert!(
+            output.contains("broken symlink"),
+            "should show broken skill reason"
+        );
+        assert!(
+            output.contains("bad-manifest"),
+            "should show bad manifest name"
+        );
+        assert!(
+            output.contains("invalid TOML"),
+            "should show parse error reason"
+        );
+        assert!(
+            output.contains("2 skipped"),
+            "header should show skipped count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skills_hides_skipped_when_none() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let output = handle_skills(&app);
+
+        // Empty registry — no skills, no skipped
+        assert!(
+            !output.contains("SKIPPED"),
+            "should not have SKIPPED section"
+        );
     }
 
     // --- Channel send failure tests ---

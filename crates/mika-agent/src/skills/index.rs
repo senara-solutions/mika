@@ -149,10 +149,21 @@ pub(crate) fn sanitize_model_dir_name(model: &str) -> String {
     model.replace('/', "--")
 }
 
+/// A skill that was found but could not be loaded.
+#[derive(Debug, Clone)]
+pub struct SkippedSkill {
+    /// Directory name (not manifest name — manifest may be unreadable).
+    pub name: String,
+    /// Human-readable reason for skipping.
+    pub reason: String,
+}
+
 /// Result of scanning a skills directory.
 pub struct ScanResult {
     pub entries: Vec<SkillEntry>,
     pub skipped_count: usize,
+    /// Details of skills that were skipped during scan.
+    pub skipped: Vec<SkippedSkill>,
 }
 
 /// Scan a skills directory and load all valid skill manifests.
@@ -169,12 +180,14 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             return ScanResult {
                 entries: Vec::new(),
                 skipped_count: 0,
+                skipped: Vec::new(),
             };
         }
     };
 
     let mut entries = Vec::new();
     let mut skipped_count: usize = 0;
+    let mut skipped: Vec<SkippedSkill> = Vec::new();
     for dir_entry in read_dir {
         let dir_entry = match dir_entry {
             Ok(de) => de,
@@ -196,6 +209,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
+            let reason = match &target {
+                Some(t) => format!("broken symlink \u{2192} {}", t.display()),
+                None => "broken symlink".to_string(),
+            };
             warn!(
                 skill = dir_name,
                 target = ?target,
@@ -204,6 +221,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                 dir_name,
                 dir_name
             );
+            skipped.push(SkippedSkill {
+                name: dir_name.to_string(),
+                reason,
+            });
             skipped_count += 1;
             continue;
         }
@@ -218,11 +239,19 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         if let Ok(meta) = std::fs::metadata(&manifest_path)
             && meta.len() > MAX_SKILL_TOML_SIZE
         {
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
             warn!(
                 path = %manifest_path.display(),
                 size = meta.len(),
                 "skill.toml exceeds 64KB, skipping"
             );
+            skipped.push(SkippedSkill {
+                name: dir_name.to_string(),
+                reason: format!("skill.toml exceeds 64KB ({}B)", meta.len()),
+            });
             skipped_count += 1;
             continue;
         }
@@ -230,7 +259,15 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         let content = match std::fs::read_to_string(&manifest_path) {
             Ok(c) => c,
             Err(e) => {
+                let dir_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
                 warn!(path = %manifest_path.display(), error = %e, "cannot read skill manifest");
+                skipped.push(SkippedSkill {
+                    name: dir_name.to_string(),
+                    reason: format!("cannot read manifest: {e}"),
+                });
                 skipped_count += 1;
                 continue;
             }
@@ -238,11 +275,19 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
 
         // Detect legacy format: has [handler] section with type = "builtin"
         if is_legacy_format(&content) {
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
             warn!(
                 path = %manifest_path.display(),
                 "skipping legacy-format skill (has [handler] section). \
                  Migrate to new [skill] section format — handler config belongs in tools.json."
             );
+            skipped.push(SkippedSkill {
+                name: dir_name.to_string(),
+                reason: "legacy format (has [handler] section)".to_string(),
+            });
             skipped_count += 1;
             continue;
         }
@@ -250,7 +295,15 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         let manifest: SkillManifest = match toml::from_str(&content) {
             Ok(m) => m,
             Err(e) => {
+                let dir_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
                 warn!(path = %manifest_path.display(), error = %e, "invalid skill manifest");
+                skipped.push(SkippedSkill {
+                    name: dir_name.to_string(),
+                    reason: format!("invalid TOML: {e}"),
+                });
                 skipped_count += 1;
                 continue;
             }
@@ -294,6 +347,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                          An always_on skill without its prompt is functionally broken. \
                          Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
                     );
+                    skipped.push(SkippedSkill {
+                        name: manifest.skill.name.clone(),
+                        reason: format!("oversized prompt ({size}B, limit {limit}B)"),
+                    });
                     skipped_count += 1;
                     continue;
                 }
@@ -315,6 +372,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                         error = %e,
                         "always_on skill prompt unreadable — skill NOT loaded"
                     );
+                    skipped.push(SkippedSkill {
+                        name: manifest.skill.name.clone(),
+                        reason: format!("unreadable prompt: {e}"),
+                    });
                     skipped_count += 1;
                     continue;
                 }
@@ -354,6 +415,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
     ScanResult {
         entries,
         skipped_count,
+        skipped,
     }
 }
 
