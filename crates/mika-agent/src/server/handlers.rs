@@ -19,7 +19,8 @@ use crate::task_engine::types::{task_status, trigger_type};
 use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
 use super::types::{
-    AcceptedResponse, HealthResponse, MessageRequest, TaskCompleteRequest, TaskCompleteResponse,
+    AcceptedResponse, HealthResponse, MessageRequest, TaskCancelRequest, TaskCancelResponse,
+    TaskCompleteRequest, TaskCompleteResponse,
 };
 
 /// Media types accepted by the Claude API for image content blocks.
@@ -237,7 +238,7 @@ pub async fn handle_message(
                 user_images: &user_images,
                 brave_api_key: s.brave_api_key.as_deref(),
                 github_token: s.github_token.as_deref(),
-                github_app: s.github_app.as_deref(),
+                github_app: a.github_app.as_deref(),
                 skills_dirty: &a.skills_dirty,
                 mcp_manager: a.mcp_manager.as_ref(),
                 global_home_dir: Some(&s.global_home_dir),
@@ -535,6 +536,58 @@ pub async fn handle_task_complete(
         }),
     )
         .into_response()
+}
+
+/// POST /tasks/{id}/cancel — Cancel a task and kill its running process (if any).
+///
+/// Requires internal token auth (same as /tasks/{id}/complete).
+/// Returns 200 with cancellation status.
+pub async fn handle_task_cancel(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    JsonBody(req): JsonBody<TaskCancelRequest>,
+) -> impl IntoResponse {
+    let agent_state = match state.resolve_agent(&req.agent) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("agent '{}' not found", req.agent), "task_id": task_id})),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::task_engine::process_kill::cancel_task_and_kill(&agent_state.db, &task_id).await {
+        Ok(Some(outcome)) => {
+            info!(task_id = %task_id, label = %outcome.label, "task cancelled via HTTP");
+            (
+                StatusCode::OK,
+                Json(TaskCancelResponse {
+                    task_id: task_id.to_string(),
+                    status: "cancelled".to_string(),
+                    process_killed: outcome.process_killed,
+                }),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("task '{}' not found or not in cancellable status", task_id),
+                "task_id": task_id
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, task_id, "failed to cancel task");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to cancel task", "task_id": task_id})),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Flush previously failed outbound sends (best-effort, up to 5).

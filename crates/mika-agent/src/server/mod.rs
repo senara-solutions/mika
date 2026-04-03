@@ -207,6 +207,7 @@ fn build_router(state: AppState) -> Router {
             post(handlers::handle_message).layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         )
         .route("/tasks/{id}/complete", post(handlers::handle_task_complete))
+        .route("/tasks/{id}/cancel", post(handlers::handle_task_cancel))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,

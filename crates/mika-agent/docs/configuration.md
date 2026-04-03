@@ -129,6 +129,7 @@ MIKA_BRAVE_API_KEY=BSA...
 MIKA_GITHUB_APP_ID=123456              # GitHub App (preferred over PAT)
 MIKA_GITHUB_APP_PRIVATE_KEY=<base64>   # base64 -w0 < your-app.pem
 MIKA_GITHUB_APP_INSTALLATION_ID=78901234
+MIKA_GITHUB_APP_LOGIN=mika-dev[bot]    # Bot login for assignee filtering (optional)
 MIKA_GITHUB_TOKEN=ghp_...              # Agent operations (PAT fallback)
 MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_...  # Investigation panel only (issue creation)
 MIKA_GITHUB_REPO=owner/repo
@@ -156,9 +157,10 @@ operations. They are short-lived (1 hour), org-scoped, and auditable.
    MIKA_GITHUB_APP_ID=123456
    MIKA_GITHUB_APP_PRIVATE_KEY=<paste base64 output here>
    MIKA_GITHUB_APP_INSTALLATION_ID=78901234
+   MIKA_GITHUB_APP_LOGIN=mika-dev[bot]  # optional — bot login for assignee filtering
    ```
 
-All 3 env vars must be set. The private key is validated at startup — base64 decode
+All 3 core env vars must be set (ID, key, installation ID). `MIKA_GITHUB_APP_LOGIN` is optional. The private key is validated at startup — base64 decode
 and RSA PEM parse errors are reported immediately. When configured, Mika generates
 RS256 JWTs and exchanges them for installation tokens with automatic caching
 (5-minute pre-expiry refresh). If the token exchange fails, Mika falls back to

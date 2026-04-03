@@ -373,6 +373,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "GitHub App installation ID for the org",
     },
+    ConfigKeyInfo {
+        key: "github_app_login",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_GITHUB_APP_LOGIN"),
+        secret: false,
+        description: "GitHub App bot login (e.g., mika-dev[bot])",
+    },
     // Database backend (customer_config table)
     ConfigKeyInfo {
         key: "timezone",
@@ -470,6 +477,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
             .as_ref()
             .map(|_| "[SET]".to_string()),
         "github_app_installation_id" => settings.github_app_installation_id.map(|v| v.to_string()),
+        "github_app_login" => settings.github_app_login.clone(),
         "internal_token" => settings
             .internal_token
             .as_ref()
@@ -646,6 +654,11 @@ pub struct Settings {
     /// GitHub App installation ID for the org (optional).
     #[serde(default)]
     pub github_app_installation_id: Option<u64>,
+
+    /// GitHub App bot login (e.g., "mika-dev[bot]"). Used for assignee filtering
+    /// in autonomous issue pickup. Derived from the App slug or set explicitly.
+    #[serde(default)]
+    pub github_app_login: Option<String>,
 
     /// Enable embedded dashboard SPA at /dashboard/ (default: false)
     #[serde(default)]
@@ -1078,6 +1091,7 @@ impl std::fmt::Debug for Settings {
                 "github_app_installation_id",
                 &self.github_app_installation_id,
             )
+            .field("github_app_login", &self.github_app_login)
             .field("server_log_file", &self.server_log_file)
             .field("dashboard_enabled", &self.dashboard_enabled)
             .field("disable_bundled_skills", &self.disable_bundled_skills)

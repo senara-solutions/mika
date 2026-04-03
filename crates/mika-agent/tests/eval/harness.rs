@@ -267,6 +267,7 @@ fn dummy_settings() -> Settings {
         github_app_id: None,
         github_app_private_key: None,
         github_app_installation_id: None,
+        github_app_login: None,
         home_dir: PathBuf::from("/tmp"),
         server_log_file: None,
         dashboard_enabled: false,

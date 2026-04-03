@@ -285,11 +285,7 @@ impl TaskEngine {
             Ok(tasks) => {
                 for (task_id, pid) in tasks {
                     info!(task_id = %task_id, pid = pid, "killing orphan process for expired task");
-                    // Use std::process::Command to send SIGTERM without adding a libc dependency
-                    let _ = std::process::Command::new("kill")
-                        .arg("-TERM")
-                        .arg(pid.to_string())
-                        .output();
+                    super::process_kill::kill_process_immediate(pid);
                     // Clear process_id so we don't attempt to kill again on next tick
                     if let Err(e) = self.db.clear_task_process_id(&task_id).await {
                         warn!(task_id = %task_id, error = %e, "failed to clear process_id after kill");
