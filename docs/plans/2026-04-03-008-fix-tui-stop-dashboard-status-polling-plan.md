@@ -1,7 +1,7 @@
 ---
 title: "fix(tui): stop polling /api/v1/dashboard/status every 5s — check once at startup"
 type: fix
-status: active
+status: completed
 date: 2026-04-03
 issue: 425
 ---
