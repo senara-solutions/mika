@@ -31,8 +31,8 @@ pub fn parse_dotenv(home_dir: &Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
     match dotenvy::from_path_iter(&env_path) {
         Ok(iter) => {
-            for item in iter.flatten() {
-                map.insert(item.0, item.1);
+            for (key, val) in iter.flatten() {
+                map.insert(key, val);
             }
         }
         Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -49,13 +49,18 @@ pub fn parse_dotenv(home_dir: &Path) -> HashMap<String, String> {
 ///
 /// Strips the `MIKA_` prefix and lowercases keys to match config-rs field names
 /// (e.g., `MIKA_GITHUB_TOKEN` → `github_token = "..."`). Non-MIKA keys are skipped.
-/// Values are TOML-escaped (backslash and double-quote).
+/// Values are TOML-escaped (backslash, double-quote, newline, carriage return, tab).
 pub fn dotenv_to_toml(vars: &HashMap<String, String>) -> String {
     let mut toml = String::new();
     for (key, value) in vars {
         if let Some(config_key) = key.strip_prefix("MIKA_") {
             let config_key = config_key.to_lowercase();
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
             toml.push_str(&format!("{config_key} = \"{escaped}\"\n"));
         }
     }
@@ -389,6 +394,44 @@ mod tests {
             std::env::var(key).is_err(),
             "parse_dotenv must not set process env vars"
         );
+    }
+
+    // --- dotenv_to_toml tests ---
+
+    #[test]
+    fn test_dotenv_to_toml_strips_prefix_and_lowercases() {
+        let mut vars = HashMap::new();
+        vars.insert("MIKA_GITHUB_TOKEN".to_string(), "ghp_abc".to_string());
+        let toml = dotenv_to_toml(&vars);
+        assert!(toml.contains("github_token = \"ghp_abc\""));
+    }
+
+    #[test]
+    fn test_dotenv_to_toml_skips_non_mika_keys() {
+        let mut vars = HashMap::new();
+        vars.insert("GH_TOKEN".to_string(), "ghp_leaked".to_string());
+        vars.insert("MIKA_BRAVE_API_KEY".to_string(), "key".to_string());
+        let toml = dotenv_to_toml(&vars);
+        assert!(!toml.contains("gh_token"));
+        assert!(toml.contains("brave_api_key"));
+    }
+
+    #[test]
+    fn test_dotenv_to_toml_escapes_special_chars() {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "MIKA_TEST_KEY".to_string(),
+            "has\\backslash\"quotes\nnewline\rtab\there".to_string(),
+        );
+        let toml = dotenv_to_toml(&vars);
+        assert!(toml.contains(r#"test_key = "has\\backslash\"quotes\nnewline\rtab\there""#));
+    }
+
+    #[test]
+    fn test_dotenv_to_toml_empty_map() {
+        let vars = HashMap::new();
+        let toml = dotenv_to_toml(&vars);
+        assert!(toml.is_empty());
     }
 
     // --- env_file_contains_key tests ---
