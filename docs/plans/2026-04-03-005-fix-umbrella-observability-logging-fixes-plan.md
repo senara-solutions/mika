@@ -1,7 +1,7 @@
 ---
 title: "fix: umbrella observability and logging fixes"
 type: fix
-status: active
+status: completed
 date: 2026-04-03
 issues: [420, 419, 412, 354]
 ---
