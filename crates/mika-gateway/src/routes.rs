@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Request, State},
     http::{self, HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
@@ -26,6 +26,42 @@ use crate::telegram::{
     ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_agent_prefix,
     parse_update,
 };
+
+/// Carries HTTP method and path from request to response extensions,
+/// making them available to TraceLayer's `on_response` callback as
+/// top-level JSON fields (not nested inside the `spans` array).
+#[derive(Clone, Debug)]
+struct RequestMeta {
+    method: String,
+    path: String,
+}
+
+/// Middleware that captures method and path from the request and injects
+/// them into response extensions for downstream logging.
+async fn inject_request_meta(request: Request, next: Next) -> Response {
+    let meta = RequestMeta {
+        method: request.method().to_string(),
+        path: request.uri().path().to_owned(),
+    };
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(meta);
+    response
+}
+
+/// Build version info returned by the `/version` endpoint.
+#[derive(serde::Serialize)]
+struct VersionInfo {
+    version: &'static str,
+    git_hash: &'static str,
+}
+
+/// Returns build version and git hash as JSON. No authentication required.
+async fn handle_version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        git_hash: option_env!("GIT_HASH").unwrap_or("unknown"),
+    })
+}
 
 // -- AppState --
 
@@ -103,15 +139,19 @@ pub fn build_router(state: AppState) -> Router {
             "/a2a/{customer_id}/{agent_name}/agent.json",
             get(a2a_routes::handle_a2a_agent_card),
         )
-        // Health probes (no auth)
+        // Health probes and version (no auth)
         .route("/health", get(handle_readiness))
         .route("/readyz", get(handle_readiness))
         .route("/livez", get(handle_liveness))
+        .route("/version", get(handle_version))
         // Security headers on all responses
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         ))
+        // inject_request_meta must be inner to TraceLayer so that on the response
+        // path it inserts RequestMeta into extensions BEFORE on_response reads them.
+        .layer(middleware::from_fn(inject_request_meta))
         // Request logging — health probes at DEBUG, everything else at INFO
         .layer(
             TraceLayer::new_for_http()
@@ -130,16 +170,26 @@ pub fn build_router(state: AppState) -> Router {
                         let is_debug = span
                             .metadata()
                             .is_some_and(|m| *m.level() == tracing::Level::DEBUG);
+                        let (method, path) = response
+                            .extensions()
+                            .get::<RequestMeta>()
+                            .map(|m| (m.method.as_str(), m.path.as_str()))
+                            .unwrap_or(("unknown", "unknown"));
                         if status >= 500 {
-                            tracing::warn!(status, ?latency, "response");
+                            tracing::warn!(status, method, path, ?latency, "response");
                         } else if is_debug {
-                            tracing::debug!(status, ?latency, "response");
+                            tracing::debug!(status, method, path, ?latency, "response");
                         } else {
-                            tracing::info!(status, ?latency, "response");
+                            tracing::info!(status, method, path, ?latency, "response");
                         }
                     },
                 )
                 .on_failure(
+                    // NOTE: on_failure fires on connection-level failures where no
+                    // response is produced. RequestMeta is carried via response
+                    // extensions, so it is unavailable here. Method and path remain
+                    // accessible via the parent span's fields (nested in JSON output
+                    // under `spans`). Connection-level failures are rare.
                     |error: tower_http::classify::ServerErrorsFailureClass,
                      latency: Duration,
                      _span: &tracing::Span| {
@@ -157,7 +207,7 @@ pub fn build_router(state: AppState) -> Router {
 /// Returns `true` for Kubernetes health/readiness/liveness probe paths.
 /// These are logged at DEBUG level to reduce noise from frequent probe traffic.
 fn is_health_probe(path: &str) -> bool {
-    matches!(path, "/health" | "/readyz" | "/livez")
+    matches!(path, "/health" | "/readyz" | "/livez" | "/version")
 }
 
 // -- Webhook handler --
@@ -1001,6 +1051,7 @@ mod tests {
         assert!(is_health_probe("/health"));
         assert!(is_health_probe("/readyz"));
         assert!(is_health_probe("/livez"));
+        assert!(is_health_probe("/version"));
         assert!(!is_health_probe("/webhook/telegram"));
         assert!(!is_health_probe("/send"));
         assert!(!is_health_probe("/a2a/customer/agent"));
