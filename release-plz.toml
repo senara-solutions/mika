@@ -7,16 +7,18 @@ git_release_name = "v{{ version }}"
 semver_check = false
 pr_labels = ["release"]
 
+# mika-common is the only released package. It drives the unified version,
+# changelog, git tag, and GitHub release. All other crates are publish = false
+# and release = false because cargo package can't resolve workspace deps
+# (e.g., mika-a2a ^0.3.2) from crates.io where they were never published.
+# Their commits flow into the changelog via changelog_include.
 [[package]]
 name = "mika-common"
 publish = false
 release = true
 changelog_path = "CHANGELOG.md"
-changelog_include = ["mika-agent", "mika-cli"]
+changelog_include = ["mika-agent", "mika-cli", "mika-a2a"]
 
-# mika-agent: release = false because rust-embed uses ../../dashboard/dist/
-# which escapes the crate boundary during cargo package --verify.
-# Its commits still appear in the changelog via mika-common's changelog_include.
 [[package]]
 name = "mika-agent"
 publish = false
@@ -25,18 +27,12 @@ release = false
 [[package]]
 name = "mika-cli"
 publish = false
-release = true
-changelog_update = false
-git_release_enable = false
-git_tag_enable = false
+release = false
 
 [[package]]
 name = "mika-a2a"
 publish = false
-release = true
-changelog_update = false
-git_release_enable = false
-git_tag_enable = false
+release = false
 
 [[package]]
 name = "mika-gateway"
