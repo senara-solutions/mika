@@ -555,6 +555,9 @@ pub async fn run(
     // Initialize cross-channel polling watermark
     app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
 
+    // One-time dashboard status check at startup (no periodic polling).
+    app.dashboard_running = crate::commands::dashboard::is_dashboard_running().await;
+
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -849,6 +852,10 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
     // Team mode: skip history loading. Team conversations are goal-driven —
     // each goal triggers a full team run. The shared container DB contains
     // regular agent messages that should not appear in the team TUI.
+
+    // One-time dashboard status check at startup (no periodic polling).
+    app.dashboard_running = crate::commands::dashboard::is_dashboard_running().await;
+
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
