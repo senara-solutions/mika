@@ -13,7 +13,10 @@ pub mod types;
 
 use anyhow::{Result, anyhow};
 use axum::{
-    Router, http, middleware,
+    Router,
+    extract::Request,
+    http, middleware,
+    response::Response,
     routing::{get, post},
 };
 use std::collections::HashMap;
@@ -25,6 +28,27 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
+
+/// Carries HTTP method and path from request to response extensions,
+/// making them available to TraceLayer's `on_response` callback as
+/// top-level JSON fields (not nested inside the `spans` array).
+#[derive(Clone, Debug)]
+struct RequestMeta {
+    method: String,
+    path: String,
+}
+
+/// Middleware that captures method and path from the request and injects
+/// them into response extensions for downstream logging.
+async fn inject_request_meta(request: Request, next: middleware::Next) -> Response {
+    let meta = RequestMeta {
+        method: request.method().to_string(),
+        path: request.uri().path().to_owned(),
+    };
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(meta);
+    response
+}
 
 use mika_common::agent;
 use mika_common::config::Settings;
@@ -200,6 +224,9 @@ fn build_router(state: AppState) -> Router {
         .route("/", get(embedded_dashboard::handle_root))
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
+        // inject_request_meta must be inner to TraceLayer so that on the response
+        // path it inserts RequestMeta into extensions BEFORE on_response reads them.
+        .layer(middleware::from_fn(inject_request_meta))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &http::Request<_>| {
@@ -217,16 +244,26 @@ fn build_router(state: AppState) -> Router {
                         let is_debug = span
                             .metadata()
                             .is_some_and(|m| *m.level() == tracing::Level::DEBUG);
+                        let (method, path) = response
+                            .extensions()
+                            .get::<RequestMeta>()
+                            .map(|m| (m.method.as_str(), m.path.as_str()))
+                            .unwrap_or(("unknown", "unknown"));
                         if status >= 500 {
-                            tracing::warn!(status, ?latency, "response");
+                            tracing::warn!(status, method, path, ?latency, "response");
                         } else if is_debug {
-                            tracing::debug!(status, ?latency, "response");
+                            tracing::debug!(status, method, path, ?latency, "response");
                         } else {
-                            tracing::info!(status, ?latency, "response");
+                            tracing::info!(status, method, path, ?latency, "response");
                         }
                     },
                 )
                 .on_failure(
+                    // NOTE: on_failure fires on connection-level failures where no
+                    // response is produced. RequestMeta is carried via response
+                    // extensions, so it is unavailable here. Method and path remain
+                    // accessible via the parent span's fields (nested in JSON output
+                    // under `spans`). Connection-level failures are rare.
                     |error: tower_http::classify::ServerErrorsFailureClass,
                      latency: Duration,
                      _span: &tracing::Span| {
