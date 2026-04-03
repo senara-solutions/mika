@@ -1,4 +1,4 @@
-name: Release-plz
+name: Release
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  release-plz-pr:
+  release-pr:
     name: Release PR
     runs-on: ubuntu-22.04
     if: github.repository_owner == 'senara-solutions'
@@ -15,43 +15,177 @@ jobs:
       contents: write
       pull-requests: write
     concurrency:
-      group: release-plz-pr
+      group: release-pr
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - name: Install Rust toolchain
-        run: rustup show  # reads rust-toolchain.toml
-      - name: Create dashboard dist placeholder
-        run: mkdir -p dashboard/dist
-      - uses: release-plz/action@f708778669256143d984cce4b23592637532e040  # v0.5
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-  release-plz-release:
-    name: Release
+      - name: Install git-cliff
+        uses: taiki-e/install-action@90b40388b8931b1c39e248959515e295e02e9066  # v2
+        with:
+          tool: git-cliff
+
+      - name: Check for unreleased changes
+        id: check
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No tags found, skipping"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Count conventional commits since last tag (excluding ci/chore/test/style)
+          COMMIT_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges \
+            --grep="^feat" --grep="^fix" --grep="^refactor" --grep="^perf" --grep="^doc" \
+            --all-match 2>/dev/null | wc -l || echo 0)
+
+          # Also check with individual grep (git log --grep is OR by default without --all-match)
+          FEAT_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^feat" | wc -l)
+          FIX_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^fix" | wc -l)
+          REFACTOR_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^refactor" | wc -l)
+          PERF_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^perf" | wc -l)
+          DOC_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^doc" | wc -l)
+          TOTAL=$((FEAT_COUNT + FIX_COUNT + REFACTOR_COUNT + PERF_COUNT + DOC_COUNT))
+
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "feat_count=$FEAT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine next version
+        if: steps.check.outputs.has_changes == 'true'
+        id: version
+        run: |
+          CURRENT="${{ steps.check.outputs.latest_tag }}"
+          CURRENT="${CURRENT#v}"  # strip v prefix
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          # Check for breaking changes
+          BREAKING=$(git log "v${CURRENT}..HEAD" --oneline --no-merges --grep="BREAKING" | wc -l)
+
+          if [ "$BREAKING" -gt 0 ] && [ "$MAJOR" -gt 0 ]; then
+            NEXT="$((MAJOR + 1)).0.0"
+          elif [ "${{ steps.check.outputs.feat_count }}" -gt 0 ]; then
+            NEXT="${MAJOR}.$((MINOR + 1)).0"
+          else
+            NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing release PR
+        if: steps.check.outputs.has_changes == 'true'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          PR=$(gh pr list --head "release/v${{ steps.version.outputs.next }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PR" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release PR #$PR already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release branch and PR
+        if: steps.check.outputs.has_changes == 'true' && steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          NEXT="${{ steps.version.outputs.next }}"
+          CURRENT="${{ steps.version.outputs.current }}"
+          BRANCH="release/v${NEXT}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+
+          # Bump workspace version
+          sed -i "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" Cargo.toml
+
+          # Update Cargo.lock
+          cargo update --workspace
+
+          # Generate changelog
+          git-cliff --tag "v${NEXT}" -o CHANGELOG.md
+
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore: release v${NEXT}"
+          git push origin "$BRANCH"
+
+          # Create PR
+          CHANGELOG_BODY=$(git-cliff --tag "v${NEXT}" --unreleased --strip header)
+          gh pr create \
+            --title "chore: release v${NEXT}" \
+            --body "$(cat <<EOF
+          ## Release v${NEXT}
+
+          ${CHANGELOG_BODY}
+
+          ---
+          Merging this PR will trigger tag creation and GitHub release.
+          EOF
+          )" \
+            --label "release" \
+            --base main \
+            --head "$BRANCH"
+
+  release-tag:
+    name: Tag & Release
     runs-on: ubuntu-22.04
-    if: github.repository_owner == 'senara-solutions'
+    if: github.repository_owner == 'senara-solutions' && startsWith(github.event.head_commit.message, 'chore: release v')
     permissions:
       contents: write
     concurrency:
-      group: release-plz-release
+      group: release-tag
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - name: Install Rust toolchain
-        run: rustup show  # reads rust-toolchain.toml
-      - name: Create dashboard dist placeholder
-        run: mkdir -p dashboard/dist
-      - uses: release-plz/action@f708778669256143d984cce4b23592637532e040  # v0.5
-        with:
-          command: release
+
+      - name: Extract version and create tag
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          # Extract version from commit message: "chore: release v0.3.3"
+          VERSION=$(echo "${{ github.event.head_commit.message }}" | grep -oP 'v\d+\.\d+\.\d+' | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "No version found in commit message, skipping"
+            exit 0
+          fi
+
+          # Check if tag already exists
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists, skipping"
+            exit 0
+          fi
+
+          # Install git-cliff for release notes
+          cargo install git-cliff --locked 2>/dev/null || true
+
+          # Generate release notes
+          NOTES=$(git-cliff --tag "$VERSION" --unreleased --strip header 2>/dev/null || echo "Release $VERSION")
+
+          # Create tag
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+
+          # Create GitHub release
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "$NOTES" \
+            --verify-tag

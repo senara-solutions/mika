@@ -1,22 +1,6 @@
-[workspace]
-git_only = true
-git_release_enable = true
-git_tag_enable = true
-git_tag_name = "v{{ version }}"
-git_release_name = "v{{ version }}"
-semver_check = false
-pr_labels = ["release"]
-
-# Only mika-common is declared — release-plz ignores all other workspace
-# members. mika-common has no workspace deps so cargo package succeeds.
-# Commits from mika-agent, mika-cli, and mika-a2a flow into the changelog
-# via changelog_include.
-[[package]]
-name = "mika-common"
-publish = false
-release = true
-changelog_path = "CHANGELOG.md"
-changelog_include = ["mika-agent", "mika-cli", "mika-a2a"]
+# git-cliff configuration — replaces release-plz changelog generation.
+# release-plz is incompatible with publish = false workspace crates that have
+# inter-dependencies (cargo package can't resolve versions from crates.io).
 
 [changelog]
 header = """# Changelog\n\nAll notable changes to this project will be documented in this file.\n"""
@@ -25,12 +9,15 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}**BREAKING** {% endif %}{{ commit.message }}
-{%- endfor %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}**BREAKING** {% endif %}\
+{{ commit.message }}{%- endfor %}
 {% endfor %}
 """
 trim = true
-protect_breaking_commits = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
 commit_parsers = [
     { message = "^feat", group = "Added" },
     { message = "^fix", group = "Fixed" },
@@ -42,3 +29,5 @@ commit_parsers = [
     { message = "^chore", skip = true },
     { message = "^style", skip = true },
 ]
+protect_breaking_commits = true
+tag_pattern = "v[0-9].*"
