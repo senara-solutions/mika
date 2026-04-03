@@ -158,6 +158,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
+          git config user.name "mika-platform[bot]"
+          git config user.email "mika@getmika.ai"
+
           VERSION=$(echo "${{ github.event.head_commit.message }}" | grep -oP 'v\d+\.\d+\.\d+' | head -1)
           if [ -z "$VERSION" ]; then
             echo "No version found in commit message, skipping"
