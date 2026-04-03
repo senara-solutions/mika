@@ -557,11 +557,8 @@ mod tests {
     // -- Event routing tests --
 
     #[test]
-    fn test_route_event_issues_opened() {
-        assert_eq!(
-            route_event("issues", Some("opened"), None),
-            Some("mika-dev")
-        );
+    fn test_route_event_issues_opened_ignored() {
+        assert_eq!(route_event("issues", Some("opened"), None), None);
     }
 
     #[test]
