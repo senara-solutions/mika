@@ -5,7 +5,7 @@
 [changelog]
 header = """# Changelog\n\nAll notable changes to this project will be documented in this file.\n"""
 body = """
-## [{{ version }}](https://github.com/senara-solutions/mika/releases/tag/v{{ version }}) — {{ timestamp | date(format="%Y-%m-%d") }}
+## [{{ version }}](https://github.com/senara-solutions/mika/releases/tag/{{ version }}) — {{ timestamp | date(format="%Y-%m-%d") }}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
