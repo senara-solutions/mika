@@ -1,7 +1,7 @@
 ---
 title: "feat(gateway): multi-tenant GitHub webhook routing — agent_mapping and strict mode"
 type: feat
-status: active
+status: completed
 date: 2026-04-04
 issue: 411
 ---
