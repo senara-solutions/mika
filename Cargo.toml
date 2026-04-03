@@ -143,10 +143,10 @@ serial_test = "3"
 # Concurrent collections
 dashmap = "6"
 
-# Workspace crates
-mika-common = { path = "crates/mika-common", version = "0.3.2" }
-mika-agent = { path = "crates/mika-agent", version = "0.3.2" }
-mika-a2a = { path = "crates/mika-a2a", version = "0.3.2" }
+# Workspace crates (path-only — no version needed since all are publish = false)
+mika-common = { path = "crates/mika-common" }
+mika-agent = { path = "crates/mika-agent" }
+mika-a2a = { path = "crates/mika-a2a" }
 
 [profile.release]
 lto = true
