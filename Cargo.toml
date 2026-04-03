@@ -117,7 +117,7 @@ rmcp = { version = "0.17", default-features = false, features = [
 ] }
 
 # Postgres (mika-gateway)
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
 
 # Embedded assets
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
