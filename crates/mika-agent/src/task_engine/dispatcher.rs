@@ -897,8 +897,15 @@ fn extract_callback_fields(result: &str) -> serde_json::Value {
         map.insert("turns".into(), serde_json::Value::Number(n.into()));
     }
     if let Some(cap) = RE_COST.captures(result) {
-        // Regex already rejects non-numeric input (e.g. "$unknown")
-        map.insert("cost_usd".into(), serde_json::Value::String(cap[1].into()));
+        // Parse as f64 and store as JSON number (consistent with turns/duration_ms).
+        // from_f64 returns None for NaN/Infinity — impossible from the regex but handled defensively.
+        if let Some(n) = cap[1]
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+        {
+            map.insert("cost_usd".into(), serde_json::Value::Number(n));
+        }
     }
     if let Some(cap) = RE_DURATION.captures(result)
         && let Ok(n) = cap[1].parse::<u64>()
@@ -1148,7 +1155,7 @@ mod tests {
         let cp = &extracted["claude_pilot"];
         assert_eq!(cp["session_id"], "abc-123-def");
         assert_eq!(cp["turns"], 91);
-        assert_eq!(cp["cost_usd"], "7.07");
+        assert_eq!(cp["cost_usd"], 7.07);
         assert_eq!(cp["duration_ms"], 996000);
     }
 
@@ -1163,7 +1170,7 @@ mod tests {
         let cp = &extracted["claude_pilot"];
         assert_eq!(cp["session_id"], "sess-456");
         assert_eq!(cp["turns"], 45);
-        assert_eq!(cp["cost_usd"], "3.50");
+        assert_eq!(cp["cost_usd"], 3.5);
         assert_eq!(cp["duration_ms"], 500000);
     }
 
@@ -1175,7 +1182,7 @@ mod tests {
         let extracted = extract_callback_fields(result);
         let cp = &extracted["claude_pilot"];
         assert_eq!(cp["session_id"], "my-session");
-        assert_eq!(cp["cost_usd"], "1.23");
+        assert_eq!(cp["cost_usd"], 1.23);
         assert!(cp.get("turns").is_none());
         assert!(cp.get("duration_ms").is_none());
     }
@@ -1288,7 +1295,7 @@ mod tests {
         let cp = &metadata["claude_pilot"];
         assert_eq!(cp["session_id"], "test-session-id");
         assert_eq!(cp["turns"], 91);
-        assert_eq!(cp["cost_usd"], "7.07");
+        assert_eq!(cp["cost_usd"], 7.07);
         assert_eq!(cp["duration_ms"], 996000);
     }
 
