@@ -4,7 +4,7 @@ category: architecture-patterns
 date: 2026-03-31
 tags: [gateway, middleware, tower-http, TraceLayer, observability, logging, health-probes]
 severity: low
-components: [mika-gateway]
+components: [mika-gateway, mika-agent]
 ---
 
 # Gateway Request Logging with TraceLayer and Health Probe Filtering
@@ -19,7 +19,7 @@ The gateway router in `crates/mika-gateway/src/routes.rs` was assembled with `Re
 
 ## Solution
 
-Added `TraceLayer::new_for_http()` with custom `make_span_with` and `on_response` closures to the gateway router. The key design choice was differentiating health probes from operational routes:
+Added `TraceLayer::new_for_http()` with custom `make_span_with`, `on_response`, and `on_failure` closures to both the gateway and agent server routers. The key design choice was differentiating health probes from operational routes:
 
 ```rust
 use tower_http::trace::TraceLayer;
@@ -50,6 +50,17 @@ use tower_http::trace::TraceLayer;
                     tracing::info!(status, ?latency, "response");
                 }
             },
+        )
+        .on_failure(
+            |error: tower_http::classify::ServerErrorsFailureClass,
+             latency: Duration,
+             _span: &tracing::Span| {
+                tracing::error!(
+                    classification = %error,
+                    ?latency,
+                    "response failed"
+                );
+            },
         ),
 )
 
@@ -60,7 +71,7 @@ fn is_health_probe(path: &str) -> bool {
 
 ### Key decisions
 
-1. **Custom `make_span_with` instead of defaults:** mika-server uses plain `TraceLayer::new_for_http()` with defaults. The gateway needs the custom span factory to log health probes at DEBUG level (reducing noise from Kubernetes liveness/readiness checks that fire every few seconds).
+1. **Custom `make_span_with` instead of defaults:** Both the gateway and mika-server use custom span factories to log health probes at DEBUG level (reducing noise from Kubernetes liveness/readiness checks that fire every few seconds). The gateway checks three paths (`/health`, `/readyz`, `/livez`); the server checks only `/health` (its sole health endpoint).
 
 2. **Span-level filtering:** Health probe spans use `debug_span!` while operational routes use `info_span!`. The `on_response` callback checks the span's metadata level to match: health probe responses use `debug!`, operational responses use `info!`, and 5xx responses always use `warn!`. This ensures health probe traffic is fully suppressed at INFO log level — both the span and the response event.
 
@@ -68,15 +79,17 @@ fn is_health_probe(path: &str) -> bool {
 
 4. **No Cargo.toml changes:** The `tower-http` crate with the `"trace"` feature was already a workspace dependency.
 
+5. **Custom `on_failure` for connection-level errors:** Both components have explicit `on_failure` callbacks that log at ERROR with classification and latency. Without this, tower-http's default `on_failure` would log timeouts and stream errors without the span's method/path context being visible in flat log searches.
+
 ## Prevention
 
-- When adding new HTTP services (Axum routers), include `TraceLayer` from the start.
+- When adding new HTTP services (Axum routers), include `TraceLayer` from the start with custom `make_span_with`, `on_response`, and `on_failure`.
 - Use custom `make_span_with` when health probe noise reduction is needed (any service behind Kubernetes probes).
 - Always check `docs/solutions/integration-issues/langfuse-non-llm-span-filtering.md` before adding tracing spans to avoid unintended OTel export.
 
 ## References
 
 - Gateway router: `crates/mika-gateway/src/routes.rs`
-- mika-server TraceLayer: `crates/mika-agent/src/server/mod.rs:204`
+- Agent server router: `crates/mika-agent/src/server/mod.rs`
 - Langfuse span filtering: `docs/solutions/integration-issues/langfuse-non-llm-span-filtering.md`
 - GitHub issue: #355
