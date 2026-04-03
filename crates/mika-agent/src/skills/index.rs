@@ -149,10 +149,20 @@ pub(crate) fn sanitize_model_dir_name(model: &str) -> String {
     model.replace('/', "--")
 }
 
+/// A skill that was found but could not be loaded.
+#[derive(Debug, Clone)]
+pub struct SkippedSkill {
+    /// Directory name (not manifest name — manifest may be unreadable).
+    pub name: String,
+    /// Human-readable reason for skipping.
+    pub reason: String,
+}
+
 /// Result of scanning a skills directory.
 pub struct ScanResult {
     pub entries: Vec<SkillEntry>,
-    pub skipped_count: usize,
+    /// Details of skills that were skipped during scan.
+    pub skipped: Vec<SkippedSkill>,
 }
 
 /// Scan a skills directory and load all valid skill manifests.
@@ -168,13 +178,13 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             warn!(path = %skills_dir.display(), error = %e, "cannot read skills directory");
             return ScanResult {
                 entries: Vec::new(),
-                skipped_count: 0,
+                skipped: Vec::new(),
             };
         }
     };
 
     let mut entries = Vec::new();
-    let mut skipped_count: usize = 0;
+    let mut skipped: Vec<SkippedSkill> = Vec::new();
     for dir_entry in read_dir {
         let dir_entry = match dir_entry {
             Ok(de) => de,
@@ -185,6 +195,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         };
 
         let path = dir_entry.path();
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
 
         // Detect broken symlinks (linked skills whose target was removed)
         if let Ok(meta) = std::fs::symlink_metadata(&path)
@@ -192,10 +206,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             && !path.exists()
         {
             let target = std::fs::read_link(&path).ok();
-            let dir_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
+            let reason = match &target {
+                Some(t) => format!("broken symlink \u{2192} {}", t.display()),
+                None => "broken symlink".to_string(),
+            };
             warn!(
                 skill = dir_name,
                 target = ?target,
@@ -204,7 +218,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                 dir_name,
                 dir_name
             );
-            skipped_count += 1;
+            skipped.push(SkippedSkill {
+                name: dir_name.to_string(),
+                reason,
+            });
             continue;
         }
 
@@ -223,7 +240,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                 size = meta.len(),
                 "skill.toml exceeds 64KB, skipping"
             );
-            skipped_count += 1;
+            skipped.push(SkippedSkill {
+                name: dir_name.to_string(),
+                reason: format!("skill.toml exceeds 64KB ({}B)", meta.len()),
+            });
             continue;
         }
 
@@ -231,7 +251,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             Ok(c) => c,
             Err(e) => {
                 warn!(path = %manifest_path.display(), error = %e, "cannot read skill manifest");
-                skipped_count += 1;
+                skipped.push(SkippedSkill {
+                    name: dir_name.to_string(),
+                    reason: format!("cannot read manifest: {e}"),
+                });
                 continue;
             }
         };
@@ -243,7 +266,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                 "skipping legacy-format skill (has [handler] section). \
                  Migrate to new [skill] section format — handler config belongs in tools.json."
             );
-            skipped_count += 1;
+            skipped.push(SkippedSkill {
+                name: dir_name.to_string(),
+                reason: "legacy format (has [handler] section)".to_string(),
+            });
             continue;
         }
 
@@ -251,7 +277,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             Ok(m) => m,
             Err(e) => {
                 warn!(path = %manifest_path.display(), error = %e, "invalid skill manifest");
-                skipped_count += 1;
+                skipped.push(SkippedSkill {
+                    name: dir_name.to_string(),
+                    reason: format!("invalid TOML: {e}"),
+                });
                 continue;
             }
         };
@@ -294,7 +323,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                          An always_on skill without its prompt is functionally broken. \
                          Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
                     );
-                    skipped_count += 1;
+                    skipped.push(SkippedSkill {
+                        name: manifest.skill.name.clone(),
+                        reason: format!("oversized prompt ({size}B, limit {limit}B)"),
+                    });
                     continue;
                 }
                 error!(
@@ -315,7 +347,10 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                         error = %e,
                         "always_on skill prompt unreadable — skill NOT loaded"
                     );
-                    skipped_count += 1;
+                    skipped.push(SkippedSkill {
+                        name: manifest.skill.name.clone(),
+                        reason: format!("unreadable prompt: {e}"),
+                    });
                     continue;
                 }
                 warn!(
@@ -351,10 +386,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
         });
     }
 
-    ScanResult {
-        entries,
-        skipped_count,
-    }
+    ScanResult { entries, skipped }
 }
 
 /// Diagnostic level for skill validation.
@@ -1414,7 +1446,7 @@ mod tests {
 
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.skipped_count, 0);
+        assert_eq!(scan.skipped.len(), 0);
         assert_eq!(scan.entries[0].manifest.skill.name, "web-search");
         assert_eq!(scan.entries[0].keywords_lower, vec!["search", "look up"]);
         assert_eq!(scan.entries[0].dir, skill_dir);
@@ -1460,7 +1492,7 @@ mod tests {
 
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.skipped_count, 1);
+        assert_eq!(scan.skipped.len(), 1);
         assert_eq!(scan.entries[0].manifest.skill.name, "web-search");
     }
 
@@ -1492,8 +1524,31 @@ mod tests {
 
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.skipped_count, 2); // bad TOML + missing manifest
+        assert_eq!(scan.skipped.len(), 2); // bad TOML + missing manifest
         assert_eq!(scan.entries[0].manifest.skill.name, "good");
+
+        // Verify skipped details capture names and reasons
+        let skipped_names: Vec<&str> = scan.skipped.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            skipped_names.contains(&"bad"),
+            "should record 'bad' as skipped: {skipped_names:?}"
+        );
+        assert!(
+            skipped_names.contains(&"missing"),
+            "should record 'missing' as skipped: {skipped_names:?}"
+        );
+        let bad_entry = scan.skipped.iter().find(|s| s.name == "bad").unwrap();
+        assert!(
+            bad_entry.reason.contains("invalid TOML"),
+            "bad skill should have TOML parse error reason: {}",
+            bad_entry.reason
+        );
+        let missing_entry = scan.skipped.iter().find(|s| s.name == "missing").unwrap();
+        assert!(
+            missing_entry.reason.contains("cannot read manifest"),
+            "missing skill should have read error reason: {}",
+            missing_entry.reason
+        );
     }
 
     #[test]
@@ -1529,7 +1584,7 @@ mod tests {
 
         let scan = scan_skills_dir(tmp.path());
         assert!(scan.entries.is_empty());
-        assert_eq!(scan.skipped_count, 1);
+        assert_eq!(scan.skipped.len(), 1);
     }
 
     #[test]
@@ -1734,7 +1789,7 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         // always_on skill with oversized prompt should be SKIPPED entirely
         assert_eq!(scan.entries.len(), 0);
-        assert_eq!(scan.skipped_count, 1);
+        assert_eq!(scan.skipped.len(), 1);
     }
 
     #[test]
@@ -1757,7 +1812,7 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].prompt_snippet, "Remember things.");
-        assert_eq!(scan.skipped_count, 0);
+        assert_eq!(scan.skipped.len(), 0);
     }
 
     #[test]
@@ -1783,7 +1838,7 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].prompt_snippet.len(), 29 * 1024);
-        assert_eq!(scan.skipped_count, 0);
+        assert_eq!(scan.skipped.len(), 0);
     }
 
     #[test]
@@ -1807,7 +1862,7 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].prompt_snippet, "");
-        assert_eq!(scan.skipped_count, 0);
+        assert_eq!(scan.skipped.len(), 0);
     }
 
     #[test]
@@ -1831,7 +1886,7 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].prompt_snippet, "");
-        assert_eq!(scan.skipped_count, 0);
+        assert_eq!(scan.skipped.len(), 0);
     }
 
     #[test]

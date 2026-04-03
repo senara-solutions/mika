@@ -107,7 +107,7 @@ Clear the chat display and start a new session.
 
 **Aliases:** None | **Arguments:** None
 
-Ends the current session, creates a new one with a fresh UUID, and notifies the agent worker. Clears all display messages, resets scroll position, context token tracking, and cross-channel polling watermarks. The agent starts fresh with no conversation history. Previous sessions remain in the database for audit and history purposes.
+Ends the current session, creates a new one with a fresh UUID, and notifies the agent worker. Drains any stale responses from the agent channel to prevent ghost messages. Clears all display messages, resets scroll position, context token tracking, cross-channel polling watermarks, and all transient state: `pending_response`, `reveal_index`, `status` (back to Idle), `pending_images`, `pending_command`, `has_new_message`, `selection_state`, `pending_task_count`. User preferences (`thinking_level`, model, provider) are preserved. The agent starts fresh with no conversation history. Previous sessions remain in the database for audit and history purposes.
 
 ---
 
@@ -280,12 +280,23 @@ List all loaded skills from the filesystem-based skill registry.
 
 **Aliases:** None | **Arguments:** None
 
-Each skill shows its name, handler type (`builtin`, `exec`, or `http`), description, and whether it is always-on.
+Skills are grouped into "ALWAYS ON" and "ON DEMAND" sections. Each skill shows its name, tool count, description, and optional badges (`[disabled]`, `[override]`, `[variants: N]`). Within each group, enabled skills are listed before disabled ones. The header shows the total count and, if any skills failed to load, the skipped count.
+
+If skills were skipped during scanning (broken symlinks, invalid manifests, oversized prompts, etc.), a "SKIPPED" section appears at the bottom showing each skipped skill's name and reason. At startup, skipped skills are also shown as a system message warning (up to 5 inline, with a note to run `mika skills validate` for details).
 
 ```
-Loaded skills:
-  web_search (builtin) — Search the web for current information
-  shell_exec (exec) — Execute shell commands [always on]
+Loaded skills (12, 2 skipped):
+
+  ALWAYS ON
+  ● memory       —         Core memory management
+  ● self-knowledge  —      Agent self-awareness
+
+  ON DEMAND
+  ● web-search   1 tool    Search the web
+
+  SKIPPED
+  ✗ broken-skill           broken symlink → /old/path
+  ✗ bad-manifest           invalid TOML: expected `=` at line 3
 ```
 
 ---
