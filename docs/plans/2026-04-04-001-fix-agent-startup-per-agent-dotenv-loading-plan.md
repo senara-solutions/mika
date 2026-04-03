@@ -1,7 +1,7 @@
 ---
 title: "fix: agent startup must load per-agent .env before constructing Settings"
 type: fix
-status: active
+status: completed
 date: 2026-04-04
 ---
 
