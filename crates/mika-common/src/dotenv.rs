@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, warn};
 
@@ -18,6 +19,47 @@ pub fn load_dotenv(home_dir: &Path) {
             warn!(path = %env_path.display(), error = %e, "failed to load .env");
         }
     }
+}
+
+/// Parse a `.env` file and return key-value pairs without modifying process env.
+///
+/// Keys are returned as-is (e.g., `MIKA_GITHUB_TOKEN`) — the caller decides
+/// how to map them. Uses `dotenvy::from_path_iter()` which reads without setting
+/// env vars. Silently returns an empty map if the file is missing or unparseable.
+pub fn parse_dotenv(home_dir: &Path) -> HashMap<String, String> {
+    let env_path = home_dir.join(".env");
+    let mut map = HashMap::new();
+    match dotenvy::from_path_iter(&env_path) {
+        Ok(iter) => {
+            for item in iter.flatten() {
+                map.insert(item.0, item.1);
+            }
+        }
+        Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Expected — no .env file
+        }
+        Err(e) => {
+            warn!(path = %env_path.display(), error = %e, "failed to parse .env");
+        }
+    }
+    map
+}
+
+/// Convert parsed dotenv key-value pairs into a TOML string for config-rs ingestion.
+///
+/// Strips the `MIKA_` prefix and lowercases keys to match config-rs field names
+/// (e.g., `MIKA_GITHUB_TOKEN` → `github_token = "..."`). Non-MIKA keys are skipped.
+/// Values are TOML-escaped (backslash and double-quote).
+pub fn dotenv_to_toml(vars: &HashMap<String, String>) -> String {
+    let mut toml = String::new();
+    for (key, value) in vars {
+        if let Some(config_key) = key.strip_prefix("MIKA_") {
+            let config_key = config_key.to_lowercase();
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            toml.push_str(&format!("{config_key} = \"{escaped}\"\n"));
+        }
+    }
+    toml
 }
 
 /// Check for deprecated and misplaced environment variables, warn the user, and
@@ -303,6 +345,50 @@ mod tests {
         assert!(set_env_var(tmp.path(), "has space", "value").is_err());
         assert!(set_env_var(tmp.path(), "has=equals", "value").is_err());
         assert!(set_env_var(tmp.path(), "has-dash", "value").is_err());
+    }
+
+    // --- parse_dotenv tests ---
+
+    #[test]
+    fn test_parse_dotenv_returns_pairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MIKA_GITHUB_TOKEN=ghp_abc\nMIKA_BRAVE_API_KEY=brave_123\n",
+        )
+        .unwrap();
+
+        let map = parse_dotenv(tmp.path());
+        assert_eq!(map.get("MIKA_GITHUB_TOKEN").unwrap(), "ghp_abc");
+        assert_eq!(map.get("MIKA_BRAVE_API_KEY").unwrap(), "brave_123");
+    }
+
+    #[test]
+    fn test_parse_dotenv_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map = parse_dotenv(tmp.path());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dotenv_does_not_set_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = "MIKA_TEST_PARSE_NO_SET";
+        std::fs::write(
+            tmp.path().join(".env"),
+            format!("{key}=should_not_appear\n"),
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var(key) };
+
+        let map = parse_dotenv(tmp.path());
+        assert_eq!(map.get(key).unwrap(), "should_not_appear");
+        // Must NOT be in process env
+        assert!(
+            std::env::var(key).is_err(),
+            "parse_dotenv must not set process env vars"
+        );
     }
 
     // --- env_file_contains_key tests ---

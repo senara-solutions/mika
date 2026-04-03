@@ -146,18 +146,20 @@ async fn main() -> Result<()> {
         None => init::resolve_active_agent()?,
     };
 
-    // Load .env from ~/.mika/.env (secrets, does not override shell env vars)
+    // Resolve home dirs and load .env files.
+    // Per-agent .env first (dotenvy won't override), then global as fallback.
+    // This ensures per-agent secrets (e.g., MIKA_GITHUB_APP_*) take precedence.
     let global_home = home::resolve_home_dir().ok();
+    let agent_home = global_home
+        .as_ref()
+        .map(|h| home::resolve_agent_home(h, &agent_name));
+    if let Some(ref ah) = agent_home {
+        mika_common::dotenv::load_dotenv(ah);
+    }
     if let Some(ref h) = global_home {
         mika_common::dotenv::load_dotenv(h);
         mika_common::dotenv::check_env_warnings(h);
     }
-
-    // Resolve log directory: ~/.mika/agents/{name}/logs/
-    // Uses agent-specific home so logs land in the correct agent directory.
-    let agent_home = global_home
-        .as_ref()
-        .map(|h| home::resolve_agent_home(h, &agent_name));
     let log_dir = agent_home.as_ref().map(|h| h.join("logs"));
 
     // Generate CLI reference markdown in the agent home directory.

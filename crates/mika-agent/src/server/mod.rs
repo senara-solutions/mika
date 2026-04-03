@@ -284,6 +284,8 @@ fn build_router(state: AppState) -> Router {
 /// Uses the shared container database at `{global_home}/data/mika.db`.
 /// Loads per-agent settings via `Settings::load_for_agent()` so each agent gets
 /// its own LLM provider (respecting per-agent `config.toml` overrides). See #323.
+/// Per-agent `.env` values are injected via `Settings::load_for_agent()` — no
+/// process env mutation needed. See #430.
 #[allow(clippy::too_many_arguments)]
 async fn init_agent(
     agent_name: &str,
@@ -295,11 +297,14 @@ async fn init_agent(
     http_client: &reqwest::Client,
     embedding_client: Option<EmbeddingClient>,
     brave_api_key: Option<String>,
-    github_token: Option<String>,
     disable_bundled_skills: bool,
 ) -> Result<AgentState> {
-    // Load per-agent settings (global config.toml → agent config.toml → env vars)
+    // Load per-agent settings (global config.toml → agent config.toml → agent .env → env vars).
+    // Settings::load_for_agent injects per-agent .env as a config source (#430),
+    // so each agent gets its own secrets (e.g., MIKA_GITHUB_APP_*) without
+    // polluting the process environment.
     let agent_settings = Settings::load_for_agent(global_home, agent_home)?;
+    let github_token = agent_settings.agent_github_token().map(String::from);
     let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
     std::fs::create_dir_all(db_path.parent().unwrap())?;
@@ -536,7 +541,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
-                settings.agent_github_token().map(String::from),
                 settings.disable_bundled_skills,
             )
             .await?;
@@ -555,7 +559,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &http_client,
                 embedding_client.clone(),
                 settings.brave_api_key.clone(),
-                settings.agent_github_token().map(String::from),
                 settings.disable_bundled_skills,
             )
             .await

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use config::{Config, Environment, File};
+use config::{Config, Environment, File, FileFormat};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -947,8 +947,14 @@ impl Settings {
     ///   1. Rust `Default` / serde defaults        (compiled-in)
     ///   2. `{global_home}/config.toml`             (shared settings)
     ///   3. `{agent_home}/config.toml`              (per-agent overrides)
-    ///   4. `~/.mika/.env`                          (secrets, loaded by caller)
-    ///   5. MIKA_* env vars                         (highest priority)
+    ///   4. `~/.mika/agents/<name>/.env`             (per-agent secrets, parsed inline)
+    ///   5. `~/.mika/.env`                          (global secrets, loaded by caller into process env)
+    ///   6. MIKA_* env vars                         (highest priority — shell always wins)
+    ///
+    /// In CLI mode (single agent), the caller also loads per-agent `.env` into the
+    /// process environment before this method, so layers 4 and 5 are redundant but
+    /// harmless. In server mode (multiple agents), per-agent `.env` is NOT in the
+    /// process environment — layer 4 is the only path for per-agent secrets.
     ///
     /// `agent_home` is the resolved directory for the specific agent.
     /// `db_path` defaults to `{global_home}/data/mika.db` (single container DB).
@@ -961,6 +967,20 @@ impl Settings {
         // Only add agent config if it's different from global config
         if global_home != agent_home {
             builder = builder.add_source(File::from(agent_config).required(false));
+        }
+
+        // Per-agent .env: parse without mutating process env, inject as config source.
+        // Priority: config files < per-agent .env < process env vars (shell always wins).
+        // In server mode, process env only has global .env values — this is the only
+        // path for per-agent secrets like MIKA_GITHUB_APP_*.
+        // Converted to inline TOML and added as a File source so that the process-env
+        // Environment source (added next) retains highest priority.
+        if global_home != agent_home {
+            let dotenv_vars = crate::dotenv::parse_dotenv(agent_home);
+            if !dotenv_vars.is_empty() {
+                let toml = crate::dotenv::dotenv_to_toml(&dotenv_vars);
+                builder = builder.add_source(File::from_str(&toml, FileFormat::Toml));
+            }
         }
 
         let mut settings: Settings = builder
