@@ -17,7 +17,6 @@ use crate::db::SkillOverride;
 #[derive(Debug)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
-    skipped_count: usize,
     skipped: Vec<SkippedSkill>,
 }
 
@@ -25,9 +24,9 @@ impl SkillRegistry {
     /// Scan a skills directory and build the registry.
     pub fn from_dir(skills_dir: &Path) -> Self {
         let result = index::scan_skills_dir(skills_dir);
-        if result.skipped_count > 0 {
+        if !result.skipped.is_empty() {
             tracing::warn!(
-                count = result.skipped_count,
+                count = result.skipped.len(),
                 "skipped invalid skill(s) at startup — run `mika skills validate` for details"
             );
         }
@@ -39,13 +38,12 @@ impl SkillRegistry {
             .collect();
         tracing::info!(
             count = loaded_names.len(),
-            skipped = result.skipped_count,
+            skipped = result.skipped.len(),
             names = ?loaded_names,
             "skills loaded"
         );
         Self {
             skills: result.entries,
-            skipped_count: result.skipped_count,
             skipped: result.skipped,
         }
     }
@@ -54,24 +52,21 @@ impl SkillRegistry {
     pub fn empty() -> Self {
         Self {
             skills: Vec::new(),
-            skipped_count: 0,
             skipped: Vec::new(),
         }
     }
 
     /// Create a registry with pre-populated skipped skills (for testing/display).
     pub fn with_skipped(skipped: Vec<SkippedSkill>) -> Self {
-        let skipped_count = skipped.len();
         Self {
             skills: Vec::new(),
-            skipped_count,
             skipped,
         }
     }
 
     /// Number of skill directories that were skipped during scan (invalid, legacy, etc.).
     pub fn skipped_count(&self) -> usize {
-        self.skipped_count
+        self.skipped.len()
     }
 
     /// Details of skills that were skipped during scan (name + reason).
@@ -187,7 +182,6 @@ impl SkillRegistry {
             }
             true
         });
-        self.skipped_count += removed.len();
         self.skipped.extend(removed);
     }
 
@@ -281,7 +275,6 @@ mod tests {
     #[test]
     fn test_always_on_skills() {
         let registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
@@ -298,7 +291,6 @@ mod tests {
     #[test]
     fn test_always_on_skills_filters_disabled() {
         let registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
@@ -365,7 +357,6 @@ mod tests {
         let prompt_only = make_entry("guidelines", true, true);
 
         let registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
         };
@@ -421,7 +412,6 @@ mod tests {
         }];
 
         let registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![safe_with_dep, exec_dep],
         };
@@ -438,7 +428,6 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
@@ -462,7 +451,6 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![make_entry("Web-Search", false, true)],
         };
@@ -481,7 +469,6 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
@@ -500,7 +487,6 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
@@ -519,7 +505,6 @@ mod tests {
         use crate::db::SkillOverride;
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
@@ -540,7 +525,6 @@ mod tests {
     #[test]
     fn test_apply_overrides_validates_dependencies_silent_on_valid() {
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["tmux"]),
@@ -554,7 +538,6 @@ mod tests {
     #[test]
     fn test_apply_overrides_validates_dependencies_warns_on_missing() {
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![make_entry_with_deps(
                 "self-dev",
@@ -570,7 +553,6 @@ mod tests {
     #[test]
     fn test_apply_overrides_validates_dependencies_case_insensitive() {
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["TMUX"]),
@@ -584,7 +566,6 @@ mod tests {
     #[test]
     fn test_apply_overrides_validates_dependencies_no_deps_no_warn() {
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![
                 make_entry("web-search", true, true),
@@ -614,7 +595,6 @@ mod tests {
         entry.prompt_snippet = String::new(); // emptied due to oversized prompt
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![entry],
         };
@@ -627,7 +607,7 @@ mod tests {
 
         // Skill should be removed: always_on + override + empty prompt + oversized file
         assert!(registry.skills.is_empty());
-        assert_eq!(registry.skipped_count, 1);
+        assert_eq!(registry.skipped_count(), 1);
     }
 
     #[test]
@@ -640,7 +620,6 @@ mod tests {
         // dir points to a non-existent path, so metadata check will fail → keep
 
         let mut registry = SkillRegistry {
-            skipped_count: 0,
             skipped: Vec::new(),
             skills: vec![entry],
         };

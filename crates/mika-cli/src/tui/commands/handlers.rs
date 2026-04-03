@@ -779,6 +779,7 @@ fn handle_skills(app: &App<'_>) -> String {
     let max_name_width = skills
         .iter()
         .map(|e| e.manifest.skill.name.len())
+        .chain(skipped.iter().map(|s| s.name.len()))
         .max()
         .unwrap_or(0);
 
@@ -858,7 +859,13 @@ fn handle_skills(app: &App<'_>) -> String {
     if !skipped.is_empty() {
         let _ = writeln!(out, "\n  SKIPPED");
         for entry in skipped {
-            let _ = writeln!(out, "  \u{2717} {}  {}", entry.name, entry.reason);
+            let _ = writeln!(
+                out,
+                "  \u{2717} {:<width$}  {}",
+                entry.name,
+                entry.reason,
+                width = max_name_width
+            );
         }
     }
 
