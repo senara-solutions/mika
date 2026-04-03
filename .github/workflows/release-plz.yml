@@ -38,12 +38,6 @@ jobs:
             exit 0
           fi
 
-          # Count conventional commits since last tag (excluding ci/chore/test/style)
-          COMMIT_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges \
-            --grep="^feat" --grep="^fix" --grep="^refactor" --grep="^perf" --grep="^doc" \
-            --all-match 2>/dev/null | wc -l || echo 0)
-
-          # Also check with individual grep (git log --grep is OR by default without --all-match)
           FEAT_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^feat" | wc -l)
           FIX_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^fix" | wc -l)
           REFACTOR_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^refactor" | wc -l)
@@ -66,11 +60,10 @@ jobs:
         id: version
         run: |
           CURRENT="${{ steps.check.outputs.latest_tag }}"
-          CURRENT="${CURRENT#v}"  # strip v prefix
+          CURRENT="${CURRENT#v}"
 
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
 
-          # Check for breaking changes
           BREAKING=$(git log "v${CURRENT}..HEAD" --oneline --no-merges --grep="BREAKING" | wc -l)
 
           if [ "$BREAKING" -gt 0 ] && [ "$MAJOR" -gt 0 ]; then
@@ -125,19 +118,16 @@ jobs:
           git commit -m "chore: release v${NEXT}"
           git push origin "$BRANCH"
 
-          # Create PR
+          # Generate PR body
           CHANGELOG_BODY=$(git-cliff --tag "v${NEXT}" --unreleased --strip header)
+
           gh pr create \
             --title "chore: release v${NEXT}" \
-            --body "$(cat <<EOF
-          ## Release v${NEXT}
-
+            --body "## Release v${NEXT}
           ${CHANGELOG_BODY}
 
           ---
-          Merging this PR will trigger tag creation and GitHub release.
-          EOF
-          )" \
+          Merging this PR will trigger tag creation and GitHub release." \
             --label "release" \
             --base main \
             --head "$BRANCH"
@@ -145,7 +135,9 @@ jobs:
   release-tag:
     name: Tag & Release
     runs-on: ubuntu-22.04
-    if: github.repository_owner == 'senara-solutions' && startsWith(github.event.head_commit.message, 'chore: release v')
+    if: >-
+      github.repository_owner == 'senara-solutions' &&
+      startsWith(github.event.head_commit.message, 'chore: release v')
     permissions:
       contents: write
     concurrency:
@@ -157,34 +149,31 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
+      - name: Install git-cliff
+        uses: taiki-e/install-action@90b40388b8931b1c39e248959515e295e02e9066  # v2
+        with:
+          tool: git-cliff
+
       - name: Extract version and create tag
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
-          # Extract version from commit message: "chore: release v0.3.3"
           VERSION=$(echo "${{ github.event.head_commit.message }}" | grep -oP 'v\d+\.\d+\.\d+' | head -1)
           if [ -z "$VERSION" ]; then
             echo "No version found in commit message, skipping"
             exit 0
           fi
 
-          # Check if tag already exists
           if git rev-parse "$VERSION" >/dev/null 2>&1; then
             echo "Tag $VERSION already exists, skipping"
             exit 0
           fi
 
-          # Install git-cliff for release notes
-          cargo install git-cliff --locked 2>/dev/null || true
-
-          # Generate release notes
           NOTES=$(git-cliff --tag "$VERSION" --unreleased --strip header 2>/dev/null || echo "Release $VERSION")
 
-          # Create tag
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
 
-          # Create GitHub release
           gh release create "$VERSION" \
             --title "$VERSION" \
             --notes "$NOTES" \
