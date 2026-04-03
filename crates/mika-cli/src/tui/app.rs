@@ -552,7 +552,7 @@ pub struct App<'a> {
     /// Live dashboard state during team runs (created on first PhaseChanged event).
     pub team_dashboard: Option<TeamDashboardState>,
 
-    /// Whether the embedded dashboard is enabled on the running server (polled periodically).
+    /// Whether the embedded dashboard is enabled on the running server (checked once at startup).
     pub dashboard_running: bool,
 
     /// Screen rect of the `[open]` button in the footer (set during draw, used for click handling).
@@ -984,15 +984,6 @@ impl<'a> App<'a> {
             && self.status == AgentStatus::Idle
         {
             self.poll_callback_tasks().await;
-        }
-
-        // Dashboard status polling: query mika-server for embedded dashboard state.
-        if self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) {
-            let running = crate::commands::dashboard::is_dashboard_running().await;
-            if running != self.dashboard_running {
-                self.dashboard_running = running;
-                self.needs_redraw = true;
-            }
         }
 
         // Thinking animation needs redraw every tick while active
