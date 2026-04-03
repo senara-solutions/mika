@@ -138,6 +138,17 @@ pub fn build_router(state: AppState) -> Router {
                             tracing::info!(status, ?latency, "response");
                         }
                     },
+                )
+                .on_failure(
+                    |error: tower_http::classify::ServerErrorsFailureClass,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        tracing::error!(
+                            classification = %error,
+                            ?latency,
+                            "response failed"
+                        );
+                    },
                 ),
         )
         .with_state(state)

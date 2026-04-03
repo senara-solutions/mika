@@ -144,7 +144,7 @@ pub fn route_event(
     check_conclusion: Option<&str>,
 ) -> Option<&'static str> {
     match (event_type, action) {
-        ("issues", Some("opened" | "assigned")) => Some("mika-dev"),
+        ("issues", Some("assigned")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
         ("pull_request", Some("opened" | "synchronize")) => Some("mika-qa"),
         ("pull_request_review", Some("submitted")) => Some("mika-dev"),
@@ -557,11 +557,8 @@ mod tests {
     // -- Event routing tests --
 
     #[test]
-    fn test_route_event_issues_opened() {
-        assert_eq!(
-            route_event("issues", Some("opened"), None),
-            Some("mika-dev")
-        );
+    fn test_route_event_issues_opened_ignored() {
+        assert_eq!(route_event("issues", Some("opened"), None), None);
     }
 
     #[test]

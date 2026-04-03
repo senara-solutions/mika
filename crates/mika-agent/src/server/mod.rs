@@ -13,12 +13,13 @@ pub mod types;
 
 use anyhow::{Result, anyhow};
 use axum::{
-    Router, middleware,
+    Router, http, middleware,
     routing::{get, post},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -199,7 +200,44 @@ fn build_router(state: AppState) -> Router {
         .route("/", get(embedded_dashboard::handle_root))
         // Health endpoint is OUTSIDE auth layer (for health probes)
         .route("/health", get(handlers::handle_health))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &http::Request<_>| {
+                    let path = request.uri().path();
+                    let method = request.method();
+                    if path == "/health" {
+                        tracing::debug_span!("http_request", %method, path)
+                    } else {
+                        tracing::info_span!("http_request", %method, path)
+                    }
+                })
+                .on_response(
+                    |response: &http::Response<_>, latency: Duration, span: &tracing::Span| {
+                        let status = response.status().as_u16();
+                        let is_debug = span
+                            .metadata()
+                            .is_some_and(|m| *m.level() == tracing::Level::DEBUG);
+                        if status >= 500 {
+                            tracing::warn!(status, ?latency, "response");
+                        } else if is_debug {
+                            tracing::debug!(status, ?latency, "response");
+                        } else {
+                            tracing::info!(status, ?latency, "response");
+                        }
+                    },
+                )
+                .on_failure(
+                    |error: tower_http::classify::ServerErrorsFailureClass,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        tracing::error!(
+                            classification = %error,
+                            ?latency,
+                            "response failed"
+                        );
+                    },
+                ),
+        )
         .with_state(state)
 }
 
