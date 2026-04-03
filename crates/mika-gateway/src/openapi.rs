@@ -20,11 +20,13 @@ use crate::routes;
         routes::handle_send,
         routes::handle_readiness,
         routes::handle_liveness,
+        routes::handle_version,
         // github::handle_github_webhook is excluded from OpenAPI because it
         // consumes raw Bytes for HMAC validation (not JSON-schema-describable).
     ),
     components(schemas(
         routes::SendPayload,
+        routes::VersionInfo,
     )),
     modifiers(&SecurityAddon),
 )]

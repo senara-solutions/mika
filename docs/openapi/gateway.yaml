@@ -31,30 +31,6 @@ paths:
           description: Ready and database reachable
         '503':
           description: Not ready or database unreachable
-  /version:
-    get:
-      tags:
-      - routes
-      summary: GET /version — Build version and git hash (no auth).
-      description: Returns build version from Cargo.toml and short git hash captured at compile time. Falls back to "unknown" for git_hash when .git is absent.
-      operationId: handle_version
-      responses:
-        '200':
-          description: Build version info
-          content:
-            application/json:
-              schema:
-                type: object
-                required:
-                - version
-                - git_hash
-                properties:
-                  version:
-                    type: string
-                    example: "0.4.0"
-                  git_hash:
-                    type: string
-                    example: "abc1234"
   /send:
     post:
       tags:
@@ -83,6 +59,22 @@ paths:
           description: Telegram API error
       security:
       - bearer: []
+  /version:
+    get:
+      tags:
+      - routes
+      summary: GET /version — Build version and git hash (no auth).
+      description: |-
+        Returns build version from Cargo.toml and short git hash captured at compile
+        time. Falls back to "unknown" for git_hash when .git is absent.
+      operationId: handle_version
+      responses:
+        '200':
+          description: Build version info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionInfo'
   /webhook/telegram:
     post:
       tags:
@@ -245,6 +237,21 @@ components:
         update_id:
           type: integer
           format: int64
+    VersionInfo:
+      type: object
+      description: Build version info returned by the `/version` endpoint.
+      required:
+      - version
+      - git_hash
+      properties:
+        git_hash:
+          type: string
+          description: Short git commit hash captured at compile time
+          example: abc1234
+        version:
+          type: string
+          description: Semantic version from Cargo.toml
+          example: 0.4.0
   securitySchemes:
     bearer:
       type: http

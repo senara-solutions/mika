@@ -49,14 +49,28 @@ async fn inject_request_meta(request: Request, next: Next) -> Response {
 }
 
 /// Build version info returned by the `/version` endpoint.
-#[derive(serde::Serialize)]
-struct VersionInfo {
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct VersionInfo {
+    /// Semantic version from Cargo.toml
+    #[schema(example = "0.4.0")]
     version: &'static str,
+    /// Short git commit hash captured at compile time
+    #[schema(example = "abc1234")]
     git_hash: &'static str,
 }
 
-/// Returns build version and git hash as JSON. No authentication required.
-async fn handle_version() -> Json<VersionInfo> {
+/// GET /version — Build version and git hash (no auth).
+///
+/// Returns build version from Cargo.toml and short git hash captured at compile
+/// time. Falls back to "unknown" for git_hash when .git is absent.
+#[utoipa::path(
+    get,
+    path = "/version",
+    responses(
+        (status = 200, description = "Build version info", body = VersionInfo),
+    ),
+)]
+pub(crate) async fn handle_version() -> Json<VersionInfo> {
     Json(VersionInfo {
         version: env!("CARGO_PKG_VERSION"),
         git_hash: option_env!("GIT_HASH").unwrap_or("unknown"),
