@@ -103,15 +103,22 @@ sensitive tokens, edit `mcp.json` directly.
 
 ## Configuration Cascade
 
-Settings are loaded from four sources, in order of increasing priority. A value
+Settings are loaded from multiple sources, in order of increasing priority. A value
 set at a higher layer overrides the same value from a lower layer.
 
 | Priority | Source                    | Description                                |
 |----------|---------------------------|--------------------------------------------|
 | 1 (lowest) | Rust defaults           | Compiled-in serde defaults (e.g. `claude-sonnet-4-6`) |
 | 2        | TOML config files         | `~/.mika/config.toml` + optional `~/.mika/agents/X/config.toml` |
-| 3        | `~/.mika/.env`            | Secrets file (API keys, tokens) — loaded via dotenvy |
-| 4 (highest) | `MIKA_*` env vars      | Shell environment variables, always win    |
+| 3        | Per-agent `.env`          | `~/.mika/agents/X/.env` — parsed inline, not set in process env (server mode) |
+| 4        | Global `.env`             | `~/.mika/.env` — loaded into process env via dotenvy |
+| 5 (highest) | `MIKA_*` env vars      | Shell environment variables, always win    |
+
+In **CLI mode** (single agent per process), the per-agent `.env` is loaded into the
+process environment before the global `.env` (dotenvy first-write-wins). In **server
+mode** (multiple agents per process), per-agent `.env` files are parsed without
+mutating process env and injected as inline TOML config sources — each agent gets
+its own secrets without cross-contamination.
 
 All config files are optional. If a file does not exist, it is silently skipped.
 
@@ -140,6 +147,21 @@ Run `mika setup` to interactively configure secrets (API keys, tokens) and
 preferences (telemetry) — secrets are written to `~/.mika/.env`, config to
 `~/.mika/config.toml`. The wizard auto-generates `MIKA_INTERNAL_TOKEN` for
 server mode.
+
+### Per-agent secrets in `~/.mika/agents/<name>/.env`
+
+In a multi-agent setup, each agent can have its own `.env` file for agent-specific
+secrets (e.g., different GitHub App credentials per agent):
+
+```sh
+# ~/.mika/agents/mika-qa/.env
+MIKA_GITHUB_APP_ID=654321
+MIKA_GITHUB_APP_PRIVATE_KEY=<base64>
+MIKA_GITHUB_APP_INSTALLATION_ID=98765432
+MIKA_GITHUB_APP_LOGIN=mika-qa[bot]
+```
+
+Per-agent `.env` values override the global `~/.mika/.env` but not shell env vars.
 
 ### GitHub App authentication (preferred)
 
