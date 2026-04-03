@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::io::BufRead;
+use std::path::Path;
 
 /// Run the `mika credential-helper` subcommand.
 ///
@@ -11,13 +12,16 @@ use std::io::BufRead;
 /// Lightweight path: loads dotenv + Settings + GitHubApp only.
 /// No tracing, no DB, no agent resolution.
 ///
+/// When `agent_home` is `Some`, loads per-agent settings for agent-specific
+/// GitHub App credentials. Otherwise, uses the global home directory.
+///
 /// **Security:** Only responds for `github.com` HTTPS requests. All other
 /// hosts are silently ignored (exit 0, no output) to prevent token leakage.
 ///
 /// **Error handling:** Returns exit 0 with no output on any failure, allowing
 /// git to fall through to the next credential source. This preserves backward
 /// compatibility (SSH, system keychain, etc.).
-pub async fn run(operation: &str, home_dir: &std::path::Path) -> Result<()> {
+pub async fn run(operation: &str, global_home: &Path, agent_home: Option<&Path>) -> Result<()> {
     // Only `get` produces output; `store` and `erase` are silent no-ops
     if operation != "get" {
         return Ok(());
@@ -33,7 +37,7 @@ pub async fn run(operation: &str, home_dir: &std::path::Path) -> Result<()> {
     }
 
     // Attempt to get an installation token — any failure is silent (exit 0)
-    match get_installation_token(home_dir).await {
+    match get_installation_token(global_home, agent_home).await {
         Some(token) => {
             println!("protocol=https");
             println!("host=github.com");
@@ -75,10 +79,20 @@ fn parse_credential_request(reader: impl BufRead) -> Result<(Option<String>, Opt
 
 /// Attempt to get a GitHub App installation token.
 /// Returns `None` on any failure (config missing, network error, etc.).
-async fn get_installation_token(home_dir: &std::path::Path) -> Option<String> {
-    let settings = mika_common::config::Settings::load(home_dir).ok()?;
+///
+/// When `agent_home` is provided, loads per-agent settings and uses the
+/// agent's own GitHub App credentials and token cache. Falls back to
+/// global settings when agent config is absent.
+async fn get_installation_token(global_home: &Path, agent_home: Option<&Path>) -> Option<String> {
+    let settings = if let Some(agent_home) = agent_home {
+        mika_common::config::Settings::load_for_agent(global_home, agent_home).ok()?
+    } else {
+        mika_common::config::Settings::load(global_home).ok()?
+    };
     let github_app = mika_common::github_app::GitHubApp::from_settings(&settings)?;
-    let cache_path = home_dir.join("github_app_token.json");
+    // Use per-agent cache dir if available, otherwise global
+    let cache_dir = agent_home.unwrap_or(global_home);
+    let cache_path = cache_dir.join("github_app_token.json");
     github_app
         .installation_token_with_file_cache(&cache_path)
         .await

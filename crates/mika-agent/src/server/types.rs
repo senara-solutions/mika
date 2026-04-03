@@ -57,3 +57,22 @@ pub struct TaskCompleteResponse {
     pub task_id: String,
     pub status: String,
 }
+
+/// Request body for POST /tasks/{id}/cancel.
+///
+/// Cancels a task and kills its running process (if any).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TaskCancelRequest {
+    /// Target agent name (defaults to the server's default agent if absent or empty).
+    #[serde(default)]
+    pub agent: String,
+}
+
+/// Response body for POST /tasks/{id}/cancel.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskCancelResponse {
+    pub task_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_killed: Option<bool>,
+}

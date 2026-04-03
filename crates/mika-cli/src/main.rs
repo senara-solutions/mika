@@ -18,16 +18,30 @@ async fn main() -> Result<()> {
 
     // Lightweight commands: early-exit before agent resolution, logging, and telemetry.
     // These need only dotenv + Settings + GitHubApp — fast startup for credential helper usage.
+    // When --agent is specified, resolve per-agent home dir for per-agent GitHub App config.
     match &cli.command {
         Some(Commands::Token(args)) => {
-            let home_dir = home::resolve_home_dir()?;
-            mika_common::dotenv::load_dotenv(&home_dir);
-            return commands::token::run(&args.command, &home_dir).await;
+            let global_home = home::resolve_home_dir()?;
+            mika_common::dotenv::load_dotenv(&global_home);
+            let agent_home = cli
+                .agent
+                .as_deref()
+                .map(|name| home::resolve_agent_home(&global_home, name));
+            return commands::token::run(&args.command, &global_home, agent_home.as_deref()).await;
         }
         Some(Commands::CredentialHelper(args)) => {
-            let home_dir = home::resolve_home_dir()?;
-            mika_common::dotenv::load_dotenv(&home_dir);
-            return commands::credential_helper::run(&args.operation, &home_dir).await;
+            let global_home = home::resolve_home_dir()?;
+            mika_common::dotenv::load_dotenv(&global_home);
+            let agent_home = cli
+                .agent
+                .as_deref()
+                .map(|name| home::resolve_agent_home(&global_home, name));
+            return commands::credential_helper::run(
+                &args.operation,
+                &global_home,
+                agent_home.as_deref(),
+            )
+            .await;
         }
         _ => {}
     }

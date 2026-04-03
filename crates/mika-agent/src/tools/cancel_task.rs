@@ -17,8 +17,9 @@ impl Tool for CancelTaskTool {
         ToolDefinition {
             name: "cancel_task".to_string(),
             description:
-                "Cancel any pending task by its full UUID (from list_tasks or create_task). \
-                Works for any task type: reminders, callback tasks, recurring tasks, etc."
+                "Cancel any pending or in-progress task by its full UUID (from list_tasks or create_task). \
+                Works for any task type: reminders, callback tasks, recurring tasks, etc. \
+                If the task has a running process (e.g., claude-pilot), the process is killed."
                     .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -44,27 +45,39 @@ impl Tool for CancelTaskTool {
             ));
         }
 
-        let cancelled = ctx.db.cancel_task(id).await?;
-        if cancelled {
-            ctx.db
-                .log_audit_event(
-                    ctx.session_id,
-                    "cancel_task",
-                    &format!("task:{id}"),
-                    None,
-                    Some("cancelled"),
-                    None,
-                    Some(ctx.trace_id),
-                )
-                .await?;
-            Ok(ToolOutput::success(format!(
-                "Task {id} has been cancelled."
-            )))
-        } else {
-            Ok(ToolOutput::error(format!(
+        let outcome = crate::task_engine::process_kill::cancel_task_and_kill(ctx.db, id).await?;
+
+        let Some(outcome) = outcome else {
+            return Ok(ToolOutput::error(format!(
                 "Task {id} not found or not in cancellable status."
-            )))
-        }
+            )));
+        };
+
+        // Build kill status message
+        let kill_msg = match (outcome.process_killed, outcome.pid) {
+            (Some(true), Some(pid)) => format!(" Process (PID {pid}) terminated."),
+            (Some(false), Some(pid)) => {
+                format!(" Warning: process (PID {pid}) may still be running.")
+            }
+            _ => String::new(),
+        };
+
+        ctx.db
+            .log_audit_event(
+                ctx.session_id,
+                "cancel_task",
+                &format!("task:{id}"),
+                None,
+                Some("cancelled"),
+                None,
+                Some(ctx.trace_id),
+            )
+            .await?;
+
+        Ok(ToolOutput::success(format!(
+            "Task {id} (\"{}\") has been cancelled.{kill_msg}",
+            outcome.label
+        )))
     }
 }
 
@@ -117,6 +130,7 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("cancelled"));
+        assert!(result.content.contains("Analyze codebase"));
     }
 
     #[tokio::test]

@@ -376,12 +376,10 @@ pub(crate) async fn handle_github_webhook(
         }
     };
 
-    // Self-event filter intentionally removed: mika-dev and mika-qa share one GitHub
-    // App identity but subscribe to disjoint event types. No routing path exists that
-    // would deliver an agent's own action back to itself. Loop prevention is guaranteed
-    // by the routing table, not by identity filtering.
-    // Future: give mika-qa a dedicated App token (Option 3) if per-agent audit trails
-    // or permission scopes become necessary.
+    // Self-event filter: with per-agent GitHub App identities (#422), each agent has
+    // a distinct bot login. Loop prevention is guaranteed by the routing table (disjoint
+    // event types per agent), not by identity filtering. If loop risks emerge (e.g.,
+    // mika-qa's own check_suite events), filter by sender.login != agent's bot login.
 
     // 8. Route to agent
     let check_conclusion = event
@@ -428,28 +426,82 @@ pub(crate) async fn handle_github_webhook(
     // 12. Async dispatch — return 200 to GitHub immediately
     let forwarding_state = state.clone();
     let target = target_agent.to_string();
+    let repo_name = event.repository.as_ref().and_then(|r| r.full_name.clone());
     tokio::spawn(async move {
         let _permit = permit; // held until task completes
-        forward_github_event(&forwarding_state, &target, &text, &request_id).await;
+        forward_github_event(
+            &forwarding_state,
+            &target,
+            &text,
+            &request_id,
+            repo_name.as_deref(),
+        )
+        .await;
     });
 
     StatusCode::OK
 }
 
+/// Resolve the container URL for a GitHub webhook event by looking up the
+/// repository's full_name in the `github_repos` table. Falls back to
+/// `agent_base_url` for backward compatibility with single-tenant deployments.
+async fn resolve_github_container_url(
+    state: &AppState,
+    repo_full_name: Option<&str>,
+) -> Option<String> {
+    // Multi-tenant: look up repo → customer mapping
+    if let Some(repo_name) = repo_full_name {
+        match sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT customer_id FROM github_repos WHERE repo_full_name = $1",
+        )
+        .bind(repo_name)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some(customer_id)) => {
+                let url = crate::routes::container_url_str(
+                    &customer_id.to_string(),
+                    state.agent_base_url.as_deref(),
+                    &state.agents_namespace,
+                );
+                info!(repo = repo_name, customer_id = %customer_id, "resolved GitHub repo to customer");
+                return Some(url);
+            }
+            Ok(None) => {
+                debug!(
+                    repo = repo_name,
+                    "GitHub repo not registered in github_repos table"
+                );
+            }
+            Err(e) => {
+                warn!(repo = repo_name, error = %e, "failed to query github_repos table");
+            }
+        }
+    }
+
+    // Fallback: single-tenant mode via agent_base_url
+    if let Some(ref base) = state.agent_base_url {
+        Some(base.clone())
+    } else {
+        debug!("GitHub webhook: no repo mapping found and no MIKA_AGENT_BASE_URL configured");
+        None
+    }
+}
+
 /// Forward a GitHub event to the agent container via `POST {container_url}/message`.
 ///
 /// Uses `channel: "github"` and `chat_id: 0` (no reply channel).
-/// Single-tenant routing: always uses `agent_base_url` or first customer's container.
-async fn forward_github_event(state: &AppState, target_agent: &str, text: &str, request_id: &str) {
-    // Single-tenant: route to agent_base_url (required for GitHub webhooks in Phase 2a)
-    let url = match &state.agent_base_url {
-        Some(base) => base.clone(),
-        None => {
-            warn!(
-                "GitHub webhook forwarding requires MIKA_AGENT_BASE_URL (multi-tenant not yet supported)"
-            );
-            return;
-        }
+/// Multi-tenant routing: looks up `github_repos` table first, falls back to `agent_base_url`.
+async fn forward_github_event(
+    state: &AppState,
+    target_agent: &str,
+    text: &str,
+    request_id: &str,
+    repo_full_name: Option<&str>,
+) {
+    let url = match resolve_github_container_url(state, repo_full_name).await {
+        Some(u) => u,
+        None => return,
     };
 
     let payload = serde_json::json!({

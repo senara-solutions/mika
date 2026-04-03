@@ -1,6 +1,7 @@
 pub mod cron;
 pub mod dispatcher;
 pub mod engine;
+pub mod process_kill;
 pub mod queue;
 pub mod types;
 
