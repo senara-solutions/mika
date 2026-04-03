@@ -556,7 +556,6 @@ pub async fn run(
     app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
 
     // One-time dashboard status check at startup (no periodic polling).
-    // auth_token() short-circuits instantly when no token is configured.
     app.dashboard_running = crate::commands::dashboard::is_dashboard_running().await;
 
     // Install panic hook that restores terminal
