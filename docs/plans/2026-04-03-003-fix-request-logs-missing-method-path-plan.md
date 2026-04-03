@@ -1,7 +1,7 @@
 ---
 title: "fix: request logs missing HTTP method and path"
 type: fix
-status: active
+status: completed
 date: 2026-04-03
 ---
 
