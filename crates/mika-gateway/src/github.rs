@@ -284,16 +284,30 @@ struct ResolvedRoute {
     agent_mapping: serde_json::Value,
 }
 
+/// Validate that an agent name is well-formed: lowercase alphanumeric + hyphens,
+/// 1-63 chars, no leading/trailing/consecutive hyphens.
+fn is_valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
 /// Apply per-repo agent name overrides from the `agent_mapping` JSONB column.
 ///
 /// Keys are default agent names from `route_event()` (e.g. `"mika-dev"`),
 /// values are the customer's replacement agent names (e.g. `"acme-dev"`).
-/// Returns the original agent name if no override exists for this agent.
+/// Returns the original agent name if no override exists or the override
+/// is not a valid agent name.
 fn apply_agent_mapping(agent_mapping: &serde_json::Value, default_agent: &str) -> String {
     agent_mapping
         .get(default_agent)
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| is_valid_agent_name(s))
         .unwrap_or(default_agent)
         .to_string()
 }
@@ -499,10 +513,18 @@ async fn resolve_github_container_url(
                 });
             }
             Ok(None) => {
-                warn!(
-                    repo = repo_name,
-                    "GitHub repo not registered in github_repos table"
-                );
+                // debug when fallback will handle it (single-tenant), warn when event will be dropped
+                if state.agent_base_url.is_some() {
+                    debug!(
+                        repo = repo_name,
+                        "GitHub repo not in github_repos table, falling back to agent_base_url"
+                    );
+                } else {
+                    warn!(
+                        repo = repo_name,
+                        "GitHub repo not registered and no fallback configured"
+                    );
+                }
             }
             Err(e) => {
                 warn!(repo = repo_name, error = %e, "failed to query github_repos table");
@@ -1188,5 +1210,38 @@ mod tests {
     fn test_apply_agent_mapping_null_value() {
         let mapping = serde_json::Value::Null;
         assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_rejects_invalid_name() {
+        let mapping = serde_json::json!({
+            "mika-dev": "has spaces",
+            "mika-qa": "-leading-hyphen"
+        });
+        // Invalid agent names fall back to defaults
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+        assert_eq!(apply_agent_mapping(&mapping, "mika-qa"), "mika-qa");
+    }
+
+    // -- Agent name validation tests --
+
+    #[test]
+    fn test_is_valid_agent_name() {
+        assert!(is_valid_agent_name("mika-dev"));
+        assert!(is_valid_agent_name("acme-qa"));
+        assert!(is_valid_agent_name("a"));
+        assert!(is_valid_agent_name("agent123"));
+    }
+
+    #[test]
+    fn test_is_valid_agent_name_rejects_invalid() {
+        assert!(!is_valid_agent_name(""));
+        assert!(!is_valid_agent_name("-leading"));
+        assert!(!is_valid_agent_name("trailing-"));
+        assert!(!is_valid_agent_name("double--hyphen"));
+        assert!(!is_valid_agent_name("HAS UPPER"));
+        assert!(!is_valid_agent_name("has spaces"));
+        assert!(!is_valid_agent_name("special@chars"));
+        assert!(!is_valid_agent_name(&"a".repeat(64))); // too long
     }
 }
