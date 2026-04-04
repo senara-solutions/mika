@@ -107,7 +107,7 @@ Clear the chat display and start a new session.
 
 **Aliases:** None | **Arguments:** None
 
-Ends the current session, creates a new one with a fresh UUID, and notifies the agent worker. Drains any stale responses from the agent channel to prevent ghost messages. Clears all display messages, resets scroll position, context token tracking, cross-channel polling watermarks, and all transient state: `pending_response`, `reveal_index`, `status` (back to Idle), `pending_images`, `pending_command`, `has_new_message`, `selection_state`, `pending_task_count`. User preferences (`thinking_level`, model, provider) are preserved. The agent starts fresh with no conversation history. Previous sessions remain in the database for audit and history purposes.
+Ends the current session, creates a new one with a fresh UUID, and notifies the agent worker. Drains any stale responses from the agent channel to prevent ghost messages. Clears all display messages, resets scroll position, context token tracking, cross-channel polling watermarks, and all transient state: `pending_response`, `reveal_index`, `status` (back to Idle), `pending_images`, `pending_command`, `has_new_message`, `selection_state`, `pending_task_count`. User preferences (`thinking_level`, model, provider) are preserved. `active_background_task_count` is intentionally NOT reset — background callback tasks are agent-scoped and persist across sessions. The agent starts fresh with no conversation history. Previous sessions remain in the database for audit and history purposes.
 
 ---
 

@@ -3325,6 +3325,22 @@ impl Database {
         Ok(rows)
     }
 
+    /// Count active background tasks (long-running callback tasks that are pending or in-progress).
+    /// Used by TUI footer badge. Complements `get_user_visible_tasks()` which intentionally
+    /// excludes callback tasks.
+    pub fn get_active_background_task_count(&self, agent_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND action_type = 'resume_agent'
+               AND status IN ('pending', 'in_progress')",
+            params![agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn get_inject_context_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
@@ -8043,6 +8059,75 @@ mod tests {
             .get_undelivered_callback_tasks_for_session("mika", "1970-01-01T00:00:00Z", "session_b")
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_active_background_task_count_counts_pending_and_in_progress() {
+        let db = db();
+        // No callback tasks → count is 0
+        assert_eq!(db.get_active_background_task_count("mika").unwrap(), 0);
+
+        // Create a pending callback task → count is 1
+        let id1 = db.create_task(&callback_task("mika")).unwrap();
+        assert_eq!(db.get_active_background_task_count("mika").unwrap(), 1);
+
+        // Create a second pending callback task → count is 2
+        let mut task2 = callback_task("mika");
+        task2.label = "build_project".to_string();
+        let _id2 = db.create_task(&task2).unwrap();
+        assert_eq!(db.get_active_background_task_count("mika").unwrap(), 2);
+
+        // Complete the first task → count drops to 1
+        assert!(
+            db.update_task_completed(&id1, "mika", Some("done"))
+                .unwrap()
+        );
+        assert_eq!(db.get_active_background_task_count("mika").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_active_background_task_count_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+
+        let _id = db.create_task(&callback_task("agent_a")).unwrap();
+
+        // agent_a has 1, agent_b has 0
+        assert_eq!(db.get_active_background_task_count("agent_a").unwrap(), 1);
+        assert_eq!(db.get_active_background_task_count("agent_b").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_active_background_task_count_excludes_non_callback_tasks() {
+        let db = db();
+        // Create a non-callback task (e.g., a reminder)
+        let reminder = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "morning reminder".to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: r#"{"text":"hello"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let _id = db.create_task(&reminder).unwrap();
+
+        // Reminder should NOT count as a background task
+        assert_eq!(db.get_active_background_task_count("mika").unwrap(), 0);
     }
 
     #[test]

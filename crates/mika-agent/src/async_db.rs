@@ -391,6 +391,12 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_user_visible_tasks(&id)).await
     }
 
+    pub async fn get_active_background_task_count(&self) -> Result<usize> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_active_background_task_count(&id))
+            .await
+    }
+
     pub async fn get_inject_context_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_inject_context_tasks(&id))
