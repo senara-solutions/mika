@@ -4,7 +4,7 @@
 # Checks:
 #   1. A plan doc exists in docs/plans/*.md (in the branch diff)
 #   2. Source code changes exist beyond the plan doc
-#   3. A compound doc exists in docs/solutions/**/*.md (in the branch diff)
+#   3. A compound doc exists in docs/solutions/*.md (in the branch diff)
 #
 # Usage:
 #   ./scripts/verify-pipeline.sh              # local (compares to main)
