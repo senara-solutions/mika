@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use mika_common::agent::{self, DEFAULT_AGENT};
 use mika_common::home;
 
-use crate::cli::{AgentsArgs, AgentsCommand};
+use crate::cli::{AgentsArgs, AgentsCommand, OutputFormat};
 use crate::wizard;
 
 pub async fn run(args: AgentsArgs) -> Result<()> {
@@ -14,7 +14,7 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
     home::migrate_to_multi_agent(&global_home)?;
 
     match args.command {
-        AgentsCommand::List => list(&global_home),
+        AgentsCommand::List { format } => list(&global_home, &format),
         AgentsCommand::Create {
             name,
             no_interactive,
@@ -25,21 +25,37 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
     }
 }
 
-fn list(global_home: &std::path::Path) -> Result<()> {
+fn list(global_home: &std::path::Path, format: &OutputFormat) -> Result<()> {
     let agents = agent::list_agents(global_home);
     let active = home::read_active_agent(global_home);
 
-    if agents.is_empty() {
-        println!("\n  No agents found. Run `mika agents create <name>` to create one.\n");
-        return Ok(());
-    }
+    match format {
+        OutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = agents
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "name": name,
+                        "active": *name == active,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        OutputFormat::Text => {
+            if agents.is_empty() {
+                println!("\n  No agents found. Run `mika agents create <name>` to create one.\n");
+                return Ok(());
+            }
 
-    println!("\n  Agents:");
-    for name in &agents {
-        let marker = if *name == active { " (active)" } else { "" };
-        println!("    {name}{marker}");
+            println!("\n  Agents:");
+            for name in &agents {
+                let marker = if *name == active { " (active)" } else { "" };
+                println!("    {name}{marker}");
+            }
+            println!();
+        }
     }
-    println!();
     Ok(())
 }
 
