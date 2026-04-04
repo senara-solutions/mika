@@ -6367,10 +6367,6 @@ impl Database {
             task_ids.extend(children);
         }
 
-        if task_ids.is_empty() {
-            return Ok(vec![]);
-        }
-
         let placeholders: String = (1..=task_ids.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
@@ -8629,54 +8625,15 @@ mod tests {
         let db = db();
 
         // Create a parent task
-        let parent_task = NewTask {
-            agent_id: "mika".to_string(),
-            team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: "parent-work-item".to_string(),
-            trigger_type: "manual".to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: None,
-            timeout_at: None,
-            action_type: "none".to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: None,
-            created_trace_id: None,
-            reference_url: None,
-            source: None,
-            metadata: None,
-        };
-        let parent_id = db.create_task(&parent_task).unwrap();
+        let parent_id = db
+            .create_task(&new_task("mika", "parent-work-item", "manual", "none"))
+            .unwrap();
 
         // Create a child task
-        let child_task = NewTask {
-            agent_id: "mika".to_string(),
-            team_run_id: None,
-            parent_task_id: Some(parent_id.clone()),
-            depth: 1,
-            label: "child-callback".to_string(),
-            trigger_type: "callback".to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: None,
-            timeout_at: None,
-            action_type: "resume_agent".to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: None,
-            created_trace_id: None,
-            reference_url: None,
-            source: None,
-            metadata: None,
-        };
-        let child_id = db.create_task(&child_task).unwrap();
+        let mut child = new_task("mika", "child-callback", "callback", "resume_agent");
+        child.parent_task_id = Some(parent_id.clone());
+        child.depth = 1;
+        let child_id = db.create_task(&child).unwrap();
 
         // Create sessions linked to the task tree
         db.create_session_with_parent("sess-parent", "mika", "cli", None, None, Some(&parent_id))
@@ -8713,29 +8670,9 @@ mod tests {
         let db = db();
 
         // Simulate a pre-v19 session with task_id only in metadata JSON
-        let task = NewTask {
-            agent_id: "mika".to_string(),
-            team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: "legacy-task".to_string(),
-            trigger_type: "manual".to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: None,
-            timeout_at: None,
-            action_type: "none".to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: None,
-            created_trace_id: None,
-            reference_url: None,
-            source: None,
-            metadata: None,
-        };
-        let task_id = db.create_task(&task).unwrap();
+        let task_id = db
+            .create_task(&new_task("mika", "legacy-task", "manual", "none"))
+            .unwrap();
 
         // Create session with task_id only in metadata (legacy path)
         db.create_session_with_metadata(
@@ -8757,29 +8694,9 @@ mod tests {
     fn test_list_sessions_paginated_coalesce_task_id() {
         let db = db();
 
-        let task = NewTask {
-            agent_id: "mika".to_string(),
-            team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: "coalesce-test".to_string(),
-            trigger_type: "manual".to_string(),
-            cron_expr: None,
-            event_source: None,
-            event_offset_secs: None,
-            condition_expr: None,
-            next_fire_at: None,
-            timeout_at: None,
-            action_type: "none".to_string(),
-            action_config: "{}".to_string(),
-            input_context: None,
-            created_by_session: None,
-            created_trace_id: None,
-            reference_url: None,
-            source: None,
-            metadata: None,
-        };
-        let task_id = db.create_task(&task).unwrap();
+        let task_id = db
+            .create_task(&new_task("mika", "coalesce-test", "manual", "none"))
+            .unwrap();
 
         // Session with task_id in column
         db.create_session_with_metadata("col-sess", "mika", "cli", None, Some(&task_id))

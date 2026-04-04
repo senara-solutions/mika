@@ -685,6 +685,21 @@ pub struct TaskSessionResponse {
     pub task_label: Option<String>,
 }
 
+impl From<db::TaskSessionRow> for TaskSessionResponse {
+    fn from(r: db::TaskSessionRow) -> Self {
+        Self {
+            id: r.id,
+            agent_id: r.agent_id,
+            channel_type: r.channel_type,
+            started_at: r.started_at,
+            ended_at: r.ended_at,
+            task_id: r.task_id,
+            message_count: r.message_count,
+            task_label: r.task_label,
+        }
+    }
+}
+
 pub async fn handle_task_sessions(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -695,19 +710,8 @@ pub async fn handle_task_sessions(
         .await
     {
         Ok(rows) => {
-            let sessions: Vec<TaskSessionResponse> = rows
-                .into_iter()
-                .map(|r| TaskSessionResponse {
-                    id: r.id,
-                    agent_id: r.agent_id,
-                    channel_type: r.channel_type,
-                    started_at: r.started_at,
-                    ended_at: r.ended_at,
-                    task_id: r.task_id,
-                    message_count: r.message_count,
-                    task_label: r.task_label,
-                })
-                .collect();
+            let sessions: Vec<TaskSessionResponse> =
+                rows.into_iter().map(TaskSessionResponse::from).collect();
             Json(serde_json::json!({ "sessions": sessions })).into_response()
         }
         Err(e) => internal_error(e).into_response(),
