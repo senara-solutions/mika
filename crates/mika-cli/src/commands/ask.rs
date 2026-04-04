@@ -72,7 +72,7 @@ pub async fn run(
             ctx.async_db.agent_id()
         );
     }
-    // Store task_id in session metadata for observability correlation
+    // Store task_id in session metadata and as a first-class column for observability correlation
     let session_metadata = task_id.map(|tid| serde_json::json!({"task_id": tid}).to_string());
     if let Err(e) = ctx
         .async_db
@@ -81,6 +81,7 @@ pub async fn run(
             ctx.async_db.agent_id(),
             "cli",
             session_metadata.as_deref(),
+            task_id,
         )
         .await
     {

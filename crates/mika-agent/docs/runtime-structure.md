@@ -71,7 +71,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 18
+**Current schema version:** 19
 
 **Timestamp format:** All timestamp columns use ISO 8601 TEXT (`%Y-%m-%dT%H:%M:%SZ`) — not Unix epoch integers. SQL defaults use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`. Fixed-width UTC format ensures correct lexicographic ordering.
 
@@ -81,7 +81,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **agents** — `id TEXT PK`, `name TEXT NOCASE`, `home_dir TEXT`, `active BOOLEAN DEFAULT 1`, `last_seen TEXT`, `created_at TEXT`
 
-**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `started_at TEXT`, `ended_at TEXT`, `metadata TEXT`
+**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `task_id TEXT` (reverse link to triggering task, partial index), `started_at TEXT`, `ended_at TEXT`, `metadata TEXT`
 
 **messages** — `id INTEGER PK AUTO`, `session_id TEXT FK→sessions`, `agent_id TEXT FK→agents`, `role TEXT CHECK(user|assistant|system|summary|tool_result)`, `content TEXT`, `metadata TEXT`, `trace_id TEXT`, `compacted_through_id INTEGER`, `created_at TEXT`
 

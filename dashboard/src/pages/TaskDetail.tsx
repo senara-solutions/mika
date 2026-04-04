@@ -1,12 +1,26 @@
 import { Link, useParams } from 'react-router'
-import { useTask, useTaskChildren } from '../api/tasks.ts'
+import { useTask, useTaskChildren, useTaskSessions } from '../api/tasks.ts'
 import { TaskStatusBadge, CopyButton, formatRelativeTime } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
+
+function formatDuration(start: string, end: string): string {
+  const ms = new Date(end).getTime() - new Date(start).getTime()
+  if (ms < 1000) return `${ms}ms`
+  const secs = Math.floor(ms / 1000)
+  if (secs < 60) return `${secs}s`
+  const mins = Math.floor(secs / 60)
+  const remSecs = secs % 60
+  if (mins < 60) return `${mins}m ${remSecs}s`
+  const hours = Math.floor(mins / 60)
+  const remMins = mins % 60
+  return `${hours}h ${remMins}m`
+}
 
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>()
   const { data: task, isLoading, error } = useTask(taskId)
   const { data: children } = useTaskChildren(taskId)
+  const { data: taskSessions } = useTaskSessions(taskId)
 
   if (isLoading) {
     return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
@@ -199,9 +213,65 @@ export default function TaskDetail() {
                 >
                   {child.label}
                 </Link>
-                <span className="text-muted/40 text-xs font-mono ml-auto">
-                  {child.action_type}
+                <div className="flex items-center gap-2 ml-auto">
+                  {child.created_by_session && (
+                    <Link
+                      to={`/sessions/${child.created_by_session}`}
+                      className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white/[0.06] text-accent hover:text-accent-light transition-colors"
+                    >
+                      SESSION
+                    </Link>
+                  )}
+                  {child.execution_trace_id && (
+                    <Link
+                      to={`/traces/${child.execution_trace_id}`}
+                      className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white/[0.06] text-accent hover:text-accent-light transition-colors"
+                    >
+                      TRACE
+                    </Link>
+                  )}
+                  <span className="text-muted/40 text-xs font-mono">
+                    {child.action_type}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Sessions */}
+      {taskSessions && taskSessions.sessions.length > 0 && (
+        <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5 mt-4">
+          <h3 className="text-heading text-sm font-medium mb-3">
+            Sessions ({taskSessions.sessions.length})
+          </h3>
+          <div className="space-y-2">
+            {taskSessions.sessions.map((session) => (
+              <div key={session.id} className="flex items-center gap-3 py-1.5">
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white/[0.06] text-muted/60">
+                  {session.channel_type}
                 </span>
+                <Link
+                  to={`/sessions/${session.id}`}
+                  className="text-accent text-xs font-mono hover:text-accent-light transition-colors truncate max-w-[220px]"
+                >
+                  {session.id}
+                </Link>
+                {session.task_label && (
+                  <span className="text-muted/40 text-xs truncate max-w-[180px]" title={session.task_label}>
+                    {session.task_label}
+                  </span>
+                )}
+                <div className="flex items-center gap-3 ml-auto text-muted/40 text-xs shrink-0">
+                  <span>{session.message_count} msgs</span>
+                  <span>
+                    {session.ended_at
+                      ? formatDuration(session.started_at, session.ended_at)
+                      : 'ongoing'}
+                  </span>
+                  <span>{formatRelativeTime(session.started_at)}</span>
+                </div>
               </div>
             ))}
           </div>

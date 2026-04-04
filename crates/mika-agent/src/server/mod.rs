@@ -115,6 +115,10 @@ fn build_router(state: AppState) -> Router {
             "/tasks/{task_id}/children",
             get(dashboard::handle_task_children),
         )
+        .route(
+            "/tasks/{task_id}/sessions",
+            get(dashboard::handle_task_sessions),
+        )
         .route("/team-runs", get(dashboard::handle_team_runs_list))
         .route(
             "/team-runs/{run_id}",

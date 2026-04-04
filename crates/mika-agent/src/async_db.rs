@@ -10,8 +10,8 @@ use tokio::sync::oneshot;
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
     NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats,
-    SkillOverride, Task, TaskFilters, TaskHealthSummary, TeamRow, TeamRunFilters, TeamRunRow,
-    TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    SkillOverride, Task, TaskFilters, TaskHealthSummary, TaskSessionRow, TeamRow, TeamRunFilters,
+    TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&Database) + Send>;
@@ -493,18 +493,22 @@ impl AsyncDatabase {
         agent_id: &str,
         channel_type: &str,
         metadata: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<()> {
-        let (i, a, ct, m) = (
+        let (i, a, ct, m, t) = (
             id.to_owned(),
             agent_id.to_owned(),
             channel_type.to_owned(),
             metadata.map(|s| s.to_owned()),
+            task_id.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.create_session_with_metadata(&i, &a, &ct, m.as_deref()))
-            .await
+        self.with_db(move |db| {
+            db.create_session_with_metadata(&i, &a, &ct, m.as_deref(), t.as_deref())
+        })
+        .await
     }
 
-    /// Create a session with metadata and a parent session reference.
+    /// Create a session with metadata, parent session reference, and optional task linkage.
     pub async fn create_session_with_parent(
         &self,
         id: &str,
@@ -512,16 +516,18 @@ impl AsyncDatabase {
         channel_type: &str,
         metadata: Option<&str>,
         parent_session_id: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<()> {
-        let (i, a, ct, m, p) = (
+        let (i, a, ct, m, p, t) = (
             id.to_owned(),
             agent_id.to_owned(),
             channel_type.to_owned(),
             metadata.map(|s| s.to_owned()),
             parent_session_id.map(|s| s.to_owned()),
+            task_id.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
-            db.create_session_with_parent(&i, &a, &ct, m.as_deref(), p.as_deref())
+            db.create_session_with_parent(&i, &a, &ct, m.as_deref(), p.as_deref(), t.as_deref())
         })
         .await
     }
@@ -1444,6 +1450,16 @@ impl AsyncDatabase {
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
         let sid = session_id.to_owned();
         self.with_db(move |db| db.get_session(&sid)).await
+    }
+
+    /// Get all sessions linked to a task tree (root task + direct children).
+    pub async fn get_sessions_for_task_tree(
+        &self,
+        root_task_id: &str,
+    ) -> Result<Vec<TaskSessionRow>> {
+        let tid = root_task_id.to_owned();
+        self.with_db(move |db| db.get_sessions_for_task_tree(&tid))
+            .await
     }
 
     pub async fn load_session_messages_paginated(

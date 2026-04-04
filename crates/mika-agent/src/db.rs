@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 18;
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -185,6 +185,7 @@ pub struct Session {
     pub ended_at: Option<String>,
     pub metadata: Option<String>,
     pub parent_session_id: Option<String>,
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -548,7 +549,21 @@ pub struct SessionWithStats {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub metadata: Option<String>,
+    pub task_id: Option<String>,
     pub message_count: i64,
+}
+
+/// A session row enriched with task label for the task-sessions endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSessionRow {
+    pub id: String,
+    pub agent_id: String,
+    pub channel_type: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub task_id: Option<String>,
+    pub message_count: i64,
+    pub task_label: Option<String>,
 }
 
 // ===== Database =====
@@ -709,6 +724,10 @@ impl Database {
             self.migrate_v17_to_v18()?;
             info!(version = 18, "database migrated to v18");
         }
+        if (3..=18).contains(&version) {
+            self.migrate_v18_to_v19()?;
+            info!(version = 19, "database migrated to v19");
+        }
         Ok(())
     }
 
@@ -765,7 +784,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (18);
+            INSERT INTO schema_version (version) VALUES (19);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -868,10 +887,12 @@ impl Database {
                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 ended_at TEXT,
                 metadata TEXT,
-                parent_session_id TEXT
+                parent_session_id TEXT,
+                task_id TEXT
             );
             CREATE INDEX idx_sessions_agent ON sessions(agent_id, started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;
+            CREATE INDEX idx_sessions_task_id ON sessions(task_id) WHERE task_id IS NOT NULL;
 
             CREATE TABLE messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2400,6 +2421,28 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v18_to_v19(&self) -> Result<()> {
+        info!("migrating database schema v18 → v19 (add task_id to sessions for reverse lookup)");
+
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+
+             ALTER TABLE sessions ADD COLUMN task_id TEXT;
+
+             CREATE INDEX idx_sessions_task_id ON sessions(task_id) WHERE task_id IS NOT NULL;
+
+             -- Backfill from existing metadata JSON (cli --task-id sessions)
+             UPDATE sessions SET task_id = json_extract(metadata, '$.task_id')
+               WHERE json_extract(metadata, '$.task_id') IS NOT NULL AND task_id IS NULL;
+
+             INSERT INTO schema_version (version) VALUES (19);
+
+             COMMIT;",
+        )?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -3585,15 +3628,16 @@ impl Database {
         agent_id: &str,
         channel_type: &str,
         metadata: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (id, agent_id, channel_type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            params![id, agent_id, channel_type, metadata],
+            "INSERT INTO sessions (id, agent_id, channel_type, metadata, task_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, agent_id, channel_type, metadata, task_id],
         )?;
         Ok(())
     }
 
-    /// Create a session with metadata and a parent session reference.
+    /// Create a session with metadata, parent session reference, and optional task linkage.
     /// Used by callback and skill_run dispatchers to link back to the originating session.
     pub fn create_session_with_parent(
         &self,
@@ -3602,10 +3646,11 @@ impl Database {
         channel_type: &str,
         metadata: Option<&str>,
         parent_session_id: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (id, agent_id, channel_type, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, agent_id, channel_type, metadata, parent_session_id],
+            "INSERT INTO sessions (id, agent_id, channel_type, metadata, parent_session_id, task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, agent_id, channel_type, metadata, parent_session_id, task_id],
         )?;
         Ok(())
     }
@@ -6212,7 +6257,7 @@ impl Database {
         if let Some(tid) = task_id {
             param_values.push(tid.to_string());
             conditions.push(format!(
-                "json_extract(s.metadata, '$.task_id') = ?{}",
+                "COALESCE(s.task_id, json_extract(s.metadata, '$.task_id')) = ?{}",
                 param_values.len()
             ));
         }
@@ -6224,7 +6269,7 @@ impl Database {
         };
 
         let sql = format!(
-            "SELECT s.id, s.agent_id, s.channel_type, s.started_at, s.ended_at, s.metadata,
+            "SELECT s.id, s.agent_id, s.channel_type, s.started_at, s.ended_at, s.metadata, s.task_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) as msg_count
              FROM sessions s {} ORDER BY s.started_at DESC LIMIT ?{} OFFSET ?{}",
             where_clause,
@@ -6249,7 +6294,8 @@ impl Database {
                     started_at: r.get(3)?,
                     ended_at: r.get(4)?,
                     metadata: r.get(5)?,
-                    message_count: r.get(6)?,
+                    task_id: r.get(6)?,
+                    message_count: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -6285,7 +6331,7 @@ impl Database {
         if let Some(tid) = task_id {
             param_values.push(tid.to_string());
             conditions.push(format!(
-                "json_extract(metadata, '$.task_id') = ?{}",
+                "COALESCE(task_id, json_extract(metadata, '$.task_id')) = ?{}",
                 param_values.len()
             ));
         }
@@ -6305,11 +6351,67 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Get all sessions linked to a task tree (the given task + its direct children).
+    /// Returns sessions where `task_id` (or legacy `json_extract(metadata, '$.task_id')`)
+    /// matches any task ID in the tree. Includes message count for display.
+    pub fn get_sessions_for_task_tree(&self, root_task_id: &str) -> Result<Vec<TaskSessionRow>> {
+        // Collect all task IDs in the tree: root + direct children
+        let mut task_ids = vec![root_task_id.to_string()];
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM tasks WHERE parent_task_id = ?1")?;
+            let children: Vec<String> = stmt
+                .query_map(params![root_task_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            task_ids.extend(children);
+        }
+
+        let placeholders: String = (1..=task_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "SELECT s.id, s.agent_id, s.channel_type, s.started_at, s.ended_at, s.task_id,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) as msg_count,
+                    t.label as task_label
+             FROM sessions s
+             LEFT JOIN tasks t ON t.id = COALESCE(s.task_id, json_extract(s.metadata, '$.task_id'))
+             WHERE COALESCE(s.task_id, json_extract(s.metadata, '$.task_id')) IN ({placeholders})
+             ORDER BY s.started_at DESC"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = task_ids
+            .into_iter()
+            .map(|s| Box::new(s) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| &**p).collect();
+
+        let rows = stmt
+            .query_map(&*refs, |r| {
+                Ok(TaskSessionRow {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    channel_type: r.get(2)?,
+                    started_at: r.get(3)?,
+                    ended_at: r.get(4)?,
+                    task_id: r.get(5)?,
+                    message_count: r.get(6)?,
+                    task_label: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        Ok(rows)
+    }
+
     /// Get a single session by id.
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, agent_id, channel_type, started_at, ended_at, metadata, parent_session_id
+                "SELECT id, agent_id, channel_type, started_at, ended_at, metadata, parent_session_id, task_id
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 |r| {
@@ -6321,6 +6423,7 @@ impl Database {
                         ended_at: r.get(4)?,
                         metadata: r.get(5)?,
                         parent_session_id: r.get(6)?,
+                        task_id: r.get(7)?,
                     })
                 },
             )
@@ -8459,18 +8562,20 @@ mod tests {
         // Create a parent session first
         db.create_session("parent-sess", "mika", "cli").unwrap();
 
-        // Create a child session with parent reference
+        // Create a child session with parent reference and task linkage
         db.create_session_with_parent(
             "child-sess",
             "mika",
             "system",
             Some(r#"{"trigger": "callback"}"#),
             Some("parent-sess"),
+            Some("task-123"),
         )
         .unwrap();
 
         let session = db.get_session("child-sess").unwrap().unwrap();
         assert_eq!(session.parent_session_id.as_deref(), Some("parent-sess"));
+        assert_eq!(session.task_id.as_deref(), Some("task-123"));
         assert_eq!(
             session.metadata.as_deref(),
             Some(r#"{"trigger": "callback"}"#)
@@ -8486,11 +8591,135 @@ mod tests {
             "system",
             Some(r#"{"trigger": "heartbeat"}"#),
             None,
+            None,
         )
         .unwrap();
 
         let session = db.get_session("no-parent-sess").unwrap().unwrap();
         assert!(session.parent_session_id.is_none());
+        assert!(session.task_id.is_none());
+    }
+
+    #[test]
+    fn test_create_session_with_metadata_and_task_id() {
+        let db = db();
+        db.create_session_with_metadata(
+            "meta-sess",
+            "mika",
+            "cli",
+            Some(r#"{"task_id": "task-abc"}"#),
+            Some("task-abc"),
+        )
+        .unwrap();
+
+        let session = db.get_session("meta-sess").unwrap().unwrap();
+        assert_eq!(session.task_id.as_deref(), Some("task-abc"));
+        assert_eq!(
+            session.metadata.as_deref(),
+            Some(r#"{"task_id": "task-abc"}"#)
+        );
+    }
+
+    #[test]
+    fn test_get_sessions_for_task_tree() {
+        let db = db();
+
+        // Create a parent task
+        let parent_id = db
+            .create_task(&new_task("mika", "parent-work-item", "manual", "none"))
+            .unwrap();
+
+        // Create a child task
+        let mut child = new_task("mika", "child-callback", "callback", "resume_agent");
+        child.parent_task_id = Some(parent_id.clone());
+        child.depth = 1;
+        let child_id = db.create_task(&child).unwrap();
+
+        // Create sessions linked to the task tree
+        db.create_session_with_parent("sess-parent", "mika", "cli", None, None, Some(&parent_id))
+            .unwrap();
+        db.create_session_with_parent(
+            "sess-child",
+            "mika",
+            "system",
+            Some(r#"{"trigger": "callback"}"#),
+            Some("sess-parent"),
+            Some(&child_id),
+        )
+        .unwrap();
+        // Unrelated session (no task_id)
+        db.create_session("sess-unrelated", "mika", "cli").unwrap();
+
+        let sessions = db.get_sessions_for_task_tree(&parent_id).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Both sessions should be found
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"sess-parent"));
+        assert!(ids.contains(&"sess-child"));
+
+        // Verify task labels are joined
+        let parent_sess = sessions.iter().find(|s| s.id == "sess-parent").unwrap();
+        assert_eq!(parent_sess.task_label.as_deref(), Some("parent-work-item"));
+        let child_sess = sessions.iter().find(|s| s.id == "sess-child").unwrap();
+        assert_eq!(child_sess.task_label.as_deref(), Some("child-callback"));
+    }
+
+    #[test]
+    fn test_sessions_for_task_tree_backfill_compat() {
+        let db = db();
+
+        // Simulate a pre-v19 session with task_id only in metadata JSON
+        let task_id = db
+            .create_task(&new_task("mika", "legacy-task", "manual", "none"))
+            .unwrap();
+
+        // Create session with task_id only in metadata (legacy path)
+        db.create_session_with_metadata(
+            "legacy-sess",
+            "mika",
+            "cli",
+            Some(&format!(r#"{{"task_id": "{task_id}"}}"#)),
+            None, // no task_id column
+        )
+        .unwrap();
+
+        // The COALESCE in the query should still find it
+        let sessions = db.get_sessions_for_task_tree(&task_id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "legacy-sess");
+    }
+
+    #[test]
+    fn test_list_sessions_paginated_coalesce_task_id() {
+        let db = db();
+
+        let task_id = db
+            .create_task(&new_task("mika", "coalesce-test", "manual", "none"))
+            .unwrap();
+
+        // Session with task_id in column
+        db.create_session_with_metadata("col-sess", "mika", "cli", None, Some(&task_id))
+            .unwrap();
+        // Session with task_id only in metadata (legacy)
+        db.create_session_with_metadata(
+            "meta-sess-2",
+            "mika",
+            "cli",
+            Some(&format!(r#"{{"task_id": "{task_id}"}}"#)),
+            None,
+        )
+        .unwrap();
+        // Unrelated session
+        db.create_session("other-sess", "mika", "cli").unwrap();
+
+        let sessions = db
+            .list_sessions_paginated(None, None, None, Some(&task_id), 50, 0)
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"col-sess"));
+        assert!(ids.contains(&"meta-sess-2"));
     }
 
     #[test]
