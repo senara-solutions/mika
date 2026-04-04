@@ -29,13 +29,21 @@ import {
 
 // ===== Helpers =====
 
-function formatDuration(ms: number | null): string {
-  if (ms === null || ms === undefined) return '--'
+function formatDurationMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
   const totalSecs = Math.floor(ms / 1000)
+  if (totalSecs < 60) return `${totalSecs}s`
   const mins = Math.floor(totalSecs / 60)
   const secs = totalSecs % 60
-  if (mins === 0) return `${secs}s`
-  return `${mins}m ${secs}s`
+  if (mins < 60) return `${mins}m ${secs}s`
+  const hours = Math.floor(mins / 60)
+  const remMins = mins % 60
+  return `${hours}h ${remMins}m`
+}
+
+function formatDuration(ms: number | null): string {
+  if (ms === null || ms === undefined) return '--'
+  return formatDurationMs(ms)
 }
 
 function formatCost(usd: number | null): string {
@@ -65,7 +73,6 @@ function derivePipelineSteps(
   // Determine how far the pipeline got
   const planDone = true // if we have a dev run, plan started
   const workDone = hasBranch
-  const reviewDone = hasPr
   const prDone = hasPr
   const qaDone = hasReviews && reviewVerdict !== null
 
@@ -78,8 +85,7 @@ function derivePipelineSteps(
   return [
     { label: 'Plan', status: stepStatus(planDone, true) },
     { label: 'Work', status: stepStatus(workDone, planDone) },
-    { label: 'Review', status: stepStatus(reviewDone, workDone) },
-    { label: 'PR', status: stepStatus(prDone, reviewDone) },
+    { label: 'PR', status: stepStatus(prDone, workDone) },
     { label: 'QA', status: stepStatus(qaDone, prDone) },
   ]
 }
@@ -194,16 +200,7 @@ function SessionRow({ sessionId, label, messageCount, startedAt, endedAt }: {
 }
 
 function formatDurationFromDates(start: string, end: string): string {
-  const ms = new Date(end).getTime() - new Date(start).getTime()
-  if (ms < 1000) return `${ms}ms`
-  const secs = Math.floor(ms / 1000)
-  if (secs < 60) return `${secs}s`
-  const mins = Math.floor(secs / 60)
-  const remSecs = secs % 60
-  if (mins < 60) return `${mins}m ${remSecs}s`
-  const hours = Math.floor(mins / 60)
-  const remMins = mins % 60
-  return `${hours}h ${remMins}m`
+  return formatDurationMs(new Date(end).getTime() - new Date(start).getTime())
 }
 
 /** Lazy-loaded session messages (only fetched when expanded). */

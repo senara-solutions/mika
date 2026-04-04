@@ -21,7 +21,7 @@ export function parseGitHubUrl(url: string | null | undefined): GitHubRef | null
   return {
     owner: match[1],
     repo: match[2],
-    number: parseInt(match[3] === 'issues' ? match[4] : match[4], 10),
+    number: parseInt(match[4], 10),
     type: match[3] === 'issues' ? 'issue' : 'pull',
   }
 }

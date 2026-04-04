@@ -271,6 +271,17 @@ async fn github_get<T: serde::de::DeserializeOwned>(
     })
 }
 
+// ===== GitHub Proxy Helpers =====
+
+/// Validate GitHub owner/repo path segments to prevent SSRF-like probing.
+/// Only allows alphanumeric, hyphens, underscores, and dots.
+fn is_valid_github_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 100
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 // ===== GitHub Proxy Handlers =====
 
 /// GET /api/v1/github/issues/{owner}/{repo}/{number} — proxy to GitHub Issues API.
@@ -278,6 +289,14 @@ pub async fn handle_github_issue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, u32)>,
 ) -> impl IntoResponse {
+    if !is_valid_github_name(&owner) || !is_valid_github_name(&repo) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid owner or repo name"})),
+        )
+            .into_response();
+    }
+
     let Some(token) = &state.github_token else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -313,6 +332,14 @@ pub async fn handle_github_pull(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, u32)>,
 ) -> impl IntoResponse {
+    if !is_valid_github_name(&owner) || !is_valid_github_name(&repo) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid owner or repo name"})),
+        )
+            .into_response();
+    }
+
     let Some(token) = &state.github_token else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -322,7 +349,8 @@ pub async fn handle_github_pull(
     };
 
     let pull_url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}");
-    let reviews_url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews");
+    let reviews_url =
+        format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=20");
 
     // Fetch PR and reviews in parallel.
     let (pull_result, reviews_result) = tokio::join!(
