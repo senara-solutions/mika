@@ -1052,6 +1052,14 @@ fn draw_footer(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect, terminal_width:
                 Style::default().fg(Color::Cyan),
             ));
         }
+        // Active background task badge
+        if app.active_background_task_count > 0 {
+            s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            s.push(Span::styled(
+                format!("[{} running]", app.active_background_task_count),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         s
     };
 
