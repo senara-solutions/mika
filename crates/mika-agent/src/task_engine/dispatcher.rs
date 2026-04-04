@@ -230,6 +230,7 @@ impl TaskDispatcher {
                 "system",
                 Some(r#"{"trigger": "skill_run"}"#),
                 task.created_by_session.as_deref(),
+                Some(&task.id),
             )
             .await
         {
@@ -355,6 +356,7 @@ impl TaskDispatcher {
                 "system",
                 Some(session_trigger_meta),
                 task.created_by_session.as_deref(),
+                Some(&task.id),
             )
             .await
         {
@@ -546,6 +548,7 @@ impl TaskDispatcher {
                 &task.agent_id,
                 "system",
                 Some(r#"{"trigger": "heartbeat"}"#),
+                Some(&task.id),
             )
             .await
         {
@@ -687,6 +690,7 @@ impl TaskDispatcher {
                 &task.agent_id,
                 "system",
                 Some(r#"{"trigger": "reflection"}"#),
+                Some(&task.id),
             )
             .await
         {

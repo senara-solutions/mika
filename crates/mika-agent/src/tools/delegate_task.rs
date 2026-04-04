@@ -248,6 +248,11 @@ impl Tool for DelegateTaskTool {
                 "delegate",
                 Some(&delegate_metadata),
                 Some(ctx.session_id),
+                if work_item_id.is_empty() {
+                    None
+                } else {
+                    Some(work_item_id)
+                },
             )
             .await
         {

@@ -86,3 +86,27 @@ export function useTaskChildren(parentTaskId: string | undefined) {
     enabled: !!parentTaskId,
   })
 }
+
+/** Session linked to a task tree — returned by GET /api/v1/tasks/:id/sessions. */
+export interface TaskSession {
+  id: string
+  agent_id: string
+  channel_type: string
+  started_at: string
+  ended_at: string | null
+  task_id: string | null
+  message_count: number
+  task_label: string | null
+}
+
+export interface TaskSessionsResponse {
+  sessions: TaskSession[]
+}
+
+export function useTaskSessions(taskId: string | undefined) {
+  return useQuery<TaskSessionsResponse>({
+    queryKey: ['task-sessions', taskId],
+    queryFn: () => apiFetch(`/tasks/${taskId}/sessions`),
+    enabled: !!taskId,
+  })
+}
