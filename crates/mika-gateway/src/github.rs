@@ -276,6 +276,42 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
     }
 }
 
+// -- Agent mapping --
+
+/// Result of resolving a GitHub repo to a customer container.
+struct ResolvedRoute {
+    container_url: String,
+    agent_mapping: serde_json::Value,
+}
+
+/// Validate that an agent name is well-formed: lowercase alphanumeric + hyphens,
+/// 1-63 chars, no leading/trailing/consecutive hyphens.
+fn is_valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// Apply per-repo agent name overrides from the `agent_mapping` JSONB column.
+///
+/// Keys are default agent names from `route_event()` (e.g. `"mika-dev"`),
+/// values are the customer's replacement agent names (e.g. `"acme-dev"`).
+/// Returns the original agent name if no override exists or the override
+/// is not a valid agent name.
+fn apply_agent_mapping(agent_mapping: &serde_json::Value, default_agent: &str) -> String {
+    agent_mapping
+        .get(default_agent)
+        .and_then(|v| v.as_str())
+        .filter(|s| is_valid_agent_name(s))
+        .unwrap_or(default_agent)
+        .to_string()
+}
+
 // -- LRU cache --
 
 /// Default capacity for the delivery ID dedup cache.
@@ -442,36 +478,53 @@ pub(crate) async fn handle_github_webhook(
     StatusCode::OK
 }
 
-/// Resolve the container URL for a GitHub webhook event by looking up the
-/// repository's full_name in the `github_repos` table. Falls back to
-/// `agent_base_url` for backward compatibility with single-tenant deployments.
+/// Resolve the container URL and agent mapping for a GitHub webhook event by
+/// looking up the repository's full_name in the `github_repos` table. Falls back
+/// to `agent_base_url` for backward compatibility with single-tenant deployments.
 async fn resolve_github_container_url(
     state: &AppState,
     repo_full_name: Option<&str>,
-) -> Option<String> {
+) -> Option<ResolvedRoute> {
     // Multi-tenant: look up repo → customer mapping
     if let Some(repo_name) = repo_full_name {
-        match sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT customer_id FROM github_repos WHERE repo_full_name = $1",
+        match sqlx::query_as::<_, (uuid::Uuid, serde_json::Value)>(
+            "SELECT customer_id, agent_mapping FROM github_repos WHERE repo_full_name = $1",
         )
         .bind(repo_name)
         .fetch_optional(&state.pool)
         .await
         {
-            Ok(Some(customer_id)) => {
-                let url = crate::routes::container_url_str(
+            Ok(Some((customer_id, agent_mapping))) => {
+                let container_url = crate::routes::container_url_str(
                     &customer_id.to_string(),
                     state.agent_base_url.as_deref(),
                     &state.agents_namespace,
                 );
-                info!(repo = repo_name, customer_id = %customer_id, "resolved GitHub repo to customer");
-                return Some(url);
+                let has_mapping = agent_mapping.as_object().is_some_and(|m| !m.is_empty());
+                info!(
+                    repo = repo_name,
+                    customer_id = %customer_id,
+                    agent_mapping_active = has_mapping,
+                    "resolved GitHub repo to customer"
+                );
+                return Some(ResolvedRoute {
+                    container_url,
+                    agent_mapping,
+                });
             }
             Ok(None) => {
-                debug!(
-                    repo = repo_name,
-                    "GitHub repo not registered in github_repos table"
-                );
+                // debug when fallback will handle it (single-tenant), warn when event will be dropped
+                if state.agent_base_url.is_some() {
+                    debug!(
+                        repo = repo_name,
+                        "GitHub repo not in github_repos table, falling back to agent_base_url"
+                    );
+                } else {
+                    warn!(
+                        repo = repo_name,
+                        "GitHub repo not registered and no fallback configured"
+                    );
+                }
             }
             Err(e) => {
                 warn!(repo = repo_name, error = %e, "failed to query github_repos table");
@@ -481,9 +534,14 @@ async fn resolve_github_container_url(
 
     // Fallback: single-tenant mode via agent_base_url
     if let Some(ref base) = state.agent_base_url {
-        Some(base.clone())
+        Some(ResolvedRoute {
+            container_url: base.clone(),
+            agent_mapping: serde_json::Value::Object(serde_json::Map::new()),
+        })
     } else {
-        debug!("GitHub webhook: no repo mapping found and no MIKA_AGENT_BASE_URL configured");
+        warn!(
+            "GitHub webhook: no repo mapping found and no MIKA_AGENT_BASE_URL configured, dropping event"
+        );
         None
     }
 }
@@ -492,18 +550,30 @@ async fn resolve_github_container_url(
 ///
 /// Uses `channel: "github"` and `chat_id: 0` (no reply channel).
 /// Multi-tenant routing: looks up `github_repos` table first, falls back to `agent_base_url`.
+/// Per-repo agent name overrides are applied from the `agent_mapping` column.
 async fn forward_github_event(
     state: &AppState,
-    target_agent: &str,
+    default_agent: &str,
     text: &str,
     request_id: &str,
     repo_full_name: Option<&str>,
 ) {
-    let url = match resolve_github_container_url(state, repo_full_name).await {
-        Some(u) => u,
+    let route = match resolve_github_container_url(state, repo_full_name).await {
+        Some(r) => r,
         None => return,
     };
 
+    let target_agent = apply_agent_mapping(&route.agent_mapping, default_agent);
+    if target_agent != default_agent {
+        info!(
+            default_agent,
+            mapped_agent = %target_agent,
+            repo = ?repo_full_name,
+            "applied agent_mapping override"
+        );
+    }
+
+    let url = route.container_url;
     let payload = serde_json::json!({
         "text": text,
         "chat_id": 0,
@@ -1084,5 +1154,94 @@ mod tests {
         let result = truncate_body(&long, 2000);
         assert!(result.starts_with(&"a".repeat(2000)));
         assert!(result.ends_with("[truncated]"));
+    }
+
+    // -- Agent mapping tests --
+
+    #[test]
+    fn test_apply_agent_mapping_empty_object() {
+        let mapping = serde_json::json!({});
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+        assert_eq!(apply_agent_mapping(&mapping, "mika-qa"), "mika-qa");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_valid_override() {
+        let mapping = serde_json::json!({
+            "mika-dev": "acme-dev",
+            "mika-qa": "acme-qa"
+        });
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "acme-dev");
+        assert_eq!(apply_agent_mapping(&mapping, "mika-qa"), "acme-qa");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_partial_override() {
+        let mapping = serde_json::json!({
+            "mika-dev": "custom-dev"
+        });
+        // Override exists for mika-dev
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "custom-dev");
+        // No override for mika-qa — use default
+        assert_eq!(apply_agent_mapping(&mapping, "mika-qa"), "mika-qa");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_empty_string_value() {
+        let mapping = serde_json::json!({
+            "mika-dev": ""
+        });
+        // Empty string override is treated as absent — use default
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_non_string_value() {
+        let mapping = serde_json::json!({
+            "mika-dev": 42,
+            "mika-qa": null
+        });
+        // Non-string values are ignored — use defaults
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+        assert_eq!(apply_agent_mapping(&mapping, "mika-qa"), "mika-qa");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_null_value() {
+        let mapping = serde_json::Value::Null;
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+    }
+
+    #[test]
+    fn test_apply_agent_mapping_rejects_invalid_name() {
+        let mapping = serde_json::json!({
+            "mika-dev": "has spaces",
+            "mika-qa": "-leading-hyphen"
+        });
+        // Invalid agent names fall back to defaults
+        assert_eq!(apply_agent_mapping(&mapping, "mika-dev"), "mika-dev");
+        assert_eq!(apply_agent_mapping(&mapping, "mika-qa"), "mika-qa");
+    }
+
+    // -- Agent name validation tests --
+
+    #[test]
+    fn test_is_valid_agent_name() {
+        assert!(is_valid_agent_name("mika-dev"));
+        assert!(is_valid_agent_name("acme-qa"));
+        assert!(is_valid_agent_name("a"));
+        assert!(is_valid_agent_name("agent123"));
+    }
+
+    #[test]
+    fn test_is_valid_agent_name_rejects_invalid() {
+        assert!(!is_valid_agent_name(""));
+        assert!(!is_valid_agent_name("-leading"));
+        assert!(!is_valid_agent_name("trailing-"));
+        assert!(!is_valid_agent_name("double--hyphen"));
+        assert!(!is_valid_agent_name("HAS UPPER"));
+        assert!(!is_valid_agent_name("has spaces"));
+        assert!(!is_valid_agent_name("special@chars"));
+        assert!(!is_valid_agent_name(&"a".repeat(64))); // too long
     }
 }
