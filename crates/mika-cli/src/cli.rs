@@ -223,7 +223,11 @@ pub struct AgentsArgs {
 #[derive(Subcommand)]
 pub enum AgentsCommand {
     /// List all agents
-    List,
+    List {
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Create a new agent
     Create {
         /// Name for the new agent (lowercase, alphanumeric, hyphens)
