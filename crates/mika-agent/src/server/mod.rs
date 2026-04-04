@@ -162,6 +162,15 @@ fn build_router(state: AppState) -> Router {
             "/dev-runs/{task_id}",
             get(dashboard_dev_runs::handle_dev_run_detail),
         )
+        // GitHub proxy endpoints for dashboard (issue/PR details)
+        .route(
+            "/github/issues/{owner}/{repo}/{number}",
+            get(dashboard_dev_runs::handle_github_issue),
+        )
+        .route(
+            "/github/pulls/{owner}/{repo}/{number}",
+            get(dashboard_dev_runs::handle_github_pull),
+        )
         .route(
             "/investigate",
             post(investigate::handle_investigate).layer(RequestBodyLimitLayer::new(
