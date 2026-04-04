@@ -52,5 +52,6 @@ export function useSessionMessages(sessionId: string, page = 1, perPage = 50) {
     queryFn: () =>
       apiFetch(`/sessions/${sessionId}/messages`, { page, per_page: perPage }),
     enabled: !!sessionId,
+    staleTime: 60 * 1000, // 1 min — messages are immutable once session ends
   })
 }
