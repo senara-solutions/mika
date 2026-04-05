@@ -561,13 +561,30 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
         return format!("Cannot use model {args}: {e}");
     }
 
-    let full_id = if target_provider == ProviderKind::Anthropic {
-        model_name.to_string()
-    } else {
-        format!("{target_provider}/{model_name}")
-    };
+    let display_id = format_display_model(target_provider, model_name);
+    apply_model_switch(
+        app,
+        target_provider,
+        model_name,
+        display_id.clone(),
+        &display_id,
+    )
+}
 
-    apply_model_switch(app, target_provider, model_name, full_id.clone(), &full_id)
+/// Format model string for the agent worker — always includes provider prefix
+/// so the worker can switch both provider and model atomically.
+fn format_worker_model(provider: mika_common::llm::ProviderKind, model: &str) -> String {
+    format!("{provider}/{model}")
+}
+
+/// Format model string for TUI display — no prefix for Anthropic (matches
+/// `Settings::active_model_display()` convention).
+fn format_display_model(provider: mika_common::llm::ProviderKind, model: &str) -> String {
+    if provider == mika_common::llm::ProviderKind::Anthropic {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    }
 }
 
 /// Shared logic for applying a model switch: persist provider/model to config,
@@ -606,10 +623,16 @@ fn apply_model_switch(
             }
         };
 
-    app.model = full_id.clone();
+    // Display value is user-friendly (no prefix for Anthropic).
+    // Worker message always includes provider prefix so the worker can
+    // switch both provider and model atomically. See #451.
+    let worker_model = format_worker_model(target_provider, model_name);
+    app.model = full_id;
     if app
         .agent_tx
-        .send(AgentRequest::SetModel { model: full_id })
+        .send(AgentRequest::SetModel {
+            model: worker_model,
+        })
         .is_err()
     {
         return WORKER_NOT_RESPONDING.to_string();
@@ -624,8 +647,10 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
 
     let args = args.trim();
     if args.is_empty() {
-        // Show current provider and list all available
+        // Show current provider and list all available with configured models
         let current = app.provider.to_string();
+        let settings =
+            mika_common::config::Settings::load_for_agent(&app.global_home, &app.home_dir).ok();
         let mut out = format!("Current provider: {current}\n\nAvailable providers:");
         for &p in ProviderKind::ALL {
             let marker = if p.to_string() == current {
@@ -633,7 +658,11 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
             } else {
                 ""
             };
-            let _ = write!(out, "\n  {} — {}{}", p, p.default_model(), marker);
+            let model = settings
+                .as_ref()
+                .and_then(|s| s.provider_fields(p).0.map(String::from))
+                .unwrap_or_else(|| p.default_model().to_string());
+            let _ = write!(out, "\n  {} — {}{}", p, model, marker);
         }
         let _ = write!(out, "\n\nUsage: /provider <name>");
         return out;
@@ -671,12 +700,6 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                 Ok(()) => {
                     // If setting model, also update the display and agent worker
                     if field == "model" {
-                        let full_id = if app.provider == ProviderKind::Anthropic {
-                            value.to_string()
-                        } else {
-                            format!("{}/{}", app.provider, value)
-                        };
-
                         // Pre-validate: load settings and try to build the provider
                         if let Err(e) = validate_provider_switch_for(
                             &app.home_dir,
@@ -686,10 +709,14 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                             return format!("Error: cannot use model {value}: {e}");
                         }
 
-                        app.model = full_id.clone();
+                        let display_id = format_display_model(app.provider, value);
+                        let worker_model = format_worker_model(app.provider, value);
+                        app.model = display_id;
                         if app
                             .agent_tx
-                            .send(AgentRequest::SetModel { model: full_id })
+                            .send(AgentRequest::SetModel {
+                                model: worker_model,
+                            })
                             .is_err()
                         {
                             return WORKER_NOT_RESPONDING.to_string();
@@ -728,16 +755,15 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                 let config = settings.active_llm_config();
                 let model = config.model.clone();
                 let had_configured_model = settings.provider_fields(new_provider).0.is_some();
-                let full_id = if new_provider == ProviderKind::Anthropic {
-                    model.clone()
-                } else {
-                    format!("{new_provider}/{model}")
-                };
-                app.model = full_id.clone();
+                let display_id = format_display_model(new_provider, &model);
+                let worker_model = format_worker_model(new_provider, &model);
+                app.model = display_id;
                 app.provider = new_provider;
                 if app
                     .agent_tx
-                    .send(AgentRequest::SetModel { model: full_id })
+                    .send(AgentRequest::SetModel {
+                        model: worker_model,
+                    })
                     .is_err()
                 {
                     return WORKER_NOT_RESPONDING.to_string();
@@ -2132,5 +2158,138 @@ mod tests {
         assert_eq!(ProviderKind::Anthropic.max_output_tokens(), 128_000);
         assert_eq!(ProviderKind::OpenAi.max_output_tokens(), 16_384);
         assert_eq!(ProviderKind::Groq.max_output_tokens(), 8_192);
+    }
+
+    // --- #451: provider switch worker propagation ---
+
+    #[tokio::test]
+    async fn test_provider_switch_worker_gets_provider_prefix() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Setup: start on Anthropic, switch to DeepSeek
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        let _output = handle_provider(&mut app, "deepseek").await;
+
+        // Worker message must contain "deepseek/" prefix so worker can switch provider
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model.starts_with("deepseek/"))
+            ),
+            "SetModel should contain provider prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_switch_to_anthropic_worker_gets_prefix() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Set API keys via process env (test_app uses global_home == agent_home,
+        // so .env file isn't loaded by load_for_agent).
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        // Switch to DeepSeek first
+        let _ = handle_provider(&mut app, "deepseek").await;
+        drain_requests(&mut rx);
+
+        // Now switch back to Anthropic — need API key in config since .env isn't read
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"deepseek\"\nanthropic_model = \"claude-sonnet-4-6\"\nanthropic_api_key = \"sk-ant-fake-key\"\n",
+        )
+        .unwrap();
+        let _output = handle_provider(&mut app, "anthropic").await;
+
+        // Worker message must contain "anthropic/" prefix even for Anthropic
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model.starts_with("anthropic/"))
+            ),
+            "SetModel for Anthropic should contain provider prefix"
+        );
+        // Display value should NOT have the prefix
+        assert_eq!(app.model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn test_model_switch_worker_gets_provider_prefix() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Need API key in config (test_app uses global_home == agent_home, .env not read)
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"anthropic\"\nanthropic_api_key = \"sk-ant-fake-key\"\n",
+        )
+        .unwrap();
+
+        // Direct model name on Anthropic — worker should get "anthropic/" prefix
+        let output = handle_model(&mut app, "claude-opus-4-6").await;
+
+        assert!(
+            output.contains("Switched to"),
+            "should switch model, got: {output}"
+        );
+
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model == "anthropic/claude-opus-4-6")
+            ),
+            "SetModel should have anthropic/ prefix"
+        );
+        // Display should be bare for Anthropic
+        assert_eq!(app.model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn test_provider_listing_shows_configured_model() {
+        let (mut app, _rx, tmp) = test_app().await;
+
+        // Configure a non-default model for DeepSeek
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"anthropic\"\ndeepseek_model = \"deepseek-reasoner\"\n",
+        )
+        .unwrap();
+
+        let output = handle_provider(&mut app, "").await;
+
+        // Should show the configured model, not the default "deepseek-chat"
+        assert!(
+            output.contains("deepseek-reasoner"),
+            "should show configured model for deepseek, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_format_helpers() {
+        use mika_common::llm::ProviderKind;
+
+        // format_worker_model always includes prefix
+        assert_eq!(
+            format_worker_model(ProviderKind::Anthropic, "claude-sonnet-4-6"),
+            "anthropic/claude-sonnet-4-6"
+        );
+        assert_eq!(
+            format_worker_model(ProviderKind::DeepSeek, "deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+
+        // format_display_model: no prefix for Anthropic, prefix for others
+        assert_eq!(
+            format_display_model(ProviderKind::Anthropic, "claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            format_display_model(ProviderKind::DeepSeek, "deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
     }
 }
