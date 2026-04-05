@@ -14,19 +14,21 @@ pub async fn run(args: TeamsArgs) -> Result<()> {
     home::migrate_to_multi_agent(&global_home)?;
 
     match args.command {
-        TeamsCommand::List => list(&global_home),
+        TeamsCommand::List { format } => list(&global_home, &format),
         TeamsCommand::Create {
             name,
             no_interactive,
         } => create(&global_home, &name, no_interactive),
-        TeamsCommand::Status { name } => status(&global_home, &name),
+        TeamsCommand::Status { name, format } => status(&global_home, &name, &format),
         TeamsCommand::Log {
             name,
             format,
             limit,
         } => log(&global_home, &name, &format, limit),
         TeamsCommand::Delete { name, force } => delete(&global_home, &name, force),
-        TeamsCommand::Validate { name } => validate_teams(&global_home, name.as_deref()),
+        TeamsCommand::Validate { name, format } => {
+            validate_teams(&global_home, name.as_deref(), &format)
+        }
     }
 }
 
@@ -47,26 +49,54 @@ pub(crate) fn open_container_db_async(global_home: &std::path::Path) -> Result<A
     Ok(AsyncDatabase::new(db))
 }
 
-fn list(global_home: &std::path::Path) -> Result<()> {
+fn list(global_home: &std::path::Path, format: &crate::cli::OutputFormat) -> Result<()> {
     let teams = team::list_teams(global_home);
 
     if teams.is_empty() {
-        println!("\n  No teams found. Run `mika teams create <name>` to create one.\n");
+        match format {
+            crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Text => {
+                println!("\n  No teams found. Run `mika teams create <name>` to create one.\n");
+            }
+        }
         return Ok(());
     }
 
-    println!("\n  Teams:");
-    for name in &teams {
-        match team::load_team(global_home, name) {
-            Ok(def) => {
-                println!("    {name} ({} agents)", def.agents.len());
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = teams
+                .iter()
+                .map(|name| match team::load_team(global_home, name) {
+                    Ok(def) => serde_json::json!({
+                        "name": name,
+                        "orchestrator": def.team.orchestrator,
+                        "agents": def.agents.iter().map(|a| &a.name).collect::<Vec<_>>(),
+                        "agent_count": def.agents.len(),
+                        "max_iterations": def.flow.max_iterations,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "name": name,
+                        "error": e.to_string(),
+                    }),
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!("\n  Teams:");
+            for name in &teams {
+                match team::load_team(global_home, name) {
+                    Ok(def) => {
+                        println!("    {name} ({} agents)", def.agents.len());
+                    }
+                    Err(e) => {
+                        println!("    {name} (error loading: {e})");
+                    }
+                }
             }
-            Err(e) => {
-                println!("    {name} (error loading: {e})");
-            }
+            println!();
         }
     }
-    println!();
     Ok(())
 }
 
@@ -133,7 +163,11 @@ fn create(global_home: &std::path::Path, name: &str, no_interactive: bool) -> Re
     Ok(())
 }
 
-fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
+fn status(
+    global_home: &std::path::Path,
+    name: &str,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
     let name = team::normalize_team_name(name);
 
     if !team::team_exists(global_home, &name) {
@@ -142,31 +176,53 @@ fn status(global_home: &std::path::Path, name: &str) -> Result<()> {
 
     let def = team::load_team(global_home, &name)?;
 
-    println!("\n  Team: {}", def.team.name);
-    println!("  Orchestrator: {}", def.team.orchestrator);
-    println!("  Agents:");
-    for agent in &def.agents {
-        println!(
-            "    {} (role: {}): {}",
-            agent.name, agent.role, agent.mandate
-        );
-    }
-    println!("  Max iterations: {}", def.flow.max_iterations);
+    let latest_run = open_container_db(global_home)
+        .ok()
+        .and_then(|db| db.load_latest_team_run(&name).ok().flatten());
 
-    // Show latest run if available from shared container DB
-    if let Ok(db) = open_container_db(global_home)
-        && let Ok(Some(latest)) = db.load_latest_team_run(&name)
-    {
-        println!("\n  Latest run:");
-        println!("    ID: {}", latest.id);
-        println!("    Goal: {}", latest.goal);
-        println!("    Status: {}", latest.status);
-        println!("    Started: {}", format_ts(&latest.started_at));
-        if let Some(ref ended) = latest.ended_at {
-            println!("    Ended: {}", format_ts(ended));
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let mut obj = serde_json::json!({
+                "team": def,
+                "latest_run": serde_json::Value::Null,
+            });
+            if let Some(run) = latest_run {
+                obj["latest_run"] = serde_json::json!({
+                    "id": run.id,
+                    "team_name": run.team_name,
+                    "goal": run.goal,
+                    "status": run.status,
+                    "started_at": run.started_at,
+                    "ended_at": run.ended_at,
+                });
+            }
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!("\n  Team: {}", def.team.name);
+            println!("  Orchestrator: {}", def.team.orchestrator);
+            println!("  Agents:");
+            for agent in &def.agents {
+                println!(
+                    "    {} (role: {}): {}",
+                    agent.name, agent.role, agent.mandate
+                );
+            }
+            println!("  Max iterations: {}", def.flow.max_iterations);
+
+            if let Some(latest) = latest_run {
+                println!("\n  Latest run:");
+                println!("    ID: {}", latest.id);
+                println!("    Goal: {}", latest.goal);
+                println!("    Status: {}", latest.status);
+                println!("    Started: {}", format_ts(&latest.started_at));
+                if let Some(ref ended) = latest.ended_at {
+                    println!("    Ended: {}", format_ts(ended));
+                }
+            }
+            println!();
         }
     }
-    println!();
 
     Ok(())
 }
@@ -267,7 +323,11 @@ fn delete(global_home: &std::path::Path, name: &str, force: bool) -> Result<()> 
     Ok(())
 }
 
-fn validate_teams(global_home: &std::path::Path, name: Option<&str>) -> Result<()> {
+fn validate_teams(
+    global_home: &std::path::Path,
+    name: Option<&str>,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
     use mika_agent::skills::index::DiagnosticLevel;
     use mika_agent::validate::validate_team_config;
 
@@ -275,7 +335,10 @@ fn validate_teams(global_home: &std::path::Path, name: Option<&str>) -> Result<(
         Some(n) => {
             team::validate_team_name(n)?;
             if !team::team_exists(global_home, n) {
-                println!("\n  Team '{n}' not found.\n");
+                match format {
+                    crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Text => println!("\n  Team '{n}' not found.\n"),
+                }
                 return Ok(());
             }
             vec![n.to_string()]
@@ -283,16 +346,23 @@ fn validate_teams(global_home: &std::path::Path, name: Option<&str>) -> Result<(
         None => {
             let found = team::list_teams(global_home);
             if found.is_empty() {
-                println!("\n  No teams found.\n");
+                match format {
+                    crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Text => println!("\n  No teams found.\n"),
+                }
                 return Ok(());
             }
             found
         }
     };
 
-    println!();
+    let mut all_diags: Vec<serde_json::Value> = Vec::new();
     let mut total_errors = 0;
     let mut total_warnings = 0;
+
+    if matches!(format, crate::cli::OutputFormat::Text) {
+        println!();
+    }
 
     for team_name in &teams {
         let diags = validate_team_config(global_home, team_name);
@@ -306,23 +376,43 @@ fn validate_teams(global_home: &std::path::Path, name: Option<&str>) -> Result<(
             total_warnings += 1;
         }
 
-        println!("  {team_name}/");
-        for diag in &diags {
-            println!("    {} {}", diag.tag(), diag.message);
+        match format {
+            crate::cli::OutputFormat::Json => {
+                for diag in &diags {
+                    all_diags.push(serde_json::json!({
+                        "team": team_name,
+                        "level": diag.level,
+                        "message": diag.message,
+                    }));
+                }
+            }
+            crate::cli::OutputFormat::Text => {
+                println!("  {team_name}/");
+                for diag in &diags {
+                    println!("    {} {}", diag.tag(), diag.message);
+                }
+            }
         }
     }
 
-    println!();
-    let total = teams.len();
-    let ok_count = total - total_errors;
-    if total_errors == 0 && total_warnings == 0 {
-        println!("  All {total} team(s) valid.");
-    } else {
-        println!(
-            "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
-        );
+    match format {
+        crate::cli::OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&all_diags)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!();
+            let total = teams.len();
+            let ok_count = total - total_errors;
+            if total_errors == 0 && total_warnings == 0 {
+                println!("  All {total} team(s) valid.");
+            } else {
+                println!(
+                    "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
+                );
+            }
+            println!();
+        }
     }
-    println!();
 
     if total_errors > 0 {
         bail!("team validation failed: {} error(s) found", total_errors);

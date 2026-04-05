@@ -196,6 +196,10 @@ pub struct AskArgs {
 pub struct StatusArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
 }
 
 #[derive(Clone, Default, ValueEnum)]
@@ -268,6 +272,9 @@ pub enum AgentsCommand {
     Validate {
         /// Agent name to validate (omit to validate all)
         name: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
 }
 
@@ -280,7 +287,11 @@ pub struct TeamsArgs {
 #[derive(Subcommand)]
 pub enum TeamsCommand {
     /// List all teams
-    List,
+    List {
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Create a new team (interactive)
     Create {
         /// Name for the new team (lowercase, alphanumeric, hyphens)
@@ -293,6 +304,9 @@ pub enum TeamsCommand {
     Status {
         /// Name of the team
         name: String,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
     /// Show execution history
     Log {
@@ -317,6 +331,9 @@ pub enum TeamsCommand {
     Validate {
         /// Team name to validate (omit to validate all)
         name: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
 }
 
@@ -332,7 +349,11 @@ pub struct SkillsArgs {
 #[derive(Subcommand)]
 pub enum SkillsCommand {
     /// List all skills
-    List,
+    List {
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Show details for a specific skill
     Info {
         /// Skill name
@@ -391,6 +412,9 @@ pub enum SkillsCommand {
     Validate {
         /// Skill name to validate (omit to validate all)
         name: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
 }
 
@@ -406,7 +430,12 @@ pub struct MemoryArgs {
 #[derive(Subcommand)]
 pub enum MemoryCommand {
     /// Search across all memory types
-    Search { query: String },
+    Search {
+        query: String,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// List tracked people
     People,
     /// List commitments
@@ -488,6 +517,9 @@ pub enum ConfigCommand {
         /// Show value source per key
         #[arg(long)]
         verbose: bool,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
 }
 

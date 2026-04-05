@@ -209,7 +209,7 @@ pub struct CoreMemoryEntry {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Person {
     pub id: i64,
     pub canonical_name: String,
@@ -220,7 +220,7 @@ pub struct Person {
     pub mention_count: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Commitment {
     pub id: i64,
     pub description: String,
@@ -231,7 +231,7 @@ pub struct Commitment {
     pub completed_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Preference {
     pub category: String,
     pub value: String,
@@ -261,7 +261,7 @@ pub struct TaskHealthSummary {
     pub anomalies: Vec<TaskHealthAnomaly>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Event {
     pub id: i64,
     pub description: String,

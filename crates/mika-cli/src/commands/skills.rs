@@ -20,9 +20,13 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     let skills_dir = agent_home.join("skills");
 
     match args.command {
-        None | Some(SkillsCommand::List) => {
+        None => {
             let registry = SkillRegistry::from_dir(&skills_dir);
-            list_skills(&registry, &agent_home);
+            list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
+        }
+        Some(SkillsCommand::List { format }) => {
+            let registry = SkillRegistry::from_dir(&skills_dir);
+            list_skills(&registry, &agent_home, &format)?;
         }
         Some(SkillsCommand::Info { name }) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
@@ -49,75 +53,127 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Update { name }) => {
             update_skills(&agent_home, &skills_dir, name.as_deref())?;
         }
-        Some(SkillsCommand::Validate { name }) => {
-            validate_skills(&skills_dir, name.as_deref())?;
+        Some(SkillsCommand::Validate { name, format }) => {
+            validate_skills(&skills_dir, name.as_deref(), &format)?;
         }
     }
     Ok(())
 }
 
-fn list_skills(registry: &SkillRegistry, agent_home: &Path) {
+fn list_skills(
+    registry: &SkillRegistry,
+    agent_home: &Path,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
     let skills = registry.skills();
     if skills.is_empty() {
-        println!("\n  No skills loaded.\n");
-        println!("  Create one with: mika skills create <name>");
-        return;
+        match format {
+            crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Text => {
+                println!("\n  No skills loaded.\n");
+                println!("  Create one with: mika skills create <name>");
+            }
+        }
+        return Ok(());
     }
     let lock = marketplace::read_lock(agent_home);
-    println!("\n  Skills ({}):", skills.len());
-    for entry in skills {
-        let name = &entry.manifest.skill.name;
-        let tool_count = entry.skill_tools.len();
-        let tools_desc = if tool_count > 0 {
-            format!("{} tools", tool_count)
-        } else {
-            "no tools".to_string()
-        };
-        let origin = if bundled_skills::is_bundled_skill(name) {
-            " [built-in]"
-        } else if let Some(mp_entry) = lock.skills.get(name.as_str()) {
-            if mp_entry.linked {
-                " [marketplace/linked]"
-            } else {
-                " [marketplace]"
+
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = skills
+                .iter()
+                .map(|entry| {
+                    let name = &entry.manifest.skill.name;
+                    let origin = if bundled_skills::is_bundled_skill(name) {
+                        "built-in"
+                    } else if let Some(mp_entry) = lock.skills.get(name.as_str()) {
+                        if mp_entry.linked {
+                            "marketplace/linked"
+                        } else {
+                            "marketplace"
+                        }
+                    } else {
+                        "custom"
+                    };
+                    let llm_override = if !entry.manifest.llm.is_empty() {
+                        let provider = entry.manifest.llm.provider.as_deref().unwrap_or("*");
+                        let model = entry.manifest.llm.model.as_deref().unwrap_or("default");
+                        Some(format!("{provider}/{model}"))
+                    } else {
+                        None
+                    };
+                    serde_json::json!({
+                        "name": name,
+                        "description": entry.manifest.skill.description,
+                        "origin": origin,
+                        "enabled": entry.enabled,
+                        "always_on": entry.manifest.skill.always_on,
+                        "tools": entry.skill_tools.len(),
+                        "variants": entry.variant_count(),
+                        "llm_override": llm_override,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!("\n  Skills ({}):", skills.len());
+            for entry in skills {
+                let name = &entry.manifest.skill.name;
+                let tool_count = entry.skill_tools.len();
+                let tools_desc = if tool_count > 0 {
+                    format!("{} tools", tool_count)
+                } else {
+                    "no tools".to_string()
+                };
+                let origin = if bundled_skills::is_bundled_skill(name) {
+                    " [built-in]"
+                } else if let Some(mp_entry) = lock.skills.get(name.as_str()) {
+                    if mp_entry.linked {
+                        " [marketplace/linked]"
+                    } else {
+                        " [marketplace]"
+                    }
+                } else {
+                    " [custom]"
+                };
+                let always_on = if entry.manifest.skill.always_on {
+                    " [always on]"
+                } else {
+                    ""
+                };
+                let status = if entry.enabled { "" } else { " [disabled]" };
+                let variants = {
+                    let count = entry.variant_count();
+                    if count > 0 {
+                        format!(" [variants: {count}]")
+                    } else {
+                        String::new()
+                    }
+                };
+                let llm_badge = if !entry.manifest.llm.is_empty() {
+                    let provider = entry.manifest.llm.provider.as_deref().unwrap_or("*");
+                    let model = entry.manifest.llm.model.as_deref().unwrap_or("default");
+                    format!(" [llm: {provider}/{model}]")
+                } else {
+                    String::new()
+                };
+                println!(
+                    "    {} ({}) — {}{}{}{}{}{}",
+                    name,
+                    tools_desc,
+                    entry.manifest.skill.description,
+                    origin,
+                    always_on,
+                    status,
+                    variants,
+                    llm_badge
+                );
             }
-        } else {
-            " [custom]"
-        };
-        let always_on = if entry.manifest.skill.always_on {
-            " [always on]"
-        } else {
-            ""
-        };
-        let status = if entry.enabled { "" } else { " [disabled]" };
-        let variants = {
-            let count = entry.variant_count();
-            if count > 0 {
-                format!(" [variants: {count}]")
-            } else {
-                String::new()
-            }
-        };
-        let llm_badge = if !entry.manifest.llm.is_empty() {
-            let provider = entry.manifest.llm.provider.as_deref().unwrap_or("*");
-            let model = entry.manifest.llm.model.as_deref().unwrap_or("default");
-            format!(" [llm: {provider}/{model}]")
-        } else {
-            String::new()
-        };
-        println!(
-            "    {} ({}) — {}{}{}{}{}{}",
-            name,
-            tools_desc,
-            entry.manifest.skill.description,
-            origin,
-            always_on,
-            status,
-            variants,
-            llm_badge
-        );
+            println!();
+        }
     }
-    println!();
+    Ok(())
 }
 
 fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
@@ -951,24 +1007,41 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
     Ok(())
 }
 
-fn validate_skills(skills_dir: &Path, name: Option<&str>) -> Result<()> {
+fn validate_skills(
+    skills_dir: &Path,
+    name: Option<&str>,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
     if !skills_dir.is_dir() {
-        println!(
-            "\n  No skills directory found at {}\n",
-            skills_dir.display()
-        );
+        match format {
+            crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Text => {
+                println!(
+                    "\n  No skills directory found at {}\n",
+                    skills_dir.display()
+                );
+            }
+        }
         return Ok(());
     }
 
     let dirs: Vec<_> = match name {
         Some(n) => {
             if let Err(e) = validate_skill_name(n) {
-                println!("\n  Invalid skill name: {e}\n");
+                match format {
+                    crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Text => println!("\n  Invalid skill name: {e}\n"),
+                }
                 return Ok(());
             }
             let skill_dir = skills_dir.join(n);
             if !skill_dir.is_dir() {
-                println!("\n  Skill '{n}' not found at {}\n", skill_dir.display());
+                match format {
+                    crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Text => {
+                        println!("\n  Skill '{n}' not found at {}\n", skill_dir.display());
+                    }
+                }
                 return Ok(());
             }
             vec![(n.to_string(), skill_dir)]
@@ -991,13 +1064,20 @@ fn validate_skills(skills_dir: &Path, name: Option<&str>) -> Result<()> {
     };
 
     if dirs.is_empty() {
-        println!("\n  No skills found to validate.\n");
+        match format {
+            crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Text => println!("\n  No skills found to validate.\n"),
+        }
         return Ok(());
     }
 
-    println!();
+    let mut all_diags: Vec<serde_json::Value> = Vec::new();
     let mut total_errors = 0;
     let mut total_warnings = 0;
+
+    if matches!(format, crate::cli::OutputFormat::Text) {
+        println!();
+    }
 
     for (dir_name, dir_path) in &dirs {
         let diags = validate_skill(dir_path);
@@ -1011,23 +1091,43 @@ fn validate_skills(skills_dir: &Path, name: Option<&str>) -> Result<()> {
             total_warnings += 1;
         }
 
-        println!("  {dir_name}/");
-        for diag in &diags {
-            println!("    {} {}", diag.tag(), diag.message);
+        match format {
+            crate::cli::OutputFormat::Json => {
+                for diag in &diags {
+                    all_diags.push(serde_json::json!({
+                        "skill": dir_name,
+                        "level": diag.level,
+                        "message": diag.message,
+                    }));
+                }
+            }
+            crate::cli::OutputFormat::Text => {
+                println!("  {dir_name}/");
+                for diag in &diags {
+                    println!("    {} {}", diag.tag(), diag.message);
+                }
+            }
         }
     }
 
-    println!();
-    let total = dirs.len();
-    let ok_count = total - total_errors;
-    if total_errors == 0 && total_warnings == 0 {
-        println!("  All {total} skill(s) valid.");
-    } else {
-        println!(
-            "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
-        );
+    match format {
+        crate::cli::OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&all_diags)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!();
+            let total = dirs.len();
+            let ok_count = total - total_errors;
+            if total_errors == 0 && total_warnings == 0 {
+                println!("  All {total} skill(s) valid.");
+            } else {
+                println!(
+                    "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
+                );
+            }
+            println!();
+        }
     }
-    println!();
 
     if total_errors > 0 {
         bail!("skill validation failed: {} error(s) found", total_errors);

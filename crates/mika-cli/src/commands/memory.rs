@@ -25,7 +25,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
                 println!();
             }
         }
-        Some(MemoryCommand::Search { query }) => {
+        Some(MemoryCommand::Search { query, format }) => {
             let (people, commitments, preferences, events) = tokio::join!(
                 db.search_people(&query),
                 db.search_commitments(&query),
@@ -33,71 +33,84 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
                 db.search_events(&query),
             );
 
-            let mut found = false;
-            println!();
-
-            if let Ok(ref items) = people
-                && !items.is_empty()
-            {
-                found = true;
-                println!("  People:");
-                for p in items {
-                    println!(
-                        "    {} — {} {}",
-                        p.canonical_name,
-                        p.relationship.as_deref().unwrap_or(""),
-                        p.notes.as_deref().unwrap_or("")
-                    );
+            match format {
+                crate::cli::OutputFormat::Json => {
+                    let obj = serde_json::json!({
+                        "people": people.unwrap_or_default(),
+                        "commitments": commitments.unwrap_or_default(),
+                        "preferences": preferences.unwrap_or_default(),
+                        "events": events.unwrap_or_default(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&obj)?);
                 }
-                println!();
-            }
+                crate::cli::OutputFormat::Text => {
+                    let mut found = false;
+                    println!();
 
-            if let Ok(ref items) = commitments
-                && !items.is_empty()
-            {
-                found = true;
-                println!("  Commitments:");
-                for c in items {
-                    println!(
-                        "    #{} [{}] {} {}",
-                        c.id,
-                        c.status,
-                        c.description,
-                        c.due_date.as_deref().unwrap_or("")
-                    );
+                    if let Ok(ref items) = people
+                        && !items.is_empty()
+                    {
+                        found = true;
+                        println!("  People:");
+                        for p in items {
+                            println!(
+                                "    {} — {} {}",
+                                p.canonical_name,
+                                p.relationship.as_deref().unwrap_or(""),
+                                p.notes.as_deref().unwrap_or("")
+                            );
+                        }
+                        println!();
+                    }
+
+                    if let Ok(ref items) = commitments
+                        && !items.is_empty()
+                    {
+                        found = true;
+                        println!("  Commitments:");
+                        for c in items {
+                            println!(
+                                "    #{} [{}] {} {}",
+                                c.id,
+                                c.status,
+                                c.description,
+                                c.due_date.as_deref().unwrap_or("")
+                            );
+                        }
+                        println!();
+                    }
+
+                    if let Ok(ref items) = preferences
+                        && !items.is_empty()
+                    {
+                        found = true;
+                        println!("  Preferences:");
+                        for p in items {
+                            println!("    {}: {}", p.category, p.value);
+                        }
+                        println!();
+                    }
+
+                    if let Ok(ref items) = events
+                        && !items.is_empty()
+                    {
+                        found = true;
+                        println!("  Events:");
+                        for e in items {
+                            println!(
+                                "    #{} {} {}",
+                                e.id,
+                                e.description,
+                                e.event_date.as_deref().unwrap_or("")
+                            );
+                        }
+                        println!();
+                    }
+
+                    if !found {
+                        println!("  No results for \"{query}\"\n");
+                    }
                 }
-                println!();
-            }
-
-            if let Ok(ref items) = preferences
-                && !items.is_empty()
-            {
-                found = true;
-                println!("  Preferences:");
-                for p in items {
-                    println!("    {}: {}", p.category, p.value);
-                }
-                println!();
-            }
-
-            if let Ok(ref items) = events
-                && !items.is_empty()
-            {
-                found = true;
-                println!("  Events:");
-                for e in items {
-                    println!(
-                        "    #{} {} {}",
-                        e.id,
-                        e.description,
-                        e.event_date.as_deref().unwrap_or("")
-                    );
-                }
-                println!();
-            }
-
-            if !found {
-                println!("  No results for \"{query}\"\n");
             }
         }
         Some(MemoryCommand::People) => {
