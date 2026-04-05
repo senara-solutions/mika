@@ -784,6 +784,20 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                     ));
                 }
 
+                // Pre-fetch model list for the new provider (fire-and-forget cache warm)
+                let home = app.home_dir.clone();
+                let base_url_owned = config.base_url.clone();
+                let api_key_owned = config.api_key.clone();
+                tokio::spawn(async move {
+                    let _ = mika_common::llm::models::get_models(
+                        &home,
+                        new_provider,
+                        base_url_owned.as_deref(),
+                        api_key_owned.as_deref(),
+                    )
+                    .await;
+                });
+
                 format!("Switched to {new_provider} (model: {model}).{persist_warning}{notes}")
             }
             Err(e) => e,
