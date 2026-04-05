@@ -42,11 +42,11 @@ pub fn complete_model(
         })
         .collect();
 
-    // Try to read cached models for the current provider (synchronous, no API call)
-    if let Ok(settings) =
-        mika_common::config::Settings::load_for_agent(ctx.global_home, ctx.home_dir)
+    // Try to read cached models for the current TUI provider (synchronous, no API call).
+    // Uses ctx.provider (the TUI's active provider) rather than disk config, which may
+    // be stale after in-session provider switches.
     {
-        let provider = settings.llm_provider;
+        let provider = ctx.provider;
         let cache_path = ctx
             .home_dir
             .join("cache")
@@ -71,18 +71,29 @@ pub fn complete_model(
     (filter_by_prefix(items, arg_text), " Models ")
 }
 
-/// `/provider <tab>` — LLM provider names.
+/// `/provider <tab>` — LLM provider names with configured models.
 pub fn complete_provider(
     arg_text: &str,
     _arg_index: usize,
-    _ctx: &CompletionContext,
+    ctx: &CompletionContext,
 ) -> (Vec<CompletionItem>, &'static str) {
     use mika_common::llm::ProviderKind;
+
+    // Load settings to show configured models (same pattern as complete_model)
+    let settings =
+        mika_common::config::Settings::load_for_agent(ctx.global_home, ctx.home_dir).ok();
+
     let items: Vec<CompletionItem> = ProviderKind::ALL
         .iter()
-        .map(|p| CompletionItem {
-            value: p.to_string(),
-            description: Some(format!("default: {}", p.default_model())),
+        .map(|p| {
+            let model = settings
+                .as_ref()
+                .and_then(|s| s.provider_fields(*p).0.map(String::from))
+                .unwrap_or_else(|| p.default_model().to_string());
+            CompletionItem {
+                value: p.to_string(),
+                description: Some(model),
+            }
         })
         .collect();
     (filter_by_prefix(items, arg_text), " Providers ")
@@ -393,6 +404,7 @@ mod tests {
             current_agent: "mika",
             cwd,
             args_str,
+            provider: mika_common::llm::ProviderKind::Anthropic,
         }
     }
 

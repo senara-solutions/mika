@@ -731,6 +731,7 @@ fn trigger_argument_completion(app: &mut App<'_>) {
         current_agent: &app.agent_name,
         cwd: &cwd,
         args_str,
+        provider: app.provider,
     };
 
     let (items, title) = completer(arg_prefix, arg_index, &ctx);
