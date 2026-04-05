@@ -544,17 +544,20 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
         );
     }
 
-    // Not an alias — treat as a direct model name for the current provider
-    // Try provider/model format first (e.g., "deepseek/deepseek-reasoner")
-    let (target_provider, model_name) = if let Some(slash_pos) = args.find('/') {
-        let prefix = &args[..slash_pos];
-        match prefix.parse::<ProviderKind>() {
-            Ok(p) => (p, &args[slash_pos + 1..]),
-            Err(_) => (app.provider, args),
-        }
-    } else {
-        (app.provider, args)
-    };
+    // Not an alias — treat as a direct model name for the current provider.
+    // If current provider uses slash-separated model names (e.g., OpenRouter uses
+    // "qwen/qwen-plus"), don't interpret the slash as a cross-provider switch.
+    let (target_provider, model_name) =
+        if app.provider.model_names_contain_slash() || !args.contains('/') {
+            (app.provider, args)
+        } else {
+            let slash_pos = args.find('/').unwrap();
+            let prefix = &args[..slash_pos];
+            match prefix.parse::<ProviderKind>() {
+                Ok(p) => (p, &args[slash_pos + 1..]),
+                Err(_) => (app.provider, args),
+            }
+        };
 
     // Pre-validate
     if let Err(e) = validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider) {
@@ -740,7 +743,6 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
 
                 // Pre-validate: load settings with the new provider and try to build it
                 let config_path = app.home_dir.join("config.toml");
-                let old_provider = app.provider;
                 let settings = match validate_provider_switch_for(
                     &app.home_dir,
                     &app.global_home,
@@ -792,16 +794,8 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                     }
                 }
 
-                // Warn about stale model field from the provider being switched away from
-                let mut notes = String::new();
-                if settings.provider_fields(old_provider).0.is_some() {
-                    let old_key = format!("{}_model", old_provider.config_prefix());
-                    notes.push_str(&format!(
-                        "\nNote: {old_key} is still set (kept for switching back)"
-                    ));
-                }
-
                 // Warn if llm_max_tokens exceeds the new provider's limit
+                let mut notes = String::new();
                 let max = new_provider.max_output_tokens();
                 if settings.llm_max_tokens > max {
                     notes.push_str(&format!(
@@ -2043,28 +2037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_switch_shows_stale_field_warning() {
-        let (mut app, _rx, tmp) = test_app().await;
-
-        // Set up: anthropic_model is configured (the provider we're switching FROM)
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "llm_provider = \"anthropic\"\nanthropic_model = \"claude-opus-4-6\"\n",
-        )
-        .unwrap();
-        let env_path = tmp.path().join(".env");
-        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
-
-        let output = handle_provider(&mut app, "deepseek").await;
-
-        assert!(
-            output.contains("anthropic_model is still set"),
-            "should warn about stale field, got: {output}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_provider_switch_warns_max_tokens() {
         let (mut app, _rx, tmp) = test_app().await;
 
@@ -2290,6 +2262,58 @@ mod tests {
         assert_eq!(
             format_display_model(ProviderKind::DeepSeek, "deepseek-chat"),
             "deepseek/deepseek-chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_on_openrouter_keeps_slash_model_name() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Set up: user is on OpenRouter
+        app.provider = ProviderKind::OpenRouter;
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_provider = \"openrouter\"\n").unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "MIKA_OPENROUTER_API_KEY=sk-or-fake-key-for-test\n",
+        )
+        .unwrap();
+
+        // When on OpenRouter, "qwen/qwen-plus" should be treated as an OpenRouter model
+        // name, NOT as a cross-provider switch to the Qwen provider.
+        let output = handle_model(&mut app, "qwen/qwen-plus").await;
+
+        // Should stay on OpenRouter, not switch to Qwen
+        assert_eq!(
+            app.provider,
+            ProviderKind::OpenRouter,
+            "should stay on OpenRouter, got: {:?}",
+            app.provider
+        );
+        assert!(
+            output.contains("openrouter/qwen/qwen-plus"),
+            "should show openrouter model, got: {output}"
+        );
+
+        // Worker should receive openrouter/qwen/qwen-plus (not qwen/qwen-plus)
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model == "openrouter/qwen/qwen-plus")
+            ),
+            "SetModel should have openrouter/ prefix"
+        );
+
+        // Config should have openrouter_model, not qwen_model
+        let config_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config_content.contains("openrouter_model"),
+            "should persist to openrouter_model, config: {config_content}"
+        );
+        assert!(
+            !config_content.contains("qwen_model"),
+            "should NOT create qwen_model, config: {config_content}"
         );
     }
 }

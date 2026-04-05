@@ -42,11 +42,11 @@ pub fn complete_model(
         })
         .collect();
 
-    // Try to read cached models for the current provider (synchronous, no API call)
-    if let Ok(settings) =
-        mika_common::config::Settings::load_for_agent(ctx.global_home, ctx.home_dir)
+    // Try to read cached models for the current TUI provider (synchronous, no API call).
+    // Uses ctx.provider (the TUI's active provider) rather than disk config, which may
+    // be stale after in-session provider switches.
     {
-        let provider = settings.llm_provider;
+        let provider = ctx.provider;
         let cache_path = ctx
             .home_dir
             .join("cache")
@@ -404,6 +404,7 @@ mod tests {
             current_agent: "mika",
             cwd,
             args_str,
+            provider: mika_common::llm::ProviderKind::Anthropic,
         }
     }
 

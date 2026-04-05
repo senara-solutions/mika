@@ -22,6 +22,8 @@ pub struct CompletionContext<'a> {
     pub cwd: &'a Path,
     /// Full args string (everything after the command name), for multi-arg completers.
     pub args_str: &'a str,
+    /// Current active provider in the TUI (may differ from config on disk).
+    pub provider: mika_common::llm::ProviderKind,
 }
 
 /// What kind of completion is active.

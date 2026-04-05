@@ -237,6 +237,12 @@ impl ProviderKind {
         }
     }
 
+    /// Whether this provider's model identifiers contain slashes (e.g., `qwen/qwen-plus`).
+    /// Used to avoid misinterpreting model names as cross-provider switches.
+    pub fn model_names_contain_slash(&self) -> bool {
+        matches!(self, ProviderKind::OpenRouter)
+    }
+
     /// Default model for this provider (used when no model is explicitly configured).
     pub fn default_model(&self) -> &'static str {
         match self {
