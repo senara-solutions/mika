@@ -1,7 +1,7 @@
 ---
 title: "Fix text-based tool calls: extract XML tool calls and add agent-loop recovery"
 type: fix
-status: active
+status: completed
 date: 2026-04-05
 ---
 
