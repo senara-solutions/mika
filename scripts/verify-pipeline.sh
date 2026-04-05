@@ -4,6 +4,7 @@
 # Checks:
 #   1. A plan doc exists in docs/plans/*.md (in the branch diff)
 #   2. Source code changes exist beyond the plan doc
+#   3. A compound doc exists in docs/solutions/*.md (in the branch diff)
 #
 # Usage:
 #   ./scripts/verify-pipeline.sh              # local (compares to main)
@@ -41,9 +42,16 @@ if [[ -z "$CODE" ]]; then
   ERRORS=$((ERRORS + 1))
 fi
 
+# Check 3: Compound doc in docs/solutions/
+COMPOUND=$(echo "$ALL" | grep '^docs/solutions/.*\.md$' || true)
+if [[ -z "$COMPOUND" ]]; then
+  echo "MISSING: No compound doc in docs/solutions/. Run /ce:compound." >&2
+  ERRORS=$((ERRORS + 1))
+fi
+
 if [[ $ERRORS -gt 0 ]]; then
   echo "Verification FAILED: $ERRORS missing artifact(s)." >&2
   exit 1
 fi
 
-echo "Pipeline verification passed. Plan: $PLAN"
+echo "Pipeline verification passed. Plan: $PLAN Compound: $COMPOUND"
