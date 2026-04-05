@@ -32,6 +32,10 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 │       ├── mcp.json                  # MCP server config (0600)
 │       ├── marketplace.lock          # Marketplace skill tracking (TOML)
 │       ├── .input_history            # TUI input history (JSON, 0600)
+│       ├── cache/                    # Cached data (0700)
+│       │   └── models/              # Provider model lists (0600 files, 24h TTL)
+│       │       ├── deepseek.json
+│       │       └── openai.json
 │       ├── logs/                     # Daily-rotating logs (0700)
 │       │   ├── mika.log
 │       │   └── mika.log.YYYY-MM-DD
