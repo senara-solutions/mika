@@ -106,7 +106,25 @@ New `mika-common/src/llm/models.rs` module fetches available models from provide
 
 Cache stored per-agent at `{agent_home}/cache/models/{provider}.json` with 24h TTL. Graceful fallback: fresh cache → API fetch → stale cache → empty.
 
-### 6. apply_model_switch helper
+### 6. Background model cache prefetch on provider switch
+
+After a successful `/provider` switch, spawns a fire-and-forget `tokio::spawn` to call `get_models()` for the new provider. This pre-warms the model list cache so that subsequent `/model` invocations respond instantly instead of blocking on an API fetch:
+
+```rust
+let home = app.home_dir.clone();
+let base_url_owned = config.base_url.clone();
+let api_key_owned = config.api_key.clone();
+tokio::spawn(async move {
+    let _ = mika_common::llm::models::get_models(
+        &home, new_provider,
+        base_url_owned.as_deref(), api_key_owned.as_deref(),
+    ).await;
+});
+```
+
+For hardcoded providers (Anthropic, Google), `get_models()` returns immediately without a network call — the spawn is harmless. Fetch failures are silently discarded.
+
+### 7. apply_model_switch helper
 
 Extracted common logic between alias and direct-name paths into a single `apply_model_switch()` helper to eliminate ~60 LOC duplication.
 
