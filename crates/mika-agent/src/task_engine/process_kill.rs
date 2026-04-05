@@ -9,7 +9,6 @@
 //! PID reuse is rare. For stronger guarantees, store the process start time at
 //! spawn and compare with `/proc/{pid}/stat` field 22 (starttime) before killing.
 
-use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
@@ -25,7 +24,7 @@ const KILL_GRACE_PERIOD_SECS: u64 = 5;
 fn is_process_alive(pid: i64) -> bool {
     #[cfg(target_os = "linux")]
     {
-        PathBuf::from(format!("/proc/{pid}/stat")).exists()
+        std::path::PathBuf::from(format!("/proc/{pid}/stat")).exists()
     }
     #[cfg(not(target_os = "linux"))]
     {

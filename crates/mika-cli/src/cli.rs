@@ -67,6 +67,10 @@ pub enum Commands {
     Dashboard(DashboardArgs),
     /// Manage tokens (GitHub App installation tokens)
     Token(TokenArgs),
+    /// List or switch LLM providers
+    Provider(ProviderArgs),
+    /// List or switch LLM models
+    Model(ModelArgs),
     /// Git credential helper (used by git, not directly by users)
     #[command(name = "credential-helper")]
     CredentialHelper(CredentialHelperArgs),
@@ -86,6 +90,8 @@ impl Commands {
             Commands::Mcp(args) => args.agent_flag.agent.as_deref(),
             Commands::Tasks(args) => args.agent_flag.agent.as_deref(),
             Commands::Agents(args) => args.agent_flag.agent.as_deref(),
+            Commands::Provider(args) => args.agent_flag.agent.as_deref(),
+            Commands::Model(args) => args.agent_flag.agent.as_deref(),
             // No agent override — listed explicitly so adding a new Commands variant
             // produces a compile error, forcing a conscious scoping decision.
             Commands::Setup { .. }
@@ -116,6 +122,8 @@ impl Commands {
             | Commands::Teams(_)
             | Commands::Dashboard(_)
             | Commands::Token(_)
+            | Commands::Provider(_)
+            | Commands::Model(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -530,6 +538,57 @@ pub struct TokenArgs {
 pub enum TokenCommand {
     /// Print a GitHub App installation token to stdout
     Github,
+}
+
+#[derive(clap::Args)]
+pub struct ProviderArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+
+    /// Provider name to switch to (omit to list all)
+    pub name: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Option<ProviderSubcommand>,
+}
+
+#[derive(Subcommand)]
+pub enum ProviderSubcommand {
+    /// Set a provider config field
+    Set {
+        /// Field to set: model, api-key, or base-url
+        #[arg(value_enum)]
+        field: ProviderField,
+        /// Value (required for model/base-url, omit for api-key to use interactive prompt)
+        value: Option<String>,
+    },
+}
+
+#[derive(Clone, ValueEnum)]
+pub enum ProviderField {
+    /// Set the model for the current provider
+    Model,
+    /// Set the API key (interactive prompt, never passed as argument)
+    ApiKey,
+    /// Set the base URL for the current provider
+    BaseUrl,
+}
+
+#[derive(clap::Args)]
+pub struct ModelArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+
+    /// Model name or alias to switch to (omit to list)
+    pub name: Option<String>,
 }
 
 #[derive(clap::Args)]
