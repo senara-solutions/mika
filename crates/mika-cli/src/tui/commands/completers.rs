@@ -71,18 +71,29 @@ pub fn complete_model(
     (filter_by_prefix(items, arg_text), " Models ")
 }
 
-/// `/provider <tab>` — LLM provider names.
+/// `/provider <tab>` — LLM provider names with configured models.
 pub fn complete_provider(
     arg_text: &str,
     _arg_index: usize,
-    _ctx: &CompletionContext,
+    ctx: &CompletionContext,
 ) -> (Vec<CompletionItem>, &'static str) {
     use mika_common::llm::ProviderKind;
+
+    // Load settings to show configured models (same pattern as complete_model)
+    let settings =
+        mika_common::config::Settings::load_for_agent(ctx.global_home, ctx.home_dir).ok();
+
     let items: Vec<CompletionItem> = ProviderKind::ALL
         .iter()
-        .map(|p| CompletionItem {
-            value: p.to_string(),
-            description: Some(format!("default: {}", p.default_model())),
+        .map(|p| {
+            let model = settings
+                .as_ref()
+                .and_then(|s| s.provider_fields(*p).0.map(String::from))
+                .unwrap_or_else(|| p.default_model().to_string());
+            CompletionItem {
+                value: p.to_string(),
+                description: Some(model),
+            }
         })
         .collect();
     (filter_by_prefix(items, arg_text), " Providers ")
