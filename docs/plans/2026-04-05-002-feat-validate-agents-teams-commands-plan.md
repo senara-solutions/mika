@@ -1,7 +1,7 @@
 ---
 title: "feat: add mika validate agents/teams commands"
 type: feat
-status: active
+status: completed
 date: 2026-04-05
 ---
 
