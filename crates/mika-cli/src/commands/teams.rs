@@ -26,6 +26,7 @@ pub async fn run(args: TeamsArgs) -> Result<()> {
             limit,
         } => log(&global_home, &name, &format, limit),
         TeamsCommand::Delete { name, force } => delete(&global_home, &name, force),
+        TeamsCommand::Validate { name } => validate_teams(&global_home, name.as_deref()),
     }
 }
 
@@ -263,5 +264,69 @@ fn delete(global_home: &std::path::Path, name: &str, force: bool) -> Result<()> 
     let dir = team::team_dir(global_home, &name);
     std::fs::remove_dir_all(&dir)?;
     println!("  Deleted team '{name}'.");
+    Ok(())
+}
+
+fn validate_teams(global_home: &std::path::Path, name: Option<&str>) -> Result<()> {
+    use mika_agent::skills::index::DiagnosticLevel;
+    use mika_agent::validate::validate_team_config;
+
+    let teams: Vec<String> = match name {
+        Some(n) => {
+            team::validate_team_name(n)?;
+            if !team::team_exists(global_home, n) {
+                println!("\n  Team '{n}' not found.\n");
+                return Ok(());
+            }
+            vec![n.to_string()]
+        }
+        None => {
+            let found = team::list_teams(global_home);
+            if found.is_empty() {
+                println!("\n  No teams found.\n");
+                return Ok(());
+            }
+            found
+        }
+    };
+
+    println!();
+    let mut total_errors = 0;
+    let mut total_warnings = 0;
+
+    for team_name in &teams {
+        let diags = validate_team_config(global_home, team_name);
+        let has_errors = diags.iter().any(|d| d.level == DiagnosticLevel::Fail);
+        let has_warnings = diags.iter().any(|d| d.level == DiagnosticLevel::Warn);
+
+        if has_errors {
+            total_errors += 1;
+        }
+        if has_warnings {
+            total_warnings += 1;
+        }
+
+        println!("  {team_name}/");
+        for diag in &diags {
+            println!("    {} {}", diag.tag(), diag.message);
+        }
+    }
+
+    println!();
+    let total = teams.len();
+    let ok_count = total - total_errors;
+    if total_errors == 0 && total_warnings == 0 {
+        println!("  All {total} team(s) valid.");
+    } else {
+        println!(
+            "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
+        );
+    }
+    println!();
+
+    if total_errors > 0 {
+        bail!("team validation failed: {} error(s) found", total_errors);
+    }
+
     Ok(())
 }

@@ -256,6 +256,11 @@ pub enum AgentsCommand {
         /// Name for the new agent
         name: String,
     },
+    /// Validate agent configuration
+    Validate {
+        /// Agent name to validate (omit to validate all)
+        name: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -299,6 +304,11 @@ pub enum TeamsCommand {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+    },
+    /// Validate team configuration
+    Validate {
+        /// Team name to validate (omit to validate all)
+        name: Option<String>,
     },
 }
 

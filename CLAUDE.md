@@ -85,6 +85,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `mika credential-helper get` — Git credential helper for HTTPS push with GitHub App tokens (used by git, not directly)
 - `mika setup --mode compose` — Generate `.env` for docker-compose in current directory
 - `mika setup --mode oauth` — Authorize Mika with Claude Pro/Max subscription via PKCE (exchanges `sk-ant-oat*` token for access token, stores in `~/.mika/oauth.json`)
+- `mika agents validate [NAME]` — Validate agent config (provider/model pairing, API key, stale fields, max_tokens, soul.md, MCP, skill LLM overrides). Omit name to validate all agents.
+- `mika teams validate [NAME]` — Validate team config (team.toml, agent existence, orchestrator, flow settings). Omit name to validate all teams.
 
 ## Architecture
 

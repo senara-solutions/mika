@@ -22,6 +22,7 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
         AgentsCommand::Delete { name, force } => delete(&global_home, &name, force),
         AgentsCommand::Switch { name } => switch(&global_home, &name),
         AgentsCommand::Clone { source, name } => clone(&global_home, &source, &name),
+        AgentsCommand::Validate { name } => validate_agents(&global_home, name.as_deref()),
     }
 }
 
@@ -223,6 +224,70 @@ fn clone(global_home: &std::path::Path, source: &str, target: &str) -> Result<()
 
     println!("\n  Cloned '{source}' personality into new agent '{target}'.");
     println!("  The new agent starts with a fresh database (no conversation history).\n");
+    Ok(())
+}
+
+fn validate_agents(global_home: &std::path::Path, name: Option<&str>) -> Result<()> {
+    use mika_agent::skills::index::DiagnosticLevel;
+    use mika_agent::validate::validate_agent;
+
+    let agents: Vec<String> = match name {
+        Some(n) => {
+            agent::validate_agent_name(n)?;
+            if !agent::agent_exists(global_home, n) {
+                println!("\n  Agent '{n}' not found.\n");
+                return Ok(());
+            }
+            vec![n.to_string()]
+        }
+        None => {
+            let found = agent::list_agents(global_home);
+            if found.is_empty() {
+                println!("\n  No agents found.\n");
+                return Ok(());
+            }
+            found
+        }
+    };
+
+    println!();
+    let mut total_errors = 0;
+    let mut total_warnings = 0;
+
+    for agent_name in &agents {
+        let diags = validate_agent(global_home, agent_name);
+        let has_errors = diags.iter().any(|d| d.level == DiagnosticLevel::Fail);
+        let has_warnings = diags.iter().any(|d| d.level == DiagnosticLevel::Warn);
+
+        if has_errors {
+            total_errors += 1;
+        }
+        if has_warnings {
+            total_warnings += 1;
+        }
+
+        println!("  {agent_name}/");
+        for diag in &diags {
+            println!("    {} {}", diag.tag(), diag.message);
+        }
+    }
+
+    println!();
+    let total = agents.len();
+    let ok_count = total - total_errors;
+    if total_errors == 0 && total_warnings == 0 {
+        println!("  All {total} agent(s) valid.");
+    } else {
+        println!(
+            "  {ok_count}/{total} valid, {total_errors} with errors, {total_warnings} with warnings."
+        );
+    }
+    println!();
+
+    if total_errors > 0 {
+        bail!("agent validation failed: {} error(s) found", total_errors);
+    }
+
     Ok(())
 }
 

@@ -405,19 +405,19 @@ pub struct SkillDiagnostic {
 }
 
 impl SkillDiagnostic {
-    fn ok(msg: impl Into<String>) -> Self {
+    pub fn ok(msg: impl Into<String>) -> Self {
         Self {
             level: DiagnosticLevel::Ok,
             message: msg.into(),
         }
     }
-    fn warn(msg: impl Into<String>) -> Self {
+    pub fn warn(msg: impl Into<String>) -> Self {
         Self {
             level: DiagnosticLevel::Warn,
             message: msg.into(),
         }
     }
-    fn fail(msg: impl Into<String>) -> Self {
+    pub fn fail(msg: impl Into<String>) -> Self {
         Self {
             level: DiagnosticLevel::Fail,
             message: msg.into(),
