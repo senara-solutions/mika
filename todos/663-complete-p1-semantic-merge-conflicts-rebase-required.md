@@ -1,5 +1,5 @@
 ---
-status: pending
+status: wont_fix
 priority: p1
 issue_id: "663"
 tags: [code-review, merge, compilation]

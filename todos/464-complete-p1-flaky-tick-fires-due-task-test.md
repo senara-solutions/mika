@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "464"
 tags: [code-review, testing, task-engine, flaky]
