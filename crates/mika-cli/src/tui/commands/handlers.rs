@@ -510,19 +510,21 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
         }
 
         // Parse provider/model to determine the right config key and provider for validation
-        let (provider_prefix, model_name) = if let Some(slash_pos) = full_id.find('/') {
+        let model_name = if let Some(slash_pos) = full_id.find('/') {
             let prefix = &full_id[..slash_pos];
             if prefix.parse::<ProviderKind>().is_ok() {
-                (prefix, &full_id[slash_pos + 1..])
+                &full_id[slash_pos + 1..]
             } else {
-                ("anthropic", full_id)
+                full_id
             }
         } else {
-            ("anthropic", full_id)
+            full_id
         };
 
-        let target_provider = provider_prefix
-            .parse::<ProviderKind>()
+        let target_provider = full_id
+            .split('/')
+            .next()
+            .and_then(|p| p.parse::<ProviderKind>().ok())
             .unwrap_or(app.provider);
 
         // Pre-validate before any state mutation
@@ -532,49 +534,14 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             return format!("Cannot switch to {display}: {e}");
         }
 
-        let config_path = app.home_dir.join("config.toml");
-
-        // If alias targets a different provider, switch the active provider too
-        let mut provider_note = String::new();
-        if target_provider != app.provider {
-            if let Err(e) = crate::commands::config::write_config_toml(
-                &config_path,
-                "llm_provider",
-                &target_provider.to_string(),
-            ) {
-                tracing::warn!(error = %e, "failed to persist provider switch to config.toml");
-            }
-            app.provider = target_provider;
-            provider_note = format!(" (switched provider to {target_provider})");
-        }
-
-        // Persist model to config.toml
-        let model_key = format!("{provider_prefix}_model");
-        let persist_warning = match crate::commands::config::write_config_toml(
-            &config_path,
-            &model_key,
+        let display_label = format!("{display} ({full_id})");
+        return apply_model_switch(
+            app,
+            target_provider,
             model_name,
-        ) {
-            Ok(()) => String::new(),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to persist model to config.toml");
-                " (warning: failed to save — change won't survive restart)".to_string()
-            }
-        };
-
-        app.model = full_id.to_string();
-        if app
-            .agent_tx
-            .send(AgentRequest::SetModel {
-                model: full_id.to_string(),
-            })
-            .is_err()
-        {
-            return WORKER_NOT_RESPONDING.to_string();
-        }
-        app.needs_redraw = true;
-
-        return format!("Switched to {display} ({full_id}).{persist_warning}{provider_note}");
+            full_id.to_string(),
+            &display_label,
+        );
     }
 
     // Not an alias — treat as a direct model name for the current provider
@@ -594,9 +561,27 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
         return format!("Cannot use model {args}: {e}");
     }
 
+    let full_id = if target_provider == ProviderKind::Anthropic {
+        model_name.to_string()
+    } else {
+        format!("{target_provider}/{model_name}")
+    };
+
+    apply_model_switch(app, target_provider, model_name, full_id.clone(), &full_id)
+}
+
+/// Shared logic for applying a model switch: persist provider/model to config,
+/// update app state, notify the agent worker, and format the output message.
+fn apply_model_switch(
+    app: &mut App<'_>,
+    target_provider: mika_common::llm::ProviderKind,
+    model_name: &str,
+    full_id: String,
+    display: &str,
+) -> String {
     let config_path = app.home_dir.join("config.toml");
 
-    // Switch provider if needed
+    // If targeting a different provider, switch the active provider too
     let mut provider_note = String::new();
     if target_provider != app.provider {
         if let Err(e) = crate::commands::config::write_config_toml(
@@ -610,7 +595,7 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
         provider_note = format!(" (switched provider to {target_provider})");
     }
 
-    // Persist model
+    // Persist model to config.toml
     let model_key = format!("{}_model", target_provider.config_prefix());
     let persist_warning =
         match crate::commands::config::write_config_toml(&config_path, &model_key, model_name) {
@@ -621,25 +606,17 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             }
         };
 
-    let full_id = if target_provider == ProviderKind::Anthropic {
-        model_name.to_string()
-    } else {
-        format!("{target_provider}/{model_name}")
-    };
-
     app.model = full_id.clone();
     if app
         .agent_tx
-        .send(AgentRequest::SetModel {
-            model: full_id.clone(),
-        })
+        .send(AgentRequest::SetModel { model: full_id })
         .is_err()
     {
         return WORKER_NOT_RESPONDING.to_string();
     }
     app.needs_redraw = true;
 
-    format!("Set model to {full_id}.{persist_warning}{provider_note}")
+    format!("Switched to {display}.{persist_warning}{provider_note}")
 }
 
 async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
@@ -1710,7 +1687,7 @@ mod tests {
         let output = handle_model(&mut app, "deepseek-reasoner").await;
 
         assert!(
-            output.contains("Set model to deepseek/deepseek-reasoner"),
+            output.contains("Switched to deepseek/deepseek-reasoner"),
             "should accept direct model name, got: {output}"
         );
         assert_eq!(app.model, "deepseek/deepseek-reasoner");

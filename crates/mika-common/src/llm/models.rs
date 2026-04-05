@@ -179,7 +179,12 @@ fn write_cache(path: &Path, cache: &ModelCache) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(data) = serde_json::to_string_pretty(cache) {
-        let _ = std::fs::write(path, data);
+        let _ = std::fs::write(path, &data);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 
