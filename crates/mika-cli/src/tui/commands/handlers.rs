@@ -436,11 +436,10 @@ async fn handle_config_set(app: &mut App<'_>, args: &str) -> String {
     }
 }
 
-use crate::cli::MODEL_ALIASES;
-
+#[cfg(test)]
 fn resolve_model_name(input: &str) -> Option<(&'static str, &'static str)> {
     let lower = input.to_lowercase();
-    for &(alias, full_id, display) in MODEL_ALIASES {
+    for &(alias, full_id, display) in crate::cli::MODEL_ALIASES {
         if lower == alias || lower == full_id {
             return Some((full_id, display));
         }
@@ -449,200 +448,70 @@ fn resolve_model_name(input: &str) -> Option<(&'static str, &'static str)> {
 }
 
 async fn handle_model(app: &mut App<'_>, args: &str) -> String {
-    use mika_common::llm::ProviderKind;
-
     let args = args.trim();
     if args.is_empty() {
-        let mut out = format!(
-            "Current model: {}\n\nAvailable models for {}:",
-            app.model, app.provider
-        );
-
-        // Fetch provider's model list (from cache or API)
-        let settings =
-            mika_common::config::Settings::load_for_agent(&app.global_home, &app.home_dir).ok();
-        let (api_key, base_url) = settings
-            .as_ref()
-            .map(|s| {
-                let (_, key, url) = s.provider_fields(app.provider);
-                (key.map(String::from), url.map(String::from))
-            })
-            .unwrap_or((None, None));
-
-        let models = mika_common::llm::models::get_models(
-            &app.home_dir,
-            app.provider,
-            base_url.as_deref(),
-            api_key.as_deref(),
-        )
-        .await;
-
-        if models.is_empty() {
-            let _ = write!(
-                out,
-                "\n  (no models available — type a model name directly)"
-            );
-        } else {
-            // Determine current model name (strip provider prefix if present)
-            let current_model = app.model.split('/').next_back().unwrap_or(&app.model);
-            for m in &models {
-                let marker = if m.id == current_model {
-                    " (current)"
+        match crate::commands::model::list_models(&app.global_home, &app.home_dir).await {
+            Ok(result) => {
+                let mut out = format!(
+                    "Current model: {}\n\nAvailable models for {}:",
+                    result.current_model, result.provider
+                );
+                if result.models.is_empty() {
+                    let _ = write!(
+                        out,
+                        "\n  (no models available \u{2014} type a model name directly)"
+                    );
                 } else {
-                    ""
-                };
-                let _ = write!(out, "\n  {}{}", m.id, marker);
+                    for m in &result.models {
+                        let marker = if m.current { " (current)" } else { "" };
+                        let _ = write!(out, "\n  {}{}", m.id, marker);
+                    }
+                }
+                let _ = write!(out, "\n\nAliases:");
+                for a in &result.aliases {
+                    let _ = write!(out, "\n  {} \u{2014} {}", a.alias, a.display);
+                }
+                let _ = write!(out, "\n\nUsage: /model <name> or /model <alias>");
+                out
             }
+            Err(e) => format!("Error: {e}"),
         }
-
-        let _ = write!(out, "\n\nAliases:");
-        for &(alias, _, display) in MODEL_ALIASES {
-            let _ = write!(out, "\n  {alias} — {display}");
-        }
-        let _ = write!(out, "\n\nUsage: /model <name> or /model <alias>");
-        return out;
-    }
-
-    // Try resolving as an alias first
-    if let Some((full_id, display)) = resolve_model_name(args) {
-        if full_id == app.model {
-            return format!("Already using {display}.");
-        }
-
-        // Parse provider/model to determine the right config key and provider for validation
-        let model_name = if let Some(slash_pos) = full_id.find('/') {
-            let prefix = &full_id[..slash_pos];
-            if prefix.parse::<ProviderKind>().is_ok() {
-                &full_id[slash_pos + 1..]
-            } else {
-                full_id
-            }
-        } else {
-            full_id
-        };
-
-        let target_provider = full_id
-            .split('/')
-            .next()
-            .and_then(|p| p.parse::<ProviderKind>().ok())
-            .unwrap_or(app.provider);
-
-        // Pre-validate before any state mutation
-        if let Err(e) =
-            validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider)
-        {
-            return format!("Cannot switch to {display}: {e}");
-        }
-
-        let display_label = format!("{display} ({full_id})");
-        return apply_model_switch(
-            app,
-            target_provider,
-            model_name,
-            full_id.to_string(),
-            &display_label,
-        );
-    }
-
-    // Not an alias — treat as a direct model name for the current provider.
-    // If current provider uses slash-separated model names (e.g., OpenRouter uses
-    // "qwen/qwen-plus"), don't interpret the slash as a cross-provider switch.
-    let (target_provider, model_name) =
-        if app.provider.model_names_contain_slash() || !args.contains('/') {
-            (app.provider, args)
-        } else {
-            let slash_pos = args.find('/').unwrap();
-            let prefix = &args[..slash_pos];
-            match prefix.parse::<ProviderKind>() {
-                Ok(p) => (p, &args[slash_pos + 1..]),
-                Err(_) => (app.provider, args),
-            }
-        };
-
-    // Pre-validate
-    if let Err(e) = validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider) {
-        return format!("Cannot use model {args}: {e}");
-    }
-
-    let display_id = format_display_model(target_provider, model_name);
-    apply_model_switch(
-        app,
-        target_provider,
-        model_name,
-        display_id.clone(),
-        &display_id,
-    )
-}
-
-/// Format model string for the agent worker — always includes provider prefix
-/// so the worker can switch both provider and model atomically.
-fn format_worker_model(provider: mika_common::llm::ProviderKind, model: &str) -> String {
-    format!("{provider}/{model}")
-}
-
-/// Format model string for TUI display — no prefix for Anthropic (matches
-/// `Settings::active_model_display()` convention).
-fn format_display_model(provider: mika_common::llm::ProviderKind, model: &str) -> String {
-    if provider == mika_common::llm::ProviderKind::Anthropic {
-        model.to_string()
     } else {
-        format!("{provider}/{model}")
-    }
-}
+        match crate::commands::model::switch_model(&app.global_home, &app.home_dir, args) {
+            Ok(result) => {
+                let target_provider: mika_common::llm::ProviderKind =
+                    result.provider.parse().unwrap_or(app.provider);
+                if result.provider_changed {
+                    app.provider = target_provider;
+                }
+                let display_id =
+                    crate::commands::provider::format_display_model(target_provider, &result.model);
+                let worker_model =
+                    crate::commands::provider::format_worker_model(target_provider, &result.model);
+                app.model = display_id.clone();
+                if app
+                    .agent_tx
+                    .send(AgentRequest::SetModel {
+                        model: worker_model,
+                    })
+                    .is_err()
+                {
+                    return WORKER_NOT_RESPONDING.to_string();
+                }
+                app.needs_redraw = true;
 
-/// Shared logic for applying a model switch: persist provider/model to config,
-/// update app state, notify the agent worker, and format the output message.
-fn apply_model_switch(
-    app: &mut App<'_>,
-    target_provider: mika_common::llm::ProviderKind,
-    model_name: &str,
-    full_id: String,
-    display: &str,
-) -> String {
-    let config_path = app.home_dir.join("config.toml");
-
-    // If targeting a different provider, switch the active provider too
-    let mut provider_note = String::new();
-    if target_provider != app.provider {
-        if let Err(e) = crate::commands::config::write_config_toml(
-            &config_path,
-            "llm_provider",
-            &target_provider.to_string(),
-        ) {
-            tracing::warn!(error = %e, "failed to persist provider switch to config.toml");
-        }
-        app.provider = target_provider;
-        provider_note = format!(" (switched provider to {target_provider})");
-    }
-
-    // Persist model to config.toml
-    let model_key = format!("{}_model", target_provider.config_prefix());
-    let persist_warning =
-        match crate::commands::config::write_config_toml(&config_path, &model_key, model_name) {
-            Ok(()) => String::new(),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to persist model to config.toml");
-                " (warning: failed to save — change won't survive restart)".to_string()
+                let mut out = format!("Switched to {display_id}.");
+                if result.provider_changed {
+                    out.push_str(&format!(" (switched provider to {})", result.provider));
+                }
+                for w in &result.warnings {
+                    out.push_str(&format!(" (warning: {w})"));
+                }
+                out
             }
-        };
-
-    // Display value is user-friendly (no prefix for Anthropic).
-    // Worker message always includes provider prefix so the worker can
-    // switch both provider and model atomically. See #451.
-    let worker_model = format_worker_model(target_provider, model_name);
-    app.model = full_id;
-    if app
-        .agent_tx
-        .send(AgentRequest::SetModel {
-            model: worker_model,
-        })
-        .is_err()
-    {
-        return WORKER_NOT_RESPONDING.to_string();
+            Err(e) => format!("{e}"),
+        }
     }
-    app.needs_redraw = true;
-
-    format!("Switched to {display}.{persist_warning}{provider_note}")
 }
 
 async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
@@ -650,22 +519,16 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
 
     let args = args.trim();
     if args.is_empty() {
-        // Show current provider and list all available with configured models
-        let current = app.provider.to_string();
-        let settings =
-            mika_common::config::Settings::load_for_agent(&app.global_home, &app.home_dir).ok();
-        let mut out = format!("Current provider: {current}\n\nAvailable providers:");
-        for &p in ProviderKind::ALL {
-            let marker = if p.to_string() == current {
-                " (current)"
-            } else {
-                ""
-            };
-            let model = settings
-                .as_ref()
-                .and_then(|s| s.provider_fields(p).0.map(String::from))
-                .unwrap_or_else(|| p.default_model().to_string());
-            let _ = write!(out, "\n  {} — {}{}", p, model, marker);
+        // List providers using shared logic
+        let providers = crate::commands::provider::list_providers(
+            &app.global_home,
+            &app.home_dir,
+            app.provider,
+        );
+        let mut out = format!("Current provider: {}\n\nAvailable providers:", app.provider);
+        for p in &providers {
+            let marker = if p.current { " (current)" } else { "" };
+            let _ = write!(out, "\n  {} — {}{}", p.name, p.model, marker);
         }
         let _ = write!(out, "\n\nUsage: /provider <name>");
         return out;
@@ -679,41 +542,19 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
         let rest = rest.trim();
         if let Some((field, value)) = rest.split_once(' ') {
             let value = value.trim();
-            let prefix = app.provider.config_prefix();
-            let config_path = app.home_dir.join("config.toml");
-            let key = match field {
-                "model" => format!("{prefix}_model"),
-                "base_url" => format!("{prefix}_base_url"),
-                "api_key" => {
-                    // API keys go to .env, not config.toml
-                    let env_key = format!("MIKA_{}_API_KEY", prefix.to_uppercase());
-                    let global_home = &app.global_home;
-                    match mika_common::dotenv::set_env_var(global_home, &env_key, value) {
-                        Ok(()) => {
-                            return format!(
-                                "Set {env_key} in .env (restart required for changes to take effect)"
-                            );
-                        }
-                        Err(e) => return format!("Error: {e}"),
-                    }
-                }
-                _ => return format!("Unknown field: {field}. Use: model, api_key, base_url"),
-            };
-            match crate::commands::config::write_config_toml(&config_path, &key, value) {
-                Ok(()) => {
+            match crate::commands::provider::set_provider_field(
+                &app.global_home,
+                &app.home_dir,
+                field,
+                value,
+            ) {
+                Ok(result) => {
                     // If setting model, also update the display and agent worker
                     if field == "model" {
-                        // Pre-validate: load settings and try to build the provider
-                        if let Err(e) = validate_provider_switch_for(
-                            &app.home_dir,
-                            &app.global_home,
-                            app.provider,
-                        ) {
-                            return format!("Error: cannot use model {value}: {e}");
-                        }
-
-                        let display_id = format_display_model(app.provider, value);
-                        let worker_model = format_worker_model(app.provider, value);
+                        let display_id =
+                            crate::commands::provider::format_display_model(app.provider, value);
+                        let worker_model =
+                            crate::commands::provider::format_worker_model(app.provider, value);
                         app.model = display_id;
                         if app
                             .agent_tx
@@ -726,39 +567,39 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                         }
                         app.needs_redraw = true;
                     }
-                    format!("Set {key} = \"{value}\"")
+                    if field == "api_key" || field == "api-key" {
+                        format!(
+                            "Set {} in .env (restart required for changes to take effect)",
+                            result.field
+                        )
+                    } else {
+                        format!("Set {} = \"{}\"", result.field, result.value)
+                    }
                 }
-                Err(e) => format!("Error writing config: {e}"),
+                Err(e) => format!("Error: {e}"),
             }
         } else {
             "Usage: /provider set <model|api_key|base_url> <value>".to_string()
         }
     } else {
-        // Switch provider
-        match args.parse::<ProviderKind>() {
-            Ok(new_provider) => {
-                if new_provider == app.provider {
-                    return format!("Already using {new_provider}.");
-                }
-
-                // Pre-validate: load settings with the new provider and try to build it
-                let config_path = app.home_dir.join("config.toml");
-                let settings = match validate_provider_switch_for(
-                    &app.home_dir,
-                    &app.global_home,
-                    new_provider,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => return format!("Cannot switch to {new_provider}: {e}"),
-                };
-
-                // Read the resolved model from Settings (respects user's {provider}_model config,
-                // falls back to default_model() only when none is configured)
-                let config = settings.active_llm_config();
-                let model = config.model.clone();
-                let had_configured_model = settings.provider_fields(new_provider).0.is_some();
-                let display_id = format_display_model(new_provider, &model);
-                let worker_model = format_worker_model(new_provider, &model);
+        // Switch provider using shared logic (prefetch_models=false, TUI does fire-and-forget)
+        match crate::commands::provider::switch_provider(
+            &app.global_home,
+            &app.home_dir,
+            match args.parse::<ProviderKind>() {
+                Ok(p) => p,
+                Err(e) => return e,
+            },
+            false,
+        )
+        .await
+        {
+            Ok(result) => {
+                let new_provider: ProviderKind = result.provider.parse().unwrap_or(app.provider);
+                let display_id =
+                    crate::commands::provider::format_display_model(new_provider, &result.model);
+                let worker_model =
+                    crate::commands::provider::format_worker_model(new_provider, &result.model);
                 app.model = display_id;
                 app.provider = new_provider;
                 if app
@@ -772,72 +613,23 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                 }
                 app.needs_redraw = true;
 
-                // Persist provider switch to config.toml
-                let mut persist_warning = String::new();
-                if let Err(e) = crate::commands::config::write_config_toml(
-                    &config_path,
-                    "llm_provider",
-                    &new_provider.to_string(),
-                ) {
-                    tracing::warn!(error = %e, "failed to persist provider to config.toml");
-                    persist_warning =
-                        " (warning: failed to save — change won't survive restart)".to_string();
-                }
-
-                // Persist default model when no {provider}_model was previously configured
-                if !had_configured_model {
-                    let model_key = format!("{}_model", new_provider.config_prefix());
-                    if let Err(e) =
-                        crate::commands::config::write_config_toml(&config_path, &model_key, &model)
-                    {
-                        tracing::warn!(error = %e, "failed to persist default model to config.toml");
-                    }
-                }
-
-                // Warn if llm_max_tokens exceeds the new provider's limit
-                let mut notes = String::new();
-                let max = new_provider.max_output_tokens();
-                if settings.llm_max_tokens > max {
-                    notes.push_str(&format!(
-                        "\nWarning: llm_max_tokens ({}) exceeds {new_provider}'s limit ({max})",
-                        settings.llm_max_tokens
-                    ));
-                }
-
-                // Pre-fetch model list for the new provider (fire-and-forget cache warm)
+                // Fire-and-forget model cache warm (TUI keeps running, unlike CLI)
                 let home = app.home_dir.clone();
-                let base_url_owned = config.base_url.clone();
-                let api_key_owned = config.api_key.clone();
+                let global = app.global_home.clone();
                 tokio::spawn(async move {
-                    let _ = mika_common::llm::models::get_models(
-                        &home,
-                        new_provider,
-                        base_url_owned.as_deref(),
-                        api_key_owned.as_deref(),
-                    )
-                    .await;
+                    let _ =
+                        crate::commands::provider::fetch_models(&global, &home, new_provider).await;
                 });
 
-                format!("Switched to {new_provider} (model: {model}).{persist_warning}{notes}")
+                let mut out = format!("Switched to {new_provider} (model: {}).", result.model);
+                for w in &result.warnings {
+                    let _ = write!(out, "\n{w}");
+                }
+                out
             }
-            Err(e) => e,
+            Err(e) => format!("{e}"),
         }
     }
-}
-
-/// Pre-validate that switching to a specific provider will work (API key present, etc.).
-/// Returns the loaded settings (with `llm_provider` set to the target) on success,
-/// so the caller can read `active_llm_config()` without a second load.
-fn validate_provider_switch_for(
-    home_dir: &std::path::Path,
-    global_home: &std::path::Path,
-    provider: mika_common::llm::ProviderKind,
-) -> Result<mika_common::config::Settings, String> {
-    let mut settings = mika_common::config::Settings::load_for_agent(global_home, home_dir)
-        .map_err(|e| format!("failed to load settings: {e}"))?;
-    settings.llm_provider = provider;
-    settings.make_llm_provider().map_err(|e| e.to_string())?;
-    Ok(settings)
 }
 
 async fn handle_export(app: &mut App<'_>) -> String {
@@ -2242,6 +2034,7 @@ mod tests {
 
     #[test]
     fn test_format_helpers() {
+        use crate::commands::provider::{format_display_model, format_worker_model};
         use mika_common::llm::ProviderKind;
 
         // format_worker_model always includes prefix

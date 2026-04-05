@@ -268,6 +268,8 @@ async fn main() -> Result<()> {
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
         Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
         Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
+        Some(Commands::Provider(args)) => commands::provider::run(args, &agent_name).await,
+        Some(Commands::Model(args)) => commands::model::run(args, &agent_name).await,
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
         Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
     }
@@ -473,6 +475,8 @@ mod tests {
             "doctor",
             "dashboard",
             "token",
+            "provider",
+            "model",
             "credential-helper",
         ] {
             assert!(
