@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Memory(args)) => commands::memory::run(args, &agent_name).await,
         Some(Commands::Reminders(args)) => commands::reminders::run(args, &agent_name).await,
-        Some(Commands::Status(_)) => commands::status::run(&agent_name).await,
+        Some(Commands::Status(ref args)) => commands::status::run(&agent_name, &args.format).await,
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
         Some(Commands::Ask(args)) => {

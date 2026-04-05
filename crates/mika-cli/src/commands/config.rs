@@ -16,7 +16,9 @@ pub async fn run(args: ConfigArgs, agent_name: &str) -> Result<()> {
         Some(ConfigCommand::Soul) => run_soul(agent_name),
         Some(ConfigCommand::Get { key, verbose }) => run_get(agent_name, &key, verbose).await,
         Some(ConfigCommand::Set { key, value }) => run_set(agent_name, &key, value).await,
-        Some(ConfigCommand::List { verbose }) => run_list(agent_name, verbose).await,
+        Some(ConfigCommand::List { verbose, format }) => {
+            run_list(agent_name, verbose, &format).await
+        }
     }
 }
 
@@ -209,39 +211,82 @@ async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<(
     Ok(())
 }
 
-async fn run_list(agent_name: &str, verbose: bool) -> Result<()> {
+async fn run_list(
+    agent_name: &str,
+    verbose: bool,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
     let ctx = init::init_db_only_for_agent(agent_name)?;
 
     // Pre-fetch all DB config
     let db_configs = ctx.async_db.list_customer_config().await?;
 
-    println!();
-    println!("  Mika Configuration Keys");
-    println!();
-
-    for info in CONFIG_KEYS {
-        let value = if info.backend == ConfigBackend::Database {
-            db_configs
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = CONFIG_KEYS
                 .iter()
-                .find(|(k, _)| k == info.key)
-                .map(|(_, v)| v.clone())
-        } else {
-            get_effective_value(info.key, &ctx.settings)
-        };
+                .map(|info| {
+                    let value = if info.backend == ConfigBackend::Database {
+                        db_configs
+                            .iter()
+                            .find(|(k, _)| k == info.key)
+                            .map(|(_, v)| v.clone())
+                    } else {
+                        get_effective_value(info.key, &ctx.settings)
+                    };
+                    let display_value = if info.secret {
+                        value.as_ref().map(|v| {
+                            if v.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String("[REDACTED]".to_string())
+                            }
+                        })
+                    } else {
+                        value.as_ref().map(|v| serde_json::Value::String(v.clone()))
+                    };
+                    serde_json::json!({
+                        "key": info.key,
+                        "value": display_value.unwrap_or(serde_json::Value::Null),
+                        "backend": format!("{:?}", info.backend).to_lowercase(),
+                        "env_var": info.env_var,
+                        "secret": info.secret,
+                        "description": info.description,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!();
+            println!("  Mika Configuration Keys");
+            println!();
 
-        let display_value = format_display_value(&value, info.secret);
+            for info in CONFIG_KEYS {
+                let value = if info.backend == ConfigBackend::Database {
+                    db_configs
+                        .iter()
+                        .find(|(k, _)| k == info.key)
+                        .map(|(_, v)| v.clone())
+                } else {
+                    get_effective_value(info.key, &ctx.settings)
+                };
 
-        if verbose {
-            let source = resolve_source(info.key, info, &ctx.home_dir, &ctx.global_home);
-            println!(
-                "  {:<24} {:<30} ({}, {:?})",
-                info.key, display_value, source, info.backend
-            );
-        } else {
-            println!("  {:<24} {}", info.key, display_value);
+                let display_value = format_display_value(&value, info.secret);
+
+                if verbose {
+                    let source = resolve_source(info.key, info, &ctx.home_dir, &ctx.global_home);
+                    println!(
+                        "  {:<24} {:<30} ({}, {:?})",
+                        info.key, display_value, source, info.backend
+                    );
+                } else {
+                    println!("  {:<24} {}", info.key, display_value);
+                }
+            }
+            println!();
         }
     }
-    println!();
 
     Ok(())
 }

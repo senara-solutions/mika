@@ -390,7 +390,8 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
 }
 
 /// Diagnostic level for skill validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DiagnosticLevel {
     Ok,
     Warn,
@@ -398,7 +399,7 @@ pub enum DiagnosticLevel {
 }
 
 /// A single diagnostic finding from skill validation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillDiagnostic {
     pub level: DiagnosticLevel,
     pub message: String,
