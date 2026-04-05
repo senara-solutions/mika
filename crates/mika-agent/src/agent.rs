@@ -574,6 +574,8 @@ async fn run_loop(
     let mut tools_called: HashSet<String> = HashSet::new();
     // Whether we already injected a required-tools correction. Only allow one retry.
     let mut required_tools_retry_done = false;
+    // Whether we already injected a text-based tool call correction. Only allow one retry.
+    let mut text_tool_call_retry_done = false;
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -685,6 +687,39 @@ async fn run_loop(
                 let text = mika_common::llm::strip_internal_tags(&response.text());
 
                 if !text.is_empty() {
+                    // Text-based tool call detection: if the LLM output XML tool calls
+                    // as text instead of using the structured API, re-prompt once.
+                    // Fires before required_tools check — re-prompting for structured
+                    // tool use is more likely to succeed. See #447.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !text_tool_call_retry_done
+                        && detect_text_based_tool_call(&text)
+                    {
+                        text_tool_call_retry_done = true;
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            "LLM output text-based tool call instead of using structured API — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                "[Your response contained tool calls as text (e.g., <function=...>) \
+                                 instead of using the structured tool calling API. Do NOT output \
+                                 tool calls as text. Use the tool calling mechanism provided to \
+                                 you. Call the tool now using the proper API.]"
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     // Required-tools enforcement: if matched skills declared required_tools
                     // and the agent hasn't called all of them yet, reject the response and
                     // re-prompt. Only one retry is allowed to prevent infinite loops.
@@ -1259,6 +1294,13 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             "provider does not support vision; images will be ignored"
         );
     }
+
+    info!(
+        tool_count = tools_for_request.as_ref().map_or(0, |t| t.len()),
+        provider = effective_llm.provider_name(),
+        model = effective_llm.model_name(),
+        "preparing LLM request"
+    );
 
     let mut request = LlmRequest {
         model: effective_llm.model_name().to_string(),
@@ -1965,16 +2007,26 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
         skill_tool_defs.into_iter().map(Into::into).collect();
+    let tools_for_request = if llm_tool_defs.is_empty() {
+        None
+    } else {
+        Some(llm_tool_defs)
+    };
+
+    info!(
+        tool_count = tools_for_request.as_ref().map_or(0, |t| t.len()),
+        provider = effective_llm.provider_name(),
+        model = effective_llm.model_name(),
+        mode = "silent",
+        "preparing LLM request"
+    );
+
     let mut request = LlmRequest {
         model: effective_llm.model_name().to_string(),
         max_tokens: effective_llm.max_tokens(),
         system: Some(system),
         messages,
-        tools: if llm_tool_defs.is_empty() {
-            None
-        } else {
-            Some(llm_tool_defs)
-        },
+        tools: tools_for_request,
         thinking: None,
     };
 
@@ -2266,16 +2318,26 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
         skill_tool_defs.into_iter().map(Into::into).collect();
+    let tools_for_request = if llm_tool_defs.is_empty() {
+        None
+    } else {
+        Some(llm_tool_defs)
+    };
+
+    info!(
+        tool_count = tools_for_request.as_ref().map_or(0, |t| t.len()),
+        provider = effective_llm.provider_name(),
+        model = effective_llm.model_name(),
+        mode = "team",
+        "preparing LLM request"
+    );
+
     let mut request = LlmRequest {
         model: effective_llm.model_name().to_string(),
         max_tokens: effective_llm.max_tokens(),
         system: Some(system),
         messages,
-        tools: if llm_tool_defs.is_empty() {
-            None
-        } else {
-            Some(llm_tool_defs)
-        },
+        tools: tools_for_request,
         thinking: None,
     };
 
@@ -2539,6 +2601,19 @@ fn inject_skills_and_resolve_tools(
     }
 
     tool_defs
+}
+
+/// Detect whether text contains XML-formatted tool call patterns.
+///
+/// This is a lightweight check used by the agent loop to detect cases where
+/// Layer 1 (XML extraction in `from_openai_response`) missed a pattern.
+/// Returns `true` if the text likely contains a text-based tool call attempt.
+fn detect_text_based_tool_call(text: &str) -> bool {
+    if !text.contains('<') {
+        return false;
+    }
+    // Must have a function opening tag AND a closing tag to avoid false positives.
+    text.contains("<function=") && (text.contains("</function>") || text.contains("</tool_call>"))
 }
 
 #[cfg(test)]
@@ -4082,5 +4157,41 @@ mod tests {
         assert_eq!(required.len(), 1);
         assert!(required.contains("run_tests"));
         assert!(!required.contains("run_claude_pilot"));
+    }
+
+    // -- detect_text_based_tool_call tests --
+
+    #[test]
+    fn test_detect_text_based_tool_call_function_tag() {
+        assert!(detect_text_based_tool_call(
+            "<function=search_memory>{\"query\":\"test\"}</function>"
+        ));
+    }
+
+    #[test]
+    fn test_detect_text_based_tool_call_tool_call_wrapper() {
+        assert!(detect_text_based_tool_call(
+            "<tool_call><function=search>{}</function></tool_call>"
+        ));
+    }
+
+    #[test]
+    fn test_detect_text_based_tool_call_plain_text() {
+        assert!(!detect_text_based_tool_call(
+            "I found some information about your meetings."
+        ));
+    }
+
+    #[test]
+    fn test_detect_text_based_tool_call_empty() {
+        assert!(!detect_text_based_tool_call(""));
+    }
+
+    #[test]
+    fn test_detect_text_based_tool_call_partial_tag() {
+        // Only opening tag without closing — should NOT trigger.
+        assert!(!detect_text_based_tool_call(
+            "Use <function=search_memory to find things"
+        ));
     }
 }

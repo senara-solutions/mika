@@ -74,3 +74,28 @@ async fn test_tool_call_with_store_fact() {
     assert_tools_include(&trace, &["store_fact"]);
     assert_has_output(&trace);
 }
+
+#[tokio::test]
+async fn test_text_based_tool_call_retry() {
+    // First response: LLM outputs XML tool call as text instead of structured API.
+    // The agent loop should detect this and re-prompt.
+    // Second response: proper structured tool call.
+    // Third response: text summary after tool execution.
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            text_response("<function=search_memory>\n{\"query\": \"meetings\"}\n</function>"),
+            tool_call_response("search_memory", json!({"query": "meetings"})),
+            text_response("Here are your meetings."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("What meetings do I have?").await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "meetings");
+    assert_tools_include(&trace, &["search_memory"]);
+    // 3 steps: text (retry), tool call, final response
+    assert_exact_steps(&trace, 3);
+}
