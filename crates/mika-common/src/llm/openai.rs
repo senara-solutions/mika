@@ -751,8 +751,11 @@ fn extract_xml_tool_calls(text: &str) -> (Vec<LlmResponseContent>, String) {
     let mut call_index: usize = 0;
 
     // Pass 1: Extract wrapped `<tool_call>...</tool_call>` blocks.
-    while let Some(m) = RE_WRAPPED_TOOL_CALL.find(&remaining) {
-        let caps = RE_WRAPPED_TOOL_CALL.captures(&remaining).unwrap();
+    // Use captures() directly to avoid running the regex twice per iteration.
+    while let Some(caps) = RE_WRAPPED_TOOL_CALL.captures(&remaining) {
+        let full_match = caps.get(0).unwrap();
+        let start = full_match.start();
+        let end = full_match.end();
 
         // Determine if it's a <function=name>args</function> or bare JSON inside <tool_call>.
         if let Some(name_match) = caps.get(1) {
@@ -770,26 +773,22 @@ fn extract_xml_tool_calls(text: &str) -> (Vec<LlmResponseContent>, String) {
             if let Some(tc) = parse_json_tool_call(json_match.as_str(), call_index) {
                 tool_calls.push(tc);
             } else {
-                // Malformed JSON — skip this match, leave in text.
+                // Malformed JSON — skip this match by removing it to avoid infinite loop.
                 call_index += 1;
-                // Replace just this match to avoid infinite loop, but keep content.
-                let start = m.start();
-                let end = m.end();
-                // Move past this match by replacing with a placeholder we won't re-match.
                 remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
                 continue;
             }
         }
 
         call_index += 1;
-        let start = m.start();
-        let end = m.end();
         remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
     }
 
     // Pass 2: Extract bare `<function=name>args</function>` (not already consumed).
-    while let Some(m) = RE_BARE_FUNCTION.find(&remaining) {
-        let caps = RE_BARE_FUNCTION.captures(&remaining).unwrap();
+    while let Some(caps) = RE_BARE_FUNCTION.captures(&remaining) {
+        let full_match = caps.get(0).unwrap();
+        let start = full_match.start();
+        let end = full_match.end();
         let name = caps.get(1).unwrap().as_str().to_string();
         let raw_args = caps.get(2).map_or("", |m| m.as_str()).trim();
         let arguments = parse_tool_arguments(raw_args);
@@ -799,8 +798,6 @@ fn extract_xml_tool_calls(text: &str) -> (Vec<LlmResponseContent>, String) {
             arguments,
         });
         call_index += 1;
-        let start = m.start();
-        let end = m.end();
         remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
     }
 
