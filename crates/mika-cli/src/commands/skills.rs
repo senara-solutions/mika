@@ -22,11 +22,11 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     match args.command {
         None => {
             let registry = SkillRegistry::from_dir(&skills_dir);
-            list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text);
+            list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
         }
         Some(SkillsCommand::List { format }) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
-            list_skills(&registry, &agent_home, &format);
+            list_skills(&registry, &agent_home, &format)?;
         }
         Some(SkillsCommand::Info { name }) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
@@ -60,7 +60,11 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_skills(registry: &SkillRegistry, agent_home: &Path, format: &crate::cli::OutputFormat) {
+fn list_skills(
+    registry: &SkillRegistry,
+    agent_home: &Path,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
     let skills = registry.skills();
     if skills.is_empty() {
         match format {
@@ -70,7 +74,7 @@ fn list_skills(registry: &SkillRegistry, agent_home: &Path, format: &crate::cli:
                 println!("  Create one with: mika skills create <name>");
             }
         }
-        return;
+        return Ok(());
     }
     let lock = marketplace::read_lock(agent_home);
 
@@ -110,7 +114,7 @@ fn list_skills(registry: &SkillRegistry, agent_home: &Path, format: &crate::cli:
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&entries).unwrap());
+            println!("{}", serde_json::to_string_pretty(&entries)?);
         }
         crate::cli::OutputFormat::Text => {
             println!("\n  Skills ({}):", skills.len());
@@ -169,6 +173,7 @@ fn list_skills(registry: &SkillRegistry, agent_home: &Path, format: &crate::cli:
             println!();
         }
     }
+    Ok(())
 }
 
 fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
