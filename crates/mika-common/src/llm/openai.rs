@@ -1,6 +1,8 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use regex::Regex;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -605,7 +607,12 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
         }
     }
 
-    // Extract tool calls
+    // Extract structured tool calls
+    let has_structured_tool_calls = choice
+        .message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|tc| !tc.is_empty());
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
             let arguments =
@@ -626,10 +633,44 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
         }
     }
 
+    // Extract XML-formatted tool calls from text content (e.g. <function=name>...</function>).
+    // Only run when no structured tool_calls were returned — prevents duplicates.
+    if !has_structured_tool_calls {
+        let mut new_content = Vec::new();
+        let mut xml_tool_calls = Vec::new();
+        for item in content {
+            if let LlmResponseContent::Text(ref text) = item {
+                let (extracted, remaining) = extract_xml_tool_calls(text);
+                if !extracted.is_empty() {
+                    info!(
+                        extracted_count = extracted.len(),
+                        "extracted XML-formatted tool calls from text response"
+                    );
+                    xml_tool_calls.extend(extracted);
+                    if !remaining.is_empty() {
+                        new_content.push(LlmResponseContent::Text(remaining));
+                    }
+                } else {
+                    new_content.push(item);
+                }
+            } else {
+                new_content.push(item);
+            }
+        }
+        new_content.extend(xml_tool_calls);
+        content = new_content;
+    }
+
+    // Determine stop_reason. If content contains tool calls (structured or XML-extracted)
+    // but finish_reason didn't indicate tool use, override to ToolUse.
+    let has_any_tool_calls = content
+        .iter()
+        .any(|c| matches!(c, LlmResponseContent::ToolCall { .. }));
     let stop_reason = match choice.finish_reason.as_deref() {
         Some("tool_calls") => LlmStopReason::ToolUse,
         Some("length") => LlmStopReason::MaxTokens,
         Some("content_filter") => LlmStopReason::ContentFilter,
+        _ if has_any_tool_calls => LlmStopReason::ToolUse,
         _ => LlmStopReason::EndTurn,
     };
 
@@ -679,6 +720,118 @@ fn extract_think_block(text: &str) -> Option<(String, String)> {
         return None;
     }
     Some((think_content, remaining))
+}
+
+// Regex for `<tool_call>...<function=name>args</function>...</tool_call>` or
+// `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
+static RE_WRAPPED_TOOL_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<tool_call>\s*(?:<function=([^>]+)>([\s\S]*?)</function>|(\{[\s\S]*?\}))\s*</tool_call>").unwrap()
+});
+
+// Regex for bare `<function=name>args</function>` (no `<tool_call>` wrapper).
+static RE_BARE_FUNCTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<function=([^>]+)>([\s\S]*?)</function>").unwrap());
+
+/// Extract XML-formatted tool calls from text content.
+///
+/// Some OpenAI-compatible providers emit tool calls as XML text
+/// (e.g. `<function=search>{"query":"test"}</function>`) instead of structured
+/// `tool_calls` in the response. This function extracts those, converts them to
+/// `LlmResponseContent::ToolCall` items, and returns the remaining text with
+/// XML removed.
+///
+/// Returns `(extracted_tool_calls, remaining_text)`.
+fn extract_xml_tool_calls(text: &str) -> (Vec<LlmResponseContent>, String) {
+    if !text.contains('<') {
+        return (vec![], text.to_string());
+    }
+
+    let mut tool_calls = Vec::new();
+    let mut remaining = text.to_string();
+    let mut call_index: usize = 0;
+
+    // Pass 1: Extract wrapped `<tool_call>...</tool_call>` blocks.
+    while let Some(m) = RE_WRAPPED_TOOL_CALL.find(&remaining) {
+        let caps = RE_WRAPPED_TOOL_CALL.captures(&remaining).unwrap();
+
+        // Determine if it's a <function=name>args</function> or bare JSON inside <tool_call>.
+        if let Some(name_match) = caps.get(1) {
+            // <tool_call><function=name>args</function></tool_call>
+            let name = name_match.as_str().to_string();
+            let raw_args = caps.get(2).map_or("", |m| m.as_str()).trim();
+            let arguments = parse_tool_arguments(raw_args);
+            tool_calls.push(LlmResponseContent::ToolCall {
+                id: format!("xml_call_{call_index}"),
+                name,
+                arguments,
+            });
+        } else if let Some(json_match) = caps.get(3) {
+            // <tool_call>{"name":"...","arguments":{...}}</tool_call>
+            if let Some(tc) = parse_json_tool_call(json_match.as_str(), call_index) {
+                tool_calls.push(tc);
+            } else {
+                // Malformed JSON — skip this match, leave in text.
+                call_index += 1;
+                // Replace just this match to avoid infinite loop, but keep content.
+                let start = m.start();
+                let end = m.end();
+                // Move past this match by replacing with a placeholder we won't re-match.
+                remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+                continue;
+            }
+        }
+
+        call_index += 1;
+        let start = m.start();
+        let end = m.end();
+        remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+    }
+
+    // Pass 2: Extract bare `<function=name>args</function>` (not already consumed).
+    while let Some(m) = RE_BARE_FUNCTION.find(&remaining) {
+        let caps = RE_BARE_FUNCTION.captures(&remaining).unwrap();
+        let name = caps.get(1).unwrap().as_str().to_string();
+        let raw_args = caps.get(2).map_or("", |m| m.as_str()).trim();
+        let arguments = parse_tool_arguments(raw_args);
+        tool_calls.push(LlmResponseContent::ToolCall {
+            id: format!("xml_call_{call_index}"),
+            name,
+            arguments,
+        });
+        call_index += 1;
+        let start = m.start();
+        let end = m.end();
+        remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+    }
+
+    // Clean up whitespace left by removals.
+    let remaining = remaining.trim().to_string();
+
+    (tool_calls, remaining)
+}
+
+/// Parse tool call arguments: valid JSON object → Value, empty → empty object,
+/// invalid → Value::String (same fallback as structured tool_calls).
+fn parse_tool_arguments(raw: &str) -> Value {
+    if raw.is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+    serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+/// Parse a JSON-formatted tool call: `{"name":"func","arguments":{...}}`.
+fn parse_json_tool_call(json_str: &str, index: usize) -> Option<LlmResponseContent> {
+    let obj: Value = serde_json::from_str(json_str).ok()?;
+    let name = obj.get("name")?.as_str()?.to_string();
+    let arguments = obj
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+    Some(LlmResponseContent::ToolCall {
+        id: format!("xml_call_{index}"),
+        name,
+        arguments,
+    })
 }
 
 #[cfg(test)]
@@ -1065,5 +1218,226 @@ mod tests {
         let llm = from_openai_response(resp).unwrap();
         assert_eq!(llm.text(), "Hello!");
         assert!(llm.reasoning.is_none());
+    }
+
+    // -- extract_xml_tool_calls tests --
+
+    #[test]
+    fn test_extract_xml_tool_calls_wrapped_function_tag() {
+        let text = r#"<tool_call>
+<function=search_memory>
+{"query": "meetings"}
+</function>
+</tool_call>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            id,
+            name,
+            arguments,
+        } = &calls[0]
+        {
+            assert_eq!(id, "xml_call_0");
+            assert_eq!(name, "search_memory");
+            assert_eq!(arguments, &json!({"query": "meetings"}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_bare_function_tag() {
+        let text = r#"<function=list_work_items>
+{"status": "active"}
+</function>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            name, arguments, ..
+        } = &calls[0]
+        {
+            assert_eq!(name, "list_work_items");
+            assert_eq!(arguments, &json!({"status": "active"}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_json_in_tool_call() {
+        let text = r#"<tool_call>
+{"name": "search_memory", "arguments": {"query": "test"}}
+</tool_call>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            name, arguments, ..
+        } = &calls[0]
+        {
+            assert_eq!(name, "search_memory");
+            assert_eq!(arguments, &json!({"query": "test"}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_empty_arguments() {
+        let text = "<function=list_work_items></function>";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            name, arguments, ..
+        } = &calls[0]
+        {
+            assert_eq!(name, "list_work_items");
+            assert_eq!(arguments, &json!({}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_multiple() {
+        let text = r#"<function=search_memory>{"query": "a"}</function>
+<function=store_fact>{"text": "b"}</function>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        if let LlmResponseContent::ToolCall { name, .. } = &calls[0] {
+            assert_eq!(name, "search_memory");
+        }
+        if let LlmResponseContent::ToolCall { name, .. } = &calls[1] {
+            assert_eq!(name, "store_fact");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_mixed_text() {
+        let text = "Let me search for that.\n<function=search_memory>{\"query\": \"test\"}</function>\nHere are the results.";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert!(remaining.contains("Let me search for that."));
+        assert!(remaining.contains("Here are the results."));
+        assert!(!remaining.contains("<function="));
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_no_xml() {
+        let text = "This is plain text with no tool calls.";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, text);
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_malformed() {
+        // Missing closing tag — should not be extracted.
+        let text = "<function=search_memory>{\"query\": \"test\"}";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, text);
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_with_think_block() {
+        let text = "<think>I should search</think><function=search_memory>{\"query\": \"test\"}</function>";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        // Think block should remain in the text (handled separately by extract_think_block).
+        assert!(remaining.contains("<think>"));
+    }
+
+    #[test]
+    fn test_from_openai_response_xml_tool_calls() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<function=search_memory>\n{\"query\": \"test\"}\n</function>".into(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert!(llm.has_tool_calls());
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+        let tc = llm.tool_calls();
+        assert_eq!(tc.len(), 1);
+        if let LlmResponseContent::ToolCall { name, .. } = tc[0] {
+            assert_eq!(name, "search_memory");
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_xml_skipped_when_structured() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<function=search_memory>{\"query\": \"stale\"}</function>".into(),
+                    )),
+                    tool_calls: Some(vec![OpenAiToolCall {
+                        id: "call_123".into(),
+                        call_type: "function".into(),
+                        function: OpenAiFunction {
+                            name: "search_memory".into(),
+                            arguments: "{\"query\": \"real\"}".into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        // Should have exactly 1 tool call (the structured one), not 2.
+        let tc = llm.tool_calls();
+        assert_eq!(tc.len(), 1);
+        if let LlmResponseContent::ToolCall { id, .. } = tc[0] {
+            assert_eq!(id, "call_123");
+        }
+        // The text content should still have the XML (it was not extracted).
+        assert_eq!(
+            llm.text(),
+            "<function=search_memory>{\"query\": \"stale\"}</function>"
+        );
+    }
+
+    #[test]
+    fn test_from_openai_response_stop_reason_flip() {
+        // finish_reason is "stop" but XML tool calls are extracted — stop_reason should be ToolUse.
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<tool_call>\n<function=list_work_items>\n{}\n</function>\n</tool_call>"
+                            .into(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+        assert!(llm.has_tool_calls());
     }
 }
