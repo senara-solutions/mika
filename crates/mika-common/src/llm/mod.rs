@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
+pub mod models;
 pub mod openai;
 pub mod types;
 
@@ -213,6 +214,26 @@ impl ProviderKind {
             ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
             ProviderKind::Kimi => Some("https://api.moonshot.cn/v1"),
             ProviderKind::Qwen => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        }
+    }
+
+    /// Conservative maximum output tokens for this provider.
+    ///
+    /// Used to warn users when `llm_max_tokens` exceeds the provider's typical limit.
+    /// These are provider-level defaults -- individual models may differ.
+    pub fn max_output_tokens(&self) -> u32 {
+        match self {
+            ProviderKind::Anthropic => 128_000,
+            ProviderKind::OpenAi => 16_384,
+            ProviderKind::OpenRouter => 128_000, // varies by model
+            ProviderKind::Groq => 8_192,
+            ProviderKind::Ollama => 131_072, // no hard limit
+            ProviderKind::Mistral => 8_192,
+            ProviderKind::Google => 65_536,
+            ProviderKind::DeepSeek => 8_192,
+            ProviderKind::MiniMax => 16_384,
+            ProviderKind::Kimi => 8_192,
+            ProviderKind::Qwen => 8_192,
         }
     }
 

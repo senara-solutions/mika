@@ -25,26 +25,49 @@ fn filter_by_prefix(items: Vec<CompletionItem>, prefix: &str) -> Vec<CompletionI
 
 // === Static completers ===
 
-/// `/model <tab>` — model aliases.
+/// `/model <tab>` — model aliases plus cached provider models.
 pub fn complete_model(
     arg_text: &str,
     _arg_index: usize,
-    _ctx: &CompletionContext,
+    ctx: &CompletionContext,
 ) -> (Vec<CompletionItem>, &'static str) {
-    let items = vec![
-        CompletionItem {
-            value: "sonnet".to_string(),
-            description: Some("Claude Sonnet 4.6".to_string()),
-        },
-        CompletionItem {
-            value: "opus".to_string(),
-            description: Some("Claude Opus 4.6".to_string()),
-        },
-        CompletionItem {
-            value: "haiku".to_string(),
-            description: Some("Claude Haiku 4.5".to_string()),
-        },
-    ];
+    use crate::cli::MODEL_ALIASES;
+
+    // Start with aliases
+    let mut items: Vec<CompletionItem> = MODEL_ALIASES
+        .iter()
+        .map(|&(alias, _, display)| CompletionItem {
+            value: alias.to_string(),
+            description: Some(display.to_string()),
+        })
+        .collect();
+
+    // Try to read cached models for the current provider (synchronous, no API call)
+    if let Ok(settings) =
+        mika_common::config::Settings::load_for_agent(ctx.global_home, ctx.home_dir)
+    {
+        let provider = settings.llm_provider;
+        let cache_path = ctx
+            .home_dir
+            .join("cache")
+            .join("models")
+            .join(format!("{}.json", provider.config_prefix()));
+        if let Ok(data) = std::fs::read_to_string(&cache_path)
+            && let Ok(cache) = serde_json::from_str::<mika_common::llm::models::ModelCache>(&data)
+        {
+            for m in &cache.models {
+                // Skip if already covered by an alias
+                let already_listed = items.iter().any(|i| i.value == m.id);
+                if !already_listed {
+                    items.push(CompletionItem {
+                        value: m.id.clone(),
+                        description: m.name.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     (filter_by_prefix(items, arg_text), " Models ")
 }
 
@@ -377,7 +400,8 @@ mod tests {
     fn test_complete_model_all() {
         let ctx = test_ctx(Path::new("/tmp"));
         let (items, title) = complete_model("", 0, &ctx);
-        assert_eq!(items.len(), 3);
+        // 6 aliases from MODEL_ALIASES (no cache file at /tmp, so no provider models)
+        assert_eq!(items.len(), 6);
         assert_eq!(title, " Models ");
         assert_eq!(items[0].value, "sonnet");
     }

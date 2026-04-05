@@ -41,7 +41,7 @@ accepting a command name, press Tab to see available completions:
 
 | Command | Completes | Source |
 |---------|-----------|--------|
-| `/model` | Model aliases (sonnet, opus, haiku) | Static |
+| `/model` | Model aliases + cached provider models | Static + `cache/models/{provider}.json` |
 | `/think` | Thinking levels (off, low, medium, high) | Static |
 | `/memory` | Subcommands (search) | Static |
 | `/config` | Subcommands (set, get), then config keys, then values | Static + config registry |
@@ -198,25 +198,56 @@ Configuration: Model: claude-sonnet-4-6 | Home: /home/sami/.mika | Session: a1b2
 
 ### /model
 
-Show or switch the currently active Claude model. Without arguments, displays the
-current model. With an argument, switches to that model immediately.
+Show or switch the currently active LLM model. Without arguments, displays the
+current model and lists available models for the active provider. With an argument,
+switches to that model immediately.
 
-**Aliases:** None | **Arguments:** `[sonnet|opus|haiku]` (optional)
+**Aliases:** None | **Arguments:** `[model-name|alias|provider/model]` (optional)
 
-**Show current model:**
+**Show current model and available models:**
 ```
 /model
 → Current model: claude-sonnet-4-6
+
+Available models for anthropic:
+  claude-sonnet-4-6 (current)
+  claude-opus-4-6
+  claude-haiku-4-5
+
+Aliases:
+  sonnet — Claude Sonnet 4.6
+  opus — Claude Opus 4.6
+  ...
 ```
 
-**Switch model:**
+For Anthropic and Google, models are hardcoded. For all other providers (OpenAI,
+DeepSeek, Groq, etc.), models are fetched from the provider's `/models` API and
+cached per-agent at `cache/models/{provider}.json` with a 24-hour TTL. If the API
+is unreachable, stale cache or aliases are used as fallback.
+
+**Switch model by alias:**
 ```
 /model opus
-→ Switched to claude-opus-4-6.
+→ Switched to Claude Opus 4.6 (claude-opus-4-6).
 ```
 
-Recognized shortcuts: `sonnet` = `claude-sonnet-4-6`, `opus` = `claude-opus-4-6`,
-`haiku` = `claude-haiku-4-5`. Full model IDs (e.g., `claude-sonnet-4-6`) also work.
+**Switch model by name (any model the provider supports):**
+```
+/model deepseek-reasoner
+→ Switched to deepseek/deepseek-reasoner.
+```
+
+**Cross-provider switch (alias or provider/model format):**
+```
+/model deepseek
+→ Switched to DeepSeek Chat (deepseek/deepseek-chat). (switched provider to deepseek)
+```
+
+When a model alias or `provider/model` format targets a different provider, the
+active provider is also switched and both `llm_provider` and `{provider}_model`
+are persisted to `config.toml`.
+
+Recognized aliases: `sonnet`, `opus`, `haiku`, `gpt4o`, `deepseek`, `gemini`.
 
 ---
 
@@ -241,9 +272,17 @@ Available providers:
 
 **Switch provider:**
 ```
-/provider openai
-→ Switched to openai (model: gpt-4o).
+/provider deepseek
+→ Switched to deepseek (model: deepseek-reasoner).
+Note: anthropic_model is still set (kept for switching back)
 ```
+
+The switch reads the user's configured `{provider}_model` from `config.toml` if
+set, falling back to the provider's default model otherwise. When no model was
+previously configured, the default is persisted to `config.toml` for visibility.
+
+Switching warns about stale model fields from the previous provider (kept for
+switching back) and if `llm_max_tokens` exceeds the new provider's limit.
 
 Validates the provider configuration before switching — if the required API key is
 missing, the switch is blocked with a clear error message:

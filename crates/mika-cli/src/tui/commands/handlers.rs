@@ -449,84 +449,174 @@ fn resolve_model_name(input: &str) -> Option<(&'static str, &'static str)> {
 }
 
 async fn handle_model(app: &mut App<'_>, args: &str) -> String {
+    use mika_common::llm::ProviderKind;
+
     let args = args.trim();
     if args.is_empty() {
-        let mut out = format!("Current model: {}\n\nAvailable models:", app.model);
-        for &(alias, full_id, display) in MODEL_ALIASES {
-            let current = if full_id == app.model {
-                " (current)"
-            } else {
-                ""
-            };
-            let _ = write!(out, "\n  /{alias} — {display}{current}");
+        let mut out = format!(
+            "Current model: {}\n\nAvailable models for {}:",
+            app.model, app.provider
+        );
+
+        // Fetch provider's model list (from cache or API)
+        let settings =
+            mika_common::config::Settings::load_for_agent(&app.global_home, &app.home_dir).ok();
+        let (api_key, base_url) = settings
+            .as_ref()
+            .map(|s| {
+                let (_, key, url) = s.provider_fields(app.provider);
+                (key.map(String::from), url.map(String::from))
+            })
+            .unwrap_or((None, None));
+
+        let models = mika_common::llm::models::get_models(
+            &app.home_dir,
+            app.provider,
+            base_url.as_deref(),
+            api_key.as_deref(),
+        )
+        .await;
+
+        if models.is_empty() {
+            let _ = write!(
+                out,
+                "\n  (no models available — type a model name directly)"
+            );
+        } else {
+            // Determine current model name (strip provider prefix if present)
+            let current_model = app.model.split('/').next_back().unwrap_or(&app.model);
+            for m in &models {
+                let marker = if m.id == current_model {
+                    " (current)"
+                } else {
+                    ""
+                };
+                let _ = write!(out, "\n  {}{}", m.id, marker);
+            }
         }
-        let _ = write!(out, "\n\nUsage: /model <name>");
+
+        let _ = write!(out, "\n\nAliases:");
+        for &(alias, _, display) in MODEL_ALIASES {
+            let _ = write!(out, "\n  {alias} — {display}");
+        }
+        let _ = write!(out, "\n\nUsage: /model <name> or /model <alias>");
         return out;
     }
 
-    match resolve_model_name(args) {
-        Some((full_id, display)) => {
-            if full_id == app.model {
-                return format!("Already using {display}.");
-            }
+    // Try resolving as an alias first
+    if let Some((full_id, display)) = resolve_model_name(args) {
+        if full_id == app.model {
+            return format!("Already using {display}.");
+        }
 
-            // Parse provider/model to determine the right config key and provider for validation
-            let (provider_prefix, model_name) = if let Some(slash_pos) = full_id.find('/') {
-                let prefix = &full_id[..slash_pos];
-                if prefix.parse::<mika_common::llm::ProviderKind>().is_ok() {
-                    (prefix, &full_id[slash_pos + 1..])
-                } else {
-                    ("anthropic", full_id)
-                }
+        // Parse provider/model to determine the right config key and provider for validation
+        let model_name = if let Some(slash_pos) = full_id.find('/') {
+            let prefix = &full_id[..slash_pos];
+            if prefix.parse::<ProviderKind>().is_ok() {
+                &full_id[slash_pos + 1..]
             } else {
-                ("anthropic", full_id)
-            };
-
-            // Pre-validate: ensure the new model works with the provider
-            // Validate BEFORE persisting to avoid leaving dirty config on disk
-            let target_provider = provider_prefix
-                .parse::<mika_common::llm::ProviderKind>()
-                .unwrap_or(app.provider);
-            if let Err(e) =
-                validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider)
-            {
-                return format!("Cannot switch to {display}: {e}");
+                full_id
             }
+        } else {
+            full_id
+        };
 
-            // Persist to config.toml (only after validation succeeds)
-            let config_path = app.home_dir.join("config.toml");
-            let model_key = format!("{provider_prefix}_model");
-            let persist_warning = match crate::commands::config::write_config_toml(
-                &config_path,
-                &model_key,
-                model_name,
-            ) {
-                Ok(()) => String::new(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to persist model to config.toml");
-                    " (warning: failed to save — change won't survive restart)".to_string()
-                }
-            };
+        let target_provider = full_id
+            .split('/')
+            .next()
+            .and_then(|p| p.parse::<ProviderKind>().ok())
+            .unwrap_or(app.provider);
 
-            app.model = full_id.to_string();
-            if app
-                .agent_tx
-                .send(AgentRequest::SetModel {
-                    model: full_id.to_string(),
-                })
-                .is_err()
-            {
-                return WORKER_NOT_RESPONDING.to_string();
-            }
-            app.needs_redraw = true;
-
-            format!("Switched to {display} ({full_id}).{persist_warning}")
+        // Pre-validate before any state mutation
+        if let Err(e) =
+            validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider)
+        {
+            return format!("Cannot switch to {display}: {e}");
         }
-        None => {
-            let options: Vec<&str> = MODEL_ALIASES.iter().map(|&(a, _, _)| a).collect();
-            format!("Unknown model: {args}\nAvailable: {}", options.join(", "))
-        }
+
+        let display_label = format!("{display} ({full_id})");
+        return apply_model_switch(
+            app,
+            target_provider,
+            model_name,
+            full_id.to_string(),
+            &display_label,
+        );
     }
+
+    // Not an alias — treat as a direct model name for the current provider
+    // Try provider/model format first (e.g., "deepseek/deepseek-reasoner")
+    let (target_provider, model_name) = if let Some(slash_pos) = args.find('/') {
+        let prefix = &args[..slash_pos];
+        match prefix.parse::<ProviderKind>() {
+            Ok(p) => (p, &args[slash_pos + 1..]),
+            Err(_) => (app.provider, args),
+        }
+    } else {
+        (app.provider, args)
+    };
+
+    // Pre-validate
+    if let Err(e) = validate_provider_switch_for(&app.home_dir, &app.global_home, target_provider) {
+        return format!("Cannot use model {args}: {e}");
+    }
+
+    let full_id = if target_provider == ProviderKind::Anthropic {
+        model_name.to_string()
+    } else {
+        format!("{target_provider}/{model_name}")
+    };
+
+    apply_model_switch(app, target_provider, model_name, full_id.clone(), &full_id)
+}
+
+/// Shared logic for applying a model switch: persist provider/model to config,
+/// update app state, notify the agent worker, and format the output message.
+fn apply_model_switch(
+    app: &mut App<'_>,
+    target_provider: mika_common::llm::ProviderKind,
+    model_name: &str,
+    full_id: String,
+    display: &str,
+) -> String {
+    let config_path = app.home_dir.join("config.toml");
+
+    // If targeting a different provider, switch the active provider too
+    let mut provider_note = String::new();
+    if target_provider != app.provider {
+        if let Err(e) = crate::commands::config::write_config_toml(
+            &config_path,
+            "llm_provider",
+            &target_provider.to_string(),
+        ) {
+            tracing::warn!(error = %e, "failed to persist provider switch to config.toml");
+        }
+        app.provider = target_provider;
+        provider_note = format!(" (switched provider to {target_provider})");
+    }
+
+    // Persist model to config.toml
+    let model_key = format!("{}_model", target_provider.config_prefix());
+    let persist_warning =
+        match crate::commands::config::write_config_toml(&config_path, &model_key, model_name) {
+            Ok(()) => String::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to persist model to config.toml");
+                " (warning: failed to save — change won't survive restart)".to_string()
+            }
+        };
+
+    app.model = full_id.clone();
+    if app
+        .agent_tx
+        .send(AgentRequest::SetModel { model: full_id })
+        .is_err()
+    {
+        return WORKER_NOT_RESPONDING.to_string();
+    }
+    app.needs_redraw = true;
+
+    format!("Switched to {display}.{persist_warning}{provider_note}")
 }
 
 async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
@@ -623,14 +713,23 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
 
                 // Pre-validate: load settings with the new provider and try to build it
                 let config_path = app.home_dir.join("config.toml");
-                match validate_provider_switch_for(&app.home_dir, &app.global_home, new_provider) {
-                    Ok(()) => {}
+                let old_provider = app.provider;
+                let settings = match validate_provider_switch_for(
+                    &app.home_dir,
+                    &app.global_home,
+                    new_provider,
+                ) {
+                    Ok(s) => s,
                     Err(e) => return format!("Cannot switch to {new_provider}: {e}"),
-                }
+                };
 
-                let model = new_provider.default_model();
+                // Read the resolved model from Settings (respects user's {provider}_model config,
+                // falls back to default_model() only when none is configured)
+                let config = settings.active_llm_config();
+                let model = config.model.clone();
+                let had_configured_model = settings.provider_fields(new_provider).0.is_some();
                 let full_id = if new_provider == ProviderKind::Anthropic {
-                    model.to_string()
+                    model.clone()
                 } else {
                     format!("{new_provider}/{model}")
                 };
@@ -646,19 +745,60 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                 app.needs_redraw = true;
 
                 // Persist provider switch to config.toml
-                let persist_warning = match crate::commands::config::write_config_toml(
+                let mut persist_warning = String::new();
+                if let Err(e) = crate::commands::config::write_config_toml(
                     &config_path,
                     "llm_provider",
                     &new_provider.to_string(),
                 ) {
-                    Ok(()) => String::new(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to persist provider to config.toml");
-                        " (warning: failed to save — change won't survive restart)".to_string()
-                    }
-                };
+                    tracing::warn!(error = %e, "failed to persist provider to config.toml");
+                    persist_warning =
+                        " (warning: failed to save — change won't survive restart)".to_string();
+                }
 
-                format!("Switched to {new_provider} (model: {model}).{persist_warning}")
+                // Persist default model when no {provider}_model was previously configured
+                if !had_configured_model {
+                    let model_key = format!("{}_model", new_provider.config_prefix());
+                    if let Err(e) =
+                        crate::commands::config::write_config_toml(&config_path, &model_key, &model)
+                    {
+                        tracing::warn!(error = %e, "failed to persist default model to config.toml");
+                    }
+                }
+
+                // Warn about stale model field from the provider being switched away from
+                let mut notes = String::new();
+                if settings.provider_fields(old_provider).0.is_some() {
+                    let old_key = format!("{}_model", old_provider.config_prefix());
+                    notes.push_str(&format!(
+                        "\nNote: {old_key} is still set (kept for switching back)"
+                    ));
+                }
+
+                // Warn if llm_max_tokens exceeds the new provider's limit
+                let max = new_provider.max_output_tokens();
+                if settings.llm_max_tokens > max {
+                    notes.push_str(&format!(
+                        "\nWarning: llm_max_tokens ({}) exceeds {new_provider}'s limit ({max})",
+                        settings.llm_max_tokens
+                    ));
+                }
+
+                // Pre-fetch model list for the new provider (fire-and-forget cache warm)
+                let home = app.home_dir.clone();
+                let base_url_owned = config.base_url.clone();
+                let api_key_owned = config.api_key.clone();
+                tokio::spawn(async move {
+                    let _ = mika_common::llm::models::get_models(
+                        &home,
+                        new_provider,
+                        base_url_owned.as_deref(),
+                        api_key_owned.as_deref(),
+                    )
+                    .await;
+                });
+
+                format!("Switched to {new_provider} (model: {model}).{persist_warning}{notes}")
             }
             Err(e) => e,
         }
@@ -666,16 +806,18 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
 }
 
 /// Pre-validate that switching to a specific provider will work (API key present, etc.).
+/// Returns the loaded settings (with `llm_provider` set to the target) on success,
+/// so the caller can read `active_llm_config()` without a second load.
 fn validate_provider_switch_for(
     home_dir: &std::path::Path,
     global_home: &std::path::Path,
     provider: mika_common::llm::ProviderKind,
-) -> Result<(), String> {
+) -> Result<mika_common::config::Settings, String> {
     let mut settings = mika_common::config::Settings::load_for_agent(global_home, home_dir)
         .map_err(|e| format!("failed to load settings: {e}"))?;
     settings.llm_provider = provider;
     settings.make_llm_provider().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(settings)
 }
 
 async fn handle_export(app: &mut App<'_>) -> String {
@@ -1546,17 +1688,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_model_unknown_returns_error() {
-        let (mut app, _rx, _tmp) = test_app().await;
-        let original_model = app.model.clone();
+    async fn test_model_direct_name_sets_model() {
+        let (mut app, mut rx, tmp) = test_app().await;
 
-        let output = handle_model(&mut app, "nonexistent-xyz").await;
+        // Switch to DeepSeek first (easier to test with fake API key)
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+        let _ = handle_provider(&mut app, "deepseek").await;
+        drain_requests(&mut rx); // clear SetModel from provider switch
 
-        assert!(output.contains("Unknown model"));
-        assert_eq!(
-            app.model, original_model,
-            "model should not change on error"
+        // Use a direct model name (not an alias)
+        let output = handle_model(&mut app, "deepseek-reasoner").await;
+
+        assert!(
+            output.contains("Switched to deepseek/deepseek-reasoner"),
+            "should accept direct model name, got: {output}"
         );
+        assert_eq!(app.model, "deepseek/deepseek-reasoner");
+
+        // Should have sent SetModel to the worker
+        let requests = drain_requests(&mut rx);
+        assert!(requests.iter().any(
+            |r| matches!(r, AgentRequest::SetModel { model } if model == "deepseek/deepseek-reasoner")
+        ));
     }
 
     // --- /provider tests ---
@@ -1812,5 +1966,171 @@ mod tests {
             output.contains("not responding"),
             "should report worker error: {output}"
         );
+    }
+
+    // --- #442: provider/model config state fixes ---
+
+    #[tokio::test]
+    async fn test_provider_switch_reads_configured_model() {
+        let (mut app, _rx, tmp) = test_app().await;
+
+        // Pre-configure deepseek_model in config.toml
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"anthropic\"\ndeepseek_model = \"deepseek-reasoner\"\n",
+        )
+        .unwrap();
+
+        // Also need a fake API key for validation to pass
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        let output = handle_provider(&mut app, "deepseek").await;
+
+        // Should use the configured model, not the default
+        assert!(
+            output.contains("deepseek-reasoner"),
+            "should show configured model, got: {output}"
+        );
+        assert_eq!(app.provider, ProviderKind::DeepSeek);
+    }
+
+    #[tokio::test]
+    async fn test_provider_switch_persists_default_model() {
+        let (mut app, _rx, tmp) = test_app().await;
+
+        // Set up API key but no deepseek_model
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_provider = \"anthropic\"\n").unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        let _output = handle_provider(&mut app, "deepseek").await;
+
+        // Config should now have deepseek_model persisted
+        let config_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config_content.contains("deepseek_model"),
+            "should persist default model, config: {config_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_switch_shows_stale_field_warning() {
+        let (mut app, _rx, tmp) = test_app().await;
+
+        // Set up: anthropic_model is configured (the provider we're switching FROM)
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"anthropic\"\nanthropic_model = \"claude-opus-4-6\"\n",
+        )
+        .unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        let output = handle_provider(&mut app, "deepseek").await;
+
+        assert!(
+            output.contains("anthropic_model is still set"),
+            "should warn about stale field, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_switch_warns_max_tokens() {
+        let (mut app, _rx, tmp) = test_app().await;
+
+        // Set up: llm_max_tokens exceeds DeepSeek's 8192 limit
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"anthropic\"\nllm_max_tokens = 16384\n",
+        )
+        .unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        let output = handle_provider(&mut app, "deepseek").await;
+
+        assert!(
+            output.contains("exceeds deepseek's limit"),
+            "should warn about max_tokens, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_cross_provider_alias_switches_provider() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Set up: start on Anthropic, switch via deepseek alias
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        assert_eq!(app.provider, ProviderKind::Anthropic);
+        let output = handle_model(&mut app, "deepseek").await;
+
+        // Should switch provider to DeepSeek
+        assert_eq!(
+            app.provider,
+            ProviderKind::DeepSeek,
+            "should switch provider for cross-provider alias"
+        );
+        assert!(
+            output.contains("switched provider to deepseek"),
+            "should note provider switch, got: {output}"
+        );
+
+        // Verify SetModel was sent
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, AgentRequest::SetModel { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_direct_with_provider_prefix() {
+        let (mut app, _rx, tmp) = test_app().await;
+
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
+
+        let output = handle_model(&mut app, "deepseek/deepseek-reasoner").await;
+
+        assert_eq!(app.provider, ProviderKind::DeepSeek);
+        assert!(
+            output.contains("deepseek/deepseek-reasoner"),
+            "should set full model id, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_no_args_shows_provider_models() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        let output = handle_model(&mut app, "").await;
+
+        // Anthropic uses hardcoded models
+        assert!(
+            output.contains("Available models for anthropic"),
+            "should show provider models, got: {output}"
+        );
+        assert!(
+            output.contains("claude-sonnet-4-6"),
+            "should list Anthropic models, got: {output}"
+        );
+        assert!(output.contains("Aliases:"), "should show aliases section");
+    }
+
+    #[test]
+    fn test_max_output_tokens_known_providers() {
+        // Verify key providers have sensible limits
+        assert_eq!(ProviderKind::DeepSeek.max_output_tokens(), 8_192);
+        assert_eq!(ProviderKind::Anthropic.max_output_tokens(), 128_000);
+        assert_eq!(ProviderKind::OpenAi.max_output_tokens(), 16_384);
+        assert_eq!(ProviderKind::Groq.max_output_tokens(), 8_192);
     }
 }
