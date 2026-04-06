@@ -128,7 +128,7 @@ async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
     app.session_id = new_session;
     app.messages.clear();
     app.scroll_offset = 0;
-    app.last_seen_msg_id = 0;
+    app.last_seen_msg_id = app.db.max_message_id().await.unwrap_or(0);
     app.context_tokens = None;
     app.messages_layout = MessagesLayout::default();
 
