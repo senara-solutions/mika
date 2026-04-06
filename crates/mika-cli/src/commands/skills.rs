@@ -19,9 +19,6 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     let agent_home = home::resolve_agent_home(&global_home, agent_name);
     let skills_dir = agent_home.join("skills");
 
-    // Resolve GitHub token once for git operations (App preferred, PAT fallback)
-    let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
-
     match args.command {
         None => {
             let registry = SkillRegistry::from_dir(&skills_dir);
@@ -48,6 +45,8 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
             toggle_skill(&skills_dir, &name, false)?;
         }
         Some(SkillsCommand::Install { source, name, link }) => {
+            // Resolve GitHub token only for git operations (App preferred, PAT fallback)
+            let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
             install_skill(
                 &agent_home,
                 &skills_dir,
@@ -61,6 +60,7 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
             uninstall_skill(&agent_home, &skills_dir, &name, remove_deps)?;
         }
         Some(SkillsCommand::Update { name }) => {
+            let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
             update_skills(
                 &agent_home,
                 &skills_dir,

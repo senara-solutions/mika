@@ -105,7 +105,7 @@ pub fn clone_to_temp(url: &str, github_token: Option<&str>) -> Result<TempDir> {
 /// Inject a GitHub token into an HTTPS GitHub URL for authentication.
 ///
 /// Only rewrites `https://github.com/...` URLs. All other URLs are returned unchanged.
-pub(crate) fn inject_github_token(url: &str, token: &str) -> String {
+fn inject_github_token(url: &str, token: &str) -> String {
     if url.starts_with("https://github.com/") {
         url.replacen(
             "https://github.com/",
