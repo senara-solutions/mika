@@ -100,13 +100,11 @@ pub fn switch_model(global_home: &Path, home_dir: &Path, input: &str) -> Result<
     let lower = input.to_lowercase();
     for &(alias, full_id, display) in MODEL_ALIASES {
         if lower == alias || lower == full_id {
-            let current_display =
-                super::provider::format_display_model(current_provider, &previous_model);
-            if full_id == current_display {
+            let (target_provider, model_name) = parse_provider_model(full_id, current_provider);
+
+            if target_provider == current_provider && model_name == previous_model {
                 bail!("Already using {display}.");
             }
-
-            let (target_provider, model_name) = parse_provider_model(full_id, current_provider);
 
             super::provider::validate_provider_switch(global_home, home_dir, target_provider)
                 .map_err(|e| anyhow::anyhow!("Cannot switch to {display}: {e}"))?;

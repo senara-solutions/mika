@@ -93,7 +93,7 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "model",
         aliases: &[],
         description: "Show or switch model",
-        args_hint: Some("[sonnet|opus|haiku]"),
+        args_hint: Some("[<name|alias>]"),
         completer: Some(completers::complete_model),
     },
     SlashCommand {

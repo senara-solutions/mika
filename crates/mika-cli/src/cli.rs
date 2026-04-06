@@ -673,16 +673,17 @@ pub enum McpCommand {
 /// Known model shorthands: (shorthand, full_model_id, display_name).
 /// Single source of truth — used by both CLI `--model` flag and TUI `/model` command.
 pub const MODEL_ALIASES: &[(&str, &str, &str)] = &[
-    ("sonnet", "claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("opus", "claude-opus-4-6", "Claude Opus 4.6"),
-    ("haiku", "claude-haiku-4-5", "Claude Haiku 4.5"),
+    ("sonnet", "anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("opus", "anthropic/claude-opus-4-6", "Claude Opus 4.6"),
+    ("haiku", "anthropic/claude-haiku-4-5", "Claude Haiku 4.5"),
     ("gpt4o", "openai/gpt-4o", "GPT-4o"),
     ("deepseek", "deepseek/deepseek-chat", "DeepSeek Chat"),
     ("gemini", "google/gemini-2.5-flash", "Gemini 2.5 Flash"),
 ];
 
-/// Resolve a model alias (e.g., "sonnet") to its full model ID (e.g., "claude-sonnet-4-6").
-/// Returns the input unchanged if it's not a known alias (allows provider-prefixed names like "openai/gpt-4o").
+/// Resolve a model alias (e.g., "sonnet") to its full model ID (e.g., "anthropic/claude-sonnet-4-6").
+/// All aliases include their provider prefix for cross-provider correctness.
+/// Returns the input unchanged if it's not a known alias.
 pub fn resolve_model_alias(input: &str) -> String {
     let lower = input.to_lowercase();
     for &(alias, full_id, _display) in MODEL_ALIASES {

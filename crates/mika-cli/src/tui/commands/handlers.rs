@@ -2059,6 +2059,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_model_alias_on_openrouter_uses_provider_prefix() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Set up: user is on OpenRouter
+        app.provider = ProviderKind::OpenRouter;
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"anthropic/claude-sonnet-4\"\n",
+        )
+        .unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "MIKA_OPENROUTER_API_KEY=sk-or-fake-key-for-test\n",
+        )
+        .unwrap();
+
+        // Using "sonnet" alias on OpenRouter should set the model to
+        // "anthropic/claude-sonnet-4-6" (valid OpenRouter model name),
+        // NOT "claude-sonnet-4-6" (invalid bare name).
+        let output = handle_model(&mut app, "sonnet").await;
+
+        // Should stay on OpenRouter (not switch to Anthropic)
+        assert_eq!(
+            app.provider,
+            ProviderKind::OpenRouter,
+            "should stay on OpenRouter, got: {:?}",
+            app.provider
+        );
+        assert!(
+            output.contains("openrouter/anthropic/claude-sonnet-4-6"),
+            "should show openrouter model with anthropic prefix, got: {output}"
+        );
+
+        // Worker should receive the full prefixed model
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model == "openrouter/anthropic/claude-sonnet-4-6")
+            ),
+            "SetModel should have openrouter/anthropic/ prefix"
+        );
+
+        // Config should have openrouter_model with anthropic prefix
+        let config_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config_content.contains("anthropic/claude-sonnet-4-6"),
+            "should persist model with anthropic prefix, config: {config_content}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_model_on_openrouter_keeps_slash_model_name() {
         let (mut app, mut rx, tmp) = test_app().await;
 
