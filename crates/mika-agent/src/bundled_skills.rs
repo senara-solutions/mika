@@ -82,6 +82,12 @@ static FILE_READER_SKILL: BundledSkill = skill!("file-reader", [
     ("handlers/read.sh" => "../templates/skills/file-reader/handlers/read.sh", +x),
 ]);
 
+static SKILL_REVIEW_SKILL: BundledSkill = skill!("skill-review", [
+    ("skill.toml" => "../templates/skills/skill-review/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/skill-review/system_prompt.md"),
+    ("tools.json" => "../templates/skills/skill-review/tools.json"),
+]);
+
 static SELF_KNOWLEDGE_SKILL: BundledSkill = skill!("self-knowledge", [
     ("skill.toml" => "../templates/skills/self-knowledge/skill.toml"),
     ("system_prompt.md" => "../templates/skills/self-knowledge/system_prompt.md"),
@@ -130,6 +136,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &SHELL_EXEC_SKILL,
     &WEB_SEARCH_SKILL,
     &FILE_READER_SKILL,
+    &SKILL_REVIEW_SKILL,
     &SELF_KNOWLEDGE_SKILL,
     &GIT_OPS_SKILL,
     &GOOGLE_WORKSPACE_SKILL,

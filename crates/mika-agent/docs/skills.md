@@ -572,14 +572,17 @@ These three use the `builtin` handler type, so their tools are dispatched throug
 
 ### Builtin-handler skills (keyword-triggered)
 
-| Skill              | Keywords                                                                                           | Tools      | Prompt Snippet |
-|--------------------|----------------------------------------------------------------------------------------------------|------------|----------------|
+| Skill              | Keywords                                                                                           | Tools          | Prompt Snippet |
+|--------------------|----------------------------------------------------------------------------------------------------|----------------|----------------|
 | git-ops            | rebase, merge main, sync main, git sync, sync branch, fast-forward, git fetch, rebase onto, git rebase, git merge | `git_ops`  | Yes            |
-| google-workspace   | google, gmail, google calendar, google drive, gdrive                                               | `run_gws`  | Yes            |
+| google-workspace   | google, gmail, google calendar, google drive, gdrive                                               | `run_gws`      | Yes            |
+| skill-review       | review skill, adapt skill, generate variant, tune prompt, skill variant                            | `review_skill` | Yes            |
 
 The **git-ops** skill provides `git_ops` for structured git maintenance operations (fetch, rebase, merge). It uses `tokio::process::Command` with `GIT_TERMINAL_PROMPT=0` and scrubs `MIKA_*` env vars from child processes. Supported operations: `fetch` (download remote refs), `rebase` (fetch + rebase onto base ref, auto-aborts on conflict), `merge` (fetch + fast-forward only merge). Optional `push: true` on rebase uses `--force-with-lease` with branch protection (refuses push to `main`/`master`). Pre-flight checks verify the repo path, clean working tree, and no in-progress rebase/merge. `timeout_secs = 120` for large repo operations.
 
 The **google-workspace** skill provides `run_gws` for interacting with Google Workspace (Gmail, Calendar, Drive) via the `gws` CLI. It uses a service allowlist (`gmail`, `calendar`, `drive`) and blocks credential/config-smuggling flags (`--token`, `--credentials-file`, `--config`, `--config-dir` including `--flag=value` forms). Scrubs `MIKA_*` env vars from child processes. Uses `gws`'s native keyring-based authentication (set up via `gws auth login`). Requires `gws` CLI installed (included in Docker image). `timeout_secs = 45` to accommodate first-call API schema discovery.
+
+The **skill-review** skill provides `review_skill` for generating model-tuned `system_prompt.md` variants. It reads a skill's root prompt and tool signatures, resolves the agent's current provider/model (extracting canonical tuples for aggregator providers like OpenRouter), and returns structured data so the agent can generate an adapted prompt. Supports single-skill review, batch mode (`skill_name = "*"`), dry-run preview, and force overwrite. Refuses linked skills to enforce the read-only invariant. See the [Model Tuning](#model-tuning) section for details. `timeout_secs = 60`.
 
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
 
@@ -941,6 +944,104 @@ The `list_skills` tool shows an `[override]` badge when the effective `always_on
 
 ```
 - web-search (enabled) [built-in] — Search the web [always-on] [override]
+```
+
+---
+
+## Model Tuning
+
+Mika supports per-provider/model prompt variants so each skill can have a model-tuned `system_prompt.md`. The built-in **skill-review** skill automates generating these variants.
+
+### How it works
+
+The `skill-review` skill reads a skill's root `system_prompt.md` and tool signatures, then lets the agent's LLM generate an adapted prompt optimized for the current model. The result is written to the skill's variant directory.
+
+### Invoking skill-review
+
+Use natural language with any of these keywords: "review skill", "adapt skill", "generate variant", "tune prompt", "skill variant".
+
+**Examples:**
+
+```
+review the web-search skill
+adapt the shell-exec skill prompt for this model
+generate variant for all skills
+```
+
+### The review_skill tool
+
+The skill exposes one tool:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `skill_name` | string | (required) | Skill name, or `*` for all skills |
+| `dry_run` | boolean | false | Show adapted prompt without writing |
+| `force` | boolean | false | Overwrite existing variants |
+
+### Where variants are stored
+
+Variants follow the two-level resolution hierarchy:
+
+```
+~/.mika/agents/<name>/skills/<skill>/
+  system_prompt.md                           # Root prompt (fallback)
+  anthropic/
+    claude-sonnet-4-6/
+      system_prompt.md                       # Model-specific variant
+  openai/
+    gpt-4o/
+      system_prompt.md                       # Another variant
+```
+
+**Resolution order:** model-specific prompt -> root prompt. There are no provider-level prompts (models from the same provider have different requirements).
+
+### Aggregator providers
+
+When running on an aggregator provider like OpenRouter (model name `anthropic/claude-sonnet-4`), skill-review extracts the canonical provider and model:
+
+- OpenRouter `anthropic/claude-sonnet-4` -> writes to `anthropic/claude-sonnet-4/system_prompt.md`
+- OpenRouter `openai/gpt-4o` -> writes to `openai/gpt-4o/system_prompt.md`
+
+This means variants generated via OpenRouter are used when the agent later runs on the native provider directly.
+
+### Batch mode
+
+Use `skill_name = "*"` to review all skills. The tool returns a list of eligible and skipped skills. Due to the agent's step limit, batch mode processes skills iteratively — you may need multiple invocations for large skill sets.
+
+Skills are skipped in batch mode when:
+- Installed with `--link` (read-only invariant)
+- No `system_prompt.md` (nothing to adapt)
+- Variant already exists (unless `force = true`)
+
+### Dry-run workflow
+
+Set `dry_run = true` to preview the adaptation without writing:
+
+```
+review skill web-search with dry_run
+```
+
+The agent will generate and display the adapted prompt for review. You can then decide whether to proceed with writing.
+
+### Manual editing
+
+Variant files are plain markdown — you can edit them directly:
+
+```bash
+# Edit a variant
+vim ~/.mika/agents/<name>/skills/web-search/anthropic/claude-sonnet-4-6/system_prompt.md
+
+# Remove a variant (falls back to root prompt)
+rm -rf ~/.mika/agents/<name>/skills/web-search/anthropic/claude-sonnet-4-6/
+```
+
+### Linked skills
+
+Linked skills (installed with `--link`) cannot have variants written to them because the skill directory is a symlink to the author's source directory. Unlink first, then generate variants:
+
+```bash
+mika skills uninstall my-skill
+mika skills install /path/to/my-skill  # Without --link
 ```
 
 ---

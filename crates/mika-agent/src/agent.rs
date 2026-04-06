@@ -1242,6 +1242,8 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         is_reflection: false,
         is_task_context: false,
         is_callback_turn: params.is_callback_turn,
+        provider_name: provider,
+        model_name: model,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -2003,6 +2005,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         // `is_callback_turn` is only meaningful in the Conversation mode path
         // (TUI poll_callback_tasks) where it additionally gates create_work_item.
         is_callback_turn: false,
+        provider_name: provider,
+        model_name: model,
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -2314,6 +2318,8 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         is_reflection: false,
         is_task_context: true,
         is_callback_turn: false,
+        provider_name: provider,
+        model_name: model,
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =

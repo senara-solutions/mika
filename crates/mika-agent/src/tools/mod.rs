@@ -89,6 +89,12 @@ pub struct ToolContext<'a> {
     pub is_task_context: bool,
     /// True when running in a callback turn (Guard 3 — blocks ALL work item creation).
     pub is_callback_turn: bool,
+    /// Current LLM provider name (e.g., "anthropic", "openrouter").
+    /// Used by builtin handlers that need to know the agent's active provider.
+    pub provider_name: &'a str,
+    /// Current LLM model name (e.g., "claude-sonnet-4-6", "anthropic/claude-sonnet-4").
+    /// Used by builtin handlers that need to know the agent's active model.
+    pub model_name: &'a str,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

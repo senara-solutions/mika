@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 
 use tokio::io::AsyncReadExt;
 
+use crate::skills::index::sanitize_model_dir_name;
 use crate::tools::{ToolContext, ToolOutput};
 
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
@@ -36,6 +37,7 @@ static DOC_TASK_SYSTEM: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/task
 pub const KNOWN_BUILTINS: &[&str] = &[
     "get_documentation",
     "git_ops",
+    "review_skill",
     "run_gh",
     "run_gws",
     "web_search",
@@ -67,6 +69,7 @@ pub async fn execute(
     let mut output = match function {
         "get_documentation" => get_documentation(&input, ctx).await,
         "git_ops" => git_ops(&input, ctx).await,
+        "review_skill" => review_skill(&input, ctx).await,
         "run_gh" => run_gh(&input, ctx).await,
         "run_gws" => run_gws(&input, ctx).await,
         "web_search" => web_search(&input, ctx).await,
@@ -899,6 +902,284 @@ async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutpu
     .await
 }
 
+// ---------------------------------------------------------------------------
+// review_skill — gather skill prompt data for model-tuned variant generation
+// ---------------------------------------------------------------------------
+
+/// Maximum size for a root prompt included in the response (characters).
+const MAX_PROMPT_IN_RESPONSE: usize = 8_000;
+
+/// Resolve the canonical (provider, model) tuple for variant directory naming.
+///
+/// For aggregator providers (e.g. OpenRouter) whose model names contain a slash
+/// (`anthropic/claude-sonnet-4`), extracts the real provider and model so that
+/// variants are filed under the canonical provider directory.
+///
+/// For direct providers the inputs are returned as-is.
+fn resolve_canonical_provider_model<'a>(
+    provider_name: &'a str,
+    model_name: &'a str,
+) -> (&'a str, &'a str) {
+    let Ok(kind) = provider_name.parse::<mika_common::llm::ProviderKind>() else {
+        return (provider_name, model_name);
+    };
+
+    if kind.model_names_contain_slash()
+        && let Some((real_provider, real_model)) = model_name.split_once('/')
+        && !real_provider.is_empty()
+        && !real_model.is_empty()
+    {
+        return (real_provider, real_model);
+    }
+
+    (provider_name, model_name)
+}
+
+/// Gather skill prompt data and resolve variant paths for model-tuned variant
+/// generation.  Returns structured JSON so the agent loop can perform the
+/// creative prompt adaptation and write the result via `write_agent_file`.
+async fn review_skill(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
+    // --- Input validation --------------------------------------------------
+    let skill_name = match input.get("skill_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return ToolOutput::error("Missing required 'skill_name' (string)."),
+    };
+    if skill_name.len() > 200 {
+        return ToolOutput::error("'skill_name' must be at most 200 characters.");
+    }
+    let dry_run = input
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let force = input
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // --- Resolve canonical provider / model --------------------------------
+    let (canonical_provider, canonical_model) =
+        resolve_canonical_provider_model(ctx.provider_name, ctx.model_name);
+    let sanitized_model = sanitize_model_dir_name(canonical_model);
+
+    let skills_dir = ctx.home_dir.join("skills");
+
+    // --- Batch mode --------------------------------------------------------
+    if skill_name == "*" {
+        return review_skill_batch(&skills_dir, canonical_provider, &sanitized_model, force).await;
+    }
+
+    // --- Single-skill mode -------------------------------------------------
+    review_skill_single(
+        &skills_dir,
+        skill_name,
+        canonical_provider,
+        canonical_model,
+        &sanitized_model,
+        dry_run,
+        force,
+    )
+    .await
+}
+
+/// Handle a single-skill review_skill invocation.
+async fn review_skill_single(
+    skills_dir: &std::path::Path,
+    skill_name: &str,
+    canonical_provider: &str,
+    canonical_model: &str,
+    sanitized_model: &str,
+    dry_run: bool,
+    force: bool,
+) -> ToolOutput {
+    let skill_dir = skills_dir.join(skill_name);
+
+    // Existence check
+    if !skill_dir.exists() {
+        return ToolOutput::error(format!(
+            "Skill '{skill_name}' not found. Check the name with `list_agent_files` \
+             at path 'skills/'."
+        ));
+    }
+
+    // Linked-skill check (symlink → refuse)
+    match std::fs::symlink_metadata(&skill_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return ToolOutput::error(format!(
+                "Skill '{skill_name}' is installed with --link. Variants cannot be \
+                 written to linked skills (read-only invariant). Unlink first with \
+                 `mika skills uninstall {skill_name}` then reinstall without --link."
+            ));
+        }
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "Cannot read skill directory for '{skill_name}': {e}"
+            ));
+        }
+        _ => {}
+    }
+
+    // Read root prompt
+    let prompt_path = skill_dir.join("system_prompt.md");
+    let root_prompt = match std::fs::read_to_string(&prompt_path) {
+        Ok(content) if !content.trim().is_empty() => content,
+        Ok(_) => {
+            return ToolOutput::error(format!(
+                "Skill '{skill_name}' has an empty system_prompt.md — nothing to adapt."
+            ));
+        }
+        Err(_) => {
+            return ToolOutput::error(format!(
+                "Skill '{skill_name}' has no system_prompt.md to adapt."
+            ));
+        }
+    };
+
+    // Read tools.json (optional — prompt-only skills may not have one)
+    let tools_path = skill_dir.join("tools.json");
+    let tools_json = std::fs::read_to_string(&tools_path).unwrap_or_else(|_| "[]".to_string());
+
+    // Compute variant path (relative to agent home for write_agent_file)
+    let variant_rel =
+        format!("skills/{skill_name}/{canonical_provider}/{sanitized_model}/system_prompt.md");
+    let variant_abs = skills_dir.parent().unwrap_or(skills_dir).join(&variant_rel);
+
+    // Check existing variant
+    let existing_variant = std::fs::read_to_string(&variant_abs).ok();
+
+    if existing_variant.is_some() && !force {
+        let result = serde_json::json!({
+            "skill_name": skill_name,
+            "provider": canonical_provider,
+            "model": canonical_model,
+            "variant_path": variant_rel,
+            "skipped": true,
+            "reason": "variant already exists (use force=true to overwrite)",
+            "dry_run": dry_run,
+        });
+        return ToolOutput::success(serde_json::to_string_pretty(&result).unwrap());
+    }
+
+    // Truncate very large prompts to keep the response within output limits
+    let prompt_for_response = if root_prompt.len() > MAX_PROMPT_IN_RESPONSE {
+        let truncated = &root_prompt[..root_prompt
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_PROMPT_IN_RESPONSE)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(MAX_PROMPT_IN_RESPONSE)];
+        format!(
+            "{truncated}\n\n... (truncated — original is {} chars)",
+            root_prompt.len()
+        )
+    } else {
+        root_prompt
+    };
+
+    let result = serde_json::json!({
+        "skill_name": skill_name,
+        "root_prompt": prompt_for_response,
+        "tools_json": tools_json,
+        "provider": canonical_provider,
+        "model": canonical_model,
+        "variant_path": variant_rel,
+        "existing_variant": existing_variant,
+        "dry_run": dry_run,
+        "skipped": false,
+    });
+
+    ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
+}
+
+/// Handle batch mode (`skill_name = "*"`).
+///
+/// Returns a summary of all eligible and skipped skills so the agent can
+/// then process them individually.
+async fn review_skill_batch(
+    skills_dir: &std::path::Path,
+    canonical_provider: &str,
+    sanitized_model: &str,
+    force: bool,
+) -> ToolOutput {
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return ToolOutput::error(format!("Cannot read skills directory: {e}"));
+        }
+    };
+
+    let mut eligible: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+
+    let mut dirs: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type()
+                .map(|ft| ft.is_dir() || ft.is_symlink())
+                .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort_by_key(|e| e.file_name());
+
+    for entry in dirs {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let path = entry.path();
+
+        // Skip linked skills
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.file_type().is_symlink()
+        {
+            skipped.push(serde_json::json!({
+                "name": name_str,
+                "reason": "linked",
+            }));
+            continue;
+        }
+
+        // Skip skills without system_prompt.md
+        let prompt_path = path.join("system_prompt.md");
+        if !prompt_path.exists() {
+            skipped.push(serde_json::json!({
+                "name": name_str,
+                "reason": "no system_prompt.md",
+            }));
+            continue;
+        }
+
+        // Check existing variant
+        let variant_path = path
+            .join(canonical_provider)
+            .join(sanitized_model)
+            .join("system_prompt.md");
+        let has_variant = variant_path.exists();
+
+        if has_variant && !force {
+            skipped.push(serde_json::json!({
+                "name": name_str,
+                "reason": "variant exists",
+            }));
+            continue;
+        }
+
+        eligible.push(serde_json::json!({
+            "name": name_str,
+            "has_variant": has_variant,
+        }));
+    }
+
+    let result = serde_json::json!({
+        "mode": "batch",
+        "provider": canonical_provider,
+        "model": sanitized_model,
+        "eligible_skills": eligible,
+        "skipped_skills": skipped,
+        "total_eligible": eligible.len(),
+        "total_skipped": skipped.len(),
+    });
+
+    ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,5 +1948,258 @@ mod tests {
                  Run scripts/sync-agent-docs.sh to fix."
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // review_skill tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_review_skill_in_known_builtins() {
+        assert!(KNOWN_BUILTINS.contains(&"review_skill"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_missing_skill_name() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = review_skill(&serde_json::json!({}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing required 'skill_name'"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_empty_skill_name() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = review_skill(&serde_json::json!({"skill_name": ""}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing required 'skill_name'"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_nonexistent_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "nonexistent"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_no_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = home.join("skills/test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            "[skill]\nname = \"test-skill\"\n",
+        )
+        .unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "test-skill"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("no system_prompt.md"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_linked_skill_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skills_dir = home.join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        // Create a real directory and symlink to it
+        let real_dir = tmp.path().join("real-skill");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("system_prompt.md"), "test prompt").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, skills_dir.join("linked-skill")).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Skip on non-unix
+            return;
+        }
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "linked-skill"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("--link"));
+        assert!(output.content.contains("read-only invariant"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_single_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = home.join("skills/web-search");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
+        std::fs::write(skill_dir.join("tools.json"), r#"[{"name": "web_search"}]"#).unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "web-search"}), &ctx).await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["skill_name"], "web-search");
+        assert_eq!(parsed["provider"], "anthropic");
+        assert_eq!(parsed["model"], "claude-sonnet-4-6");
+        assert_eq!(parsed["root_prompt"], "Search the web.");
+        assert_eq!(parsed["skipped"], false);
+        assert!(
+            parsed["variant_path"]
+                .as_str()
+                .unwrap()
+                .contains("anthropic/claude-sonnet-4-6/system_prompt.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_existing_variant_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = home.join("skills/web-search");
+        let variant_dir = skill_dir.join("anthropic/claude-sonnet-4-6");
+        std::fs::create_dir_all(&variant_dir).unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
+        std::fs::write(variant_dir.join("system_prompt.md"), "Existing variant.").unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "web-search"}), &ctx).await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["skipped"], true);
+        assert!(
+            parsed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("already exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_existing_variant_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = home.join("skills/web-search");
+        let variant_dir = skill_dir.join("anthropic/claude-sonnet-4-6");
+        std::fs::create_dir_all(&variant_dir).unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
+        std::fs::write(variant_dir.join("system_prompt.md"), "Existing variant.").unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(
+            &serde_json::json!({"skill_name": "web-search", "force": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["skipped"], false);
+        assert_eq!(parsed["existing_variant"], "Existing variant.");
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_batch_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skills_dir = home.join("skills");
+        // Create two skills with prompts
+        for name in &["alpha-skill", "beta-skill"] {
+            let dir = skills_dir.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("system_prompt.md"), format!("{name} prompt")).unwrap();
+        }
+        // Create one skill without prompt
+        let no_prompt = skills_dir.join("gamma-skill");
+        std::fs::create_dir_all(&no_prompt).unwrap();
+        std::fs::write(no_prompt.join("skill.toml"), "[skill]\nname = \"gamma\"\n").unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "*"}), &ctx).await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["mode"], "batch");
+        assert_eq!(parsed["total_eligible"], 2);
+        assert_eq!(parsed["total_skipped"], 1);
+        // gamma-skill skipped for no system_prompt.md
+        let skipped = parsed["skipped_skills"].as_array().unwrap();
+        assert!(skipped.iter().any(|s| s["name"] == "gamma-skill"));
+    }
+
+    #[test]
+    fn test_resolve_canonical_provider_model_direct() {
+        let (p, m) = resolve_canonical_provider_model("anthropic", "claude-sonnet-4-6");
+        assert_eq!(p, "anthropic");
+        assert_eq!(m, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_resolve_canonical_provider_model_openrouter() {
+        let (p, m) = resolve_canonical_provider_model("openrouter", "anthropic/claude-sonnet-4");
+        assert_eq!(p, "anthropic");
+        assert_eq!(m, "claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_resolve_canonical_provider_model_openrouter_openai() {
+        let (p, m) = resolve_canonical_provider_model("openrouter", "openai/gpt-4o");
+        assert_eq!(p, "openai");
+        assert_eq!(m, "gpt-4o");
+    }
+
+    #[test]
+    fn test_resolve_canonical_provider_model_openrouter_meta_llama() {
+        let (p, m) =
+            resolve_canonical_provider_model("openrouter", "meta-llama/llama-3.3-70b-instruct");
+        assert_eq!(p, "meta-llama");
+        assert_eq!(m, "llama-3.3-70b-instruct");
+    }
+
+    #[test]
+    fn test_resolve_canonical_provider_model_unknown_provider() {
+        let (p, m) = resolve_canonical_provider_model("custom-provider", "my-model");
+        assert_eq!(p, "custom-provider");
+        assert_eq!(m, "my-model");
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = home.join("skills/test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "Test prompt.").unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(
+            &serde_json::json!({"skill_name": "test-skill", "dry_run": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["dry_run"], true);
+        assert_eq!(parsed["skipped"], false);
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_no_tools_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = home.join("skills/prompt-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("system_prompt.md"), "Prompt only skill.").unwrap();
+        // No tools.json
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "prompt-only"}), &ctx).await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["tools_json"], "[]");
     }
 }

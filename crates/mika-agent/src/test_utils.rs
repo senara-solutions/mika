@@ -49,6 +49,8 @@ pub mod test_helpers {
             is_reflection: false,
             is_task_context: false,
             is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
         }
     }
 
@@ -117,6 +119,8 @@ pub mod test_helpers {
                 is_reflection: true,
                 is_task_context: false,
                 is_callback_turn: false,
+                provider_name: "anthropic",
+                model_name: "claude-sonnet-4-6",
             }
         }
 
@@ -139,6 +143,8 @@ pub mod test_helpers {
                 is_reflection: false,
                 is_task_context: false,
                 is_callback_turn: false,
+                provider_name: "anthropic",
+                model_name: "claude-sonnet-4-6",
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -165,6 +171,8 @@ pub mod test_helpers {
                 is_reflection: false,
                 is_task_context: false,
                 is_callback_turn: false,
+                provider_name: "anthropic",
+                model_name: "claude-sonnet-4-6",
             }
         }
     }
