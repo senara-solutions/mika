@@ -761,6 +761,8 @@ async fn run_investigation(
         is_reflection: false,
         is_task_context: false,
         is_callback_turn: false,
+        provider_name: llm.provider_name(),
+        model_name: llm.model_name(),
     };
 
     for _step in 0..MAX_INVESTIGATION_STEPS {

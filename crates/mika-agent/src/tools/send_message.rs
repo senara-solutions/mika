@@ -150,6 +150,8 @@ mod tests {
             is_reflection: false,
             is_task_context: false,
             is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
         };
         let tool = SendMessageTool;
 
