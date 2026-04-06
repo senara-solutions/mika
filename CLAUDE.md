@@ -34,7 +34,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/adr/` — Architecture Decision Records (numbered)
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
-- `Makefile` — Development workflow targets: `make build`, `make deploy` (build+stop+install), `make deploy-dashboard`, `make test`, `make lint`, `make fmt`, `make check`
+- `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+stop+install), `make test`, `make lint`, `make fmt`, `make check`
 - `todos/` — Code review findings (tracked as markdown files)
 - `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues)
 
@@ -74,8 +74,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `mika dashboard status` — Query embedded dashboard status from mika-server (via `GET /api/v1/dashboard/status`)
 - `mika dashboard open` — Open dashboard URL in browser
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
-- `make deploy` — Build release binaries with telemetry, stop running mika-server/mika-gateway, install to `~/.local/bin/`
-- `make deploy-dashboard` — Same as `make deploy` but builds the dashboard first
+- `make deploy` — Build dashboard + release binaries with telemetry, stop running mika-server/mika-gateway, install to `~/.local/bin/`
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
 - `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image

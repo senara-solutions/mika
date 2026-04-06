@@ -19,7 +19,9 @@ Thumbs.db
 
 # Node
 node_modules/
-# dashboard/dist/ is committed — embedded into mika-server via rust-embed
+# dashboard/dist/ is a build artifact — embedded into mika-server via rust-embed at compile time.
+# Run `make deploy` or `npm run build --prefix dashboard` to produce it.
+dashboard/dist/
 
 # Data
 data/
