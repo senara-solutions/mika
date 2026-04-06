@@ -1,7 +1,7 @@
 ---
 title: "feat(skills): built-in skill-review skill to generate model-tuned prompt variants"
 type: feat
-status: active
+status: completed
 date: 2026-04-06
 issue: "#243"
 ---
