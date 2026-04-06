@@ -36,8 +36,16 @@ static BLANK_LINE_RE: LazyLock<Regex> =
 
 /// Build a compiled regex for a specific tag name that matches `<tag ...>...</tag>`.
 /// Uses `(?s)` for dotall (multi-line content) and `.*?` for lazy matching.
+///
+/// Closing tag tolerates malformed variants from non-Anthropic models (#453):
+///   - Well-formed: `</tag>`
+///   - Whitespace: `< /tag>`, `</ tag>`, `< / tag >`
+///   - Bare: `tag>` (missing `</`)
 fn build_tag_regex(tag: &str) -> Regex {
-    Regex::new(&format!(r"(?s)<{tag}\b[^>]*>.*?</{tag}>")).expect("tag regex must compile")
+    Regex::new(&format!(
+        r"(?s)<{tag}\b[^>]*>.*?(?:<\s*/\s*{tag}\s*>|{tag}\s*>)"
+    ))
+    .expect("tag regex must compile")
 }
 
 /// Lazily compiled regexes for each internal tag.
@@ -564,5 +572,46 @@ send_message({"text":"test"})
         // LLM echoes only a nested tag without the outer <task-health>
         let input = "Status: <active-work-items>fix auth flow</active-work-items> checked.";
         assert_eq!(strip_internal_tags(input), "Status:  checked.");
+    }
+
+    #[test]
+    fn test_strip_malformed_closing_bare_tag() {
+        // #453: non-Anthropic models echo `context>` instead of `</context>`
+        let input = r#"Hello.
+<context type="tool_history" trust="metadata">
+list_work_items({"source":"self_dev"}) → No work items found...
+context>
+Bye."#;
+        assert_eq!(strip_internal_tags(input), "Hello.\n\nBye.");
+    }
+
+    #[test]
+    fn test_strip_malformed_closing_space_in_slash() {
+        // LLM tokenization artifact: </ context> with space before tag name
+        let input = r#"Result: <context type="summary">data here</ context> done."#;
+        assert_eq!(strip_internal_tags(input), "Result:  done.");
+    }
+
+    #[test]
+    fn test_strip_malformed_closing_space_after_angle() {
+        // LLM tokenization artifact: < /context> with space after <
+        let input = r#"X <callback_result trust="untrusted">result< /callback_result> Y"#;
+        assert_eq!(strip_internal_tags(input), "X  Y");
+    }
+
+    #[test]
+    fn test_strip_nested_with_malformed_outer_closing() {
+        // Outer <task-health> has malformed closing, inner tags are well-formed
+        let input =
+            "<task-health>\n<active-work-items>\n- item\n</active-work-items>\ntask-health>";
+        assert_eq!(strip_internal_tags(input), "");
+    }
+
+    #[test]
+    fn test_strip_malformed_closing_bare_tag_with_trailing_space() {
+        // Bare closing tag with trailing space before >
+        let input =
+            r#"Hi <context type="x">data</context> and <context type="y">more data context > end"#;
+        assert_eq!(strip_internal_tags(input), "Hi  and  end");
     }
 }
