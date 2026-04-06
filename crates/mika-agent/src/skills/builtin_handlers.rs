@@ -947,6 +947,17 @@ async fn review_skill(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolO
     if skill_name.len() > 200 {
         return ToolOutput::error("'skill_name' must be at most 200 characters.");
     }
+    // Path traversal protection: reject names containing path separators or parent refs.
+    if skill_name != "*"
+        && (skill_name.contains('/')
+            || skill_name.contains('\\')
+            || skill_name.contains("..")
+            || skill_name.contains('\0'))
+    {
+        return ToolOutput::error(
+            "'skill_name' must be a plain name (no path separators, '..', or null bytes).",
+        );
+    }
     let dry_run = input
         .get("dry_run")
         .and_then(|v| v.as_bool())
@@ -1975,6 +1986,20 @@ mod tests {
         let output = review_skill(&serde_json::json!({"skill_name": ""}), &ctx).await;
         assert!(output.is_error);
         assert!(output.content.contains("Missing required 'skill_name'"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_path_traversal_rejected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        for bad_name in &["../etc/passwd", "foo/bar", "skill\\evil", "a\0b", ".."] {
+            let output = review_skill(&serde_json::json!({"skill_name": bad_name}), &ctx).await;
+            assert!(output.is_error, "should reject: {bad_name}");
+            assert!(
+                output.content.contains("no path separators"),
+                "wrong error for: {bad_name}"
+            );
+        }
     }
 
     #[tokio::test]
