@@ -1,7 +1,7 @@
 ---
 title: "fix: strip_internal_tags fails on malformed closing tags"
 type: fix
-status: active
+status: completed
 date: 2026-04-06
 issue: "#453"
 ---
