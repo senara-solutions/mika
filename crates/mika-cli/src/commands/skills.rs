@@ -19,6 +19,9 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     let agent_home = home::resolve_agent_home(&global_home, agent_name);
     let skills_dir = agent_home.join("skills");
 
+    // Resolve GitHub token once for git operations (App preferred, PAT fallback)
+    let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
+
     match args.command {
         None => {
             let registry = SkillRegistry::from_dir(&skills_dir);
@@ -45,19 +48,48 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
             toggle_skill(&skills_dir, &name, false)?;
         }
         Some(SkillsCommand::Install { source, name, link }) => {
-            install_skill(&agent_home, &skills_dir, &source, name.as_deref(), link)?;
+            install_skill(
+                &agent_home,
+                &skills_dir,
+                &source,
+                name.as_deref(),
+                link,
+                github_token.as_deref(),
+            )?;
         }
         Some(SkillsCommand::Uninstall { name, remove_deps }) => {
             uninstall_skill(&agent_home, &skills_dir, &name, remove_deps)?;
         }
         Some(SkillsCommand::Update { name }) => {
-            update_skills(&agent_home, &skills_dir, name.as_deref())?;
+            update_skills(
+                &agent_home,
+                &skills_dir,
+                name.as_deref(),
+                github_token.as_deref(),
+            )?;
         }
         Some(SkillsCommand::Validate { name, format }) => {
             validate_skills(&skills_dir, name.as_deref(), &format)?;
         }
     }
     Ok(())
+}
+
+/// Resolve a GitHub token for git clone authentication.
+/// Prefers GitHub App installation token, falls back to PAT.
+async fn resolve_github_token_for_git(global_home: &Path, agent_home: &Path) -> Option<String> {
+    let settings = mika_common::config::Settings::load_for_agent(global_home, agent_home).ok()?;
+
+    // Try GitHub App first (short-lived installation token)
+    if let Some(app) = mika_common::github_app::GitHubApp::from_settings(&settings) {
+        let cache_path = agent_home.join("github_app_token.json");
+        if let Ok(token) = app.installation_token_with_file_cache(&cache_path).await {
+            return Some(token);
+        }
+    }
+
+    // Fall back to PAT
+    settings.agent_github_token().map(|s| s.to_string())
 }
 
 fn list_skills(
@@ -481,6 +513,7 @@ fn install_skill(
     source: &str,
     alias: Option<&str>,
     link: bool,
+    github_token: Option<&str>,
 ) -> Result<()> {
     use mika_agent::skills::git::SourceKind;
 
@@ -498,7 +531,7 @@ fn install_skill(
 
     match source_kind {
         SourceKind::Git(url) => {
-            install_from_git(agent_home, skills_dir, &url, alias)?;
+            install_from_git(agent_home, skills_dir, &url, alias, github_token)?;
         }
         SourceKind::Local(path) => {
             install_from_local(agent_home, skills_dir, &path, alias, link)?;
@@ -514,11 +547,12 @@ fn install_from_git(
     skills_dir: &Path,
     url: &str,
     alias: Option<&str>,
+    github_token: Option<&str>,
 ) -> Result<()> {
     println!("\n  Installing from {url}...");
 
     git::check_git()?;
-    let tmp = git::clone_to_temp(url)?;
+    let tmp = git::clone_to_temp(url, github_token)?;
     let commit = git::get_head_commit(tmp.path())?;
 
     let candidates = marketplace::scan_repo_for_skills(tmp.path());
@@ -910,7 +944,12 @@ fn uninstall_skill(
     Ok(())
 }
 
-fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Result<()> {
+fn update_skills(
+    agent_home: &Path,
+    skills_dir: &Path,
+    name: Option<&str>,
+    github_token: Option<&str>,
+) -> Result<()> {
     use mika_agent::skills::install::UpdateResult;
 
     let lock = marketplace::read_lock(agent_home);
@@ -927,7 +966,7 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
                 bail!("Skill '{name}' is not a marketplace-installed skill.");
             }
             println!("\n  Updating '{name}'...");
-            match install::update_skill(agent_home, skills_dir, name)? {
+            match install::update_skill(agent_home, skills_dir, name, github_token)? {
                 UpdateResult::Updated {
                     name,
                     old_commit,
@@ -963,7 +1002,7 @@ fn update_skills(agent_home: &Path, skills_dir: &Path, name: Option<&str>) -> Re
             let mut failed: Vec<(String, String)> = Vec::new();
 
             for skill_name in &names {
-                match install::update_skill(agent_home, skills_dir, skill_name) {
+                match install::update_skill(agent_home, skills_dir, skill_name, github_token) {
                     Ok(UpdateResult::Updated {
                         ref name,
                         ref old_commit,
