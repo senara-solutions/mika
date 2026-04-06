@@ -479,7 +479,12 @@ pub fn uninstall_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Resu
 /// - Linked skills → no-op (source changes are always current)
 /// - Local snapshot skills → re-copy from original path
 /// - Git skills → re-clone and compare commit hashes
-pub fn update_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<UpdateResult> {
+pub fn update_skill(
+    agent_home: &Path,
+    skills_dir: &Path,
+    name: &str,
+    github_token: Option<&str>,
+) -> Result<UpdateResult> {
     let mut lock = read_lock(agent_home);
     let entry = lock
         .skills
@@ -530,7 +535,7 @@ pub fn update_skill(agent_home: &Path, skills_dir: &Path, name: &str) -> Result<
     }
 
     // Git source: re-clone and compare
-    let tmp = git::clone_to_temp(&entry.url)
+    let tmp = git::clone_to_temp(&entry.url, github_token)
         .with_context(|| format!("failed to clone {} for update", entry.url))?;
 
     let candidates = scan_repo_for_skills(tmp.path());
@@ -1088,7 +1093,7 @@ mod tests {
         fs::write(skill_src.join("new_file.txt"), "new content").unwrap();
 
         // Update should re-copy
-        let result = update_skill(tmp.path(), &skills_dir, "local-skill").unwrap();
+        let result = update_skill(tmp.path(), &skills_dir, "local-skill", None).unwrap();
         assert!(matches!(result, UpdateResult::Updated { .. }));
 
         // New file should be in the installed copy
@@ -1123,7 +1128,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = update_skill(tmp.path(), &skills_dir, "linked-skill").unwrap();
+        let result = update_skill(tmp.path(), &skills_dir, "linked-skill", None).unwrap();
         assert!(matches!(result, UpdateResult::LinkedNoOp { .. }));
     }
 
@@ -1159,7 +1164,7 @@ mod tests {
         fs::remove_dir_all(&skill_src).unwrap();
 
         // Update should fail with clear message
-        let result = update_skill(tmp.path(), &skills_dir, "disappearing-skill");
+        let result = update_skill(tmp.path(), &skills_dir, "disappearing-skill", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no longer exists"));
     }

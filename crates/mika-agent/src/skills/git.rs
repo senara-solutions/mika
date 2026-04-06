@@ -75,22 +75,46 @@ pub fn check_git() -> Result<()> {
 
 /// Clone a repo to a temp directory using a shallow clone (--depth=1).
 ///
+/// When `github_token` is provided and the URL is an HTTPS GitHub URL,
+/// the token is injected into the URL for authentication (private repos).
+///
 /// Returns the `TempDir` which is automatically cleaned up on drop.
-pub fn clone_to_temp(url: &str) -> Result<TempDir> {
+pub fn clone_to_temp(url: &str, github_token: Option<&str>) -> Result<TempDir> {
     let tmp = TempDir::new().context("failed to create temp directory for clone")?;
 
+    let effective_url = match github_token {
+        Some(token) => inject_github_token(url, token),
+        None => url.to_string(),
+    };
+
     let output = git_command()
-        .args(["clone", "--depth", "1", url])
+        .args(["clone", "--depth", "1", &effective_url])
         .arg(tmp.path())
         .output()
         .context("failed to run git clone")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Use original URL in error message — never expose token
         bail!("git clone failed: {stderr}");
     }
 
     Ok(tmp)
+}
+
+/// Inject a GitHub token into an HTTPS GitHub URL for authentication.
+///
+/// Only rewrites `https://github.com/...` URLs. All other URLs are returned unchanged.
+fn inject_github_token(url: &str, token: &str) -> String {
+    if url.starts_with("https://github.com/") {
+        url.replacen(
+            "https://github.com/",
+            &format!("https://x-access-token:{token}@github.com/"),
+            1,
+        )
+    } else {
+        url.to_string()
+    }
 }
 
 /// Get the HEAD commit hash from a cloned repository.
@@ -308,6 +332,35 @@ mod tests {
     fn test_resolve_source_empty() {
         assert!(resolve_source("").is_err());
         assert!(resolve_source("  ").is_err());
+    }
+
+    // --- inject_github_token tests ---
+
+    #[test]
+    fn test_inject_github_token_https() {
+        let url = inject_github_token("https://github.com/user/repo.git", "ghs_abc123");
+        assert_eq!(
+            url,
+            "https://x-access-token:ghs_abc123@github.com/user/repo.git"
+        );
+    }
+
+    #[test]
+    fn test_inject_github_token_non_github() {
+        let url = inject_github_token("https://gitlab.com/user/repo.git", "token");
+        assert_eq!(url, "https://gitlab.com/user/repo.git");
+    }
+
+    #[test]
+    fn test_inject_github_token_ssh_unchanged() {
+        let url = inject_github_token("git@github.com:user/repo.git", "token");
+        assert_eq!(url, "git@github.com:user/repo.git");
+    }
+
+    #[test]
+    fn test_inject_github_token_without_dotgit() {
+        let url = inject_github_token("https://github.com/user/repo", "tok");
+        assert_eq!(url, "https://x-access-token:tok@github.com/user/repo");
     }
 
     // --- check_git test ---
