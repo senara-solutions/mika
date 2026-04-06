@@ -73,7 +73,7 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
 
 impl AppContext {
     /// Apply a one-shot model override (not persisted to config).
-    /// Resolves aliases (e.g., "sonnet" → "claude-sonnet-4-6") and rebuilds the LLM provider.
+    /// Resolves aliases (e.g., "sonnet" → "anthropic/claude-sonnet-4-6") and rebuilds the LLM provider.
     ///
     /// Accepts plain model names (overrides the active provider's model)
     /// or `provider/model` format (switches provider and sets model).

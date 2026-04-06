@@ -804,25 +804,36 @@ mod tests {
     }
 
     /// resolve_model_alias resolves known aliases and passes through unknown values.
+    /// All aliases now include provider prefix for cross-provider correctness.
     #[test]
     fn test_resolve_model_alias() {
+        // Anthropic aliases include provider prefix
         assert_eq!(
             crate::cli::resolve_model_alias("sonnet"),
-            "claude-sonnet-4-6"
+            "anthropic/claude-sonnet-4-6"
         );
-        assert_eq!(crate::cli::resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(crate::cli::resolve_model_alias("haiku"), "claude-haiku-4-5");
+        assert_eq!(
+            crate::cli::resolve_model_alias("opus"),
+            "anthropic/claude-opus-4-6"
+        );
+        assert_eq!(
+            crate::cli::resolve_model_alias("haiku"),
+            "anthropic/claude-haiku-4-5"
+        );
+        // Case-insensitive
         assert_eq!(
             crate::cli::resolve_model_alias("Sonnet"),
-            "claude-sonnet-4-6"
+            "anthropic/claude-sonnet-4-6"
         );
+        // Cross-provider aliases already had prefix (unchanged)
         assert_eq!(
             crate::cli::resolve_model_alias("openai/gpt-4o"),
             "openai/gpt-4o"
         );
+        // Unknown values pass through unchanged
         assert_eq!(
-            crate::cli::resolve_model_alias("claude-sonnet-4-6"),
-            "claude-sonnet-4-6"
+            crate::cli::resolve_model_alias("some-custom-model"),
+            "some-custom-model"
         );
     }
 }
