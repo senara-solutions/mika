@@ -31,7 +31,7 @@ No tag-stripping existed anywhere in the response pipeline. The flow `run_loop()
 
 ### 1. `strip_internal_tags()` function (`mika-common::llm`)
 
-Per-tag lazy-compiled regexes (not backreferences — Rust `regex` crate doesn't support them). Each tag gets a pattern `(?s)<{tag}\b[^>]*>.*?</{tag}>` with dotall mode and lazy matching.
+Per-tag lazy-compiled regexes (not backreferences — Rust `regex` crate doesn't support them). Each tag gets a pattern `(?s)<{tag}\b[^>]*>.*?(?:<\s*/\s*{tag}\s*>|{tag}\s*>)` with dotall mode and lazy matching. The closing-tag alternation tolerates malformed variants from non-Anthropic models (#453): whitespace (`< /tag>`, `</ tag>`) and bare (`tag>` without `</`).
 
 **Key design choices:**
 - **Early-exit fast path:** `if !text.contains('<')` skips regex entirely (common case — most responses have no tags)
