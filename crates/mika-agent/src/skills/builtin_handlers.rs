@@ -1040,9 +1040,11 @@ async fn review_skill_single(
         ));
     }
 
-    // Linked-skill awareness — warn but proceed. Reviews of linked skills now flow
-    // through normally; any subsequent write will land in the source directory by
-    // symlink transparency. The agent and user are explicitly opting in via --link.
+    // Linked-skill awareness — detect but do not log here. Reviews of linked skills
+    // flow through normally; any subsequent write will land in the source directory
+    // by symlink transparency. The `warn_linked_skill_write` tracing event fires only
+    // when an actual write happens (persist branch, non-dry-run) — inspecting a linked
+    // skill is not a noteworthy event on its own.
     let linked = match std::fs::symlink_metadata(&skill_dir) {
         Ok(meta) => meta.file_type().is_symlink(),
         Err(e) => {
@@ -1051,9 +1053,6 @@ async fn review_skill_single(
             ));
         }
     };
-    if linked {
-        warn_linked_skill_write(skill_name, &skill_dir);
-    }
 
     // Read root prompt
     let prompt_path = skill_dir.join("system_prompt.md");
@@ -1101,16 +1100,6 @@ async fn review_skill_single(
         root_prompt
     };
 
-    let warning = if linked {
-        Some(format!(
-            "linked skill: any variant written by review_skill will be persisted \
-             through the symlink to the source directory at {}",
-            skill_dir.display()
-        ))
-    } else {
-        None
-    };
-
     // --- Persist branch (content provided) --------------------------------
     if let Some(body) = content {
         // Truncation guard: variant must be at least MIN_VARIANT_RATIO of source.
@@ -1146,6 +1135,11 @@ async fn review_skill_single(
                     variant_path.display()
                 ));
             }
+            // Ops-side log for writes that land in a linked (symlinked) skill
+            // source directory. Fires only on real writes, not dry-runs or inspects.
+            if linked {
+                warn_linked_skill_write(skill_name, &skill_dir);
+            }
             // Mark the registry stale so the next agent turn re-scans and picks
             // up the new generated variant. Without this, `resolve_prompt` keeps
             // serving the root prompt until the process restarts — the whole
@@ -1153,6 +1147,23 @@ async fn review_skill_single(
             skills_dirty.store(true, std::sync::atomic::Ordering::Release);
             written = true;
         }
+
+        // Persist-branch warning: tense reflects whether a write actually happened.
+        let warning = if linked {
+            Some(if written {
+                format!(
+                    "linked skill: variant persisted through symlink to source directory at {}",
+                    skill_dir.display()
+                )
+            } else {
+                format!(
+                    "linked skill: variant would be persisted through symlink to source directory at {} (dry_run)",
+                    skill_dir.display()
+                )
+            })
+        } else {
+            None
+        };
 
         let result = serde_json::json!({
             "skill_name": skill_name,
@@ -1168,7 +1179,7 @@ async fn review_skill_single(
             "linked": linked,
             "warning": warning,
             "written": written,
-            "written_path": variant_path.display().to_string(),
+            "target_path": variant_path.display().to_string(),
             "content_bytes": body.len(),
             "source_bytes": source_size,
         });
@@ -1176,18 +1187,33 @@ async fn review_skill_single(
     }
 
     // --- Inspect-only branch (no content) ---------------------------------
+    // Inspect-branch warning: future tense — no write planned, but tell the agent
+    // where a subsequent persist call would land.
+    let warning = if linked {
+        Some(format!(
+            "linked skill: any variant written by review_skill will be persisted \
+             through the symlink to the source directory at {}",
+            skill_dir.display()
+        ))
+    } else {
+        None
+    };
+
     let result = serde_json::json!({
         "skill_name": skill_name,
         "root_prompt": prompt_for_response,
         "tools_json": tools_json,
         "runtime_provider": canonical_provider,
         "runtime_model": canonical_model,
+        "provider": canonical_provider,
+        "model": sanitized_model,
         "existing_variant": existing_variant,
         "dry_run": dry_run,
         "skipped": false,
         "linked": linked,
         "warning": warning,
         "written": false,
+        "target_path": variant_path.display().to_string(),
     });
 
     ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
@@ -2187,10 +2213,18 @@ mod tests {
         assert_eq!(parsed["runtime_model"], "claude-sonnet-4-6");
         assert_eq!(parsed["root_prompt"], "Search the web.");
         assert_eq!(parsed["skipped"], false);
-        // The response does not expose a writable target path the agent can fabricate,
-        // and the legacy `next_action` instruction is gone — `review_skill` is now the
-        // single tool that both inspects and persists.
-        assert!(parsed.get("variant_path").is_none());
+        // Inspect and persist branches share the same core shape: `provider`, `model`,
+        // and `target_path` are emitted in both so the agent doesn't have to branch
+        // on mode. The legacy `next_action` instruction is gone — `review_skill` is
+        // now the single tool that both inspects and persists.
+        assert_eq!(parsed["provider"], "anthropic");
+        assert_eq!(parsed["model"], "claude-sonnet-4-6");
+        assert!(
+            parsed["target_path"]
+                .as_str()
+                .unwrap()
+                .contains("/generated/anthropic/claude-sonnet-4-6/system_prompt.md")
+        );
         assert!(parsed.get("next_action").is_none());
         assert_eq!(parsed["written"], false);
     }
@@ -2358,7 +2392,7 @@ mod tests {
         .await;
         assert!(!output.is_error, "expected ok, got: {}", output.content);
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        let written = parsed["written_path"].as_str().unwrap();
+        let written = parsed["target_path"].as_str().unwrap();
         assert!(
             written.contains("/anthropic/claude-sonnet-4-6/system_prompt.md"),
             "path should derive from ctx (anthropic/claude-sonnet-4-6), got: {written}"
@@ -2391,7 +2425,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(parsed["provider"], "minimax");
         assert_eq!(parsed["model"], "minimax-m2.7");
-        let written = parsed["written_path"].as_str().unwrap();
+        let written = parsed["target_path"].as_str().unwrap();
         assert!(
             written.contains("/generated/minimax/minimax-m2.7/system_prompt.md"),
             "got: {written}"
@@ -2606,7 +2640,7 @@ mod tests {
         assert_eq!(parsed["written"], false);
         // The would-be path is reported, but the file does NOT exist on disk.
         assert!(
-            parsed["written_path"]
+            parsed["target_path"]
                 .as_str()
                 .unwrap()
                 .contains("/generated/anthropic/claude-sonnet-4-6/system_prompt.md")
