@@ -474,7 +474,7 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
                     keys.sort();
                     println!("      generated:");
                     for key in keys {
-                        println!("        └─ {key} (auto-written by write_skill_variant)");
+                        println!("        └─ {key} (auto-written by review_skill)");
                     }
                 }
             }
