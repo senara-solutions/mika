@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -394,10 +394,12 @@ pub struct TeamRunSummary {
 // ===== Skill Override Types =====
 
 /// A user override for a skill property (persists across bundled skill re-sync).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SkillOverride {
     pub skill_name: String,
     pub always_on: Option<bool>,
+    pub llm_provider: Option<String>,
+    pub llm_model: Option<String>,
 }
 
 // ===== Observability Types =====
@@ -728,6 +730,10 @@ impl Database {
             self.migrate_v18_to_v19()?;
             info!(version = 19, "database migrated to v19");
         }
+        if (3..=19).contains(&version) {
+            self.migrate_v19_to_v20()?;
+            info!(version = 20, "database migrated to v20");
+        }
         Ok(())
     }
 
@@ -784,7 +790,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (19);
+            INSERT INTO schema_version (version) VALUES (20);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1055,9 +1061,11 @@ impl Database {
             );
 
             CREATE TABLE skill_overrides (
-                agent_id   TEXT NOT NULL COLLATE NOCASE,
-                skill_name TEXT NOT NULL COLLATE NOCASE,
-                always_on  INTEGER,
+                agent_id     TEXT NOT NULL COLLATE NOCASE,
+                skill_name   TEXT NOT NULL COLLATE NOCASE,
+                always_on    INTEGER,
+                llm_provider TEXT,
+                llm_model    TEXT,
                 PRIMARY KEY (agent_id, skill_name)
             );
 
@@ -2443,6 +2451,26 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v19_to_v20(&self) -> Result<()> {
+        info!("migrating database schema v19 → v20 (skill_overrides: llm_provider, llm_model)");
+
+        // Idempotent: skip ALTER if columns already exist (defensive — re-runs).
+        let has_provider = self.column_exists("skill_overrides", "llm_provider")?;
+        let has_model = self.column_exists("skill_overrides", "llm_model")?;
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !has_provider {
+            sql.push_str("ALTER TABLE skill_overrides ADD COLUMN llm_provider TEXT;\n");
+        }
+        if !has_model {
+            sql.push_str("ALTER TABLE skill_overrides ADD COLUMN llm_model TEXT;\n");
+        }
+        sql.push_str("INSERT INTO schema_version (version) VALUES (20);\nCOMMIT;");
+
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -2507,14 +2535,17 @@ impl Database {
 
     /// Get all skill overrides for an agent.
     pub fn get_skill_overrides(&self, agent_id: &str) -> Result<Vec<SkillOverride>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT skill_name, always_on FROM skill_overrides WHERE agent_id = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_name, always_on, llm_provider, llm_model
+             FROM skill_overrides WHERE agent_id = ?1",
+        )?;
         let rows = stmt
             .query_map(params![agent_id], |r| {
                 Ok(SkillOverride {
                     skill_name: r.get(0)?,
                     always_on: r.get(1)?,
+                    llm_provider: r.get(2)?,
+                    llm_model: r.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -2533,6 +2564,47 @@ impl Database {
              VALUES (?1, ?2, ?3)
              ON CONFLICT(agent_id, skill_name) DO UPDATE SET always_on = excluded.always_on",
             params![agent_id, skill_name, always_on],
+        )?;
+        Ok(())
+    }
+
+    /// Set (upsert) an LLM provider/model override for a skill.
+    /// Preserves existing `always_on` via the conflict clause.
+    pub fn set_skill_llm_override(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO skill_overrides (agent_id, skill_name, llm_provider, llm_model)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, skill_name) DO UPDATE SET
+               llm_provider = excluded.llm_provider,
+               llm_model    = excluded.llm_model",
+            params![agent_id, skill_name, provider, model],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the LLM override columns for a skill. If the resulting row has no
+    /// remaining override values (all columns NULL), the row is deleted.
+    pub fn delete_skill_llm_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE skill_overrides
+                SET llm_provider = NULL, llm_model = NULL
+              WHERE agent_id = ?1 AND skill_name = ?2",
+            params![agent_id, skill_name],
+        )?;
+        // Prune fully-NULL row.
+        self.conn.execute(
+            "DELETE FROM skill_overrides
+              WHERE agent_id = ?1 AND skill_name = ?2
+                AND always_on IS NULL
+                AND llm_provider IS NULL
+                AND llm_model IS NULL",
+            params![agent_id, skill_name],
         )?;
         Ok(())
     }

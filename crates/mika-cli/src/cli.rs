@@ -416,6 +416,26 @@ pub enum SkillsCommand {
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+    /// Manage per-skill LLM provider/model overrides
+    Llm {
+        /// Skill name
+        name: String,
+        #[command(subcommand)]
+        action: SkillLlmAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SkillLlmAction {
+    /// Set the LLM override for this skill (provider/model, e.g. anthropic/claude-sonnet-4-6)
+    Set {
+        /// Provider/model spec, e.g. `anthropic/claude-sonnet-4-6` or `deepseek/deepseek-chat`
+        model: String,
+    },
+    /// Clear the LLM override and revert to manifest default
+    Reset,
+    /// Show the effective LLM provider/model and its source
+    Show,
 }
 
 #[derive(clap::Args)]
