@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, validate_and_resolve_path};
+use super::{MAX_PAYLOAD_BYTES, Tool, ToolContext, ToolOutput, validate_and_resolve_path};
 
 pub struct WriteWorkspaceTool {
     pub workspace_dir: PathBuf,
@@ -46,9 +46,9 @@ impl Tool for WriteWorkspaceTool {
                 "'content' is required and cannot be empty.",
             ));
         }
-        if content.len() > MAX_INPUT_LEN {
+        if content.len() > MAX_PAYLOAD_BYTES {
             return Ok(ToolOutput::error(format!(
-                "Content exceeds maximum length of {MAX_INPUT_LEN} characters."
+                "Content exceeds maximum payload size of {MAX_PAYLOAD_BYTES} bytes."
             )));
         }
 

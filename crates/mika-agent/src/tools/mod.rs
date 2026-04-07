@@ -59,8 +59,17 @@ use mika_common::agent::DEFAULT_AGENT;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::team;
 
-/// Maximum length (in characters) allowed for any single string input to a tool.
+/// Maximum length (in characters) allowed for control fields (path, name, query, etc.).
+/// File body fields ("payload" fields like `content`) use [`MAX_PAYLOAD_BYTES`] instead.
 pub const MAX_INPUT_LEN: usize = 10_000;
+
+/// Maximum length (in bytes) allowed for file-body payload fields such as the
+/// `content` parameter on `write_agent_file` and `write_workspace`.
+///
+/// Distinct from [`MAX_INPUT_LEN`] (which guards control fields like paths and
+/// queries) so that the agent can write reasonably sized documents and
+/// model-tuned skill prompts without truncation. Control fields keep the 10K cap.
+pub const MAX_PAYLOAD_BYTES: usize = 200 * 1024;
 
 /// Context available to every tool during execution.
 pub struct ToolContext<'a> {

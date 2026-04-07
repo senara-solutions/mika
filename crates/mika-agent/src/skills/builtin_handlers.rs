@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use tokio::io::AsyncReadExt;
 
-use crate::skills::index::sanitize_model_dir_name;
+use crate::skills::index::{resolve_canonical_provider_model, sanitize_model_dir_name};
 use crate::tools::{ToolContext, ToolOutput};
 
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
@@ -41,6 +41,7 @@ pub const KNOWN_BUILTINS: &[&str] = &[
     "run_gh",
     "run_gws",
     "web_search",
+    "write_skill_variant",
 ];
 
 /// Maximum output size from a builtin handler (matches executor::MAX_OUTPUT_LEN).
@@ -73,6 +74,7 @@ pub async fn execute(
         "run_gh" => run_gh(&input, ctx).await,
         "run_gws" => run_gws(&input, ctx).await,
         "web_search" => web_search(&input, ctx).await,
+        "write_skill_variant" => write_skill_variant(&input, ctx).await,
         _ => ToolOutput::error(format!("Unknown builtin function: {function}")),
     };
     truncate_output(&mut output);
@@ -909,32 +911,6 @@ async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutpu
 /// Maximum size for a root prompt included in the response (characters).
 const MAX_PROMPT_IN_RESPONSE: usize = 8_000;
 
-/// Resolve the canonical (provider, model) tuple for variant directory naming.
-///
-/// For aggregator providers (e.g. OpenRouter) whose model names contain a slash
-/// (`anthropic/claude-sonnet-4`), extracts the real provider and model so that
-/// variants are filed under the canonical provider directory.
-///
-/// For direct providers the inputs are returned as-is.
-fn resolve_canonical_provider_model<'a>(
-    provider_name: &'a str,
-    model_name: &'a str,
-) -> (&'a str, &'a str) {
-    let Ok(kind) = provider_name.parse::<mika_common::llm::ProviderKind>() else {
-        return (provider_name, model_name);
-    };
-
-    if kind.model_names_contain_slash()
-        && let Some((real_provider, real_model)) = model_name.split_once('/')
-        && !real_provider.is_empty()
-        && !real_model.is_empty()
-    {
-        return (real_provider, real_model);
-    }
-
-    (provider_name, model_name)
-}
-
 /// Gather skill prompt data and resolve variant paths for model-tuned variant
 /// generation.  Returns structured JSON so the agent loop can perform the
 /// creative prompt adaptation and write the result via `write_agent_file`.
@@ -1049,22 +1025,23 @@ async fn review_skill_single(
     let tools_path = skill_dir.join("tools.json");
     let tools_json = std::fs::read_to_string(&tools_path).unwrap_or_else(|_| "[]".to_string());
 
-    // Compute variant path (relative to agent home for write_agent_file)
-    let variant_rel =
-        format!("skills/{skill_name}/{canonical_provider}/{sanitized_model}/system_prompt.md");
-    let variant_abs = skills_dir.parent().unwrap_or(skills_dir).join(&variant_rel);
-
-    // Check existing variant
+    // Check for an existing generated variant. Path is recomputed inside
+    // `write_skill_variant` from `ctx` — never sent back to the agent as input,
+    // so the agent can't fabricate a target path.
+    let variant_abs = skill_dir
+        .join("generated")
+        .join(canonical_provider)
+        .join(sanitized_model)
+        .join("system_prompt.md");
     let existing_variant = std::fs::read_to_string(&variant_abs).ok();
 
     if existing_variant.is_some() && !force {
         let result = serde_json::json!({
             "skill_name": skill_name,
-            "provider": canonical_provider,
-            "model": canonical_model,
-            "variant_path": variant_rel,
+            "runtime_provider": canonical_provider,
+            "runtime_model": canonical_model,
             "skipped": true,
-            "reason": "variant already exists (use force=true to overwrite)",
+            "reason": "variant already exists (re-call write_skill_variant with force=true to overwrite)",
             "dry_run": dry_run,
         });
         return ToolOutput::success(serde_json::to_string_pretty(&result).unwrap());
@@ -1090,14 +1067,177 @@ async fn review_skill_single(
         "skill_name": skill_name,
         "root_prompt": prompt_for_response,
         "tools_json": tools_json,
-        "provider": canonical_provider,
-        "model": canonical_model,
-        "variant_path": variant_rel,
+        "runtime_provider": canonical_provider,
+        "runtime_model": canonical_model,
         "existing_variant": existing_variant,
         "dry_run": dry_run,
         "skipped": false,
+        "next_action": "Call write_skill_variant with skill_name and content. Do not pass a path — the path is computed from your runtime provider/model.",
     });
 
+    ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// write_skill_variant — commit a model-tuned skill prompt under generated/
+// ---------------------------------------------------------------------------
+
+/// Minimum allowed ratio of variant size to source size.
+/// Anything smaller is rejected as a likely truncation.
+const MIN_VARIANT_RATIO: f64 = 0.5;
+
+/// Write a model-tuned skill prompt variant under
+/// `skills/<skill_name>/generated/<provider>/<sanitized_model>/system_prompt.md`.
+///
+/// **No path input** — the target path is computed entirely from
+/// `ctx.provider_name` / `ctx.model_name`. This makes path fabrication
+/// structurally impossible: the agent cannot supply a wrong path because
+/// there is no path parameter.
+///
+/// Layered safety:
+/// 1. `skill_name` validated (no traversal, length cap, must exist, no symlink)
+/// 2. Provider/model resolved via the canonical helper used by `review_skill`
+/// 3. `generated/` segment is hard-coded — no input can move the write outside it
+/// 4. Truncation guard: rejects content < `MIN_VARIANT_RATIO` of source size
+/// 5. Refuses overwrite unless `force = true`
+async fn write_skill_variant(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
+    // --- Input validation --------------------------------------------------
+    let skill_name = match input.get("skill_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return ToolOutput::error("Missing required 'skill_name' (string)."),
+    };
+    if skill_name.len() > 200 {
+        return ToolOutput::error("'skill_name' must be at most 200 characters.");
+    }
+    if skill_name.contains('/')
+        || skill_name.contains('\\')
+        || skill_name.contains("..")
+        || skill_name.contains('\0')
+    {
+        return ToolOutput::error(
+            "'skill_name' must be a plain name (no path separators, '..', or null bytes).",
+        );
+    }
+
+    let content = match input.get("content").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return ToolOutput::error(
+                "Missing required 'content' (string). Pass the full adapted prompt body.",
+            );
+        }
+    };
+    if content.len() > crate::tools::MAX_PAYLOAD_BYTES {
+        return ToolOutput::error(format!(
+            "'content' exceeds maximum payload size of {} bytes.",
+            crate::tools::MAX_PAYLOAD_BYTES
+        ));
+    }
+
+    let force = input
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // --- Resolve skill directory ------------------------------------------
+    let skills_dir = ctx.home_dir.join("skills");
+    let skill_dir = skills_dir.join(skill_name);
+
+    if !skill_dir.exists() {
+        return ToolOutput::error(format!(
+            "Skill '{skill_name}' not found. Run review_skill first to confirm the skill name."
+        ));
+    }
+
+    match std::fs::symlink_metadata(&skill_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return ToolOutput::error(format!(
+                "Skill '{skill_name}' is installed with --link. Variants cannot be written to \
+                 linked skills (read-only invariant). Unlink first with \
+                 `mika skills uninstall {skill_name}` then reinstall without --link."
+            ));
+        }
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "Cannot read skill directory for '{skill_name}': {e}"
+            ));
+        }
+        _ => {}
+    }
+
+    // --- Read source prompt for truncation guard --------------------------
+    let source_path = skill_dir.join("system_prompt.md");
+    let source_size = match std::fs::metadata(&source_path) {
+        Ok(meta) => meta.len() as usize,
+        Err(_) => {
+            return ToolOutput::error(format!(
+                "Skill '{skill_name}' has no system_prompt.md to adapt — cannot validate variant."
+            ));
+        }
+    };
+    if source_size == 0 {
+        return ToolOutput::error(format!(
+            "Skill '{skill_name}' has an empty system_prompt.md — nothing to adapt."
+        ));
+    }
+
+    let min_size = ((source_size as f64) * MIN_VARIANT_RATIO).ceil() as usize;
+    if content.len() < min_size {
+        let pct = ((content.len() as f64) / (source_size as f64) * 100.0).round() as u64;
+        return ToolOutput::error(format!(
+            "Variant is {pct}% the size of the source ({} bytes vs {source_size} bytes) — \
+             this looks like truncation. Re-emit the full adapted prompt.",
+            content.len()
+        ));
+    }
+
+    // --- Compute target path (entirely from ctx) ---------------------------
+    let (canonical_provider, canonical_model) =
+        resolve_canonical_provider_model(ctx.provider_name, ctx.model_name);
+    let sanitized_model = sanitize_model_dir_name(canonical_model);
+
+    let target_dir = skill_dir
+        .join("generated")
+        .join(canonical_provider)
+        .join(&sanitized_model);
+    let target_path = target_dir.join("system_prompt.md");
+
+    // --- Overwrite guard --------------------------------------------------
+    if target_path.exists() && !force {
+        return ToolOutput::error(format!(
+            "Variant already exists at '{}'. Re-call with force=true to overwrite.",
+            target_path.display()
+        ));
+    }
+
+    // --- Write -------------------------------------------------------------
+    if let Err(e) = std::fs::create_dir_all(&target_dir) {
+        return ToolOutput::error(format!(
+            "Failed to create variant directory '{}': {e}",
+            target_dir.display()
+        ));
+    }
+    if let Err(e) = std::fs::write(&target_path, content) {
+        return ToolOutput::error(format!(
+            "Failed to write variant '{}': {e}",
+            target_path.display()
+        ));
+    }
+
+    // Mark the registry stale so the next agent turn re-scans and picks up
+    // the new generated variant. Without this, `resolve_prompt` keeps serving
+    // the root prompt until the process restarts — the whole point of the loop.
+    ctx.skills_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let result = serde_json::json!({
+        "written_path": target_path.display().to_string(),
+        "skill_name": skill_name,
+        "provider": canonical_provider,
+        "model": sanitized_model,
+        "content_bytes": content.len(),
+        "source_bytes": source_size,
+    });
     ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
 }
 
@@ -1157,8 +1297,9 @@ async fn review_skill_batch(
             continue;
         }
 
-        // Check existing variant
+        // Check existing generated variant
         let variant_path = path
+            .join("generated")
             .join(canonical_provider)
             .join(sanitized_model)
             .join("system_prompt.md");
@@ -2071,15 +2212,18 @@ mod tests {
         assert!(!output.is_error);
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(parsed["skill_name"], "web-search");
-        assert_eq!(parsed["provider"], "anthropic");
-        assert_eq!(parsed["model"], "claude-sonnet-4-6");
+        assert_eq!(parsed["runtime_provider"], "anthropic");
+        assert_eq!(parsed["runtime_model"], "claude-sonnet-4-6");
         assert_eq!(parsed["root_prompt"], "Search the web.");
         assert_eq!(parsed["skipped"], false);
+        // The response no longer exposes a writable target path: write_skill_variant
+        // computes the path entirely from ctx, so the agent cannot fabricate one.
+        assert!(parsed.get("variant_path").is_none());
         assert!(
-            parsed["variant_path"]
+            parsed["next_action"]
                 .as_str()
                 .unwrap()
-                .contains("anthropic/claude-sonnet-4-6/system_prompt.md")
+                .contains("write_skill_variant")
         );
     }
 
@@ -2088,7 +2232,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let skill_dir = home.join("skills/web-search");
-        let variant_dir = skill_dir.join("anthropic/claude-sonnet-4-6");
+        let variant_dir = skill_dir.join("generated/anthropic/claude-sonnet-4-6");
         std::fs::create_dir_all(&variant_dir).unwrap();
         std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
         std::fs::write(variant_dir.join("system_prompt.md"), "Existing variant.").unwrap();
@@ -2111,7 +2255,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let skill_dir = home.join("skills/web-search");
-        let variant_dir = skill_dir.join("anthropic/claude-sonnet-4-6");
+        let variant_dir = skill_dir.join("generated/anthropic/claude-sonnet-4-6");
         std::fs::create_dir_all(&variant_dir).unwrap();
         std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
         std::fs::write(variant_dir.join("system_prompt.md"), "Existing variant.").unwrap();
@@ -2210,6 +2354,216 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(parsed["dry_run"], true);
         assert_eq!(parsed["skipped"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // write_skill_variant tests
+    // -----------------------------------------------------------------------
+
+    /// Set up a skill directory with a source prompt of `source_size` bytes.
+    fn setup_skill_with_source(
+        home: &std::path::Path,
+        skill_name: &str,
+        source_size: usize,
+    ) -> std::path::PathBuf {
+        let skill_dir = home.join("skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let source = "x".repeat(source_size);
+        std::fs::write(skill_dir.join("system_prompt.md"), source).unwrap();
+        skill_dir
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_uses_runtime_model() {
+        // Path must derive from ctx.provider_name / ctx.model_name, not from any input.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill_dir = setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new(); // anthropic / claude-sonnet-4-6
+        let ctx = harness.ctx_with_home(home);
+        let body = "y".repeat(800);
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error, "expected ok, got: {}", output.content);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        let written = parsed["written_path"].as_str().unwrap();
+        assert!(
+            written.contains("/anthropic/claude-sonnet-4-6/system_prompt.md"),
+            "path should derive from ctx (anthropic/claude-sonnet-4-6), got: {written}"
+        );
+        assert!(
+            skill_dir
+                .join("generated/anthropic/claude-sonnet-4-6/system_prompt.md")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_canonicalises_openrouter() {
+        // openrouter/minimax/minimax-m2.7 → generated/minimax/minimax-m2.7/
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_home(home);
+        ctx.provider_name = "openrouter";
+        ctx.model_name = "minimax/minimax-m2.7";
+        let body = "q".repeat(800);
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error, "got: {}", output.content);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["provider"], "minimax");
+        assert_eq!(parsed["model"], "minimax-m2.7");
+        let written = parsed["written_path"].as_str().unwrap();
+        assert!(
+            written.contains("/generated/minimax/minimax-m2.7/system_prompt.md"),
+            "got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_path_traversal_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        for bad in &["../etc/passwd", "foo/bar", "skill\\evil", "a\0b", ".."] {
+            let output = write_skill_variant(
+                &serde_json::json!({"skill_name": bad, "content": "data"}),
+                &ctx,
+            )
+            .await;
+            assert!(output.is_error, "should reject: {bad}");
+            assert!(
+                output.content.contains("no path separators"),
+                "wrong error for {bad}: {}",
+                output.content
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_skill_variant_refuses_linked_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        let real = tmp.path().join("real-skill");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("system_prompt.md"), "x".repeat(1000)).unwrap();
+        std::os::unix::fs::symlink(&real, home.join("skills/linked")).unwrap();
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "linked", "content": "y".repeat(800)}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("--link"));
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_no_overwrite_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let body = "y".repeat(800);
+
+        // First write succeeds.
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body.clone()}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+
+        // Second write without force is rejected.
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body.clone()}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("force=true"));
+
+        // Second write with force is accepted.
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body, "force": true}),
+            &ctx,
+        )
+        .await;
+        assert!(
+            !output.is_error,
+            "force should overwrite, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_marks_skills_dirty() {
+        // Without this the registry never re-scans the new generated variant
+        // and resolve_prompt keeps serving the root prompt — the feature loop
+        // is broken until process restart.
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        // Reset the shared static (TestHarness::ctx_with_home uses a static
+        // AtomicBool across tests), so we can observe the flip cleanly.
+        ctx.skills_dirty.store(false, Ordering::Release);
+
+        let body = "y".repeat(800);
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        assert!(
+            ctx.skills_dirty.load(Ordering::Acquire),
+            "skills_dirty must be set after a successful variant write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_truncation_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        // 400 bytes is 40% of 1000 — below the 50% MIN_VARIANT_RATIO threshold.
+        let truncated = "y".repeat(400);
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": truncated}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("truncation"),
+            "expected truncation error, got: {}",
+            output.content
+        );
     }
 
     #[tokio::test]

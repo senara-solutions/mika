@@ -142,6 +142,7 @@ fn list_skills(
                         "always_on": entry.manifest.skill.always_on,
                         "tools": entry.skill_tools.len(),
                         "variants": entry.variant_count(),
+                        "generated_variants": entry.generated_model_prompts.len(),
                         "llm_override": llm_override,
                     })
                 })
@@ -176,11 +177,13 @@ fn list_skills(
                 };
                 let status = if entry.enabled { "" } else { " [disabled]" };
                 let variants = {
-                    let count = entry.variant_count();
-                    if count > 0 {
-                        format!(" [variants: {count}]")
-                    } else {
-                        String::new()
+                    let hand = entry.variant_count();
+                    let gen_count = entry.generated_model_prompts.len();
+                    match (hand, gen_count) {
+                        (0, 0) => String::new(),
+                        (h, 0) => format!(" [variants: {h} hand]"),
+                        (0, g) => format!(" [variants: {g} generated]"),
+                        (h, g) => format!(" [variants: {h} hand, {g} generated]"),
                     }
                 };
                 let llm_badge = if !entry.manifest.llm.is_empty() {
@@ -276,8 +279,13 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
 
             // Show provider and model variants
             let providers = entry.variant_providers();
-            if !providers.is_empty() || entry.variant_count() > 0 {
-                println!("    Variants:    {} total", entry.variant_count());
+            let generated_count = entry.generated_model_prompts.len();
+            if !providers.is_empty() || entry.variant_count() > 0 || generated_count > 0 {
+                println!(
+                    "    Variants:    {} hand, {} generated",
+                    entry.variant_count(),
+                    generated_count
+                );
                 for provider in &providers {
                     let has_override = entry.provider_overrides.contains_key(*provider);
                     if has_override {
@@ -308,6 +316,14 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
                         .flatten()
                         .collect();
                         println!("        └─ {} ({})", model, model_parts.join(", "));
+                    }
+                }
+                if generated_count > 0 {
+                    let mut keys: Vec<&String> = entry.generated_model_prompts.keys().collect();
+                    keys.sort();
+                    println!("      generated:");
+                    for key in keys {
+                        println!("        └─ {key} (auto-written by write_skill_variant)");
                     }
                 }
             }
