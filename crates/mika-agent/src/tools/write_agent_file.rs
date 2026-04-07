@@ -6,7 +6,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{
-    MAX_INPUT_LEN, Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path,
+    MAX_PAYLOAD_BYTES, Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path,
 };
 
 /// Maximum file size for reading existing content during confirmation flow (100 KB).
@@ -59,9 +59,9 @@ impl Tool for WriteAgentFileTool {
                 "'content' is required and cannot be empty.",
             ));
         }
-        if content.len() > MAX_INPUT_LEN {
+        if content.len() > MAX_PAYLOAD_BYTES {
             return Ok(ToolOutput::error(format!(
-                "Content exceeds maximum length of {MAX_INPUT_LEN} characters."
+                "Content exceeds maximum payload size of {MAX_PAYLOAD_BYTES} bytes."
             )));
         }
 
@@ -566,6 +566,42 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("orchestrator"));
+    }
+
+    #[tokio::test]
+    async fn test_write_agent_file_large_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let tool = WriteAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+
+        // 50 KB body should succeed (well under 200 KB cap, well over old 10 KB limit).
+        let body_50k = "x".repeat(50 * 1024);
+        let input = serde_json::json!({ "path": "big.md", "content": body_50k });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(
+            !output.is_error,
+            "50KB write should succeed, got: {}",
+            output.content
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("big.md")).unwrap().len(),
+            50 * 1024
+        );
+
+        // 210 KB body should be rejected.
+        let body_210k = "x".repeat(210 * 1024);
+        let input = serde_json::json!({ "path": "huge.md", "content": body_210k });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error, "210KB write should be rejected");
+        assert!(
+            output.content.contains("payload"),
+            "error should mention payload limit, got: {}",
+            output.content
+        );
     }
 
     #[tokio::test]
