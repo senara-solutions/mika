@@ -1036,8 +1036,11 @@ This means variants generated via OpenRouter are used when the agent later runs 
 Use `skill_name = "*"` to review all skills. The tool returns a list of eligible and skipped skills. Due to the agent's step limit, batch mode processes skills iteratively — you may need multiple invocations for large skill sets.
 
 Skills are skipped in batch mode when:
+- **Built-in** — platform-managed skills cannot be reviewed or adapted (#480)
 - No `system_prompt.md` (nothing to adapt)
 - Variant already exists (unless `force = true`)
+
+Built-in skills (tmux, shell-exec, web-search, file-reader, skill-review, self-knowledge, git-ops, google-workspace, github, mcp, browser-control, agents-teams) are also rejected in single-skill mode — the tool returns a clear message and does not touch the filesystem.
 
 Linked skills are **not** skipped — they are reviewed and can have variants
 written through to their source directory (with a structured warning).
