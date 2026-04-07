@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 
 use tokio::io::AsyncReadExt;
 
+use crate::bundled_skills::is_bundled_skill;
 use crate::skills::index::{resolve_canonical_provider_model, sanitize_model_dir_name};
 use crate::tools::{ToolContext, ToolOutput};
 
@@ -989,6 +990,16 @@ async fn review_skill(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolO
 
     let skills_dir = ctx.home_dir.join("skills");
 
+    // --- Built-in skill guard (#480) ---------------------------------------
+    // Block before filesystem existence check so case-mismatched names get
+    // "built-in" error (via eq_ignore_ascii_case) rather than "not found".
+    if skill_name != "*" && is_bundled_skill(skill_name) {
+        return ToolOutput::success(format!(
+            "Cannot review built-in skill '{skill_name}'. \
+             Built-in skills are platform-managed and updated automatically.",
+        ));
+    }
+
     // --- Batch mode --------------------------------------------------------
     if skill_name == "*" {
         if content.is_some() {
@@ -1267,6 +1278,15 @@ async fn review_skill_batch(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         let path = entry.path();
+
+        // Skip built-in skills (#480)
+        if is_bundled_skill(&name_str) {
+            skipped.push(serde_json::json!({
+                "name": name_str,
+                "reason": "built-in",
+            }));
+            continue;
+        }
 
         // Skip linked skills
         if let Ok(meta) = std::fs::symlink_metadata(&path)
@@ -2199,16 +2219,16 @@ mod tests {
     async fn test_review_skill_single_happy_path() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        let skill_dir = home.join("skills/web-search");
+        let skill_dir = home.join("skills/custom-search");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
         std::fs::write(skill_dir.join("tools.json"), r#"[{"name": "web_search"}]"#).unwrap();
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(home);
-        let output = review_skill(&serde_json::json!({"skill_name": "web-search"}), &ctx).await;
+        let output = review_skill(&serde_json::json!({"skill_name": "custom-search"}), &ctx).await;
         assert!(!output.is_error);
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        assert_eq!(parsed["skill_name"], "web-search");
+        assert_eq!(parsed["skill_name"], "custom-search");
         assert_eq!(parsed["runtime_provider"], "anthropic");
         assert_eq!(parsed["runtime_model"], "claude-sonnet-4-6");
         assert_eq!(parsed["root_prompt"], "Search the web.");
@@ -2237,14 +2257,14 @@ mod tests {
         // agent only asked to inspect.
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        let skill_dir = home.join("skills/web-search");
+        let skill_dir = home.join("skills/custom-search");
         let variant_dir = skill_dir.join("generated/anthropic/claude-sonnet-4-6");
         std::fs::create_dir_all(&variant_dir).unwrap();
         std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
         std::fs::write(variant_dir.join("system_prompt.md"), "Existing variant.").unwrap();
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(home);
-        let output = review_skill(&serde_json::json!({"skill_name": "web-search"}), &ctx).await;
+        let output = review_skill(&serde_json::json!({"skill_name": "custom-search"}), &ctx).await;
         assert!(!output.is_error);
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(parsed["skipped"], false);
@@ -2256,7 +2276,7 @@ mod tests {
     async fn test_review_skill_existing_variant_force() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        let skill_dir = home.join("skills/web-search");
+        let skill_dir = home.join("skills/custom-search");
         let variant_dir = skill_dir.join("generated/anthropic/claude-sonnet-4-6");
         std::fs::create_dir_all(&variant_dir).unwrap();
         std::fs::write(skill_dir.join("system_prompt.md"), "Search the web.").unwrap();
@@ -2264,7 +2284,7 @@ mod tests {
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(home);
         let output = review_skill(
-            &serde_json::json!({"skill_name": "web-search", "force": true}),
+            &serde_json::json!({"skill_name": "custom-search", "force": true}),
             &ctx,
         )
         .await;
@@ -2683,5 +2703,102 @@ mod tests {
         assert!(!output.is_error);
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(parsed["tools_json"], "[]");
+    }
+
+    // -----------------------------------------------------------------------
+    // review_skill — built-in skill guard (#480)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_review_skill_rejects_builtin_inspect() {
+        // Inspect mode (no content) should be rejected for built-in skills.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = review_skill(&serde_json::json!({"skill_name": "skill-review"}), &ctx).await;
+        assert!(!output.is_error); // Not a tool error — a clear rejection message
+        assert!(
+            output.content.contains("Cannot review built-in skill"),
+            "expected built-in rejection, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("skill-review"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_rejects_builtin_persist() {
+        // Persist mode (with content) should also be rejected for built-in skills.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = review_skill(
+            &serde_json::json!({
+                "skill_name": "self-knowledge",
+                "content": "Adapted prompt for self-knowledge."
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        assert!(
+            output.content.contains("Cannot review built-in skill"),
+            "expected built-in rejection, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("self-knowledge"));
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_rejects_builtin_case_insensitive() {
+        // Case-insensitive matching: "SHELL-EXEC" should be blocked.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        for name in &["SHELL-EXEC", "Shell-Exec", "Skill-Review", "GITHUB"] {
+            let output = review_skill(&serde_json::json!({"skill_name": name}), &ctx).await;
+            assert!(
+                output.content.contains("Cannot review built-in skill"),
+                "should reject '{}', got: {}",
+                name,
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_batch_skips_builtins() {
+        // Batch mode should skip all built-in skills with reason "built-in".
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skills_dir = home.join("skills");
+
+        // Create a built-in skill directory (shell-exec) with a prompt
+        let builtin_dir = skills_dir.join("shell-exec");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        std::fs::write(builtin_dir.join("system_prompt.md"), "Execute shell.").unwrap();
+
+        // Create a custom skill directory with a prompt
+        let custom_dir = skills_dir.join("my-custom-skill");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        std::fs::write(custom_dir.join("system_prompt.md"), "Custom prompt.").unwrap();
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        let output = review_skill(&serde_json::json!({"skill_name": "*"}), &ctx).await;
+        assert!(!output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["mode"], "batch");
+
+        // shell-exec should be in skipped with reason "built-in"
+        let skipped = parsed["skipped_skills"].as_array().unwrap();
+        let builtin_skip = skipped
+            .iter()
+            .find(|s| s["name"] == "shell-exec")
+            .expect("shell-exec should be in skipped list");
+        assert_eq!(builtin_skip["reason"], "built-in");
+
+        // my-custom-skill should be in eligible
+        let eligible = parsed["eligible_skills"].as_array().unwrap();
+        assert!(
+            eligible.iter().any(|s| s["name"] == "my-custom-skill"),
+            "my-custom-skill should be eligible"
+        );
     }
 }
