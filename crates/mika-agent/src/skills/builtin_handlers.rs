@@ -1182,15 +1182,12 @@ async fn review_skill_single(
         "tools_json": tools_json,
         "runtime_provider": canonical_provider,
         "runtime_model": canonical_model,
-        "provider": canonical_provider,
-        "model": sanitized_model,
         "existing_variant": existing_variant,
         "dry_run": dry_run,
         "skipped": false,
         "linked": linked,
         "warning": warning,
         "written": false,
-        "source_bytes": source_size,
     });
 
     ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
