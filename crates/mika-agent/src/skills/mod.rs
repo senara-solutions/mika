@@ -637,6 +637,72 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_overrides_merges_llm_columns() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            skills: vec![make_entry("qa-review", false, true)],
+        };
+        // Baseline: manifest [llm] empty.
+        assert!(registry.skills[0].manifest.llm.is_empty());
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "qa-review".to_string(),
+            always_on: None,
+            llm_provider: Some("anthropic".to_string()),
+            llm_model: Some("claude-sonnet-4-6".to_string()),
+        }]);
+
+        assert!(registry.skills[0].has_override);
+        assert_eq!(
+            registry.skills[0].manifest.llm.provider.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            registry.skills[0].manifest.llm.model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn test_apply_overrides_llm_partial_merges_onto_manifest() {
+        use crate::db::SkillOverride;
+        use crate::skills::manifest::LlmOverride;
+
+        let mut entry = make_entry("qa-review", false, true);
+        // Manifest already sets provider + model (author default).
+        entry.manifest.llm = LlmOverride {
+            provider: Some("deepseek".to_string()),
+            model: Some("deepseek-chat".to_string()),
+        };
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            skills: vec![entry],
+        };
+
+        // DB override supplies only the model — provider should stay as manifest.
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "qa-review".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: Some("deepseek-reasoner".to_string()),
+        }]);
+
+        assert!(registry.skills[0].has_override);
+        assert_eq!(
+            registry.skills[0].manifest.llm.provider.as_deref(),
+            Some("deepseek"),
+            "provider should remain as manifest default"
+        );
+        assert_eq!(
+            registry.skills[0].manifest.llm.model.as_deref(),
+            Some("deepseek-reasoner"),
+            "model should be overridden by DB"
+        );
+    }
+
+    #[test]
     fn test_apply_overrides_keeps_always_on_override_with_no_prompt_file() {
         use crate::db::SkillOverride;
 

@@ -96,24 +96,25 @@ fn run_skill_llm(
     }
 
     // Read manifest [llm] for source annotation and default-equals-delete check.
+    // Parse errors are propagated — a malformed manifest should surface loudly
+    // rather than look like "no [llm] section" and let stale overrides accumulate.
     let manifest_path = skill_dir.join("skill.toml");
     let manifest_llm = if manifest_path.exists() {
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        toml::from_str::<toml::Value>(&raw)
-            .ok()
-            .and_then(|v| v.get("llm").cloned())
-            .map(|llm| {
-                let provider = llm
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let model = llm
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                (provider, model)
-            })
+        let doc: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        doc.get("llm").cloned().map(|llm| {
+            let provider = llm
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let model = llm
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (provider, model)
+        })
     } else {
         None
     };

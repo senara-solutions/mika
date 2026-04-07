@@ -2590,23 +2590,38 @@ impl Database {
 
     /// Clear the LLM override columns for a skill. If the resulting row has no
     /// remaining override values (all columns NULL), the row is deleted.
+    ///
+    /// The UPDATE and prune DELETE are wrapped in an atomic transaction so a
+    /// crash between them cannot leave a half-cleared row.
     pub fn delete_skill_llm_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE skill_overrides
-                SET llm_provider = NULL, llm_model = NULL
-              WHERE agent_id = ?1 AND skill_name = ?2",
-            params![agent_id, skill_name],
-        )?;
-        // Prune fully-NULL row.
-        self.conn.execute(
-            "DELETE FROM skill_overrides
-              WHERE agent_id = ?1 AND skill_name = ?2
-                AND always_on IS NULL
-                AND llm_provider IS NULL
-                AND llm_model IS NULL",
-            params![agent_id, skill_name],
-        )?;
-        Ok(())
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result: rusqlite::Result<()> = (|| {
+            self.conn.execute(
+                "UPDATE skill_overrides
+                    SET llm_provider = NULL, llm_model = NULL
+                  WHERE agent_id = ?1 AND skill_name = ?2",
+                params![agent_id, skill_name],
+            )?;
+            self.conn.execute(
+                "DELETE FROM skill_overrides
+                  WHERE agent_id = ?1 AND skill_name = ?2
+                    AND always_on IS NULL
+                    AND llm_provider IS NULL
+                    AND llm_model IS NULL",
+                params![agent_id, skill_name],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e.into())
+            }
+        }
     }
 
     /// Delete an override for a skill (revert to bundled default).
@@ -8488,6 +8503,77 @@ mod tests {
         db.delete_skill_override("mika", "web-search").unwrap();
         let overrides = db.get_skill_overrides("mika").unwrap();
         assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn test_skill_llm_override_round_trip() {
+        let db = db();
+
+        // Set LLM override on a skill with no existing row.
+        db.set_skill_llm_override("mika", "qa-review", "anthropic", "claude-sonnet-4-6")
+            .unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].skill_name, "qa-review");
+        assert_eq!(overrides[0].always_on, None);
+        assert_eq!(overrides[0].llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(overrides[0].llm_model.as_deref(), Some("claude-sonnet-4-6"));
+
+        // Upsert to a different model.
+        db.set_skill_llm_override("mika", "qa-review", "deepseek", "deepseek-chat")
+            .unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].llm_provider.as_deref(), Some("deepseek"));
+        assert_eq!(overrides[0].llm_model.as_deref(), Some("deepseek-chat"));
+
+        // Clearing LLM columns prunes a row with no other overrides.
+        db.delete_skill_llm_override("mika", "qa-review").unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert!(overrides.is_empty(), "fully-NULL row should be pruned");
+    }
+
+    #[test]
+    fn test_skill_llm_override_preserves_always_on() {
+        let db = db();
+
+        // Start with always_on set.
+        db.set_skill_override("mika", "qa-review", true).unwrap();
+        // Layer an LLM override on top.
+        db.set_skill_llm_override("mika", "qa-review", "anthropic", "claude-sonnet-4-6")
+            .unwrap();
+
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].always_on, Some(true));
+        assert_eq!(overrides[0].llm_provider.as_deref(), Some("anthropic"));
+
+        // Clearing LLM columns must NOT delete the row — always_on still set.
+        db.delete_skill_llm_override("mika", "qa-review").unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].always_on, Some(true));
+        assert_eq!(overrides[0].llm_provider, None);
+        assert_eq!(overrides[0].llm_model, None);
+    }
+
+    #[test]
+    fn test_skill_llm_override_case_insensitive_and_per_agent() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "").unwrap();
+        db.register_agent("agent-b", "Agent B", "").unwrap();
+
+        db.set_skill_llm_override("agent-a", "QA-Review", "anthropic", "claude-sonnet-4-6")
+            .unwrap();
+        db.set_skill_llm_override("agent-b", "qa-review", "deepseek", "deepseek-chat")
+            .unwrap();
+
+        let a = db.get_skill_overrides("AGENT-A").unwrap();
+        let b = db.get_skill_overrides("agent-b").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].llm_provider.as_deref(), Some("deepseek"));
     }
 
     #[test]
