@@ -59,8 +59,8 @@ pub struct SkillEntry {
     /// Empty map if no model variants exist.
     pub model_overrides: HashMap<String, ProviderSkillFields>,
     /// Auto-generated model prompts under `generated/{provider}/{sanitized_model}/`.
-    /// Key = "{provider}/{sanitized_model}". Populated by `write_skill_variant`
-    /// at runtime; loaded eagerly at scan time. Hand-authored variants in
+    /// Key = "{provider}/{sanitized_model}". Populated by `review_skill` (when
+    /// called with `content`) at runtime; loaded eagerly at scan time. Hand-authored variants in
     /// `model_prompts` always win over generated entries here (see `resolve_prompt`).
     pub generated_model_prompts: HashMap<String, String>,
 }
@@ -1382,7 +1382,8 @@ fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> Variant
 
 /// Scan `<skill_dir>/generated/<provider>/<model>/system_prompt.md` files.
 ///
-/// These are written by the `write_skill_variant` builtin at runtime — the
+/// These are written by the `review_skill` builtin (when called with a
+/// `content` argument) at runtime — the
 /// `generated/` segment is hard-coded so the agent cannot move writes outside
 /// it. Generated variants are loaded into a separate map from hand-authored
 /// variants so resolution can prefer hand-authored content.
@@ -3005,7 +3006,7 @@ mod tests {
         .unwrap();
         fs::write(skill_dir.join("system_prompt.md"), "ROOT").unwrap();
         // Variant written under canonical (minimax/minimax-m2.7), as
-        // write_skill_variant does for an openrouter ctx.
+        // review_skill does for an openrouter ctx.
         let gen_dir = skill_dir.join("generated/minimax/minimax-m2.7");
         fs::create_dir_all(&gen_dir).unwrap();
         fs::write(gen_dir.join("system_prompt.md"), "GENERATED").unwrap();
