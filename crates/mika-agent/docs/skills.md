@@ -925,6 +925,33 @@ rm -rf ~/.mika/skills/memory
 # Restart Mika -- bootstrap recreates the memory skill from templates
 ```
 
+### Per-skill LLM override (v20+)
+
+A skill's `[llm]` section in `skill.toml` captures the **author's intent** — the
+provider/model the skill was designed and validated for. To change which model
+a specific skill uses **without editing committed files**, use the per-agent
+DB override layer (schema v20):
+
+```bash
+mika skills llm qa-review set anthropic/claude-sonnet-4-6
+mika skills llm qa-review show     # → [db-override]
+mika skills llm qa-review reset    # clear override
+```
+
+Resolution order at runtime:
+
+1. **DB override** (`skill_overrides.llm_provider` / `llm_model`) — set via the
+   CLI above.
+2. **Manifest `[llm]`** in the skill's root `skill.toml` — author default.
+3. **Agent default** — the agent's active provider and model.
+
+If a `set` value matches the manifest default exactly, the row is **deleted**
+instead of being stored, so stale overrides never block future skill updates
+(same default-equals-delete semantics as `always_on`).
+
+`mika skills llm <name> show` annotates the source of the effective value:
+`[db-override]`, `[manifest]`, or `[agent-default]`.
+
 ### Persistent overrides for built-in skills (v7+)
 
 Built-in skill `always_on` preferences are stored in the SQLite `skill_overrides` table (schema v7). This table survives `seed_bundled_skills()` re-sync cycles, which overwrite `skill.toml` on every startup.

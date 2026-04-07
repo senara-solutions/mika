@@ -985,7 +985,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 | `tasks` | Unified task scheduler — all proactive behaviors (`agent_id`, `action_type`, `status`, `cron_expression`, `next_fire_at`, `fired_at`, `completed_at`, `created_trace_id`, `execution_trace_id`). Trigger types include `a2a` for A2A protocol tasks. |
 | `team_runs` | Team run metadata (goal, status, iterations, deliverable, checkpoint, trace_id) |
 | `team_workspace` | Graph-structured team workspace entries with `parent_id` links; `trace_id` column |
-| `skill_overrides` | Persistent user overrides for built-in skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer) |
+| `skill_overrides` | Persistent user overrides for skill properties (`agent_id` + `skill_name` PK, `always_on` nullable integer, `llm_provider` / `llm_model` nullable text — schema v20). Resolution: DB override > manifest `[llm]` > agent default. |
 | `a2a_task_map` | Maps A2A task IDs to internal task IDs and session IDs (`a2a_task_id` PK, `task_id` FK→tasks, `session_id` FK→sessions, `context_id`) |
 | `a2a_artifacts` | A2A artifacts (files, data) per task (`task_id` FK→a2a_task_map, `artifact_id`, `name`, `parts` JSON) |
 | `a2a_push_notification_configs` | Push notification config per A2A task (`task_id` FK→a2a_task_map, `url`, auth fields) |
