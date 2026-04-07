@@ -9,6 +9,7 @@ mod eval {
     pub mod trace;
 
     mod test_basic_conversation;
+    mod test_completion_claim_guard;
     mod test_error_handling;
     mod test_multi_step;
     mod test_tool_calling;
