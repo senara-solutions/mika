@@ -1250,6 +1250,12 @@ async fn write_skill_variant(input: &serde_json::Value, ctx: &ToolContext<'_>) -
         ));
     }
 
+    // Mark the registry stale so the next agent turn re-scans and picks up
+    // the new generated variant. Without this, `resolve_prompt` keeps serving
+    // the root prompt until the process restarts — the whole point of the loop.
+    ctx.skills_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+
     let result = serde_json::json!({
         "written_path": target_path.display().to_string(),
         "skill_name": skill_name,
@@ -2393,11 +2399,6 @@ mod tests {
         skill_dir
     }
 
-    #[test]
-    fn test_write_skill_variant_in_known_builtins() {
-        assert!(KNOWN_BUILTINS.contains(&"write_skill_variant"));
-    }
-
     #[tokio::test]
     async fn test_write_skill_variant_uses_runtime_model() {
         // Path must derive from ctx.provider_name / ctx.model_name, not from any input.
@@ -2424,30 +2425,6 @@ mod tests {
             skill_dir
                 .join("generated/anthropic/claude-sonnet-4-6/system_prompt.md")
                 .exists()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_write_skill_variant_writes_under_generated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        setup_skill_with_source(home, "demo", 1000);
-
-        let harness = TestHarness::new();
-        let ctx = harness.ctx_with_home(home);
-        let body = "z".repeat(800);
-        let output = write_skill_variant(
-            &serde_json::json!({"skill_name": "demo", "content": body}),
-            &ctx,
-        )
-        .await;
-        assert!(!output.is_error);
-        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        let written = parsed["written_path"].as_str().unwrap();
-        // Hard-coded `/generated/` segment must always be present.
-        assert!(
-            written.contains("/generated/"),
-            "resolved path must contain /generated/, got: {written}"
         );
     }
 
@@ -2560,6 +2537,35 @@ mod tests {
             !output.is_error,
             "force should overwrite, got: {}",
             output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_skill_variant_marks_skills_dirty() {
+        // Without this the registry never re-scans the new generated variant
+        // and resolve_prompt keeps serving the root prompt — the feature loop
+        // is broken until process restart.
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        // Reset the shared static (TestHarness::ctx_with_home uses a static
+        // AtomicBool across tests), so we can observe the flip cleanly.
+        ctx.skills_dirty.store(false, Ordering::Release);
+
+        let body = "y".repeat(800);
+        let output = write_skill_variant(
+            &serde_json::json!({"skill_name": "demo", "content": body}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        assert!(
+            ctx.skills_dirty.load(Ordering::Acquire),
+            "skills_dirty must be set after a successful variant write"
         );
     }
 

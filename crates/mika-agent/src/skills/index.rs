@@ -101,17 +101,6 @@ impl SkillEntry {
         &self.prompt_snippet
     }
 
-    /// Number of auto-generated model variants under `generated/`.
-    pub fn generated_variant_count(&self) -> usize {
-        self.generated_model_prompts.len()
-    }
-
-    /// Number of hand-authored variants (provider overrides + model variants).
-    /// Excludes generated variants — use [`Self::generated_variant_count`] for those.
-    pub fn handauthored_variant_count(&self) -> usize {
-        self.variant_count()
-    }
-
     /// Sorted set of all provider names that have any variant (override or model).
     pub fn variant_providers(&self) -> BTreeSet<&str> {
         let mut providers = BTreeSet::new();
@@ -1368,7 +1357,15 @@ fn scan_generated_variants(skill_dir: &Path, manifest: &SkillManifest) -> HashMa
 
     for provider_entry in provider_dirs.flatten() {
         let provider_path = provider_entry.path();
-        if !provider_path.is_dir() {
+        // Defense in depth: skip symlinked provider directories. The
+        // `generated/` subtree is mika-owned and should never contain
+        // symlinks; refusing to traverse one prevents an external write
+        // from redirecting reads outside the skill tree.
+        if !provider_path.is_dir()
+            || std::fs::symlink_metadata(&provider_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true)
+        {
             continue;
         }
         let provider_name = match provider_path.file_name().and_then(|n| n.to_str()) {
@@ -1387,7 +1384,11 @@ fn scan_generated_variants(skill_dir: &Path, manifest: &SkillManifest) -> HashMa
 
         for model_entry in model_dirs.flatten() {
             let model_path = model_entry.path();
-            if !model_path.is_dir() {
+            if !model_path.is_dir()
+                || std::fs::symlink_metadata(&model_path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(true)
+            {
                 continue;
             }
             let model_name = match model_path.file_name().and_then(|n| n.to_str()) {
@@ -2925,7 +2926,7 @@ mod tests {
         let scan = scan_skills_dir(&skills_root);
         assert_eq!(scan.entries.len(), 1);
         let entry = &scan.entries[0];
-        assert_eq!(entry.generated_variant_count(), 1);
+        assert_eq!(entry.generated_model_prompts.len(), 1);
         // Generated variant wins over root when no hand-authored exists.
         assert_eq!(
             entry.resolve_prompt("anthropic", "claude-sonnet-4-6"),
