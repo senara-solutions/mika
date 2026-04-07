@@ -582,7 +582,7 @@ The **git-ops** skill provides `git_ops` for structured git maintenance operatio
 
 The **google-workspace** skill provides `run_gws` for interacting with Google Workspace (Gmail, Calendar, Drive) via the `gws` CLI. It uses a service allowlist (`gmail`, `calendar`, `drive`) and blocks credential/config-smuggling flags (`--token`, `--credentials-file`, `--config`, `--config-dir` including `--flag=value` forms). Scrubs `MIKA_*` env vars from child processes. Uses `gws`'s native keyring-based authentication (set up via `gws auth login`). Requires `gws` CLI installed (included in Docker image). `timeout_secs = 45` to accommodate first-call API schema discovery.
 
-The **skill-review** skill provides `review_skill` for generating model-tuned `system_prompt.md` variants. It reads a skill's root prompt and tool signatures, resolves the agent's current provider/model (extracting canonical tuples for aggregator providers like OpenRouter), and returns structured data so the agent can generate an adapted prompt. Supports single-skill review, batch mode (`skill_name = "*"`), dry-run preview, and force overwrite. Refuses linked skills to enforce the read-only invariant. See the [Model Tuning](#model-tuning) section for details. `timeout_secs = 60`.
+The **skill-review** skill provides `review_skill` for generating model-tuned `system_prompt.md` variants. It reads a skill's root prompt and tool signatures, resolves the agent's current provider/model (extracting canonical tuples for aggregator providers like OpenRouter), and returns structured data so the agent can generate an adapted prompt. Supports single-skill review, batch mode (`skill_name = "*"`), dry-run preview, and force overwrite. Linked skills (`--link`) are reviewed normally — the tool emits a `linked: true` warning and any subsequent `write_skill_variant` call writes through the symlink to the source directory. See the [Model Tuning](#model-tuning) section for details. `timeout_secs = 60`.
 
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
 
@@ -925,6 +925,33 @@ rm -rf ~/.mika/skills/memory
 # Restart Mika -- bootstrap recreates the memory skill from templates
 ```
 
+### Per-skill LLM override (v20+)
+
+A skill's `[llm]` section in `skill.toml` captures the **author's intent** — the
+provider/model the skill was designed and validated for. To change which model
+a specific skill uses **without editing committed files**, use the per-agent
+DB override layer (schema v20):
+
+```bash
+mika skills llm qa-review set anthropic/claude-sonnet-4-6
+mika skills llm qa-review show     # → [db-override]
+mika skills llm qa-review reset    # clear override
+```
+
+Resolution order at runtime:
+
+1. **DB override** (`skill_overrides.llm_provider` / `llm_model`) — set via the
+   CLI above.
+2. **Manifest `[llm]`** in the skill's root `skill.toml` — author default.
+3. **Agent default** — the agent's active provider and model.
+
+If a `set` value matches the manifest default exactly, the row is **deleted**
+instead of being stored, so stale overrides never block future skill updates
+(same default-equals-delete semantics as `always_on`).
+
+`mika skills llm <name> show` annotates the source of the effective value:
+`[db-override]`, `[manifest]`, or `[agent-default]`.
+
 ### Persistent overrides for built-in skills (v7+)
 
 Built-in skill `always_on` preferences are stored in the SQLite `skill_overrides` table (schema v7). This table survives `seed_bundled_skills()` re-sync cycles, which overwrite `skill.toml` on every startup.
@@ -1009,9 +1036,11 @@ This means variants generated via OpenRouter are used when the agent later runs 
 Use `skill_name = "*"` to review all skills. The tool returns a list of eligible and skipped skills. Due to the agent's step limit, batch mode processes skills iteratively — you may need multiple invocations for large skill sets.
 
 Skills are skipped in batch mode when:
-- Installed with `--link` (read-only invariant)
 - No `system_prompt.md` (nothing to adapt)
 - Variant already exists (unless `force = true`)
+
+Linked skills are **not** skipped — they are reviewed and can have variants
+written through to their source directory (with a structured warning).
 
 ### Dry-run workflow
 

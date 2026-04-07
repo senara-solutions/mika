@@ -988,21 +988,19 @@ async fn review_skill_single(
         ));
     }
 
-    // Linked-skill check (symlink → refuse)
-    match std::fs::symlink_metadata(&skill_dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return ToolOutput::error(format!(
-                "Skill '{skill_name}' is installed with --link. Variants cannot be \
-                 written to linked skills (read-only invariant). Unlink first with \
-                 `mika skills uninstall {skill_name}` then reinstall without --link."
-            ));
-        }
+    // Linked-skill awareness — warn but proceed. Reviews of linked skills now flow
+    // through normally; any subsequent write will land in the source directory by
+    // symlink transparency. The agent and user are explicitly opting in via --link.
+    let linked = match std::fs::symlink_metadata(&skill_dir) {
+        Ok(meta) => meta.file_type().is_symlink(),
         Err(e) => {
             return ToolOutput::error(format!(
                 "Cannot read skill directory for '{skill_name}': {e}"
             ));
         }
-        _ => {}
+    };
+    if linked {
+        warn_linked_skill_write(skill_name, &skill_dir);
     }
 
     // Read root prompt
@@ -1072,6 +1070,13 @@ async fn review_skill_single(
         "existing_variant": existing_variant,
         "dry_run": dry_run,
         "skipped": false,
+        "linked": linked,
+        "warning": if linked {
+            Some(format!(
+                "linked skill: any write_skill_variant call will write through to the source directory at {}",
+                skill_dir.display()
+            ))
+        } else { None },
         "next_action": "Call write_skill_variant with skill_name and content. Do not pass a path — the path is computed from your runtime provider/model.",
     });
 
@@ -1149,20 +1154,16 @@ async fn write_skill_variant(input: &serde_json::Value, ctx: &ToolContext<'_>) -
         ));
     }
 
-    match std::fs::symlink_metadata(&skill_dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return ToolOutput::error(format!(
-                "Skill '{skill_name}' is installed with --link. Variants cannot be written to \
-                 linked skills (read-only invariant). Unlink first with \
-                 `mika skills uninstall {skill_name}` then reinstall without --link."
-            ));
-        }
+    let linked = match std::fs::symlink_metadata(&skill_dir) {
+        Ok(meta) => meta.file_type().is_symlink(),
         Err(e) => {
             return ToolOutput::error(format!(
                 "Cannot read skill directory for '{skill_name}': {e}"
             ));
         }
-        _ => {}
+    };
+    if linked {
+        warn_linked_skill_write(skill_name, &skill_dir);
     }
 
     // --- Read source prompt for truncation guard --------------------------
@@ -1237,8 +1238,29 @@ async fn write_skill_variant(input: &serde_json::Value, ctx: &ToolContext<'_>) -
         "model": sanitized_model,
         "content_bytes": content.len(),
         "source_bytes": source_size,
+        "linked": linked,
+        "warning": if linked {
+            Some(format!(
+                "linked skill: variant written through symlink to source directory at {}",
+                skill_dir.display()
+            ))
+        } else { None },
     });
     ToolOutput::success(serde_json::to_string_pretty(&result).unwrap())
+}
+
+/// Emit a structured warning when a write operation targets a linked skill.
+///
+/// Linked skills (`mika skills install <path> --link`) are symlinks to a live
+/// source directory. Writes through the symlink land in the source tree by
+/// design — the user explicitly opted into mutable-source semantics. We log
+/// the write so it's visible in audit and tracing output.
+fn warn_linked_skill_write(skill_name: &str, skill_dir: &std::path::Path) {
+    tracing::warn!(
+        skill = %skill_name,
+        path  = %skill_dir.display(),
+        "[linked skill] changes will be written to the source directory"
+    );
 }
 
 /// Handle batch mode (`skill_name = "*"`).
@@ -2174,7 +2196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_review_skill_linked_skill_refused() {
+    async fn test_review_skill_linked_skill_warns_and_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let skills_dir = home.join("skills");
@@ -2183,19 +2205,24 @@ mod tests {
         let real_dir = tmp.path().join("real-skill");
         std::fs::create_dir_all(&real_dir).unwrap();
         std::fs::write(real_dir.join("system_prompt.md"), "test prompt").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_dir, skills_dir.join("linked-skill")).unwrap();
         #[cfg(not(unix))]
         {
-            // Skip on non-unix
             return;
         }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, skills_dir.join("linked-skill")).unwrap();
         let harness = TestHarness::new();
         let ctx = harness.ctx_with_home(home);
         let output = review_skill(&serde_json::json!({"skill_name": "linked-skill"}), &ctx).await;
-        assert!(output.is_error);
-        assert!(output.content.contains("--link"));
-        assert!(output.content.contains("read-only invariant"));
+        assert!(!output.is_error, "linked skill review must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["linked"], true);
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("linked skill")
+        );
     }
 
     #[tokio::test]
@@ -2454,7 +2481,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_write_skill_variant_refuses_linked_skill() {
+    async fn test_write_skill_variant_linked_skill_warns_and_writes_through() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         std::fs::create_dir_all(home.join("skills")).unwrap();
@@ -2470,8 +2497,21 @@ mod tests {
             &ctx,
         )
         .await;
-        assert!(output.is_error);
-        assert!(output.content.contains("--link"));
+        assert!(!output.is_error, "linked skill variant must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed["linked"], true);
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("linked skill")
+        );
+        // Variant must land in the source directory by symlink transparency.
+        let variant_path = real.join("generated/anthropic/claude-sonnet-4-6/system_prompt.md");
+        assert!(
+            variant_path.exists(),
+            "variant should be written through symlink to source: {variant_path:?}"
+        );
     }
 
     #[tokio::test]

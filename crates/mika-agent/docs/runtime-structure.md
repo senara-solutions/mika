@@ -141,7 +141,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **failed_sends** — `id INTEGER PK AUTO`, `agent_id FK`, `text TEXT`, `request_id TEXT`, `retry_count INTEGER DEFAULT 0`, `created_at TEXT`
 
-**skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`
+**skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20). Per-agent LLM overrides resolve as: DB > manifest `[llm]` > agent default. Set via `mika skills llm <name> set <provider>/<model>`.
 
 ### View
 

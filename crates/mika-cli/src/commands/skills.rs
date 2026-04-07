@@ -11,7 +11,7 @@ use mika_common::home;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::cli::{SkillsArgs, SkillsCommand};
+use crate::cli::{SkillLlmAction, SkillsArgs, SkillsCommand};
 
 pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     let global_home = home::resolve_home_dir()?;
@@ -70,6 +70,157 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         }
         Some(SkillsCommand::Validate { name, format }) => {
             validate_skills(&skills_dir, name.as_deref(), &format)?;
+        }
+        Some(SkillsCommand::Llm { name, action }) => {
+            run_skill_llm(&global_home, &skills_dir, agent_name, &name, action)?;
+        }
+    }
+    Ok(())
+}
+
+/// Handle `mika skills llm <name> {set|reset|show}`.
+///
+/// Writes to the per-agent `skill_overrides` DB row. Resolution order at runtime
+/// is: DB override > manifest `[llm]` > agent default.
+fn run_skill_llm(
+    global_home: &Path,
+    skills_dir: &Path,
+    agent_id: &str,
+    skill_name: &str,
+    action: SkillLlmAction,
+) -> Result<()> {
+    // Verify the skill exists locally so users can't set overrides for typos.
+    let skill_dir = skills_dir.join(skill_name);
+    if !skill_dir.exists() {
+        bail!("Skill '{skill_name}' not found at {}", skill_dir.display());
+    }
+
+    // Read manifest [llm] for source annotation and default-equals-delete check.
+    // Parse errors are propagated — a malformed manifest should surface loudly
+    // rather than look like "no [llm] section" and let stale overrides accumulate.
+    let manifest_path = skill_dir.join("skill.toml");
+    let manifest_llm = if manifest_path.exists() {
+        let raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let doc: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        doc.get("llm").cloned().map(|llm| {
+            let provider = llm
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let model = llm
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (provider, model)
+        })
+    } else {
+        None
+    };
+
+    let db_path = mika_common::home::container_db_path(global_home);
+    if !db_path.exists() {
+        bail!(
+            "Mika database not found at {}. Run `mika status` to initialize the agent.",
+            db_path.display()
+        );
+    }
+    let db = mika_agent::db::Database::open(&db_path)
+        .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+
+    match action {
+        SkillLlmAction::Set { model } => {
+            // Parse "provider/model".
+            let (provider, model_part) = model.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Expected `provider/model`, got '{model}'. Example: \
+                     anthropic/claude-sonnet-4-6"
+                )
+            })?;
+            if provider.is_empty() || model_part.is_empty() {
+                bail!("Both provider and model are required (got '{model}').");
+            }
+            // Validate provider against the known set.
+            provider
+                .parse::<mika_common::llm::ProviderKind>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Unknown provider '{provider}': {e}. Run `mika provider` to list valid providers."
+                    )
+                })?;
+
+            // D3: default-equals-delete — if effective override matches manifest, delete row.
+            let matches_manifest = manifest_llm
+                .as_ref()
+                .map(|(mp, mm)| {
+                    mp.as_deref() == Some(provider) && mm.as_deref() == Some(model_part)
+                })
+                .unwrap_or(false);
+
+            if matches_manifest {
+                db.delete_skill_llm_override(agent_id, skill_name)?;
+                println!(
+                    "\n  Skill '{skill_name}' LLM override matches manifest default — \
+                     no DB row written.\n  Effective: {provider}/{model_part} [manifest]\n"
+                );
+            } else {
+                db.set_skill_llm_override(agent_id, skill_name, provider, model_part)?;
+                println!(
+                    "\n  Skill '{skill_name}' LLM set to {provider}/{model_part} [db-override]\n"
+                );
+            }
+        }
+        SkillLlmAction::Reset => {
+            db.delete_skill_llm_override(agent_id, skill_name)?;
+            let (eff_p, eff_m, src) = match &manifest_llm {
+                Some((Some(p), Some(m))) => (p.as_str(), m.as_str(), "manifest"),
+                _ => ("(agent default)", "", "agent-default"),
+            };
+            println!(
+                "\n  Skill '{skill_name}' LLM override cleared.\n  Effective: {eff_p}/{eff_m} [{src}]\n"
+            );
+        }
+        SkillLlmAction::Show => {
+            let overrides = db.get_skill_overrides(agent_id)?;
+            let row = overrides
+                .iter()
+                .find(|o| o.skill_name.eq_ignore_ascii_case(skill_name));
+            let (provider, model, source) = match row {
+                Some(o) if o.llm_provider.is_some() || o.llm_model.is_some() => {
+                    let p = o
+                        .llm_provider
+                        .clone()
+                        .or_else(|| manifest_llm.as_ref().and_then(|(p, _)| p.clone()))
+                        .unwrap_or_else(|| "(agent default)".to_string());
+                    let m = o
+                        .llm_model
+                        .clone()
+                        .or_else(|| manifest_llm.as_ref().and_then(|(_, m)| m.clone()))
+                        .unwrap_or_default();
+                    (p, m, "db-override")
+                }
+                _ => match &manifest_llm {
+                    Some((Some(p), Some(m))) => (p.clone(), m.clone(), "manifest"),
+                    Some((Some(p), None)) => (p.clone(), String::new(), "manifest"),
+                    Some((None, Some(m))) => (String::new(), m.clone(), "manifest"),
+                    _ => (
+                        "(agent default)".to_string(),
+                        String::new(),
+                        "agent-default",
+                    ),
+                },
+            };
+            let separator = if model.is_empty() { "" } else { "/" };
+            println!("\n  {skill_name}  llm: {provider}{separator}{model}  [{source}]");
+            if let Some((mp, mm)) = &manifest_llm
+                && source == "db-override"
+            {
+                let mp = mp.as_deref().unwrap_or("(unset)");
+                let mm = mm.as_deref().unwrap_or("(unset)");
+                println!("                manifest default: {mp}/{mm}");
+            }
+            println!();
         }
     }
     Ok(())

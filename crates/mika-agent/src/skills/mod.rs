@@ -112,13 +112,26 @@ impl SkillRegistry {
     /// `tracing::warn` for each unresolvable dependency.
     pub fn apply_overrides(&mut self, overrides: &[SkillOverride]) {
         for ov in overrides {
-            if let Some(always_on) = ov.always_on
-                && let Some(entry) = self
-                    .skills
-                    .iter_mut()
-                    .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(&ov.skill_name))
-            {
+            let Some(entry) = self
+                .skills
+                .iter_mut()
+                .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(&ov.skill_name))
+            else {
+                continue;
+            };
+
+            if let Some(always_on) = ov.always_on {
                 entry.manifest.skill.always_on = always_on;
+                entry.has_override = true;
+            }
+
+            if ov.llm_provider.is_some() || ov.llm_model.is_some() {
+                if let Some(p) = &ov.llm_provider {
+                    entry.manifest.llm.provider = Some(p.clone());
+                }
+                if let Some(m) = &ov.llm_model {
+                    entry.manifest.llm.model = Some(m.clone());
+                }
                 entry.has_override = true;
             }
         }
@@ -439,6 +452,8 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "web-search".to_string(),
             always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         assert!(registry.skills[0].manifest.skill.always_on);
@@ -459,6 +474,8 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "web-search".to_string(),
             always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         assert!(registry.skills[0].manifest.skill.always_on);
@@ -477,6 +494,8 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "web-search".to_string(),
             always_on: None,
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         assert!(!registry.skills[0].manifest.skill.always_on);
@@ -495,6 +514,8 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "nonexistent".to_string(),
             always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         // No crash, web-search unchanged
@@ -518,6 +539,8 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "web-search".to_string(),
             always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         assert_eq!(registry.always_on_skills().len(), 2);
@@ -604,11 +627,79 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "big-skill".to_string(),
             always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         // Skill should be removed: always_on + override + empty prompt + oversized file
         assert!(registry.skills.is_empty());
         assert_eq!(registry.skipped_count(), 1);
+    }
+
+    #[test]
+    fn test_apply_overrides_merges_llm_columns() {
+        use crate::db::SkillOverride;
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            skills: vec![make_entry("qa-review", false, true)],
+        };
+        // Baseline: manifest [llm] empty.
+        assert!(registry.skills[0].manifest.llm.is_empty());
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "qa-review".to_string(),
+            always_on: None,
+            llm_provider: Some("anthropic".to_string()),
+            llm_model: Some("claude-sonnet-4-6".to_string()),
+        }]);
+
+        assert!(registry.skills[0].has_override);
+        assert_eq!(
+            registry.skills[0].manifest.llm.provider.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            registry.skills[0].manifest.llm.model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn test_apply_overrides_llm_partial_merges_onto_manifest() {
+        use crate::db::SkillOverride;
+        use crate::skills::manifest::LlmOverride;
+
+        let mut entry = make_entry("qa-review", false, true);
+        // Manifest already sets provider + model (author default).
+        entry.manifest.llm = LlmOverride {
+            provider: Some("deepseek".to_string()),
+            model: Some("deepseek-chat".to_string()),
+        };
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            skills: vec![entry],
+        };
+
+        // DB override supplies only the model — provider should stay as manifest.
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "qa-review".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: Some("deepseek-reasoner".to_string()),
+        }]);
+
+        assert!(registry.skills[0].has_override);
+        assert_eq!(
+            registry.skills[0].manifest.llm.provider.as_deref(),
+            Some("deepseek"),
+            "provider should remain as manifest default"
+        );
+        assert_eq!(
+            registry.skills[0].manifest.llm.model.as_deref(),
+            Some("deepseek-reasoner"),
+            "model should be overridden by DB"
+        );
     }
 
     #[test]
@@ -628,6 +719,8 @@ mod tests {
         registry.apply_overrides(&[SkillOverride {
             skill_name: "tool-only".to_string(),
             always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
         }]);
 
         // Should still be present — no prompt file means tool-only, not broken
