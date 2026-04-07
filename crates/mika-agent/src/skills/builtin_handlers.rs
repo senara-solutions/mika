@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use tokio::io::AsyncReadExt;
 
-use crate::skills::index::sanitize_model_dir_name;
+use crate::skills::index::{resolve_canonical_provider_model, sanitize_model_dir_name};
 use crate::tools::{ToolContext, ToolOutput};
 
 /// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
@@ -910,32 +910,6 @@ async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutpu
 
 /// Maximum size for a root prompt included in the response (characters).
 const MAX_PROMPT_IN_RESPONSE: usize = 8_000;
-
-/// Resolve the canonical (provider, model) tuple for variant directory naming.
-///
-/// For aggregator providers (e.g. OpenRouter) whose model names contain a slash
-/// (`anthropic/claude-sonnet-4`), extracts the real provider and model so that
-/// variants are filed under the canonical provider directory.
-///
-/// For direct providers the inputs are returned as-is.
-fn resolve_canonical_provider_model<'a>(
-    provider_name: &'a str,
-    model_name: &'a str,
-) -> (&'a str, &'a str) {
-    let Ok(kind) = provider_name.parse::<mika_common::llm::ProviderKind>() else {
-        return (provider_name, model_name);
-    };
-
-    if kind.model_names_contain_slash()
-        && let Some((real_provider, real_model)) = model_name.split_once('/')
-        && !real_provider.is_empty()
-        && !real_model.is_empty()
-    {
-        return (real_provider, real_model);
-    }
-
-    (provider_name, model_name)
-}
 
 /// Gather skill prompt data and resolve variant paths for model-tuned variant
 /// generation.  Returns structured JSON so the agent loop can perform the
