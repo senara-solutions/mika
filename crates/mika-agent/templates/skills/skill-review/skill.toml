@@ -9,4 +9,4 @@ timeout_secs = 60
 keywords = ["review skill", "adapt skill", "generate variant", "tune prompt", "skill variant"]
 
 [constraints]
-required_tools = ["review_skill"]
+required_tools = ["review_skill", "write_skill_variant"]

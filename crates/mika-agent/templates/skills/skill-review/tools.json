@@ -1,13 +1,17 @@
 [
   {
-    "name": "review_skill",
-    "description": "Gather skill prompt data and resolve variant paths for generating a model-tuned system_prompt.md. Returns the root prompt, tool signatures, resolved provider/model, and target write path. After receiving the result, adapt the prompt for the target model and write it using write_agent_file.",
+    "name": "write_skill_variant",
+    "description": "Gather skill prompt data and resolve variant paths for generating a model-tuned system_prompt.md. Returns the root prompt, tool signatures, resolved provider/model, and target write path. After receiving the result, adapt the prompt for the target model and persist it by calling write_skill_variant again with the content parameter.",
     "input_schema": {
       "type": "object",
       "properties": {
         "skill_name": {
           "type": "string",
           "description": "Skill name to review, or '*' for batch mode (returns list of all eligible skills)"
+        },
+        "content": {
+          "type": "string",
+          "description": "Full adapted prompt content to write as the model-tuned variant. Omit for inspect/dry-run modes."
         },
         "dry_run": {
           "type": "boolean",
@@ -24,7 +28,7 @@
     },
     "handler": {
       "type": "builtin",
-      "function": "review_skill"
+      "function": "write_skill_variant"
     }
   }
 ]
