@@ -84,7 +84,9 @@ impl Tool for UpdateWorkItemStatusTool {
                     "metadata": {
                         "type": "object",
                         "description": "Optional structured metadata to merge into the work item. \
-                            Top-level keys are shallow-merged with existing metadata. Max 10 KB."
+                            Shallow-merged at the top level AND one level deep for object-valued fields \
+                            (e.g. fields under `claude_pilot.*` from a prior callback are preserved when \
+                            you write a new key under `claude_pilot`). Max 10 KB."
                     }
                 },
                 "required": ["task_id", "status"]
@@ -227,13 +229,7 @@ async fn merge_and_persist_metadata(
     let merged = if let Ok(Some(task)) = ctx.db.get_task_unscoped(task_id).await {
         if let Some(existing_str) = &task.metadata {
             if let Ok(mut existing) = serde_json::from_str::<Value>(existing_str) {
-                if let (Some(existing_obj), Some(new_obj)) =
-                    (existing.as_object_mut(), new_meta.as_object())
-                {
-                    for (k, v) in new_obj {
-                        existing_obj.insert(k.clone(), v.clone());
-                    }
-                }
+                crate::work_item_metadata::merge_metadata(&mut existing, new_meta);
                 existing
             } else {
                 new_meta.clone()
@@ -504,6 +500,110 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Metadata updated"));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_inner_object_fields_preserved_across_updates() {
+        // Issue #489: engine writes claude_pilot.{cost_usd,duration_ms,session_id,turns},
+        // agent enriches with claude_pilot.{pr_url,branch} — all six fields must survive.
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "489 repro").await;
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // Turn 1: engine-injected claude_pilot fields
+        let r1 = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {
+                        "claude_pilot": {
+                            "cost_usd": "6.465109",
+                            "duration_ms": 1230514,
+                            "session_id": "d29d3852",
+                            "turns": 102
+                        }
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!r1.is_error, "{}", r1.content);
+
+        // Turn 2: agent enrichment — must NOT clobber turn 1 fields
+        let r2 = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {
+                        "claude_pilot": {
+                            "pr_url": "https://github.com/senara-solutions/mika/pull/19",
+                            "branch": "fix/489/x"
+                        }
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!r2.is_error, "{}", r2.content);
+
+        // Read back and assert all six fields are present.
+        let task = harness.db.get_task_unscoped(&id).await.unwrap().unwrap();
+        let meta_str = task.metadata.expect("metadata should exist");
+        let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        let cp = meta
+            .get("claude_pilot")
+            .and_then(|v| v.as_object())
+            .expect("claude_pilot object");
+
+        assert_eq!(cp.get("cost_usd").unwrap(), "6.465109");
+        assert_eq!(cp.get("duration_ms").unwrap(), 1230514);
+        assert_eq!(cp.get("session_id").unwrap(), "d29d3852");
+        assert_eq!(cp.get("turns").unwrap(), 102);
+        assert_eq!(
+            cp.get("pr_url").unwrap(),
+            "https://github.com/senara-solutions/mika/pull/19"
+        );
+        assert_eq!(cp.get("branch").unwrap(), "fix/489/x");
+    }
+
+    #[tokio::test]
+    async fn test_metadata_top_level_keys_preserved_across_updates() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "top-level merge").await;
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        tool.execute(
+            serde_json::json!({
+                "task_id": id,
+                "status": "in_progress",
+                "metadata": {"claude_pilot": {"cost_usd": "1.00"}}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        tool.execute(
+            serde_json::json!({
+                "task_id": id,
+                "status": "in_progress",
+                "metadata": {"github": {"pr": 19}}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let task = harness.db.get_task_unscoped(&id).await.unwrap().unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&task.metadata.unwrap()).unwrap();
+        assert_eq!(meta["claude_pilot"]["cost_usd"], "1.00");
+        assert_eq!(meta["github"]["pr"], 19);
     }
 
     #[tokio::test]
