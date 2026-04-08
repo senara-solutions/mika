@@ -576,6 +576,9 @@ async fn run_loop(
     let mut required_tools_retry_done = false;
     // Whether we already injected a text-based tool call correction. Only allow one retry.
     let mut text_tool_call_retry_done = false;
+    // Whether we already injected a completion-claim correction. Only allow one retry.
+    // Guards against fabricated completion claims without update_work_item_status calls (#483).
+    let mut completion_claim_retry_done = false;
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -763,6 +766,73 @@ async fn run_loop(
                                 )),
                             });
                             continue;
+                        }
+                    }
+
+                    // Completion-claim guard: if the agent claims work is done (e.g.,
+                    // "merged", "deployed", "completed") but didn't call
+                    // update_work_item_status, reject and re-prompt once. This catches
+                    // fabricated completion claims that leave work items stuck in
+                    // in_progress. Only fires on EndTurn. See #483.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !completion_claim_retry_done
+                        && let Some(keyword) = detect_completion_claim(&text)
+                    {
+                        // Only enforce if the agent has the tool available
+                        // (delegates and team agents don't — they get default_tools() only)
+                        if tools.get("update_work_item_status").is_some()
+                            && !tools_called.contains("update_work_item_status")
+                        {
+                            // Lazy-resolve active work items (only completable statuses)
+                            let active_items: Vec<_> = db
+                                .list_active_work_items()
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|t| t.status == "pending" || t.status == "in_progress")
+                                .collect();
+
+                            if !active_items.is_empty() {
+                                completion_claim_retry_done = true;
+                                warn!(
+                                    step,
+                                    keyword,
+                                    active_items = active_items.len(),
+                                    label = mode.label(),
+                                    "Completion claim detected without update_work_item_status call — re-prompting"
+                                );
+
+                                let item_list = active_items
+                                    .iter()
+                                    .take(5)
+                                    .map(|t| format!("- {} ({}): {}", t.id, t.status, t.label))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+
+                                // Push the assistant's response so the model sees what it tried
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::Assistant,
+                                    content: LlmContent::Blocks(
+                                        mika_common::llm::response_content_to_blocks(
+                                            &response.content,
+                                        ),
+                                    ),
+                                });
+                                // Inject a correction telling the model to update work items
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::User,
+                                    content: LlmContent::Text(format!(
+                                        "[Your response was rejected because you claimed completion \
+                                         (matched: \"{keyword}\") but did not call update_work_item_status. \
+                                         You have {} active work item(s):\n{item_list}\n\n\
+                                         Call update_work_item_status for each relevant work item, \
+                                         or retract the completion claim if the work is not actually done. \
+                                         Do not fabricate or assume results — verify with tools first.]",
+                                        active_items.len(),
+                                    )),
+                                });
+                                continue;
+                            }
                         }
                     }
 
@@ -2612,6 +2682,35 @@ fn inject_skills_and_resolve_tools(
 /// This is a lightweight check used by the agent loop to detect cases where
 /// Layer 1 (XML extraction in `from_openai_response`) missed a pattern.
 /// Returns `true` if the text likely contains a text-based tool call attempt.
+/// Lazy-compiled regex for completion-claim keywords.
+///
+/// Matches words that indicate the agent is claiming work is done:
+/// `merged`, `deployed`, `complete`, `completed`, `shipped`.
+///
+/// Intentionally excludes high-false-positive words like "done", "built",
+/// "finished" — the guard is defense-in-depth, not exhaustive.
+static COMPLETION_CLAIM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(merged|deployed|completed?|shipped)\b")
+        .expect("completion claim regex must compile")
+});
+
+/// Detects whether assistant text contains a completion claim.
+///
+/// Returns the matched keyword for logging, or `None`. Uses a fast-path
+/// substring check before running the regex (same pattern as `strip_internal_tags`).
+fn detect_completion_claim(text: &str) -> Option<&str> {
+    // Fast path: skip regex if no likely substrings present.
+    let lower = text.to_lowercase();
+    if !lower.contains("merge")
+        && !lower.contains("deploy")
+        && !lower.contains("complete")
+        && !lower.contains("ship")
+    {
+        return None;
+    }
+    COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
+}
+
 fn detect_text_based_tool_call(text: &str) -> bool {
     if !text.contains('<') {
         return false;
@@ -4348,5 +4447,104 @@ mod tests {
         assert!(!detect_text_based_tool_call(
             "Use <function=search_memory to find things"
         ));
+    }
+
+    // -- detect_completion_claim tests (#483) --
+
+    #[test]
+    fn test_detect_completion_claim_merged() {
+        assert_eq!(
+            detect_completion_claim("PR merged successfully"),
+            Some("merged")
+        );
+    }
+
+    #[test]
+    fn test_detect_completion_claim_completed() {
+        assert_eq!(detect_completion_claim("Task completed"), Some("completed"));
+    }
+
+    #[test]
+    fn test_detect_completion_claim_complete() {
+        assert_eq!(
+            detect_completion_claim("The migration is complete"),
+            Some("complete")
+        );
+    }
+
+    #[test]
+    fn test_detect_completion_claim_deployed() {
+        assert_eq!(
+            detect_completion_claim("Successfully deployed to production"),
+            Some("deployed")
+        );
+    }
+
+    #[test]
+    fn test_detect_completion_claim_shipped() {
+        assert_eq!(
+            detect_completion_claim("Feature shipped in v2.1"),
+            Some("shipped")
+        );
+    }
+
+    #[test]
+    fn test_detect_completion_claim_case_insensitive() {
+        assert_eq!(detect_completion_claim("MERGED the PR"), Some("MERGED"));
+        assert_eq!(
+            detect_completion_claim("Successfully Deployed"),
+            Some("Deployed")
+        );
+    }
+
+    #[test]
+    fn test_detect_completion_claim_no_match_on_done() {
+        // "done" intentionally excluded — too many false positives
+        assert!(detect_completion_claim("I'm done analyzing").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_no_match_on_built() {
+        // "built" intentionally excluded — too many false positives
+        assert!(detect_completion_claim("I built a query for you").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_no_match_on_finished() {
+        assert!(detect_completion_claim("I finished the analysis").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_no_match_on_plain_text() {
+        assert!(detect_completion_claim("Here is the analysis result").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_no_match_on_substring() {
+        // "unmerged" should NOT match due to word boundary
+        assert!(detect_completion_claim("the unmerged changes").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_no_match_on_empty() {
+        assert!(detect_completion_claim("").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_word_boundary_redeployed() {
+        // "redeployed" contains "deployed" but word boundary should still match
+        // because "redeployed" has "deployed" at a word boundary after the prefix
+        // Actually regex \b matches between "re" and "deployed"? No — \bdeployed\b
+        // requires a word boundary before "deployed". In "redeployed", there's no
+        // boundary between "re" and "deployed", so it should NOT match.
+        assert!(detect_completion_claim("the service was redeployed").is_none());
+    }
+
+    #[test]
+    fn test_detect_completion_claim_in_sentence() {
+        assert_eq!(
+            detect_completion_claim("I've merged the PR and synced main. Everything looks good."),
+            Some("merged")
+        );
     }
 }
