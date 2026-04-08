@@ -185,39 +185,33 @@ impl Tool for PrMergeWithGateTool {
                 let merge_result =
                     run_gh_merge(pr_number, repo, merge_method, delete_branch, false, token).await;
 
-                match merge_result {
-                    Ok(output) => {
-                        // Check if already merged
-                        if output.contains("already been merged") {
-                            let result = MergeGateResult::AlreadyMerged;
-                            Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
-                        } else {
-                            let result = MergeGateResult::Merged;
-                            Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
-                        }
-                    }
-                    Err(e) => {
-                        // Parse common merge errors for better UX
-                        let err_lower = e.to_lowercase();
-                        if err_lower.contains("already been merged") {
-                            let result = MergeGateResult::AlreadyMerged;
-                            Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
-                        } else if err_lower.contains("draft") {
-                            Ok(ToolOutput::error(
-                                "PR is a draft — convert to ready before merging",
-                            ))
-                        } else if err_lower.contains("merge conflict")
-                            || err_lower.contains("not mergeable")
-                        {
-                            Ok(ToolOutput::error(
-                                "Merge conflicts — resolve before merging",
-                            ))
-                        } else if err_lower.contains("review") && err_lower.contains("required") {
-                            Ok(ToolOutput::error("Required reviews not met"))
-                        } else {
-                            Ok(ToolOutput::error(format!("Merge failed: {e}")))
-                        }
-                    }
+                // Unify success/error into a single string for "already merged" detection
+                let (output, is_err) = match merge_result {
+                    Ok(s) => (s, false),
+                    Err(s) => (s, true),
+                };
+
+                let output_lower = output.to_lowercase();
+                if output_lower.contains("already been merged") {
+                    let result = MergeGateResult::AlreadyMerged;
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                } else if !is_err {
+                    let result = MergeGateResult::Merged;
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                } else if output_lower.contains("draft") {
+                    Ok(ToolOutput::error(
+                        "PR is a draft — convert to ready before merging",
+                    ))
+                } else if output_lower.contains("merge conflict")
+                    || output_lower.contains("not mergeable")
+                {
+                    Ok(ToolOutput::error(
+                        "Merge conflicts — resolve before merging",
+                    ))
+                } else if output_lower.contains("review") && output_lower.contains("required") {
+                    Ok(ToolOutput::error("Required reviews not met"))
+                } else {
+                    Ok(ToolOutput::error(format!("Merge failed: {output}")))
                 }
             }
         }
@@ -243,7 +237,7 @@ enum MergeGateResult {
 }
 
 /// Check info included in the structured result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct CheckInfo {
     name: String,
     state: String,
