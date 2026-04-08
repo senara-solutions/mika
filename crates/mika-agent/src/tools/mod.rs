@@ -26,6 +26,7 @@ mod list_tasks;
 mod list_teams;
 mod list_work_items;
 mod list_workspace;
+mod pr_merge_with_gate;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
@@ -541,6 +542,11 @@ pub fn default_tools() -> ToolRegistry {
     // Work item read-only tools — available to all agents (including delegates)
     registry.register(Box::new(list_work_items::ListWorkItemsTool));
     registry.register(Box::new(check_work_item::CheckWorkItemTool));
+    // PR merge with CI gate — structural backstop against merging with failing checks.
+    // Intentionally in default_tools() (not management_tools_if_needed) so delegates
+    // spawned via claude-pilot are also gated. The tool itself never merges with failing
+    // required checks regardless of caller. See #490.
+    registry.register(Box::new(pr_merge_with_gate::PrMergeWithGateTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));
