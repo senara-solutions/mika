@@ -825,17 +825,13 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
         return;
     }
 
-    // 4. Shallow merge with existing metadata
+    // 4. Two-level shallow merge with existing metadata (see issue #489).
+    //    Shared helper guarantees identical semantics with the agent-facing
+    //    update_work_item_status tool.
     let merged = match &parent.metadata {
         Some(existing) => {
             if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
-                if let Some(base_obj) = base.as_object_mut()
-                    && let Some(new_obj) = extracted.as_object()
-                {
-                    for (k, v) in new_obj {
-                        base_obj.insert(k.clone(), v.clone());
-                    }
-                }
+                crate::work_item_metadata::merge_metadata(&mut base, &extracted);
                 base
             } else {
                 extracted

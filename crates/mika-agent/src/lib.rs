@@ -20,3 +20,4 @@ pub mod test_utils;
 pub mod timestamp;
 pub mod tools;
 pub mod validate;
+pub mod work_item_metadata;
