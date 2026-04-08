@@ -67,7 +67,23 @@ impl Tool for UpdateCoreMemoryTool {
         let section = input["section"].as_str().unwrap_or("");
         let action = input["action"].as_str().unwrap_or("");
         let content = input["content"].as_str().unwrap_or("");
-        let reasoning = input["reasoning"].as_str().unwrap_or("");
+        // Accept `reason` as an alias for `reasoning` to accommodate tokenization
+        // quirks in some LLMs (e.g., minimax/minimax-m2.7 consistently truncates
+        // the key to `reason`). Canonical `reasoning` wins when both are present.
+        // The alias is intentionally undocumented in the tool schema — we do not
+        // want to advertise the misspelling. See issue #488.
+        let reasoning_canonical = input["reasoning"].as_str();
+        let reasoning = reasoning_canonical
+            .or_else(|| input["reason"].as_str())
+            .unwrap_or("");
+        if reasoning_canonical.is_none() && input.get("reason").is_some() {
+            tracing::debug!(
+                target: "mika::tools",
+                model = ?ctx.model_name,
+                provider = ?ctx.provider_name,
+                "update_core_memory: accepted 'reason' as alias for 'reasoning'"
+            );
+        }
 
         // Validate required fields with specific error messages
         let content_required = action != "reset" && !action.is_empty();
@@ -698,6 +714,85 @@ mod tests {
         assert!(result.content.contains("section"));
         assert!(result.content.contains("action"));
         assert!(result.content.contains("reasoning"));
+    }
+
+    #[tokio::test]
+    async fn test_reason_alias_accepted_when_only_reason_provided() {
+        // Regression for #488: minimax/minimax-m2.7 truncates `reasoning` to
+        // `reason` in tool input JSON. The engine should accept the alias.
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "section": "user_summary",
+                    "action": "replace",
+                    "content": "Alice, CEO of Acme Corp.",
+                    "reason": "User introduced herself"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "expected success, got: {}",
+            result.content
+        );
+
+        let entry = harness
+            .db
+            .get_core_memory("user_summary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.value, "Alice, CEO of Acme Corp.");
+
+        // Audit event should record the aliased reasoning text.
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
+        assert_eq!(events.len(), 1);
+        let reasoning = events[0].reasoning.as_deref().unwrap();
+        assert!(reasoning.contains("User introduced herself"));
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_wins_when_both_reason_and_reasoning_provided() {
+        // When both canonical `reasoning` and alias `reason` are present,
+        // `reasoning` must win (canonical field takes precedence).
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "section": "user_summary",
+                    "action": "replace",
+                    "content": "Bob",
+                    "reasoning": "canonical value",
+                    "reason": "alias value"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
+        assert_eq!(events.len(), 1);
+        let reasoning = events[0].reasoning.as_deref().unwrap();
+        assert!(
+            reasoning.contains("canonical value"),
+            "expected canonical 'reasoning' to win, got: {reasoning}"
+        );
+        assert!(
+            !reasoning.contains("alias value"),
+            "alias 'reason' should be ignored when canonical is present, got: {reasoning}"
+        );
     }
 
     #[tokio::test]
