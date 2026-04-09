@@ -382,13 +382,25 @@ pub(crate) async fn handle_github_webhook(
     )
     .entered();
 
-    // 5. Handle ping (no routing needed)
+    // 5. Pre-routing trace — fires for EVERY valid webhook before dedup/routing/filtering.
+    // Diagnostic chain:
+    //   - Never arrived:        no debug! at all for that delivery_id
+    //   - Arrived but deduped:  this debug! + dedup debug!
+    //   - Arrived, not routed:  this debug! + unroutable warn!
+    //   - Arrived and delivered: this debug! + routing info!
+    debug!(
+        event_type,
+        delivery_id = %delivery_id,
+        "GitHub webhook received (pre-dedup, pre-routing)"
+    );
+
+    // 6. Handle ping (no routing needed)
     if event_type == "ping" {
         info!("GitHub webhook ping received");
         return StatusCode::OK;
     }
 
-    // 6. Idempotency via X-GitHub-Delivery LRU cache
+    // 7. Idempotency via X-GitHub-Delivery LRU cache
     if !delivery_id.is_empty() {
         match state.github_delivery_cache.lock() {
             Ok(mut cache) => {
@@ -403,7 +415,7 @@ pub(crate) async fn handle_github_webhook(
         }
     }
 
-    // 7. Parse body
+    // 8. Parse body
     let event: GitHubWebhookEvent = match serde_json::from_slice(&body) {
         Ok(e) => e,
         Err(e) => {
@@ -417,7 +429,7 @@ pub(crate) async fn handle_github_webhook(
     // event types per agent), not by identity filtering. If loop risks emerge (e.g.,
     // mika-qa's own check_suite events), filter by sender.login != agent's bot login.
 
-    // 8. Route to agent
+    // 9. Route to agent
     let check_conclusion = event
         .check_suite
         .as_ref()
@@ -425,9 +437,10 @@ pub(crate) async fn handle_github_webhook(
     let target_agent = match route_event(event_type, event.action.as_deref(), check_conclusion) {
         Some(agent) => agent,
         None => {
-            debug!(
+            warn!(
                 event_type,
                 action = ?event.action,
+                delivery_id = %delivery_id,
                 "GitHub webhook event not routable, dropping"
             );
             return StatusCode::OK;
