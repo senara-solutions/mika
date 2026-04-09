@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use mika_common::claude::ToolDefinition;
 use mika_common::llm::ProviderKind;
@@ -147,32 +147,18 @@ impl SkillEntry {
     pub fn resolve_prompt(&self, provider: &str, model: &str) -> ResolvedPrompt<'_> {
         let requesting_key = format!("{}/{}", provider, sanitize_model_dir_name(model));
         if let Some(prompt) = self.model_prompts.get(&requesting_key) {
-            let resolved = ResolvedPrompt {
+            return ResolvedPrompt {
                 text: prompt,
                 source: PromptVariantSource::HandAuthoredModel,
                 key: Some(requesting_key),
             };
-            debug!(
-                skill = %self.manifest.skill.name,
-                variant_source = %resolved.source,
-                variant_key = ?resolved.key,
-                "skill prompt resolved"
-            );
-            return resolved;
         }
         if let Some(prompt) = self.generated_model_prompts.get(&requesting_key) {
-            let resolved = ResolvedPrompt {
+            return ResolvedPrompt {
                 text: prompt,
                 source: PromptVariantSource::GeneratedModel,
                 key: Some(requesting_key),
             };
-            debug!(
-                skill = %self.manifest.skill.name,
-                variant_source = %resolved.source,
-                variant_key = ?resolved.key,
-                "skill prompt resolved"
-            );
-            return resolved;
         }
         // Generated variants are written under the *canonical* provider/model
         // tuple (aggregator namespace stripped), so an openrouter caller must
@@ -188,31 +174,18 @@ impl SkillEntry {
                 sanitize_model_dir_name(canonical_model)
             );
             if let Some(prompt) = self.generated_model_prompts.get(&canonical_key) {
-                let resolved = ResolvedPrompt {
+                return ResolvedPrompt {
                     text: prompt,
                     source: PromptVariantSource::GeneratedCanonical,
                     key: Some(canonical_key),
                 };
-                debug!(
-                    skill = %self.manifest.skill.name,
-                    variant_source = %resolved.source,
-                    variant_key = ?resolved.key,
-                    "skill prompt resolved"
-                );
-                return resolved;
             }
         }
-        let resolved = ResolvedPrompt {
+        ResolvedPrompt {
             text: &self.prompt_snippet,
             source: PromptVariantSource::Base,
             key: None,
-        };
-        debug!(
-            skill = %self.manifest.skill.name,
-            variant_source = %resolved.source,
-            "skill prompt resolved"
-        );
-        resolved
+        }
     }
 
     /// Sorted set of all provider names that have any variant (override or model).

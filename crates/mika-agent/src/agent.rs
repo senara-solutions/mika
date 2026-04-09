@@ -2660,6 +2660,11 @@ fn inject_skills_and_resolve_tools(
     for entry in matched {
         // Two-level prompt resolution via SkillEntry helper (model → root)
         let resolved = entry.resolve_prompt(provider_name, model_name);
+        debug!(
+            skill = %entry.manifest.skill.name,
+            variant = %resolved.variant_descriptor(),
+            "skill prompt resolved"
+        );
 
         // Apply context variable replacements (e.g., {{pr_diff}})
         let prompt = if !resolved_context.is_empty() {
