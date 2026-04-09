@@ -403,6 +403,12 @@ pub(crate) async fn handle_github_webhook(
         }
     }
 
+    debug!(
+        event_type,
+        delivery_id = %delivery_id,
+        "GitHub webhook received, processing"
+    );
+
     // 7. Parse body
     let event: GitHubWebhookEvent = match serde_json::from_slice(&body) {
         Ok(e) => e,
@@ -425,9 +431,10 @@ pub(crate) async fn handle_github_webhook(
     let target_agent = match route_event(event_type, event.action.as_deref(), check_conclusion) {
         Some(agent) => agent,
         None => {
-            debug!(
+            warn!(
                 event_type,
                 action = ?event.action,
+                delivery_id = %delivery_id,
                 "GitHub webhook event not routable, dropping"
             );
             return StatusCode::OK;
