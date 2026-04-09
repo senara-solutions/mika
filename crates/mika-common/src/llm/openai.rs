@@ -100,11 +100,19 @@ struct OpenAiChoice {
 }
 
 #[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    /// OpenAI-standard nested cache metrics (`prompt_tokens_details.cached_tokens`).
+    prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 // -- Error response --
@@ -255,6 +263,7 @@ impl OpenAiCompatibleProvider {
                         model = %request.model,
                         input_tokens = llm_response.usage.input_tokens,
                         output_tokens = llm_response.usage.output_tokens,
+                        cache_read_tokens = llm_response.usage.cache_read_input_tokens,
                         stop_reason = ?llm_response.stop_reason,
                         provider = %self.provider_kind,
                         "llm_call completed"
@@ -674,11 +683,17 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
         _ => LlmStopReason::EndTurn,
     };
 
-    let usage = resp.usage.map_or_else(LlmUsage::default, |u| LlmUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+    let usage = resp.usage.map_or_else(LlmUsage::default, |u| {
+        let cache_read = u
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .filter(|&t| t > 0);
+        LlmUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: cache_read,
+        }
     });
 
     // Extract <think>…</think> blocks as reasoning (e.g. MiniMax, DeepSeek).
@@ -1003,6 +1018,7 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                prompt_tokens_details: None,
             }),
         };
 
@@ -1189,6 +1205,7 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                prompt_tokens_details: None,
             }),
         };
 
@@ -1436,5 +1453,90 @@ mod tests {
         let llm = from_openai_response(resp).unwrap();
         assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
         assert!(llm.has_tool_calls());
+    }
+
+    // -- Cache token parsing tests (#479) --
+
+    fn make_response_with_usage(usage: Option<OpenAiUsage>) -> OpenAiResponse {
+        OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage,
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_cache_hit() {
+        let resp = make_response_with_usage(Some(OpenAiUsage {
+            prompt_tokens: 36000,
+            completion_tokens: 500,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: 8192,
+            }),
+        }));
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.input_tokens, 36000);
+        assert_eq!(llm.usage.output_tokens, 500);
+        assert_eq!(llm.usage.cache_read_input_tokens, Some(8192));
+        assert_eq!(llm.usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn test_from_openai_response_no_cache_details() {
+        let resp = make_response_with_usage(Some(OpenAiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            prompt_tokens_details: None,
+        }));
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.cache_read_input_tokens, None);
+        assert_eq!(llm.usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn test_from_openai_response_zero_or_default_cached_tokens() {
+        // Zero cached_tokens (explicit or via #[serde(default)] for empty `{}`) maps to None.
+        let resp = make_response_with_usage(Some(OpenAiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+        }));
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_from_openai_response_cache_details_json_deserialization() {
+        // End-to-end: verify serde deserialization from a real OpenRouter-style JSON payload
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 36000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {
+                    "cached_tokens": 8192
+                }
+            }
+        }"#;
+
+        let resp: OpenAiResponse = serde_json::from_str(json).unwrap();
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.cache_read_input_tokens, Some(8192));
     }
 }
