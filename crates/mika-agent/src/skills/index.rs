@@ -1166,8 +1166,9 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
 /// Detect whether a skill.toml uses the legacy flat format.
 ///
 /// Legacy format has a top-level `[handler]` section with a `type` field
-/// (any handler type: builtin, exec, http). New format wraps skill metadata
-/// under `[skill]` and puts handler config in tools.json per-tool.
+/// (any handler type: builtin, exec, http) but no `[skill]` section.
+/// New format wraps skill metadata under `[skill]` and puts handler config
+/// in tools.json per-tool. A file with `[skill]` is never legacy.
 fn is_legacy_format(content: &str) -> bool {
     // Parse as generic TOML table and check for legacy markers
     let table: toml::Table = match content.parse() {
@@ -1721,10 +1722,34 @@ mod tests {
         )
         .unwrap();
 
+        // New format with [handler] section — should NOT be skipped (#507)
+        let with_handler = tmp.path().join("qa-review");
+        fs::create_dir_all(&with_handler).unwrap();
+        fs::write(
+            with_handler.join("skill.toml"),
+            r#"
+            [skill]
+            name = "qa-review"
+            description = "QA review with exec handler"
+            version = "0.1.0"
+
+            [handler]
+            type = "exec"
+            command = "./run.sh"
+            "#,
+        )
+        .unwrap();
+
         let scan = scan_skills_dir(tmp.path());
-        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries.len(), 2);
         assert_eq!(scan.skipped.len(), 1);
-        assert_eq!(scan.entries[0].manifest.skill.name, "web-search");
+        let names: Vec<&str> = scan
+            .entries
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert!(names.contains(&"web-search"));
+        assert!(names.contains(&"qa-review"));
     }
 
     #[test]
