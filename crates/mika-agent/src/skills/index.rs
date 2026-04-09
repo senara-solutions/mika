@@ -386,7 +386,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             }
         };
 
-        // Detect legacy format: has [handler] section with type = "builtin"
+        // Detect legacy format: has [handler] section with type field but no [skill]
         if is_legacy_format(&content) {
             warn!(
                 path = %manifest_path.display(),
@@ -1174,7 +1174,11 @@ fn is_legacy_format(content: &str) -> bool {
         Ok(t) => t,
         Err(_) => return false,
     };
-    // Legacy format has top-level "handler" table with any "type" field
+    // New format has [skill] section — never legacy
+    if table.contains_key("skill") {
+        return false;
+    }
+    // Legacy format has top-level "handler" table with any "type" field but no [skill]
     if let Some(handler) = table.get("handler").and_then(|v| v.as_table())
         && handler.get("type").and_then(|v| v.as_str()).is_some()
     {
@@ -2308,6 +2312,31 @@ mod tests {
             [skill]
             name = "web-search"
             description = "Search"
+            "#
+        ));
+
+        // New format with [handler] section is NOT legacy (has [skill])
+        assert!(!is_legacy_format(
+            r#"
+            [skill]
+            name = "qa-review"
+            description = "QA review with exec handler"
+            version = "0.1.0"
+
+            [handler]
+            type = "exec"
+            command = "./run.sh"
+            "#
+        ));
+
+        // Empty [skill] section with [handler] is still NOT legacy
+        assert!(!is_legacy_format(
+            r#"
+            [skill]
+
+            [handler]
+            type = "exec"
+            command = "./run.sh"
             "#
         ));
 
