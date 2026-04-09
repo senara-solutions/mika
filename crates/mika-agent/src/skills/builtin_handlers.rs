@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use tokio::io::AsyncReadExt;
 
-use crate::bundled_skills::is_bundled_skill;
+use crate::bundled_skills::{is_trust_critical_skill, trust_critical_skill_names};
 use crate::skills::index::{resolve_canonical_provider_model, sanitize_model_dir_name};
 use crate::tools::{ToolContext, ToolOutput};
 
@@ -990,13 +990,19 @@ async fn review_skill(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolO
 
     let skills_dir = ctx.home_dir.join("skills");
 
-    // --- Built-in skill guard (#480) ---------------------------------------
+    // --- Trust-critical skill guard (#480, #486) ----------------------------
+    // Only block trust-critical skills (skill-review, self-knowledge,
+    // agents-teams) whose prompts govern security/identity. Other bundled
+    // skills (web-search, shell-exec, etc.) are reviewable — their prompts
+    // focus on tool usage mechanics, safe to adapt per-model.
     // Block before filesystem existence check so case-mismatched names get
-    // "built-in" error (via eq_ignore_ascii_case) rather than "not found".
-    if skill_name != "*" && is_bundled_skill(skill_name) {
+    // "trust-critical" error (via eq_ignore_ascii_case) rather than "not found".
+    if skill_name != "*" && is_trust_critical_skill(skill_name) {
+        let names = trust_critical_skill_names().join(", ");
         return ToolOutput::success(format!(
-            "Cannot review built-in skill '{skill_name}'. \
-             Built-in skills are platform-managed and updated automatically.",
+            "Cannot review trust-critical skill '{skill_name}'. \
+             Trust-critical skills ({names}) are platform-managed and cannot \
+             be adapted — their prompts govern security, identity, or orchestration.",
         ));
     }
 
@@ -1279,11 +1285,11 @@ async fn review_skill_batch(
         let name_str = name.to_string_lossy();
         let path = entry.path();
 
-        // Skip built-in skills (#480)
-        if is_bundled_skill(&name_str) {
+        // Skip trust-critical skills (#480, #486)
+        if is_trust_critical_skill(&name_str) {
             skipped.push(serde_json::json!({
                 "name": name_str,
-                "reason": "built-in",
+                "reason": "trust-critical",
             }));
             continue;
         }
@@ -2710,23 +2716,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_review_skill_rejects_builtin_inspect() {
-        // Inspect mode (no content) should be rejected for built-in skills.
+    async fn test_review_skill_rejects_trust_critical_inspect() {
+        // Inspect mode (no content) should be rejected for trust-critical skills.
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let output = review_skill(&serde_json::json!({"skill_name": "skill-review"}), &ctx).await;
         assert!(!output.is_error); // Not a tool error — a clear rejection message
         assert!(
-            output.content.contains("Cannot review built-in skill"),
-            "expected built-in rejection, got: {}",
+            output
+                .content
+                .contains("Cannot review trust-critical skill"),
+            "expected trust-critical rejection, got: {}",
             output.content
         );
         assert!(output.content.contains("skill-review"));
     }
 
     #[tokio::test]
-    async fn test_review_skill_rejects_builtin_persist() {
-        // Persist mode (with content) should also be rejected for built-in skills.
+    async fn test_review_skill_rejects_trust_critical_persist() {
+        // Persist mode (with content) should also be rejected for trust-critical skills.
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let output = review_skill(
@@ -2739,22 +2747,26 @@ mod tests {
         .await;
         assert!(!output.is_error);
         assert!(
-            output.content.contains("Cannot review built-in skill"),
-            "expected built-in rejection, got: {}",
+            output
+                .content
+                .contains("Cannot review trust-critical skill"),
+            "expected trust-critical rejection, got: {}",
             output.content
         );
         assert!(output.content.contains("self-knowledge"));
     }
 
     #[tokio::test]
-    async fn test_review_skill_rejects_builtin_case_insensitive() {
-        // Case-insensitive matching: "SHELL-EXEC" should be blocked.
+    async fn test_review_skill_rejects_trust_critical_case_insensitive() {
+        // Case-insensitive matching: trust-critical skills blocked regardless of case.
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        for name in &["SHELL-EXEC", "Shell-Exec", "Skill-Review", "GITHUB"] {
+        for name in &["Skill-Review", "SELF-KNOWLEDGE", "Agents-Teams"] {
             let output = review_skill(&serde_json::json!({"skill_name": name}), &ctx).await;
             assert!(
-                output.content.contains("Cannot review built-in skill"),
+                output
+                    .content
+                    .contains("Cannot review trust-critical skill"),
                 "should reject '{}', got: {}",
                 name,
                 output.content
@@ -2763,16 +2775,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_review_skill_batch_skips_builtins() {
-        // Batch mode should skip all built-in skills with reason "built-in".
+    async fn test_review_skill_allows_reviewable_bundled_skills() {
+        // Non-trust-critical bundled skills (e.g., web-search, shell-exec)
+        // should NOT be blocked by the trust-critical guard.
+        // They will fail with "not found" (no skill dir in temp home) but
+        // should NOT hit the trust-critical rejection.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        for name in &["web-search", "shell-exec", "tmux", "github", "git-ops"] {
+            let output = review_skill(&serde_json::json!({"skill_name": name}), &ctx).await;
+            assert!(
+                !output
+                    .content
+                    .contains("Cannot review trust-critical skill"),
+                "'{}' should NOT be blocked as trust-critical, got: {}",
+                name,
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_batch_skips_trust_critical_only() {
+        // Batch mode should skip trust-critical skills but include reviewable
+        // bundled skills.
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let skills_dir = home.join("skills");
 
-        // Create a built-in skill directory (shell-exec) with a prompt
-        let builtin_dir = skills_dir.join("shell-exec");
-        std::fs::create_dir_all(&builtin_dir).unwrap();
-        std::fs::write(builtin_dir.join("system_prompt.md"), "Execute shell.").unwrap();
+        // Create a trust-critical skill directory with a prompt
+        let trust_critical_dir = skills_dir.join("self-knowledge");
+        std::fs::create_dir_all(&trust_critical_dir).unwrap();
+        std::fs::write(
+            trust_critical_dir.join("system_prompt.md"),
+            "Self knowledge.",
+        )
+        .unwrap();
+
+        // Create a reviewable bundled skill directory with a prompt
+        let reviewable_dir = skills_dir.join("shell-exec");
+        std::fs::create_dir_all(&reviewable_dir).unwrap();
+        std::fs::write(reviewable_dir.join("system_prompt.md"), "Execute shell.").unwrap();
 
         // Create a custom skill directory with a prompt
         let custom_dir = skills_dir.join("my-custom-skill");
@@ -2786,16 +2829,26 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(parsed["mode"], "batch");
 
-        // shell-exec should be in skipped with reason "built-in"
+        // self-knowledge should be in skipped with reason "trust-critical"
         let skipped = parsed["skipped_skills"].as_array().unwrap();
-        let builtin_skip = skipped
+        let trust_skip = skipped
             .iter()
-            .find(|s| s["name"] == "shell-exec")
-            .expect("shell-exec should be in skipped list");
-        assert_eq!(builtin_skip["reason"], "built-in");
+            .find(|s| s["name"] == "self-knowledge")
+            .expect("self-knowledge should be in skipped list");
+        assert_eq!(trust_skip["reason"], "trust-critical");
+
+        // shell-exec (reviewable bundled) should be in eligible, NOT skipped
+        let eligible = parsed["eligible_skills"].as_array().unwrap();
+        assert!(
+            eligible.iter().any(|s| s["name"] == "shell-exec"),
+            "shell-exec (reviewable bundled) should be eligible"
+        );
+        assert!(
+            !skipped.iter().any(|s| s["name"] == "shell-exec"),
+            "shell-exec should NOT be in skipped list"
+        );
 
         // my-custom-skill should be in eligible
-        let eligible = parsed["eligible_skills"].as_array().unwrap();
         assert!(
             eligible.iter().any(|s| s["name"] == "my-custom-skill"),
             "my-custom-skill should be eligible"
