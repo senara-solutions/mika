@@ -17,6 +17,7 @@ export interface LlmCallRow {
   status: string
   error_message: string | null
   step: number
+  prompt_variant: string | null
   created_at: string
 }
 

@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -421,6 +421,9 @@ pub struct LlmCallRow {
     pub status: String,
     pub error_message: Option<String>,
     pub step: u32,
+    /// JSON map of skill names to resolved prompt variant descriptors.
+    /// `None` when no skills contributed prompts to this turn.
+    pub prompt_variant: Option<String>,
     pub created_at: String,
 }
 
@@ -734,6 +737,10 @@ impl Database {
             self.migrate_v19_to_v20()?;
             info!(version = 20, "database migrated to v20");
         }
+        if (3..=20).contains(&version) {
+            self.migrate_v20_to_v21()?;
+            info!(version = 21, "database migrated to v21");
+        }
         Ok(())
     }
 
@@ -790,7 +797,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (20);
+            INSERT INTO schema_version (version) VALUES (21);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1132,6 +1139,7 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'success',
                 error_message TEXT,
                 step INTEGER NOT NULL DEFAULT 0,
+                prompt_variant TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
             CREATE INDEX idx_llm_calls_trace ON llm_calls(trace_id);
@@ -2466,6 +2474,21 @@ impl Database {
             sql.push_str("ALTER TABLE skill_overrides ADD COLUMN llm_model TEXT;\n");
         }
         sql.push_str("INSERT INTO schema_version (version) VALUES (20);\nCOMMIT;");
+
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    fn migrate_v20_to_v21(&self) -> Result<()> {
+        info!("migrating database schema v20 → v21 (llm_calls: prompt_variant)");
+
+        let has_col = self.column_exists("llm_calls", "prompt_variant")?;
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !has_col {
+            sql.push_str("ALTER TABLE llm_calls ADD COLUMN prompt_variant TEXT;\n");
+        }
+        sql.push_str("INSERT INTO schema_version (version) VALUES (21);\nCOMMIT;");
 
         self.conn.execute_batch(&sql)?;
         Ok(())
@@ -3824,12 +3847,13 @@ impl Database {
         status: &str,
         error_message: Option<&str>,
         step: u32,
+        prompt_variant: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO llm_calls (id, agent_id, session_id, trace_id, provider, model,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             latency_ms, stop_reason, status, error_message, step)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             latency_ms, stop_reason, status, error_message, step, prompt_variant)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 agent_id,
@@ -3846,6 +3870,7 @@ impl Database {
                 status,
                 error_message,
                 step,
+                prompt_variant,
             ],
         )?;
         Ok(())
@@ -3929,7 +3954,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, step, created_at
+                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
              FROM llm_calls WHERE trace_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -3967,7 +3992,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, step, created_at
+                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
              FROM llm_calls WHERE session_id = ?1
              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
@@ -4059,7 +4084,7 @@ impl Database {
         let query_sql = format!(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, step, created_at
+                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
              FROM llm_calls {where_sql}
              ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
             params_vec.len() - 1,
@@ -4169,7 +4194,7 @@ impl Database {
             .query_row(
                 "SELECT id, agent_id, session_id, trace_id, provider, model,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                        latency_ms, stop_reason, status, error_message, step, created_at
+                        latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
                  FROM llm_calls WHERE id = ?1",
                 params![id],
                 Self::row_to_llm_call,
@@ -4210,7 +4235,8 @@ impl Database {
             status: r.get(12)?,
             error_message: r.get(13)?,
             step: r.get(14)?,
-            created_at: r.get(15)?,
+            prompt_variant: r.get(15)?,
+            created_at: r.get(16)?,
         })
     }
 

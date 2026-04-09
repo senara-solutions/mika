@@ -564,6 +564,7 @@ async fn run_loop(
     required_tools: &HashSet<String>,
     store_llm_calls: bool,
     store_tool_calls: bool,
+    prompt_variant: Option<&str>,
 ) -> Result<LoopResult> {
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
@@ -640,6 +641,7 @@ async fn run_loop(
                             "success",
                             None,
                             step as u32,
+                            prompt_variant,
                         )
                         .await
                     {
@@ -663,6 +665,7 @@ async fn run_loop(
                             "error",
                             Some(&e.to_string()),
                             step as u32,
+                            prompt_variant,
                         )
                         .await
                     {
@@ -1221,7 +1224,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
-    let mut skill_tool_defs = inject_skills_and_resolve_tools(
+    let (mut skill_tool_defs, prompt_variant) = inject_skills_and_resolve_tools(
         &matched_entries,
         tools,
         &mut system,
@@ -1427,6 +1430,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         &required_tools,
         store_llm,
         store_tools,
+        prompt_variant.as_deref(),
     )
     .await?;
 
@@ -2015,7 +2019,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let provider = llm.provider_name();
     let model = llm.model_name();
     let no_context = HashMap::new();
-    let skill_tool_defs =
+    let (skill_tool_defs, prompt_variant) =
         inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model, &no_context);
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
@@ -2128,6 +2132,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         &no_required_tools,
         store_llm,
         store_tools,
+        prompt_variant.as_deref(),
     )
     .await?;
 
@@ -2335,7 +2340,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
-    let mut skill_tool_defs = inject_skills_and_resolve_tools(
+    let (mut skill_tool_defs, prompt_variant) = inject_skills_and_resolve_tools(
         &matched_entries,
         tools,
         &mut system,
@@ -2427,6 +2432,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         &required_tools,
         store_llm,
         store_tools,
+        prompt_variant.as_deref(),
     )
     .await?;
 
@@ -2641,25 +2647,38 @@ fn inject_skills_and_resolve_tools(
     provider_name: &str,
     model_name: &str,
     resolved_context: &HashMap<String, context::ContextBlock>,
-) -> Vec<mika_common::claude::ToolDefinition> {
+) -> (Vec<mika_common::claude::ToolDefinition>, Option<String>) {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
     let mut seen: std::collections::HashSet<String> =
         tool_defs.iter().map(|d| d.name.clone()).collect();
 
+    // Collect variant descriptors per skill for observability (#481).
+    let mut variant_map: HashMap<String, String> = HashMap::new();
+
     // Add skill prompt snippets and skill-defined tools from matched skills
     for entry in matched {
         // Two-level prompt resolution via SkillEntry helper (model → root)
-        let prompt = entry.resolve_prompt(provider_name, model_name);
+        let resolved = entry.resolve_prompt(provider_name, model_name);
+        debug!(
+            skill = %entry.manifest.skill.name,
+            variant = %resolved.variant_descriptor(),
+            "skill prompt resolved"
+        );
 
         // Apply context variable replacements (e.g., {{pr_diff}})
         let prompt = if !resolved_context.is_empty() {
-            context::apply_context_replacements(prompt, resolved_context)
+            context::apply_context_replacements(resolved.text, resolved_context)
         } else {
-            prompt.to_string()
+            resolved.text.to_string()
         };
 
         if !prompt.is_empty() {
+            // Record variant descriptor only for skills that contributed prompt text.
+            variant_map.insert(
+                entry.manifest.skill.name.clone(),
+                resolved.variant_descriptor(),
+            );
             write!(
                 system,
                 "\n<context type=\"skill\" trust=\"local\">\n## {} Skill\n{}\n</context>\n",
@@ -2674,7 +2693,14 @@ fn inject_skills_and_resolve_tools(
         }
     }
 
-    tool_defs
+    // Serialize variant map to JSON for storage in llm_calls.prompt_variant.
+    let prompt_variant = if variant_map.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&variant_map).ok()
+    };
+
+    (tool_defs, prompt_variant)
 }
 
 /// Detect whether text contains XML-formatted tool call patterns.
@@ -3029,7 +3055,7 @@ mod tests {
         let mut system = "Base prompt.".to_string();
 
         let no_ctx = HashMap::new();
-        let defs = inject_skills_and_resolve_tools(
+        let (defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3044,6 +3070,11 @@ mod tests {
         // Should include the skill tool definition
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "test_tool");
+        // Should record variant info for the non-empty prompt
+        assert!(variant.is_some());
+        let variant_json: HashMap<String, String> =
+            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
+        assert_eq!(variant_json.get("test").unwrap(), "base");
     }
 
     #[test]
@@ -3079,7 +3110,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        let defs = inject_skills_and_resolve_tools(
+        let (defs, _variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3102,7 +3133,7 @@ mod tests {
         let mut system = "Base.".to_string();
 
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3114,6 +3145,8 @@ mod tests {
         // Should NOT add skill context section when snippet is empty
         assert!(!system.contains("quiet Skill"));
         assert_eq!(system, "Base.");
+        // No variant info when prompt is empty
+        assert!(variant.is_none());
     }
 
     #[test]
@@ -3126,7 +3159,7 @@ mod tests {
 
         // No model variant — should fall back to root
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, _variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3147,7 +3180,7 @@ mod tests {
         let mut system = "Base.".to_string();
 
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3158,6 +3191,7 @@ mod tests {
 
         // Should NOT add any skill context section
         assert_eq!(system, "Base.");
+        assert!(variant.is_none());
     }
 
     #[test]
@@ -3173,7 +3207,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3184,6 +3218,13 @@ mod tests {
 
         assert!(system.contains("Sonnet-specific prompt."));
         assert!(!system.contains("Root prompt."));
+        // Should record hand-authored model variant
+        let variant_json: HashMap<String, String> =
+            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            variant_json.get("search").unwrap(),
+            "hand_authored_model:anthropic/claude-sonnet-4-6"
+        );
     }
 
     #[test]
@@ -3200,7 +3241,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3211,6 +3252,9 @@ mod tests {
 
         assert!(system.contains("Root prompt."));
         assert!(!system.contains("Sonnet prompt."));
+        let variant_json: HashMap<String, String> =
+            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
+        assert_eq!(variant_json.get("search").unwrap(), "base");
     }
 
     #[test]
@@ -3223,7 +3267,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, _variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3249,7 +3293,7 @@ mod tests {
 
         // Model name contains a slash — sanitize_model_dir_name should match
         let no_ctx = HashMap::new();
-        inject_skills_and_resolve_tools(
+        let (_defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -3260,6 +3304,12 @@ mod tests {
 
         assert!(system.contains("OpenRouter model prompt."));
         assert!(!system.contains("Root prompt."));
+        let variant_json: HashMap<String, String> =
+            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            variant_json.get("search").unwrap(),
+            "hand_authored_model:openrouter/anthropic--claude-sonnet-4"
+        );
     }
 
     #[test]

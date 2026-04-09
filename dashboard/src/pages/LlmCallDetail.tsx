@@ -100,6 +100,32 @@ export default function LlmCallDetail() {
         )}
       </div>
 
+      {/* Skill Variants */}
+      {call.prompt_variant && (() => {
+        try {
+          const variants = JSON.parse(call.prompt_variant) as Record<string, string>
+          return (
+            <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5 mt-4 space-y-1">
+              <h3 className="text-heading text-sm font-medium mb-3">Skill Variants</h3>
+              {Object.entries(variants).map(([skill, variant]) => (
+                <MetadataRow key={skill} label={skill}>
+                  <span className="font-mono text-xs">{variant}</span>
+                </MetadataRow>
+              ))}
+            </div>
+          )
+        } catch {
+          return (
+            <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5 mt-4 space-y-1">
+              <h3 className="text-heading text-sm font-medium mb-3">Skill Variants</h3>
+              <MetadataRow label="Raw">
+                <span className="font-mono text-xs">{call.prompt_variant}</span>
+              </MetadataRow>
+            </div>
+          )
+        }
+      })()}
+
       {/* Token Usage */}
       <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5 mt-4 space-y-1">
         <h3 className="text-heading text-sm font-medium mb-3">Token Usage</h3>
