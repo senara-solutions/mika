@@ -153,6 +153,38 @@ pub fn is_bundled_skill(name: &str) -> bool {
         .any(|s| s.name.eq_ignore_ascii_case(name))
 }
 
+/// Trust-critical bundled skills whose prompts must NOT be reviewed or adapted.
+///
+/// These skills govern the agent's self-awareness, security posture, or ability
+/// to modify other skills. Model-specific rewording could weaken their safety
+/// properties. All other bundled skills are "functional" — their prompts focus
+/// on tool usage mechanics and are safe to adapt per-model.
+///
+/// Criteria for trust-critical classification:
+/// - `skill-review`: can modify any skill's prompt (self-referential risk)
+/// - `self-knowledge`: governs agent self-awareness and core identity
+/// - `agents-teams`: controls multi-agent orchestration and delegation
+static TRUST_CRITICAL_SKILLS: &[&str] = &["skill-review", "self-knowledge", "agents-teams"];
+
+/// Check whether a skill is trust-critical (blocked from review/adaptation).
+///
+/// Only trust-critical bundled skills are blocked from `review_skill`. Other
+/// bundled skills (e.g., web-search, shell-exec) are reviewable because their
+/// prompts focus on tool usage mechanics — safe to adapt per-model.
+///
+/// Note: this does NOT replace `is_bundled_skill()` for install/delete/update
+/// guards — ALL bundled skills remain protected from those operations.
+pub fn is_trust_critical_skill(name: &str) -> bool {
+    TRUST_CRITICAL_SKILLS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(name))
+}
+
+/// Return the list of trust-critical skill names (for error messages and prompts).
+pub fn trust_critical_skill_names() -> &'static [&'static str] {
+    TRUST_CRITICAL_SKILLS
+}
+
 /// Seed bundled skills into the given skills directory.
 ///
 /// Always writes bundled skill files, updating existing installs to match the
@@ -392,6 +424,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_trust_critical_skills_are_subset_of_bundled() {
+        // Every trust-critical skill must also be a bundled skill.
+        for name in TRUST_CRITICAL_SKILLS {
+            assert!(
+                is_bundled_skill(name),
+                "trust-critical skill '{}' is not in BUNDLED_SKILLS",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_trust_critical_skill() {
+        assert!(is_trust_critical_skill("skill-review"));
+        assert!(is_trust_critical_skill("self-knowledge"));
+        assert!(is_trust_critical_skill("agents-teams"));
+        // Case-insensitive
+        assert!(is_trust_critical_skill("Skill-Review"));
+        assert!(is_trust_critical_skill("SELF-KNOWLEDGE"));
+    }
+
+    #[test]
+    fn test_reviewable_bundled_skills_not_trust_critical() {
+        // Every bundled skill that is NOT trust-critical should be reviewable.
+        // Derived from the actual constants to avoid fragile enumeration.
+        let reviewable: Vec<_> = BUNDLED_SKILLS
+            .iter()
+            .filter(|s| !is_trust_critical_skill(s.name))
+            .collect();
+        // At least one bundled skill must be reviewable.
+        assert!(
+            !reviewable.is_empty(),
+            "expected some reviewable bundled skills"
+        );
+        // Trust-critical must be a strict subset of bundled.
+        assert!(
+            TRUST_CRITICAL_SKILLS.len() < BUNDLED_SKILLS.len(),
+            "trust-critical should be smaller than bundled"
+        );
+        // Verify each reviewable skill is indeed bundled but not trust-critical.
+        for skill in &reviewable {
+            assert!(is_bundled_skill(skill.name));
+            assert!(!is_trust_critical_skill(skill.name));
+        }
+    }
+
+    #[test]
+    fn test_skill_review_prompt_lists_trust_critical_skills() {
+        // The skill-review system prompt must mention every trust-critical
+        // skill name so the agent doesn't waste tool calls on them.
+        let content = include_str!("../templates/skills/skill-review/system_prompt.md");
+        for name in TRUST_CRITICAL_SKILLS {
+            assert!(
+                content.contains(name),
+                "skill-review prompt missing trust-critical skill '{}'",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_skill_review_prompt_does_not_reference_write_skill_variant() {
+        // Regression: ensure the stale tool name is gone from the prompt.
+        let content = include_str!("../templates/skills/skill-review/system_prompt.md");
+        assert!(
+            !content.contains("write_skill_variant"),
+            "skill-review prompt still references write_skill_variant"
+        );
     }
 
     #[test]

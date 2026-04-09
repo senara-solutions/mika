@@ -1,7 +1,7 @@
 [
   {
-    "name": "write_skill_variant",
-    "description": "Gather skill prompt data and resolve variant paths for generating a model-tuned system_prompt.md. Returns the root prompt, tool signatures, resolved provider/model, and target write path. After receiving the result, adapt the prompt for the target model and persist it by calling write_skill_variant again with the content parameter.",
+    "name": "review_skill",
+    "description": "Inspect a skill's prompt, tools, and runtime model context, and optionally persist a model-tuned variant. Call without 'content' to inspect; call with 'content' to write the adapted prompt.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -11,24 +11,24 @@
         },
         "content": {
           "type": "string",
-          "description": "Full adapted prompt content to write as the model-tuned variant. Omit for inspect/dry-run modes."
+          "description": "Full adapted prompt content to persist as the model-tuned variant. Omit to inspect only."
         },
         "dry_run": {
           "type": "boolean",
           "default": false,
-          "description": "If true, return data for review without expecting a write afterward"
+          "description": "If true, return data for review without writing to disk"
         },
         "force": {
           "type": "boolean",
           "default": false,
-          "description": "If true, include skills that already have variants for the current model (overwrite mode)"
+          "description": "If true, overwrite an existing variant for the current model"
         }
       },
       "required": ["skill_name"]
     },
     "handler": {
       "type": "builtin",
-      "function": "write_skill_variant"
+      "function": "review_skill"
     }
   }
 ]
