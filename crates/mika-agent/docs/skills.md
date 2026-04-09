@@ -1115,3 +1115,30 @@ Both exec and http handlers enforce the `timeout_secs` value from the manifest (
 ### Invalid skills never break startup
 
 The skill scanner (`scan_skills_dir`) catches all errors -- missing files, invalid TOML, bad JSON -- and logs them as warnings. A broken skill is simply skipped. This ensures that a single bad skill file cannot prevent Mika from starting.
+
+## QA Verdict Contract
+
+mika-qa-bot posts PR verdicts as GitHub reviews with:
+
+- **Review state:** `COMMENTED` (NOT `APPROVED` or `CHANGES_REQUESTED`)
+- **Body:** contains a `VERDICT: <class>[<detail>]` token (e.g., `VERDICT: approve`, `VERDICT: hold[review]`, `VERDICT: reject`)
+
+**The `state` field is NOT authoritative. The `VERDICT:` token in the body is.**
+
+QA is advisory — it never blocks GitHub's native merge button. Using `CHANGES_REQUESTED` would conflate advisory verdicts with GitHub's review-required gate and is explicitly rejected.
+
+### BAD — gating on state
+
+```rust
+// ❌ never fires for qa-bot — all qa-bot reviews are state=COMMENTED
+if review.state == "CHANGES_REQUESTED" { retry() }
+```
+
+### GOOD — parsing the token
+
+```rust
+// ✅ parse the VERDICT: token from the review body
+if body.contains("VERDICT: hold") || body.contains("VERDICT: reject") { retry() }
+```
+
+Any webhook filter, routing rule, or verdict parser that gates on `state` instead of body content is a bug. See issue [#487](https://github.com/senara-solutions/mika/issues/487) for the incident that motivated this contract.
