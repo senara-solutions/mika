@@ -1,7 +1,7 @@
 ---
 title: "fix: is_legacy_format() rejects valid skill.toml with both [skill] and [handler]"
 type: fix
-status: active
+status: completed
 date: 2026-04-09
 issue: "#507"
 ---
