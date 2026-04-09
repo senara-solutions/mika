@@ -1,7 +1,7 @@
 ---
 title: "fix: gateway PR review webhook observability and verdict contract"
 type: fix
-status: active
+status: completed
 date: 2026-04-09
 issue: 487
 ---
@@ -30,7 +30,7 @@ Issue #487 — mika-qa posted a `state=COMMENTED` PR review on mika-platform#19 
 - [x] Unroutable events log at `warn!` (not `debug!`) with `event_type`, `action`, and `delivery_id`, so a silently-dropped `pull_request_review` (or any event) is discoverable via log search.
 - [x] `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -p mika-gateway` all pass.
 - [x] `docs/skills.md` contains an explicit note on the qa-bot verdict contract, including the BAD pattern ("gate on `state` field") and the GOOD pattern ("parse `VERDICT:` token from body"). The note lives alongside the existing self-dev / skills lifecycle documentation.
-- [ ] PR body documents the manual verification steps (criteria A and C) for the human operator to run post-merge.
+- [x] PR body documents the manual verification steps (criteria A and C) for the human operator to run post-merge.
 
 ## Implementation notes
 
