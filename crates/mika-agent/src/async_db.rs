@@ -1732,8 +1732,9 @@ impl AsyncDatabase {
         status: &str,
         error_message: Option<&str>,
         step: u32,
+        prompt_variant: Option<&str>,
     ) -> Result<()> {
-        let (a, i, sid, tid, p, m, sr, st, em) = (
+        let (a, i, sid, tid, p, m, sr, st, em, pv) = (
             self.agent_id.clone(),
             id.to_owned(),
             session_id.to_owned(),
@@ -1743,6 +1744,7 @@ impl AsyncDatabase {
             stop_reason.map(|s| s.to_owned()),
             status.to_owned(),
             error_message.map(|s| s.to_owned()),
+            prompt_variant.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
             db.save_llm_call(
@@ -1761,6 +1763,7 @@ impl AsyncDatabase {
                 &st,
                 em.as_deref(),
                 step,
+                pv.as_deref(),
             )
         })
         .await
