@@ -6009,6 +6009,16 @@ impl Database {
         Ok(())
     }
 
+    /// Returns search content rows that have no embedding yet (for backfill).
+    pub fn get_unembedded_content(&self, agent_id: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content FROM search_content
+             WHERE agent_id = ?1 AND embedding_json IS NULL",
+        )?;
+        let rows = stmt.query_map(params![agent_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn count_search_content(&self, agent_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM search_content WHERE agent_id = ?1",
@@ -7663,6 +7673,54 @@ mod tests {
         let results = db.fts_search("mika", "Alice", 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Alice"));
+    }
+
+    #[test]
+    fn test_get_unembedded_content() {
+        let db = db();
+        // Index two content rows — both start with embedding_json = NULL
+        let id1 = db
+            .index_content("mika", "person", Some(1), "Alice in Wonderland")
+            .unwrap();
+        let id2 = db
+            .index_content("mika", "person", Some(2), "Bob the Builder")
+            .unwrap();
+
+        // Both should be returned as unembedded
+        let unembedded = db.get_unembedded_content("mika").unwrap();
+        assert_eq!(unembedded.len(), 2);
+
+        // Store an embedding for the first one
+        db.index_embedding(id1, &[0.1; 512]).unwrap();
+
+        // Now only the second should be unembedded
+        let unembedded = db.get_unembedded_content("mika").unwrap();
+        assert_eq!(unembedded.len(), 1);
+        assert_eq!(unembedded[0].0, id2);
+        assert_eq!(unembedded[0].1, "Bob the Builder");
+
+        // Store embedding for the second — none left
+        db.index_embedding(id2, &[0.2; 512]).unwrap();
+        let unembedded = db.get_unembedded_content("mika").unwrap();
+        assert!(unembedded.is_empty());
+    }
+
+    #[test]
+    fn test_get_unembedded_content_agent_isolation() {
+        let db = db();
+        db.register_agent("other", "Other", "").unwrap();
+        db.index_content("mika", "person", Some(1), "Alice")
+            .unwrap();
+        db.index_content("other", "person", Some(1), "Bob").unwrap();
+
+        // Each agent sees only its own unembedded content
+        let mika_unembedded = db.get_unembedded_content("mika").unwrap();
+        assert_eq!(mika_unembedded.len(), 1);
+        assert_eq!(mika_unembedded[0].1, "Alice");
+
+        let other_unembedded = db.get_unembedded_content("other").unwrap();
+        assert_eq!(other_unembedded.len(), 1);
+        assert_eq!(other_unembedded[0].1, "Bob");
     }
 
     #[test]

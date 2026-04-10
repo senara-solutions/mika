@@ -414,7 +414,10 @@ async fn init_agent(
 ///
 /// These are slow operations moved out of the hot path. Runs concurrently with
 /// the main server after `ready` is set.
-async fn startup_cleanup(db: AsyncDatabase) {
+async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingClient>) {
+    /// Max items per `embed_batch()` API call — conservative to avoid rate limits.
+    const EMBEDDING_BACKFILL_BATCH_SIZE: usize = 100;
+
     // Prune old heartbeat sends (> 7 days)
     if let Err(e) = db.prune_old_heartbeat_sends(7).await {
         warn!(error = %e, "failed to prune old heartbeat sends");
@@ -452,17 +455,45 @@ async fn startup_cleanup(db: AsyncDatabase) {
         && !facts.is_empty()
     {
         info!(count = facts.len(), "backfilling search index");
-        let mut content_ids: Vec<(i64, usize)> = Vec::new();
-        for (i, (source_type, source_id, content)) in facts.iter().enumerate() {
-            if let Ok(cid) = db
+        for (source_type, source_id, content) in &facts {
+            let _ = db
                 .index_content(source_type, Some(*source_id), content)
-                .await
-            {
-                content_ids.push((cid, i));
-            }
+                .await;
         }
         info!("search index backfill complete");
-        let _ = content_ids; // embeddings require embedding_client; skipped here
+    }
+
+    // Backfill embeddings for rows missing them (idempotent, runs every startup)
+    if let Some(ref client) = embedding_client {
+        match db.get_unembedded_content().await {
+            Ok(unembedded) if !unembedded.is_empty() => {
+                info!(
+                    count = unembedded.len(),
+                    "backfilling embeddings for search content"
+                );
+                for chunk in unembedded.chunks(EMBEDDING_BACKFILL_BATCH_SIZE) {
+                    let texts: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
+                    match client.embed_batch(&texts).await {
+                        Ok(embeddings) => {
+                            for ((id, _), emb) in chunk.iter().zip(embeddings) {
+                                if let Err(e) = db.index_embedding(*id, emb).await {
+                                    warn!(content_id = id, error = %e, "failed to store embedding");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "embedding batch failed, will retry on next startup");
+                            break;
+                        }
+                    }
+                }
+                info!("embedding backfill complete");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to query unembedded content");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -703,7 +734,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         tick_handles.push(handle);
 
         // Background cleanup runs concurrently — fire and forget
-        tokio::spawn(startup_cleanup(db));
+        tokio::spawn(startup_cleanup(db, agent_state.embedding_client.clone()));
     }
 
     let agent_count = state.agents.len();

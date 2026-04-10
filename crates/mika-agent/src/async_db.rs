@@ -1160,6 +1160,11 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn get_unembedded_content(&self) -> Result<Vec<(i64, String)>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_unembedded_content(&a)).await
+    }
+
     pub async fn count_search_content(&self) -> Result<i64> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.count_search_content(&a)).await
