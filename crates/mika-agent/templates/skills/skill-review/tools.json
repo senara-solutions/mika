@@ -11,7 +11,7 @@
         },
         "content": {
           "type": "string",
-          "description": "Full adapted prompt content to persist as the model-tuned variant. Omit to inspect only."
+          "description": "Full adapted system_prompt.md in markdown format. Must start with a markdown heading (## Skill Name). This is the complete prompt variant \u2014 NOT JSON, NOT a dict, NOT a summary. Must be at least 50% the size of the root prompt."
         },
         "dry_run": {
           "type": "boolean",
@@ -24,7 +24,9 @@
           "description": "If true, overwrite an existing variant for the current model"
         }
       },
-      "required": ["skill_name"]
+      "required": [
+        "skill_name"
+      ]
     },
     "handler": {
       "type": "builtin",
