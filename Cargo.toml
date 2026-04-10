@@ -132,7 +132,7 @@ jsonwebtoken = "9"
 rand = "0.9"
 hex = "0.4"
 hmac = "0.12"
-lru = "0.12"
+lru = "0.16"
 sha2 = "0.10"
 dialoguer = "0.11"
 
