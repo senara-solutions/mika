@@ -1,7 +1,7 @@
 ---
 title: "fix: exec handler GitHub identity and required_tools retry on terminal errors"
 type: fix
-status: active
+status: completed
 date: 2026-04-11
 ---
 
