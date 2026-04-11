@@ -2819,8 +2819,11 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
 /// Regex matching GitHub resource URLs that look like created resources:
 /// issue comments, review comments, PR review IDs, issues, and PRs.
 static GITHUB_RESOURCE_URL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // Use [^\s>\]] to allow `)` inside URLs — LLMs often emit markdown links like
+    // [comment](https://github.com/org/repo/pull/1#issuecomment-99) where `)` is
+    // part of the surrounding syntax but the URL itself contains the resource anchor.
     regex::Regex::new(
-            r"https://github\.com/[^\s)>\]]+(?:#issuecomment-\d+|#discussion_r\d+|#pullrequestreview-\d+|/(?:issues|pull)/\d+)",
+            r"https://github\.com/[^\s>\]]+(?:#issuecomment-\d+|#discussion_r\d+|#pullrequestreview-\d+|/(?:issues|pull)/\d+)",
         )
         .expect("github resource url regex must compile")
 });
@@ -4890,5 +4893,16 @@ mod tests {
         assert!(result.is_some());
         let (verb, _) = result.unwrap();
         assert_eq!(verb, "POSTED");
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_markdown_link() {
+        // LLMs often emit markdown link syntax — the regex must match through `)`
+        let text = "I posted [a comment](https://github.com/org/repo/pull/307#issuecomment-4146200192) on the PR.";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, url) = result.unwrap();
+        assert_eq!(verb, "posted");
+        assert!(url.contains("#issuecomment-4146200192"));
     }
 }
