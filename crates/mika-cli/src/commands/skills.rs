@@ -636,9 +636,14 @@ async fn test_skill_tool(
 
     println!("\n  Testing {skill_name}/{tool_name}...\n");
 
-    let output =
-        executor::execute_skill_tool(skill_tool, input, entry.manifest.skill.timeout_secs, None)
-            .await;
+    let output = executor::execute_skill_tool(
+        skill_tool,
+        input,
+        entry.manifest.skill.timeout_secs,
+        None,
+        None,
+    )
+    .await;
 
     if output.is_error {
         println!("  [ERROR] {}", output.content);
