@@ -585,6 +585,9 @@ async fn run_loop(
     // Whether we already injected a completion-claim correction. Only allow one retry.
     // Guards against fabricated completion claims without update_work_item_status calls (#483).
     let mut completion_claim_retry_done = false;
+    // Whether we already injected a fabricated-action correction. Only allow one retry.
+    // Guards against fabricated action claims with URLs but zero tool calls (#308).
+    let mut fabricated_action_retry_done = false;
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -843,6 +846,44 @@ async fn run_loop(
                                 continue;
                             }
                         }
+                    }
+
+                    // Fabricated action-claim guard: if the agent claims to have
+                    // performed an action (posted, commented, etc.) with a GitHub URL
+                    // but made zero tool calls in this turn, reject and re-prompt.
+                    // This catches hallucinated tool results where the agent fabricates
+                    // resource URLs without executing any tool. See #308.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !fabricated_action_retry_done
+                        && tools_called.is_empty()
+                        && let Some((verb, url)) = detect_fabricated_action_claim(&text)
+                    {
+                        fabricated_action_retry_done = true;
+                        warn!(
+                            step,
+                            verb,
+                            url,
+                            label = mode.label(),
+                            "Fabricated action claim detected with zero tool calls — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[Your response was rejected because you claimed to have \
+                                 {verb} a resource ({url}) but you did not call any tool \
+                                 in this turn. You MUST use tools (e.g., run_gh) to perform \
+                                 actions — do not fabricate URLs or assume actions happened. \
+                                 Call the appropriate tool now to actually perform the action, \
+                                 or explain that you cannot perform it.]",
+                            )),
+                        });
+                        continue;
                     }
 
                     if mode.saves_to_db() {
@@ -2773,6 +2814,40 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
         return None;
     }
     COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
+}
+
+/// Regex matching GitHub resource URLs that look like created resources:
+/// issue comments, review comments, PR review IDs, issues, and PRs.
+static GITHUB_RESOURCE_URL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // Use [^\s>\]] to allow `)` inside URLs — LLMs often emit markdown links like
+    // [comment](https://github.com/org/repo/pull/1#issuecomment-99) where `)` is
+    // part of the surrounding syntax but the URL itself contains the resource anchor.
+    regex::Regex::new(
+            r"https?://github\.com/[^\s>\]]+(?:#issuecomment-\d+|#discussion_r\d+|#pullrequestreview-\d+|/(?:issues|pull)/\d+)",
+        )
+        .expect("github resource url regex must compile")
+});
+
+/// Regex matching action-claim verbs that indicate the agent is claiming
+/// to have performed an action (posting, commenting, creating, etc.).
+static ACTION_CLAIM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(posted|commented|created|submitted|opened|reviewed|published|added|wrote|replied|approved|filed|raised|left a (?:comment|review))\b")
+        .expect("action claim regex must compile")
+});
+
+/// Detects whether assistant text claims to have performed an action with a
+/// fabricated GitHub URL. Returns `(verb, url)` for logging, or `None`.
+///
+/// Only detects fabrication when the agent made zero tool calls — if any tool
+/// was called, the URL may have come from a tool result.
+fn detect_fabricated_action_claim(text: &str) -> Option<(&str, &str)> {
+    // Fast path: skip regex if no likely substring present.
+    if !text.contains("github.com/") {
+        return None;
+    }
+    let url_match = GITHUB_RESOURCE_URL_RE.find(text)?;
+    let verb_match = ACTION_CLAIM_RE.find(text)?;
+    Some((verb_match.as_str(), url_match.as_str()))
 }
 
 fn detect_text_based_tool_call(text: &str) -> bool {
@@ -4728,5 +4803,116 @@ mod tests {
             detect_completion_claim("I've merged the PR and synced main. Everything looks good."),
             Some("merged")
         );
+    }
+
+    // -- detect_fabricated_action_claim tests (#308) --
+
+    #[test]
+    fn test_detect_fabricated_action_claim_comment_posted() {
+        let text = "Comment posted: https://github.com/senara-solutions/mika/pull/307#issuecomment-4146200192";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, url) = result.unwrap();
+        assert_eq!(verb, "posted");
+        assert!(url.contains("#issuecomment-4146200192"));
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_review_submitted() {
+        let text = "I've reviewed the PR: https://github.com/org/repo/pull/42#pullrequestreview-99";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, _url) = result.unwrap();
+        assert_eq!(verb, "reviewed");
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_issue_created() {
+        let text = "I created the issue at https://github.com/org/repo/issues/123 for tracking.";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, url) = result.unwrap();
+        assert_eq!(verb, "created");
+        assert!(url.contains("/issues/123"));
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_left_a_comment() {
+        let text = "I left a comment on https://github.com/org/repo/pull/5#issuecomment-100";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, _) = result.unwrap();
+        assert_eq!(verb, "left a comment");
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_discussion_comment() {
+        let text =
+            "I've submitted my feedback at https://github.com/org/repo/pull/10#discussion_r555";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, url) = result.unwrap();
+        assert_eq!(verb, "submitted");
+        assert!(url.contains("#discussion_r555"));
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_no_github_url() {
+        let text = "I posted the comment on Slack.";
+        assert!(detect_fabricated_action_claim(text).is_none());
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_no_action_verb() {
+        let text = "You can view the PR at https://github.com/org/repo/pull/42#issuecomment-100";
+        assert!(detect_fabricated_action_claim(text).is_none());
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_plain_repo_url() {
+        // A bare repo URL without resource anchor should not match
+        let text = "I posted at https://github.com/org/repo";
+        assert!(detect_fabricated_action_claim(text).is_none());
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_no_github_fast_path() {
+        // All inputs without "github.com/" hit the fast-path early return
+        assert!(detect_fabricated_action_claim("").is_none());
+        assert!(
+            detect_fabricated_action_claim("I posted a comment on the issue tracker.").is_none()
+        );
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_case_insensitive_verb() {
+        let text = "POSTED the review: https://github.com/org/repo/pull/1#pullrequestreview-42";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, _) = result.unwrap();
+        assert_eq!(verb, "POSTED");
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_synonym_verbs() {
+        // Verb synonyms added per review #754
+        for verb in &["added", "wrote", "replied", "approved", "filed", "raised"] {
+            let text =
+                format!("I {verb} a review at https://github.com/org/repo/pull/1#issuecomment-42");
+            let result = detect_fabricated_action_claim(&text);
+            assert!(result.is_some(), "should detect verb: {verb}");
+            assert_eq!(result.unwrap().0, *verb);
+        }
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_markdown_link() {
+        // LLMs often emit markdown link syntax — the regex must match through `)`
+        let text = "I posted [a comment](https://github.com/org/repo/pull/307#issuecomment-4146200192) on the PR.";
+        let result = detect_fabricated_action_claim(text);
+        assert!(result.is_some());
+        let (verb, url) = result.unwrap();
+        assert_eq!(verb, "posted");
+        assert!(url.contains("#issuecomment-4146200192"));
     }
 }

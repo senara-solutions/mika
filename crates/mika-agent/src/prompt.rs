@@ -253,9 +253,12 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          (PR status, CI pipeline, deploy, merge readiness, branch health) unless a tool \
          result in this conversation explicitly confirms that exact state. A successful \
          tool result confirms only the specific action that tool performed — do not \
-         extrapolate.\n  \
+         extrapolate. NEVER fabricate URLs — every URL you include in a response must \
+         come from a tool result, not from your own generation.\n  \
          BAD: Build tool returns \"Compilation succeeded\" → you say \"PR is ready for review.\"\n  \
+         BAD: No tool calls → you say \"Comment posted: https://github.com/…#issuecomment-123\"\n  \
          GOOD: Build tool returns \"Compilation succeeded\" → you say \"The build passed.\"\n  \
+         GOOD: run_gh posts a comment → you report the URL from the tool result.\n  \
          If you need downstream status, call the appropriate tool (e.g., check_work_item, \
          query_timeline) to verify it first.\n",
     );
@@ -1958,6 +1961,10 @@ notify = true
         // Verify bad/good examples are present
         assert!(prompt.contains("BAD:"));
         assert!(prompt.contains("GOOD:"));
+        // Verify URL fabrication examples are present (#308)
+        assert!(prompt.contains("NEVER fabricate URLs"));
+        assert!(prompt.contains("No tool calls"));
+        assert!(prompt.contains("run_gh posts a comment"));
     }
 
     #[test]
