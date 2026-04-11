@@ -1,7 +1,7 @@
 ---
 title: "refactor: split CLAUDE.md into hierarchical per-crate context files"
 type: refactor
-status: active
+status: completed
 date: 2026-04-11
 issue: "#476"
 ---
