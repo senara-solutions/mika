@@ -1,24 +1,28 @@
 ---
-title: "OpenAPI spec drift from missing utoipa annotations"
+title: "OpenAPI spec drift from missing utoipa annotations or registrations"
 category: integration-issues
-date: 2026-03-29
+date: 2026-04-11
 tags: [openapi, utoipa, spec-generation, dashboard, regression]
-issue: "#321"
-pr: "#326"
+issue: ["#321", "#328"]
+pr: ["#326"]
 modules: [mika-agent/server]
 ---
 
-# OpenAPI Spec Drift from Missing utoipa Annotations
+# OpenAPI Spec Drift from Missing utoipa Annotations or Registrations
 
 ## Problem
 
-After PR #319 regenerated `docs/openapi/mika-server.yaml`, 3 dashboard toggle endpoints (`/api/v1/dashboard/enable`, `/disable`, `/status`) disappeared from the spec. The endpoints were originally hand-added to the YAML but never backed by `#[utoipa::path]` annotations — any spec regeneration silently removed them.
+Two variants of the same bug class:
 
-**Symptom:** The `self-knowledge` skill serves the OpenAPI spec via `get_documentation("api-spec")`. Agents asked about the dashboard API got incomplete documentation.
+1. **#321 — Missing annotations:** After PR #319 regenerated `docs/openapi/mika-server.yaml`, 3 dashboard toggle endpoints (`/api/v1/dashboard/enable`, `/disable`, `/status`) disappeared from the spec. The endpoints were originally hand-added to the YAML but never backed by `#[utoipa::path]` annotations — any spec regeneration silently removed them.
+
+2. **#328 — Missing registration:** `handle_task_complete` in `handlers.rs` had a `#[utoipa::path]` annotation but was never added to the `paths(...)` list in `AgentApiDoc` in `openapi.rs`. The annotation existed but the endpoint was invisible to the generator because it wasn't registered.
+
+**Symptom (both variants):** The `self-knowledge` skill serves the OpenAPI spec via `get_documentation("api-spec")`. Agents and external consumers couldn't discover the affected endpoints.
 
 ## Root Cause
 
-The handlers in `embedded_dashboard.rs` lacked `#[utoipa::path]` proc macro annotations. The `AgentApiDoc` struct in `openapi.rs` only generates spec entries for functions listed in its `paths(...)` attribute — functions without annotations and registration are invisible to the generator.
+The `AgentApiDoc` struct in `openapi.rs` only generates spec entries for functions that meet **both** requirements: (1) the handler has a `#[utoipa::path]` proc macro annotation, and (2) the handler is listed in the `paths(...)` attribute of `#[openapi(...)]`. Missing either one makes the endpoint invisible. Request/response types also need registration in `components(schemas(...))`.
 
 ## Solution
 
@@ -66,8 +70,9 @@ paths(
 ## Prevention
 
 - **Always add `#[utoipa::path]` when creating new Axum handlers.** If a handler should appear in the OpenAPI spec, annotate it at creation time — not after the fact.
-- **The `test_committed_spec_is_current` test** catches drift between generated and committed specs, but only for endpoints that have annotations. It cannot detect missing annotations.
-- **The `test_agent_openapi_yaml_contains_endpoints` test** serves as an explicit endpoint inventory — add a new assertion whenever a new endpoint is annotated.
+- **Always register in `AgentApiDoc` paths().** Adding the annotation is not enough — the handler must also be listed in the `paths(...)` attribute in `openapi.rs`. Register request/response types in `components(schemas(...))` too.
+- **The `test_committed_spec_is_current` test** catches drift between generated and committed specs, but only for endpoints that have annotations AND are registered. It cannot detect missing annotations or missing registrations.
+- **The `test_agent_openapi_yaml_contains_endpoints` test** serves as an explicit endpoint inventory — add a new assertion whenever a new endpoint is annotated. This is the best defense against variant #328 (annotated but not registered).
 
 ## Related
 
