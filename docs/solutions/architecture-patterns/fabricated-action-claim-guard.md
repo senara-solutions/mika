@@ -24,7 +24,7 @@ External skills (like qa-review) that don't declare `required_tools` had no safe
 
 Added a 4th post-condition: **fabricated action-claim guard**. Detects when:
 1. Response contains a GitHub resource URL (`#issuecomment-`, `#discussion_r`, `#pullrequestreview-`, `/issues/`, `/pull/`)
-2. AND contains an action-claim verb (`posted`, `commented`, `created`, `submitted`, `opened`, `reviewed`, `published`, `left a comment/review`)
+2. AND contains an action-claim verb (`posted`, `commented`, `created`, `submitted`, `opened`, `reviewed`, `published`, `added`, `wrote`, `replied`, `approved`, `filed`, `raised`, `left a comment/review`)
 3. AND zero tool calls were made in the turn
 
 On match: reject response, re-prompt once (same pattern as other guards).
@@ -34,7 +34,7 @@ Also strengthened the system prompt grounding rule with explicit URL fabrication
 ## Key Design Decisions
 
 - **Zero-tool-call gate, not per-URL tracking**: Simpler heuristic — if any tool was called, we trust the output. The grounding rule covers residual risk.
-- **GitHub URLs only**: Scoped to minimize false positives. Extendable later.
+- **GitHub URLs only (HTTP and HTTPS)**: Scoped to minimize false positives. Matches both `http://` and `https://` schemes since LLMs may fabricate either. Extendable later.
 - **Markdown-safe regex**: Uses `[^\s>\]]` (no `)` exclusion) so URLs inside markdown links `[text](url#fragment)` are matched correctly.
 - **Defense-in-depth**: This guard is not exhaustive — it's a backstop. The system prompt grounding rule is the primary defense.
 
