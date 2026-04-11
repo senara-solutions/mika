@@ -748,23 +748,40 @@ impl Settings {
         self.github_token.as_deref()
     }
 
-    /// Resolve the best available GitHub token for agent operations.
+    /// Resolve the GitHub token to use for agent action operations.
     ///
-    /// Prefers GitHub App installation token (short-lived, org-scoped) over
-    /// `MIKA_GITHUB_TOKEN` PAT. Falls back to PAT on App token exchange failure.
+    /// Returns the `MIKA_GITHUB_TOKEN` PAT if configured — this is the agent's
+    /// machine user identity (per ADR-008), required for operations where the
+    /// GitHub author/reviewer identity matters: PR reviews, merges, comments,
+    /// issue creation. Without distinct PATs per agent, GitHub rejects
+    /// cross-agent operations like `mika-qa` approving `mika-dev`'s PRs with
+    /// `Review Can not approve your own pull request`, because both agents
+    /// would otherwise share the single `mika-platform-bot[bot]` App identity.
+    ///
+    /// Falls back to a GitHub App installation token only when no PAT is
+    /// configured (single-identity deployments, bootstrap, or agents that do
+    /// not need a distinct machine user). Returns `None` if neither is
+    /// available.
     pub async fn resolve_github_token(
         &self,
         github_app: Option<&crate::github_app::GitHubApp>,
     ) -> Option<String> {
+        // PAT first — the agent's machine user identity.
+        if let Some(pat) = self.github_token.as_deref() {
+            return Some(pat.to_string());
+        }
+        // Fall back to an App installation token (short-lived, org-scoped).
         if let Some(app) = github_app {
             match app.installation_token().await {
                 Ok(token) => return Some(token),
                 Err(e) => {
-                    tracing::warn!("GitHub App token exchange failed: {e}. Falling back to PAT.");
+                    tracing::warn!(
+                        "GitHub App token exchange failed: {e}. No PAT configured for fallback."
+                    );
                 }
             }
         }
-        self.github_token.clone()
+        None
     }
 
     /// Return `(model_field, api_key_field, base_url_field)` references for a given provider.
@@ -1318,5 +1335,38 @@ mod tests {
         let settings = Settings::load(tmp.path()).unwrap();
         // Anthropic shows just the model
         assert_eq!(settings.active_model_display(), "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_github_token_returns_pat_when_set() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        // Simulate per-agent `.env` setting MIKA_GITHUB_TOKEN to the machine
+        // user PAT (e.g., `github_pat_...`).
+        settings.github_token = Some("github_pat_test_value".to_string());
+
+        // With no GitHub App available, `resolve_github_token` must still
+        // return the PAT — the PAT is the agent's machine user identity and
+        // is the primary token source per ADR-008.
+        let resolved = settings.resolve_github_token(None).await;
+        assert_eq!(resolved.as_deref(), Some("github_pat_test_value"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_github_token_returns_none_when_nothing_set() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        // Clean-slate settings: no PAT, and the test passes `None` for the
+        // App parameter, so `resolve_github_token` has nothing to return.
+        assert!(settings.github_token.is_none());
+
+        let resolved = settings.resolve_github_token(None).await;
+        assert!(resolved.is_none());
     }
 }
