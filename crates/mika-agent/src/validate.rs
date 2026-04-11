@@ -133,7 +133,7 @@ pub fn validate_agent(global_home: &Path, agent_name: &str) -> Vec<SkillDiagnost
         }
     }
 
-    // 8. Skill LLM overrides
+    // 8. Skill LLM overrides (from DB via apply_overrides — no longer from skill.toml #504)
     let skills_dir = agent_home.join("skills");
     if skills_dir.is_dir() {
         let scan = scan_skills_dir(&skills_dir);

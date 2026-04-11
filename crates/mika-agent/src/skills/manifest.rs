@@ -13,22 +13,23 @@ use serde::{Deserialize, Serialize};
 /// [triggers]
 /// keywords = ["search", "look up"]
 ///
-/// [llm]
-/// provider = "openai"       # optional — overrides agent active provider
-/// model    = "gpt-4o-mini"  # optional — overrides provider default model
-///
 /// [constraints]
 /// required_tools = ["run_gh"]  # optional — tools that must be called before response
 /// ```
+///
+/// Note: The `[llm]` section is no longer supported in skill.toml (#504).
+/// Use `mika skills llm <name> set <provider>/<model>` to configure
+/// per-skill LLM overrides (stored in the `skill_overrides` DB table).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillManifest {
     pub skill: SkillInfo,
     #[serde(default)]
     pub triggers: Triggers,
-    /// Optional LLM provider/model override for this skill.
-    /// When set, the agent constructs a per-skill provider instance for turns
-    /// where this skill is active. Only valid in root `skill.toml`, not variant dirs.
-    #[serde(default)]
+    /// Runtime-only LLM provider/model override for this skill.
+    /// Populated from the `skill_overrides` DB table via `apply_overrides()`.
+    /// Not deserialized from skill.toml — the `[llm]` section is no longer
+    /// supported in manifests (use `mika skills llm <name> set` instead).
+    #[serde(skip)]
     pub llm: LlmOverride,
     /// Optional constraints on agent behavior when this skill is active.
     /// Used to enforce tool execution before accepting a response.
@@ -42,7 +43,11 @@ pub struct SkillManifest {
 
 /// Per-skill LLM provider and model preferences.
 ///
-/// Declared in the root `skill.toml` `[llm]` section. Both fields are optional:
+/// Populated at runtime from the `skill_overrides` DB table via
+/// `SkillRegistry::apply_overrides()`. No longer deserialized from
+/// skill.toml — the `[llm]` section is unsupported since #504.
+///
+/// Both fields are optional:
 /// - `provider` only: use this provider with its configured or default model
 /// - `model` only: use this model on the agent's active provider
 /// - both: fully explicit override
@@ -464,10 +469,11 @@ mod tests {
         }
     }
 
-    // -- [llm] section tests --
+    // -- [llm] section tests (now skipped via #[serde(skip)], #504) --
 
     #[test]
-    fn test_parse_llm_provider_and_model() {
+    fn test_parse_llm_section_is_ignored() {
+        // [llm] in TOML is silently ignored — field stays empty (#504)
         let toml_str = r#"
             [skill]
             name = "web-search"
@@ -478,41 +484,10 @@ mod tests {
             model = "gpt-4o-mini"
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.llm.provider.as_deref(), Some("openai"));
-        assert_eq!(manifest.llm.model.as_deref(), Some("gpt-4o-mini"));
-        assert!(!manifest.llm.is_empty());
-    }
-
-    #[test]
-    fn test_parse_llm_provider_only() {
-        let toml_str = r#"
-            [skill]
-            name = "code-review"
-            description = "Review code"
-
-            [llm]
-            provider = "anthropic"
-        "#;
-        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.llm.provider.as_deref(), Some("anthropic"));
-        assert_eq!(manifest.llm.model, None);
-        assert!(!manifest.llm.is_empty());
-    }
-
-    #[test]
-    fn test_parse_llm_model_only() {
-        let toml_str = r#"
-            [skill]
-            name = "fast-search"
-            description = "Fast search"
-
-            [llm]
-            model = "gpt-4o-mini"
-        "#;
-        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.llm.provider, None);
-        assert_eq!(manifest.llm.model.as_deref(), Some("gpt-4o-mini"));
-        assert!(!manifest.llm.is_empty());
+        assert!(
+            manifest.llm.is_empty(),
+            "[llm] should be ignored with #[serde(skip)]"
+        );
     }
 
     #[test]
@@ -526,19 +501,6 @@ mod tests {
         assert!(manifest.llm.is_empty());
         assert_eq!(manifest.llm.provider, None);
         assert_eq!(manifest.llm.model, None);
-    }
-
-    #[test]
-    fn test_parse_empty_llm_section_defaults_empty() {
-        let toml_str = r#"
-            [skill]
-            name = "normal"
-            description = "Normal skill"
-
-            [llm]
-        "#;
-        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
-        assert!(manifest.llm.is_empty());
     }
 
     #[test]
@@ -561,27 +523,29 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_section_serializes_clean() {
-        // Verify that a skill with [llm] round-trips through serialization
+    fn test_llm_section_not_serialized() {
+        // With #[serde(skip)], [llm] should not appear in serialized output
         let toml_str = r#"
             [skill]
             name = "test"
             description = "Test"
-
-            [llm]
-            provider = "groq"
-            model = "llama3-8b"
         "#;
-        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        let mut manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        // Simulate DB override injection (what apply_overrides does)
+        manifest.llm = LlmOverride {
+            provider: Some("groq".to_string()),
+            model: Some("llama3-8b".to_string()),
+        };
         let serialized = toml::to_string_pretty(&manifest).unwrap();
-        let reparsed: SkillManifest = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.llm.provider.as_deref(), Some("groq"));
-        assert_eq!(reparsed.llm.model.as_deref(), Some("llama3-8b"));
+        assert!(
+            !serialized.contains("[llm]"),
+            "[llm] should not appear in serialized output. Got:\n{serialized}"
+        );
     }
 
     #[test]
     fn test_existing_skill_toml_backward_compat() {
-        // A skill.toml from before [llm] was introduced should parse fine
+        // A skill.toml without [llm] should parse fine
         let toml_str = r#"
             [skill]
             name = "web-search"
@@ -634,20 +598,17 @@ mod tests {
     }
 
     #[test]
-    fn test_constraints_coexists_with_llm_section() {
+    fn test_constraints_standalone() {
         let toml_str = r#"
             [skill]
             name = "review"
             description = "Code review skill"
 
-            [llm]
-            provider = "anthropic"
-
             [constraints]
             required_tools = ["run_gh"]
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.llm.provider.as_deref(), Some("anthropic"));
+        assert!(manifest.llm.is_empty());
         assert_eq!(manifest.constraints.required_tools, vec!["run_gh"]);
     }
 
@@ -714,14 +675,11 @@ mod tests {
     }
 
     #[test]
-    fn test_context_coexists_with_constraints_and_llm() {
+    fn test_context_coexists_with_constraints() {
         let toml_str = r#"
             [skill]
             name = "qa-review"
             description = "Review PRs"
-
-            [llm]
-            provider = "deepseek"
 
             [constraints]
             required_tools = ["run_gh"]
@@ -730,7 +688,7 @@ mod tests {
             type = "gh_pr_diff"
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.llm.provider.as_deref(), Some("deepseek"));
+        assert!(manifest.llm.is_empty());
         assert_eq!(manifest.constraints.required_tools, vec!["run_gh"]);
         assert_eq!(manifest.context.len(), 1);
         assert_eq!(

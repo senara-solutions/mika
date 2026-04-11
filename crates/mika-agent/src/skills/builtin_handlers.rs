@@ -1130,6 +1130,14 @@ async fn review_skill_single(
             ));
         }
 
+        // Markdown validation: reject malformed content before writing (#511).
+        if let Err(reason) = super::validate_markdown_content(body) {
+            return ToolOutput::error(format!(
+                "Generated prompt fails markdown validation: {reason}. \
+                 Fix the content and re-call review_skill.",
+            ));
+        }
+
         // Overwrite guard: a pre-existing variant requires force.
         if existing_variant.is_some() && !force {
             return ToolOutput::error(format!(
@@ -2603,6 +2611,54 @@ mod tests {
         assert!(
             output.content.contains("truncation"),
             "expected truncation error, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_rejects_invalid_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 1000);
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        // Content with null bytes — should fail markdown validation
+        let body = format!("{}hello\0world{}", "x".repeat(500), "x".repeat(500));
+        let output = review_skill(
+            &serde_json::json!({"skill_name": "demo", "content": body}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("markdown validation"),
+            "expected markdown validation error, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_skill_rejects_unclosed_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        setup_skill_with_source(home, "demo", 100);
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(home);
+        // Content with 3 fences (odd = unclosed). Must be >= 50% of source (50 bytes).
+        let body =
+            "# Prompt\n\n```rust\nfn main() {}\n```\n\nSome text.\n\n```python\nprint('hello')\n";
+        assert!(body.len() >= 50, "body too short: {}", body.len());
+        let output = review_skill(
+            &serde_json::json!({"skill_name": "demo", "content": body}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("code fence"),
+            "expected code fence error, got: {}",
             output.content
         );
     }
