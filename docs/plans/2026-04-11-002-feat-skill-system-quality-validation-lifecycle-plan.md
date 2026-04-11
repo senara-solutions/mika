@@ -1,7 +1,7 @@
 ---
 title: "Skill system quality: validation, lifecycle, and enforcement improvements"
 type: feat
-status: active
+status: completed
 date: 2026-04-11
 ---
 
