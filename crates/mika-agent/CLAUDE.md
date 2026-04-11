@@ -18,8 +18,8 @@ Four sequential post-conditions on assistant text responses:
 
 1. **Text-based tool call detection:** `detect_text_based_tool_call()` catches patterns that slip through `extract_xml_tool_calls()` in mika-common, re-prompts the LLM once.
 2. **Required-tools gate:** When keyword-matched skills declare `[constraints] required_tools`, the engine tracks tool calls across all steps; if required tools haven't been called, the response is rejected once. `filter_available_required_tools()` pre-filters against builtins + skill tools + MCP. Only `Keyword`-matched skills contribute constraints (#265).
-3. **Completion-claim guard (#483):** Detects completion-claim keywords (`merged`, `deployed`, `complete`/`completed`, `shipped`) in assistant text. If detected AND `update_work_item_status` is in the tool registry AND it was not called AND active work items exist, the response is rejected once. Skips for delegates and team agents.
-4. **Fabricated action-claim guard (#308):** Detects when the agent claims to have performed an action with a GitHub resource URL but made zero tool calls in the turn. Single retry.
+3. **Completion-claim guard (#483):** `detect_completion_claim()` detects completion-claim keywords (`merged`, `deployed`, `complete`/`completed`, `shipped`) in assistant text. If detected AND `update_work_item_status` is in the tool registry AND it was not called AND active work items exist, the response is rejected once. Skips for delegates and team agents.
+4. **Fabricated action-claim guard (#308):** `detect_fabricated_action_claim()` detects when the agent claims to have performed an action with a GitHub resource URL but made zero tool calls in the turn. Single retry.
 
 ### Deterministic Context Injection
 
