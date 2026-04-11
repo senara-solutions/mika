@@ -2823,7 +2823,7 @@ static GITHUB_RESOURCE_URL_RE: std::sync::LazyLock<regex::Regex> = std::sync::La
     // [comment](https://github.com/org/repo/pull/1#issuecomment-99) where `)` is
     // part of the surrounding syntax but the URL itself contains the resource anchor.
     regex::Regex::new(
-            r"https://github\.com/[^\s>\]]+(?:#issuecomment-\d+|#discussion_r\d+|#pullrequestreview-\d+|/(?:issues|pull)/\d+)",
+            r"https?://github\.com/[^\s>\]]+(?:#issuecomment-\d+|#discussion_r\d+|#pullrequestreview-\d+|/(?:issues|pull)/\d+)",
         )
         .expect("github resource url regex must compile")
 });
@@ -2831,7 +2831,7 @@ static GITHUB_RESOURCE_URL_RE: std::sync::LazyLock<regex::Regex> = std::sync::La
 /// Regex matching action-claim verbs that indicate the agent is claiming
 /// to have performed an action (posting, commenting, creating, etc.).
 static ACTION_CLAIM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\b(posted|commented|created|submitted|opened|reviewed|published|left a (?:comment|review))\b")
+    regex::Regex::new(r"(?i)\b(posted|commented|created|submitted|opened|reviewed|published|added|wrote|replied|approved|filed|raised|left a (?:comment|review))\b")
         .expect("action claim regex must compile")
 });
 
@@ -4876,14 +4876,12 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_fabricated_action_claim_empty() {
+    fn test_detect_fabricated_action_claim_no_github_fast_path() {
+        // All inputs without "github.com/" hit the fast-path early return
         assert!(detect_fabricated_action_claim("").is_none());
-    }
-
-    #[test]
-    fn test_detect_fabricated_action_claim_no_github() {
-        let text = "I posted a comment on the issue tracker.";
-        assert!(detect_fabricated_action_claim(text).is_none());
+        assert!(
+            detect_fabricated_action_claim("I posted a comment on the issue tracker.").is_none()
+        );
     }
 
     #[test]
@@ -4893,6 +4891,18 @@ mod tests {
         assert!(result.is_some());
         let (verb, _) = result.unwrap();
         assert_eq!(verb, "POSTED");
+    }
+
+    #[test]
+    fn test_detect_fabricated_action_claim_synonym_verbs() {
+        // Verb synonyms added per review #754
+        for verb in &["added", "wrote", "replied", "approved", "filed", "raised"] {
+            let text =
+                format!("I {verb} a review at https://github.com/org/repo/pull/1#issuecomment-42");
+            let result = detect_fabricated_action_claim(&text);
+            assert!(result.is_some(), "should detect verb: {verb}");
+            assert_eq!(result.unwrap().0, *verb);
+        }
     }
 
     #[test]
