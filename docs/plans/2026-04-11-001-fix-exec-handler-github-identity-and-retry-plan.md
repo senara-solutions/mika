@@ -1,7 +1,7 @@
 ---
 title: "fix: exec handler GitHub identity and required_tools retry on terminal errors"
 type: fix
-status: active
+status: completed
 date: 2026-04-11
 ---
 
@@ -75,14 +75,18 @@ Change the tracking: insert the tool name into `tools_called` regardless of succ
 - [x] `GH_TOKEN` is injected into exec handler child processes when `github_token` is `Some`
 - [x] `GH_TOKEN` is injected into long-running exec handler child processes
 - [x] `GH_TOKEN` is NOT injected when `github_token` is `None` (no fallback)
-- [x] Required tools gate already tracks tool calls before dispatch (no code change needed — see note below)
+- [x] Required tools gate already tracks tool calls before dispatch
+- [x] Required tools gate filters unavailable tools at enforcement time (#516)
 - [x] Existing required_tools retry behavior preserved for tools never called
 - [x] `cargo clippy` clean
 - [x] `cargo test` passes
 - [x] Add test: exec handler receives `GH_TOKEN` when `github_token` is provided
+- [x] Add test: required_tools gate filters out unavailable tools
 - [ ] ~~Add test: required_tools gate does not retry when required tool was called but failed~~ (not needed — tracking was already correct)
 
-**Note on #516:** Investigation revealed that `tools_called` is populated from the LLM's ToolCall blocks **before** dispatch (agent.rs:919-923). Tool names are inserted regardless of execution outcome. The retry in the audit was caused by `run_shell` never being requested by the LLM (not applicable for that review), not by a failed tool being missed. The real fix is to remove `run_shell` from qa-review's `required_tools` config (mika-skills concern, not engine).
+**Note on #516:** Investigation revealed that `tools_called` is populated from the LLM's ToolCall blocks **before** dispatch (agent.rs:919-923). Tool names are inserted regardless of execution outcome. The retry in the audit was caused by `run_shell` never being requested by the LLM (not applicable for that review), not by a failed tool being missed.
+
+**Engine-side resilience fix (#516):** While the root cause is skill config (mika-skills), the engine can be made resilient: `filter_available_required_tools()` checks required tool names against the union of ToolRegistry + skill_tool_map + MCP at enforcement time. Tools not found in any source are excluded with a warning, preventing the gate from retrying for tools that can't possibly be called. This catches stale config, typos, and mismatched tool names without wasting LLM calls.
 
 ## Sources & References
 
