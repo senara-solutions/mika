@@ -566,6 +566,11 @@ async fn run_loop(
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
 ) -> Result<LoopResult> {
+    // Filter required_tools to only include tools that are actually available in the
+    // current tool set (builtins + skill tools + MCP). See #516, #517.
+    let effective_required_tools =
+        filter_available_required_tools(required_tools, tools, skill_tool_map, mcp_manager);
+
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
     let mut last_usage = None;
@@ -731,12 +736,13 @@ async fn run_loop(
                     // re-prompt. Only one retry is allowed to prevent infinite loops.
                     // Only enforced on EndTurn — MaxTokens and ContentFilter are unrecoverable
                     // (re-prompting won't help if the context window is full or content was
-                    // filtered). See #270.
+                    // filtered). Uses effective_required_tools (filtered to available tools
+                    // only) to avoid retrying for tools not in the registry. See #270, #516.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
-                        && !required_tools.is_empty()
+                        && !effective_required_tools.is_empty()
                         && !required_tools_retry_done
                     {
-                        let missing: Vec<&String> = required_tools
+                        let missing: Vec<&String> = effective_required_tools
                             .iter()
                             .filter(|t| !tools_called.contains(t.as_str()))
                             .collect();
@@ -2635,6 +2641,37 @@ fn collect_required_tools(matched: &[MatchedSkill<'_>]) -> HashSet<String> {
         .collect()
 }
 
+/// Filter required tools to only those available in the current tool set.
+///
+/// Checks builtins (ToolRegistry), skill-defined tools, and MCP tools. Tools not found
+/// in any source are excluded with a warning — this prevents the required_tools gate from
+/// retrying for tools that can't possibly be called (e.g., stale config referencing a
+/// removed tool). See #516, #517.
+fn filter_available_required_tools(
+    required: &HashSet<String>,
+    tools: &ToolRegistry,
+    skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
+    mcp_manager: Option<&McpManager>,
+) -> HashSet<String> {
+    required
+        .iter()
+        .filter(|t| {
+            let available = tools.get(t).is_some()
+                || skill_tool_map.contains_key(t.as_str())
+                || mcp_manager.is_some_and(|m| m.is_mcp_tool(t));
+            if !available {
+                warn!(
+                    tool = %t,
+                    "required_tools references unavailable tool — skipping enforcement \
+                     (fix the skill's [constraints] required_tools config)"
+                );
+            }
+            available
+        })
+        .cloned()
+        .collect()
+}
+
 /// Inject matched skill prompt snippets into the system prompt and resolve
 /// tool definitions. Always includes all builtin tools plus skill-defined tools.
 ///
@@ -4312,6 +4349,100 @@ mod tests {
         assert_eq!(required.len(), 1);
         assert!(required.contains("run_tests"));
         assert!(!required.contains("run_claude_pilot"));
+    }
+
+    // -- filter_available_required_tools tests (#516, #517) --
+
+    fn make_resolved_skill_tool(name: &str) -> ResolvedSkillTool {
+        ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: name.to_string(),
+                description: format!("{name} tool"),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Builtin {
+                function: name.to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/test"),
+        }
+    }
+
+    /// Create a ToolRegistry with a single dummy builtin tool named `name`.
+    fn make_registry_with_tool(name: &'static str) -> ToolRegistry {
+        struct DummyBuiltin(&'static str);
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for DummyBuiltin {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.0.to_string(),
+                    description: format!("{} tool", self.0),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &crate::tools::ToolContext<'_>,
+            ) -> Result<crate::tools::ToolOutput> {
+                Ok(crate::tools::ToolOutput::success("ok"))
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyBuiltin(name)));
+        registry
+    }
+
+    #[test]
+    fn test_filter_available_required_tools_keeps_builtin() {
+        let tools = make_registry_with_tool("run_gh");
+        let required: HashSet<String> = ["run_gh".to_string()].into();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains("run_gh"));
+    }
+
+    #[test]
+    fn test_filter_available_required_tools_removes_unavailable() {
+        let tools = ToolRegistry::new();
+        let required: HashSet<String> = ["run_shell".to_string(), "nonexistent".to_string()].into();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        assert!(
+            filtered.is_empty(),
+            "unavailable tools should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_filter_available_required_tools_keeps_skill_tools() {
+        let tools = ToolRegistry::new();
+        let skill_tool = make_resolved_skill_tool("qa_pr_review");
+        let mut skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        skill_map.insert("qa_pr_review".to_string(), &skill_tool);
+
+        let required: HashSet<String> = ["qa_pr_review".to_string()].into();
+        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains("qa_pr_review"));
+    }
+
+    #[test]
+    fn test_filter_available_required_tools_mixed() {
+        // Mix of available (builtin) and unavailable tools — only available kept
+        let tools = make_registry_with_tool("run_gh");
+        let required: HashSet<String> = ["run_gh".to_string(), "run_shell".to_string()].into();
+        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains("run_gh"));
+        assert!(
+            !filtered.contains("run_shell"),
+            "unavailable run_shell should be filtered out"
+        );
     }
 
     // -- resolve_skill_llm_override tests (#463) --
