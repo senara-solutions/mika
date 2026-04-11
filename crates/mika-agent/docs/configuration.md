@@ -215,6 +215,10 @@ Without it, `gh` falls back to the host user's `~/.config/gh/hosts.yml` (persona
 Additionally, `scrub_mika_env_vars()` scrubs `GH_TOKEN` from exec handler child processes
 via `EXTRA_SCRUB_VARS` as defense-in-depth. The `run_gh` builtin handler re-injects
 `MIKA_GITHUB_TOKEN` as `GH_TOKEN` AFTER the scrub for correct platform identity separation.
+The same scrub-then-inject pattern is applied to all exec handler subprocesses spawned by
+skills — `MIKA_GITHUB_TOKEN` is re-injected as `GH_TOKEN` after the env scrub, so any `gh`
+CLI invocation inside a skill handler runs as the agent's configured GitHub identity (not
+the host user).
 
 | Layer | Identity | Purpose |
 |-------|----------|---------|

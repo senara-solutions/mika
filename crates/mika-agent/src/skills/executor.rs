@@ -106,6 +106,7 @@ pub async fn execute_skill_tool(
     input: serde_json::Value,
     timeout_secs: u64,
     long_running_ctx: Option<&LongRunningContext>,
+    github_token: Option<&str>,
 ) -> ToolOutput {
     // Check for long-running exec handler
     if let ToolHandler::Exec {
@@ -115,12 +116,19 @@ pub async fn execute_skill_tool(
     } = &skill_tool.handler
         && let Some(ctx) = long_running_ctx
     {
-        return execute_long_running(skill_tool, command, input, *estimated_duration_secs, ctx)
-            .await;
+        return execute_long_running(
+            skill_tool,
+            command,
+            input,
+            *estimated_duration_secs,
+            ctx,
+            github_token,
+        )
+        .await;
     }
 
     let timeout = Duration::from_secs(timeout_secs);
-    match tokio::time::timeout(timeout, execute_inner(skill_tool, input)).await {
+    match tokio::time::timeout(timeout, execute_inner(skill_tool, input, github_token)).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
             warn!(
@@ -147,6 +155,7 @@ pub async fn execute_skill_tool(
 async fn execute_inner(
     skill_tool: &ResolvedSkillTool,
     input: serde_json::Value,
+    github_token: Option<&str>,
 ) -> Result<ToolOutput> {
     tracing::info!(
         tool = %skill_tool.definition.name,
@@ -160,6 +169,7 @@ async fn execute_inner(
                 &skill_tool.skill_dir,
                 &skill_tool.definition.name,
                 input,
+                github_token,
             )
             .await
         }
@@ -306,6 +316,7 @@ async fn execute_exec(
     skill_dir: &std::path::Path,
     tool_name: &str,
     input: serde_json::Value,
+    github_token: Option<&str>,
 ) -> Result<ToolOutput> {
     // Resolve command relative to skill directory
     let cmd_path = skill_dir.join(command);
@@ -328,6 +339,11 @@ async fn execute_exec(
             .env_remove("TMUX_PANE")
             .kill_on_drop(true);
         scrub_mika_env_vars(&mut cmd);
+        // Re-inject agent's GitHub token for platform identity separation.
+        // Same pattern as builtin run_gh handler (builtin_handlers.rs).
+        if let Some(token) = github_token {
+            cmd.env("GH_TOKEN", token);
+        }
         match cmd.spawn() {
             Ok(child) => break child,
             Err(e) if e.raw_os_error() == Some(26 /* ETXTBSY */) => {
@@ -515,6 +531,7 @@ async fn execute_long_running(
     input: serde_json::Value,
     estimated_duration_secs: Option<u64>,
     ctx: &LongRunningContext,
+    github_token: Option<&str>,
 ) -> ToolOutput {
     // Validate work_item_id — long-running tasks require tracked work items
     let work_item_id = input
@@ -602,6 +619,7 @@ async fn execute_long_running(
         enriched_input,
         task_id.clone(),
         ctx.db.clone(),
+        github_token.map(|s| s.to_string()),
     );
 
     ToolOutput::success(format!(
@@ -622,6 +640,7 @@ fn spawn_long_running_exec(
     input: serde_json::Value,
     task_id: String,
     db: AsyncDatabase,
+    github_token: Option<String>,
 ) {
     tokio::spawn(async move {
         let mut cmd = tokio::process::Command::new(&cmd_path);
@@ -633,6 +652,9 @@ fn spawn_long_running_exec(
             .env_remove("TMUX_PANE")
             .kill_on_drop(false);
         scrub_mika_env_vars(&mut cmd);
+        if let Some(ref token) = github_token {
+            cmd.env("GH_TOKEN", token);
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -790,7 +812,7 @@ mod tests {
 
         let tool = make_exec_tool(tmp.path(), "handlers/handler.sh");
         let output =
-            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, None).await;
+            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("hello from handler"));
     }
@@ -804,7 +826,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "fail.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         // Non-zero exit is NOT a tool error — the process ran to completion
         assert!(!output.is_error, "non-zero exit should not be is_error");
         assert!(
@@ -828,7 +850,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "status.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(
             !output.is_error,
             "non-zero exit should not be is_error, got: {}",
@@ -852,7 +874,7 @@ mod tests {
         write_script(&tmp.path().join("silent_fail.sh"), "#!/bin/sh\nexit 3");
 
         let tool = make_exec_tool(tmp.path(), "silent_fail.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(!output.is_error, "non-zero exit should not be is_error");
         assert!(
             output.content.contains("Exit code: 3"),
@@ -867,7 +889,7 @@ mod tests {
         // via 2>&1, so on non-zero exit the executor must read stdout (not stderr).
         let (_tmp, tool) = setup_shell_exec_handler();
         let input = serde_json::json!({"command": "echo 'health check output' && exit 2"});
-        let output = execute_skill_tool(&tool, input, 30, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None).await;
         assert!(
             !output.is_error,
             "non-zero exit via run.sh should not be is_error, got: {}",
@@ -892,7 +914,7 @@ mod tests {
         write_script(&tmp.path().join("ok.sh"), "#!/bin/sh\necho 'all good'");
 
         let tool = make_exec_tool(tmp.path(), "ok.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(!output.is_error);
         assert!(
             !output.content.contains("Exit code:"),
@@ -912,7 +934,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "both.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(!output.is_error);
         assert!(output.content.contains("Exit code: 1"));
         assert!(
@@ -931,7 +953,7 @@ mod tests {
     async fn test_exec_handler_missing_command() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_exec_tool(tmp.path(), "nonexistent.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("not found"));
     }
@@ -945,7 +967,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "slow.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 2, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 2, None, None).await;
         assert!(
             output.is_error,
             "expected timeout error, got: {}",
@@ -961,7 +983,7 @@ mod tests {
 
         let tool = make_exec_tool(tmp.path(), "echo_input.sh");
         let input = serde_json::json!({"query": "hello world"});
-        let output = execute_skill_tool(&tool, input.clone(), 30, None).await;
+        let output = execute_skill_tool(&tool, input.clone(), 30, None, None).await;
         assert!(!output.is_error);
         // The output should contain the JSON input
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
@@ -972,7 +994,7 @@ mod tests {
     async fn test_exec_handler_command_with_quotes() {
         let (_tmp, tool) = setup_shell_exec_handler();
         let input = serde_json::json!({"command": "echo \"hello world\""});
-        let output = execute_skill_tool(&tool, input, 30, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("hello world"),
@@ -999,7 +1021,7 @@ mod tests {
         let (_tmp, tool) = setup_shell_exec_handler();
         // CSS selectors and hex colors contain # which must survive JSON → jq → eval
         let input = serde_json::json!({"command": "echo '#custom-relay { color: #a6e3a1; }'"});
-        let output = execute_skill_tool(&tool, input, 30, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#custom-relay"),
@@ -1020,7 +1042,7 @@ mod tests {
         let input = serde_json::json!({
             "command": "cat << 'EOF'\n#selector { color: #fff; }\nEOF"
         });
-        let output = execute_skill_tool(&tool, input, 30, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#selector"),
@@ -1045,7 +1067,7 @@ mod tests {
             css_file.display()
         );
         let input = serde_json::json!({"command": cmd});
-        let output = execute_skill_tool(&tool, input, 30, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#new-selector"),
@@ -1059,7 +1081,7 @@ mod tests {
         let (_tmp, tool) = setup_shell_exec_handler();
         // printf with \n format specifiers: backslashes must survive JSON → jq → eval → printf
         let input = serde_json::json!({"command": "printf 'line1\\nline2\\n'"});
-        let output = execute_skill_tool(&tool, input, 30, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("line1"),
@@ -1097,7 +1119,7 @@ mod tests {
             },
             skill_dir: PathBuf::from("/tmp"),
         };
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 5, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 5, None, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("unsupported HTTP method"));
     }
@@ -1263,7 +1285,7 @@ mod tests {
         write_script(&handler_dir.join("screenshot.sh"), &script);
 
         let tool = make_exec_tool(tmp.path(), "handlers/screenshot.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("Screenshot taken."));
         assert_eq!(output.images.len(), 1);
@@ -1280,7 +1302,7 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "plain.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(!output.is_error);
         assert!(output.content.contains("just plain text"));
         assert!(output.images.is_empty());
@@ -1303,7 +1325,7 @@ mod tests {
         }
 
         let tool = make_exec_tool(tmp.path(), "check_env.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         // Both vars should be empty because env_remove strips them
         assert_eq!(output.content.trim(), "TMUX= TMUX_PANE=");
@@ -1333,8 +1355,14 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
         };
 
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, Some(&ctx)).await;
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test"}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
 
         assert!(output.is_error);
         assert!(
@@ -1384,6 +1412,7 @@ mod tests {
             serde_json::json!({"query": "test", "work_item_id": wi_id}),
             30,
             Some(&ctx),
+            None,
         )
         .await;
 
@@ -1447,7 +1476,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
         };
 
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx)).await;
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx), None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("sync result"),
@@ -1481,6 +1510,7 @@ mod tests {
             serde_json::json!({"work_item_id": wi_id}),
             30,
             Some(&ctx),
+            None,
         )
         .await;
 
@@ -1504,6 +1534,42 @@ mod tests {
         assert!(
             result_text.contains("Exit code: 1"),
             "expected 'Exit code: 1' in result, got: {result_text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_receives_gh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("check_token.sh"),
+            "#!/bin/sh\necho \"GH_TOKEN=$GH_TOKEN\"",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "check_token.sh");
+
+        // With github_token provided — should appear in child env
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({}),
+            30,
+            None,
+            Some("ghp_test_token_123"),
+        )
+        .await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("GH_TOKEN=ghp_test_token_123"),
+            "expected GH_TOKEN to be injected, got: {}",
+            output.content
+        );
+
+        // Without github_token — GH_TOKEN should be absent (scrubbed)
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            !output.content.contains("GH_TOKEN=ghp_"),
+            "expected GH_TOKEN to not contain a token when github_token is None, got: {}",
+            output.content
         );
     }
 }

@@ -1698,6 +1698,7 @@ async fn execute_tool(
             input,
             dispatch.skill_timeout,
             dispatch.long_running_ctx,
+            dispatch.ctx.github_token,
         )
         .await;
     }

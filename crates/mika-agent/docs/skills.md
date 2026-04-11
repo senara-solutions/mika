@@ -205,6 +205,7 @@ Execution details:
 - Stdout is captured as the successful tool result.
 - Stderr is included in the error message on non-zero exit.
 - The command is **not** passed the tool name as an argument — all dispatch context is in the JSON on stdin.
+- All `MIKA_*` environment variables are scrubbed from the child process. The agent's `MIKA_GITHUB_TOKEN` is then re-injected as `GH_TOKEN` so `gh` CLI calls in the handler run as the agent's GitHub identity. Note that `git push` / `git clone` over HTTPS does **not** receive credential helper injection — those operations fall back to host credentials or fail. Skill authors who need git over HTTPS should use SSH remotes instead, or open an issue to request `GIT_ASKPASS` injection.
 
 Exec handlers require a `tools.json` file in the skill directory to define the tool schemas sent to Claude.
 
