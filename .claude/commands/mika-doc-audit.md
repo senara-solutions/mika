@@ -18,11 +18,27 @@ Process:
 2. Categorize changes: schema, CLI, skills, config, infra, env vars, tools, architecture
 3. For each category affected, update the corresponding docs:
 
-- **Always**: Review `CLAUDE.md` for accuracy (architecture, conventions, commands, env vars, test count, schema version, pending work)
+**CLAUDE.md hierarchy** — The project uses hierarchical CLAUDE.md files. Update the file closest to the change:
+
+| Change category | Primary CLAUDE.md | Also check |
+|----------------|-------------------|------------|
+| Agent loop, tools, skills, memory, task engine | `crates/mika-agent/CLAUDE.md` | Root `CLAUDE.md` Architecture Summary |
+| Schema/DB migrations | `crates/mika-agent/CLAUDE.md` (Schema Version section) | `docs/runtime-structure.md` |
+| LLM providers, API client, prompt caching, errors | `crates/mika-common/CLAUDE.md` | — |
+| Gateway endpoints, webhooks, routing | `crates/mika-gateway/CLAUDE.md` | — |
+| CLI commands, TUI features, slash commands | `crates/mika-cli/CLAUDE.md` | Root `CLAUDE.md` Commands section |
+| A2A protocol | `crates/mika-a2a/CLAUDE.md` | — |
+| Dashboard pages, UI components | `dashboard/CLAUDE.md` | — |
+| Env vars (shared/common) | Root `CLAUDE.md` | Gateway-specific -> `crates/mika-gateway/CLAUDE.md`, Dashboard-specific -> `dashboard/CLAUDE.md` |
+| Cross-cutting conventions | Root `CLAUDE.md` | — |
+| Docker, CI/CD, deployment | Root `CLAUDE.md` | `docs/deployment.md` |
+| New env vars | Root `CLAUDE.md`, `.env.example`, `docs/configuration.md` | Crate-specific CLAUDE.md if scoped |
+
+- **Always**: Review the root `CLAUDE.md` for accuracy (architecture summary, conventions, commands, env vars, test count, pending work)
 - **If new env vars**: Update `.env.example` and `docs/configuration.md`
-- **If schema/DB changes**: Update `docs/architecture.md` and CLAUDE.md Architecture section
-- **If new CLI commands or tools**: Update `README.md`, `docs/getting-started.md`, `docs/slash-commands.md`
-- **If skill changes**: Update `docs/skills.md`
+- **If schema/DB changes**: Update `crates/mika-agent/CLAUDE.md` Schema Version section and `docs/runtime-structure.md`
+- **If new CLI commands or tools**: Update `crates/mika-cli/CLAUDE.md`, `README.md`, `docs/getting-started.md`, `docs/slash-commands.md`
+- **If skill changes**: Update `crates/mika-agent/CLAUDE.md` Skills System section and `docs/skills.md`
 - **If infra changes** (Docker, deployment): Update `docs/deployment.md`
 - **If new config fields**: Update `docs/configuration.md`
 - **If new slash commands**: Update `docs/slash-commands.md`
