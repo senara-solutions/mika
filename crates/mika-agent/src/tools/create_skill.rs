@@ -224,6 +224,18 @@ impl Tool for CreateSkillTool {
         if let Err(e) = validate_keywords(&keywords) {
             return Ok(ToolOutput::error(e));
         }
+        // Reject skill name in keywords (#510) — skills are already matched by name
+        {
+            let name_lower = name.to_ascii_lowercase();
+            if keywords
+                .iter()
+                .any(|k| k.to_ascii_lowercase() == name_lower)
+            {
+                return Ok(ToolOutput::error(format!(
+                    "Skill name '{name}' must not appear in keywords — skills are already matched by name.",
+                )));
+            }
+        }
         if let Err(e) = validate_dependencies(&dependencies) {
             return Ok(ToolOutput::error(e));
         }
@@ -610,6 +622,48 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("Dependency name cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_rejects_name_in_keywords() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let input = json!({
+            "name": "my-skill",
+            "description": "A skill",
+            "keywords": ["my-skill", "other"],
+            "system_prompt": "prompt"
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("must not appear in keywords"),
+            "Got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_rejects_name_in_keywords_case_insensitive() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = CreateSkillTool;
+
+        let input = json!({
+            "name": "My-Skill",
+            "description": "A skill",
+            "keywords": ["my-skill", "other"],
+            "system_prompt": "prompt"
+        });
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("must not appear in keywords"),
+            "Got: {}",
+            output.content
+        );
     }
 
     #[test]

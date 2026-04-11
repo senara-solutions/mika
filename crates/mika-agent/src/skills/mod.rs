@@ -226,6 +226,46 @@ impl SkillRegistry {
     }
 }
 
+/// Lightweight markdown well-formedness check (#511).
+///
+/// Returns `Ok(())` for valid-looking markdown, or `Err(description)` for
+/// common corruption patterns: empty/whitespace-only, binary content (null
+/// bytes or control characters), and unclosed code fences.
+///
+/// This is intentionally lightweight — no AST parsing or heavyweight
+/// dependencies. It catches the most common corruption from generated prompts.
+pub(crate) fn validate_markdown_content(content: &str) -> Result<(), String> {
+    // 1. Reject empty/whitespace-only
+    if content.trim().is_empty() {
+        return Err("content is empty or whitespace-only".to_string());
+    }
+    // 2. Reject binary content (null bytes)
+    if content.bytes().any(|b| b == 0) {
+        return Err("content contains null bytes — likely binary data".to_string());
+    }
+    // 3. Reject control characters (except newline, carriage return, tab)
+    let control_count = content
+        .bytes()
+        .filter(|&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+        .count();
+    if control_count > 0 {
+        return Err(format!(
+            "content contains {control_count} control character(s) — likely corrupted"
+        ));
+    }
+    // 4. Check for unclosed code fences
+    let fence_count = content
+        .lines()
+        .filter(|l| l.trim_start().starts_with("```"))
+        .count();
+    if fence_count % 2 != 0 {
+        return Err(format!(
+            "content has {fence_count} code fence(s) — odd count suggests an unclosed code block"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,5 +766,50 @@ mod tests {
         // Should still be present — no prompt file means tool-only, not broken
         assert_eq!(registry.skills.len(), 1);
         assert!(registry.skills[0].manifest.skill.always_on);
+    }
+
+    // -- validate_markdown_content tests (#511) --
+
+    #[test]
+    fn test_validate_markdown_content_valid() {
+        assert!(validate_markdown_content("# Hello\n\nSome text.\n").is_ok());
+        assert!(validate_markdown_content("Simple text.").is_ok());
+        assert!(validate_markdown_content("```rust\nfn main() {}\n```\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_markdown_content_empty() {
+        assert!(validate_markdown_content("").is_err());
+        assert!(validate_markdown_content("   ").is_err());
+        assert!(validate_markdown_content("\n\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_markdown_content_null_bytes() {
+        assert!(validate_markdown_content("hello\0world").is_err());
+    }
+
+    #[test]
+    fn test_validate_markdown_content_control_chars() {
+        assert!(validate_markdown_content("hello\x01world").is_err());
+        assert!(validate_markdown_content("hello\x07world").is_err());
+    }
+
+    #[test]
+    fn test_validate_markdown_content_unclosed_fence() {
+        assert!(validate_markdown_content("```\ncode here\n").is_err());
+        assert!(validate_markdown_content("text\n```rust\ncode\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_markdown_content_balanced_fences() {
+        assert!(validate_markdown_content("```\ncode\n```\n").is_ok());
+        assert!(validate_markdown_content("```rust\ncode\n```\n```\nmore\n```\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_markdown_content_allows_common_whitespace() {
+        // Tabs, newlines, carriage returns are fine
+        assert!(validate_markdown_content("hello\tworld\r\n").is_ok());
     }
 }

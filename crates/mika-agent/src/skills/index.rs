@@ -562,8 +562,9 @@ impl SkillDiagnostic {
     }
 }
 
-/// Emit startup warnings for skills with `[llm]` overrides that reference
-/// providers without configured API keys. Call after `scan_skills_dir()`.
+/// Emit startup warnings for skills with LLM overrides (from DB via
+/// `apply_overrides()`) that reference providers without configured API keys.
+/// Call after `scan_skills_dir()` and `apply_overrides()`.
 pub fn warn_missing_llm_api_keys(entries: &[SkillEntry], settings: &mika_common::config::Settings) {
     for entry in entries {
         if let Some(ref provider_str) = entry.manifest.llm.provider
@@ -644,35 +645,32 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
             .collect::<String>()
     )));
 
-    // 3b. Validate [llm] section if present
-    if !manifest.llm.is_empty() {
-        if let Some(ref provider_str) = manifest.llm.provider {
-            match provider_str.parse::<ProviderKind>() {
-                Ok(pk) => {
-                    diags.push(SkillDiagnostic::ok(format!(
-                        "[llm] provider '{}' is valid",
-                        pk.config_prefix()
-                    )));
-                }
-                Err(_) => {
-                    diags.push(SkillDiagnostic::fail(format!(
-                        "[llm] provider '{}' is not a valid provider. \
-                         Valid providers: anthropic, openai, openrouter, groq, ollama, \
-                         mistral, google, deepseek, minimax, kimi, qwen",
-                        provider_str
-                    )));
-                }
+    // 3b. Reject skill name in keywords (#510)
+    {
+        let name_lower = manifest.skill.name.to_ascii_lowercase();
+        for kw in &manifest.triggers.keywords {
+            if kw.to_ascii_lowercase() == name_lower {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "skill name '{}' appears in [triggers].keywords — this is redundant \
+                     (skills are already matched by name). Remove it from keywords.",
+                    manifest.skill.name
+                )));
+                break;
             }
         }
-        if let Some(ref model_str) = manifest.llm.model {
-            if model_str.trim().is_empty() {
-                diags.push(SkillDiagnostic::warn(
-                    "[llm] model is empty — will use provider default".to_string(),
-                ));
-            } else {
-                diags.push(SkillDiagnostic::ok(format!("[llm] model '{}'", model_str)));
-            }
-        }
+    }
+
+    // 3c. Reject [llm] section — no longer supported in skill.toml (#504).
+    // Parse raw TOML to detect the key, since SkillManifest now has #[serde(skip)] on llm.
+    if let Ok(raw) = toml::from_str::<toml::Value>(&content)
+        && raw.get("llm").is_some()
+    {
+        diags.push(SkillDiagnostic::fail(
+            "[llm] section is no longer supported in skill.toml. \
+             Use `mika skills llm <name> set <provider>/<model>` to configure \
+             per-skill LLM overrides (stored in DB)."
+                .to_string(),
+        ));
     }
 
     // 4. Check tools.json if present
@@ -910,6 +908,45 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
+    // 6b. Validate system_prompt.md markdown well-formedness (#511)
+    {
+        let snippet_path = skill_dir.join("system_prompt.md");
+        if let Ok(content) = std::fs::read_to_string(&snippet_path)
+            && let Err(reason) = super::validate_markdown_content(&content)
+        {
+            diags.push(SkillDiagnostic::warn(format!("system_prompt.md: {reason}")));
+        }
+        // Also check generated variants
+        let generated_dir = skill_dir.join("generated");
+        if generated_dir.is_dir()
+            && let Ok(providers) = std::fs::read_dir(&generated_dir)
+        {
+            for provider_entry in providers.flatten() {
+                let provider_path = provider_entry.path();
+                if !provider_path.is_dir() {
+                    continue;
+                }
+                if let Ok(models) = std::fs::read_dir(&provider_path) {
+                    for model_entry in models.flatten() {
+                        let model_path = model_entry.path();
+                        let variant_prompt = model_path.join("system_prompt.md");
+                        if let Ok(content) = std::fs::read_to_string(&variant_prompt)
+                            && let Err(reason) = super::validate_markdown_content(&content)
+                        {
+                            let rel = variant_prompt
+                                .strip_prefix(skill_dir)
+                                .unwrap_or(&variant_prompt);
+                            diags.push(SkillDiagnostic::warn(format!(
+                                "{}: {reason}",
+                                rel.display()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 7. Validate provider variant directories
     if let Ok(rd) = std::fs::read_dir(skill_dir) {
         for dir_entry in rd.flatten() {
@@ -982,10 +1019,10 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                                             "provider '{subdir_name}/skill.toml' contains [triggers] section which is ignored — triggers cannot be overridden per-provider"
                                         )));
                                     }
-                                    // [llm] belongs only in root skill.toml
+                                    // [llm] is no longer supported anywhere (#504)
                                     if raw.get("llm").is_some() {
                                         diags.push(SkillDiagnostic::warn(format!(
-                                            "provider '{subdir_name}/skill.toml' contains [llm] section which is ignored — [llm] overrides belong in the root skill.toml only"
+                                            "provider '{subdir_name}/skill.toml' contains [llm] section which is no longer supported — use `mika skills llm` to configure overrides via DB"
                                         )));
                                     }
                                 }
@@ -4149,6 +4186,249 @@ mod tests {
             ctx_issues.count(),
             0,
             "Expected no context issues. Got: {diags:?}"
+        );
+    }
+
+    // -- validate_skill: [llm] rejection (#504) --
+
+    #[test]
+    fn test_validate_skill_rejects_llm_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("llm-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "llm-skill"
+            description = "Has [llm] section"
+
+            [llm]
+            provider = "openai"
+            model = "gpt-4o-mini"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Fail
+                && d.message.contains("[llm] section is no longer supported")
+        });
+        assert!(
+            fail.is_some(),
+            "Expected FAIL for [llm] section. Diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_no_llm_section_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("no-llm");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "no-llm"
+            description = "No llm section"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Fail && d.message.contains("[llm]"));
+        assert!(
+            fail.is_none(),
+            "Should not fail without [llm] section. Diags: {diags:?}"
+        );
+    }
+
+    // -- validate_skill: name-in-keywords rejection (#510) --
+
+    #[test]
+    fn test_validate_skill_rejects_name_in_keywords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "my-skill"
+            description = "A skill"
+
+            [triggers]
+            keywords = ["my-skill", "other"]
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Fail && d.message.contains("appears in [triggers].keywords")
+        });
+        assert!(
+            fail.is_some(),
+            "Expected FAIL for name in keywords. Diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_name_in_keywords_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("Web-Search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "Web-Search"
+            description = "Search"
+
+            [triggers]
+            keywords = ["web-search", "look up"]
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Fail && d.message.contains("appears in [triggers].keywords")
+        });
+        assert!(
+            fail.is_some(),
+            "Expected case-insensitive FAIL. Diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_partial_name_in_keywords_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("web-search");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "web-search"
+            description = "Search the web"
+
+            [triggers]
+            keywords = ["search", "look up", "web"]
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Prompt.").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let fail = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Fail && d.message.contains("appears in [triggers].keywords")
+        });
+        assert!(
+            fail.is_none(),
+            "Partial match should NOT trigger name-in-keywords. Diags: {diags:?}"
+        );
+    }
+
+    // -- validate_skill: markdown validation (#511) --
+
+    #[test]
+    fn test_validate_skill_warns_bad_markdown_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("bad-md");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "bad-md"
+            description = "Has bad markdown"
+            "#,
+        )
+        .unwrap();
+        // Unclosed code fence
+        fs::write(skill_dir.join("system_prompt.md"), "```\ncode here\n").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let warn = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Warn && d.message.contains("code fence"));
+        assert!(
+            warn.is_some(),
+            "Expected WARN for unclosed fence. Diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_warns_bad_markdown_generated_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("bad-variant");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "bad-variant"
+            description = "Has bad variant"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Good prompt.").unwrap();
+
+        // Create a generated variant with null bytes
+        let variant_dir = skill_dir.join("generated/anthropic/claude-sonnet-4-6");
+        fs::create_dir_all(&variant_dir).unwrap();
+        fs::write(variant_dir.join("system_prompt.md"), "hello\0world").unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let warn = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Warn && d.message.contains("null bytes"));
+        assert!(
+            warn.is_some(),
+            "Expected WARN for null bytes in variant. Diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_no_markdown_warn_for_valid_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("good-md");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "good-md"
+            description = "Has good markdown"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("system_prompt.md"),
+            "# Good Prompt\n\nSome instructions.\n\n```rust\nfn main() {}\n```\n",
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let md_warns = diags.iter().filter(|d| {
+            d.level == DiagnosticLevel::Warn
+                && (d.message.contains("code fence")
+                    || d.message.contains("null bytes")
+                    || d.message.contains("control character")
+                    || d.message.contains("empty or whitespace"))
+        });
+        assert_eq!(
+            md_warns.count(),
+            0,
+            "Expected no markdown warnings. Diags: {diags:?}"
         );
     }
 

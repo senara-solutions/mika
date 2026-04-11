@@ -45,7 +45,7 @@ Each immediate subdirectory of `~/.mika/skills/` is treated as a skill. The dire
 
 ## Manifest Reference (skill.toml)
 
-The manifest is a TOML file with three sections: `[skill]` (required), `[triggers]` (optional), and `[llm]` (optional).
+The manifest is a TOML file with two sections: `[skill]` (required) and `[triggers]` (optional).
 
 ### `[skill]` section
 
@@ -63,51 +63,33 @@ The manifest is a TOML file with three sections: `[skill]` (required), `[trigger
 
 | Field      | Type           | Required | Default | Description                                     |
 |------------|----------------|----------|---------|-------------------------------------------------|
-| `keywords` | Array<String>  | No       | `[]`    | Keywords for substring matching against user messages. Case-insensitive. |
+| `keywords` | Array<String>  | No       | `[]`    | Keywords for substring matching against user messages. Case-insensitive. The skill name must NOT appear in keywords — skills are already matched by name (#510). |
 
 If the `[triggers]` section is omitted entirely, it defaults to an empty keyword list. A skill with no keywords and `always_on = false` will never activate.
 
-### `[llm]` section
+### Per-skill LLM override (DB-only)
 
-Optional per-skill LLM provider and model override. When set, the agent constructs a separate provider instance for turns where this skill is active, using the agent's per-provider credentials.
+Per-skill LLM provider and model overrides are managed exclusively via the `skill_overrides` DB table. The `[llm]` section in `skill.toml` is no longer supported (#504) — `validate_skill()` rejects it.
 
-| Field      | Type   | Required | Default | Description                                     |
-|------------|--------|----------|---------|-------------------------------------------------|
-| `provider` | String | No       | —       | Provider name matching a `ProviderKind` (e.g., `"openai"`, `"anthropic"`, `"groq"`). Case-insensitive. |
-| `model`    | String | No       | —       | Model identifier (e.g., `"gpt-4o-mini"`, `"claude-sonnet-4-6"`). |
+Use the CLI to configure per-skill LLM overrides:
+
+```bash
+mika skills llm <name> set <provider>/<model>   # Set override
+mika skills llm <name> reset                     # Remove override
+mika skills llm <name> show                      # Show effective LLM
+```
 
 **Resolution order** (highest to lowest priority):
 
-1. `skill.toml` `[llm].provider` + `[llm].model` — explicit skill override
+1. DB override (`skill_overrides.llm_provider` / `llm_model`) — set via CLI above
 2. Per-provider agent config (e.g., `anthropic.model` from config.toml)
 3. Agent global `llm_provider` + provider default model
 
-**Important:** The `[llm]` section belongs only in the **root** `skill.toml`. Provider variant directories already imply their provider — adding `[llm]` to variant `skill.toml` files is ignored with a validation warning.
-
-**Conflict resolution:** If multiple matched skills declare different `[llm]` overrides, the agent falls back to the default provider with a warning log. Skills with identical overrides are deduplicated.
-
-**Examples:**
-
-```toml
-# Provider only — use OpenAI with its configured or default model
-[llm]
-provider = "openai"
-
-# Model only — use this model on the agent's active provider
-[llm]
-model = "gpt-4o-mini"
-
-# Both — fully explicit override
-[llm]
-provider = "openai"
-model = "gpt-4o-mini"
-```
+**Conflict resolution:** If multiple matched skills declare different LLM overrides, the agent falls back to the default provider with a warning log. Skills with identical overrides are deduplicated.
 
 The resolved provider/model feeds into the existing variant resolution system:
 - `resolve_prompt(provider, model)` selects the best prompt variant
 - `effective_timeout(provider, model)` selects the correct timeout
-
-This means `[llm].provider = "openai"` + `[llm].model = "gpt-4o-mini"` automatically selects `openai/gpt-4o-mini/system_prompt.md` if it exists, falling back to root `system_prompt.md`.
 
 ### Minimal valid manifest
 
@@ -943,15 +925,14 @@ Resolution order at runtime:
 
 1. **DB override** (`skill_overrides.llm_provider` / `llm_model`) — set via the
    CLI above.
-2. **Manifest `[llm]`** in the skill's root `skill.toml` — author default.
-3. **Agent default** — the agent's active provider and model.
+2. **Agent default** — the agent's active provider and model.
 
-If a `set` value matches the manifest default exactly, the row is **deleted**
-instead of being stored, so stale overrides never block future skill updates
-(same default-equals-delete semantics as `always_on`).
+Note: The `[llm]` section in `skill.toml` is no longer supported (#504). All
+LLM overrides are DB-only. `validate_skill()` rejects skill.toml files
+containing `[llm]`.
 
 `mika skills llm <name> show` annotates the source of the effective value:
-`[db-override]`, `[manifest]`, or `[agent-default]`.
+`[db-override]` or `[agent-default]`.
 
 ### Persistent overrides for built-in skills (v7+)
 
