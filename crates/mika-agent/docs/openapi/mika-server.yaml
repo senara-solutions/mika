@@ -114,6 +114,46 @@ paths:
           description: Agent is busy processing another message
       security:
       - bearer: []
+  /tasks/{id}/complete:
+    post:
+      tags:
+      - handlers
+      summary: POST /tasks/{id}/complete — mark a callback task complete and trigger resume_agent.
+      description: |-
+        Called by background processes (exec handlers, scripts) to deliver results back
+        to the agent. Validates the task exists and has trigger_type="callback", stores
+        the result, marks the task completed, then spawns the resume_agent dispatch.
+      operationId: handle_task_complete
+      parameters:
+      - name: id
+        in: path
+        description: Task UUID
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskCompleteRequest'
+        required: true
+      responses:
+        '200':
+          description: Task marked complete, resume_agent dispatched
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskCompleteResponse'
+        '400':
+          description: Task is not a callback task or result is empty
+        '401':
+          description: Missing or invalid Bearer token
+        '404':
+          description: Task not found
+        '409':
+          description: Task already completed or cancelled
+      security:
+      - bearer: []
 components:
   schemas:
     AcceptedResponse:
@@ -179,6 +219,33 @@ components:
         request_id:
           type: string
         text:
+          type: string
+    TaskCompleteRequest:
+      type: object
+      description: |-
+        Request body for POST /tasks/{id}/complete.
+
+        Marks a `callback` trigger task as completed with an optional result payload,
+        then triggers `resume_agent` dispatch if the task's action_type is `resume_agent`.
+      required:
+      - result
+      properties:
+        agent:
+          type: string
+          description: Target agent name (defaults to the server's default agent if absent or empty).
+        result:
+          type: string
+          description: Result payload from the background process (required for resume_agent tasks).
+    TaskCompleteResponse:
+      type: object
+      description: Response body for POST /tasks/{id}/complete.
+      required:
+      - task_id
+      - status
+      properties:
+        status:
+          type: string
+        task_id:
           type: string
   securitySchemes:
     bearer:

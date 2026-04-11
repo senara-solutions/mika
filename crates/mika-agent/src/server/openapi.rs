@@ -17,6 +17,7 @@ use super::types;
     paths(
         handlers::handle_health,
         handlers::handle_message,
+        handlers::handle_task_complete,
         embedded_dashboard::handle_enable,
         embedded_dashboard::handle_disable,
         embedded_dashboard::handle_status,
@@ -25,6 +26,8 @@ use super::types;
         types::MessageRequest,
         types::AcceptedResponse,
         types::HealthResponse,
+        types::TaskCompleteRequest,
+        types::TaskCompleteResponse,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -77,6 +80,10 @@ mod tests {
         assert!(
             yaml.contains("/api/v1/dashboard/status"),
             "missing /api/v1/dashboard/status endpoint"
+        );
+        assert!(
+            yaml.contains("/tasks/{id}/complete"),
+            "missing /tasks/{{id}}/complete endpoint"
         );
     }
 
