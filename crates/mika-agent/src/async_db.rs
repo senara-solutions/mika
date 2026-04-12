@@ -594,15 +594,19 @@ impl AsyncDatabase {
         content: &str,
         metadata: Option<&str>,
         trace_id: Option<&str>,
+        internal: bool,
     ) -> Result<i64> {
-        self.save_message_as(
-            &self.agent_id.clone(),
-            session_id,
-            role,
-            content,
-            metadata,
-            trace_id,
-        )
+        let (a, sid, r, c, m, t) = (
+            self.agent_id.clone(),
+            session_id.to_owned(),
+            role.to_owned(),
+            content.to_owned(),
+            metadata.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref(), t.as_deref(), internal)
+        })
         .await
     }
 
@@ -628,7 +632,7 @@ impl AsyncDatabase {
             trace_id.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
-            db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref(), t.as_deref())
+            db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref(), t.as_deref(), false)
         })
         .await
     }
@@ -636,6 +640,17 @@ impl AsyncDatabase {
     pub async fn load_recent_messages(&self, limit: usize) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.load_recent_messages(&a, limit))
+            .await
+    }
+
+    /// Load recent messages with optional internal-message filtering.
+    pub async fn load_recent_messages_filtered(
+        &self,
+        limit: usize,
+        exclude_internal: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.load_recent_messages_filtered(&a, limit, exclude_internal))
             .await
     }
 
@@ -2117,7 +2132,7 @@ mod tests {
         db.create_session(team_sid, "mika", "team").await.unwrap();
 
         // save_message_with_metadata uses self.agent_id (default "mika")
-        db.save_message_with_metadata(team_sid, "assistant", "from default", None, None)
+        db.save_message_with_metadata(team_sid, "assistant", "from default", None, None, false)
             .await
             .unwrap();
 

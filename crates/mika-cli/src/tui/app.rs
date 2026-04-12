@@ -178,6 +178,45 @@ pub fn callback_label_from_metadata(metadata: &Option<String>) -> String {
         .unwrap_or_else(|| "background task".to_string())
 }
 
+/// Convert a `SessionMessage` to a `ChatMessage` for TUI display.
+///
+/// Returns `None` if the message should be skipped (unsupported role, stale framing, etc.).
+/// This is the single conversion point used by startup history load, cross-channel poll,
+/// and rewind reload to ensure consistent filtering and formatting.
+pub fn session_message_to_chat_message(
+    msg: &mika_agent::db::SessionMessage,
+) -> Option<ChatMessage> {
+    let role = match msg.role.as_str() {
+        "user" => {
+            // Skip stale framing messages saved before the callback save fix
+            if msg.content.starts_with("A background task has completed.") {
+                return None;
+            }
+            ChatRole::User
+        }
+        "assistant" => ChatRole::Assistant,
+        "tool_result" => ChatRole::System,
+        _ => return None,
+    };
+    let channel = if msg.channel_type == "cli" {
+        None
+    } else {
+        Some(msg.channel_type.clone())
+    };
+    let content = if msg.role == "tool_result" {
+        let label = callback_label_from_metadata(&msg.metadata);
+        format!("[Task: {}] Result received", label)
+    } else {
+        msg.content.clone()
+    };
+    Some(ChatMessage {
+        role,
+        content,
+        rendered: None,
+        channel,
+    })
+}
+
 /// Format a previous team run summary as a human-readable context block.
 fn format_previous_run_context(summary: &TeamRunSummary) -> String {
     fn truncate(s: &str, max_chars: usize) -> String {
@@ -552,6 +591,10 @@ pub struct App<'a> {
     pub team_dir: Option<PathBuf>,
     /// Verbose mode: show individual agent responses in team mode.
     pub verbose_mode: bool,
+    /// Inbox mode: hide internal (agent-to-agent) messages. Default: true.
+    pub inbox_mode: bool,
+    /// Count of hidden internal messages (for footer badge).
+    pub hidden_internal_count: usize,
     /// Live dashboard state during team runs (created on first PhaseChanged event).
     pub team_dashboard: Option<TeamDashboardState>,
 
@@ -641,6 +684,8 @@ impl<'a> App<'a> {
             team_name: None,
             team_dir: None,
             verbose_mode: false,
+            inbox_mode: true,
+            hidden_internal_count: 0,
             team_dashboard: None,
             dashboard_running: false,
             footer_open_rect: None,
@@ -725,6 +770,8 @@ impl<'a> App<'a> {
             team_name: Some(team_name.to_string()),
             team_dir: Some(team_dir),
             verbose_mode: false,
+            inbox_mode: true,
+            hidden_internal_count: 0,
             team_dashboard: None,
             dashboard_running: false,
             footer_open_rect: None,
@@ -1382,41 +1429,17 @@ impl<'a> App<'a> {
         }
 
         for msg in &new_msgs {
-            let role = match msg.role.as_str() {
-                "user" => {
-                    // Skip stale framing messages saved before the callback save fix
-                    if msg.content.starts_with("A background task has completed.") {
-                        continue;
-                    }
-                    ChatRole::User
-                }
-                "assistant" => ChatRole::Assistant,
-                "tool_result" => ChatRole::System,
-                _ => continue,
-            };
-            // CLI messages from other processes don't need a channel badge
-            // (same channel as the TUI), matching the history loader behavior.
-            let channel = if msg.channel_type == "cli" {
-                None
-            } else {
-                Some(msg.channel_type.clone())
-            };
-            // For tool_result, show a brief summary with label from metadata
-            let content = if msg.role == "tool_result" {
-                let label = callback_label_from_metadata(&msg.metadata);
-                format!("[Task: {}] Result received", label)
-            } else {
-                msg.content.clone()
-            };
-            self.messages.push(ChatMessage {
-                role,
-                content,
-                rendered: None,
-                channel,
-            });
+            // In inbox mode, skip internal messages but count them
+            if self.inbox_mode && msg.internal {
+                self.hidden_internal_count += 1;
+                continue;
+            }
+            if let Some(chat_msg) = session_message_to_chat_message(msg) {
+                self.messages.push(chat_msg);
+            }
         }
 
-        // Update watermark
+        // Update watermark (always advance, even for filtered messages)
         if let Some(last) = new_msgs.last() {
             self.last_seen_msg_id = last.id;
         }

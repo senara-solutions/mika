@@ -487,6 +487,23 @@ Only available in team mode (`mika --team <name>`).
 
 ---
 
+### /inbox
+
+Toggle between inbox mode (hide internal agent-to-agent messages) and audit mode (show all messages). Inbox mode is the default.
+
+**Aliases:** None | **Arguments:** None
+
+When toggled, message history is reloaded from the database with the new filter setting. In inbox mode, a `[N hidden]` footer badge shows the count of suppressed internal messages.
+
+**Example:**
+```
+/inbox
+```
+
+Output: `Switched to audit mode (all messages visible).` or `Switched to inbox mode (internal messages hidden).`
+
+---
+
 ### /undo
 
 Undo the last exchange (user message + assistant response) and reverse any memory changes made during that exchange. Equivalent to `/rewind 1`.
@@ -556,7 +573,7 @@ to a safe subset. Agent-specific commands are disabled:
 |-----------|----------|
 | `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
-| `/status`, `/team`, `/verbose` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
+| `/status`, `/team`, `/verbose`, `/inbox` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
 |  | `/undo`, `/rewind` |
 
 In team mode, `/status` and `/team` both show team info (name, orchestrator,

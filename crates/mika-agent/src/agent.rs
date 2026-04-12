@@ -894,6 +894,7 @@ async fn run_loop(
                             &text,
                             metadata.as_deref(),
                             Some(tool_ctx.trace_id),
+                            false,
                         )
                         .await?;
                     }
@@ -1491,6 +1492,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             &cont.text,
             metadata.as_deref(),
             Some(trace_id),
+            false,
         )
         .await?;
         return Ok(AgentOutput {
@@ -3749,6 +3751,7 @@ mod tests {
             "I searched your memory.",
             Some(metadata),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -3775,9 +3778,16 @@ mod tests {
     #[tokio::test]
     async fn test_save_message_with_null_metadata() {
         let db = test_async_db();
-        db.save_message_with_metadata("test-session", "assistant", "No tools used.", None, None)
-            .await
-            .unwrap();
+        db.save_message_with_metadata(
+            "test-session",
+            "assistant",
+            "No tools used.",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
 
         let messages = db.load_recent_messages(10).await.unwrap();
         assert_eq!(messages.len(), 1);

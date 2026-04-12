@@ -7,7 +7,7 @@ use mika_common::team;
 
 use crate::tui::app::{
     AgentRequest, AgentStatus, App, ChatMessage, ChatRole, MessagesLayout, SelectionState,
-    callback_label_from_metadata,
+    session_message_to_chat_message,
 };
 use crate::tui::commands::{COMMANDS, parse_command, resolve_thinking_level};
 use crate::tui::input;
@@ -67,6 +67,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
             }
         }
         "verbose" | "v" => Some(handle_verbose(app)),
+        "inbox" => Some(handle_inbox(app).await),
         "think" | "t" => handle_think(app, args).await,
         "attach" | "img" => Some(handle_attach(app, args)),
         "undo" => Some(handle_undo(app).await),
@@ -145,6 +146,7 @@ async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
     app.has_new_message = false;
     app.selection_state = SelectionState::None;
     app.pending_task_count = 0;
+    app.hidden_internal_count = 0;
 
     app.needs_redraw = true;
 
@@ -976,6 +978,36 @@ fn handle_verbose(app: &mut App<'_>) -> String {
     format!("Verbose mode: {state}")
 }
 
+/// Toggle between inbox mode (hide internal messages) and audit mode (show all).
+async fn handle_inbox(app: &mut App<'_>) -> String {
+    app.inbox_mode = !app.inbox_mode;
+
+    // Reload messages from DB with the new filter setting
+    app.messages.clear();
+    if let Ok(recent) = app
+        .db
+        .load_recent_messages_filtered(20, app.inbox_mode)
+        .await
+    {
+        for msg in &recent {
+            if let Some(chat_msg) = session_message_to_chat_message(msg) {
+                app.messages.push(chat_msg);
+            }
+        }
+    }
+
+    // Reset hidden count — will be refreshed on next poll tick
+    app.hidden_internal_count = 0;
+    app.scroll_offset = 0;
+    app.messages_layout = MessagesLayout::default();
+
+    if app.inbox_mode {
+        "Switched to inbox mode (internal messages hidden).".to_string()
+    } else {
+        "Switched to audit mode (all messages visible).".to_string()
+    }
+}
+
 fn handle_team_info(app: &App<'_>) -> String {
     let team_name = app.team_name.as_deref().unwrap_or("unknown");
     let mut out = String::new();
@@ -1194,36 +1226,15 @@ async fn handle_rewind_impl(
             // that are never in app.messages, so counting-based truncation is unreliable.
             // This mirrors the startup loader in chat.rs.
             app.messages.clear();
-            if let Ok(recent) = app.db.load_recent_messages(20).await {
+            if let Ok(recent) = app
+                .db
+                .load_recent_messages_filtered(20, app.inbox_mode)
+                .await
+            {
                 for msg in &recent {
-                    let role = match msg.role.as_str() {
-                        "user" => {
-                            if msg.content.starts_with("A background task has completed.") {
-                                continue;
-                            }
-                            ChatRole::User
-                        }
-                        "assistant" => ChatRole::Assistant,
-                        "tool_result" => ChatRole::System,
-                        _ => continue,
-                    };
-                    let channel = if msg.channel_type == "cli" {
-                        None
-                    } else {
-                        Some(msg.channel_type.clone())
-                    };
-                    let content = if msg.role == "tool_result" {
-                        let label = callback_label_from_metadata(&msg.metadata);
-                        format!("[Task: {}] Result received", label)
-                    } else {
-                        msg.content.clone()
-                    };
-                    app.messages.push(ChatMessage {
-                        role,
-                        content,
-                        rendered: None,
-                        channel,
-                    });
+                    if let Some(chat_msg) = session_message_to_chat_message(msg) {
+                        app.messages.push(chat_msg);
+                    }
                 }
             }
             app.scroll_offset = 0;

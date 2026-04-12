@@ -149,11 +149,12 @@ All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). Th
 
 ## Schema Version
 
-**Current: v21.** Tables: sessions, messages, team_workspace, audit_events, skill_overrides, tasks (with manual/callback/a2a trigger types), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
+**Current: v22.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides, tasks (with manual/callback/a2a trigger types), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
 
 Recent migrations:
 - v18->v19: `sessions.task_id` column for reverse session->task lookups. `get_sessions_for_task_tree()`.
 - v19->v20: `skill_overrides.llm_provider` and `skill_overrides.llm_model` for per-skill LLM override.
 - v20->v21: `llm_calls.prompt_variant` for skill prompt variant recording.
+- v21->v22: `messages.internal` column (`INTEGER NOT NULL DEFAULT 0`) for agent-to-agent message visibility. TUI inbox mode filters internal messages at the DB level.
 
 Full migration history: see `docs/runtime-structure.md`.
