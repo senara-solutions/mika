@@ -261,7 +261,7 @@ impl Tool for DelegateTaskTool {
 
         // Persist the delegated task as a user message (internal — agent-to-agent)
         if let Err(e) = async_db
-            .save_internal_message(&session_id, "user", task, Some(ctx.trace_id))
+            .save_message_with_metadata(&session_id, "user", task, None, Some(ctx.trace_id), true)
             .await
         {
             tracing::warn!(session = %session_id, error = %e, "failed to persist delegate task message");
@@ -296,7 +296,14 @@ impl Tool for DelegateTaskTool {
         match &result {
             Ok(Some(text)) => {
                 if let Err(e) = async_db
-                    .save_internal_message(&session_id, "assistant", text, Some(ctx.trace_id))
+                    .save_message_with_metadata(
+                        &session_id,
+                        "assistant",
+                        text,
+                        None,
+                        Some(ctx.trace_id),
+                        true,
+                    )
                     .await
                 {
                     tracing::warn!(session = %session_id, error = %e, "failed to persist delegate response");
@@ -306,7 +313,14 @@ impl Tool for DelegateTaskTool {
             Err(e) => {
                 let error_msg = format!("Delegation failed: {e}");
                 if let Err(pe) = async_db
-                    .save_internal_message(&session_id, "system", &error_msg, Some(ctx.trace_id))
+                    .save_message_with_metadata(
+                        &session_id,
+                        "system",
+                        &error_msg,
+                        None,
+                        Some(ctx.trace_id),
+                        true,
+                    )
                     .await
                 {
                     tracing::warn!(session = %session_id, error = %pe, "failed to persist delegate error");
