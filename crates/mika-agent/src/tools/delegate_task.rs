@@ -259,9 +259,9 @@ impl Tool for DelegateTaskTool {
             tracing::warn!(session = %session_id, error = %e, "failed to create delegate session");
         }
 
-        // Persist the delegated task as a user message
+        // Persist the delegated task as a user message (internal — agent-to-agent)
         if let Err(e) = async_db
-            .save_message(&session_id, "user", task, Some(ctx.trace_id))
+            .save_internal_message(&session_id, "user", task, Some(ctx.trace_id))
             .await
         {
             tracing::warn!(session = %session_id, error = %e, "failed to persist delegate task message");
@@ -292,11 +292,11 @@ impl Tool for DelegateTaskTool {
 
         let result = crate::agent::run_team_agent(&params).await;
 
-        // Persist result message for observability (#253)
+        // Persist result message for observability (#253) — internal (agent-to-agent)
         match &result {
             Ok(Some(text)) => {
                 if let Err(e) = async_db
-                    .save_message(&session_id, "assistant", text, Some(ctx.trace_id))
+                    .save_internal_message(&session_id, "assistant", text, Some(ctx.trace_id))
                     .await
                 {
                     tracing::warn!(session = %session_id, error = %e, "failed to persist delegate response");
@@ -306,7 +306,7 @@ impl Tool for DelegateTaskTool {
             Err(e) => {
                 let error_msg = format!("Delegation failed: {e}");
                 if let Err(pe) = async_db
-                    .save_message(&session_id, "system", &error_msg, Some(ctx.trace_id))
+                    .save_internal_message(&session_id, "system", &error_msg, Some(ctx.trace_id))
                     .await
                 {
                     tracing::warn!(session = %session_id, error = %pe, "failed to persist delegate error");

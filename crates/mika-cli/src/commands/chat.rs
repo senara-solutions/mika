@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::init::{self, AppContext};
 use crate::tui::app::{
     AgentRequest, AgentResponse, App, ChatMessage, ChatRole, TeamRequest,
-    callback_label_from_metadata,
+    session_message_to_chat_message,
 };
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
@@ -488,39 +488,18 @@ pub async fn run(
         worker._ctx.settings.llm_provider,
     );
 
-    // Load recent conversation history so the user sees prior messages on restart
-    if let Ok(history) = worker._ctx.async_db.load_recent_messages(20).await {
+    // Load recent conversation history so the user sees prior messages on restart.
+    // In inbox mode (default), internal messages are filtered at the DB level.
+    if let Ok(history) = worker
+        ._ctx
+        .async_db
+        .load_recent_messages_filtered(20, app.inbox_mode)
+        .await
+    {
         for msg in history {
-            let role = match msg.role.as_str() {
-                "user" => {
-                    // Skip stale framing messages saved before the callback save fix
-                    if msg.content.starts_with("A background task has completed.") {
-                        continue;
-                    }
-                    ChatRole::User
-                }
-                "assistant" => ChatRole::Assistant,
-                "tool_result" => ChatRole::System,
-                _ => continue,
-            };
-            let channel = if msg.channel_type == "cli" {
-                None
-            } else {
-                Some(msg.channel_type.clone())
-            };
-            // For tool_result, show a brief summary with label from metadata
-            let content = if msg.role == "tool_result" {
-                let label = callback_label_from_metadata(&msg.metadata);
-                format!("[Task: {}] Result received", label)
-            } else {
-                msg.content
-            };
-            app.messages.push(ChatMessage {
-                role,
-                content,
-                rendered: None,
-                channel,
-            });
+            if let Some(chat_msg) = session_message_to_chat_message(&msg) {
+                app.messages.push(chat_msg);
+            }
         }
     }
 
@@ -549,6 +528,7 @@ pub async fn run(
             content: warning.trim_end().to_string(),
             rendered: None,
             channel: None,
+            internal: false,
         });
     }
 
@@ -664,6 +644,7 @@ pub async fn run(
                                 ),
                                 rendered: None,
                                 channel: None,
+                                internal: false,
                             });
                         }
                         Err(e) => {
@@ -672,6 +653,7 @@ pub async fn run(
                                 content: format!("Failed to switch agent: {e}"),
                                 rendered: None,
                                 channel: None,
+                                internal: false,
                             });
                         }
                     }
@@ -682,6 +664,7 @@ pub async fn run(
                         content: format!("Failed to switch agent: {e}"),
                         rendered: None,
                         channel: None,
+                        internal: false,
                     });
                 }
             }
@@ -846,6 +829,7 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
             content: warning,
             rendered: None,
             channel: None,
+            internal: false,
         });
     }
 

@@ -174,6 +174,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         completer: None,
     },
     SlashCommand {
+        name: "inbox",
+        aliases: &[],
+        description: "Toggle inbox/audit mode (hide/show internal messages)",
+        args_hint: None,
+        completer: None,
+    },
+    SlashCommand {
         name: "undo",
         aliases: &[],
         description: "Undo last exchange and reverse memory changes",

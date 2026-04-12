@@ -29,6 +29,10 @@ impl Tool for SendMessageTool {
                     "text": {
                         "type": "string",
                         "description": "The message to send to the user"
+                    },
+                    "internal": {
+                        "type": "boolean",
+                        "description": "If true, marks this message as internal (agent-to-agent). Internal messages are hidden from the TUI inbox view but visible in audit mode. Use when communicating with other agents rather than the human user."
                     }
                 },
                 "required": ["text"]
@@ -48,6 +52,8 @@ impl Tool for SendMessageTool {
             )));
         }
 
+        let internal = input["internal"].as_bool().unwrap_or(false);
+
         // Strip any internal metadata tags the LLM may have echoed
         let cleaned = mika_common::llm::strip_internal_tags(text);
         if cleaned.is_empty() {
@@ -55,9 +61,15 @@ impl Tool for SendMessageTool {
         }
 
         // Persist the outbound message for conversation history
-        ctx.db
-            .save_message(ctx.session_id, "assistant", &cleaned, Some(ctx.trace_id))
-            .await?;
+        if internal {
+            ctx.db
+                .save_internal_message(ctx.session_id, "assistant", &cleaned, Some(ctx.trace_id))
+                .await?;
+        } else {
+            ctx.db
+                .save_message(ctx.session_id, "assistant", &cleaned, Some(ctx.trace_id))
+                .await?;
+        }
 
         match &ctx.message_sender {
             Some(sender) => {

@@ -591,6 +591,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
                         content: "Image attachments are not supported in team mode.".to_string(),
                         rendered: None,
                         channel: None,
+                        internal: false,
                     });
                 } else if let Some(err) = app.attach_image(attachment) {
                     app.messages.push(crate::tui::app::ChatMessage {
@@ -598,6 +599,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
                         content: err,
                         rendered: None,
                         channel: None,
+                        internal: false,
                     });
                 }
                 return;
@@ -614,6 +616,7 @@ fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
                             .to_string(),
                     rendered: None,
                     channel: None,
+                    internal: false,
                 });
                 return;
             }
@@ -799,6 +802,7 @@ pub fn handle_paste(app: &mut App<'_>, text: &str) {
             ),
             rendered: None,
             channel: None,
+            internal: false,
         });
         &text[..text.floor_char_boundary(MAX_PASTE_BYTES)]
     } else {

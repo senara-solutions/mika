@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -199,6 +199,8 @@ pub struct SessionMessage {
     pub metadata: Option<String>,
     pub trace_id: Option<String>,
     pub created_at: String,
+    /// Whether this message is internal (agent-to-agent) and should be hidden from inbox mode.
+    pub internal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -741,6 +743,10 @@ impl Database {
             self.migrate_v20_to_v21()?;
             info!(version = 21, "database migrated to v21");
         }
+        if (3..=21).contains(&version) {
+            self.migrate_v21_to_v22()?;
+            info!(version = 22, "database migrated to v22");
+        }
         Ok(())
     }
 
@@ -797,7 +803,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (21);
+            INSERT INTO schema_version (version) VALUES (22);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -916,7 +922,8 @@ impl Database {
                 metadata TEXT,
                 trace_id TEXT,
                 compacted_through_id INTEGER,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                internal INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
             CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
@@ -2489,6 +2496,21 @@ impl Database {
             sql.push_str("ALTER TABLE llm_calls ADD COLUMN prompt_variant TEXT;\n");
         }
         sql.push_str("INSERT INTO schema_version (version) VALUES (21);\nCOMMIT;");
+
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    fn migrate_v21_to_v22(&self) -> Result<()> {
+        info!("migrating database schema v21 → v22 (messages: internal flag)");
+
+        let has_col = self.column_exists("messages", "internal")?;
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !has_col {
+            sql.push_str("ALTER TABLE messages ADD COLUMN internal INTEGER NOT NULL DEFAULT 0;\n");
+        }
+        sql.push_str("INSERT INTO schema_version (version) VALUES (22);\nCOMMIT;");
 
         self.conn.execute_batch(&sql)?;
         Ok(())
@@ -4288,6 +4310,23 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Save a message marked as internal (hidden from TUI inbox mode).
+    pub fn save_internal_message(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO messages (session_id, agent_id, role, content, trace_id, internal)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![session_id, agent_id, role, content, trace_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     pub fn save_message_with_metadata(
         &self,
         agent_id: &str,
@@ -4305,7 +4344,25 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    const SESSION_MESSAGE_COLUMNS: &'static str = "m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at";
+    /// Save a message with metadata, marked as internal (hidden from TUI inbox mode).
+    pub fn save_internal_message_with_metadata(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO messages (session_id, agent_id, role, content, metadata, trace_id, internal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            params![session_id, agent_id, role, content, metadata, trace_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    const SESSION_MESSAGE_COLUMNS: &'static str = "m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at, m.internal";
 
     fn row_to_session_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
         Ok(SessionMessage {
@@ -4318,6 +4375,7 @@ impl Database {
             metadata: r.get(6)?,
             trace_id: r.get(7)?,
             created_at: r.get(8)?,
+            internal: r.get::<_, i64>(9).unwrap_or(0) != 0,
         })
     }
 
@@ -4326,11 +4384,28 @@ impl Database {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
+        self.load_recent_messages_filtered(agent_id, limit, false)
+    }
+
+    /// Load recent messages with optional internal-message filtering.
+    /// When `exclude_internal` is true, messages with `internal = 1` are excluded.
+    pub fn load_recent_messages_filtered(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        exclude_internal: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        let internal_filter = if exclude_internal {
+            " AND m.internal = 0"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
-              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'{}
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
-            Self::SESSION_MESSAGE_COLUMNS
+            Self::SESSION_MESSAGE_COLUMNS,
+            internal_filter,
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut messages = stmt
@@ -4445,6 +4520,17 @@ impl Database {
             .query_map(params![agent_id, after_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Count internal messages after a given message ID (for TUI hidden-count badge).
+    pub fn count_internal_messages_after(&self, agent_id: &str, after_id: i64) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages
+              WHERE agent_id = ?1 AND id > ?2 AND internal = 1",
+            params![agent_id, after_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     pub fn max_message_id(&self, agent_id: &str) -> Result<i64> {
@@ -9671,5 +9757,92 @@ mod tests {
     fn test_format_age_invalid_timestamp() {
         let now = Utc::now();
         assert_eq!(format_age("not-a-timestamp", now), "unknown");
+    }
+
+    // ===== Internal message tests (#494) =====
+
+    #[test]
+    fn test_internal_column_exists() {
+        let db = db();
+        assert!(db.column_exists("messages", "internal").unwrap());
+    }
+
+    #[test]
+    fn test_save_internal_message() {
+        let (db, sid) = db_with_session();
+        db.save_internal_message("mika", &sid, "assistant", "internal msg", None)
+            .unwrap();
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].internal);
+        assert_eq!(msgs[0].content, "internal msg");
+    }
+
+    #[test]
+    fn test_save_internal_message_with_metadata() {
+        let (db, sid) = db_with_session();
+        db.save_internal_message_with_metadata(
+            "mika",
+            &sid,
+            "assistant",
+            "internal with meta",
+            Some(r#"{"tool_calls":[]}"#),
+            None,
+        )
+        .unwrap();
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].internal);
+        assert!(msgs[0].metadata.is_some());
+    }
+
+    #[test]
+    fn test_save_message_defaults_not_internal() {
+        let (db, sid) = db_with_session();
+        db.save_message("mika", &sid, "user", "hello", None)
+            .unwrap();
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs[0].internal);
+    }
+
+    #[test]
+    fn test_load_recent_messages_filtered_excludes_internal() {
+        let (db, sid) = db_with_session();
+        db.save_message("mika", &sid, "user", "visible 1", None)
+            .unwrap();
+        db.save_internal_message("mika", &sid, "assistant", "hidden", None)
+            .unwrap();
+        db.save_message("mika", &sid, "assistant", "visible 2", None)
+            .unwrap();
+
+        // Without filter: all 3
+        let all = db.load_recent_messages_filtered("mika", 10, false).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // With filter: only 2 visible
+        let visible = db.load_recent_messages_filtered("mika", 10, true).unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|m| !m.internal));
+    }
+
+    #[test]
+    fn test_count_internal_messages_after() {
+        let (db, sid) = db_with_session();
+        let id1 = db
+            .save_message("mika", &sid, "user", "msg 1", None)
+            .unwrap();
+        db.save_internal_message("mika", &sid, "assistant", "internal 1", None)
+            .unwrap();
+        db.save_internal_message("mika", &sid, "assistant", "internal 2", None)
+            .unwrap();
+        db.save_message("mika", &sid, "assistant", "visible", None)
+            .unwrap();
+
+        let count = db.count_internal_messages_after("mika", id1).unwrap();
+        assert_eq!(count, 2);
+
+        let count_all = db.count_internal_messages_after("mika", 0).unwrap();
+        assert_eq!(count_all, 2);
     }
 }

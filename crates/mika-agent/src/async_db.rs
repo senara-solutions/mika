@@ -587,6 +587,25 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Save a message marked as internal (hidden from TUI inbox mode).
+    pub async fn save_internal_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        let (a, sid, r, c, t) = (
+            self.agent_id.clone(),
+            session_id.to_owned(),
+            role.to_owned(),
+            content.to_owned(),
+            trace_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.save_internal_message(&a, &sid, &r, &c, t.as_deref()))
+            .await
+    }
+
     pub async fn save_message_with_metadata(
         &self,
         session_id: &str,
@@ -603,6 +622,29 @@ impl AsyncDatabase {
             metadata,
             trace_id,
         )
+        .await
+    }
+
+    /// Save a message with metadata, marked as internal (hidden from TUI inbox mode).
+    pub async fn save_internal_message_with_metadata(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        let (a, sid, r, c, m, t) = (
+            self.agent_id.clone(),
+            session_id.to_owned(),
+            role.to_owned(),
+            content.to_owned(),
+            metadata.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.save_internal_message_with_metadata(&a, &sid, &r, &c, m.as_deref(), t.as_deref())
+        })
         .await
     }
 
@@ -636,6 +678,17 @@ impl AsyncDatabase {
     pub async fn load_recent_messages(&self, limit: usize) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.load_recent_messages(&a, limit))
+            .await
+    }
+
+    /// Load recent messages with optional internal-message filtering.
+    pub async fn load_recent_messages_filtered(
+        &self,
+        limit: usize,
+        exclude_internal: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.load_recent_messages_filtered(&a, limit, exclude_internal))
             .await
     }
 
@@ -904,6 +957,13 @@ impl AsyncDatabase {
     pub async fn compact_old_audit_events(&self, days: u32) -> Result<usize> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.compact_old_audit_events(&a, days))
+            .await
+    }
+
+    /// Count internal messages after a given message ID (for TUI hidden-count badge).
+    pub async fn count_internal_messages_after(&self, after_id: i64) -> Result<i64> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_internal_messages_after(&a, after_id))
             .await
     }
 
