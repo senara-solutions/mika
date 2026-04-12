@@ -122,20 +122,19 @@ Extract a `session_message_to_chat_message(msg: &SessionMessage, inbox_mode: boo
 
 - [x] Schema v22: `messages.internal` column (INTEGER NOT NULL DEFAULT 0)
 - [x] `SessionMessage` struct carries `internal: bool`
-- [x] `save_internal_message` / `save_internal_message_with_metadata` persist internal flag
+- [x] `save_message_with_metadata` gains `internal: bool` parameter (consolidated — no separate methods)
 - [x] Delegate task messages saved with `internal: true`
-- [x] `send_message` tool accepts optional `internal` parameter
 - [x] `load_recent_messages_filtered` supports `exclude_internal` filter
-- [x] `ChatMessage` carries `internal: bool`
 - [x] TUI defaults to inbox mode (`inbox_mode: true`)
-- [x] Startup history load respects inbox mode
-- [x] Cross-channel poll respects inbox mode
+- [x] Startup history load respects inbox mode (DB-level filtering)
+- [x] Cross-channel poll respects inbox mode (app-level filtering + hidden count)
 - [x] Rewind reload respects inbox mode
 - [x] `/inbox` command toggles between inbox and audit mode with message reload
 - [x] Footer shows `[N hidden]` badge when internal messages are suppressed
 - [x] `/undo` in inbox mode works correctly (exchange-level boundaries naturally skip internal)
+- [x] `session_message_to_chat_message()` shared helper deduplicates 3 conversion sites
 - [x] All existing tests pass (`cargo test`)
-- [x] New tests for internal message filtering (6 DB-level tests)
+- [x] New tests for internal message filtering (5 DB-level tests)
 
 ## Design Decisions
 
