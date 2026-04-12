@@ -48,10 +48,6 @@ pub struct ChatMessage {
     pub rendered: Option<Vec<Line<'static>>>,
     /// Source channel: None = CLI (local), Some("telegram") = Telegram, etc.
     pub channel: Option<String>,
-    /// Whether this message is internal (agent-to-agent). Hidden in inbox mode.
-    /// Read by audit-mode rendering (future: dimmed styling for internal messages).
-    #[allow(dead_code)]
-    pub internal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,7 +214,6 @@ pub fn session_message_to_chat_message(
         content,
         rendered: None,
         channel,
-        internal: msg.internal,
     })
 }
 
@@ -723,7 +718,6 @@ impl<'a> App<'a> {
                 content: format_previous_run_context(&summary),
                 rendered: None,
                 channel: None,
-                internal: false,
             }]
         } else {
             Vec::new()
@@ -835,7 +829,6 @@ impl<'a> App<'a> {
                 content: text.clone(),
                 rendered: None,
                 channel: None,
-                internal: false,
             });
             let _ = team_tx.send(TeamRequest::Goal(text.clone()));
             // Persist user message to DB (fire-and-forget)
@@ -874,7 +867,6 @@ impl<'a> App<'a> {
             content: display,
             rendered: None,
             channel: None,
-            internal: false,
         });
 
         // Drain pending images
@@ -909,7 +901,6 @@ impl<'a> App<'a> {
                     content: output,
                     rendered: None,
                     channel: None,
-                    internal: false,
                 });
                 self.auto_scroll_to_bottom();
             }
@@ -962,7 +953,6 @@ impl<'a> App<'a> {
                 content: msg,
                 rendered: None,
                 channel: None,
-                internal: false,
             });
             self.auto_scroll_to_bottom();
             self.needs_redraw = true;
@@ -1004,7 +994,6 @@ impl<'a> App<'a> {
                     content: full,
                     rendered: Some(rendered),
                     channel: None,
-                    internal: false,
                 });
                 self.reveal_index = 0;
                 self.status = AgentStatus::Idle;
@@ -1077,7 +1066,6 @@ impl<'a> App<'a> {
                     content: msg,
                     rendered: None,
                     channel: None,
-                    internal: false,
                 });
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
@@ -1094,7 +1082,6 @@ impl<'a> App<'a> {
                     content: format!("Phase: {phase} (iteration {iteration})"),
                     rendered: None,
                     channel: None,
-                    internal: false,
                 });
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
@@ -1122,7 +1109,6 @@ impl<'a> App<'a> {
                         content: format!("[{agent}] {response}"),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                     self.auto_scroll_to_bottom();
                 }
@@ -1141,7 +1127,6 @@ impl<'a> App<'a> {
                         content: format!("[{agent}] [failed] {error}"),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                     self.auto_scroll_to_bottom();
                 }
@@ -1156,7 +1141,6 @@ impl<'a> App<'a> {
                             content: format!("[{}] [assigned] {}", task.agent, task.task),
                             rendered: None,
                             channel: None,
-                            internal: false,
                         });
                     }
                 }
@@ -1169,7 +1153,6 @@ impl<'a> App<'a> {
                     ),
                     rendered: None,
                     channel: None,
-                    internal: false,
                 });
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
@@ -1185,7 +1168,6 @@ impl<'a> App<'a> {
                     content: format!("Critic (iteration {iteration}): {verdict}. {feedback}"),
                     rendered: None,
                     channel: None,
-                    internal: false,
                 });
                 self.auto_scroll_to_bottom();
                 self.needs_redraw = true;
@@ -1198,7 +1180,6 @@ impl<'a> App<'a> {
                         content: "Team completed with no deliverable.".to_string(),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                     self.status = AgentStatus::Idle;
                 } else {
@@ -1219,7 +1200,6 @@ impl<'a> App<'a> {
                     content: format!("Team error: {msg}"),
                     rendered: None,
                     channel: None,
-                    internal: false,
                 });
                 self.status = AgentStatus::Idle;
                 self.needs_redraw = true;
@@ -1231,7 +1211,6 @@ impl<'a> App<'a> {
                         content: "Team worker stopped unexpectedly.".to_string(),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                     self.status = AgentStatus::Idle;
                     self.needs_redraw = true;
@@ -1261,7 +1240,6 @@ impl<'a> App<'a> {
                         content: format!("Error: {}", response.content),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                     self.status = AgentStatus::Idle;
                 } else {
@@ -1273,7 +1251,6 @@ impl<'a> App<'a> {
                             content: thinking,
                             rendered: Some(rendered),
                             channel: None,
-                            internal: false,
                         });
                     }
 
@@ -1284,7 +1261,6 @@ impl<'a> App<'a> {
                             content: mika_agent::agent::EMPTY_RESPONSE_FALLBACK.to_string(),
                             rendered: None,
                             channel: None,
-                            internal: false,
                         });
                         self.status = AgentStatus::Idle;
                     } else {
@@ -1303,7 +1279,6 @@ impl<'a> App<'a> {
                         content: "Agent worker stopped unexpectedly.".to_string(),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                     self.status = AgentStatus::Idle;
                     self.needs_redraw = true;
@@ -1545,7 +1520,6 @@ impl<'a> App<'a> {
                 content: format!("[{}] {}", task.label, status_label),
                 rendered: None,
                 channel: None,
-                internal: false,
             });
 
             let original_status = task.status.clone();
@@ -1579,7 +1553,6 @@ impl<'a> App<'a> {
                 ),
                 rendered: None,
                 channel: None,
-                internal: false,
             });
             self.needs_redraw = true;
         }

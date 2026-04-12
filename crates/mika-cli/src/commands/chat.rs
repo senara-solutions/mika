@@ -325,6 +325,7 @@ async fn spawn_agent_worker(
                             &result,
                             Some(&metadata),
                             trace_id.as_deref(),
+                            false,
                         )
                         .await;
 
@@ -528,7 +529,6 @@ pub async fn run(
             content: warning.trim_end().to_string(),
             rendered: None,
             channel: None,
-            internal: false,
         });
     }
 
@@ -644,7 +644,6 @@ pub async fn run(
                                 ),
                                 rendered: None,
                                 channel: None,
-                                internal: false,
                             });
                         }
                         Err(e) => {
@@ -653,7 +652,6 @@ pub async fn run(
                                 content: format!("Failed to switch agent: {e}"),
                                 rendered: None,
                                 channel: None,
-                                internal: false,
                             });
                         }
                     }
@@ -664,7 +662,6 @@ pub async fn run(
                         content: format!("Failed to switch agent: {e}"),
                         rendered: None,
                         channel: None,
-                        internal: false,
                     });
                 }
             }
@@ -829,7 +826,6 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
             content: warning,
             rendered: None,
             channel: None,
-            internal: false,
         });
     }
 

@@ -1103,7 +1103,6 @@ async fn handle_think(app: &mut App<'_>, args: &str) -> Option<String> {
         content: format!("[think:{level}] {prompt}"),
         rendered: None,
         channel: None,
-        internal: false,
     });
 
     let images = std::mem::take(&mut app.pending_images);
@@ -1437,7 +1436,6 @@ mod tests {
             content: "hello".to_string(),
             rendered: None,
             channel: None,
-            internal: false,
         });
 
         let output = handle_clear(&mut app, "").await;

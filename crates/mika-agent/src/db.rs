@@ -4310,23 +4310,7 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Save a message marked as internal (hidden from TUI inbox mode).
-    pub fn save_internal_message(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        role: &str,
-        content: &str,
-        trace_id: Option<&str>,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO messages (session_id, agent_id, role, content, trace_id, internal)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-            params![session_id, agent_id, role, content, trace_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub fn save_message_with_metadata(
         &self,
         agent_id: &str,
@@ -4335,29 +4319,12 @@ impl Database {
         content: &str,
         metadata: Option<&str>,
         trace_id: Option<&str>,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO messages (session_id, agent_id, role, content, metadata, trace_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id, agent_id, role, content, metadata, trace_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Save a message with metadata, marked as internal (hidden from TUI inbox mode).
-    pub fn save_internal_message_with_metadata(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        role: &str,
-        content: &str,
-        metadata: Option<&str>,
-        trace_id: Option<&str>,
+        internal: bool,
     ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO messages (session_id, agent_id, role, content, metadata, trace_id, internal)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-            params![session_id, agent_id, role, content, metadata, trace_id],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![session_id, agent_id, role, content, metadata, trace_id, internal as i64],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -4520,17 +4487,6 @@ impl Database {
             .query_map(params![agent_id, after_id], Self::row_to_session_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
-    }
-
-    /// Count internal messages after a given message ID (for TUI hidden-count badge).
-    pub fn count_internal_messages_after(&self, agent_id: &str, after_id: i64) -> Result<i64> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages
-              WHERE agent_id = ?1 AND id > ?2 AND internal = 1",
-            params![agent_id, after_id],
-            |r| r.get(0),
-        )?;
-        Ok(n)
     }
 
     pub fn max_message_id(&self, agent_id: &str) -> Result<i64> {
@@ -7348,7 +7304,7 @@ mod tests {
     fn test_get_messages_by_trace_id() {
         let (db, sid) = db_with_session();
         let trace = "aaaa0000bbbb1111cccc2222dddd3333";
-        db.save_message_with_metadata("mika", &sid, "user", "traced msg", None, Some(trace))
+        db.save_message_with_metadata("mika", &sid, "user", "traced msg", None, Some(trace), false)
             .unwrap();
         db.save_message("mika", &sid, "assistant", "no trace", None)
             .unwrap();
@@ -9770,7 +9726,7 @@ mod tests {
     #[test]
     fn test_save_internal_message() {
         let (db, sid) = db_with_session();
-        db.save_internal_message("mika", &sid, "assistant", "internal msg", None)
+        db.save_message_with_metadata("mika", &sid, "assistant", "internal msg", None, None, true)
             .unwrap();
         let msgs = db.load_recent_messages("mika", 10).unwrap();
         assert_eq!(msgs.len(), 1);
@@ -9781,13 +9737,14 @@ mod tests {
     #[test]
     fn test_save_internal_message_with_metadata() {
         let (db, sid) = db_with_session();
-        db.save_internal_message_with_metadata(
+        db.save_message_with_metadata(
             "mika",
             &sid,
             "assistant",
             "internal with meta",
             Some(r#"{"tool_calls":[]}"#),
             None,
+            true,
         )
         .unwrap();
         let msgs = db.load_recent_messages("mika", 10).unwrap();
@@ -9811,7 +9768,7 @@ mod tests {
         let (db, sid) = db_with_session();
         db.save_message("mika", &sid, "user", "visible 1", None)
             .unwrap();
-        db.save_internal_message("mika", &sid, "assistant", "hidden", None)
+        db.save_message_with_metadata("mika", &sid, "assistant", "hidden", None, None, true)
             .unwrap();
         db.save_message("mika", &sid, "assistant", "visible 2", None)
             .unwrap();
@@ -9824,25 +9781,5 @@ mod tests {
         let visible = db.load_recent_messages_filtered("mika", 10, true).unwrap();
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().all(|m| !m.internal));
-    }
-
-    #[test]
-    fn test_count_internal_messages_after() {
-        let (db, sid) = db_with_session();
-        let id1 = db
-            .save_message("mika", &sid, "user", "msg 1", None)
-            .unwrap();
-        db.save_internal_message("mika", &sid, "assistant", "internal 1", None)
-            .unwrap();
-        db.save_internal_message("mika", &sid, "assistant", "internal 2", None)
-            .unwrap();
-        db.save_message("mika", &sid, "assistant", "visible", None)
-            .unwrap();
-
-        let count = db.count_internal_messages_after("mika", id1).unwrap();
-        assert_eq!(count, 2);
-
-        let count_all = db.count_internal_messages_after("mika", 0).unwrap();
-        assert_eq!(count_all, 2);
     }
 }

@@ -1890,6 +1890,7 @@ mod tests {
             "traced message",
             None,
             Some(trace_id),
+            false,
         )
         .await
         .unwrap();
