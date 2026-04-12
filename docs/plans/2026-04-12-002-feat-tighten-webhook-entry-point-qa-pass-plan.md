@@ -1,7 +1,7 @@
 ---
 title: "feat: tighten webhook entry point — QA pass + open PR = immediate merge"
 type: feat
-status: active
+status: completed
 date: 2026-04-12
 ---
 
