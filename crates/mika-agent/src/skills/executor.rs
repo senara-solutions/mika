@@ -127,6 +127,30 @@ pub async fn execute_skill_tool(
         .await;
     }
 
+    // Refuse long-running tools when no long-running context is available
+    // (callback turns, silent mode, CLI test). The sync exec path does not
+    // inject __mika_task_id/__mika_agent, so the handler would crash with
+    // a cryptic error. Return an explicit error instead (#537).
+    if matches!(
+        &skill_tool.handler,
+        ToolHandler::Exec {
+            long_running: true,
+            ..
+        }
+    ) && long_running_ctx.is_none()
+    {
+        warn!(
+            tool = %skill_tool.definition.name,
+            "long-running tool invoked without long_running_ctx"
+        );
+        return ToolOutput::error(format!(
+            "Tool '{}' is declared long_running but cannot run in the current context \
+             (callback turn, silent mode, or CLI test). Long-running tools require a \
+             conversation-mode turn with an active task engine.",
+            skill_tool.definition.name
+        ));
+    }
+
     let timeout = Duration::from_secs(timeout_secs);
     match tokio::time::timeout(timeout, execute_inner(skill_tool, input, github_token)).await {
         Ok(Ok(output)) => output,
@@ -1569,6 +1593,47 @@ mod tests {
         assert!(
             !output.content.contains("GH_TOKEN=ghp_"),
             "expected GH_TOKEN to not contain a token when github_token is None, got: {}",
+            output.content
+        );
+    }
+
+    /// Regression test for #537: a long_running tool with no long_running_ctx
+    /// must return an explicit error instead of silently falling through to
+    /// the sync exec path (which lacks __mika_task_id injection).
+    #[tokio::test]
+    async fn test_long_running_tool_without_context_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Long-running test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "./handlers/run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(300),
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        };
+
+        // Pass None for long_running_ctx — simulates callback turn / silent mode / CLI test
+        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+
+        assert!(output.is_error, "expected error, got: {}", output.content);
+        assert!(
+            output.content.contains("run_claude_pilot"),
+            "error should name the tool: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("long_running"),
+            "error should mention long_running: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("cannot run in the current context"),
+            "error should explain the context restriction: {}",
             output.content
         );
     }
