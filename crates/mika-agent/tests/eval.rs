@@ -14,4 +14,5 @@ mod eval {
     mod test_multi_step;
     mod test_tool_calling;
     mod test_verdict_handler;
+    mod test_webhook_queue;
 }

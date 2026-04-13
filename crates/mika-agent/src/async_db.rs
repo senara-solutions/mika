@@ -353,6 +353,13 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn find_active_work_item_by_branch(&self, branch: &str) -> Result<Option<Task>> {
+        let a = self.agent_id.clone();
+        let b = branch.to_owned();
+        self.with_db(move |db| db.find_active_work_item_by_branch(&a, &b))
+            .await
+    }
+
     pub async fn find_active_work_item_by_label(&self, label: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let l = label.to_owned();

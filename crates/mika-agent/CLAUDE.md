@@ -63,6 +63,10 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 `server::verdict_handler` — intercepts `pull_request_review.submitted` webhook events **before** the LLM turn in `handle_message`. Parses `VERDICT:` line from the review body. For `pass` verdicts with matching `in_progress` work items: initiates merge via `run_gh_checks` + `run_gh_merge` (reused from `pr_merge_with_gate`), updates work item metadata, logs `verdict_handled` audit event, sends notification. For `block[*]`/`hold[*]` verdicts: passes through to LLM. For missing `VERDICT:` line: passes through with `verdict_missing=true` enrichment. Parser in `server::verdict` depends on gateway's `format_event_text()` output format. 60s timeout on subprocess calls. See #524.
 
+### Webhook Deferral Queue
+
+`server::webhook_queue` — in-memory queue that holds inbound GitHub webhooks when the target work item has an in-flight `run_claude_pilot` callback (#528). Prevents race conditions where a webhook (e.g. `pull_request_review.submitted`) arrives before the callback persists metadata (`pr_url`). Correlation: PR URL via `parse_pr_review_event()`, branch via check_suite regex, fallback to sole-inflight-callback heuristic. 60s per-webhook timeout with forced replay. Drain triggers: callback completion in `handle_task_complete` (Ok path only), or timeout expiry via `drain_expired()`. Emits `webhook_deferred` and `webhook_replayed` audit events. Queue is in-memory only (lost on restart; GitHub supports redelivery). See #528.
+
 ### Introspection Tools
 
 4 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap). Non-orchestrator agents scoped to their own agent_id/sessions.

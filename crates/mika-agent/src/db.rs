@@ -3201,6 +3201,30 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Find an active manual work item by agent_id and branch stored in metadata.
+    /// Looks up `json_extract(metadata, '$.claude_pilot.branch')` for matching.
+    /// Used to locate the parent work item when a PR webhook arrives before
+    /// the PR URL has been recorded (in-flight work items only have a branch).
+    pub fn find_active_work_item_by_branch(
+        &self,
+        agent_id: &str,
+        branch: &str,
+    ) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND json_extract(metadata, '$.claude_pilot.branch') = ?2
+               AND trigger_type = 'manual'
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+             LIMIT 1",
+            Self::TASK_COLUMNS
+        );
+        self.conn
+            .query_row(&sql, params![agent_id, branch], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Find an active manual work item by agent_id and label (case-insensitive).
     /// Used as a fallback dedup path when `create_work_item` is called without a reference_url.
     pub fn find_active_work_item_by_label(
@@ -9879,6 +9903,71 @@ mod tests {
                 "mika",
                 "https://github.com/senara-solutions/mika/pull/42",
             )
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    // -- find_active_work_item_by_branch tests --
+
+    #[test]
+    fn test_find_active_work_item_by_branch_found() {
+        let db = db();
+        let branch = "feat/test";
+        let task = new_task("mika", "Implement feature", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        let meta = r#"{"claude_pilot":{"branch":"feat/test"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+
+        let found = db.find_active_work_item_by_branch("mika", branch).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, id);
+    }
+
+    #[test]
+    fn test_find_active_work_item_by_branch_not_found() {
+        let db = db();
+        let task = new_task("mika", "Implement feature", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        let meta = r#"{"claude_pilot":{"branch":"feat/test"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+
+        let found = db
+            .find_active_work_item_by_branch("mika", "feat/other-branch")
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_active_work_item_by_branch_completed_not_returned() {
+        let db = db();
+        let task = new_task("mika", "Done feature", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        let meta = r#"{"claude_pilot":{"branch":"feat/test"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let found = db
+            .find_active_work_item_by_branch("mika", "feat/test")
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_active_work_item_by_branch_wrong_path() {
+        let db = db();
+        let task = new_task("mika", "Wrong path", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        // branch in a different metadata path (not under claude_pilot)
+        let meta = r#"{"other":{"branch":"feat/test"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+
+        let found = db
+            .find_active_work_item_by_branch("mika", "feat/test")
             .unwrap();
         assert!(found.is_none());
     }
