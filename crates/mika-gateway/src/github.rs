@@ -103,6 +103,7 @@ pub struct GitHubPullRequest {
     pub html_url: Option<String>,
     pub body: Option<String>,
     pub head: Option<GitHubRef>,
+    pub merged: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -147,6 +148,7 @@ pub fn route_event(
         ("issues", Some("assigned")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
         ("pull_request", Some("opened" | "synchronize")) => Some("mika-qa"),
+        ("pull_request", Some("closed")) => Some("mika-dev"),
         ("pull_request_review", Some("submitted")) => Some("mika-dev"),
         ("check_suite", Some("completed")) => match check_conclusion {
             Some("failure" | "timed_out") => Some("mika-dev"),
@@ -233,6 +235,10 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
             let mut text = format!(
                 "[GitHub] PR {action}: {repo_name}#{number} — {title} (branch: {branch})\n{url}"
             );
+            if action == "closed" {
+                let merged = pr.and_then(|p| p.merged).unwrap_or(false);
+                text.push_str(&format!("\nMerged: {merged}"));
+            }
             if !body.is_empty() {
                 text.push_str(&format!("\n\n{body}"));
             }
@@ -740,7 +746,10 @@ mod tests {
 
     #[test]
     fn test_route_event_pr_closed() {
-        assert_eq!(route_event("pull_request", Some("closed"), None), None);
+        assert_eq!(
+            route_event("pull_request", Some("closed"), None),
+            Some("mika-dev")
+        );
     }
 
     #[test]
@@ -838,6 +847,7 @@ mod tests {
                 head: Some(GitHubRef {
                     ref_name: Some("fix/bug".to_string()),
                 }),
+                merged: None,
             }),
             comment: None,
             review: None,
