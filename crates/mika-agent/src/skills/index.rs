@@ -285,6 +285,55 @@ pub struct SkippedSkill {
     pub reason: String,
 }
 
+/// A loaded skill that has validation warnings (non-fatal issues).
+///
+/// These skills are still in the registry and functional, but operators
+/// should be aware of the issues. Produced by `SkillRegistry::validate_loaded()`.
+#[derive(Debug, Clone)]
+pub struct SkillValidationWarning {
+    pub skill_name: String,
+    pub diagnostics: Vec<SkillDiagnostic>,
+}
+
+/// Classify whether a `Fail`-level diagnostic from `validate_skill()` should
+/// cause the skill to be skipped at startup (vs. loaded with a warning).
+///
+/// Skip-worthy failures indicate the skill **cannot function** at runtime
+/// (missing handler, broken tools.json, unreadable manifest). All other
+/// Fail-level diagnostics are downgraded to warnings at startup since the
+/// skill can still load and operate.
+///
+/// # Maintenance note
+/// This function depends on message strings produced by `validate_skill()`.
+/// If you change diagnostic messages in `validate_skill()`, update the
+/// patterns here. Source lines in `index.rs` that produce skip-worthy messages:
+///   - line ~594: "skill.toml not found"
+///   - line ~612: "cannot read skill.toml"
+///   - line ~684: "tools.json exceeds"
+///   - line ~706: "tool '...': handler command not found"
+///   - line ~718: "tool '...': handler command not executable"
+///   - line ~744: "invalid tools.json"
+///   - line ~750: "cannot read tools.json"
+pub fn is_skip_worthy_failure(diag: &SkillDiagnostic) -> bool {
+    if diag.level != DiagnosticLevel::Fail {
+        return false;
+    }
+    let msg = &diag.message;
+    // Handler missing or not executable
+    msg.starts_with("tool '")
+        && (msg.contains("handler command not found") || msg.contains("handler command not executable"))
+    // tools.json broken
+    || msg.starts_with("invalid tools.json")
+    || msg.starts_with("cannot read tools.json")
+    || msg.starts_with("tools.json exceeds")
+    // Manifest unreadable (symlink race between scan and validate)
+    || msg.starts_with("skill.toml not found")
+    || msg.starts_with("cannot read skill.toml")
+    // Oversized prompt on always_on skill — skill will be functionally broken
+    // (validate_skill emits this AFTER Ok diagnostics, so all_fail_no_ok won't catch it)
+    || msg.contains("— skill will be SKIPPED at startup")
+}
+
 /// Result of scanning a skills directory.
 pub struct ScanResult {
     pub entries: Vec<SkillEntry>,

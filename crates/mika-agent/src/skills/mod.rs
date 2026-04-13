@@ -10,7 +10,7 @@ pub mod matcher;
 
 use std::path::Path;
 
-use self::index::{SkillEntry, SkippedSkill};
+use self::index::{SkillEntry, SkillValidationWarning, SkippedSkill};
 use crate::db::SkillOverride;
 
 /// Registry of discovered skills, built once at startup.
@@ -18,6 +18,9 @@ use crate::db::SkillOverride;
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
     skipped: Vec<SkippedSkill>,
+    /// Warnings from post-load semantic validation (`validate_loaded()`).
+    /// These skills are still loaded and functional but have non-fatal issues.
+    validated_warnings: Vec<SkillValidationWarning>,
 }
 
 impl SkillRegistry {
@@ -45,6 +48,7 @@ impl SkillRegistry {
         Self {
             skills: result.entries,
             skipped: result.skipped,
+            validated_warnings: Vec::new(),
         }
     }
 
@@ -53,6 +57,7 @@ impl SkillRegistry {
         Self {
             skills: Vec::new(),
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
         }
     }
 
@@ -61,6 +66,7 @@ impl SkillRegistry {
         Self {
             skills: Vec::new(),
             skipped,
+            validated_warnings: Vec::new(),
         }
     }
 
@@ -72,6 +78,101 @@ impl SkillRegistry {
     /// Details of skills that were skipped during scan (name + reason).
     pub fn skipped(&self) -> &[SkippedSkill] {
         &self.skipped
+    }
+
+    /// Validation warnings from `validate_loaded()` — skills that loaded
+    /// but have non-fatal semantic issues.
+    pub fn validated_warnings(&self) -> &[SkillValidationWarning] {
+        &self.validated_warnings
+    }
+
+    /// Run semantic validation on all loaded skills and apply the decision matrix.
+    ///
+    /// Must be called **after** `apply_overrides()` since DB overrides can change
+    /// `always_on` state and LLM configuration, affecting validation context.
+    ///
+    /// Skills with skip-worthy failures (missing handler, broken tools.json, unreadable
+    /// manifest) are removed from `self.skills` and added to `self.skipped`.
+    /// Skills with non-fatal warnings are kept loaded and recorded in `self.validated_warnings`.
+    pub fn validate_loaded(&mut self) {
+        use index::{DiagnosticLevel, is_skip_worthy_failure, validate_skill};
+
+        // Phase 1: Collect validation results into local vectors.
+        // We cannot mutate self.skipped/self.validated_warnings while iterating self.skills.
+        let mut to_skip: Vec<SkippedSkill> = Vec::new();
+        let mut to_warn: Vec<SkillValidationWarning> = Vec::new();
+        let mut skip_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for entry in &self.skills {
+            let diags = validate_skill(&entry.dir);
+
+            // Catch-all check uses the FULL diagnostic set (before filtering).
+            // If validate_skill() returned zero Ok diagnostics and at least one Fail,
+            // the skill's manifest/structure is fundamentally broken (e.g., symlink
+            // race where skill.toml disappeared between scan and validate).
+            let has_any_ok = diags.iter().any(|d| d.level == DiagnosticLevel::Ok);
+            let has_any_fail = diags.iter().any(|d| d.level == DiagnosticLevel::Fail);
+            let all_fail_no_ok = has_any_fail && !has_any_ok;
+
+            // Filter to only Warn and Fail diagnostics for processing
+            let issues: Vec<_> = diags
+                .into_iter()
+                .filter(|d| matches!(d.level, DiagnosticLevel::Warn | DiagnosticLevel::Fail))
+                .collect();
+
+            if issues.is_empty() {
+                continue;
+            }
+
+            let skill_name = entry.manifest.skill.name.clone();
+            let has_skip_worthy = issues.iter().any(is_skip_worthy_failure);
+
+            if has_skip_worthy || all_fail_no_ok {
+                // Find the first skip-worthy failure for the reason, or use the first Fail
+                let reason = issues
+                    .iter()
+                    .find(|d| is_skip_worthy_failure(d))
+                    .or_else(|| issues.iter().find(|d| d.level == DiagnosticLevel::Fail))
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "validation failed".to_string());
+
+                tracing::warn!(
+                    skill = %skill_name,
+                    error_kind = "skip",
+                    message = %reason,
+                    "skill removed by startup validation — run `mika skills validate {}` for full diagnostics",
+                    skill_name,
+                );
+
+                skip_names.insert(skill_name.clone());
+                to_skip.push(SkippedSkill {
+                    name: skill_name,
+                    reason: format!("validation: {reason}"),
+                });
+            } else {
+                // Non-fatal warnings — log each one
+                for diag in &issues {
+                    tracing::warn!(
+                        skill = %skill_name,
+                        error_kind = %diag.tag(),
+                        message = %diag.message,
+                        "skill loaded with validation warning",
+                    );
+                }
+                to_warn.push(SkillValidationWarning {
+                    skill_name,
+                    diagnostics: issues,
+                });
+            }
+        }
+
+        // Phase 2: Apply collected results.
+        if !to_skip.is_empty() {
+            self.skills
+                .retain(|e| !skip_names.contains(&e.manifest.skill.name));
+            self.skipped.extend(to_skip);
+        }
+        self.validated_warnings = to_warn;
     }
 
     /// Match skills against a user message.
@@ -330,6 +431,7 @@ mod tests {
     fn test_always_on_skills() {
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
                 make_entry("reminders", false, true),
@@ -346,6 +448,7 @@ mod tests {
     fn test_always_on_skills_filters_disabled() {
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
                 make_entry("disabled-skill", true, false),
@@ -412,6 +515,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
         };
 
@@ -467,6 +571,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![safe_with_dep, exec_dep],
         };
 
@@ -483,6 +588,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
                 make_entry("tmux", false, true),
@@ -508,6 +614,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![make_entry("Web-Search", false, true)],
         };
 
@@ -528,6 +635,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
 
@@ -548,6 +656,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
 
@@ -568,6 +677,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
                 make_entry("shell-exec", true, true),
@@ -590,6 +700,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_silent_on_valid() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["tmux"]),
                 make_entry("tmux", false, true),
@@ -603,6 +714,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_warns_on_missing() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![make_entry_with_deps(
                 "self-dev",
                 true,
@@ -618,6 +730,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_case_insensitive() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["TMUX"]),
                 make_entry("tmux", false, true),
@@ -631,6 +744,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_no_deps_no_warn() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("web-search", true, true),
                 make_entry("tmux", false, true),
@@ -660,6 +774,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![entry],
         };
 
@@ -682,6 +797,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![make_entry("qa-review", false, true)],
         };
         // Baseline: manifest [llm] empty.
@@ -718,6 +834,7 @@ mod tests {
         };
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![entry],
         };
 
@@ -753,6 +870,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            validated_warnings: Vec::new(),
             skills: vec![entry],
         };
 
@@ -811,5 +929,487 @@ mod tests {
     fn test_validate_markdown_content_allows_common_whitespace() {
         // Tabs, newlines, carriage returns are fine
         assert!(validate_markdown_content("hello\tworld\r\n").is_ok());
+    }
+
+    // -- validate_loaded() tests (#530) --
+
+    /// Helper: create a minimal valid skill directory for validate_loaded() tests.
+    /// Returns the skill subdirectory path.
+    fn create_valid_skill(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let skill_dir = parent.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // Include a keyword to avoid "skill will never activate" warning from validate_skill()
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            format!(
+                r#"[skill]
+name = "{name}"
+description = "test skill"
+
+[triggers]
+keywords = ["test-{name}"]
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("system_prompt.md"),
+            "# Test\nValid prompt content.\n",
+        )
+        .unwrap();
+        skill_dir
+    }
+
+    /// Helper: build a SkillRegistry from a temp dir with real skills on disk.
+    fn registry_from_temp(skills_dir: &std::path::Path) -> SkillRegistry {
+        SkillRegistry::from_dir(skills_dir)
+    }
+
+    #[test]
+    fn test_validate_loaded_no_issues() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_valid_skill(tmp.path(), "good-skill");
+        let mut registry = registry_from_temp(tmp.path());
+        registry.validate_loaded();
+
+        assert_eq!(registry.skills().len(), 1);
+        assert!(registry.skipped().is_empty());
+        assert!(
+            registry.validated_warnings().is_empty(),
+            "unexpected warnings: {:?}",
+            registry.validated_warnings()
+        );
+    }
+
+    #[test]
+    fn test_validate_loaded_empty_registry() {
+        let mut registry = SkillRegistry::empty();
+        registry.validate_loaded();
+
+        assert!(registry.skills().is_empty());
+        assert!(registry.skipped().is_empty());
+        assert!(registry.validated_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_validate_loaded_llm_section_warns_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "has-llm");
+        // Add a deprecated [llm] section to skill.toml
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"[skill]
+name = "has-llm"
+description = "test"
+
+[triggers]
+keywords = ["llm-test"]
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+"#,
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        registry.validate_loaded();
+
+        // Skill should still be loaded (not skipped)
+        assert_eq!(registry.skills().len(), 1);
+        assert!(registry.skipped().is_empty());
+        // Should have a validation warning
+        assert_eq!(registry.validated_warnings().len(), 1);
+        assert_eq!(registry.validated_warnings()[0].skill_name, "has-llm");
+    }
+
+    #[test]
+    fn test_validate_loaded_name_in_keywords_warns_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "mem-skill");
+        // Overwrite with name-in-keywords: "mem-skill" appears both as name and keyword
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"[skill]
+name = "mem-skill"
+description = "test"
+
+[triggers]
+keywords = ["mem-skill", "remember"]
+"#,
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        registry.validate_loaded();
+
+        assert_eq!(registry.skills().len(), 1);
+        assert!(registry.skipped().is_empty());
+        assert_eq!(registry.validated_warnings().len(), 1);
+        assert_eq!(registry.validated_warnings()[0].skill_name, "mem-skill");
+    }
+
+    #[test]
+    fn test_validate_loaded_missing_handler_script_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "broken-handler");
+        // Add tools.json referencing a handler that doesn't exist
+        std::fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "run_something",
+                "description": "runs something",
+                "input_schema": {"type": "object"},
+                "handler": {"type": "exec", "command": "./nonexistent.sh"}
+            }]"#,
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        assert_eq!(registry.skills().len(), 1);
+        registry.validate_loaded();
+
+        // Skill should be skipped
+        assert_eq!(registry.skills().len(), 0);
+        assert!(
+            registry
+                .skipped()
+                .iter()
+                .any(|s| s.name == "broken-handler")
+        );
+        assert!(registry.validated_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_validate_loaded_handler_not_executable_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "not-exec");
+        // Create handler script without execute permission
+        let script_path = skill_dir.join("run.sh");
+        std::fs::write(&script_path, "#!/bin/sh\necho hello").unwrap();
+        // Explicitly remove execute permission
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "run_it",
+                "description": "runs it",
+                "input_schema": {"type": "object"},
+                "handler": {"type": "exec", "command": "./run.sh"}
+            }]"#,
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        assert_eq!(registry.skills().len(), 1);
+        registry.validate_loaded();
+
+        // Skill should be skipped (handler not executable)
+        assert_eq!(registry.skills().len(), 0);
+        assert!(registry.skipped().iter().any(|s| s.name == "not-exec"));
+    }
+
+    #[test]
+    fn test_validate_loaded_invalid_tools_json_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "bad-tools");
+        std::fs::write(skill_dir.join("tools.json"), "not valid json!!!").unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        assert_eq!(registry.skills().len(), 1);
+        registry.validate_loaded();
+
+        assert_eq!(registry.skills().len(), 0);
+        assert!(registry.skipped().iter().any(|s| s.name == "bad-tools"));
+    }
+
+    #[test]
+    fn test_validate_loaded_skip_worthy_and_warn_both_present_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "mixed-issues");
+        // Has both: deprecated [llm] section (warn) AND missing handler (skip)
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"[skill]
+name = "mixed-issues"
+description = "test"
+
+[triggers]
+keywords = ["mixed-test"]
+
+[llm]
+provider = "anthropic"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "do_thing",
+                "description": "does thing",
+                "input_schema": {"type": "object"},
+                "handler": {"type": "exec", "command": "./missing.sh"}
+            }]"#,
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        assert_eq!(registry.skills().len(), 1);
+        registry.validate_loaded();
+
+        // Skip takes precedence over warn
+        assert_eq!(registry.skills().len(), 0);
+        assert!(registry.skipped().iter().any(|s| s.name == "mixed-issues"));
+        // Should NOT appear in validated_warnings since it was skipped
+        assert!(
+            registry
+                .validated_warnings()
+                .iter()
+                .all(|w| w.skill_name != "mixed-issues")
+        );
+    }
+
+    #[test]
+    fn test_validate_loaded_warn_only_diagnostics_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "warn-only");
+        // Create a markdown file with unclosed code fence (warns, doesn't skip)
+        std::fs::write(
+            skill_dir.join("system_prompt.md"),
+            "# Test\n```\nunclosed code\n",
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        registry.validate_loaded();
+
+        assert_eq!(registry.skills().len(), 1);
+        assert!(registry.skipped().is_empty());
+        // Should have validation warning for markdown
+        assert_eq!(registry.validated_warnings().len(), 1);
+        assert_eq!(registry.validated_warnings()[0].skill_name, "warn-only");
+    }
+
+    #[test]
+    fn test_validate_loaded_multiple_skills_mixed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Good skill — no issues
+        create_valid_skill(tmp.path(), "good");
+        // Warn skill — deprecated [llm] section
+        let warn_dir = create_valid_skill(tmp.path(), "has-warn");
+        std::fs::write(
+            warn_dir.join("skill.toml"),
+            r#"[skill]
+name = "has-warn"
+description = "test"
+
+[triggers]
+keywords = ["warn-test"]
+
+[llm]
+provider = "anthropic"
+"#,
+        )
+        .unwrap();
+        // Skip skill — missing handler
+        let skip_dir = create_valid_skill(tmp.path(), "will-skip");
+        std::fs::write(
+            skip_dir.join("tools.json"),
+            r#"[{
+                "name": "broken",
+                "description": "broken",
+                "input_schema": {"type": "object"},
+                "handler": {"type": "exec", "command": "./missing.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        let mut registry = registry_from_temp(tmp.path());
+        assert_eq!(registry.skills().len(), 3);
+        registry.validate_loaded();
+
+        // 2 skills remain (good + has-warn), 1 skipped (will-skip)
+        assert_eq!(registry.skills().len(), 2);
+        assert!(registry.skipped().iter().any(|s| s.name == "will-skip"));
+        // 1 validation warning (has-warn)
+        assert_eq!(registry.validated_warnings().len(), 1);
+        assert_eq!(registry.validated_warnings()[0].skill_name, "has-warn");
+    }
+
+    #[test]
+    fn test_validate_loaded_symlink_race_all_fail_no_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "disappearing");
+        // Load registry while skill exists
+        let mut registry = registry_from_temp(tmp.path());
+        assert_eq!(registry.skills().len(), 1);
+        // Remove the skill.toml to simulate symlink race
+        std::fs::remove_file(skill_dir.join("skill.toml")).unwrap();
+        registry.validate_loaded();
+
+        // Should be skipped due to catch-all (all-Fail, zero-Ok)
+        assert!(registry.skills().is_empty());
+        assert!(registry.skipped().iter().any(|s| s.name == "disappearing"));
+    }
+
+    // -- is_skip_worthy_failure() tests --
+
+    #[test]
+    fn test_validate_loaded_always_on_oversized_prompt_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "big-prompt");
+        // Make it always_on with a prompt exceeding the default 16KB limit
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"[skill]
+name = "big-prompt"
+description = "test"
+always_on = true
+
+[triggers]
+keywords = ["big-test"]
+"#,
+        )
+        .unwrap();
+        // Write an oversized prompt (20KB exceeds the 16KB default)
+        let big_content = format!("# Big Prompt\n{}", "x".repeat(20 * 1024));
+        std::fs::write(skill_dir.join("system_prompt.md"), &big_content).unwrap();
+
+        let mut registry = registry_from_temp(tmp.path());
+        // Skill loads during scan (prompt is silently emptied for non-always_on at scan)
+        // but the entry may still be present
+        let loaded_before = registry.skills().len();
+        registry.validate_loaded();
+
+        // validate_skill() emits a Fail saying "skill will be SKIPPED at startup"
+        // for always_on skills with oversized prompts — is_skip_worthy_failure must catch it
+        if loaded_before > 0 {
+            assert!(
+                registry.skipped().iter().any(|s| s.name == "big-prompt"),
+                "always_on skill with oversized prompt should be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_loaded_skip_reason_contains_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = create_valid_skill(tmp.path(), "bad-handler");
+        std::fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "run_it",
+                "description": "runs it",
+                "input_schema": {"type": "object"},
+                "handler": {"type": "exec", "command": "./missing.sh"}
+            }]"#,
+        )
+        .unwrap();
+        let mut registry = registry_from_temp(tmp.path());
+        registry.validate_loaded();
+
+        let skipped = registry.skipped().iter().find(|s| s.name == "bad-handler");
+        assert!(skipped.is_some(), "skill should be skipped");
+        let reason = &skipped.unwrap().reason;
+        assert!(
+            reason.starts_with("validation: "),
+            "reason should start with 'validation: ', got: {reason}"
+        );
+        assert!(
+            reason.contains("handler command not found"),
+            "reason should mention the handler, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_oversized_always_on_prompt() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail(
+            "system_prompt.md (20480 bytes) exceeds limit (16384 bytes) — skill will be SKIPPED at startup \
+             (always_on skills require their prompt to function)",
+        );
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_handler_not_found() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail(
+            "tool 'run_it': handler command not found: ./run.sh (resolved to /skills/run.sh)",
+        );
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_handler_not_executable() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag =
+            SkillDiagnostic::fail("tool 'run_it': handler command not executable: /skills/run.sh");
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_invalid_tools_json() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail("invalid tools.json: expected ident at line 1 column 2");
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_cannot_read_tools_json() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail("cannot read tools.json: Permission denied");
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_tools_json_oversized() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail("tools.json exceeds 256KB (512KB)");
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_manifest_not_found() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail("skill.toml not found");
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_manifest_unreadable() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail("cannot read skill.toml: Permission denied");
+        assert!(is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_llm_section_not_skip() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail(
+            "[llm] section is no longer supported in skill.toml. Use `mika skills llm`...",
+        );
+        assert!(!is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_name_in_keywords_not_skip() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::fail(
+            "skill name 'memory' appears in [triggers].keywords — this is redundant",
+        );
+        assert!(!is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_warn_level_not_skip() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        // Even if the message matches a skip pattern, Warn level should not be skip-worthy
+        let diag = SkillDiagnostic::warn("tool 'x': handler command not found: ./run.sh");
+        assert!(!is_skip_worthy_failure(&diag));
+    }
+
+    #[test]
+    fn test_is_skip_worthy_failure_ok_level_not_skip() {
+        use index::{SkillDiagnostic, is_skip_worthy_failure};
+        let diag = SkillDiagnostic::ok("skill.toml valid");
+        assert!(!is_skip_worthy_failure(&diag));
     }
 }

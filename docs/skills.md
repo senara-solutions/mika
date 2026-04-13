@@ -586,6 +586,38 @@ These skills provide only system prompt guidance — they have no tools of their
 
 ---
 
+## Startup Validation
+
+At agent startup, Mika runs `validate_skill()` on every loaded skill **after** applying database overrides (`apply_overrides()`). This catches semantic issues that the initial structural scan (`scan_skills_dir()`) does not — deprecated manifest sections, missing handler scripts, placeholder mismatches, and more.
+
+### Decision Matrix
+
+| Diagnostic | Action | Rationale |
+|-----------|--------|-----------|
+| Missing handler script | **Skip** | Skill cannot execute tool calls |
+| Handler not executable | **Skip** | Will fail at runtime |
+| Oversized/invalid/unreadable tools.json | **Skip** | Tools won't load |
+| Unreadable skill.toml (symlink race) | **Skip** | Manifest disappeared after initial scan |
+| `[llm]` section in skill.toml | **Warn** | Runtime ignores it; use `mika skills llm` instead |
+| Skill name in keywords | **Warn** | Cosmetic — redundant but harmless |
+| Invalid context type | **Warn** | Context injection fails gracefully |
+| Placeholder mismatch | **Warn** | Context may not render correctly |
+| Invalid markdown in system_prompt.md | **Warn** | Prompt loads but may have formatting issues |
+
+**Catch-all:** If `validate_skill()` returns zero Ok diagnostics and at least one Fail, the skill is treated as skip-worthy regardless of the specific failure type.
+
+### How Warnings Surface
+
+| Mode | How warnings appear |
+|------|-------------------|
+| **TUI** (`mika`) | `ChatRole::System` message at startup listing up to 5 skills with warnings |
+| **`mika ask`** | Summary printed to stderr |
+| **Server** (`mika-server`) | `tracing::warn` log entries with structured fields (`skill`, `error_kind`, `message`) |
+
+For full diagnostic output, run `mika skills validate`.
+
+---
+
 ## Marketplace (Installing Community Skills)
 
 Mika supports installing skills from Git repositories. This lets the community share skills without any central infrastructure — just push a skill to a Git repo and share the URL.

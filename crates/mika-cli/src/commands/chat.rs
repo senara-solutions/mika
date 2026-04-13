@@ -103,6 +103,7 @@ async fn spawn_agent_worker(
     {
         skill_registry.apply_overrides(&overrides);
     }
+    skill_registry.validate_loaded();
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
@@ -516,6 +517,37 @@ pub async fn run(
         let max_display = 5;
         for entry in skipped_skills.iter().take(max_display) {
             let _ = writeln!(warning, "  \u{2022} {}: {}", entry.name, entry.reason);
+        }
+        if count > max_display {
+            let _ = writeln!(
+                warning,
+                "  ... and {} more. Run `mika skills validate` for details.",
+                count - max_display
+            );
+        }
+        app.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: warning.trim_end().to_string(),
+            rendered: None,
+            channel: None,
+        });
+    }
+
+    // Surface skills with validation warnings (#530)
+    let validation_warnings = app.skills.validated_warnings();
+    if !validation_warnings.is_empty() {
+        use std::fmt::Write;
+        let count = validation_warnings.len();
+        let mut warning = format!("\u{26a0} {count} skill(s) loaded with validation warnings:\n");
+        let max_display = 5;
+        for entry in validation_warnings.iter().take(max_display) {
+            // Show skill name + first diagnostic message for brevity
+            let first_msg = entry
+                .diagnostics
+                .first()
+                .map(|d| d.message.as_str())
+                .unwrap_or("unknown issue");
+            let _ = writeln!(warning, "  \u{2022} {}: {}", entry.skill_name, first_msg);
         }
         if count > max_display {
             let _ = writeln!(
