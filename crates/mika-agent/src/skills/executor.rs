@@ -1943,7 +1943,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": "fabricated-uuid-that-does-not-exist"}),
+            serde_json::json!({"work_item_id": "00000000-0000-0000-0000-000000000000"}),
             30,
             Some(&ctx),
             None,
@@ -1953,7 +1953,7 @@ mod tests {
         assert!(output.is_error);
         assert!(
             output.content.contains("not found"),
-            "expected not-found error for fabricated UUID, got: {}",
+            "expected not-found error for valid-format-but-nonexistent UUID, got: {}",
             output.content
         );
     }
