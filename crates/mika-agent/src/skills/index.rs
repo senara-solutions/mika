@@ -769,9 +769,12 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                                                     cmd_path.display()
                                                 )));
                                             } else {
-                                                // Symlink containment check
-                                                if let Ok(canonical) = cmd_path.canonicalize()
-                                                    && !canonical.starts_with(skill_dir)
+                                                // Symlink containment check — canonicalize both
+                                                // paths so symlinked skills don't false-positive (#526)
+                                                if let (Ok(canonical_cmd), Ok(canonical_dir)) = (
+                                                    cmd_path.canonicalize(),
+                                                    skill_dir.canonicalize(),
+                                                ) && !canonical_cmd.starts_with(&canonical_dir)
                                                 {
                                                     diags.push(SkillDiagnostic::warn(format!(
                                                         "tool '{}': handler command '{}' resolves outside skill directory",
@@ -4728,5 +4731,179 @@ mod tests {
         let resolved = entry.resolve_prompt("anthropic", "claude-sonnet-4-6");
         assert_eq!(resolved.text, "Hand.");
         assert_eq!(resolved.source, PromptVariantSource::HandAuthoredModel);
+    }
+
+    // -- symlink containment check tests (#526) --
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_skill_symlinked_handler_no_false_positive() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Source skill directory with handler
+        let source_dir = tmp.path().join("source-skill");
+        let handlers_dir = source_dir.join("handlers");
+        fs::create_dir_all(&handlers_dir).unwrap();
+        fs::write(
+            source_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "my-skill"
+            description = "Test skill"
+            "#,
+        )
+        .unwrap();
+        fs::write(source_dir.join("system_prompt.md"), "Do stuff").unwrap();
+        let handler_path = handlers_dir.join("do_stuff.sh");
+        fs::write(&handler_path, "#!/bin/sh\necho ok").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&handler_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // tools.json referencing the handler
+        fs::write(
+            source_dir.join("tools.json"),
+            r#"[{
+                "name": "do_stuff",
+                "description": "does stuff",
+                "input_schema": {"type": "object", "properties": {}},
+                "handler": {"type": "exec", "command": "handlers/do_stuff.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        // Agent home with symlink to source skill
+        let agent_skills = tmp.path().join("agent-home/skills");
+        fs::create_dir_all(&agent_skills).unwrap();
+        let linked_skill = agent_skills.join("my-skill");
+        unix_fs::symlink(&source_dir, &linked_skill).unwrap();
+
+        // Validate via the symlink path
+        let diags = validate_skill(&linked_skill);
+        let outside_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("resolves outside skill directory")
+        });
+        assert!(
+            outside_warn.is_none(),
+            "Symlinked skill should NOT produce 'resolves outside' warning. Got: {diags:?}"
+        );
+        // Should still have the OK diagnostic for the handler
+        let ok_handler = diags
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Ok && d.message.contains("handler command OK"));
+        assert!(
+            ok_handler.is_some(),
+            "Expected OK handler diagnostic. Got: {diags:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_skill_handler_escape_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("escape-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        // Create the escape target OUTSIDE the skill dir
+        let escape_script = tmp.path().join("escapeme.sh");
+        fs::write(&escape_script, "#!/bin/sh\necho pwned").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&escape_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "escape-skill"
+            description = "Tries to escape"
+            "#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Escape").unwrap();
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "bad_tool",
+                "description": "escapes",
+                "input_schema": {"type": "object", "properties": {}},
+                "handler": {"type": "exec", "command": "../escapeme.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        let diags = validate_skill(&skill_dir);
+        let outside_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("resolves outside skill directory")
+        });
+        assert!(
+            outside_warn.is_some(),
+            "Handler escaping via ../ should produce 'resolves outside' warning. Got: {diags:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_skill_symlinked_handler_pointing_outside_warns() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Source skill directory
+        let source_dir = tmp.path().join("source-skill");
+        let handlers_dir = source_dir.join("handlers");
+        fs::create_dir_all(&handlers_dir).unwrap();
+        fs::write(
+            source_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "my-skill"
+            description = "Test skill"
+            "#,
+        )
+        .unwrap();
+        fs::write(source_dir.join("system_prompt.md"), "Do stuff").unwrap();
+
+        // External script outside the skill directory
+        let external_script = tmp.path().join("external.sh");
+        fs::write(&external_script, "#!/bin/sh\necho external").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&external_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Handler is a symlink pointing outside the skill dir
+        unix_fs::symlink(&external_script, handlers_dir.join("sneaky.sh")).unwrap();
+
+        fs::write(
+            source_dir.join("tools.json"),
+            r#"[{
+                "name": "sneaky",
+                "description": "sneaky handler",
+                "input_schema": {"type": "object", "properties": {}},
+                "handler": {"type": "exec", "command": "handlers/sneaky.sh"}
+            }]"#,
+        )
+        .unwrap();
+
+        // Validate the source directory directly (no skill-level symlink)
+        let diags = validate_skill(&source_dir);
+        let outside_warn = diags.iter().find(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.message.contains("resolves outside skill directory")
+        });
+        assert!(
+            outside_warn.is_some(),
+            "Handler symlink pointing outside skill dir should warn. Got: {diags:?}"
+        );
     }
 }
