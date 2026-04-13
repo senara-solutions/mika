@@ -22,6 +22,7 @@ use super::types::{
     AcceptedResponse, HealthResponse, MessageRequest, TaskCancelRequest, TaskCancelResponse,
     TaskCompleteRequest, TaskCompleteResponse,
 };
+use super::verdict_handler::{VerdictAction, try_handle_pr_review_verdict};
 
 /// Media types accepted by the Claude API for image content blocks.
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -220,6 +221,33 @@ pub async fn handle_message(
                 None,
             );
             let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
+
+            // Structural verdict handler: intercept PR review webhooks before
+            // the LLM turn and act on VERDICT: pass deterministically (#524).
+            // NOTE: This depends on the gateway's format_event_text() output
+            // format for pull_request_review events.
+            if req.channel == "github" {
+                let action = try_handle_pr_review_verdict(
+                    &req.text,
+                    &a.db,
+                    s.github_token.as_deref(),
+                    Some(&sender_arc),
+                    &session_id,
+                    &req.request_id,
+                )
+                .await;
+                match action {
+                    VerdictAction::Handled { pre_digest } => {
+                        req.text = pre_digest;
+                    }
+                    VerdictAction::Passthrough {
+                        enrichment: Some(e),
+                    } => {
+                        req.text = format!("{e}{}", req.text);
+                    }
+                    VerdictAction::Passthrough { enrichment: None } => {}
+                }
+            }
 
             let params = AgentParams {
                 db: &a.db,

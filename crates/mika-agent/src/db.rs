@@ -3178,6 +3178,29 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Find an active manual work item by agent_id and PR URL stored in metadata.
+    /// Looks up `json_extract(metadata, '$.claude_pilot.pr_url')` for matching.
+    /// Used to locate the parent work item when a PR review verdict arrives.
+    pub fn find_active_work_item_by_pr_url(
+        &self,
+        agent_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND json_extract(metadata, '$.claude_pilot.pr_url') = ?2
+               AND trigger_type = 'manual'
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+             LIMIT 1",
+            Self::TASK_COLUMNS
+        );
+        self.conn
+            .query_row(&sql, params![agent_id, pr_url], Self::row_to_task)
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Find an active manual work item by agent_id and label (case-insensitive).
     /// Used as a fallback dedup path when `create_work_item` is called without a reference_url.
     pub fn find_active_work_item_by_label(
@@ -9781,5 +9804,82 @@ mod tests {
         let visible = db.load_recent_messages_filtered("mika", 10, true).unwrap();
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().all(|m| !m.internal));
+    }
+
+    // -- find_active_work_item_by_pr_url tests --
+
+    #[test]
+    fn test_find_active_work_item_by_pr_url_found() {
+        let db = db();
+        let pr_url = "https://github.com/senara-solutions/mika/pull/42";
+        let task = new_task("mika", "Implement feature", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        let meta =
+            r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+
+        let found = db.find_active_work_item_by_pr_url("mika", pr_url).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, id);
+    }
+
+    #[test]
+    fn test_find_active_work_item_by_pr_url_not_found() {
+        let db = db();
+        let task = new_task("mika", "Implement feature", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        let meta =
+            r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+
+        let found = db
+            .find_active_work_item_by_pr_url(
+                "mika",
+                "https://github.com/senara-solutions/mika/pull/99",
+            )
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_active_work_item_by_pr_url_completed_not_returned() {
+        let db = db();
+        let task = new_task("mika", "Done feature", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        let meta =
+            r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let found = db
+            .find_active_work_item_by_pr_url(
+                "mika",
+                "https://github.com/senara-solutions/mika/pull/42",
+            )
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_active_work_item_by_pr_url_wrong_metadata_path() {
+        let db = db();
+        let task = new_task("mika", "Wrong path", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        // pr_url in a different metadata path (not under claude_pilot)
+        let meta = r#"{"other":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
+        db.update_work_item_metadata(&id, meta).unwrap();
+
+        let found = db
+            .find_active_work_item_by_pr_url(
+                "mika",
+                "https://github.com/senara-solutions/mika/pull/42",
+            )
+            .unwrap();
+        assert!(found.is_none());
     }
 }

@@ -13,4 +13,5 @@ mod eval {
     mod test_error_handling;
     mod test_multi_step;
     mod test_tool_calling;
+    mod test_verdict_handler;
 }

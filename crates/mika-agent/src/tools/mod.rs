@@ -26,7 +26,7 @@ mod list_tasks;
 mod list_teams;
 mod list_work_items;
 mod list_workspace;
-mod pr_merge_with_gate;
+pub(crate) mod pr_merge_with_gate;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
