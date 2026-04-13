@@ -439,6 +439,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_check_invalid_uuid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CheckWorkItemTool;
+
+        let result = tool
+            .execute(serde_json::json!({"task_id": "not-a-uuid"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("invalid_uuid"));
+    }
+
+    #[tokio::test]
     async fn test_check_empty_task_id() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();

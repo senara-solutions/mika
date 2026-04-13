@@ -245,9 +245,15 @@ pub(crate) fn validate_uuid(
     field_name: &str,
     value: &str,
 ) -> std::result::Result<Uuid, ToolOutput> {
-    // Truncate for error display — prevent long garbage from consuming LLM context
+    // Truncate for error display — prevent long garbage from consuming LLM context.
+    // Use char_indices to find a safe char boundary (avoids panic on multi-byte UTF-8).
     let display_value = if value.len() > 50 {
-        format!("{}...", &value[..50])
+        let boundary = value
+            .char_indices()
+            .nth(50)
+            .map(|(i, _)| i)
+            .unwrap_or(value.len());
+        format!("{}...", &value[..boundary])
     } else {
         value.to_string()
     };
@@ -716,6 +722,18 @@ mod tests {
         assert!(err.content.contains("..."));
         // Should NOT contain the full 1000-char string
         assert!(!err.content.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn test_validate_uuid_multibyte_utf8_no_panic() {
+        // 51 two-byte chars = 102 bytes; truncation must not panic on char boundary
+        let input = "é".repeat(51);
+        let result = validate_uuid("id", &input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("..."));
+        // The received field should have exactly 50 'é' chars + "..."
+        assert!(err.content.contains("invalid_uuid"));
     }
 
     #[test]
