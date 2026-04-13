@@ -6,4 +6,4 @@ always_on = false
 timeout_secs = 30
 
 [triggers]
-keywords = ["tmux", "terminal session", "background process", "long-running"]
+keywords = ["terminal session", "background process", "long-running"]

@@ -6,4 +6,4 @@ always_on = false
 timeout_secs = 10
 
 [triggers]
-keywords = ["mcp", "model context protocol", "mcp server", "mcp tool"]
+keywords = ["model context protocol", "mcp server", "mcp tool"]
