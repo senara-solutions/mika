@@ -53,6 +53,7 @@ use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use uuid::Uuid;
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
@@ -229,6 +230,41 @@ pub(crate) fn check_reflection_evidence(
     None
 }
 
+/// Validate that a string is a well-formed UUID.
+///
+/// Returns `Ok(Uuid)` on success or `Err(ToolOutput::error(...))` with a structured
+/// JSON error on failure. The error includes the field name and the received value
+/// (truncated to 50 chars) so the LLM can self-correct.
+///
+/// # Example
+/// ```ignore
+/// let uuid = validate_uuid("task_id", id)?;
+/// // If Err, the ToolOutput is ready to return via Ok(tool_output)
+/// ```
+pub(crate) fn validate_uuid(
+    field_name: &str,
+    value: &str,
+) -> std::result::Result<Uuid, ToolOutput> {
+    // Truncate for error display — prevent long garbage from consuming LLM context
+    let display_value = if value.len() > 50 {
+        format!("{}...", &value[..50])
+    } else {
+        value.to_string()
+    };
+
+    Uuid::parse_str(value).map_err(|_| {
+        ToolOutput::error(
+            serde_json::json!({
+                "error": "invalid_uuid",
+                "field": field_name,
+                "received": display_value,
+                "reason": "string is not a well-formed UUID (expected 8-4-4-4-12 hex segments)"
+            })
+            .to_string(),
+        )
+    })
+}
+
 /// Validate that a `work_item_id` references an active manual work item.
 /// Returns `Some(error_message)` if validation fails, `None` if valid.
 pub(crate) async fn validate_work_item(
@@ -241,6 +277,10 @@ pub(crate) async fn validate_work_item(
              No delegation without tracking."
                 .to_string(),
         );
+    }
+    // Validate UUID format before DB lookup — catches fabricated/malformed IDs early
+    if let Err(tool_output) = validate_uuid("work_item_id", work_item_id) {
+        return Some(tool_output.content);
     }
     match db.get_task(work_item_id).await {
         Ok(Some(ref wi))
@@ -616,6 +656,84 @@ pub fn management_tools_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === validate_uuid tests ===
+
+    #[test]
+    fn test_validate_uuid_valid_hyphenated() {
+        let result = validate_uuid("task_id", "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_uuid_valid_non_hyphenated() {
+        let result = validate_uuid("task_id", "a1b2c3d4e5f67890abcdef1234567890");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_uuid_empty_string() {
+        let result = validate_uuid("task_id", "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("invalid_uuid"));
+        assert!(err.content.contains("task_id"));
+    }
+
+    #[test]
+    fn test_validate_uuid_too_short() {
+        let result = validate_uuid("id", "abc");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("invalid_uuid"));
+        assert!(err.content.contains(r#""field":"id""#));
+        assert!(err.content.contains(r#""received":"abc""#));
+    }
+
+    #[test]
+    fn test_validate_uuid_fabricated_suffix() {
+        // The actual fabricated UUID from the incident
+        let result = validate_uuid("task_id", "eda3190e-764c-4b0f-a123456789ab");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("invalid_uuid"));
+    }
+
+    #[test]
+    fn test_validate_uuid_non_hex_chars() {
+        let result = validate_uuid("id", "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_uuid_long_input_truncated() {
+        let long_input = "x".repeat(1000);
+        let result = validate_uuid("task_id", &long_input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // The received field should be truncated to 50 chars + "..."
+        assert!(err.content.contains("..."));
+        // Should NOT contain the full 1000-char string
+        assert!(!err.content.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn test_validate_uuid_field_name_propagated() {
+        let result = validate_uuid("parent_task_id", "not-a-uuid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("parent_task_id"));
+    }
+
+    #[test]
+    fn test_validate_uuid_returns_parsed_uuid() {
+        let result = validate_uuid("id", "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+        let uuid = result.unwrap();
+        assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    }
+
+    // === validate_and_resolve_path tests ===
 
     #[tokio::test]
     async fn test_tilde_expansion_strips_prefix() {

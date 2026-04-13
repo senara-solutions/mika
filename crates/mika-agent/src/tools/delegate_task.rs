@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delegate_task_invalid_work_item_id() {
+    async fn test_delegate_task_invalid_work_item_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = DelegateTaskTool {
@@ -417,6 +417,36 @@ mod tests {
                     "agent_name": "researcher",
                     "task": "do something",
                     "work_item_id": "nonexistent-id"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("invalid_uuid"),
+            "expected UUID validation error, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_task_work_item_not_found() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = DelegateTaskTool {
+            home_dir: PathBuf::from("/tmp"),
+            settings: dummy_settings(),
+            http_client: reqwest::Client::new(),
+            github_app: None,
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "agent_name": "researcher",
+                    "task": "do something",
+                    "work_item_id": "00000000-0000-0000-0000-000000000000"
                 }),
                 &ctx,
             )

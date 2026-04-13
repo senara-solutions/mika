@@ -203,10 +203,8 @@ impl Tool for CheckWorkItemTool {
         if task_id.is_empty() {
             return Ok(ToolOutput::error("'task_id' is required."));
         }
-        if task_id.len() > 36 {
-            return Ok(ToolOutput::error(
-                "'task_id' must be a valid UUID (36 characters).",
-            ));
+        if let Err(e) = super::validate_uuid("task_id", task_id) {
+            return Ok(e);
         }
 
         // Look up the work item (manual tasks only, agent-scoped)

@@ -42,10 +42,8 @@ impl Tool for CompleteTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        if id.len() > 36 {
-            return Ok(ToolOutput::error(
-                "'id' must be a valid task UUID (36 characters).",
-            ));
+        if let Err(e) = super::validate_uuid("id", id) {
+            return Ok(e);
         }
 
         let result = input["result"].as_str().unwrap_or("").trim();
@@ -229,14 +227,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_task_id_too_long() {
+    async fn test_complete_task_invalid_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CompleteTaskTool;
-        let long_id = "a".repeat(37);
-        let input = serde_json::json!({"id": long_id, "result": "result"});
+        let input = serde_json::json!({"id": "not-a-valid-uuid", "result": "result"});
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
-        assert!(output.content.contains("UUID"));
+        assert!(output.content.contains("invalid_uuid"));
     }
 }

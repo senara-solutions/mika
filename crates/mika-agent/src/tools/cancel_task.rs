@@ -39,10 +39,8 @@ impl Tool for CancelTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        if id.len() > 36 {
-            return Ok(ToolOutput::error(
-                "'id' must be a valid task UUID (36 characters).",
-            ));
+        if let Err(e) = super::validate_uuid("id", id) {
+            return Ok(e);
         }
 
         let outcome = crate::task_engine::process_kill::cancel_task_and_kill(ctx.db, id).await?;

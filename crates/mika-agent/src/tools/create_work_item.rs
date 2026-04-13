@@ -129,6 +129,13 @@ impl Tool for CreateWorkItemTool {
             ));
         }
 
+        // Validate parent_task_id format before DB lookup
+        if let Some(parent_id) = parent_task_id
+            && let Err(e) = super::validate_uuid("parent_task_id", parent_id)
+        {
+            return Ok(e);
+        }
+
         // Guard 2: Depth cap (application-level check before hitting DB constraint)
         let depth = if let Some(parent_id) = parent_task_id {
             match ctx.db.get_task_depth(parent_id).await? {
@@ -610,7 +617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_work_item_invalid_parent() {
+    async fn test_create_work_item_invalid_parent_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateWorkItemTool;
@@ -620,6 +627,31 @@ mod tests {
                 serde_json::json!({
                     "label": "Orphan",
                     "parent_task_id": "nonexistent-id",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("invalid_uuid"),
+            "expected UUID error, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_parent_not_found() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Orphan",
+                    "parent_task_id": "00000000-0000-0000-0000-000000000000",
                     "source": "user_request"
                 }),
                 &ctx,
