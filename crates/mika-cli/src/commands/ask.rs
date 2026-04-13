@@ -230,6 +230,17 @@ pub async fn run(
     {
         skill_registry.apply_overrides(&overrides);
     }
+    skill_registry.validate_loaded();
+
+    // Surface validation warnings on stderr (Unit 4: #530)
+    let warn_count = skill_registry.validated_warnings().len();
+    if warn_count > 0 {
+        eprintln!(
+            "[mika] {warn_count} skill(s) loaded with validation warnings. \
+             Run 'mika skills validate' for details."
+        );
+    }
+
     let skill_registry = Arc::new(skill_registry);
     let is_onboarding = check_onboarding(&ctx.async_db).await;
     let skills_dirty = AtomicBool::new(false);
