@@ -87,7 +87,7 @@ Git-based and local skill distribution via `mika skills install/uninstall/update
 
 **Image protocol (`__mika_v1`):** Scripts return images via JSON envelope `{"__mika_v1": {"text": "...", "images": ["/path/to/img"]}}`. Executor validates files (5MB limit, magic-byte check for JPEG/PNG/GIF/WebP), base64-encodes, max 5 images per result.
 
-**Long-running:** `long_running: true` + `estimated_duration_secs` in `skill.toml`. Conversation mode only. Creates callback task, injects `__mika_task_id` and `__mika_agent` env vars, spawns detached process. PID recorded for orphan cleanup.
+**Long-running:** `long_running: true` + `estimated_duration_secs` in `skill.toml`. Conversation mode only. Creates callback task, injects `__mika_task_id` and `__mika_agent` env vars, spawns detached process. PID recorded for orphan cleanup. **Dispatch-readiness guard (#525):** before spawning, `validate_dispatch_readiness()` enforces two checks: (1) work item status must be `pending` or `in_progress` (rejects `blocked`/`completed`/`cancelled` with structured JSON error `work_item_not_dispatchable`), (2) no active callback child task may exist (rejects with `work_item_active_dispatch`). Fail-closed on DB errors. Auto-transitions `pending` work items to `in_progress` on successful dispatch. Stricter than the shared `validate_work_item()` which also allows `blocked` for `delegate_task`.
 
 ## MCP (Model Context Protocol) Client
 

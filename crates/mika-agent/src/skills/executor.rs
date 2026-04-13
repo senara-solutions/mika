@@ -547,6 +547,120 @@ fn truncate_output(s: &str) -> String {
     }
 }
 
+/// Validate that a work item is in a dispatchable state for long-running execution.
+///
+/// Stricter than `validate_work_item()` (which also allows `blocked` for delegation).
+/// Long-running dispatch only permits `pending` and `in_progress`, and rejects if an
+/// active callback child task already exists (double-dispatch prevention).
+///
+/// Returns `Err(json_error_string)` on rejection, `Ok(status)` with the work item's
+/// current status if dispatch may proceed.
+async fn validate_dispatch_readiness(
+    db: &AsyncDatabase,
+    work_item_id: &str,
+) -> Result<String, String> {
+    // Re-fetch the task to get the full struct (validate_work_item confirmed existence)
+    let task = match db.get_task(work_item_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            // Should not happen after validate_work_item, but defense-in-depth
+            return Err(serde_json::json!({
+                "error": "work_item_not_found",
+                "task_id": work_item_id,
+                "reason": "Work item does not exist in the database"
+            })
+            .to_string());
+        }
+        Err(e) => {
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": work_item_id,
+                "reason": format!("Failed to fetch work item for dispatch check: {e}")
+            })
+            .to_string());
+        }
+    };
+
+    // Only pending and in_progress are dispatchable
+    if !matches!(task.status.as_str(), "pending" | "in_progress") {
+        let pr_url = extract_pr_url(&task.metadata);
+        return Err(serde_json::json!({
+            "error": "work_item_not_dispatchable",
+            "task_id": work_item_id,
+            "current_status": task.status,
+            "pr_url": pr_url,
+            "reason": format!(
+                "Work item is in '{}' state and cannot be dispatched. \
+                 Only 'pending' and 'in_progress' work items can be dispatched.",
+                task.status
+            )
+        })
+        .to_string());
+    }
+
+    // Check for active callback children (double-dispatch prevention)
+    match db.get_child_tasks(work_item_id).await {
+        Ok(children) => {
+            let active_callback = children.iter().find(|c| {
+                c.trigger_type == "callback"
+                    && matches!(c.status.as_str(), "pending" | "in_progress")
+            });
+            if let Some(child) = active_callback {
+                let pr_url = extract_pr_url(&task.metadata);
+                return Err(serde_json::json!({
+                    "error": "work_item_active_dispatch",
+                    "task_id": work_item_id,
+                    "current_status": task.status,
+                    "active_child_id": child.id,
+                    "active_child_status": child.status,
+                    "pr_url": pr_url,
+                    "reason": format!(
+                        "Work item already has an active dispatch (callback task '{}' \
+                         in '{}' status). Wait for it to complete or cancel it before \
+                         dispatching again.",
+                        child.id, child.status
+                    )
+                })
+                .to_string());
+            }
+        }
+        Err(e) => {
+            // Fail-closed: if we can't check children, reject dispatch
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": work_item_id,
+                "reason": format!("Failed to check active dispatches for work item: {e}")
+            })
+            .to_string());
+        }
+    }
+
+    Ok(task.status.clone())
+}
+
+/// Extract `pr_url` from a task's metadata JSON.
+///
+/// Looks for `claude_pilot.pr_url` (nested) or `pr_url` (top-level).
+fn extract_pr_url(metadata: &Option<String>) -> Option<String> {
+    let meta = metadata.as_deref()?;
+    let parsed: serde_json::Value = serde_json::from_str(meta).ok()?;
+
+    // Try nested claude_pilot.pr_url first
+    if let Some(url) = parsed
+        .get("claude_pilot")
+        .and_then(|cp| cp.get("pr_url"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(url.to_string());
+    }
+
+    // Fallback to top-level pr_url
+    parsed
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Execute a long-running exec handler by creating a callback task and spawning
 /// the subprocess in the background. Returns immediately with the task ID.
 async fn execute_long_running(
@@ -566,8 +680,39 @@ async fn execute_long_running(
         return ToolOutput::error(err);
     }
 
+    // Dispatch-readiness guard (#525): stricter than validate_work_item() which also
+    // allows `blocked` (needed by delegate_task). Long-running dispatch only permits
+    // `pending` and `in_progress`. Returns the current status on success to avoid
+    // a redundant DB read in the auto-transition below.
+    let wi_status = match validate_dispatch_readiness(&ctx.db, work_item_id).await {
+        Ok(status) => status,
+        Err(err) => return ToolOutput::error(err),
+    };
+
     let estimated = estimated_duration_secs.unwrap_or(3600);
     let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
+
+    // Auto-transition pending work items to in_progress on dispatch (#525).
+    // Closes the TOCTOU window where two dispatches to a pending item both pass.
+    if wi_status == "pending" {
+        if let Err(e) = ctx
+            .db
+            .update_manual_task_status(work_item_id, "in_progress")
+            .await
+        {
+            // Non-fatal: the callback child creation provides a secondary guard
+            warn!(
+                work_item_id,
+                error = %e,
+                "failed to auto-transition work item to in_progress"
+            );
+        } else {
+            info!(
+                work_item_id,
+                "auto-transitioned work item from pending to in_progress on dispatch"
+            );
+        }
+    }
 
     // Link callback task to work item via parent_task_id for task tree correlation
     let parent_task_id = input
@@ -1636,5 +1781,649 @@ mod tests {
             "error should explain the context restriction: {}",
             output.content
         );
+    }
+
+    // -- Dispatch-readiness guard tests (#525) --
+
+    /// Helper: create a work item and transition it to the given status.
+    async fn create_work_item_with_status(
+        db: &crate::async_db::AsyncDatabase,
+        status: &str,
+    ) -> String {
+        let wi_id = create_test_work_item(db).await;
+        if status != "pending" {
+            // pending -> blocked or in_progress are valid transitions;
+            // pending -> completed or cancelled are also valid.
+            db.update_manual_task_status(&wi_id, status).await.unwrap();
+        }
+        wi_id
+    }
+
+    /// Helper: create a callback child task under a work item.
+    async fn create_callback_child(
+        db: &crate::async_db::AsyncDatabase,
+        parent_work_item_id: &str,
+        status: &str,
+    ) -> String {
+        use crate::task_engine::types::{action_type, trigger_type};
+        let task = crate::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_work_item_id.to_string()),
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        let child_id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            // Transition the child to the requested status via direct DB update
+            db.update_task_status(&child_id, status).await.unwrap();
+        }
+        child_id
+    }
+
+    fn make_lr_ctx(db: crate::async_db::AsyncDatabase) -> LongRunningContext {
+        LongRunningContext {
+            db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_blocked_work_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "blocked").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "work_item_not_dispatchable");
+        assert_eq!(parsed["current_status"], "blocked");
+        assert_eq!(parsed["task_id"], wi_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_completed_work_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "completed").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        // Caught by validate_work_item() (first-pass) — not a JSON error
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not an active work item"),
+            "expected validate_work_item rejection, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_cancelled_work_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "cancelled").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        // Caught by validate_work_item() (first-pass)
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not an active work item"),
+            "expected validate_work_item rejection, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_nonexistent_task_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": "fabricated-uuid-that-does-not-exist"}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not found"),
+            "expected not-found error for fabricated UUID, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_active_callback_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        let child_id = create_callback_child(&async_db, &wi_id, "pending").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "work_item_active_dispatch");
+        assert_eq!(parsed["active_child_id"], child_id);
+        assert_eq!(parsed["task_id"], wi_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_in_progress_callback_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        let _child_id = create_callback_child(&async_db, &wi_id, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "work_item_active_dispatch");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_allows_with_only_completed_callback_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        // Create completed and failed callback children — should not block
+        create_callback_child(&async_db, &wi_id, "completed").await;
+        create_callback_child(&async_db, &wi_id, "failed").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        // Should proceed to dispatch — guard must not reject.
+        // If is_error, verify it's NOT a dispatch guard rejection.
+        if output.is_error {
+            assert!(
+                !output.content.contains("work_item_not_dispatchable")
+                    && !output.content.contains("work_item_active_dispatch"),
+                "dispatch guard should not reject, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_allows_cancelled_callback_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        // Cancelled callback child — should not block re-dispatch
+        create_callback_child(&async_db, &wi_id, "cancelled").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        if output.is_error {
+            assert!(
+                !output.content.contains("work_item_not_dispatchable")
+                    && !output.content.contains("work_item_active_dispatch"),
+                "dispatch guard should not reject for cancelled child, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_ignores_non_callback_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+
+        // Create a non-callback child (e.g., resume_agent with manual trigger)
+        let non_callback = crate::db::NewTask {
+            agent_id: async_db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(wi_id.clone()),
+            depth: 0,
+            label: "delegate:some-agent".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+        };
+        async_db.create_task(non_callback).await.unwrap();
+
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        // Should proceed — non-callback children don't block
+        if output.is_error {
+            assert!(
+                !output.content.contains("work_item_not_dispatchable")
+                    && !output.content.contains("work_item_active_dispatch"),
+                "dispatch guard should not reject for non-callback children, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_mixed_children_one_active_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        // One completed, one still pending — should block
+        create_callback_child(&async_db, &wi_id, "completed").await;
+        create_callback_child(&async_db, &wi_id, "pending").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "work_item_active_dispatch");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_auto_transitions_pending_to_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_work_item(&async_db).await;
+
+        // Verify starts as pending
+        let task_before = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(task_before.status, "pending");
+
+        let ctx = make_lr_ctx(async_db.clone());
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Verify work item transitioned to in_progress
+        let task_after = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(
+            task_after.status, "in_progress",
+            "work item should auto-transition to in_progress on dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_no_transition_for_already_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db.clone());
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Should still be in_progress (no redundant transition)
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "in_progress");
+    }
+
+    // -- Integration test: PR #522 race scenario replay (#525) --
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pr522_replay_active_dispatch_with_pr_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Create in_progress work item with PR URL in metadata
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        let metadata = serde_json::json!({
+            "claude_pilot": {
+                "pr_url": "https://github.com/senara-solutions/mika/pull/522",
+                "branch": "feat/522/some-feature"
+            }
+        });
+        async_db
+            .update_work_item_metadata(&wi_id, &metadata.to_string())
+            .await
+            .unwrap();
+
+        // Simulate active claude-pilot session (pending callback child)
+        create_callback_child(&async_db, &wi_id, "pending").await;
+
+        // Count tasks before attempted dispatch
+        let tasks_before = async_db.get_child_tasks(&wi_id).await.unwrap().len();
+
+        let ctx = make_lr_ctx(async_db.clone());
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        // Should be rejected
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "work_item_active_dispatch");
+        assert_eq!(
+            parsed["pr_url"],
+            "https://github.com/senara-solutions/mika/pull/522"
+        );
+
+        // Verify no new callback task was created
+        let tasks_after = async_db.get_child_tasks(&wi_id).await.unwrap().len();
+        assert_eq!(
+            tasks_before, tasks_after,
+            "no new callback task should be created when dispatch is rejected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pr522_replay_no_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_id, "pending").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "work_item_active_dispatch");
+        assert!(
+            parsed["pr_url"].is_null(),
+            "pr_url should be null when no metadata"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pr522_replay_retry_after_child_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_work_item_with_status(&async_db, "in_progress").await;
+        let child_id = create_callback_child(&async_db, &wi_id, "pending").await;
+
+        // First attempt: should be rejected
+        let ctx = make_lr_ctx(async_db.clone());
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+        assert!(output.is_error);
+
+        // Complete the child task
+        async_db
+            .update_task_status(&child_id, "completed")
+            .await
+            .unwrap();
+
+        // Retry: should succeed now
+        let ctx = make_lr_ctx(async_db.clone());
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(
+            !output.is_error,
+            "retry after child completion should succeed, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_double_dispatch_pending_item() {
+        // Regression: two sequential dispatches to a pending work item.
+        // First should succeed (and auto-transition to in_progress + create callback).
+        // Second should be rejected by active-child check.
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_work_item(&async_db).await;
+
+        // First dispatch: should succeed
+        let ctx = make_lr_ctx(async_db.clone());
+        let output1 = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+        assert!(
+            !output1.is_error,
+            "first dispatch should succeed: {}",
+            output1.content
+        );
+
+        // Verify first dispatch created exactly one callback child
+        let children = async_db.get_child_tasks(&wi_id).await.unwrap();
+        let callback_children: Vec<_> = children
+            .iter()
+            .filter(|c| c.trigger_type == "callback")
+            .collect();
+        assert_eq!(
+            callback_children.len(),
+            1,
+            "first dispatch must create exactly one callback child"
+        );
+
+        // Second dispatch: should be rejected (active callback child from first dispatch)
+        let ctx = make_lr_ctx(async_db.clone());
+        let output2 = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+        assert!(output2.is_error, "second dispatch should be rejected");
+        let parsed: serde_json::Value = serde_json::from_str(&output2.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output2.content));
+        assert_eq!(parsed["error"], "work_item_active_dispatch");
+
+        // Verify work item is in_progress (auto-transitioned by first dispatch)
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "in_progress");
     }
 }
