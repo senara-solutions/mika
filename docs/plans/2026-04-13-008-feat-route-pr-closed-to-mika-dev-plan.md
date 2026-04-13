@@ -1,7 +1,7 @@
 ---
 title: "feat: Route pull_request.closed webhook to mika-dev"
 type: feat
-status: active
+status: completed
 date: 2026-04-13
 ---
 
