@@ -808,12 +808,18 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
     // 5b. Validate [constraints] required_tools against known tool names
     for required in &manifest.constraints.required_tools {
         if !skill_tool_names.contains(required) {
-            // Advisory warning — the tool might be a builtin or MCP tool
-            diags.push(SkillDiagnostic::warn(format!(
-                "[constraints] required_tools references '{}' which is not in this skill's \
-                 tools.json — this is OK if it's a builtin or MCP tool",
-                required
-            )));
+            // Check if the tool name plausibly comes from a declared dependency
+            let likely_from_dep = manifest.skill.dependencies.iter().any(|dep| {
+                let prefix = dep.replace('-', "_");
+                required.starts_with(&prefix)
+            });
+            if !likely_from_dep {
+                diags.push(SkillDiagnostic::warn(format!(
+                    "[constraints] required_tools references '{}' which is not in this skill's \
+                     tools.json — this is OK if it's a builtin, MCP, or dependency tool",
+                    required
+                )));
+            }
         }
     }
 
