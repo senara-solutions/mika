@@ -107,10 +107,8 @@ impl Tool for UpdateWorkItemStatusTool {
         if task_id.is_empty() {
             return Ok(ToolOutput::error("'task_id' is required."));
         }
-        if task_id.len() > 36 {
-            return Ok(ToolOutput::error(
-                "'task_id' must be a valid UUID (36 characters).",
-            ));
+        if let Err(e) = super::validate_uuid("task_id", task_id) {
+            return Ok(e);
         }
         if status.is_empty() {
             return Ok(ToolOutput::error("'status' is required."));
@@ -344,6 +342,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_status_invalid_uuid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": "not-a-uuid", "status": "completed"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("invalid_uuid"));
+    }
+
+    #[tokio::test]
     async fn test_update_status_invalid_status() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
@@ -351,7 +366,7 @@ mod tests {
 
         let result = tool
             .execute(
-                serde_json::json!({"task_id": "some-id", "status": "invalid"}),
+                serde_json::json!({"task_id": "00000000-0000-0000-0000-000000000000", "status": "invalid"}),
                 &ctx,
             )
             .await
@@ -437,7 +452,10 @@ mod tests {
         assert!(result.content.contains("'task_id' is required"));
 
         let result = tool
-            .execute(serde_json::json!({"task_id": "abc"}), &ctx)
+            .execute(
+                serde_json::json!({"task_id": "00000000-0000-0000-0000-000000000000"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(result.is_error);

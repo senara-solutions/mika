@@ -36,10 +36,8 @@ impl Tool for GetTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        if id.len() > 36 {
-            return Ok(ToolOutput::error(
-                "'id' must be a valid task UUID (36 characters).",
-            ));
+        if let Err(e) = super::validate_uuid("id", id) {
+            return Ok(e);
         }
 
         let task = match ctx.db.get_task(id).await? {
@@ -162,17 +160,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_task_id_too_long() {
+    async fn test_get_task_invalid_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = GetTaskTool;
 
-        let long_id = "x".repeat(37);
         let result = tool
-            .execute(serde_json::json!({"id": long_id}), &ctx)
+            .execute(serde_json::json!({"id": "not-a-uuid"}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("UUID"));
+        assert!(result.content.contains("invalid_uuid"));
     }
 }

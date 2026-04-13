@@ -1,0 +1,104 @@
+---
+title: UUID Validation at Tool Boundary
+date: 2026-04-13
+category: best-practices
+module: mika-agent/tools
+problem_type: best_practice
+component: tooling
+severity: medium
+applies_when:
+  - Adding a new tool that accepts a UUID-typed argument (task_id, work_item_id, parent_task_id, etc.)
+  - LLM is fabricating or hallucinating UUIDs during recovery or multi-step workflows
+  - Soft "not found" errors from DB lookups are not teaching the LLM what went wrong structurally
+tags:
+  - uuid-validation
+  - tool-boundary
+  - hallucination-defense
+  - structural-guard
+  - input-validation
+---
+
+# UUID Validation at Tool Boundary
+
+## Context
+
+On 2026-04-11, mika-dev (qwen3-coder) called `run_claude_pilot` with a fabricated task_id — it pattern-matched the UUID shape from prior context and fabricated the suffix `a123456789ab`. The tool accepted it (only checking `len > 36`), hit the DB, and returned a soft "Work item not found" error. The LLM simply retried with the correct ID, wasting a tool step and DB query.
+
+Prompt-level instructions ("use the exact task_id") are unreliable for this failure class (per `feedback_prompt_enforcement_fragile.md`). The project philosophy is: "If the agent ignoring an instruction would cause real harm, enforce it in the harness."
+
+## Guidance
+
+Use the shared `validate_uuid(field_name, value)` helper in `tools/mod.rs` for every tool argument that should be a UUID. The helper:
+
+1. Parses the value with `uuid::Uuid::parse_str()`
+2. Returns `Ok(Uuid)` on success or `Err(ToolOutput::error(...))` with a structured JSON error
+3. Truncates the `received` value to 50 characters (using char boundaries for UTF-8 safety)
+
+The structured error format:
+```json
+{
+  "error": "invalid_uuid",
+  "field": "task_id",
+  "received": "eda3190e-764c-4b0f-a123456789ab",
+  "reason": "string is not a well-formed UUID (expected 8-4-4-4-12 hex segments)"
+}
+```
+
+Call pattern in tool `execute()` methods:
+```rust
+let id = input["id"].as_str().unwrap_or("").trim();
+if id.is_empty() {
+    return Ok(ToolOutput::error("'id' is required."));
+}
+if let Err(e) = super::validate_uuid("id", id) {
+    return Ok(e);
+}
+// id is now known to be a valid UUID format — proceed to DB lookup
+```
+
+Keep the empty-string check before `validate_uuid()` — it produces a more actionable "'id' is required" error than the generic UUID format error.
+
+For shared helpers like `validate_work_item()` that return `Option<String>`, extract the error content:
+```rust
+if let Err(tool_output) = validate_uuid("work_item_id", work_item_id) {
+    return Some(tool_output.content);
+}
+```
+
+## Why This Matters
+
+- **Structural enforcement beats prompt instructions.** The LLM cannot rationalize past a tool-boundary validator. Prompt-level "always use the exact task_id" is a soft suggestion the LLM can ignore under recovery load.
+- **Structured errors enable self-correction.** A plain "not found" error doesn't tell the LLM *why* the ID failed. The structured `invalid_uuid` error with field name and received value teaches the LLM the structural rule.
+- **Wasted work is prevented.** DB lookups, subprocess calls, and network requests don't happen for obviously malformed inputs.
+- **Defense-in-depth.** This complements #525 (dispatch-readiness guard) which catches valid-but-stale UUIDs. Together they fully close the hallucinated-task_id vulnerability.
+
+## When to Apply
+
+- Every tool in `crates/mika-agent/src/tools/` that accepts a `task_id`, `work_item_id`, `parent_task_id`, or similar UUID-typed field
+- NOT for `session_id` (uses prefixed formats like `delegate-{uuid}`, `system-{agent_id}`) or `trace_id` (32-char hex, not hyphenated UUID)
+- NOT for optional filter parameters where an invalid value simply returns empty results (e.g., `get_team_status` `run_id`)
+
+## Examples
+
+**Before (weak validation):**
+```rust
+if id.len() > 36 {
+    return Ok(ToolOutput::error("'id' must be a valid task UUID (36 characters)."));
+}
+// "abc" passes this check and hits the DB
+```
+
+**After (proper UUID validation):**
+```rust
+if let Err(e) = super::validate_uuid("id", id) {
+    return Ok(e);
+}
+// Only well-formed UUIDs reach the DB
+```
+
+## Related
+
+- [Dispatch-readiness guard](../architecture-patterns/dispatch-readiness-guard-long-running-status-validation.md) — catches valid-but-stale UUIDs (#525)
+- [Fabricated action-claim guard](../architecture-patterns/fabricated-action-claim-guard.md) — structural guard philosophy
+- [Team workspace hardening](../security-issues/team-workspace-ref-dir-validation-hardening.md) — precedent for `Uuid::parse_str()` at entry boundaries
+- GitHub issue: [#531](https://github.com/senara-solutions/mika/issues/531)
