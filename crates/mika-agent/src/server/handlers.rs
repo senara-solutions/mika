@@ -227,10 +227,16 @@ pub async fn handle_message(
             // NOTE: This depends on the gateway's format_event_text() output
             // format for pull_request_review events.
             if req.channel == "github" {
+                // Resolve per-agent GitHub token (PAT > App > None),
+                // matching run_agent() pattern at agent.rs:1243 (#561).
+                let verdict_github_token = a
+                    .settings
+                    .resolve_github_token(a.github_app.as_deref())
+                    .await;
                 let action = try_handle_pr_review_verdict(
                     &req.text,
                     &a.db,
-                    s.github_token.as_deref(),
+                    verdict_github_token.as_deref(),
                     Some(&sender_arc),
                     &session_id,
                     &req.request_id,
@@ -265,7 +271,7 @@ pub async fn handle_message(
                 thinking: None,
                 user_images: &user_images,
                 brave_api_key: s.brave_api_key.as_deref(),
-                github_token: s.github_token.as_deref(),
+                github_token: a.settings.agent_github_token(),
                 github_app: a.github_app.as_deref(),
                 skills_dirty: &a.skills_dirty,
                 mcp_manager: a.mcp_manager.as_ref(),
