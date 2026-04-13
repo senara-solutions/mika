@@ -346,6 +346,13 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn find_active_work_item_by_pr_url(&self, pr_url: &str) -> Result<Option<Task>> {
+        let a = self.agent_id.clone();
+        let url = pr_url.to_owned();
+        self.with_db(move |db| db.find_active_work_item_by_pr_url(&a, &url))
+            .await
+    }
+
     pub async fn find_active_work_item_by_label(&self, label: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let l = label.to_owned();

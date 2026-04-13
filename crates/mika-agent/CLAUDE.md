@@ -59,6 +59,10 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 `pr_merge_with_gate` builtin tool — structural backstop against merging PRs with failing required CI checks. Registered in `default_tools()` (all agents, including delegates). Decision matrix: fail/cancel -> blocked; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op. 60s timeout. Requires `ctx.github_token`. See #490.
 
+### Structural Verdict Handler
+
+`server::verdict_handler` — intercepts `pull_request_review.submitted` webhook events **before** the LLM turn in `handle_message`. Parses `VERDICT:` line from the review body. For `pass` verdicts with matching `in_progress` work items: initiates merge via `run_gh_checks` + `run_gh_merge` (reused from `pr_merge_with_gate`), updates work item metadata, logs `verdict_handled` audit event, sends notification. For `block[*]`/`hold[*]` verdicts: passes through to LLM. For missing `VERDICT:` line: passes through with `verdict_missing=true` enrichment. Parser in `server::verdict` depends on gateway's `format_event_text()` output format. 60s timeout on subprocess calls. See #524.
+
 ### Introspection Tools
 
 4 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap). Non-orchestrator agents scoped to their own agent_id/sessions.

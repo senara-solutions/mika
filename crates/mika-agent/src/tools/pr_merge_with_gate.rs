@@ -238,26 +238,26 @@ enum MergeGateResult {
 
 /// Check info included in the structured result.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct CheckInfo {
-    name: String,
-    state: String,
+pub(crate) struct CheckInfo {
+    pub(crate) name: String,
+    pub(crate) state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    link: Option<String>,
+    pub(crate) link: Option<String>,
 }
 
 /// A single check from `gh pr checks --json` output.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-struct GhCheck {
-    name: String,
-    state: String,
-    bucket: String,
+pub(crate) struct GhCheck {
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) bucket: String,
     #[serde(default)]
-    link: Option<String>,
+    pub(crate) link: Option<String>,
 }
 
 /// Classification of the overall check status.
 #[derive(Debug, Clone, PartialEq)]
-enum CheckClassification {
+pub(crate) enum CheckClassification {
     /// All checks passed (or no required checks exist).
     AllPassed,
     /// Some checks are pending, but none have failed.
@@ -300,7 +300,7 @@ fn validate_merge_method(method: &str) -> Result<(), String> {
 // Check classification (pure function — easily testable)
 // ---------------------------------------------------------------------------
 
-fn classify_checks(checks: &[GhCheck]) -> CheckClassification {
+pub(crate) fn classify_checks(checks: &[GhCheck]) -> CheckClassification {
     let has_failures = checks
         .iter()
         .any(|c| matches!(c.bucket.as_str(), "fail" | "cancel"));
@@ -321,7 +321,11 @@ fn classify_checks(checks: &[GhCheck]) -> CheckClassification {
 
 /// Run `gh pr checks <number> --repo <repo> --required --json name,state,bucket,link`
 /// and return the parsed check list.
-async fn run_gh_checks(pr_number: u64, repo: &str, token: &str) -> Result<Vec<GhCheck>, String> {
+pub(crate) async fn run_gh_checks(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+) -> Result<Vec<GhCheck>, String> {
     let pr_str = pr_number.to_string();
     let args = vec![
         "pr",
@@ -348,7 +352,7 @@ async fn run_gh_checks(pr_number: u64, repo: &str, token: &str) -> Result<Vec<Gh
 
 /// Run `gh pr merge <number> --repo <repo> --<method> [--delete-branch] [--auto]`
 /// and return stdout on success or stderr on failure.
-async fn run_gh_merge(
+pub(crate) async fn run_gh_merge(
     pr_number: u64,
     repo: &str,
     merge_method: &str,
@@ -374,7 +378,7 @@ async fn run_gh_merge(
 ///
 /// Returns stdout on success. On failure, returns an error string combining
 /// exit code and stderr.
-async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<String, String> {
+pub(crate) async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args(args);
     cmd.env("GH_PROMPT_DISABLED", "1");

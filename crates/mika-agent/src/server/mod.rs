@@ -10,6 +10,8 @@ pub mod openapi;
 pub mod rewind;
 pub mod state;
 pub mod types;
+pub(crate) mod verdict;
+pub mod verdict_handler;
 
 use anyhow::{Result, anyhow};
 use axum::{
