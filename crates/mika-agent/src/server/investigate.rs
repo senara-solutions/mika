@@ -765,6 +765,8 @@ async fn run_investigation(
         model_name: llm.model_name(),
     };
 
+    let mut text_sent = false;
+
     for _step in 0..MAX_INVESTIGATION_STEPS {
         let request = LlmRequest {
             model: llm.model_name().to_string(),
@@ -802,6 +804,15 @@ async fn run_investigation(
                 }
             };
 
+        // Warn on empty LLM response (0 output tokens)
+        if response.content.is_empty() {
+            tracing::warn!(
+                provider = llm.provider_name(),
+                model = llm.model_name(),
+                "investigation LLM returned empty response (0 output tokens)"
+            );
+        }
+
         // Collect text and tool_use blocks
         let mut text_parts = Vec::new();
         let mut tool_uses = Vec::new();
@@ -824,16 +835,28 @@ async fn run_investigation(
         // Send any text as a delta
         if !text_parts.is_empty() {
             let full_text = text_parts.join("");
-            if send_event(&tx, InvestigateEvent::TextDelta { text: full_text })
-                .await
-                .is_err()
-            {
-                return; // Client disconnected
+            if !full_text.is_empty() {
+                text_sent = true;
+                if send_event(&tx, InvestigateEvent::TextDelta { text: full_text })
+                    .await
+                    .is_err()
+                {
+                    return; // Client disconnected
+                }
             }
         }
 
         // If stop_reason is end_turn (no tool calls), we're done
         if response.stop_reason == LlmStopReason::EndTurn || tool_uses.is_empty() {
+            if !text_sent {
+                let _ = send_event(
+                    &tx,
+                    InvestigateEvent::TextDelta {
+                        text: "[The model did not generate a response after using tools. This can happen with some LLM providers. Try asking again or check the agent's LLM configuration.]".to_string(),
+                    },
+                )
+                .await;
+            }
             let _ = send_event(&tx, InvestigateEvent::Done {}).await;
             return;
         }
@@ -997,13 +1020,20 @@ pub async fn handle_investigate(
     }
 
     // --- Acquire investigation lock (non-blocking) ---
-    if state.investigation_lock.try_lock().is_err() {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "another investigation is already running"})),
-        )
-            .into_response());
-    }
+    // Use try_lock_owned() so the OwnedMutexGuard can move into the spawned
+    // task without a gap — prevents the race where try_lock() would drop the
+    // guard immediately and another request slips through before the spawned
+    // task re-acquires.
+    let investigation_guard = match state.investigation_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "another investigation is already running"})),
+            )
+                .into_response());
+        }
+    };
 
     // --- Check GitHub tool availability ---
     let has_github =
@@ -1081,15 +1111,15 @@ pub async fn handle_investigate(
         .clone();
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
-    let lock = state.investigation_lock.clone();
     let investigation_session_id = message.session_id.clone();
     let investigation_trace_id = message.trace_id.clone().unwrap_or_default();
 
     info!(message_id = req.message_id, "starting investigation");
 
     tokio::spawn(async move {
-        // Hold the lock for the entire investigation duration
-        let _guard = lock.lock().await;
+        // Guard was acquired in the handler via try_lock_owned() and moved here
+        // — no gap between the check and the hold.
+        let _guard = investigation_guard;
         let _agents = agents; // keep alive for the duration
         run_investigation(
             llm.as_ref(),

@@ -99,10 +99,12 @@ export default function InvestigationPanel({
 
       // Add user message using functional update to avoid stale closure
       const userMsg: ChatMessage = { role: 'user', content: question }
-      // Capture history from ref before state update
+      // Capture history from ref before state update.
+      // Filter out the '...' placeholder that gets set when tools run but no
+      // text response arrives — sending it as history confuses follow-up LLM calls.
       const history = messagesRef.current.map((m) => ({
         role: m.role,
-        content: m.content,
+        content: m.content === '...' ? '' : m.content,
       }))
       setMessages((prev) => [...prev, userMsg])
       setInput('')
