@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use mika_common::llm::LlmImage;
 
-use crate::agent::{self, AgentParams, check_onboarding};
+use crate::agent;
 use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 use crate::task_engine::types::{task_status, trigger_type};
@@ -23,6 +23,9 @@ use super::types::{
     TaskCompleteRequest, TaskCompleteResponse,
 };
 use super::verdict_handler::{VerdictAction, try_handle_pr_review_verdict};
+use super::webhook_queue::{
+    self, DEFERRAL_TIMEOUT, DeferredWebhook, correlate_webhook, should_defer_webhook,
+};
 
 /// Media types accepted by the Claude API for image content blocks.
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -133,6 +136,85 @@ pub async fn handle_message(
         }
     };
 
+    // Webhook deferral check (#528): if this is a GitHub webhook targeting a work item
+    // with an in-flight callback, queue it instead of processing immediately.
+    if req.channel == "github"
+        && let Some(correlation) = correlate_webhook(&req.text)
+        && let Some((work_item_id, event_desc)) =
+            should_defer_webhook(&agent_state.db, &correlation).await
+    {
+        let now = std::time::Instant::now();
+        let deadline = now + DEFERRAL_TIMEOUT;
+        let request_id = req.request_id.clone();
+
+        // Emit audit event
+        if let Err(e) = agent_state
+            .db
+            .log_audit_event(
+                "system",
+                "webhook_deferred",
+                &format!("task:{work_item_id}"),
+                None,
+                Some(&event_desc),
+                Some(&format!(
+                    "Webhook deferred: in-flight callback for work item {work_item_id}"
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to log webhook_deferred audit event");
+        }
+
+        info!(
+            request_id = %request_id,
+            work_item_id = %work_item_id,
+            event = %event_desc,
+            "deferring webhook: work item has in-flight callback"
+        );
+
+        let deferred = DeferredWebhook {
+            request: req,
+            received_at: now,
+            work_item_id: work_item_id.clone(),
+            event_desc,
+            deadline,
+        };
+
+        // Push to queue
+        agent_state.webhook_queue.lock().await.push(deferred);
+
+        // Spawn timeout task that drains only deadline-expired webhooks.
+        // Uses drain_expired (not drain_for_work_item) so recently-arrived
+        // webhooks that haven't hit their individual deadline are preserved.
+        let queue = agent_state.webhook_queue.clone();
+        let agent_state_timeout = agent_state.clone();
+        let state_timeout = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DEFERRAL_TIMEOUT).await;
+            let expired = {
+                let mut q = queue.lock().await;
+                webhook_queue::drain_expired(&mut q)
+            };
+            if !expired.is_empty() {
+                info!(
+                    count = expired.len(),
+                    "replaying expired deferred webhooks after timeout"
+                );
+                replay_deferred_webhooks(expired, &state_timeout, &agent_state_timeout).await;
+            }
+        });
+
+        return (
+            StatusCode::ACCEPTED,
+            Json(AcceptedResponse {
+                request_id,
+                status: "deferred".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     // Try to acquire the agent lock (non-blocking)
     let lock = match agent_state.agent_lock.clone().try_lock_owned() {
         Ok(guard) => guard,
@@ -185,137 +267,7 @@ pub async fn handle_message(
         tracing::info_span!(target: "mika::otel", "process_message", request_id = %request_id);
     tokio::spawn(
         async move {
-            let _lock = lock; // Hold lock for duration of agent loop
-
-            // Hot-reload skills if the dirty flag was set by a previous turn
-            let skills = if a.skills_dirty.load(Ordering::Acquire) {
-                a.skills_dirty.store(false, Ordering::Release);
-                let mut registry =
-                    crate::skills::SkillRegistry::from_dir(&a.home_dir.join("skills"));
-                if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
-                    registry.apply_overrides(&overrides);
-                }
-                let new = Arc::new(registry);
-                *a.skills.lock().unwrap() = new.clone();
-                new
-            } else {
-                a.skills.lock().unwrap().clone()
-            };
-
-            let session_id = uuid::Uuid::new_v4().to_string();
-            if let Err(e) =
-                a.db.create_session(&session_id, a.db.agent_id(), &req.channel)
-                    .await
-            {
-                warn!(error = %e, "failed to create session");
-            }
-            let is_onboarding = check_onboarding(&a.db).await;
-
-            let sender = GatewayMessageSender::new(
-                s.gateway_url.clone(),
-                s.internal_token.clone(),
-                a.db.clone(),
-                s.http_client.clone(),
-                Some(req.request_id.clone()),
-                Some(a.db.agent_id().to_string()),
-                None,
-            );
-            let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
-
-            // Structural verdict handler: intercept PR review webhooks before
-            // the LLM turn and act on VERDICT: pass deterministically (#524).
-            // NOTE: This depends on the gateway's format_event_text() output
-            // format for pull_request_review events.
-            if req.channel == "github" {
-                // Resolve per-agent GitHub token (PAT > App > None),
-                // matching run_agent() pattern at agent.rs:1243 (#561).
-                let verdict_github_token = a
-                    .settings
-                    .resolve_github_token(a.github_app.as_deref())
-                    .await;
-                let action = try_handle_pr_review_verdict(
-                    &req.text,
-                    &a.db,
-                    verdict_github_token.as_deref(),
-                    Some(&sender_arc),
-                    &session_id,
-                    &req.request_id,
-                )
-                .await;
-                match action {
-                    VerdictAction::Handled { pre_digest } => {
-                        req.text = pre_digest;
-                    }
-                    VerdictAction::Passthrough {
-                        enrichment: Some(e),
-                    } => {
-                        req.text = format!("{e}{}", req.text);
-                    }
-                    VerdictAction::Passthrough { enrichment: None } => {}
-                }
-            }
-
-            let params = AgentParams {
-                db: &a.db,
-                llm: a.llm.as_ref(),
-                tools: &s.tools,
-                skills: &skills,
-                user_message: &req.text,
-                channel_type: &req.channel,
-                session_id: &session_id,
-                home_dir: &a.home_dir,
-                is_onboarding,
-                message_sender: Some(sender_arc.clone()),
-                skip_compaction: true,
-                embedding_client: a.embedding_client.as_ref(),
-                thinking: None,
-                user_images: &user_images,
-                brave_api_key: s.brave_api_key.as_deref(),
-                github_token: a.settings.agent_github_token(),
-                github_app: a.github_app.as_deref(),
-                skills_dirty: &a.skills_dirty,
-                mcp_manager: a.mcp_manager.as_ref(),
-                global_home_dir: Some(&s.global_home_dir),
-                is_callback_turn: false,
-                settings: Some(&a.settings),
-                trace_id: Some(req.request_id.clone()),
-                correlated_task_id: None,
-            };
-
-            match agent::run_agent(&params).await {
-                Ok(output) => {
-                    if let Some(response) = output.text {
-                        info!("agent loop completed");
-                        if let Err(e) = sender_arc.send(&response).await {
-                            error!(error = %e, "failed to send response");
-                        }
-                    } else {
-                        info!("agent loop completed (no text response)");
-                        if let Err(e) = sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
-                            error!(error = %e, "failed to send fallback response");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "agent loop failed");
-                    let _ = sender_arc
-                        .send("Sorry, I had a hiccup processing your message. Could you try again?")
-                        .await;
-                }
-            }
-
-            // Spawn compaction outside the lock
-            drop(_lock);
-            let db = a.db.clone();
-            let llm = a.llm.clone();
-            tokio::spawn(
-                async move {
-                    if let Err(e) = compaction::maybe_compact(&db, llm.as_ref()).await {
-                        warn!(error = %e, "post-turn compaction failed");
-                    }
-                }
-                .instrument(tracing::info_span!("compaction")),
-            );
+            run_agent_for_message(&s, &a, req, user_images, lock).await;
         }
         .instrument(span),
     );
@@ -454,6 +406,10 @@ pub async fn handle_task_complete(
         let dispatcher = agent_state.dispatcher.clone();
         let task_id_clone = task_id.clone();
         let result_clone = req.result.clone();
+        let webhook_queue = agent_state.webhook_queue.clone();
+        let agent_state_drain = agent_state.clone();
+        let state_drain = state.clone();
+        let parent_work_item_id = completed_task.parent_task_id.clone();
         tokio::spawn(async move {
             // Persist result and mark completed in DB before dispatch
             match db
@@ -518,7 +474,27 @@ pub async fn handle_task_complete(
                 Err(e) => {
                     warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
                 }
-                Ok(()) => {}
+                Ok(()) => {
+                    // Drain deferred webhooks for the parent work item (#528).
+                    // Only drain on successful dispatch — when AgentBusy fires, the
+                    // callback silent-agent turn has not run, so metadata (pr_url etc.)
+                    // has not been persisted yet. The 60s timeout provides the safety net.
+                    if let Some(ref parent_id) = parent_work_item_id {
+                        let deferred = {
+                            let mut q = webhook_queue.lock().await;
+                            webhook_queue::drain_for_work_item(&mut q, parent_id)
+                        };
+                        if !deferred.is_empty() {
+                            info!(
+                                count = deferred.len(),
+                                work_item_id = %parent_id,
+                                "replaying deferred webhooks after callback completion"
+                            );
+                            replay_deferred_webhooks(deferred, &state_drain, &agent_state_drain)
+                                .await;
+                        }
+                    }
+                }
             }
 
             // Check if all siblings are done → fire parent
@@ -552,12 +528,39 @@ pub async fn handle_task_complete(
                     .into_response();
             }
             Ok(true) => {
-                // Check if all siblings are done → fire parent
-                let dispatcher = agent_state.dispatcher.clone();
-                let tid = task_id.clone();
-                tokio::spawn(async move {
-                    dispatcher.check_and_dispatch_parent(&tid).await;
-                });
+                // Drain deferred webhooks for the parent work item (#528).
+                if let Some(ref parent_id) = task.parent_task_id {
+                    let webhook_queue = agent_state.webhook_queue.clone();
+                    let agent_state_drain = agent_state.clone();
+                    let state_drain = state.clone();
+                    let parent_id = parent_id.clone();
+                    let dispatcher = agent_state.dispatcher.clone();
+                    let tid = task_id.clone();
+                    tokio::spawn(async move {
+                        let deferred = {
+                            let mut q = webhook_queue.lock().await;
+                            webhook_queue::drain_for_work_item(&mut q, &parent_id)
+                        };
+                        if !deferred.is_empty() {
+                            info!(
+                                count = deferred.len(),
+                                work_item_id = %parent_id,
+                                "replaying deferred webhooks after non-resume callback completion"
+                            );
+                            replay_deferred_webhooks(deferred, &state_drain, &agent_state_drain)
+                                .await;
+                        }
+                        // Check if all siblings are done → fire parent
+                        dispatcher.check_and_dispatch_parent(&tid).await;
+                    });
+                } else {
+                    // No parent — just check siblings
+                    let dispatcher = agent_state.dispatcher.clone();
+                    let tid = task_id.clone();
+                    tokio::spawn(async move {
+                        dispatcher.check_and_dispatch_parent(&tid).await;
+                    });
+                }
             }
         }
     }
@@ -622,6 +625,216 @@ pub async fn handle_task_cancel(
                 .into_response()
         }
     }
+}
+
+/// Replay deferred webhooks through the normal message processing path.
+///
+/// Each webhook is processed sequentially, acquiring the agent lock for each turn.
+/// This ensures the verdict handler and LLM see consistent work item metadata.
+async fn replay_deferred_webhooks(
+    webhooks: Vec<DeferredWebhook>,
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+) {
+    for deferred in webhooks {
+        let deferral_ms = deferred.received_at.elapsed().as_millis();
+        info!(
+            request_id = %deferred.request.request_id,
+            work_item_id = %deferred.work_item_id,
+            event = %deferred.event_desc,
+            deferral_ms = deferral_ms,
+            "replaying deferred webhook"
+        );
+
+        // Log replay audit event with deferral duration
+        if let Err(e) = agent_state
+            .db
+            .log_audit_event(
+                "system",
+                "webhook_replayed",
+                &format!("task:{}", deferred.work_item_id),
+                None,
+                Some(&format!("deferral_ms={deferral_ms}")),
+                Some(&format!(
+                    "Replaying deferred webhook: {}",
+                    deferred.event_desc
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to log webhook_replayed audit event");
+        }
+
+        // Acquire the agent lock (blocking wait — the callback turn should have
+        // released it by now, but we wait in case another replayed webhook is
+        // still processing).
+        let lock = agent_state.agent_lock.clone().lock_owned().await;
+
+        // Convert images and process through the shared agent-dispatch path
+        let user_images: Vec<mika_common::llm::LlmImage> = deferred
+            .request
+            .images
+            .as_ref()
+            .map(|imgs| {
+                imgs.iter()
+                    .map(|img| mika_common::llm::LlmImage {
+                        media_type: img.media_type.clone(),
+                        data: img.data.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        run_agent_for_message(state, agent_state, deferred.request, user_images, lock).await;
+    }
+}
+
+/// Shared agent-dispatch logic used by both `handle_message()` (via tokio::spawn)
+/// and `replay_deferred_webhooks()` (inline). Performs skills reload, session creation,
+/// verdict handler interception, agent loop execution, response delivery, and compaction.
+///
+/// The caller provides the agent lock guard; it is held for the duration of the agent
+/// loop and released before compaction.
+const AGENT_ERROR_REPLY: &str =
+    "Sorry, I had a hiccup processing your message. Could you try again?";
+
+async fn run_agent_for_message(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    mut req: MessageRequest,
+    user_images: Vec<mika_common::llm::LlmImage>,
+    lock: tokio::sync::OwnedMutexGuard<()>,
+) {
+    let _lock = lock; // Hold lock for duration of agent loop
+    let a = agent_state;
+
+    // Hot-reload skills if the dirty flag was set by a previous turn
+    let skills = if a.skills_dirty.load(Ordering::Acquire) {
+        a.skills_dirty.store(false, Ordering::Release);
+        let mut registry = crate::skills::SkillRegistry::from_dir(&a.home_dir.join("skills"));
+        if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
+            registry.apply_overrides(&overrides);
+        }
+        let new = Arc::new(registry);
+        *a.skills.lock().unwrap() = new.clone();
+        new
+    } else {
+        a.skills.lock().unwrap().clone()
+    };
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) =
+        a.db.create_session(&session_id, a.db.agent_id(), &req.channel)
+            .await
+    {
+        warn!(error = %e, "failed to create session");
+    }
+    let is_onboarding = agent::check_onboarding(&a.db).await;
+
+    let sender = GatewayMessageSender::new(
+        state.gateway_url.clone(),
+        state.internal_token.clone(),
+        a.db.clone(),
+        state.http_client.clone(),
+        Some(req.request_id.clone()),
+        Some(a.db.agent_id().to_string()),
+        None,
+    );
+    let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
+
+    // Structural verdict handler: intercept PR review webhooks before
+    // the LLM turn and act on VERDICT: pass deterministically (#524).
+    // NOTE: This depends on the gateway's format_event_text() output
+    // format for pull_request_review events.
+    if req.channel == "github" {
+        // Resolve per-agent GitHub token (PAT > App > None),
+        // matching run_agent() pattern at agent.rs:1243 (#561).
+        let verdict_github_token = a
+            .settings
+            .resolve_github_token(a.github_app.as_deref())
+            .await;
+        let action = try_handle_pr_review_verdict(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
+    }
+
+    let params = agent::AgentParams {
+        db: &a.db,
+        llm: a.llm.as_ref(),
+        tools: &state.tools,
+        skills: &skills,
+        user_message: &req.text,
+        channel_type: &req.channel,
+        session_id: &session_id,
+        home_dir: &a.home_dir,
+        is_onboarding,
+        message_sender: Some(sender_arc.clone()),
+        skip_compaction: true,
+        embedding_client: a.embedding_client.as_ref(),
+        thinking: None,
+        user_images: &user_images,
+        brave_api_key: state.brave_api_key.as_deref(),
+        github_token: a.settings.agent_github_token(),
+        github_app: a.github_app.as_deref(),
+        skills_dirty: &a.skills_dirty,
+        mcp_manager: a.mcp_manager.as_ref(),
+        global_home_dir: Some(&state.global_home_dir),
+        is_callback_turn: false,
+        settings: Some(&a.settings),
+        trace_id: Some(req.request_id.clone()),
+        correlated_task_id: None,
+    };
+
+    match agent::run_agent(&params).await {
+        Ok(output) => {
+            if let Some(response) = output.text {
+                info!("agent loop completed");
+                if let Err(e) = sender_arc.send(&response).await {
+                    error!(error = %e, "failed to send response");
+                }
+            } else {
+                info!("agent loop completed (no text response)");
+                if let Err(e) = sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
+                    error!(error = %e, "failed to send fallback response");
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "agent loop failed");
+            let _ = sender_arc.send(AGENT_ERROR_REPLY).await;
+        }
+    }
+
+    // Spawn compaction outside the lock
+    drop(_lock);
+    let db = a.db.clone();
+    let llm = a.llm.clone();
+    tokio::spawn(
+        async move {
+            if let Err(e) = compaction::maybe_compact(&db, llm.as_ref()).await {
+                warn!(error = %e, "post-turn compaction failed");
+            }
+        }
+        .instrument(tracing::info_span!("compaction")),
+    );
 }
 
 /// Flush previously failed outbound sends (best-effort, up to 5).

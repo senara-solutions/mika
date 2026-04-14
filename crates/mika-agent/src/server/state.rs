@@ -15,6 +15,7 @@ use tokio::sync::{OnceCell, broadcast};
 
 use crate::async_db::AsyncDatabase;
 use crate::mcp::McpManager;
+use crate::server::webhook_queue::DeferredWebhook;
 use crate::skills::SkillRegistry;
 use crate::task_engine::{TaskDispatcher, TaskEngine};
 use crate::tools::ToolRegistry;
@@ -40,6 +41,10 @@ pub struct AgentState {
     /// GitHub App authentication manager (optional). When present, installation
     /// tokens are preferred over `MIKA_GITHUB_TOKEN` PAT for agent operations.
     pub github_app: Option<Arc<GitHubApp>>,
+    /// In-memory queue of deferred GitHub webhooks awaiting callback completion (#528).
+    /// Webhooks targeting a work item with an in-flight callback are held here until
+    /// the callback completes or the 60s timeout expires.
+    pub webhook_queue: Arc<tokio::sync::Mutex<Vec<DeferredWebhook>>>,
 }
 
 /// Shared application state for the Axum HTTP server.

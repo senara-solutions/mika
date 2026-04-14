@@ -12,6 +12,7 @@ pub mod state;
 pub mod types;
 pub(crate) mod verdict;
 pub mod verdict_handler;
+pub mod webhook_queue;
 
 use anyhow::{Result, anyhow};
 use axum::{
@@ -406,6 +407,7 @@ async fn init_agent(
         settings: agent_settings,
         llm: agent_llm,
         github_app,
+        webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -843,6 +845,7 @@ mod tests {
             settings: test_settings(),
             llm: llm.clone(),
             github_app: None,
+            webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
 
         let mut agents = HashMap::new();
