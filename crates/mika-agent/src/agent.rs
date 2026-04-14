@@ -2128,12 +2128,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         skills_dirty: params.skills_dirty,
         is_reflection,
         is_task_context: true,
-        // Intentionally false: silent callback loop prevention relies on
-        // `long_running: None` (blocks long-running task spawning) and
-        // `is_task_context: true` (blocks top-level work item creation).
-        // `is_callback_turn` is only meaningful in the Conversation mode path
-        // (TUI poll_callback_tasks) where it additionally gates create_work_item.
-        is_callback_turn: false,
+        // Reflects actual trigger: `true` for SilentTrigger::Callback, `false` otherwise.
+        // Silent callback loop prevention already relies on structural guards
+        // (`long_running: None` blocks long-running task spawning, `is_task_context: true`
+        // blocks top-level work item creation). Propagating this flag lets future
+        // per-tool defense-in-depth hardening gate exec handlers on callback context (#567).
+        is_callback_turn: matches!(params.trigger, SilentTrigger::Callback { .. }),
         provider_name: provider,
         model_name: model,
     };
