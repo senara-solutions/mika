@@ -2061,10 +2061,21 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         system.push_str("\n</context>\n");
     }
 
-    // Match skills: use safe always-on skills (no exec/http handlers).
-    // No per-skill LLM override in silent mode — safe_always_on_skills() returns only
-    // AlwaysOn entries, and resolve_skill_llm_override filters to Keyword only (#463).
-    let matched = params.skills.safe_always_on_skills();
+    // Match skills based on trigger type:
+    // - Callback: agent is continuing a tool call it already authorized in conversation
+    //   mode, so exec/http handlers must remain available for retry/continuation (#567).
+    // - Heartbeat/Reflection/Reminder/SkillRun: fully autonomous triggers — strip
+    //   exec/http handlers so background agents cannot execute arbitrary commands
+    //   without explicit user or agent intent.
+    // Both paths return only AlwaysOn entries, and resolve_skill_llm_override filters
+    // to Keyword only — no per-skill LLM override in silent mode (#463).
+    let matched = match &params.trigger {
+        SilentTrigger::Callback { .. } => params.skills.callback_safe_skills(),
+        SilentTrigger::Heartbeat
+        | SilentTrigger::Reflection
+        | SilentTrigger::Reminder { .. }
+        | SilentTrigger::SkillRun { .. } => params.skills.safe_always_on_skills(),
+    };
 
     let provider = llm.provider_name();
     let model = llm.model_name();

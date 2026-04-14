@@ -325,6 +325,30 @@ impl SkillRegistry {
             })
             .collect()
     }
+
+    /// Return always-on skills for `SilentTrigger::Callback` turns — includes
+    /// skills with `Exec` and `Http` handlers.
+    ///
+    /// A callback turn is the agent's continuation of a tool call it already
+    /// made in conversation mode (e.g. a `run_claude_pilot` long-running task
+    /// that completed or failed). The agent was already exposed to the full
+    /// always-on skill set when it initiated that call, so the retry/continue
+    /// workflow must have access to the same tools. Stripping exec handlers
+    /// here causes retries to fail with `Unknown tool` errors (#567).
+    ///
+    /// Use `safe_always_on_skills()` for all other silent triggers
+    /// (`Heartbeat`, `Reflection`, `Reminder`, `SkillRun`), which are fully
+    /// autonomous and must not trigger exec handlers without the agent or
+    /// user explicitly initiating the workflow.
+    ///
+    /// Note: Like `safe_always_on_skills()`, this method does NOT resolve
+    /// skill dependencies.
+    pub fn callback_safe_skills(&self) -> Vec<&SkillEntry> {
+        self.skills
+            .iter()
+            .filter(|e| e.enabled && e.manifest.skill.always_on)
+            .collect()
+    }
 }
 
 /// Lightweight markdown well-formedness check (#511).
@@ -533,6 +557,128 @@ mod tests {
     fn test_safe_always_on_skills_empty() {
         let registry = SkillRegistry::empty();
         assert!(registry.safe_always_on_skills().is_empty());
+    }
+
+    #[test]
+    fn test_callback_safe_skills_includes_exec_and_http() {
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let dummy_def = ToolDefinition {
+            name: "dummy".to_string(),
+            description: "dummy".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        // Safe builtin-only always_on skill
+        let mut safe_entry = make_entry("memory", true, true);
+        safe_entry.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Builtin {
+                function: "get_documentation".to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/memory"),
+        }];
+
+        // Exec-handler always_on skill (e.g. claude-pilot)
+        let mut exec_entry = make_entry("claude-pilot", true, true);
+        exec_entry.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Exec {
+                command: "./run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(600),
+            },
+            skill_dir: PathBuf::from("/skills/claude-pilot"),
+        }];
+
+        // Http-handler always_on skill
+        let mut http_entry = make_entry("webhook", true, true);
+        http_entry.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Http {
+                url: "https://example.com".to_string(),
+                method: "POST".to_string(),
+            },
+            skill_dir: PathBuf::from("/skills/webhook"),
+        }];
+
+        // Prompt-only always_on skill
+        let prompt_only = make_entry("guidelines", true, true);
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
+        };
+
+        // callback_safe_skills includes all four (exec/http not filtered)
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 4);
+        let names: Vec<&str> = callback
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert!(names.contains(&"memory"));
+        assert!(names.contains(&"claude-pilot"));
+        assert!(names.contains(&"webhook"));
+        assert!(names.contains(&"guidelines"));
+
+        // safe_always_on_skills still strips exec and http (regression check)
+        let safe = registry.safe_always_on_skills();
+        assert_eq!(safe.len(), 2);
+    }
+
+    #[test]
+    fn test_callback_safe_skills_respects_enabled_and_always_on() {
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let dummy_def = ToolDefinition {
+            name: "dummy".to_string(),
+            description: "dummy".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        let exec_tool = || ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Exec {
+                command: "./run.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/skills/x"),
+        };
+
+        // Enabled + always_on + exec — included
+        let mut included = make_entry("included", true, true);
+        included.skill_tools = vec![exec_tool()];
+
+        // Disabled + always_on + exec — excluded
+        let mut disabled = make_entry("disabled", true, false);
+        disabled.skill_tools = vec![exec_tool()];
+
+        // Enabled + NOT always_on + exec — excluded
+        let mut not_always_on = make_entry("not-always-on", false, true);
+        not_always_on.skill_tools = vec![exec_tool()];
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![included, disabled, not_always_on],
+        };
+
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 1);
+        assert_eq!(callback[0].manifest.skill.name, "included");
+    }
+
+    #[test]
+    fn test_callback_safe_skills_empty() {
+        let registry = SkillRegistry::empty();
+        assert!(registry.callback_safe_skills().is_empty());
     }
 
     #[test]

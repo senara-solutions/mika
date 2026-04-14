@@ -99,7 +99,9 @@ Connects to external MCP servers at startup via `McpManager`. Configured in `{ag
 
 ## Silent Mode Agent Loop
 
-Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`. Heartbeat mode uses `safe_always_on_skills()` which filters out exec/http-handler skills for security.
+Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
+
+**Trigger-aware skill selection:** `Heartbeat`, `Reflection`, `Reminder`, and `SkillRun` modes use `safe_always_on_skills()` which filters out exec/http-handler skills for security (autonomous triggers must not execute arbitrary commands). `Callback` mode uses `callback_safe_skills()` which preserves exec/http handlers — callback turns continue a tool call the agent already authorized in conversation mode, so retry/continuation workflows must have access to the same tool set (#567). Loop-prevention guards in the long-running dispatch path prevent callbacks from spawning new unrelated long-running tasks.
 
 **Task health awareness (heartbeat and callback):** `get_task_health_summary(agent_id)` detects 5 anomaly types and injects `<task-health>` block. Gated to `Heartbeat`, `Callback`, and `Reminder` triggers.
 
