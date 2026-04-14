@@ -17,41 +17,16 @@ build-dashboard: ## Build dashboard for production (installs deps + builds share
 	npm run build -w packages/ui
 	npm run build --prefix dashboard
 
-stop: ## Stop running mika-server and mika-gateway (via tmux C-c)
+stop: ## Stop running mika-server and mika-gateway (via OpenRC)
 	@for bin in mika-server mika-gateway; do \
-		if tmux has-session -t "$$bin" 2>/dev/null; then \
-			echo "Stopping $$bin (tmux session)..."; \
-			tmux send-keys -t "$$bin" C-c; \
-			for i in $$(seq 1 10); do \
-				pgrep -x "$$bin" > /dev/null 2>&1 || break; \
-				sleep 0.5; \
-			done; \
-			if pgrep -x "$$bin" > /dev/null 2>&1; then \
-				echo "  Force-killing $$bin..."; \
-				pkill -KILL -x "$$bin" || true; \
-			fi; \
-		elif pgrep -x "$$bin" > /dev/null 2>&1; then \
-			echo "Stopping $$bin (pkill)..."; \
-			pkill -TERM -x "$$bin" || true; \
-			for i in $$(seq 1 10); do \
-				pgrep -x "$$bin" > /dev/null 2>&1 || break; \
-				sleep 0.5; \
-			done; \
-			if pgrep -x "$$bin" > /dev/null 2>&1; then \
-				echo "  Force-killing $$bin..."; \
-				pkill -KILL -x "$$bin" || true; \
-			fi; \
-		fi; \
+		echo "Stopping $$bin..."; \
+		sudo rc-service "$$bin" stop || true; \
 	done
 
-restart: ## Restart mika-server and mika-gateway in their tmux sessions
+restart: ## Restart mika-server and mika-gateway (via OpenRC)
 	@for bin in mika-server mika-gateway; do \
-		if tmux has-session -t "$$bin" 2>/dev/null; then \
-			echo "Restarting $$bin..."; \
-			tmux send-keys -t "$$bin" "$$bin" Enter; \
-		else \
-			echo "Warning: tmux session '$$bin' not found — start it manually"; \
-		fi; \
+		echo "Restarting $$bin..."; \
+		sudo rc-service "$$bin" restart || true; \
 	done
 
 install: ## Copy release binaries to INSTALL_DIR
