@@ -66,7 +66,9 @@ Four defensive layers, each independently sufficient to prevent the loop:
 
 ### Layer 1: Silent agent for callbacks (ask.rs)
 
-The `--task-id` path now calls `run_silent_agent()` instead of `run_agent()`. Silent mode uses `safe_always_on_skills()` which filters out exec/http handler skills, making it structurally impossible for the callback agent to spawn new long-running processes.
+The `--task-id` path now calls `run_silent_agent()` instead of `run_agent()`. Silent mode scopes the tool surface: **non-callback** silent triggers (`Heartbeat`, `Reflection`, `Reminder`, `SkillRun`) use `safe_always_on_skills()` which filters out exec/http handler skills. **Callback triggers** use `callback_safe_skills()`, which preserves exec/http handlers because the agent is continuing a tool call it already authorized in conversation mode (#567).
+
+Loop prevention for callbacks no longer relies on structural skill filtering — it relies on `validate_dispatch_readiness()` in `skills/executor.rs` (#525), which rejects new long-running dispatches when: (a) the target work item is not `pending`/`in_progress`, or (b) an active callback child task already exists. The `is_task_context: true` flag in the callback `ToolContext` also blocks top-level `create_work_item` calls.
 
 ```rust
 // Before: full agent with all tools
@@ -151,7 +153,7 @@ if task_id.is_some() && user_message.len() > MAX_CALLBACK_RESULT {
 
 | Layer | Prevents | If bypassed alone |
 |-------|----------|-------------------|
-| Silent agent | Callback spawning new processes | Would need exec skills |
+| Silent agent + dispatch-readiness guard | Callback spawning new long-running tasks | Would need to bypass `validate_dispatch_readiness()` (#525) |
 | Orchestrator guards | Non-orchestrators delegating/running teams | Would need tool access |
 | Self-delegation block | Agent delegating to itself | Would need name match |
 | Trust boundary | Prompt injection from subprocess output | LLM-level defense |
@@ -162,7 +164,7 @@ if task_id.is_some() && user_message.len() > MAX_CALLBACK_RESULT {
 
 These rules must hold across all code paths:
 
-1. **Silent/callback agents must never have exec/http handler skills.** `run_silent_agent` always calls `safe_always_on_skills()`. No code path may bypass this.
+1. **Non-callback silent agents (Heartbeat/Reflection/Reminder/SkillRun) must never have exec/http handler skills.** `run_silent_inner` dispatches these to `safe_always_on_skills()`. No code path may bypass this. **Callback turns** use `callback_safe_skills()` and inherit the conversation-mode exec/http surface; their loop-prevention story is carried by `validate_dispatch_readiness()` (#525) and `is_task_context: true`, not by skill filtering (#567).
 2. **Only orchestrators can delegate or run teams.** Both tools check `is_orchestrator()` at runtime.
 3. **External data in prompts must be trust-tagged.** Callback results, subprocess output, and any externally-influenced data must be wrapped in `trust="untrusted"` tags.
 4. **CLI and server callback paths must have parity.** Size limits, task validation, parent dispatch, and trust tagging must be identical.
@@ -189,7 +191,7 @@ When handling untrusted external input in prompts:
 
 - [ ] Wrap in `<callback_result trust="untrusted">` or equivalent tags
 - [ ] Add explicit anti-instruction-following guidance after the tags
-- [ ] Use `safe_always_on_skills()` for agents processing external data
+- [ ] Use `safe_always_on_skills()` for autonomous silent triggers; use `callback_safe_skills()` only for `SilentTrigger::Callback` (which inherits the originating agent's exec/http surface, gated by `validate_dispatch_readiness()`)
 - [ ] Cap size of injected data before prompt construction
 
 ## Related Documentation
