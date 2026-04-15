@@ -51,6 +51,8 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 4 tools: **Write** (orchestrator-only): `create_work_item`, `update_work_item_status`. **Read** (all agents): `list_work_items`, `check_work_item` (with optional GitHub PR/issue status enrichment). Work items reuse `tasks` table with `trigger_type='manual'` + `action_type='none'`.
 
+**`list_work_items` output enrichment:** Response includes a `Summary:` line with status-count breakdown (e.g., `"50 items total — 2 blocked, 48 completed"`) computed in-memory from the result set. Fully unfiltered calls also include a `Note:` with filter guidance discouraging redundant re-filtering. Filtered calls (by status or source) get a scoped summary but no guidance note. See #572.
+
 **Status transition state machine:** `pending` -> any; `in_progress` -> blocked/completed/cancelled; `blocked` -> in_progress/completed/cancelled. Terminal states cannot transition.
 
 **Idempotent creation:** Deduplicates on `reference_url` (DB partial unique index `idx_tasks_manual_active_ref_url`) and on label (case-insensitive pre-check). Five loop-prevention guards. Max 5 agent-created items per session (user_request exempt).

@@ -226,7 +226,7 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
 | `search_tool_history` | Search past tool call history across sessions by tool name, keyword, time range, and success status. Returns truncated input/output (500 chars), 10KB output cap, 30-day retention. Non-orchestrator agents scoped to own tool calls. | Introspection |
 | `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
-| `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. | Work Items |
+| `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. Includes status-count summary and filter guidance note (unfiltered calls only). | Work Items |
 | `check_work_item` | Read work item details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Work Items |
 | `pr_merge_with_gate` | Merge a GitHub PR with a CI gate. Checks required CI checks via `gh pr checks --required`, classifies by decision matrix (blocked/auto_merge_enabled/merged/already_merged). Spawns `gh` subprocess with `scrub_mika_env_vars` + `GH_TOKEN` re-injection. Requires `github_token`. 60s timeout. See #490. | PR Merge |
 
