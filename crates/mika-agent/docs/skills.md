@@ -1133,6 +1133,8 @@ Both exec and http handlers enforce the `timeout_secs` value from the manifest (
 
 The skill scanner (`scan_skills_dir`) catches all errors -- missing files, invalid TOML, bad JSON -- and logs them as warnings. A broken skill is simply skipped. This ensures that a single bad skill file cannot prevent Mika from starting.
 
+The `list_skills` agent tool runs `validate_loaded()` and reports the skipped count in its output. When skills were skipped, a warning footer is appended: `Warning: N skill(s) skipped due to errors. Run 'mika skills validate' for details.` This enables agents to self-diagnose a degraded skill registry. When no skills are skipped, the output is unchanged.
+
 ## QA Verdict Contract
 
 mika-qa-bot posts PR verdicts as GitHub reviews with:

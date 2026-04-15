@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: 738
 tags: [code-review, skills, agent-native]
@@ -43,5 +43,5 @@ Expose `validate_skill()` as an agent tool for server-mode agents.
 
 ## Acceptance Criteria
 
-- [ ] `list_skills` output includes skipped_count when > 0
-- [ ] Agent can detect degraded skill loading at runtime
+- [x] `list_skills` output includes skipped_count when > 0
+- [x] Agent can detect degraded skill loading at runtime
