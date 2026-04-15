@@ -7,6 +7,7 @@ pub mod install;
 pub mod manifest;
 pub mod marketplace;
 pub mod matcher;
+pub mod review_filter;
 
 use std::path::Path;
 

@@ -23,6 +23,7 @@ use crate::skills::executor;
 use crate::skills::index::{ResolvedSkillTool, SkillEntry};
 use crate::skills::manifest::ToolHandler;
 use crate::skills::matcher::{MatchReason, MatchedSkill};
+use crate::skills::review_filter;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
@@ -1267,6 +1268,12 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
 
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.user_message);
+
+    // Exclude skills that are the target of a skill-review turn (#513).
+    // Must run before context resolution so excluded skills don't participate
+    // in context fetching, LLM override, or prompt injection.
+    review_filter::apply_review_filter(&mut matched, params.user_message);
+
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve context requirements before LLM override
@@ -2399,6 +2406,10 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
 
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.task_message);
+
+    // Exclude skills that are the target of a skill-review turn (#513).
+    review_filter::apply_review_filter(&mut matched, params.task_message);
+
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
 
     // Resolve context requirements before LLM override
