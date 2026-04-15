@@ -151,7 +151,7 @@ pub fn route_event(
         ("pull_request", Some("closed")) => Some("mika-dev"),
         ("pull_request_review", Some("submitted")) => Some("mika-dev"),
         ("check_suite", Some("completed")) => match check_conclusion {
-            Some("failure" | "timed_out") => Some("mika-dev"),
+            Some("failure" | "timed_out" | "success") => Some("mika-dev"),
             _ => None,
         },
         _ => None,
@@ -780,7 +780,7 @@ mod tests {
     fn test_route_event_check_suite_success() {
         assert_eq!(
             route_event("check_suite", Some("completed"), Some("success")),
-            None
+            Some("mika-dev")
         );
     }
 

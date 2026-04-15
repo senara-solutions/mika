@@ -7,15 +7,18 @@ severity: high
 tags:
   - webhook-handler
   - verdict-handler
+  - ci-success-handler
+  - check-suite
   - pr-merge
   - structural-handler
   - pre-digest
   - llm-bypass
-  - state-machine
 related_issues:
   - 524
   - 522
   - 525
+  - 571
+last_updated: 2026-04-15
 applies_when:
   - An external event should trigger a deterministic state transition
   - The LLM could misinterpret or improvise on a raw webhook payload
@@ -87,3 +90,23 @@ The engine intercepts the event, parses the verdict, looks up the work item, and
 - `docs/solutions/architecture-patterns/deterministic-skill-context-injection.md` — related pattern of engine-owned pre-fetch
 - mika#524 — implementation issue
 - mika#525 — companion: tool-level refusal for `run_claude_pilot` on invalid work item states
+
+## Companion: CI Success Handler (`check_suite.completed/success`)
+
+Added in #571. When `verdict_handler` fires on a `pull_request_review.submitted` event and CI is still pending, it enables `--auto` merge via GitHub. However, if a force-push (e.g., CI fix) lands after `--auto` was set, GitHub's native auto-merge is cancelled. The `ci_success_handler` fills this gap.
+
+**Trigger:** `check_suite.completed` with conclusion `success`, routed to `mika-dev` by the gateway.
+
+**Logic:**
+1. Parse `[GitHub] Check suite success on {repo} (branch: {branch})` from gateway-formatted text
+2. `gh pr list` — find open PR for the branch (`NoPr` if none — self-terminates post-merge webhooks)
+3. `gh api` — find APPROVED review with `VERDICT: pass` in body
+4. **Stale-SHA gate (strict):** `review.commit_id == pr.head.sha`. If QA approved a different SHA than the current HEAD, do NOT merge. A push after approval — even a mechanical CI fix — is unreviewed code. The cost is one extra QA cycle; the alternative is silently trusting that the push was safe.
+5. **CI aggregation (load-bearing, not defensive):** `run_gh_checks` + `classify_checks` must return `AllPassed`. The `check_suite.completed/success` webhook is scoped to ONE workflow — a PR with multiple required workflows can fire this event while another is still pending or already failed. The aggregation IS the gate, not a belt-and-suspenders re-check.
+6. `run_gh_merge` — squash merge with branch deletion. Maps `already merged` / `Pull request is closed` to `AlreadyMerged` (info log, not error).
+
+**Key design decisions:**
+- Same location (`mika-agent/src/server/`), same return type (`VerdictAction`), same `pr_merge_with_gate` helper reuse
+- Order-independent with `verdict_handler` — each handler self-selects on event type, returns `Passthrough` for non-matching events
+- No LLM involvement — structural state-machine transition
+- Pre-digest uses `<ci_success_handler>` XML tag with completion-claim-safe phrasing

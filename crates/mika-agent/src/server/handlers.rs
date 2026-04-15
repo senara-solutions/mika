@@ -16,6 +16,7 @@ use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 use crate::task_engine::types::{task_status, trigger_type};
 
+use super::ci_success_handler;
 use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
 use super::types::{
@@ -764,6 +765,30 @@ async fn run_agent_for_message(
         )
         .await;
         match action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
+
+        // Structural CI success handler: intercept check_suite.completed(success)
+        // webhooks and re-evaluate merge eligibility for PRs with pending QA pass (#571).
+        // Order-independent — each handler self-selects on event type.
+        let ci_action = ci_success_handler::try_handle_ci_success(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match ci_action {
             VerdictAction::Handled { pre_digest } => {
                 req.text = pre_digest;
             }
