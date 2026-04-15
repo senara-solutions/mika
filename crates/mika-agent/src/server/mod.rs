@@ -1,5 +1,6 @@
 mod a2a;
 mod auth;
+pub mod ci_success_handler;
 pub mod dashboard;
 pub mod dashboard_dev_runs;
 pub mod embedded_dashboard;
