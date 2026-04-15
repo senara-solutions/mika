@@ -10,6 +10,18 @@ use crate::skills::marketplace::get_marketplace_entry;
 
 pub struct ListSkillsTool;
 
+const SKIPPED_WARNING: &str =
+    "Warning: {} skill(s) skipped due to errors. Run 'mika skills validate' for details.";
+
+/// Format the skipped-skills warning line, or empty string if none skipped.
+fn skipped_warning(count: usize) -> String {
+    if count > 0 {
+        SKIPPED_WARNING.replace("{}", &count.to_string())
+    } else {
+        String::new()
+    }
+}
+
 #[async_trait]
 impl Tool for ListSkillsTool {
     fn name(&self) -> &str {
@@ -38,10 +50,21 @@ impl Tool for ListSkillsTool {
             registry.apply_overrides(&overrides);
         }
 
+        // Run semantic validation to promote broken-handler/tools.json skills to skipped,
+        // matching the startup paths (chat.rs, ask.rs, server/mod.rs).
+        registry.validate_loaded();
+
         let entries = registry.skills();
 
         if entries.is_empty() {
-            return Ok(ToolOutput::success("No skills installed."));
+            let warning = skipped_warning(registry.skipped_count());
+            if warning.is_empty() {
+                return Ok(ToolOutput::success("No skills installed."));
+            }
+            return Ok(ToolOutput::success(format!(
+                "No skills installed.\n\n{}\n",
+                warning
+            )));
         }
 
         let mut output = format!("Installed skills ({}):\n", entries.len());
@@ -87,6 +110,11 @@ impl Tool for ListSkillsTool {
                 keywords,
                 tools_count,
             ));
+        }
+
+        let warning = skipped_warning(registry.skipped_count());
+        if !warning.is_empty() {
+            output.push_str(&format!("\n{}\n", warning));
         }
 
         Ok(ToolOutput::success(output))
@@ -201,6 +229,118 @@ mod tests {
         assert!(
             result.content.contains("[custom]"),
             "expected [custom] tag in: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_no_warning_when_no_skipped() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+
+        // Create a valid skill — no skipped entries
+        let skill_dir = tmp.path().join("skills/valid-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "valid-skill"
+            description = "A valid skill"
+            [triggers]
+            keywords = ["valid"]
+            "#,
+        )
+        .unwrap();
+
+        let tool = ListSkillsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("valid-skill"));
+        assert!(
+            !result.content.contains("Warning"),
+            "should not contain warning when no skills skipped: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("skipped"),
+            "should not mention skipped when none skipped: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_shows_skipped_warning() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+
+        // Create a valid skill
+        let valid_dir = tmp.path().join("skills/valid-skill");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        std::fs::write(
+            valid_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "valid-skill"
+            description = "A valid skill"
+            [triggers]
+            keywords = ["valid"]
+            "#,
+        )
+        .unwrap();
+
+        // Create an invalid skill (malformed TOML triggers skip)
+        let invalid_dir = tmp.path().join("skills/broken-skill");
+        std::fs::create_dir_all(&invalid_dir).unwrap();
+        std::fs::write(
+            invalid_dir.join("skill.toml"),
+            "this is not valid toml {{{{",
+        )
+        .unwrap();
+
+        let tool = ListSkillsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        // Valid skill still listed
+        assert!(result.content.contains("valid-skill"));
+        // Warning footer present
+        assert!(
+            result
+                .content
+                .contains("Warning: 1 skill(s) skipped due to errors"),
+            "expected skipped warning in: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("mika skills validate"),
+            "expected validate hint in: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_all_skipped_shows_warning() {
+        let (tmp, harness) = setup();
+        let ctx = harness.ctx_with_home(tmp.path());
+
+        // Only invalid skills — no valid ones
+        let invalid_dir = tmp.path().join("skills/broken-skill");
+        std::fs::create_dir_all(&invalid_dir).unwrap();
+        std::fs::write(invalid_dir.join("skill.toml"), "not valid toml {{{{").unwrap();
+
+        let tool = ListSkillsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("No skills installed."),
+            "expected 'No skills installed.' in: {}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("Warning: 1 skill(s) skipped due to errors"),
+            "expected skipped warning in: {}",
             result.content
         );
     }
