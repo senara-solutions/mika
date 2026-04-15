@@ -38,6 +38,9 @@ pub mod health_thresholds {
     /// Manual work item `blocked` with no `updated_at` change for longer than this is anomalous.
     pub const STALE_BLOCKED_SECS: i64 = 86_400; // 24 hours
 
+    /// Manual work item `pending` with no callback child for longer than this is anomalous (#583).
+    pub const STALE_PENDING_SECS: i64 = 86_400; // 24 hours
+
     /// Task `in_progress` for longer than this (when no `estimated_duration_secs`) is anomalous.
     pub const LONG_RUNNING_DEFAULT_SECS: i64 = 3_600; // 1 hour
 

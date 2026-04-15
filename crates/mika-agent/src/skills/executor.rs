@@ -4,6 +4,7 @@
 // files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -94,6 +95,9 @@ pub struct LongRunningContext {
     pub agent_name: String,
     pub session_id: String,
     pub trace_id: String,
+    /// Per-turn dispatch counter (#583). Only one long-running dispatch is
+    /// permitted per agent turn. Atomic for interior mutability through `&self`.
+    pub dispatch_count: AtomicU32,
 }
 
 /// Execute a skill tool with the appropriate handler.
@@ -635,6 +639,37 @@ async fn validate_dispatch_readiness(
         }
     }
 
+    // Global dispatch guard (#583): reject if ANY other work item has an active
+    // callback child. Enforces single-session-at-a-time across all work items.
+    match db.has_active_callback_tasks_excluding(work_item_id).await {
+        Ok(Some((blocking_parent_id, blocking_callback_id))) => {
+            return Err(serde_json::json!({
+                "error": "global_dispatch_active",
+                "task_id": work_item_id,
+                "blocking_work_item_id": blocking_parent_id,
+                "blocking_callback_id": blocking_callback_id,
+                "reason": format!(
+                    "Another work item ('{}') already has an active dispatch \
+                     (callback task '{}'). Only one long-running dispatch may be \
+                     active at a time. Wait for it to complete or cancel it before \
+                     dispatching again.",
+                    blocking_parent_id, blocking_callback_id
+                )
+            })
+            .to_string());
+        }
+        Ok(None) => { /* No conflicting dispatch — proceed */ }
+        Err(e) => {
+            // Fail-closed: if we can't check global state, reject dispatch
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": work_item_id,
+                "reason": format!("Failed to check global dispatch state: {e}")
+            })
+            .to_string());
+        }
+    }
+
     Ok(task.status.clone())
 }
 
@@ -688,6 +723,23 @@ async fn execute_long_running(
         Ok(status) => status,
         Err(err) => return ToolOutput::error(err),
     };
+
+    // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
+    // Check first without incrementing — the actual increment happens right before
+    // spawn to avoid leaving the counter stuck at 1 if create_task or path validation fails.
+    if ctx.dispatch_count.load(Ordering::Relaxed) > 0 {
+        return ToolOutput::error(
+            serde_json::json!({
+                "error": "dispatch_limit_exceeded",
+                "work_item_id": work_item_id,
+                "dispatches_this_turn": ctx.dispatch_count.load(Ordering::Relaxed),
+                "reason": "Only one long-running dispatch is permitted per agent turn. \
+                           A dispatch has already been launched in this turn. Wait for the \
+                           current dispatch to complete via callback before launching another."
+            })
+            .to_string(),
+        );
+    }
 
     let estimated = estimated_duration_secs.unwrap_or(3600);
     let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
@@ -781,6 +833,11 @@ async fn execute_long_running(
             serde_json::Value::String(ctx.agent_name.clone()),
         );
     }
+
+    // Increment dispatch counter right before spawn — after all validation
+    // and task creation succeeded. This ensures the counter stays at 0 if
+    // any early error path returns before we actually launch the subprocess.
+    ctx.dispatch_count.fetch_add(1, Ordering::Relaxed);
 
     spawn_long_running_exec(
         cmd_path,
@@ -1522,6 +1579,7 @@ mod tests {
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
         };
 
         let output = execute_skill_tool(
@@ -1574,6 +1632,7 @@ mod tests {
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
         };
 
         let output = execute_skill_tool(
@@ -1643,6 +1702,7 @@ mod tests {
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
         };
 
         let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx), None).await;
@@ -1672,6 +1732,7 @@ mod tests {
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
         };
 
         let output = execute_skill_tool(
@@ -1842,6 +1903,7 @@ mod tests {
             agent_name: "mika".to_string(),
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
         }
     }
 
@@ -2425,5 +2487,199 @@ mod tests {
         // Verify work item is in_progress (auto-transitioned by first dispatch)
         let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
         assert_eq!(task.status, "in_progress");
+    }
+
+    // ---- Global dispatch guard tests (#583) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_global_dispatch_guard_rejects_when_other_work_item_has_active_callback() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Create work item A with an active callback child
+        let wi_a = create_work_item_with_status(&async_db, "in_progress").await;
+        let _callback_a = create_callback_child(&async_db, &wi_a, "pending").await;
+
+        // Create work item B — attempting to dispatch on this should be blocked
+        let wi_b = create_work_item_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_b}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "global_dispatch_active");
+        assert_eq!(parsed["blocking_work_item_id"], wi_a);
+        assert_eq!(parsed["task_id"], wi_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_global_dispatch_guard_allows_when_no_other_active_callbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Work item A has only completed callbacks
+        let wi_a = create_work_item_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_a, "completed").await;
+
+        // Dispatch on work item B should succeed
+        let wi_b = create_work_item_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi_b}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+
+        // Should NOT be a global_dispatch_active error
+        if output.is_error {
+            assert!(
+                !output.content.contains("global_dispatch_active"),
+                "global dispatch guard should not reject when other callbacks are completed, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_global_dispatch_guard_allows_same_work_item_callback() {
+        // The global guard should NOT block dispatch on the same work item —
+        // that's already handled by the per-work-item guard.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_work_item_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi, "pending").await;
+
+        // Check the DB method directly — should return None since the only
+        // active callback belongs to the excluded parent
+        let result = async_db
+            .has_active_callback_tasks_excluding(&wi)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "should not find active callbacks for the same work item"
+        );
+    }
+
+    // ---- Per-turn dispatch counter tests (#583) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_turn_dispatch_counter_rejects_second_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi = create_work_item_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        // Simulate that a dispatch already happened this turn by setting the counter
+        ctx.dispatch_count.store(1, Ordering::Relaxed);
+
+        // Second dispatch should be rejected by the per-turn counter
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"work_item_id": wi}),
+            30,
+            Some(&ctx),
+            None,
+        )
+        .await;
+        assert!(output.is_error, "second dispatch should be rejected");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "dispatch_limit_exceeded");
+        // Counter should still be 1 (not incremented on rejection)
+        assert_eq!(ctx.dispatch_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_turn_dispatch_counter_resets_with_new_context() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // First context with counter at 1
+        let ctx1 = make_lr_ctx(async_db.clone());
+        ctx1.dispatch_count.store(1, Ordering::Relaxed);
+        assert_eq!(ctx1.dispatch_count.load(Ordering::Relaxed), 1);
+
+        // New context should start at 0
+        let ctx2 = make_lr_ctx(async_db);
+        assert_eq!(ctx2.dispatch_count.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- DB method tests for has_active_callback_tasks_excluding (#583) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_has_active_callback_excluding_returns_none_when_empty() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("nonexistent")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_has_active_callback_excluding_ignores_terminal_states() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_work_item_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi, "completed").await;
+        create_callback_child(&async_db, &wi, "failed").await;
+        create_callback_child(&async_db, &wi, "cancelled").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-work-item")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "should not detect terminal-state callbacks as active"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_has_active_callback_excluding_finds_active_for_different_parent() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_work_item_with_status(&async_db, "in_progress").await;
+        let callback_id = create_callback_child(&async_db, &wi, "pending").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("different-parent")
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        let (parent_id, found_callback_id) = result.unwrap();
+        assert_eq!(parent_id, wi);
+        assert_eq!(found_callback_id, callback_id);
     }
 }
