@@ -1468,6 +1468,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             agent_name: db.agent_id.clone(),
             session_id: params.session_id.to_string(),
             trace_id: trace_id.to_string(),
+            dispatch_count: std::sync::atomic::AtomicU32::new(0),
         })
     };
     // Store loaded skills in session metadata for observability

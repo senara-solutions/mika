@@ -3457,7 +3457,39 @@ impl Database {
             }
         }
 
-        // 5. GitHub-linked manual work items (active, with reference_url containing github.com)
+        // 5. Stale pending manual work items with no callback child (#583)
+        {
+            let threshold = timestamp::format(
+                &(now - Duration::seconds(health_thresholds::STALE_PENDING_SECS)),
+            );
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
+            if remaining > 0 {
+                anomalies.extend(query_anomalies(
+                    "SELECT t.id, t.label, t.trigger_type, t.status, t.created_at, t.reference_url
+                     FROM tasks t
+                     WHERE t.agent_id = ?1
+                       AND t.trigger_type = 'manual'
+                       AND t.status = 'pending'
+                       AND t.created_at < ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM tasks c
+                           WHERE c.parent_task_id = t.id
+                             AND c.trigger_type = 'callback'
+                       )
+                     ORDER BY t.created_at ASC
+                     LIMIT ?3",
+                    &[
+                        &agent_id,
+                        &threshold as &dyn rusqlite::types::ToSql,
+                        &remaining,
+                    ],
+                    "stale_pending",
+                    &|ts| format!("pending for {}", format_age(ts, now)),
+                )?);
+            }
+        }
+
+        // 6. GitHub-linked manual work items (active, with reference_url containing github.com)
         {
             let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
             if remaining > 0 {
@@ -3739,6 +3771,33 @@ impl Database {
             .query_map(params![parent_task_id], Self::row_to_task)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Check if any active callback tasks exist for a work item OTHER than the excluded one.
+    ///
+    /// Returns `Some((parent_task_id, callback_task_id))` if an active callback task exists
+    /// whose parent differs from `excluded_parent_id`. Used by the global dispatch guard
+    /// to enforce single-session-at-a-time (#583).
+    pub fn has_active_callback_tasks_excluding(
+        &self,
+        excluded_parent_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT parent_task_id, id FROM tasks
+             WHERE trigger_type = 'callback'
+               AND status IN ('pending', 'in_progress')
+               AND parent_task_id IS NOT NULL
+               AND parent_task_id != ?1
+               AND agent_id = ?2
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![excluded_parent_id, agent_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Count pending callback tasks for a given team run with depth > 1.
