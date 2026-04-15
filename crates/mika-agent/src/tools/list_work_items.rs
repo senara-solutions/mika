@@ -8,6 +8,40 @@ use crate::db::format_ts;
 
 pub struct ListWorkItemsTool;
 
+/// Status display order: active statuses first, then terminal.
+const STATUS_ORDER: &[&str] = &[
+    "pending",
+    "in_progress",
+    "blocked",
+    "completed",
+    "cancelled",
+];
+
+const FILTER_GUIDANCE_NOTE: &str = "All items are returned in this response. \
+    Filter by status= only when you need a strict subset for a subsequent action \
+    — not to verify counts already shown in summary.";
+
+/// Build a status-count summary line from the result set.
+/// Returns e.g. "50 items total — 2 blocked, 48 completed" (omits zero-count statuses).
+fn status_summary(items: &[(crate::db::Task, Option<i64>)]) -> String {
+    let total = items.len();
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (task, _) in items {
+        *counts.entry(task.status.as_str()).or_insert(0) += 1;
+    }
+
+    let parts: Vec<String> = STATUS_ORDER
+        .iter()
+        .filter_map(|s| counts.get(s).map(|c| format!("{c} {s}")))
+        .collect();
+
+    if parts.is_empty() {
+        format!("{total} items total")
+    } else {
+        format!("{total} items total \u{2014} {}", parts.join(", "))
+    }
+}
+
 #[async_trait]
 impl Tool for ListWorkItemsTool {
     fn name(&self) -> &str {
@@ -124,6 +158,15 @@ impl Tool for ListWorkItemsTool {
                 id = task.id,
                 label = task.label,
             ));
+        }
+
+        // Append status-count summary
+        lines.push(String::new()); // blank line separator
+        lines.push(format!("Summary: {}", status_summary(&items)));
+
+        // Append filter guidance note for unfiltered calls only
+        if status.is_none() {
+            lines.push(format!("Note: {FILTER_GUIDANCE_NOTE}"));
         }
 
         Ok(ToolOutput::success(lines.join("\n")))
@@ -289,6 +332,161 @@ mod tests {
         assert!(
             result.content.contains("children:1"),
             "should show child count: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_work_items_summary_mixed_statuses() {
+        let harness = TestHarness::new();
+        // Create items in different statuses
+        create_work_item(&harness, "Item 1", Some("user_request"), None).await;
+        create_work_item(&harness, "Item 2", Some("user_request"), None).await;
+        let id3 = create_work_item(&harness, "Item 3", Some("user_request"), None).await;
+        let id4 = create_work_item(&harness, "Item 4", Some("user_request"), None).await;
+
+        harness
+            .db
+            .update_manual_task_status(&id3, "in_progress")
+            .await
+            .unwrap();
+        harness
+            .db
+            .update_manual_task_status(&id4, "blocked")
+            .await
+            .unwrap();
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        // Summary should show counts in order: pending, in_progress, blocked
+        assert!(
+            result
+                .content
+                .contains("Summary: 4 items total \u{2014} 2 pending, 1 in_progress, 1 blocked"),
+            "unexpected summary in: {}",
+            result.content
+        );
+        // Note should be present (unfiltered call)
+        assert!(
+            result
+                .content
+                .contains("Note: All items are returned in this response."),
+            "missing note in: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_work_items_summary_single_status() {
+        let harness = TestHarness::new();
+        create_work_item(&harness, "Item A", Some("user_request"), None).await;
+        create_work_item(&harness, "Item B", Some("user_request"), None).await;
+        create_work_item(&harness, "Item C", Some("user_request"), None).await;
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result
+                .content
+                .contains("Summary: 3 items total \u{2014} 3 pending"),
+            "unexpected summary in: {}",
+            result.content
+        );
+        // Note present for unfiltered
+        assert!(result.content.contains("Note: All items are returned"));
+    }
+
+    #[tokio::test]
+    async fn test_list_work_items_filtered_summary_no_note() {
+        let harness = TestHarness::new();
+        let id1 = create_work_item(&harness, "Blocked 1", Some("user_request"), None).await;
+        let id2 = create_work_item(&harness, "Blocked 2", Some("user_request"), None).await;
+        create_work_item(&harness, "Pending 1", Some("user_request"), None).await;
+
+        harness
+            .db
+            .update_manual_task_status(&id1, "blocked")
+            .await
+            .unwrap();
+        harness
+            .db
+            .update_manual_task_status(&id2, "blocked")
+            .await
+            .unwrap();
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+
+        let result = tool
+            .execute(serde_json::json!({"status": "blocked"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // Scoped summary for filtered subset
+        assert!(
+            result
+                .content
+                .contains("Summary: 2 items total \u{2014} 2 blocked"),
+            "unexpected summary in: {}",
+            result.content
+        );
+        // No note on filtered calls
+        assert!(
+            !result.content.contains("Note:"),
+            "note should not appear on filtered calls: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_work_items_summary_all_statuses() {
+        let harness = TestHarness::new();
+        let id1 = create_work_item(&harness, "Pending", Some("user_request"), None).await;
+        let id2 = create_work_item(&harness, "In Progress", Some("user_request"), None).await;
+        let id3 = create_work_item(&harness, "Blocked", Some("user_request"), None).await;
+        let id4 = create_work_item(&harness, "Completed", Some("user_request"), None).await;
+        let id5 = create_work_item(&harness, "Cancelled", Some("user_request"), None).await;
+
+        // Leave id1 as pending
+        let _ = id1;
+        harness
+            .db
+            .update_manual_task_status(&id2, "in_progress")
+            .await
+            .unwrap();
+        harness
+            .db
+            .update_manual_task_status(&id3, "blocked")
+            .await
+            .unwrap();
+        harness
+            .db
+            .update_manual_task_status(&id4, "completed")
+            .await
+            .unwrap();
+        harness
+            .db
+            .update_manual_task_status(&id5, "cancelled")
+            .await
+            .unwrap();
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        // All 5 statuses in declaration order
+        assert!(
+            result.content.contains(
+                "Summary: 5 items total \u{2014} 1 pending, 1 in_progress, 1 blocked, 1 completed, 1 cancelled"
+            ),
+            "unexpected summary in: {}",
             result.content
         );
     }
