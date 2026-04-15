@@ -565,6 +565,7 @@ async fn run_loop(
     store_llm_calls: bool,
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
+    internal: bool,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -894,7 +895,7 @@ async fn run_loop(
                             &text,
                             metadata.as_deref(),
                             Some(tool_ctx.trace_id),
-                            false,
+                            internal,
                         )
                         .await?;
                     }
@@ -1109,6 +1110,10 @@ pub struct AgentParams<'a> {
     /// with a long-running task (e.g., intermediate permission requests), this field links
     /// the agent turn to that task in traces and session metadata.
     pub correlated_task_id: Option<String>,
+    /// When true, both user and assistant messages are saved with `internal: true`,
+    /// hiding them from the TUI inbox mode. Set by `mika ask --task-id` (relay sessions)
+    /// where `task_complete` is false. See #557.
+    pub internal: bool,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -1134,7 +1139,14 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         };
         params
             .db
-            .save_message(params.session_id, "user", &save_text, Some(&trace_id))
+            .save_message_with_metadata(
+                params.session_id,
+                "user",
+                &save_text,
+                None,
+                Some(&trace_id),
+                params.internal,
+            )
             .await?;
     }
 
@@ -1190,7 +1202,14 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
                 "I'm sorry, that took too long. Let me try a simpler approach next time.";
             params
                 .db
-                .save_message(params.session_id, "assistant", fallback, Some(&trace_id))
+                .save_message_with_metadata(
+                    params.session_id,
+                    "assistant",
+                    fallback,
+                    None,
+                    Some(&trace_id),
+                    params.internal,
+                )
                 .await?;
             Ok(AgentOutput {
                 text: Some(fallback.to_string()),
@@ -1479,6 +1498,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
+        params.internal,
     )
     .await?;
 
@@ -1492,7 +1512,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             &cont.text,
             metadata.as_deref(),
             Some(trace_id),
-            false,
+            params.internal,
         )
         .await?;
         return Ok(AgentOutput {
@@ -2194,6 +2214,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
+        false, // silent mode messages are never internal
     )
     .await?;
 
@@ -2494,6 +2515,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
+        false, // team mode messages are never internal
     )
     .await?;
 

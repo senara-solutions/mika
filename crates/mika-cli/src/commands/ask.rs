@@ -271,6 +271,7 @@ pub async fn run(
         settings: Some(&ctx.settings),
         trace_id: None,
         correlated_task_id: task_id.map(|s| s.to_string()),
+        internal: task_id.is_some() && !task_complete,
     })
     .await;
 

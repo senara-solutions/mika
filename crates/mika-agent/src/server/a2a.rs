@@ -159,6 +159,7 @@ async fn run_a2a_agent(
         settings: Some(&agent_state.settings),
         trace_id: Some(task_id.to_string()),
         correlated_task_id: None,
+        internal: false,
     };
 
     match agent::run_agent(&params).await {

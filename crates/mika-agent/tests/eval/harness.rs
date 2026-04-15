@@ -35,6 +35,7 @@ pub struct EvalHarness {
     is_onboarding: bool,
     is_callback_turn: bool,
     skip_compaction: bool,
+    internal: bool,
 }
 
 impl EvalHarness {
@@ -70,6 +71,7 @@ impl EvalHarness {
             settings: Some(&self.settings),
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
+            internal: self.internal,
         };
 
         let output = run_agent(&params).await?;
@@ -86,6 +88,7 @@ pub struct EvalHarnessBuilder {
     is_onboarding: bool,
     is_callback_turn: bool,
     skip_compaction: bool,
+    internal: bool,
     provider_name: Option<String>,
     model_name: Option<String>,
 }
@@ -100,6 +103,7 @@ impl Default for EvalHarnessBuilder {
             is_onboarding: false,
             is_callback_turn: false,
             skip_compaction: true, // Default: skip compaction to simplify mock sequences
+            internal: false,
             provider_name: None,
             model_name: None,
         }
@@ -146,6 +150,12 @@ impl EvalHarnessBuilder {
     /// Set whether to skip compaction. Default: `true`.
     pub fn skip_compaction(mut self, v: bool) -> Self {
         self.skip_compaction = v;
+        self
+    }
+
+    /// Set internal message tagging. Default: `false`.
+    pub fn internal(mut self, v: bool) -> Self {
+        self.internal = v;
         self
     }
 
@@ -208,6 +218,7 @@ impl EvalHarnessBuilder {
             is_onboarding: self.is_onboarding,
             is_callback_turn: self.is_callback_turn,
             skip_compaction: self.skip_compaction,
+            internal: self.internal,
         })
     }
 }
