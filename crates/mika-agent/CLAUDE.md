@@ -87,6 +87,8 @@ Git-based and local skill distribution via `mika skills install/uninstall/update
 
 **Match-reason conditioning (#265):** `match_skills()` returns `MatchedSkill` wrappers with `MatchReason` (`Keyword`, `AlwaysOn`, `Dependency`). `always_on` skills do not enforce constraints unless the user's message also triggered a keyword.
 
+**Review-target exclusion (#513):** `review_filter::apply_review_filter()` runs after `match_message()` and before `resolve_contexts()` in both conversation and team mode. When `skill-review` is keyword-matched, any other keyword-matched skill whose name appears in the user message (case-insensitive) is excluded from the matched set. This prevents the reviewed skill's prompt from contaminating the review context. `AlwaysOn` and `Dependency` skills are never excluded. Silent mode is unaffected (no keyword matching).
+
 ## Exec Handlers
 
 **Image protocol (`__mika_v1`):** Scripts return images via JSON envelope `{"__mika_v1": {"text": "...", "images": ["/path/to/img"]}}`. Executor validates files (5MB limit, magic-byte check for JPEG/PNG/GIF/WebP), base64-encodes, max 5 images per result.

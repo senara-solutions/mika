@@ -326,6 +326,8 @@ On each user turn, the `SkillRegistry` determines which skills are active:
 
 4. **Unmatched skills** are excluded from the turn entirely. Their tools are not sent to Claude and their prompt snippets are not injected.
 
+5. **Review-target exclusion (#513):** When `skill-review` is keyword-matched (i.e., the user is reviewing a skill), any other keyword-matched skill whose name appears in the user message is excluded from the matched set before prompt injection. This prevents the reviewed skill's prompt from contaminating the review context. `AlwaysOn` and `Dependency` skills are never excluded by this mechanism. Applied in both conversation and team mode via `review_filter::apply_review_filter()`.
+
 The matching algorithm is intentionally simple and cheap. Claude still makes the final decision about which tools to actually call from the matched set. The keyword system acts as a coarse filter to avoid sending irrelevant tools on every turn.
 
 **Fallback behavior:** If no skills directory exists or the `SkillRegistry` has zero loaded skills, all builtin tools are sent to Claude on every turn (pre-skill legacy behavior). This ensures Mika works out of the box even if the skills directory is missing.
