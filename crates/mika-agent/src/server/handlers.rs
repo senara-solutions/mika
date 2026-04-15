@@ -801,6 +801,7 @@ async fn run_agent_for_message(
         settings: Some(&a.settings),
         trace_id: Some(req.request_id.clone()),
         correlated_task_id: None,
+        internal: false,
     };
 
     match agent::run_agent(&params).await {

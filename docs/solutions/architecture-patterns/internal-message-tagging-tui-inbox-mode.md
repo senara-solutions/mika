@@ -2,7 +2,8 @@
 title: "Internal message tagging with TUI inbox/audit mode"
 category: architecture-patterns
 date: 2026-04-12
-tags: [tui, messages, filtering, schema, inbox, delegate-task, internal]
+last_updated: 2026-04-15
+tags: [tui, messages, filtering, schema, inbox, delegate-task, internal, relay, mika-ask, agent-params]
 issue: "#494"
 ---
 
@@ -32,9 +33,12 @@ The `DEFAULT 0` means all existing messages remain visible — safe, additive mi
 
 - `save_message_with_metadata()` gained an `internal: bool` parameter (consolidated from initially-proposed separate `save_internal_message` methods — fewer methods, same capability)
 - `delegate_task` tool hardcodes `internal: true` for all delegate session messages — agent-to-agent traffic is automatically tagged without LLM involvement
+- `mika ask --task-id` relay sessions: `AgentParams.internal` is set to `task_id.is_some() && !task_complete` (#557). This threads through `run_loop()` to all four message save paths (user message, assistant EndTurn, max-steps continuation, timeout fallback). PilotEvent relay messages from the autonomous dev loop are now hidden in inbox mode. Callback deliveries (`--task-complete`) remain visible.
 - `save_message()` (no metadata) omits the column, falling back to `DEFAULT 0`
 
-**Key design decision:** The `internal` flag is NOT exposed in any tool's `input_schema`. The LLM cannot mark its own messages as internal. Only server-side code paths (`delegate_task`) set it. This prevents the agent from accidentally hiding user-facing messages.
+**Key design decision:** The `internal` flag is NOT exposed in any tool's `input_schema`. The LLM cannot mark its own messages as internal. Only server-side code paths (`delegate_task`, `mika ask --task-id` relay) set it. This prevents the agent from accidentally hiding user-facing messages.
+
+**AgentParams propagation pattern (#557):** `AgentParams.internal: bool` carries the flag from the CLI entry point through to `run_loop()` and all message save sites. All six `AgentParams` construction sites (ask.rs, chat.rs ×2, handlers.rs, a2a.rs, eval harness) set the field — only ask.rs computes it from flags; all others default to `false`. Follows the established `AgentParams` field addition pattern from #358 (`correlated_task_id`).
 
 ### 3. Read path: filter at view
 
@@ -66,3 +70,5 @@ Extracted `session_message_to_chat_message()` to deduplicate 3 copy-pasted `Sess
 - [SQL column mismatch](../database-issues/sql-column-mismatch-trace-detail-view.md) — the `SESSION_MESSAGE_COLUMNS` pattern
 - [Callback TUI delivery polling](callback-tui-delivery-polling.md) — the poll architecture this integrates with
 - [Strip internal tags](../ui-bugs/strip-internal-metadata-tags-from-display.md) — related internal content hiding (tag-level vs message-level)
+- [Task-ID correlation](task-id-correlation-intermediate-calls.md) — the `AgentParams` field propagation pattern (#358) reused for `internal`
+- GitHub issue #557 — relay message internal tagging fix
