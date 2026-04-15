@@ -155,6 +155,41 @@ impl Tool for UpdateWorkItemStatusTool {
 
         let old_status = task.status.clone();
 
+        // Phantom retry guard (#579): reject retry-semantic metadata writes when the
+        // work item has an active callback child task (i.e., a dispatch is still running).
+        // This prevents the LLM from fabricating pipeline failures and polluting retry
+        // budget before any callback has returned. Only fires when metadata contains
+        // retry-related keys — non-retry metadata writes are unaffected.
+        if let Some(meta) = metadata_input
+            && has_retry_semantic_keys(meta)
+            && let Ok(children) = ctx.db.get_child_tasks(task_id).await
+        {
+            let active_callback = children.iter().find(|c| {
+                c.trigger_type == "callback"
+                    && matches!(c.status.as_str(), "pending" | "in_progress")
+            });
+            if let Some(child) = active_callback {
+                return Ok(ToolOutput::error(
+                    serde_json::json!({
+                        "error": "retry_metadata_rejected_active_dispatch",
+                        "task_id": task_id,
+                        "active_child_id": child.id,
+                        "active_child_status": child.status,
+                        "reason": format!(
+                            "Cannot write retry-related metadata while a dispatch is \
+                             still running (callback task '{}' is '{}'). Retry decisions \
+                             must wait for the callback to complete. If you are seeing \
+                             this error, the pipeline has NOT failed yet — do not retry.",
+                            child.id, child.status
+                        )
+                    })
+                    .to_string(),
+                ));
+            }
+            // If get_child_tasks fails (caught by let-else above), allow the write
+            // (fail-open) — the dispatch readiness guard is the primary defense.
+        }
+
         // Same-status is a no-op (skip transition validation)
         if old_status == status {
             if let Some(new_meta) = metadata_input {
@@ -215,6 +250,18 @@ impl Tool for UpdateWorkItemStatusTool {
         }
 
         Ok(ToolOutput::success(response))
+    }
+}
+
+/// Check whether metadata contains any retry-semantic keys (case-insensitive).
+///
+/// Returns `true` if any top-level key contains the substring "retry" (case-insensitive).
+/// This catches `pipeline_retry_count`, `qa_retry_count`, `retry_attempt`, etc.
+fn has_retry_semantic_keys(meta: &Value) -> bool {
+    if let Some(obj) = meta.as_object() {
+        obj.keys().any(|k| k.to_ascii_lowercase().contains("retry"))
+    } else {
+        false
     }
 }
 
@@ -862,6 +909,350 @@ mod tests {
                 result.content
             );
         }
+    }
+
+    // -- Phantom retry guard tests (#579) --
+
+    /// Helper: create a callback child task for a work item.
+    async fn create_callback_child(harness: &TestHarness, parent_id: &str, status: &str) -> String {
+        let child_id = harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: Some(parent_id.to_string()),
+                depth: 1,
+                label: "run_claude_pilot".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("test-session".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        if status != "pending" {
+            harness
+                .db
+                .update_task_status(&child_id, status)
+                .await
+                .unwrap();
+        }
+        child_id
+    }
+
+    #[tokio::test]
+    async fn test_retry_metadata_succeeds_without_active_callback() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "No callback item").await;
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"pipeline_retry_count": 1}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "should succeed: {}", result.content);
+        assert!(result.content.contains("pending → in_progress"));
+    }
+
+    #[tokio::test]
+    async fn test_non_retry_metadata_allowed_during_active_callback() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Active dispatch item").await;
+
+        // Transition to in_progress so we can add a callback child
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "pending").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // Non-retry metadata should succeed even with active callback
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"claude_pilot": {"branch": "feat/test"}}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "non-retry metadata should succeed: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_metadata_rejected_with_pending_callback() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Pending callback item").await;
+
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "pending").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"pipeline_retry_count": 1}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "should reject: {}", result.content);
+        assert!(
+            result
+                .content
+                .contains("retry_metadata_rejected_active_dispatch"),
+            "expected structured error, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_metadata_rejected_with_in_progress_callback() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "In-progress callback item").await;
+
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "in_progress").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"pipeline_retry_count": 1}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "should reject: {}", result.content);
+        assert!(
+            result
+                .content
+                .contains("retry_metadata_rejected_active_dispatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_variant_key_rejected_with_active_callback() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Variant key item").await;
+
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "pending").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // "retry_attempt" also matches the retry-semantic check
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"retry_attempt": 1}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "variant key should be rejected: {}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("retry_metadata_rejected_active_dispatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_status_only_update_allowed_during_active_callback() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Status only item").await;
+
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "pending").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // Status-only update (no metadata) should succeed
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "blocked",
+                    "note": "Waiting for callback"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "status-only update should succeed: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_metadata_allowed_after_callback_completed() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Completed callback item").await;
+
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "completed").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // Callback is completed, so retry metadata should be allowed
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"pipeline_retry_count": 1}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "should allow after completed callback: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_metadata_rejected_on_same_status_path() {
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "Same status retry item").await;
+
+        harness
+            .db
+            .update_manual_task_status(&id, "in_progress")
+            .await
+            .unwrap();
+        create_callback_child(&harness, &id, "pending").await;
+
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        // Same-status path with retry metadata should still be caught
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"pipeline_retry_count": 1}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "same-status path should also enforce guard: {}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("retry_metadata_rejected_active_dispatch")
+        );
+    }
+
+    #[test]
+    fn test_has_retry_semantic_keys() {
+        assert!(has_retry_semantic_keys(
+            &serde_json::json!({"pipeline_retry_count": 1})
+        ));
+        assert!(has_retry_semantic_keys(
+            &serde_json::json!({"qa_retry_count": 0})
+        ));
+        assert!(has_retry_semantic_keys(
+            &serde_json::json!({"retry_attempt": 1})
+        ));
+        assert!(has_retry_semantic_keys(
+            &serde_json::json!({"RETRY_COUNT": 3})
+        ));
+        assert!(!has_retry_semantic_keys(
+            &serde_json::json!({"claude_pilot": {"branch": "main"}})
+        ));
+        assert!(!has_retry_semantic_keys(
+            &serde_json::json!({"ci_fix_count": 2})
+        ));
+        assert!(!has_retry_semantic_keys(&serde_json::json!({})));
+        assert!(!has_retry_semantic_keys(&serde_json::json!(
+            "not an object"
+        )));
+        // Nested retry keys are intentionally excluded — only top-level keys trigger the guard
+        assert!(!has_retry_semantic_keys(
+            &serde_json::json!({"dispatch_info": {"retry_count": 1}})
+        ));
     }
 
     #[test]

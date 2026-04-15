@@ -55,6 +55,8 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 **Status transition state machine:** `pending` -> any; `in_progress` -> blocked/completed/cancelled; `blocked` -> in_progress/completed/cancelled. Terminal states cannot transition.
 
+**Phantom retry guard (#579):** `update_work_item_status` rejects retry-semantic metadata writes (any top-level key containing "retry", case-insensitive) when the work item has an active callback child task (`trigger_type="callback"` in `pending` or `in_progress` status). Returns structured JSON error `retry_metadata_rejected_active_dispatch`. Fail-open on `get_child_tasks` DB error — the dispatch readiness guard (#525) is the primary defense against re-dispatch. Non-retry metadata writes are unaffected.
+
 **Idempotent creation:** Deduplicates on `reference_url` (DB partial unique index `idx_tasks_manual_active_ref_url`) and on label (case-insensitive pre-check). Five loop-prevention guards. Max 5 agent-created items per session (user_request exempt).
 
 ### PR Merge Gate
