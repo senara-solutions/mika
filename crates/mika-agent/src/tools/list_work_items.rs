@@ -88,22 +88,15 @@ impl Tool for ListWorkItemsTool {
             .filter(|s| !s.is_empty());
         let include_children = input["include_children"].as_bool().unwrap_or(false);
 
-        const VALID_STATUSES: &[&str] = &[
-            "pending",
-            "in_progress",
-            "blocked",
-            "completed",
-            "cancelled",
-        ];
         const VALID_SOURCES: &[&str] = &["user_request", "github_issue", "team_run", "self_dev"];
 
         if let Some(s) = status
-            && !VALID_STATUSES.contains(&s)
+            && !STATUS_ORDER.contains(&s)
         {
             return Ok(ToolOutput::error(format!(
                 "Invalid status '{}'. Must be one of: {}",
                 s,
-                VALID_STATUSES.join(", ")
+                STATUS_ORDER.join(", ")
             )));
         }
         if let Some(s) = source
@@ -164,8 +157,8 @@ impl Tool for ListWorkItemsTool {
         lines.push(String::new()); // blank line separator
         lines.push(format!("Summary: {}", status_summary(&items)));
 
-        // Append filter guidance note for unfiltered calls only
-        if status.is_none() {
+        // Append filter guidance note for fully unfiltered calls only
+        if status.is_none() && source.is_none() {
             lines.push(format!("Note: {FILTER_GUIDANCE_NOTE}"));
         }
 
@@ -286,6 +279,12 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("GH item"));
         assert!(!result.content.contains("User item"));
+        // Source-only filter should NOT show the guidance note (not fully unfiltered)
+        assert!(
+            !result.content.contains("Note:"),
+            "note should not appear on source-filtered calls: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
