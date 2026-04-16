@@ -1,0 +1,9 @@
+[skill]
+name = "address-pr-comments"
+description = "Address PR review comments by running a focused claude-pilot session"
+version = "0.1.0"
+always_on = false
+timeout_secs = 600
+
+[triggers]
+keywords = ["address pr comments", "address review comments", "pr feedback", "review feedback", "pr comments"]

@@ -1,0 +1,30 @@
+[
+  {
+    "name": "address_pr_comments",
+    "description": "Address PR review comments by fetching them from GitHub and running a focused claude-pilot session. Long-running — returns a task ID immediately, results arrive via callback when claude-pilot finishes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pr_url": {
+          "type": "string",
+          "description": "Full GitHub PR URL (e.g., 'https://github.com/senara-solutions/mika/pull/42')."
+        },
+        "worktree_path": {
+          "type": "string",
+          "description": "Absolute path to the existing git worktree for the PR branch. The worktree must already exist (created by self-dev or manually)."
+        },
+        "task_id": {
+          "type": "string",
+          "description": "The UUID returned by create_work_item (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log."
+        }
+      },
+      "required": ["pr_url", "worktree_path", "task_id"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh",
+      "long_running": true,
+      "estimated_duration_secs": 1800
+    }
+  }
+]
