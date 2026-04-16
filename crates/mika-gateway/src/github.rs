@@ -1909,12 +1909,17 @@ mod tests {
 
         let sem_clone = semaphore.clone();
         let handle = tokio::spawn(async move {
+            // Pass repo_full_name=None to skip the resolve_github_container_url
+            // SQL lookup. test_state_with_base_url uses a lazy fake Postgres
+            // pool whose first connection attempt blocks for sqlx's default
+            // connect_timeout (~30s) on CI hosts where localhost:5432 doesn't
+            // RST-fast — that's what was eating our timing budget.
             deliver_with_retry_inner(
                 &state,
                 "mika-dev",
                 "test event",
                 "delivery-sem",
-                Some("org/repo"),
+                None,
                 permit,
                 &sem_clone,
                 &TEST_DELAYS_OBSERVE_ONLY,
@@ -1952,12 +1957,14 @@ mod tests {
         let sem_clone = semaphore.clone();
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
+            // Pass repo_full_name=None to skip the resolve_github_container_url
+            // SQL lookup (see sibling test for rationale).
             deliver_with_retry_inner(
                 &state_clone,
                 "mika-dev",
                 "test event",
                 "delivery-blocked",
-                Some("org/repo"),
+                None,
                 permit,
                 &sem_clone,
                 &TEST_DELAYS_OBSERVE_AND_ABANDON,
