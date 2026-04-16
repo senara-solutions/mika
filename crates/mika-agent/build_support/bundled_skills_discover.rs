@@ -29,9 +29,15 @@ pub struct DiscoveredFile {
 }
 
 /// A single discovered bundled skill.
+#[allow(dead_code)]
 pub struct DiscoveredSkill {
     /// Skill directory basename (used as the skill name).
     pub name: String,
+    /// Absolute path to the skill directory. Used by `build.rs` to emit
+    /// `cargo:rerun-if-changed` for the skill directory itself (so adding a
+    /// file inside the dir triggers a rebuild without requiring the parent
+    /// `skills/bundled/` mtime to change).
+    pub abs_dir: PathBuf,
     /// Files belonging to this skill, in stable alphabetical order.
     pub files: Vec<DiscoveredFile>,
 }
@@ -68,7 +74,14 @@ pub fn discover_bundled_skills(base: &Path) -> Vec<DiscoveredSkill> {
             continue;
         }
         let path = entry.path();
-        if !path.join("skill.toml").is_file() {
+        // Use symlink_metadata on the skill.toml path to stay consistent with
+        // the collector's symlink-skipping behavior below. A skill.toml that
+        // is itself a symlink shouldn't count a directory as a valid skill.
+        let toml_path = path.join("skill.toml");
+        let toml_is_real_file = fs::symlink_metadata(&toml_path)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
+        if !toml_is_real_file {
             continue;
         }
         dirs.push(path);
@@ -85,7 +98,11 @@ pub fn discover_bundled_skills(base: &Path) -> Vec<DiscoveredSkill> {
 
         let mut files = collect_skill_files(&skill_dir, "");
         files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-        skills.push(DiscoveredSkill { name, files });
+        skills.push(DiscoveredSkill {
+            name,
+            abs_dir: skill_dir,
+            files,
+        });
     }
     skills
 }

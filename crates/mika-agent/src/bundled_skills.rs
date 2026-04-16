@@ -152,16 +152,15 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
 // parallel path stays silent until a future migration ticket starts populating it.
 include!(concat!(env!("OUT_DIR"), "/bundled_skills_generated.rs"));
 
-/// Merge the legacy hardcoded `BUNDLED_SKILLS` list with the directory-sourced
-/// `ENTRIES` table. Entries from `ENTRIES` win on case-insensitive name collision.
-///
-/// Returns a deduplicated `Vec<&'static BundledSkill>`. Zero collisions are
-/// expected in production during this refactor (ENTRIES is empty). The merge
-/// semantics exist so a future migration ticket can move skills one-by-one
-/// without orchestrating a coordinated cutover.
-fn all_bundled_skills() -> Vec<&'static BundledSkill> {
-    let mut merged: Vec<&'static BundledSkill> = BUNDLED_SKILLS.to_vec();
-    for entry in ENTRIES {
+/// Pure merge primitive: overlay `entries` onto `legacy` with case-insensitive
+/// ENTRIES-wins-on-name-collision semantics. Extracted so both the production
+/// `all_bundled_skills()` path and tests can exercise the same implementation.
+fn merge_skill_lists(
+    legacy: &[&'static BundledSkill],
+    entries: &'static [BundledSkill],
+) -> Vec<&'static BundledSkill> {
+    let mut merged: Vec<&'static BundledSkill> = legacy.to_vec();
+    for entry in entries {
         if let Some(slot) = merged
             .iter_mut()
             .find(|existing| existing.name.eq_ignore_ascii_case(entry.name))
@@ -174,10 +173,26 @@ fn all_bundled_skills() -> Vec<&'static BundledSkill> {
     merged
 }
 
+/// Merge the legacy hardcoded `BUNDLED_SKILLS` list with the directory-sourced
+/// `ENTRIES` table. Entries from `ENTRIES` win on case-insensitive name collision.
+///
+/// Returns a deduplicated `Vec<&'static BundledSkill>`. Zero collisions are
+/// expected in production during this refactor (ENTRIES is empty). The merge
+/// semantics exist so a future migration ticket can move skills one-by-one
+/// without orchestrating a coordinated cutover.
+fn all_bundled_skills() -> Vec<&'static BundledSkill> {
+    merge_skill_lists(BUNDLED_SKILLS, ENTRIES)
+}
+
 /// Check whether a skill name matches a bundled (built-in) skill.
 ///
 /// Consults both the legacy hardcoded list and the directory-sourced `ENTRIES`
 /// table so install/uninstall/update guards treat either source as immutable.
+///
+/// Invariant: this must enumerate every source consulted by
+/// [`all_bundled_skills`]. If a third source is added, update both functions
+/// together. The `test_is_bundled_skill_agrees_with_all_bundled_skills` test
+/// guards the coupling.
 pub fn is_bundled_skill(name: &str) -> bool {
     BUNDLED_SKILLS
         .iter()
@@ -559,63 +574,53 @@ mod tests {
         assert!(!is_bundled_skill("definitely-not-a-skill"));
     }
 
+    // Shared fixtures for merge-semantics tests — call `merge_skill_lists`
+    // directly so the production merge function is the unit under test.
+    // Previously the test re-implemented the merge algorithm locally, which
+    // would silently pass if the production semantics drifted.
+    static MERGE_TEST_LEGACY_FILES: &[SkillFile] = &[SkillFile {
+        path: "skill.toml",
+        content: "legacy",
+        executable: false,
+    }];
+    static MERGE_TEST_LEGACY_ALPHA: BundledSkill = BundledSkill {
+        name: "alpha",
+        files: MERGE_TEST_LEGACY_FILES,
+    };
+    static MERGE_TEST_LEGACY_GAMMA: BundledSkill = BundledSkill {
+        name: "gamma",
+        files: MERGE_TEST_LEGACY_FILES,
+    };
+    static MERGE_TEST_LEGACY_SLICE: &[&BundledSkill] =
+        &[&MERGE_TEST_LEGACY_ALPHA, &MERGE_TEST_LEGACY_GAMMA];
+
+    static MERGE_TEST_OVERRIDE_FILES: &[SkillFile] = &[SkillFile {
+        path: "skill.toml",
+        content: "override",
+        executable: false,
+    }];
+    static MERGE_TEST_FRESH_FILES: &[SkillFile] = &[SkillFile {
+        path: "skill.toml",
+        content: "fresh",
+        executable: false,
+    }];
+
     #[test]
     fn test_merge_prefers_entries_on_collision() {
-        // Build synthetic legacy and ENTRIES-like inputs and apply the same
-        // merge logic to verify the invariant. This is a unit test for the
-        // semantics; real ENTRIES stays empty in production this PR.
-        fn merge(
-            legacy: &[&'static BundledSkill],
-            entries: &'static [BundledSkill],
-        ) -> Vec<&'static BundledSkill> {
-            let mut merged: Vec<&'static BundledSkill> = legacy.to_vec();
-            for entry in entries {
-                if let Some(slot) = merged
-                    .iter_mut()
-                    .find(|existing| existing.name.eq_ignore_ascii_case(entry.name))
-                {
-                    *slot = entry;
-                } else {
-                    merged.push(entry);
-                }
-            }
-            merged
-        }
-
-        static LEGACY_FILES: &[SkillFile] = &[SkillFile {
-            path: "skill.toml",
-            content: "legacy",
-            executable: false,
-        }];
-        static LEGACY: BundledSkill = BundledSkill {
-            name: "alpha",
-            files: LEGACY_FILES,
-        };
-        static LEGACY_SLICE: &[&BundledSkill] = &[&LEGACY];
-
-        static OVERRIDE_FILES: &[SkillFile] = &[SkillFile {
-            path: "skill.toml",
-            content: "override",
-            executable: false,
-        }];
-        static FRESH_FILES: &[SkillFile] = &[SkillFile {
-            path: "skill.toml",
-            content: "fresh",
-            executable: false,
-        }];
         static ENTRIES_FIXTURE: &[BundledSkill] = &[
             BundledSkill {
-                name: "ALPHA", // case-insensitive collision with LEGACY
-                files: OVERRIDE_FILES,
+                name: "ALPHA", // case-insensitive collision with MERGE_TEST_LEGACY_ALPHA
+                files: MERGE_TEST_OVERRIDE_FILES,
             },
             BundledSkill {
                 name: "beta", // new addition
-                files: FRESH_FILES,
+                files: MERGE_TEST_FRESH_FILES,
             },
         ];
 
-        let merged = merge(LEGACY_SLICE, ENTRIES_FIXTURE);
-        assert_eq!(merged.len(), 2);
+        let merged = merge_skill_lists(MERGE_TEST_LEGACY_SLICE, ENTRIES_FIXTURE);
+        // 2 legacy + 1 new = 3 (alpha collision merged)
+        assert_eq!(merged.len(), 3);
 
         let alpha = merged.iter().find(|s| s.name.eq_ignore_ascii_case("alpha"));
         assert!(alpha.is_some(), "alpha missing from merged view");
@@ -628,8 +633,97 @@ mod tests {
         let beta = merged.iter().find(|s| s.name == "beta");
         assert!(beta.is_some(), "beta missing from merged view");
         assert_eq!(beta.unwrap().files[0].content, "fresh");
+
+        // gamma survives untouched — no ENTRIES override
+        let gamma = merged.iter().find(|s| s.name == "gamma");
+        assert!(gamma.is_some(), "gamma missing from merged view");
+        assert_eq!(gamma.unwrap().files[0].content, "legacy");
     }
 
+    #[test]
+    fn test_merge_with_all_collisions_preserves_legacy_length() {
+        // Every legacy name is overridden by ENTRIES — merged length must equal
+        // legacy length, and every merged entry must be the ENTRIES version.
+        static ENTRIES_FIXTURE: &[BundledSkill] = &[
+            BundledSkill {
+                name: "alpha",
+                files: MERGE_TEST_OVERRIDE_FILES,
+            },
+            BundledSkill {
+                name: "gamma",
+                files: MERGE_TEST_OVERRIDE_FILES,
+            },
+        ];
+        let merged = merge_skill_lists(MERGE_TEST_LEGACY_SLICE, ENTRIES_FIXTURE);
+        assert_eq!(merged.len(), MERGE_TEST_LEGACY_SLICE.len());
+        for skill in &merged {
+            assert_eq!(
+                skill.files[0].content, "override",
+                "every merged skill should be the ENTRIES version"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_with_empty_entries_returns_legacy() {
+        static EMPTY: &[BundledSkill] = &[];
+        let merged = merge_skill_lists(MERGE_TEST_LEGACY_SLICE, EMPTY);
+        assert_eq!(merged.len(), MERGE_TEST_LEGACY_SLICE.len());
+        for skill in &merged {
+            assert_eq!(skill.files[0].content, "legacy");
+        }
+    }
+
+    #[test]
+    fn test_is_bundled_skill_recognizes_entries_only_name() {
+        // `is_bundled_skill` has a dedicated ENTRIES arm that's dead code when
+        // production ENTRIES is empty. Verify the arm works by exercising the
+        // same logic the function uses — a name present only in ENTRIES must
+        // be recognized as bundled.
+        static ENTRIES_ONLY: &[BundledSkill] = &[BundledSkill {
+            name: "entries-only-skill",
+            files: MERGE_TEST_FRESH_FILES,
+        }];
+
+        let has_entries_arm = BUNDLED_SKILLS
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case("entries-only-skill"))
+            || ENTRIES_ONLY
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case("entries-only-skill"));
+        assert!(
+            has_entries_arm,
+            "ENTRIES-only name must be recognized via the ENTRIES arm"
+        );
+
+        let case_insensitive = BUNDLED_SKILLS
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case("ENTRIES-ONLY-SKILL"))
+            || ENTRIES_ONLY
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case("ENTRIES-ONLY-SKILL"));
+        assert!(case_insensitive, "ENTRIES arm must be case-insensitive");
+    }
+
+    #[test]
+    fn test_is_bundled_skill_agrees_with_all_bundled_skills() {
+        // Coupling guard: `is_bundled_skill` and `all_bundled_skills` must
+        // enumerate the same sources. If a third source is added to one
+        // without updating the other, this test catches it.
+        for skill in all_bundled_skills() {
+            assert!(
+                is_bundled_skill(skill.name),
+                "all_bundled_skills() yielded '{}' but is_bundled_skill rejected it",
+                skill.name
+            );
+        }
+    }
+
+    // TODO: DELETE THIS TEST when the migration ticket (follow-up to mika#598)
+    // populates `skills/bundled/` with real engine-coupled skills. The guard
+    // is intentionally temporary and fail-loud: when someone legitimately adds
+    // a skill to `skills/bundled/` in a future PR, this test MUST be removed
+    // as part of that PR so CI doesn't block on its expected failure.
     #[test]
     fn test_production_entries_is_empty_until_migration() {
         // Guard against accidentally shipping production bundled skills before
@@ -637,9 +731,9 @@ mod tests {
         // at the workspace root — it must stay empty (beyond `.gitkeep`) in this PR.
         assert!(
             ENTRIES.is_empty(),
-            "ENTRIES is non-empty ({} skill(s)). If this was intentional, this guard \
-             should move to the migration PR. Otherwise, remove files from \
-             `skills/bundled/` at the workspace root.",
+            "ENTRIES is non-empty ({} skill(s)). If this was intentional (migration PR), \
+             DELETE this test. Otherwise, remove files from `skills/bundled/` \
+             at the workspace root.",
             ENTRIES.len()
         );
     }

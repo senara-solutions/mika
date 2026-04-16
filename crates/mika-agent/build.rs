@@ -127,23 +127,46 @@ fn generate_bundled_skills_table(manifest_dir: &str, out_dir: &str) {
 
     let entries = discover_bundled_skills(&bundled_root);
 
+    // Also emit rerun-if-changed for each discovered skill directory (and its
+    // handlers/ subdirectory when present). Without this, adding a new file to
+    // an already-discovered skill doesn't touch the parent `skills/bundled/`
+    // mtime and cargo won't re-run build.rs until the directory itself changes.
+    for entry in &entries {
+        println!("cargo:rerun-if-changed={}", entry.abs_dir.display());
+        let handlers = entry.abs_dir.join("handlers");
+        if handlers.exists() {
+            println!("cargo:rerun-if-changed={}", handlers.display());
+        }
+    }
+
     if entries.is_empty() {
         out.push_str("static ENTRIES: &[BundledSkill] = &[];\n");
     } else {
-        // Emit one `static <NAME>_ENTRY_FILES: &[SkillFile]` per skill so the
-        // generated literal stays readable.
-        for entry in &entries {
-            let upper = entry.name.to_ascii_uppercase().replace('-', "_");
-            out.push_str(&format!("static {upper}_ENTRY_FILES: &[SkillFile] = &[\n"));
+        // Emit one `static SKILL_<INDEX>_ENTRY_FILES: &[SkillFile]` per skill.
+        // Index-based identifiers avoid collisions from case-variant directory
+        // names (`foo` vs `FOO`) or hyphen-vs-underscore ambiguity
+        // (`my-skill` vs `my_skill`), both of which would otherwise produce
+        // duplicate Rust static names and an opaque compile error.
+        // The human-readable name travels in the `name:` field of each
+        // BundledSkill, where Debug-formatted string literals handle all
+        // escaping correctly.
+        for (idx, entry) in entries.iter().enumerate() {
+            out.push_str(&format!(
+                "static SKILL_{idx}_ENTRY_FILES: &[SkillFile] = &[\n"
+            ));
             for file in &entry.files {
+                // Use {:?} (Rust Debug formatter) so all string literals in the
+                // generated code are escaped correctly — handles backslashes,
+                // double-quotes, and non-ASCII control characters uniformly
+                // for both `path` and `content` include_str! arguments.
                 let abs = file
                     .abs_path
                     .to_str()
                     .unwrap_or_else(|| panic!("non-utf8 path: {}", file.abs_path.display()));
                 out.push_str(&format!(
-                    "    SkillFile {{ path: \"{rel}\", content: include_str!(\"{abs}\"), executable: {exe} }},\n",
+                    "    SkillFile {{ path: {rel:?}, content: include_str!({abs:?}), executable: {exe} }},\n",
                     rel = file.rel_path,
-                    abs = abs.replace('\\', "\\\\").replace('"', "\\\""),
+                    abs = abs,
                     exe = file.executable,
                 ));
                 // Watch each embedded file for content changes.
@@ -153,10 +176,9 @@ fn generate_bundled_skills_table(manifest_dir: &str, out_dir: &str) {
         }
 
         out.push_str("static ENTRIES: &[BundledSkill] = &[\n");
-        for entry in &entries {
-            let upper = entry.name.to_ascii_uppercase().replace('-', "_");
+        for (idx, entry) in entries.iter().enumerate() {
             out.push_str(&format!(
-                "    BundledSkill {{ name: \"{name}\", files: {upper}_ENTRY_FILES }},\n",
+                "    BundledSkill {{ name: {name:?}, files: SKILL_{idx}_ENTRY_FILES }},\n",
                 name = entry.name,
             ));
         }
