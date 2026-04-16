@@ -1,0 +1,9 @@
+[skill]
+name = "resolve-pr-conflicts"
+description = "Resolve PR merge conflicts by rebasing onto the base branch via claude-pilot"
+version = "0.1.0"
+always_on = false
+timeout_secs = 600
+
+[triggers]
+keywords = ["resolve conflicts", "resolve pr conflicts", "rebase", "sync main", "merge main"]
