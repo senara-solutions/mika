@@ -1831,9 +1831,30 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 30);
     }
 
+    /// Polls `semaphore.available_permits()` until it reaches `target`, up to `budget`.
+    /// Returns the elapsed wait. Used to replace fixed `sleep(N)` timing assumptions
+    /// that flake on slow CI runners — the production retry sleep is ≥1.5s, so a
+    /// 1s+ poll budget catches the released-permit window with margin.
+    async fn wait_for_permits(
+        semaphore: &Arc<tokio::sync::Semaphore>,
+        target: usize,
+        budget: Duration,
+    ) -> Duration {
+        let start = std::time::Instant::now();
+        loop {
+            if semaphore.available_permits() >= target {
+                return start.elapsed();
+            }
+            if start.elapsed() >= budget {
+                return start.elapsed();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_deliver_semaphore_released_during_retry_sleep() {
-        // 429 on first attempt — during the 2s sleep, the permit should be released
+        // 429 on first attempt — during the 2s retry sleep, the permit should be released.
         let (base_url, _call_count) =
             mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
         let state = test_state_with_base_url(&base_url);
@@ -1854,15 +1875,15 @@ mod tests {
             .await;
         });
 
-        // Give the first attempt time to fail and release the permit.
-        // The 429 response comes back quickly (localhost Axum), then the retry
-        // path enters tokio::time::sleep(2s +/- jitter). 500ms gives ample margin
-        // over the HTTP round-trip on any reasonable CI host.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // The permit should be available during the retry sleep window
-        let available = semaphore.available_permits();
-        assert_eq!(available, 1, "permit should be released during retry sleep");
+        // Poll for permit release rather than sleeping a fixed window.
+        // Budget is 1.4s — the production retry sleep is ≥1.5s with jitter,
+        // so this stays well inside the released-permit window even on slow CI.
+        let waited = wait_for_permits(&semaphore, 1, Duration::from_millis(1400)).await;
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit should be released during retry sleep (waited {waited:?})"
+        );
 
         handle.await.unwrap();
     }
@@ -1896,11 +1917,21 @@ mod tests {
             .await;
         });
 
-        // Wait for the first attempt to fail and release the permit
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Poll for the first attempt to release the permit (rather than
+        // sleeping a fixed window that flakes when the localhost HTTP roundtrip
+        // takes longer than expected on a loaded CI runner).
+        wait_for_permits(&semaphore, 1, Duration::from_millis(1400)).await;
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "first attempt should release the permit before the retry sleep"
+        );
 
-        // Grab the permit before the retry can — this blocks the retry
-        let _blocker = semaphore.clone().try_acquire_owned().unwrap();
+        // Grab the permit before the retry can — this blocks the retry.
+        let _blocker = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("test must hold the only permit before retry tries to re-acquire");
 
         // The retry should be abandoned because the semaphore is full.
         // Wrap in timeout to catch the race where _blocker wasn't grabbed in
