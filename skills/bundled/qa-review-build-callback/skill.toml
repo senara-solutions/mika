@@ -1,0 +1,9 @@
+[skill]
+name = "qa-review-build-callback"
+description = "Build callback resumption for qa-review — continues QA verdict after build_mika completes"
+version = "0.1.0"
+always_on = false
+dependencies = ["qa-review"]
+
+[triggers]
+keywords = ["build_mika", "build callback", "callback", "build result"]
