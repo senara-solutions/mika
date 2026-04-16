@@ -82,11 +82,8 @@ static FILE_READER_SKILL: BundledSkill = skill!("file-reader", [
     ("handlers/read.sh" => "../templates/skills/file-reader/handlers/read.sh", +x),
 ]);
 
-static SKILL_REVIEW_SKILL: BundledSkill = skill!("skill-review", [
-    ("skill.toml" => "../templates/skills/skill-review/skill.toml"),
-    ("system_prompt.md" => "../templates/skills/skill-review/system_prompt.md"),
-    ("tools.json" => "../templates/skills/skill-review/tools.json"),
-]);
+// skill-review migrated to skills/bundled/ (engine-coupled via review_filter).
+// Discovered at build time by build.rs — no static entry needed.
 
 static SELF_KNOWLEDGE_SKILL: BundledSkill = skill!("self-knowledge", [
     ("skill.toml" => "../templates/skills/self-knowledge/skill.toml"),
@@ -124,26 +121,23 @@ static BROWSER_CONTROL_SKILL: BundledSkill = skill!("browser-control", [
     ("tools.json" => "../templates/skills/browser-control/tools.json"),
 ]);
 
-static AGENTS_TEAMS_SKILL: BundledSkill = skill!("agents-teams", [
-    ("skill.toml" => "../templates/skills/agents-teams/skill.toml"),
-    ("system_prompt.md" => "../templates/skills/agents-teams/system_prompt.md"),
-    ("tools.json" => "../templates/skills/agents-teams/tools.json"),
-]);
+// agents-teams migrated to skills/bundled/ (engine-coupled via delegate_task /
+// run_team guards). Discovered at build time by build.rs.
 
-/// All bundled skills.
+/// Legacy hardcoded bundled skills (community-category skills kept embedded
+/// for convenience). Engine-coupled skills live in `skills/bundled/` and are
+/// discovered at build time — see the `ENTRIES` table below.
 static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &TMUX_SKILL,
     &SHELL_EXEC_SKILL,
     &WEB_SEARCH_SKILL,
     &FILE_READER_SKILL,
-    &SKILL_REVIEW_SKILL,
     &SELF_KNOWLEDGE_SKILL,
     &GIT_OPS_SKILL,
     &GOOGLE_WORKSPACE_SKILL,
     &GITHUB_SKILL,
     &MCP_SKILL,
     &BROWSER_CONTROL_SKILL,
-    &AGENTS_TEAMS_SKILL,
 ];
 
 // Directory-sourced bundled skills, generated at build time by `build.rs`
@@ -526,7 +520,7 @@ mod tests {
     fn test_skill_review_prompt_lists_trust_critical_skills() {
         // The skill-review system prompt must mention every trust-critical
         // skill name so the agent doesn't waste tool calls on them.
-        let content = include_str!("../templates/skills/skill-review/system_prompt.md");
+        let content = include_str!("../../../skills/bundled/skill-review/system_prompt.md");
         for name in TRUST_CRITICAL_SKILLS {
             assert!(
                 content.contains(name),
@@ -539,7 +533,7 @@ mod tests {
     #[test]
     fn test_skill_review_prompt_does_not_reference_write_skill_variant() {
         // Regression: ensure the stale tool name is gone from the prompt.
-        let content = include_str!("../templates/skills/skill-review/system_prompt.md");
+        let content = include_str!("../../../skills/bundled/skill-review/system_prompt.md");
         assert!(
             !content.contains("write_skill_variant"),
             "skill-review prompt still references write_skill_variant"
@@ -717,25 +711,6 @@ mod tests {
                 skill.name
             );
         }
-    }
-
-    // TODO: DELETE THIS TEST when the migration ticket (follow-up to mika#598)
-    // populates `skills/bundled/` with real engine-coupled skills. The guard
-    // is intentionally temporary and fail-loud: when someone legitimately adds
-    // a skill to `skills/bundled/` in a future PR, this test MUST be removed
-    // as part of that PR so CI doesn't block on its expected failure.
-    #[test]
-    fn test_production_entries_is_empty_until_migration() {
-        // Guard against accidentally shipping production bundled skills before
-        // the migration ticket lands. The single point of change is `skills/bundled/`
-        // at the workspace root — it must stay empty (beyond `.gitkeep`) in this PR.
-        assert!(
-            ENTRIES.is_empty(),
-            "ENTRIES is non-empty ({} skill(s)). If this was intentional (migration PR), \
-             DELETE this test. Otherwise, remove files from `skills/bundled/` \
-             at the workspace root.",
-            ENTRIES.len()
-        );
     }
 
     #[test]

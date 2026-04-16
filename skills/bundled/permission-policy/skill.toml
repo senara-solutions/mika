@@ -1,0 +1,21 @@
+[skill]
+name = "permission-policy"
+description = "Permission policy for PilotEvent classification (TIER 1/1.5/2/3)"
+version = "0.1.0"
+always_on = false
+
+[triggers]
+# `[claude-pilot]` is the literal structural marker written by claude-pilot's
+# transport layer at the start of every PilotEvent payload. It is the primary
+# trigger — presence of this exact substring means the current input IS a
+# PilotEvent and this skill must be loaded to handle it. The other keywords
+# below are fallback matches on PilotEvent JSON field names, preserved for
+# defense in depth if the prefix is ever stripped in transit.
+keywords = [
+    "[claude-pilot]",
+    "pilotevent",
+    "permission",
+    "tool_use_id",
+    "tool_name",
+    "decision_reason",
+]

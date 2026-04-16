@@ -1,0 +1,17 @@
+[skill]
+name = "qa-review"
+description = "Quality gate for PR review — produces structured pass/hold/block verdicts for mika-dev"
+version = "0.8.0"
+always_on = true
+max_prompt_size = 32768
+dependencies = ["github", "build-mika"]
+
+[triggers]
+keywords = ["review", "pr", "qa", "pull request"]
+
+[constraints]
+required_tools = ["qa_pr_view", "run_gh"]
+
+[context.pr_diff]
+type = "gh_pr_diff"
+required = false

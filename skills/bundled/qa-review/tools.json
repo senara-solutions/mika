@@ -1,0 +1,43 @@
+[
+  {
+    "name": "qa_pr_view",
+    "description": "Fetch PR metadata with CI-related fields stripped. Returns title, body, additions, deletions, files, labels, state, branch info, and author. Does NOT return CI check status, merge status, or commit-level check data.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pr_url": {
+          "type": "string",
+          "description": "Full PR URL (e.g., https://github.com/senara-solutions/mika/pull/495) or owner/repo#number format"
+        }
+      },
+      "required": ["pr_url"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/qa_pr_view.sh"
+    }
+  },
+  {
+    "name": "run_gh",
+    "description": "Run a GitHub CLI command. Restricted to: pr review, pr diff, pr list, issue view. Use qa_pr_view for PR metadata instead of pr view.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Command arguments for gh CLI (e.g., [\"pr\", \"review\", \"455\", \"--approve\", \"--body\", \"VERDICT: pass\"])"
+        },
+        "repo": {
+          "type": "string",
+          "description": "GitHub repository in owner/repo format (e.g., senara-solutions/mika)"
+        }
+      },
+      "required": ["command"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run_gh.sh"
+    }
+  }
+]

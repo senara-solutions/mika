@@ -706,11 +706,11 @@ async fn execute_long_running(
     ctx: &LongRunningContext,
     github_token: Option<&str>,
 ) -> ToolOutput {
-    // Validate work_item_id — long-running tasks require tracked work items
-    let work_item_id = input
-        .get("work_item_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // Validate work_item_id — long-running tasks require tracked work items.
+    // The agent passes the work item UUID via the `task_id` input field
+    // (domain-centric: work items ARE tasks with trigger_type='manual', so the
+    // canonical parameter name is `task_id`). See mika#596 / mika-skills#151.
+    let work_item_id = input.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if let Some(err) = crate::tools::validate_work_item(&ctx.db, work_item_id).await {
         return ToolOutput::error(err);
     }
@@ -731,7 +731,7 @@ async fn execute_long_running(
         return ToolOutput::error(
             serde_json::json!({
                 "error": "dispatch_limit_exceeded",
-                "work_item_id": work_item_id,
+                "task_id": work_item_id,
                 "dispatches_this_turn": ctx.dispatch_count.load(Ordering::Relaxed),
                 "reason": "Only one long-running dispatch is permitted per agent turn. \
                            A dispatch has already been launched in this turn. Wait for the \
@@ -766,9 +766,10 @@ async fn execute_long_running(
         }
     }
 
-    // Link callback task to work item via parent_task_id for task tree correlation
+    // Link callback task to work item via parent_task_id for task tree correlation.
+    // Same canonical source as the validation above — agent passes via `task_id`.
     let parent_task_id = input
-        .get("work_item_id")
+        .get("task_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
@@ -1638,7 +1639,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"query": "test", "work_item_id": wi_id}),
+            serde_json::json!({"query": "test", "task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -1738,7 +1739,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -1922,7 +1923,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -1950,7 +1951,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -1979,7 +1980,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2007,7 +2008,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": "00000000-0000-0000-0000-000000000000"}),
+            serde_json::json!({"task_id": "00000000-0000-0000-0000-000000000000"}),
             30,
             Some(&ctx),
             None,
@@ -2036,7 +2037,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2065,7 +2066,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2094,7 +2095,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2128,7 +2129,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2185,7 +2186,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2219,7 +2220,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2250,7 +2251,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2280,7 +2281,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2328,7 +2329,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2367,7 +2368,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2399,7 +2400,7 @@ mod tests {
         let ctx = make_lr_ctx(async_db.clone());
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2417,7 +2418,7 @@ mod tests {
         let ctx = make_lr_ctx(async_db.clone());
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2448,7 +2449,7 @@ mod tests {
         let ctx = make_lr_ctx(async_db.clone());
         let output1 = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2476,7 +2477,7 @@ mod tests {
         let ctx = make_lr_ctx(async_db.clone());
         let output2 = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_id}),
+            serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
             None,
@@ -2513,7 +2514,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_b}),
+            serde_json::json!({"task_id": wi_b}),
             30,
             Some(&ctx),
             None,
@@ -2547,7 +2548,7 @@ mod tests {
 
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi_b}),
+            serde_json::json!({"task_id": wi_b}),
             30,
             Some(&ctx),
             None,
@@ -2605,7 +2606,7 @@ mod tests {
         // Second dispatch should be rejected by the per-turn counter
         let output = execute_skill_tool(
             &tool,
-            serde_json::json!({"work_item_id": wi}),
+            serde_json::json!({"task_id": wi}),
             30,
             Some(&ctx),
             None,

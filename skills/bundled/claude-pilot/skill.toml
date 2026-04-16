@@ -1,0 +1,9 @@
+[skill]
+name = "claude-pilot"
+description = "Run Claude Code headlessly on a project via the claude-pilot CLI"
+version = "0.1.0"
+always_on = false
+timeout_secs = 600
+
+[triggers]
+keywords = ["claude code", "run claude", "code task", "coding task"]

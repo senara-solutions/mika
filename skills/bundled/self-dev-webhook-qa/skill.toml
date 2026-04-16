@@ -1,0 +1,16 @@
+[skill]
+name = "self-dev-webhook-qa"
+description = "Webhook handler for PR review verdicts (pass/hold/block)"
+version = "0.1.0"
+always_on = false
+dependencies = ["self-dev"]
+
+[triggers]
+keywords = [
+    "pull_request_review",
+    "pull_request",
+    "pull_request closed",
+    "pr review",
+    "verdict",
+    "qa verdict",
+]

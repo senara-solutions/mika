@@ -1,0 +1,9 @@
+[skill]
+name = "build-mika"
+description = "Build the mika project with cargo --release --features telemetry"
+version = "0.1.0"
+always_on = false
+timeout_secs = 300
+
+[triggers]
+keywords = ["build mika", "build the project", "cargo build", "compile mika"]

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "build_mika",
+    "description": "Build the mika project with `cargo build --release --features telemetry`. Long-running — returns a callback task ID immediately.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for the build. Defaults to the main mika repo root."
+        }
+      },
+      "required": []
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh",
+      "long_running": true,
+      "estimated_duration_secs": 120
+    }
+  }
+]
