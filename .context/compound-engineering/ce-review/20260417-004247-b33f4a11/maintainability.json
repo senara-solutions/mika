@@ -1,0 +1,75 @@
+{
+  "reviewer": "maintainability",
+  "findings": [
+    {
+      "id": "M1",
+      "category": "unnecessary_indirection",
+      "title": "execute-path block is deep enough to warrant extraction",
+      "confidence": 0.72,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1587-1668",
+      "detail": "The else-branch of the cache-hit / execute split now contains the full original body: tool dispatch, DB record, image summary construction, ToolCallSummary push, and HashMap insert. That branch is ~82 lines at one extra level of indentation inside an already-large for-body. A private async helper `execute_and_record_tool(...)` returning `(ToolOutput, ToolCallSummary)` would let the cache-hit branch stay a three-liner and the execute path be navigable independently. The function was already around the readable limit before this change; the extra indentation level tips it past it.",
+      "suggested_fix": "Extract the else-branch into `async fn execute_and_record_tool(dispatch, name, arguments, db, store_tool_calls, step, ...) -> (ToolOutput, ToolCallSummary)`. The outer loop then reads: `let (output, summary) = if let Some(c) = executed.get(&key) { (c.clone(), None) } else { execute_and_record_tool(...).await }`."
+    },
+    {
+      "id": "M2",
+      "category": "naming_obscures_intent",
+      "title": "`executed` is an ambiguous name for a dedup cache",
+      "confidence": 0.65,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1567",
+      "detail": "`executed` reads as a past-tense verb (\"already executed\") but acts as a noun (a cache). A future reader scanning for the HashMap might look for `cache` or `dedup_cache`. `dedup_cache` or `tool_result_cache` would signal both the structure type (a cache) and its purpose (dedup) without requiring the reader to read the comment to understand intent. The variable `cached` used for the looked-up value is fine.",
+      "suggested_fix": "Rename `executed` to `dedup_cache`."
+    },
+    {
+      "id": "M3",
+      "category": "dead_or_unreachable_code",
+      "title": "Duplicate `output.clone()` at insert and at block exit — one is load-bearing but easily confused",
+      "confidence": 0.70,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1667-1668",
+      "detail": "`executed.insert(dedup_key, output.clone()); output` at the end of the else-branch requires two clones of ToolOutput per first-seen call (one into the map, one as the block's return value) because HashMap::insert takes ownership and the value is still needed. This is semantically correct but a reader will wonder why `output` is returned after being cloned into the map rather than retrieved from it. With the extraction suggested in M1 this becomes explicit; without it, a brief comment `// clone into cache, return original` would prevent the double-take.",
+      "suggested_fix": "Add a one-line comment above `executed.insert(...)` explaining both clones are intentional, or restructure so the final `output` is retrieved via `executed.get(&dedup_key).unwrap()` (single Clone, clearer ownership)."
+    },
+    {
+      "id": "M4",
+      "category": "premature_abstraction",
+      "title": "Clone derive on ToolOutput is appropriate but ImageData images field should be noted",
+      "confidence": 0.60,
+      "file": "crates/mika-agent/src/tools/mod.rs",
+      "lines": "140",
+      "detail": "Adding `#[derive(Clone)]` is the minimal correct change. ImageData already derived Clone so the derive chain is consistent. The cost of cloning a cached ToolOutput is bounded by image data (base64 strings), which in the dedup scenario means the tool ran once and the second clone is unavoidable to keep the API sound. The risk is that future callers see Clone available and reach for it in hot paths where Arc-wrapping would be cheaper. This is a low-severity latent concern rather than a current problem -- image tool results in a single response are not expected to be large enough to matter.",
+      "suggested_fix": "No immediate change required. If image-heavy tools become common, consider `Arc<ToolOutput>` in the HashMap value to share without copying."
+    },
+    {
+      "id": "M5",
+      "category": "naming_obscures_intent",
+      "title": "Comment block length is well-calibrated",
+      "confidence": 0.85,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1562-1566",
+      "detail": "The four-line comment accurately scopes the behavior (per-function-call, not cross-step), cites the issue number, and describes the defensive motivation. It is not over-long. No change needed.",
+      "suggested_fix": null
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR1",
+      "description": "Dedup silently suppresses the DB record for the second identical tool_use block. If a provider emits three identical blocks the first will be recorded once (correct) but the tool_results list will contain three entries with the same content. The conversation/API history will be well-formed (each tool_use id gets a paired tool_result), but the tool_calls table will under-count. Observability tooling that correlates tool_calls rows with LLM response block counts may surface anomalies."
+    },
+    {
+      "id": "RR2",
+      "description": "The dedup key serializes arguments via `serde_json::to_string`. JSON key ordering in serde_json is insertion-order for Value::Object. If two structurally identical tool calls arrive with differently-ordered keys at the JSON level (possible if arguments come from different codepaths in the provider), the dedup will miss. This is unlikely in practice but is a hidden fragility: the dedup is key-order-sensitive without documentation of that assumption."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG1",
+      "description": "No eval test exercises the dedup path directly: a MockLlmProvider sequence that emits two identical ToolCall blocks in a single response, verifying that the underlying tool executes once and both tool_use ids receive paired tool_results in the request messages. The CLAUDE.md eval harness in `crates/mika-agent/tests/eval/` is the right home for this."
+    },
+    {
+      "id": "TG2",
+      "description": "No test covers the warn! log emission: the dedup warn is the primary observability signal for the bug in production. A test asserting the warning fires (via tracing-test or log capture) would guard against the log being silently removed."
+    }
+  ]
+}

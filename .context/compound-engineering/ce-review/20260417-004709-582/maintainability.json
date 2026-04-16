@@ -1,0 +1,96 @@
+{
+  "reviewer": "maintainability",
+  "findings": [
+    {
+      "title": "Cache variable name `executed` does not communicate its role as a dedup cache",
+      "severity": "low",
+      "file": "crates/mika-agent/src/agent.rs",
+      "line": 1567,
+      "confidence": 0.70,
+      "autofix_class": "rename",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Rename `executed` to `dedup_cache` (or `tool_output_cache`). The name `executed` reads as a past-tense predicate rather than a noun describing the cache's purpose. A future contributor landing on the `if let Some(cached) = executed.get(...)` branch must mentally re-map the name to its function; `dedup_cache` makes the intent legible at first read. Also rename the `dedup_key` binding at line 1575 to `cache_key` for consistency."
+    },
+    {
+      "title": "Image budget double-counted for deduplicated tool_use blocks that carry images",
+      "severity": "medium",
+      "file": "crates/mika-agent/src/agent.rs",
+      "line": 1671,
+      "confidence": 0.82,
+      "autofix_class": "logic-fix",
+      "owner": "author",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "The shared `image_bytes_budget` accounting block at lines 1671-1714 runs for BOTH the cache-hit (dedup) path and the miss (real execution) path. On a cache hit, `output` is a clone of the cached result including its `images` field. The budget decrement at line 1682 (`image_bytes_budget -= img_bytes`) will therefore consume budget a second time for the same image bytes. For the currently known issue (#582 with `send_message`), `images` is empty so this is latent. For any tool that returns images, a deduplicated block will incorrectly erode the per-step image budget. Fix: on the cache-hit path, pass an empty-images clone to the tool-result constructor (or skip image budget accounting), since the duplicate block adds no new visual data to the turn. Alternatively, gate image budget accounting on `!is_cache_hit` with a boolean tracked from the dedup branch."
+    },
+    {
+      "title": "`serde_json::to_string(arguments)` called twice on miss path — once for dedup key, once for DB record",
+      "severity": "low",
+      "file": "crates/mika-agent/src/agent.rs",
+      "line": 1619,
+      "confidence": 0.80,
+      "autofix_class": "dedup-expression",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "On the miss path, `serde_json::to_string(arguments).unwrap_or_default()` is called at line 1577 to build `dedup_key.1` and again at line 1619 to build `input_json` for `save_tool_call`. Extract the serialized string once (`let args_json = serde_json::to_string(arguments).unwrap_or_default();`) before the `if let Some(cached)` branch, reuse it as the second tuple element in `dedup_key`, and assign it to `input_json` on the miss path. This also removes the minor inconsistency where `input_summary` at line 1589 calls `arguments.to_string()` (which may differ from `serde_json::to_string`) while the DB record uses the `serde_json` variant."
+    },
+    {
+      "title": "Miss path nests three levels deep; `execute_and_record` helper would reduce cognitive load",
+      "severity": "low",
+      "file": "crates/mika-agent/src/agent.rs",
+      "line": 1587,
+      "confidence": 0.62,
+      "autofix_class": "extract-helper",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The miss branch of the dedup `if/else` is ~80 lines nested inside `for block` → `if let LlmResponseContent::ToolCall` → `else`. This is the deepest structural nesting in the function. An `execute_and_record_tool_call(...)` async helper that takes `(name, arguments, dispatch_ctx, db, ...)` and returns `ToolOutput` would flatten the outer loop to ~20 lines and isolate the DB-recording logic. This is directional — the plan noted it as preferred but optional. The current inlined form is readable today but will become harder to modify if the DB-recording path grows (e.g., adding retry-count tracking, prompt-variant tagging). Flag for the next significant touch of `process_tool_calls`."
+    },
+    {
+      "title": "CLAUDE.md dedup guard paragraph not cross-referenced from the guard list in Post-Conditions section",
+      "severity": "low",
+      "file": "crates/mika-agent/CLAUDE.md",
+      "line": 14,
+      "confidence": 0.65,
+      "autofix_class": "doc-edit",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The new paragraph is placed correctly — directly after the multi-modal tool result description and before the Post-Conditions section heading. However, the Post-Conditions section enumerates four numbered guards (text-based tool call detection, required-tools gate, completion-claim guard, fabricated action-claim guard). The dedup guard is a fifth guard on the _input_ side of the loop, not on EndTurn, so it correctly does not belong in that numbered list. However, no cross-reference links the two sections for a reader scanning the guard list. Adding a brief parenthetical — '(for a per-turn guard on the dispatch side, see the dedup guard note above)' — to the Post-Conditions header would help future contributors locate related code. The log key `\"duplicate tool_use block suppressed\"` is already mentioned in the paragraph, which is correct."
+    }
+  ],
+  "residual_risks": [
+    {
+      "description": "Canonical-JSON key reordering: if a future provider emits arguments with shuffled key order between two logically identical tool_use blocks, string comparison will fail open (both blocks execute). The plan acknowledges this and intentionally fails open over false-positive dedup. The risk is that the guard provides no protection for such providers. Observable via warn! logs being absent while the issue reoccurs.",
+      "severity": "low",
+      "likelihood": "low"
+    },
+    {
+      "description": "Image budget double-count (detailed in finding #2) is latent today because the known trigger tool (send_message) returns no images. If a future tool that returns images (e.g., browser-control screenshot tools) is deduplicated, the budget could be exhausted in a single turn leaving remaining legitimate tool results image-stripped without any warning connecting the cause to the dedup.",
+      "severity": "medium",
+      "likelihood": "low"
+    },
+    {
+      "description": "The dedup cache is scoped to `process_tool_calls` (one LLM response), not to a step. If `process_tool_calls` were ever called more than once per step (currently it is not), duplicates across those calls would not be caught. No structural protection prevents this; it relies on the single call-site in `run_loop`. If the call site is refactored, the guard's scope contract becomes implicit.",
+      "severity": "low",
+      "likelihood": "very-low"
+    }
+  ],
+  "testing_gaps": [
+    {
+      "description": "No test covers a cache-hit path where the cached ToolOutput contains non-empty `images`. This would expose the image-budget double-count risk identified in finding #2. The existing test uses `send_message` which has empty images.",
+      "suggested_test": "Add a test variant that mocks a tool returning an ImageData payload, feeds two identical tool_use blocks, and asserts that `image_bytes_budget` is decremented only once (i.e., the duplicate block does not consume additional budget)."
+    },
+    {
+      "description": "No test asserts the warn! log fires on a dedup hit. The regression test only checks `calls_for_tool().len() == 1`. A log-capture assertion (using `tracing-test` or similar) would lock in the observability contract so a future refactor that removes the warn! is caught.",
+      "suggested_test": "Use `tracing_test::traced_test` or a `tracing::subscriber::with_default` fixture to capture log events; assert that a record with message containing `\"duplicate tool_use block suppressed\"` and field `tool = \"send_message\"` is emitted exactly once."
+    },
+    {
+      "description": "No test exercises two tool_use blocks with the same name but different arguments to confirm they are NOT deduplicated (regression guard for the happy-path non-dedup case with same tool name).",
+      "suggested_test": "Feed `multi_tool_response(vec![(\"send_message\", json!({\"text\": \"a\"})), (\"send_message\", json!({\"text\": \"b\"}))])` and assert `calls_for_tool(\"send_message\").len() == 2`."
+    }
+  ]
+}

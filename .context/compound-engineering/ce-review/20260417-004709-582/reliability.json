@@ -1,0 +1,72 @@
+{
+  "reviewer": "reliability",
+  "findings": [
+    {
+      "id": "REL-001",
+      "severity": "medium",
+      "confidence": 0.85,
+      "title": "Cached error output re-used for duplicate tool_use blocks without surfacing is_error to caller",
+      "description": "When execute_tool returns is_error=true for the first occurrence and the result is cached, the duplicate tool_use block receives a cloned ToolOutput with is_error=true. This is correct behavior — the LlmContentBlock::ToolResult at line 1718 faithfully propagates is_error from the clone. However, the ToolCallSummary (step, name, success, non_zero_exit) is only emitted for the first execution inside the else branch (line 1658–1665). The duplicate hit path (the warn! branch) does NOT push a ToolCallSummary. From the agent loop's perspective, tool_call_summaries for that step will have N-1 entries for N identical tool_use blocks. If downstream logic (required_tools gate, completion-claim guard, fabricated-action guard) counts tool call attempts by consulting summaries rather than tool_results, a duplicate of a required tool will appear to have been called only once in the summaries but twice in the tool_results history. In practice the guards use `tools_called` (a HashSet populated before process_tool_calls at lines 970–974 from response.content directly), so this does not cause a guard bypass. But the mismatch between summaries count and tool_results count is a latent observability inconsistency.",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/src/agent.rs",
+      "lines": "1579-1669",
+      "evidence": "The warn! (dedup-hit) branch exits after `cached.clone()` at line 1586 with no summaries.push(). The summaries.push() is inside the else (dedup-miss) branch at line 1658. The ToolCallSummary vector is used for persistence in messages.metadata and for all_tool_summaries aggregation across steps.",
+      "recommendation": "Consider emitting a ToolCallSummary for the dedup-hit path (with a marker like `success: cached_output.is_error == false`, possibly a `deduplicated: true` flag). At minimum, document the intentional asymmetry in a comment so future readers don't assume summaries.len() == tool_results.len()."
+    },
+    {
+      "id": "REL-002",
+      "severity": "low",
+      "confidence": 0.80,
+      "title": "Image budget double-debited when duplicate tool_use blocks return images",
+      "description": "When a cached ToolOutput contains images (exec handler or MCP tool returning success_with_images), both the first execution and each duplicate hit consume from `image_bytes_budget`. The first execution debits the budget during its tool_result construction (lines 1678–1683). The cloned ToolOutput handed to the duplicate path carries the same Vec<ImageData>, which also runs through the same budget-debit loop. In practice the duplicate always loses the budget race: the budget is already reduced by the first run, so images in the duplicate tool_result are dropped with a 'budget exceeded' text block. The LLM receives asymmetric tool_results: first call has images, second call says images were skipped. This is misleading rather than incorrect — the LLM action was already suppressed by dedup — but it produces a confusing assistant message history.",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/src/agent.rs",
+      "lines": "1671-1714",
+      "evidence": "image_bytes_budget is a single u64 counter initialized once per process_tool_calls() call. Both the first and duplicate tool_result constructions loop over output.images and debit image_bytes_budget -= img_bytes. Image-returning tools: skills/executor.rs:448, mcp/mod.rs:419.",
+      "recommendation": "For duplicate-hit tool_results that contain images: either strip images from the cloned output before budget processing, or set `content = LlmToolResultContent::Text(cached_output.content)` unconditionally for the dedup path (since the LLM already has the image in the first result for the same tool_call_id pairing). This is a low-priority fix since send_message — the triggering tool — returns no images."
+    },
+    {
+      "id": "REL-003",
+      "severity": "info",
+      "confidence": 0.75,
+      "title": "No observability counter for dedup firing rate — missing operator signal for provider health",
+      "description": "When dedup fires, a warn! log is emitted with trace_id, tool, and step. There is no metric counter or structured audit event. In production, dedup firing on send_message is a signal that the upstream LLM provider is exhibiting buggy behavior (emitting duplicate tool_use blocks). An operator currently has no way to query 'how many turns in the last 24h had a dedup suppression?' without grepping structured logs. A counter or a dedicated audit event would let operators detect provider degradation before it causes user-visible duplicate messages.",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/src/agent.rs",
+      "lines": "1580-1585",
+      "evidence": "warn!(trace_id = %tool_ctx.trace_id, tool = %name, step, \"duplicate tool_use block suppressed; reusing prior result\") — log only, no counter, no audit_events row.",
+      "recommendation": "Advisory P3. If tool_call telemetry is important for provider health monitoring, consider persisting a dedicated 'tool_use_dedup' audit event or incrementing a per-agent counter. The existing warn! is sufficient for individual incident investigation but not for trend detection."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-001",
+      "title": "send_message persists to DB before gateway delivery; dedup prevents double-DB-write for duplicate blocks",
+      "description": "The dedup cache correctly prevents a second invocation of send_message.execute(), which would have called db.save_message() and sender.send() a second time. The gateway /send endpoint has no content-based dedup — it carries a request_id but handle_send() does not deduplicate on request_id. The engine-side dedup in process_tool_calls() is therefore the sole defense against duplicate Telegram message delivery within a single turn. No gateway-side gap was found for this specific scenario.",
+      "residual_exposure": "None for within-turn duplicates. Cross-turn or cross-restart duplicates remain unaffected (by design — the dedup scope is explicitly per-function-call)."
+    },
+    {
+      "id": "RR-002",
+      "title": "Long-running tool dedup: dispatch_count prevents second real dispatch; cached ToolOutput echoes 'task started' text",
+      "description": "If the LLM emits duplicate tool_use blocks for a long_running: true skill tool, the dedup cache suppresses the second execute_tool() call entirely. The second block receives a cloned ToolOutput containing the 'Task submitted (long-running). ID: <task_id>' success message. Only one callback task is created (by the first execution). The dispatch_count AtomicU32 is incremented by the first execution inside execute_long_running() at line 842. The second execute_skill_tool() call is never made, so dispatch_count stays at 1. The dedup check at line 730 (dispatch_count > 0) is never reached for the duplicate. This is the correct behavior: one task, two matching tool_results. No reliability gap.",
+      "residual_exposure": "None. The dedup cache is an outer guard that fires before execute_tool(); the dispatch_count guard is an inner guard inside execute_long_running(). Both are independently correct."
+    },
+    {
+      "id": "RR-003",
+      "title": "serde_json key ordering in dedup key is stable",
+      "description": "The dedup key uses serde_json::to_string(arguments) where arguments is serde_json::Value. The workspace Cargo.toml uses serde_json = \"1\" without preserve_order feature, which means Map<String, Value> uses BTreeMap (sorted keys). JSON serialization is therefore deterministic regardless of the order in which the provider sent object keys. Two structurally identical argument objects will produce the same dedup key string.",
+      "residual_exposure": "None."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-001",
+      "title": "No eval test for dedup-hit with is_error=true cached output",
+      "description": "The new test in tests/eval/test_tool_calling.rs covers the happy path (successful dedup suppression). There is no test verifying that when the first tool execution returns is_error=true, the duplicate tool_result also carries is_error=true. The LlmContentBlock::ToolResult construction at line 1718 uses output.is_error from the clone, which is correct, but it is untested.",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs"
+    },
+    {
+      "id": "TG-002",
+      "title": "No test verifying ToolCallSummary count asymmetry for dedup hits",
+      "description": "The eval harness could assert that all_tool_summaries contains exactly 1 entry (not 2) when 2 identical tool_use blocks are emitted. The existing test may implicitly cover this but the assertion is not documented. If a future refactor moves summaries.push() outside the else branch, the behavior changes silently.",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs"
+    }
+  ]
+}

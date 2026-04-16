@@ -1,0 +1,46 @@
+{
+  "reviewer": "correctness",
+  "findings": [
+    {
+      "id": "COR-001",
+      "title": "Image budget double-charged on cache-hit path — duplicate tool_use with images drains budget twice",
+      "severity": "medium",
+      "confidence": 0.92,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1671-1714",
+      "description": "When a cached ToolOutput is returned on a dedup hit (lines 1579-1586), the shared image-budget block at lines 1671-1714 runs unconditionally for every tool_use block, including the duplicate. `output` is a full clone of the original, so `output.images` is a non-empty Vec. The loop at line 1677 walks the cloned images and subtracts `img_bytes` from `image_bytes_budget` for each one. This means an image-producing tool that appears twice in a single turn will consume 2× the budget even though the image data is sent as text or blocks twice anyway. For a turn where the image budget is already near the limit, the second (duplicate) result will be unnecessarily downgraded to a skip/text-fallback even though the budget has not literally been exceeded by new data — it was already accounted for. More importantly, the first call's budget path ran during the miss leg (inside the `else` branch — but wait: in the refactored code the miss leg does NOT run the image-budget path; that code was moved to after the if/else). Looking at the final code: the miss path builds the `ToolCallSummary` but then falls through to the shared block at line 1671. So BOTH the cache-hit AND cache-miss paths reach line 1671-1714. That means on a hit, `output.images` from the clone is non-empty and the budget loop runs again, spending the budget a second time.",
+      "steps_to_reproduce": "1. A tool returns 1 image with size = MAX_IMAGE_BYTES_PER_STEP / 2. 2. LLM emits two identical tool_use blocks for that tool. 3. First block: miss path, budget = MAX/2 after processing, image included. 4. Second block: hit path, clone has same images Vec, budget loop runs again, consumes MAX/2 more = 0 budget remaining. 5. Any subsequent tool in the same turn that also returns an image will be budget-blocked even though conceptually only one real tool call's worth of image data was produced.",
+      "recommendation": "In the cache-hit path, either (a) yield a ToolOutput with `images: vec![]` — the duplicate gets a text-only result citing the cache, which is correct since the actual image was already sent for the first tool_use id — or (b) track images as already-budgeted by key and skip the budget loop on hit. Option (a) is simplest: construct a stripped clone on cache hit: `ToolOutput { content: cached.content.clone(), is_error: cached.is_error, images: vec![] }`. The API still gets a valid tool_result for the duplicate id; the model already saw the image for the first id in the same turn."
+    },
+    {
+      "id": "COR-002",
+      "title": "serde_json::to_string on serde_json::Value is deterministic within a single parse but not across providers with different key orderings",
+      "severity": "low",
+      "confidence": 0.72,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1575-1578",
+      "description": "The dedup key for arguments is `serde_json::to_string(arguments).unwrap_or_default()`. `serde_json::Value::Object` is backed by an `IndexMap` (insertion-order-preserving). If a provider emits two tool_use blocks with logically-identical JSON objects but different key orderings (e.g., `{\"text\":\"x\",\"channel\":\"y\"}` vs `{\"channel\":\"y\",\"text\":\"x\"}`), the serialised strings differ, the dedup cache misses, and both executions proceed. This is a missed-dedup case (no incorrect execution, no data loss), but the guard will fail to fire for the exact case described in #582 if the second duplicate has reordered keys. The risk level is constrained because the observed #582 scenario was truly byte-identical blocks from the same LLM response; however the fix does not cover all logically-duplicate cases across providers known to shuffle keys.",
+      "recommendation": "For this issue's acceptance criteria (byte-identical payload), the current key is sufficient. Document the limitation in the CLAUDE.md note or add a normalisation step (sort object keys recursively before serialisation) if cross-provider coverage is desired. No code change required to meet the stated acceptance criteria."
+    },
+    {
+      "id": "COR-003",
+      "title": "tools_called set for required-tools enforcement counts duplicate tool_use blocks twice — inconsistency with dedup guard",
+      "severity": "low",
+      "confidence": 0.85,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "970-974",
+      "description": "At lines 970-974, `tools_called.insert(name.clone())` iterates all blocks including duplicates and inserts each tool name into a `HashSet`. Since it is a HashSet the insert of the duplicate is a no-op, so required-tools enforcement is unaffected. This is correct behaviour — a skill requiring `send_message` will see `send_message` in `tools_called` whether one or two blocks were emitted. No bug here; confirming it is safe as-is.",
+      "recommendation": "No action needed. The HashSet dedup is the correct semantic for required-tools tracking regardless of the new dedup guard."
+    }
+  ],
+  "residual_risks": [
+    "Error propagation on first-execution failure: when the cache-miss path produces `is_error=true`, the cached clone for a duplicate inherits `is_error=true`. This is intentional for a same-turn duplicate because there is no basis to expect a retry would succeed in the same turn (the inputs are identical and nothing has changed). The risk is acceptable and matches the stated design intent.",
+    "The `executed` HashMap is local to the `process_tool_calls` call and is not persisted across steps or turns. A duplicate emitted in step N+1 that is identical to one in step N will not be caught. This is explicitly called out in the comment and is the intended scope.",
+    "The regression test uses `MockLlmProvider` with `send_message` as the deduplicated tool. `send_message` is a builtin that writes to the database and fires outbound messages. The test asserts only one `tool_calls` DB row, which is the right correctness signal, but it does not assert that exactly one outbound message was sent. If `MessageSender` is wired in the test harness, a double-send bug at a lower layer would not be caught by this test alone."
+  ],
+  "testing_gaps": [
+    "No test covers the cache-hit path for a tool that returns images. The image budget double-charge (COR-001) would not be caught by any existing test.",
+    "No test verifies that the duplicate tool_use block receives a syntactically valid `tool_result` in the reconstructed conversation history (i.e., that the second tool_use id appears exactly once in the tool_results Vec). The test checks DB rows but not the API message construction.",
+    "No test exercises three or more identical blocks in one turn (N>2 duplicates). The current implementation handles this correctly via the HashMap, but it is untested."
+  ]
+}

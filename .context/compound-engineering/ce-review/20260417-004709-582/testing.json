@@ -1,0 +1,101 @@
+{
+  "reviewer": "testing",
+  "findings": [
+    {
+      "title": "No assertion that exactly two tool_result blocks are forwarded to the LLM in the follow-up request",
+      "severity": "medium",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "line": 56,
+      "confidence": 0.85,
+      "autofix_class": "test_addition",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "After the run, inspect trace.captured_requests[1] (the second LLM call) and count LlmContentBlock::ToolResult variants. Assert exactly 2 ToolResult blocks are present — one per original tool_use id. This is the core API-pairing contract: the LLM must receive a result for every tool_use id it emitted, even when deduped. The harness already exposes captured_requests on AgentTrace, so no new infrastructure is needed. Example: let tool_results: Vec<_> = trace.captured_requests[1].messages.iter().flat_map(...).filter(|b| matches!(b, LlmContentBlock::ToolResult {..})).collect(); assert_eq!(tool_results.len(), 2);"
+    },
+    {
+      "title": "No test for same-tool-different-args producing two DB rows (no-false-dedup guard)",
+      "severity": "low",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "line": 30,
+      "confidence": 0.80,
+      "autofix_class": "test_addition",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "test_multiple_parallel_tool_calls uses search_memory with different args and asserts >= 2 rows — this is close but the >= bound doesn't fail if the dedup guard incorrectly fires on same-name-different-args. Add a dedicated test: two send_message calls with different text values, assert calls_for_tool(\"send_message\").len() == 2. This pins the dedup key to (name, args) rather than (name) alone, which is the actual implementation contract."
+    },
+    {
+      "title": "No test for 3+ identical tool_use blocks in a single turn",
+      "severity": "low",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "line": 56,
+      "confidence": 0.75,
+      "autofix_class": "test_addition",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The fix uses a HashMap cache that correctly handles N duplicates, but no test exercises N > 2. Add a variant with three identical blocks. Assert calls_for_tool(\"send_message\").len() == 1 and (once the tool_result pairing assertion is added) 3 ToolResult blocks in the follow-up request."
+    },
+    {
+      "title": "No test for duplicate tool_use blocks where the tool errors (is_error: true path cloned back)",
+      "severity": "low",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "line": 56,
+      "confidence": 0.72,
+      "autofix_class": "test_addition",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "When the first execution of a duplicated tool returns is_error:true, the cached ToolOutput (with is_error:true) is cloned back for the duplicate id. No test verifies that the error flag is faithfully propagated to both ToolResult blocks in the follow-up request. A test using a tool that always errors (or a custom ToolRegistry with a failing tool) and two identical blocks would cover this path."
+    },
+    {
+      "title": "ToolCallSummary emission count for duplicate blocks not asserted",
+      "severity": "info",
+      "file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "line": 78,
+      "confidence": 0.80,
+      "autofix_class": "test_addition",
+      "owner": "author",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The plan calls out ToolCallSummary emission as part of the contract (one summary, not two). ToolCallSummary is persisted in messages.metadata JSON. The test does not assert the metadata on the step-2 message contains exactly one send_message summary entry. This is lower priority since the DB row count is the primary observable, but the metadata contract is still externally visible (cross-turn introspection tools rely on it)."
+    }
+  ],
+  "residual_risks": [
+    {
+      "description": "The test uses send_message which, in the harness, has message_sender: None. The tool writes to DB and returns success regardless. In production, send_message also dispatches to a GatewayMessageSender. The dedup guard fires before execute_tool(), so the side-effect suppression path is correctly exercised. However, the test cannot verify that no outbound message was sent twice — it only verifies the DB row count. In production, a provider emitting two identical send_message blocks would attempt one outbound delivery (correct), not two. This risk is low because the dedup guard is at the process_tool_calls layer, upstream of MessageSender.",
+      "severity": "low"
+    },
+    {
+      "description": "The dedup key is (name, serde_json::to_string(arguments)). Key stability depends on serde_json serializing identical JSON objects with identical byte sequences. For Value::Object, serde_json preserves insertion order, so two Value::Object constructed from the same json!() macro call will be equal. But providers that return semantically equivalent JSON objects with different key orderings would not be deduped. The test only exercises the exact same json!() args, so key-ordering divergence is untested. This is a known design limitation (documented as defending against provider-side duplication where the LLM emits byte-for-byte identical blocks).",
+      "severity": "low"
+    }
+  ],
+  "testing_gaps": [
+    {
+      "gap": "tool_result pairing: no assertion that the second LLM request contains 2 ToolResult blocks (one per original tool_use id)",
+      "importance": "high",
+      "test_file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "infrastructure_needed": "none — trace.captured_requests is already available on AgentTrace"
+    },
+    {
+      "gap": "no-false-dedup: no test that same-tool-different-args still produces 2 DB rows",
+      "importance": "medium",
+      "test_file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "infrastructure_needed": "none"
+    },
+    {
+      "gap": "3+ identical blocks in a single turn",
+      "importance": "low",
+      "test_file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "infrastructure_needed": "none"
+    },
+    {
+      "gap": "duplicate blocks where first execution errors — is_error flag propagated to both ToolResult blocks",
+      "importance": "low",
+      "test_file": "/data/workspace/mika-platform/.claude/worktrees/feat-582-send-message-emitted-twice-in-same-turn-/mika/crates/mika-agent/tests/eval/test_tool_calling.rs",
+      "infrastructure_needed": "custom ToolRegistry with a tool that always returns ToolOutput::error()"
+    }
+  ]
+}

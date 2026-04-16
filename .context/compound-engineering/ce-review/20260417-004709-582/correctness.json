@@ -1,0 +1,50 @@
+{
+  "reviewer": "correctness",
+  "findings": [
+    {
+      "title": "Image bytes budget doubly consumed for deduplicated tool_use blocks with images",
+      "severity": "low",
+      "file": "crates/mika-agent/src/agent.rs",
+      "line": 1682,
+      "confidence": 0.85,
+      "autofix_class": "one-liner",
+      "owner": "agent-loop",
+      "requires_verification": false,
+      "pre_existing": false,
+      "why_it_matters": "When a tool that returns images is deduplicated, the cached ToolOutput is cloned and re-processed through the image_bytes_budget logic at line 1671-1713. The same image bytes are counted against the budget twice — once for the first (executing) occurrence and once for the duplicate (cached) occurrence. This can cause the second tool_result block (for the duplicate tool_use id) to have its images dropped with a '[skipped: step memory budget exceeded]' message appended, even when the budget was not actually exceeded by novel image data. The duplicate tool_result still satisfies the API contract (has content), but the LLM receives a degraded result for the second block and potentially a misleading budget-exceeded warning. In practice, the #582 regression involved send_message (no images), so this path is not exercised by the fix. The scenario requires: (a) a tool that returns images, (b) the LLM emitting it twice with identical arguments in one turn — an unusual combination.",
+      "evidence": [
+        "line 1579-1586: dedup hit returns cached.clone() — includes full images vec",
+        "line 1671-1713: image_bytes_budget is decremented for every image in output.images regardless of dedup path",
+        "line 1682: image_bytes_budget -= img_bytes — this runs for each image in the cloned output",
+        "const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024 (line 53) — budget is per function call, shared across all tool results"
+      ],
+      "suggested_fix": "On the dedup path, either (a) pass empty images in the cloned output's tool_result (the LLM already has the image from the first result in context), or (b) skip the budget decrement for images when processing a cache hit. Option (a) is simplest: before the image_bytes_budget block, if the output came from the cache, replace output.images with an empty vec. This can be done by adding a boolean flag `is_cache_hit` or by zeroing images on the cached clone at line 1586."
+    }
+  ],
+  "residual_risks": [
+    {
+      "title": "JSON key-order sensitivity in dedup key may miss semantically equal arguments with different key ordering",
+      "description": "serde_json::to_string on a Value::Object produces keys in insertion order (IndexMap). Two LLM-generated argument objects that are semantically equal but have different key orderings will produce different dedup_key strings, causing the dedup guard to miss. This is a conservative false negative — the tool executes twice instead of once, reverting to pre-fix behavior for that case. Not a safety issue; acceptable.",
+      "confidence": 0.70
+    },
+    {
+      "title": "tools_called HashSet includes duplicate tool names from response.content before dedup",
+      "description": "At line 970-973, tools_called is populated from all ToolCall blocks in response.content, including duplicates. This is harmless because HashSet.insert is idempotent. The required-tools gate, completion-claim guard, and fabricated-action guard all function correctly. Not a bug.",
+      "confidence": 0.95
+    }
+  ],
+  "testing_gaps": [
+    {
+      "title": "No test for deduplicated tool with non-empty images — budget double-consumption path untested",
+      "description": "The regression test test_duplicate_tool_use_block_deduplicated uses send_message which returns no images. There is no test that covers a tool returning images being deduplicated, so the image budget double-consumption finding (finding #1) has no coverage."
+    },
+    {
+      "title": "No test verifying the second tool_result has content matching the first — API contract check for dedup path",
+      "description": "The test verifies DB row count == 1 but does not verify that the second tool_result block in the conversation history (for the duplicate tool_use id) actually contains the cached content. If the content were empty or wrong, the LLM would receive a malformed context. Adding an assertion on the final request.messages[last].content would close this gap."
+    },
+    {
+      "title": "No test for dedup with different argument key orderings — false negative path",
+      "description": "No test exercises the case where the same logical arguments arrive with different JSON key order, verifying the guard correctly does NOT fire (acceptable) and the tool executes twice."
+    }
+  ]
+}

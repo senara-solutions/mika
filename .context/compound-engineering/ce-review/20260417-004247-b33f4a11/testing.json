@@ -1,0 +1,76 @@
+{
+  "reviewer": "testing",
+  "findings": [
+    {
+      "id": "T001",
+      "category": "untested_branch",
+      "severity": "medium",
+      "confidence": 0.92,
+      "title": "N>2 identical blocks: dedup beyond the second duplicate is untested",
+      "description": "The dedup guard uses a HashMap that handles N duplicates correctly by design, but the test only feeds exactly two identical blocks. A three-block scenario (A, A, A) is not covered. If a future refactor changes the accumulation logic (e.g. early-exit after first duplicate) a three-copy case could break without the two-copy test catching it.",
+      "location": "crates/mika-agent/tests/eval/test_tool_calling.rs:56-87",
+      "fix_suggestion": "Add a test with three identical blocks using multi_tool_response with three identical entries and assert send_calls.len() == 1."
+    },
+    {
+      "id": "T002",
+      "category": "untested_branch",
+      "severity": "medium",
+      "confidence": 0.90,
+      "title": "Mixed-duplicate scenario (identical pair interleaved with distinct tool) is untested",
+      "description": "The dedup HashMap scope is per-call to process_tool_calls. The fix should only collapse identical (name, args) pairs and leave distinct tools untouched. No test feeds [send_message(A), search_memory(B), send_message(A)] and asserts send_message appears once AND search_memory appears once. Without this, a regression that accidentally widens the dedup key (e.g. deduplicating on name alone) would not be caught.",
+      "location": "crates/mika-agent/tests/eval/test_tool_calling.rs:56-87",
+      "fix_suggestion": "Add a test with multi_tool_response containing three entries where two are identical and one is different; assert per-tool call counts separately."
+    },
+    {
+      "id": "T003",
+      "category": "missing_assertion",
+      "severity": "high",
+      "confidence": 0.95,
+      "title": "Test does not verify that both tool_use IDs receive a tool_result in conversation history",
+      "description": "The core API contract of the fix is: the duplicate tool_use id must still receive a tool_result in the outgoing message (line 1715 in agent.rs pushes a LlmContentBlock::ToolResult for every block including cache hits). The test asserts only that calls_for_tool('send_message').len() == 1 (DB rows), which confirms the tool ran once, but does not confirm the second tool_use id was paired with a tool_result in the captured request. If the tool_result push was accidentally gated behind the executed.get() miss branch, the test would still pass while the API contract is broken. The captured_requests field in AgentTrace is available and contains the full message history.",
+      "location": "crates/mika-agent/tests/eval/test_tool_calling.rs:79-86",
+      "fix_suggestion": "After assert_eq on send_calls.len(), inspect trace.captured_requests[1].messages to count LlmContentBlock::ToolResult entries and assert there are 2 — one per tool_use id. Alternatively add an assertion helper assert_tool_result_count on AgentTrace."
+    },
+    {
+      "id": "T004",
+      "category": "missing_edge_case",
+      "severity": "low",
+      "confidence": 0.72,
+      "title": "Error-path behavior under dedup is unspecified and untested",
+      "description": "If the first execution of a duplicate tool errors (output.is_error == true), the cached ToolOutput carries the error. The second identical block will reuse that error output and also receive a tool_result with is_error: true. No test exercises this scenario. The behavior may be correct, but it is an implicit assumption. If the intent were instead 'retry once on error', the current implementation does not do that and there is no test to document the chosen semantics.",
+      "location": "crates/mika-agent/src/agent.rs:1579-1586",
+      "fix_suggestion": "Add a test where the first of two identical tool calls returns an error result (use a tool name not in the registry to produce an unknown-tool error), and assert both that only one DB row exists and that the tool_result blocks carry is_error: true."
+    },
+    {
+      "id": "T005",
+      "category": "implementation_coupled_test",
+      "severity": "low",
+      "confidence": 0.65,
+      "title": "Test relies on send_message silently succeeding without message_sender",
+      "description": "The test uses send_message as the duplicate tool. send_message with message_sender: None (the harness default) returns ToolOutput::success with a warning text rather than an error. This behavior is intentional and documented in send_message.rs:69-83, but it is not documented in the test. If the no-sender behavior is ever changed (e.g. to return an error when no sender is configured), the dedup test will break not because dedup is wrong but because the chosen tool's fallback behavior changed. The coupling is subtle.",
+      "location": "crates/mika-agent/tests/eval/test_tool_calling.rs:56-87",
+      "fix_suggestion": "Add a comment in the test noting that send_message is chosen because it succeeds gracefully without a configured sender (message_sender: None). Alternatively use a tool with no external side effects, such as search_memory with a mock DB result, to remove the dependency on send_message's fallback path."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "R001",
+      "description": "The dedup key serializes serde_json::Value via serde_json::to_string. JSON object key ordering in serde_json is insertion-order stable, so two LLM-emitted argument objects with identical keys in different orders would produce different dedup keys and both tools would execute. This is a correctness edge case of the dedup logic itself, not the test. No test covers argument-order-variant duplicates.",
+      "severity": "low",
+      "confidence": 0.70
+    },
+    {
+      "id": "R002",
+      "description": "test_multiple_parallel_tool_calls uses assert!(search_calls.len() >= 2) — this is correct and not weakened by the dedup fix because the two search_memory calls have different arguments ({query: 'schedule'} vs {query: 'priorities'}), so dedup keys differ. The test continues to pass and serves as an implicit non-regression for distinct-args parallel calls. However the assertion is a lower-bound (>= 2) not an exact count, so it would pass even if a future change added spurious extra calls.",
+      "severity": "low",
+      "confidence": 0.80
+    }
+  ],
+  "testing_gaps": [
+    "No test for N>2 identical tool_use blocks in a single response (T001)",
+    "No test for mixed scenario: identical duplicates interleaved with a distinct tool call (T002)",
+    "No assertion verifying tool_result pairing in conversation history for both tool_use ids (T003 — highest priority gap given it is the stated API contract in the fix comment)",
+    "No test for dedup behavior when the first execution errors (T004)",
+    "No inline unit test for the dedup key construction (serde_json serialization determinism for serde_json::Value)"
+  ]
+}

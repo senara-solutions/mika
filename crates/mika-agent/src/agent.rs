@@ -1564,7 +1564,7 @@ async fn process_tool_calls(
     // the cached output for subsequent blocks. This defends the engine against
     // provider-side tool_use duplication (see #582). Scope is strictly this
     // function call — duplicates across steps or turns are unaffected.
-    let mut executed: HashMap<(String, String), ToolOutput> = HashMap::new();
+    let mut dedup_cache: HashMap<(String, String), ToolOutput> = HashMap::new();
     for block in &response_content {
         if let LlmResponseContent::ToolCall {
             id,
@@ -1576,14 +1576,23 @@ async fn process_tool_calls(
                 name.clone(),
                 serde_json::to_string(arguments).unwrap_or_default(),
             );
-            let output = if let Some(cached) = executed.get(&dedup_key) {
+            let output = if let Some(cached) = dedup_cache.get(&dedup_key) {
                 warn!(
                     trace_id = %tool_ctx.trace_id,
                     tool = %name,
                     step,
+                    cached_was_error = cached.is_error,
                     "duplicate tool_use block suppressed; reusing prior result"
                 );
-                cached.clone()
+                // Clone the cached result but strip images: the LLM already
+                // received them in the tool_result paired with the first
+                // duplicate's id, so re-emitting them would both waste the
+                // shared `image_bytes_budget` and send redundant bytes on
+                // the API request. Text content is preserved so the
+                // duplicate tool_use id still gets a meaningful pair.
+                let mut reused = cached.clone();
+                reused.images.clear();
+                reused
             } else {
                 debug!(tool = %name, "executing tool");
                 let input_summary = truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
@@ -1664,7 +1673,7 @@ async fn process_tool_calls(
                     non_zero_exit,
                 });
 
-                executed.insert(dedup_key, output.clone());
+                dedup_cache.insert(dedup_key, output.clone());
                 output
             };
 

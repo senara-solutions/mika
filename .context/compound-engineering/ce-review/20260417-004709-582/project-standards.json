@@ -1,0 +1,18 @@
+{
+  "reviewer": "project-standards",
+  "findings": [],
+  "residual_risks": [
+    {
+      "id": "RR-PS-001",
+      "description": "The image_bytes_budget is consumed by the *first* execution of a duplicated tool_use block (images included in `output.images`). When the cached ToolOutput is cloned for duplicate blocks, `output.images` is a full clone and re-traverses the budget loop, potentially over-counting image bytes against the budget. This is an edge-case interaction (only affects turns where a tool with image output is duplicated) not covered by the dedup regression test.",
+      "severity": "low"
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-PS-001",
+      "description": "The plan doc (Unit 1, Test scenarios) calls for a unit test of `ToolOutput::clone()` round-tripping `content`, `is_error`, and `images` byte-for-byte (\"Small sanity test for the new derive\"). No such unit test was added — `#[cfg(test)] mod tests` in `tools/mod.rs` is not present in the diff. The testing convention in CLAUDE.md requires inline module tests for each module where test logic lives.",
+      "file": "crates/mika-agent/src/tools/mod.rs"
+    }
+  ]
+}

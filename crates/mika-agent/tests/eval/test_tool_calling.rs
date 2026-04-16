@@ -1,6 +1,7 @@
 //! Integration tests: tool calling scenarios.
 
 use mika_common::llm::mock::*;
+use mika_common::llm::{LlmContent, LlmContentBlock, LlmRole};
 use serde_json::json;
 
 use super::assertions::*;
@@ -83,6 +84,91 @@ async fn test_duplicate_tool_use_block_deduplicated() {
         "Expected exactly 1 send_message call, got {}: {:?}",
         send_calls.len(),
         send_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
+    );
+
+    // API contract: every tool_use id the LLM emitted must have a matching
+    // tool_result block in the follow-up request, otherwise providers (notably
+    // Anthropic) reject the conversation. Count tool_result blocks in the
+    // second captured request (the one that carries the first turn's results).
+    let second_request = trace
+        .captured_requests
+        .get(1)
+        .expect("expected a follow-up LLM request after tool execution");
+    let tool_result_count: usize = second_request
+        .messages
+        .iter()
+        .filter(|m| m.role == LlmRole::Tool)
+        .map(|m| match &m.content {
+            LlmContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|b| matches!(b, LlmContentBlock::ToolResult { .. }))
+                .count(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        tool_result_count, 2,
+        "Both tool_use ids (original + duplicate) must receive a tool_result to satisfy the API contract, got {tool_result_count}"
+    );
+}
+
+#[tokio::test]
+async fn test_same_tool_different_args_not_deduplicated() {
+    // Guard against a regression where the dedup key drops the `arguments`
+    // component and keys only on tool name. Two `send_message` calls with
+    // different text must produce two tool_calls rows — they are legitimately
+    // distinct invocations, not a provider artifact.
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            multi_tool_response(vec![
+                ("send_message", json!({"text": "sprint started"})),
+                ("send_message", json!({"text": "sprint ended"})),
+            ]),
+            text_response("Sent both updates."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("send both updates").await.unwrap();
+
+    assert_has_output(&trace);
+    let send_calls = trace.calls_for_tool("send_message");
+    assert_eq!(
+        send_calls.len(),
+        2,
+        "Same tool with different args must not be deduplicated, got {} calls: {:?}",
+        send_calls.len(),
+        send_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_three_identical_tool_use_blocks_deduplicated() {
+    // The dedup cache must collapse any N >= 2 identical blocks in a single
+    // turn to exactly one execution. Exercises the cache-hit path twice.
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            multi_tool_response(vec![
+                ("send_message", json!({"text": "ping"})),
+                ("send_message", json!({"text": "ping"})),
+                ("send_message", json!({"text": "ping"})),
+            ]),
+            text_response("Pinged."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("ping").await.unwrap();
+
+    assert_has_output(&trace);
+    let send_calls = trace.calls_for_tool("send_message");
+    assert_eq!(
+        send_calls.len(),
+        1,
+        "Three identical blocks must still collapse to one tool_calls row, got {}",
+        send_calls.len()
     );
 }
 

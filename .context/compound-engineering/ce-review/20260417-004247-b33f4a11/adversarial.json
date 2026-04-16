@@ -1,0 +1,113 @@
+{
+  "reviewer": "adversarial",
+  "findings": [
+    {
+      "id": "ADV-001",
+      "title": "send_message dedup silently swallows the second DB persist: message saved once but LLM receives two success results",
+      "severity": "P1",
+      "confidence": 0.95,
+      "files": [
+        "crates/mika-agent/src/tools/send_message.rs",
+        "crates/mika-agent/src/agent.rs"
+      ],
+      "evidence": [
+        "send_message.execute() has two side effects: (1) ctx.db.save_message(session_id, 'assistant', &cleaned) and (2) sender.send(&cleaned).",
+        "When dedup fires, cached.clone() is returned at agent.rs:1586. The cached ToolOutput is ToolOutput::success('Message sent.') from the first execution.",
+        "The second tool_use block receives that cached success result and the LLM sees 'Message sent.' for both IDs.",
+        "The DB persist (save_message) ran only once. The outbound sender.send() ran only once. Both are correct.",
+        "BUT: the conversation history now has one assistant message row in the messages table and two 'Message sent.' tool_result entries in the API conversation. These are out of sync: the LLM believes two sends succeeded, but the messages table has one row.",
+        "Consequence: if the user queries get_session_messages or if compaction summarises the conversation, the summary will reflect one sent message while the assistant's internal reasoning chain (preserved in the tool_result history) shows two successful sends. This creates a grounding inconsistency — the very thing the grounding rule is designed to prevent.",
+        "This is specifically bad for send_message because the grounding rule says 'the agent must not claim downstream state unless a tool result confirms it'. Both tool_results confirm a send, but only one is persisted. An auditor querying tool history sees 1 send; the LLM internal state says 2."
+      ],
+      "autofix_class": "advisory",
+      "owner": "human"
+    },
+    {
+      "id": "ADV-002",
+      "title": "Image budget double-drained by dedup cache: duplicate image tool_use blocks consume budget twice for the same bytes",
+      "severity": "P2",
+      "confidence": 0.92,
+      "files": [
+        "crates/mika-agent/src/agent.rs"
+      ],
+      "evidence": [
+        "image_bytes_budget is initialized once at line 1561 (20 MB cap for the step).",
+        "When dedup fires, the cached ToolOutput (containing images) is cloned at line 1586. The clone has the full images Vec.",
+        "The image budget loop at lines 1677-1688 runs for EVERY tool_use block, including duplicates. Each duplicate iteration of `for img in output.images` decrements image_bytes_budget by img.data.len().",
+        "Scenario: an exec-handler skill tool returns 3 images totaling 15 MB. LLM emits two identical tool_use blocks for this tool. First block: budget 20 MB, 15 MB consumed, budget becomes 5 MB. Second block (dedup cache clone): budget 5 MB, first image >5 MB triggers the budget break, images are skipped for the duplicate result.",
+        "The duplicate tool_result sent to the LLM for the second block says '[N image(s) skipped: step memory budget exceeded]' even though the tool only ran once and the budget was not legitimately exhausted by distinct tool calls.",
+        "The LLM receives an inconsistent signal: identical tool calls, one with images, one without, with a budget-exceeded error. This may cause the LLM to conclude the tool is flaky or retry.",
+        "The correct behavior for dedup cache hits with images is to either: skip the budget decrement entirely (since the bytes are already in the first result), or serve a text-only copy of the cached result for duplicates."
+      ],
+      "autofix_class": "advisory",
+      "owner": "human"
+    },
+    {
+      "id": "ADV-003",
+      "title": "Semantic equality bypass: provider key-order non-determinism defeats dedup for logically identical calls",
+      "severity": "P2",
+      "confidence": 0.82,
+      "files": [
+        "crates/mika-agent/src/agent.rs"
+      ],
+      "evidence": [
+        "The dedup key is serde_json::to_string(arguments).unwrap_or_default() at line 1577.",
+        "serde_json serializes serde_json::Value objects. The Value type's Object variant uses IndexMap (preserving insertion order), not BTreeMap. Key order in the JSON string depends on the order the provider emitted the keys in the original API response.",
+        "A non-Anthropic provider (the fix specifically targets non-Anthropic providers per CLAUDE.md) that emits {\"text\":\"hello\"} in one block and {\"text\":\"hello\"} in the same order would be deduped. But if the provider emits {\"text\":\"hello\"} in block 1 and the arguments parser reconstructs them with a different key insertion order producing {\"text\":\"hello\"} (same, fine), or different Unicode escaping ({'text': 'caf\\u00e9'} vs {'text': 'café'}), these are different strings but semantically identical.",
+        "More concretely: OpenRouter and other proxy providers sometimes normalize JSON differently (compact vs padded, Unicode escape vs literal, integer vs float: 1 vs 1.0). {\"n\":1} and {\"n\":1.0} are different serde_json strings but semantically the same argument to any tool.",
+        "The fix's stated purpose is to defend against provider-side duplication. The most dangerous duplication happens with providers that have slightly different JSON serialization per block. Those providers produce key='n' with value=Number(1) in block 1 and Number(1.0) in block 2 — different serde_json strings, dedup misses, tool executes twice.",
+        "For send_message this means two sends. The fix fails exactly where it's most needed: non-Anthropic providers that serialize ambiguously."
+      ],
+      "autofix_class": "advisory",
+      "owner": "human"
+    },
+    {
+      "id": "ADV-004",
+      "title": "Test false-negative: regression test passes even if dedup is broken via DB error swallowing",
+      "severity": "P3",
+      "confidence": 0.85,
+      "files": [
+        "crates/mika-agent/tests/eval/test_tool_calling.rs",
+        "crates/mika-agent/src/agent.rs"
+      ],
+      "evidence": [
+        "The test at test_tool_calling.rs:56 asserts calls_for_tool('send_message').len() == 1.",
+        "calls_for_tool reads from the tool_calls DB table. The dedup guard prevents the second save_tool_call call. So the assertion passes when dedup works.",
+        "However: if dedup was removed but save_tool_call for the second block hit a transient DB error (warn! only at line 1644, execution continues), the second row would not be written. calls_for_tool would still return 1. The test would pass even though send_message.execute() ran twice, causing two save_message rows and two sender.send() calls.",
+        "The test does not assert: (a) how many times save_message was called in the messages table, (b) how many times the MockSender (if present — the eval harness uses no sender) was invoked.",
+        "The eval harness test for #582 specifically uses no message_sender (EvalHarness default), so the sender.send() double-fire path is never exercised by the regression test.",
+        "A correct regression test would also assert messages table row count == 1 for send_message dedup. Currently the test only validates the DB observability layer, not the tool's primary side effect."
+      ],
+      "autofix_class": "advisory",
+      "owner": "human"
+    },
+    {
+      "id": "ADV-005",
+      "title": "required_tools accounting inflated by dedup: tools_called HashSet marks tool as called even if dedup suppressed the second execution",
+      "severity": "P3",
+      "confidence": 0.88,
+      "files": [
+        "crates/mika-agent/src/agent.rs"
+      ],
+      "evidence": [
+        "At lines 970-974, tools_called.insert(name.clone()) runs for every tool_use block in response.content BEFORE process_tool_calls is called.",
+        "This is correct for normal operation: a tool appearing twice still 'counts' as called for required_tools purposes.",
+        "But the composition creates a subtle cross-direction problem: if a skill declares required_tools = ['send_message'] and the LLM emits send_message twice (duplicate), tools_called records it once (HashSet dedup), process_tool_calls executes it once (HashMap dedup). The required_tools check is satisfied.",
+        "The failure scenario goes the other direction: the LLM emits [A, B, A] where A is a required tool and B is a non-required tool. tools_called gets {A, B}. But process_tool_calls sees two A blocks — one executes, one is deduped. The ToolCallSummary is only pushed once (line 1658, inside the else branch). So all_tool_summaries has 2 entries (one A, one B) but the deduped A has no summary entry.",
+        "This means the tool_history context injected into subsequent messages will show A ran once and B ran once, even though A appeared twice in the LLM's output. The LLM's assistant message in the conversation contains two A tool_use blocks (correctly preserved at line 1724-1729), but tool_history shows one A. If the LLM introspects tool history to decide whether to retry, it sees one A where it intended two — potentially triggering another duplicate emission in the next step."
+      ],
+      "autofix_class": "advisory",
+      "owner": "human"
+    }
+  ],
+  "residual_risks": [
+    "Memory DoS via degenerate LLM output (10K identical blocks) is bounded by the HashMap staying at 1 entry but tool_results grows linearly. Each entry is a cloned ToolOutput (String + Vec<ImageData>). For text-only tools like send_message, 10K clones of a short string is ~10MB — within container limits. For image-returning exec handlers, 10K clones of a 5MB base64 string would be ~50GB — OOM. However, exec handler skills are excluded from silent mode (the mode where provider-side duplication is most likely), and 10K blocks in a single response would exceed API response size limits. Risk: low-moderate.",
+    "Cross-turn dedup is explicitly out of scope (HashMap scoped to process_tool_calls call). If the LLM retries the same tool in a subsequent step (e.g., after a required_tools rejection re-prompt), it will execute again. This is correct behavior but should be documented as an intentional scope boundary to avoid future confusion."
+  ],
+  "testing_gaps": [
+    "No test exercises dedup with a tool that has a message_sender attached — the primary regression (send_message sent twice) is not caught by the eval harness test because EvalHarness does not inject a sender.",
+    "No test exercises dedup when the first tool_use block's save_tool_call fails (DB error path). The current test only validates the happy path.",
+    "No test for semantic-equality bypass: two blocks with numerically equivalent but differently serialized arguments (e.g., integer vs float). Should be added for any provider that normalizes numbers differently.",
+    "No test for image budget interaction with dedup: a tool returning images where the duplicate block exhausts the budget for legitimate later tool calls."
+  ]
+}
