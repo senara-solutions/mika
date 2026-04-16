@@ -327,27 +327,65 @@ impl SkillRegistry {
             .collect()
     }
 
-    /// Return always-on skills for `SilentTrigger::Callback` turns — includes
-    /// skills with `Exec` and `Http` handlers.
+    /// Return always-on skills **and their transitive dependencies** for
+    /// `SilentTrigger::Callback` turns — includes skills with `Exec` and
+    /// `Http` handlers.
     ///
     /// A callback turn is the agent's continuation of a tool call it already
     /// made in conversation mode (e.g. a `run_claude_pilot` long-running task
     /// that completed or failed). The agent was already exposed to the full
-    /// always-on skill set when it initiated that call, so the retry/continue
-    /// workflow must have access to the same tools. Stripping exec handlers
-    /// here causes retries to fail with `Unknown tool` errors (#567).
+    /// skill set when it initiated that call, so the retry/continue workflow
+    /// must have access to the same tools. Stripping exec handlers here
+    /// causes retries to fail with `Unknown tool` errors (#567).
+    ///
+    /// Unlike `safe_always_on_skills()`, this method resolves skill
+    /// dependencies via BFS (same algorithm as `match_skills()` in
+    /// `matcher.rs`). This ensures dependency skills like `claude-pilot`
+    /// (which provides `run_claude_pilot` but has `always_on = false`) are
+    /// included when an always-on skill (e.g. `self-dev`) declares them as
+    /// dependencies (#578).
     ///
     /// Use `safe_always_on_skills()` for all other silent triggers
     /// (`Heartbeat`, `Reflection`, `Reminder`, `SkillRun`), which are fully
     /// autonomous and must not trigger exec handlers without the agent or
     /// user explicitly initiating the workflow.
-    ///
-    /// Note: Like `safe_always_on_skills()`, this method does NOT resolve
-    /// skill dependencies.
     pub fn callback_safe_skills(&self) -> Vec<&SkillEntry> {
+        use std::collections::{HashSet, VecDeque};
+
+        // Seed: enabled + always_on skills
+        let mut included: HashSet<usize> = HashSet::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+
+        for (i, entry) in self.skills.iter().enumerate() {
+            if entry.enabled && entry.manifest.skill.always_on {
+                included.insert(i);
+                queue.push_back(i);
+            }
+        }
+
+        // BFS transitive dependency resolution (mirrors match_skills() in matcher.rs)
+        while let Some(idx) = queue.pop_front() {
+            for dep_name in &self.skills[idx].manifest.skill.dependencies {
+                if let Some(dep_idx) = self
+                    .skills
+                    .iter()
+                    .position(|e| e.manifest.skill.name.eq_ignore_ascii_case(dep_name))
+                {
+                    // Disabled dependency breaks its sub-tree
+                    if self.skills[dep_idx].enabled && !included.contains(&dep_idx) {
+                        included.insert(dep_idx);
+                        queue.push_back(dep_idx);
+                    }
+                }
+            }
+        }
+
+        // Collect in original order
         self.skills
             .iter()
-            .filter(|e| e.enabled && e.manifest.skill.always_on)
+            .enumerate()
+            .filter(|(i, _)| included.contains(i))
+            .map(|(_, entry)| entry)
             .collect()
     }
 }
@@ -680,6 +718,185 @@ mod tests {
     fn test_callback_safe_skills_empty() {
         let registry = SkillRegistry::empty();
         assert!(registry.callback_safe_skills().is_empty());
+    }
+
+    #[test]
+    fn test_callback_safe_skills_resolves_dependencies() {
+        // Simulates self-dev (always_on) depending on claude-pilot (not always_on).
+        // callback_safe_skills must include both (#578).
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let dummy_def = ToolDefinition {
+            name: "run_claude_pilot".to_string(),
+            description: "Run claude pilot".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        // always_on skill that depends on "claude-pilot"
+        let self_dev = make_entry_with_deps("self-dev", true, true, &["claude-pilot"]);
+
+        // NOT always_on, but provides the exec tool
+        let mut claude_pilot = make_entry_with_deps("claude-pilot", false, true, &[]);
+        claude_pilot.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Exec {
+                command: "./run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(600),
+            },
+            skill_dir: PathBuf::from("/skills/claude-pilot"),
+        }];
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![self_dev, claude_pilot],
+        };
+
+        let callback = registry.callback_safe_skills();
+        let names: Vec<&str> = callback
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"self-dev"));
+        assert!(names.contains(&"claude-pilot"));
+    }
+
+    #[test]
+    fn test_callback_safe_skills_resolves_transitive_dependencies() {
+        // A -> B -> C (transitive chain)
+        let a = make_entry_with_deps("a", true, true, &["b"]);
+        let b = make_entry_with_deps("b", false, true, &["c"]);
+        let c = make_entry_with_deps("c", false, true, &[]);
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![a, b, c],
+        };
+
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 3);
+        let names: Vec<&str> = callback
+            .iter()
+            .map(|e| e.manifest.skill.name.as_str())
+            .collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    #[test]
+    fn test_callback_safe_skills_disabled_dep_breaks_subtree() {
+        // A (always_on) -> B (disabled) -> C
+        // B is disabled, so neither B nor C should appear
+        let a = make_entry_with_deps("a", true, true, &["b"]);
+        let b = make_entry_with_deps("b", false, false, &["c"]); // disabled
+        let c = make_entry_with_deps("c", false, true, &[]);
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![a, b, c],
+        };
+
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 1);
+        assert_eq!(callback[0].manifest.skill.name, "a");
+    }
+
+    #[test]
+    fn test_callback_safe_skills_no_duplicate_for_always_on_dep() {
+        // A (always_on) -> B (also always_on) — B should appear once
+        let a = make_entry_with_deps("a", true, true, &["b"]);
+        let b = make_entry_with_deps("b", true, true, &[]);
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![a, b],
+        };
+
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 2);
+    }
+
+    #[test]
+    fn test_callback_safe_skills_circular_deps_no_infinite_loop() {
+        // A -> B -> A (circular)
+        let a = make_entry_with_deps("a", true, true, &["b"]);
+        let b = make_entry_with_deps("b", false, true, &["a"]);
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![a, b],
+        };
+
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 2);
+    }
+
+    #[test]
+    fn test_callback_safe_skills_unknown_dep_silently_skipped() {
+        // A depends on "nonexistent" — should not panic
+        let a = make_entry_with_deps("a", true, true, &["nonexistent"]);
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![a],
+        };
+
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 1);
+        assert_eq!(callback[0].manifest.skill.name, "a");
+    }
+
+    #[test]
+    fn test_safe_always_on_does_not_resolve_deps_but_callback_does() {
+        // Regression: safe_always_on_skills does NOT resolve deps,
+        // callback_safe_skills DOES. Same registry, different results.
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let dummy_def = ToolDefinition {
+            name: "run_claude_pilot".to_string(),
+            description: "Run claude pilot".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        let self_dev = make_entry_with_deps("self-dev", true, true, &["claude-pilot"]);
+
+        let mut claude_pilot = make_entry_with_deps("claude-pilot", false, true, &[]);
+        claude_pilot.skill_tools = vec![ResolvedSkillTool {
+            definition: dummy_def.clone(),
+            handler: ToolHandler::Exec {
+                command: "./run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(600),
+            },
+            skill_dir: PathBuf::from("/skills/claude-pilot"),
+        }];
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![self_dev, claude_pilot],
+        };
+
+        // safe_always_on_skills: only self-dev (no dep resolution, exec filtered anyway)
+        let safe = registry.safe_always_on_skills();
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].manifest.skill.name, "self-dev");
+
+        // callback_safe_skills: both (dep resolution + exec preserved)
+        let callback = registry.callback_safe_skills();
+        assert_eq!(callback.len(), 2);
     }
 
     #[test]

@@ -2194,8 +2194,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let mode = LoopMode::Silent {
         max_steps: params.trigger.max_steps(),
     };
-    // Silent mode uses safe_always_on_skills (builtin handlers only) — no skills
-    // in this path declare required_tools, so pass an empty set.
+    // Silent mode skill selection is trigger-aware: Callback uses callback_safe_skills
+    // (includes exec/http handlers + dependency resolution), all others use
+    // safe_always_on_skills (builtin handlers only). Neither path declares
+    // required_tools, so pass an empty set.
     let no_required_tools = HashSet::new();
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
