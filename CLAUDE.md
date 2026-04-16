@@ -35,6 +35,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/` — Public documentation (architecture, configuration, deployment, runtime-structure, skills, slash-commands, getting-started) — **single source of truth** for all docs. See [docs/runtime-structure.md](docs/runtime-structure.md) for full `~/.mika` directory layout, DB schema, and log paths.
 - `docs/adr/` — Architecture Decision Records (numbered)
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
+- `skills/bundled/` — Source tree for engine-coupled bundled skills discovered at build time via `crates/mika-agent/build.rs` (currently empty; migration of engine-coupled skills from `mika-skills/` is tracked separately — see `crates/mika-agent/CLAUDE.md` Skills System).
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
 - `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+stop+install), `make test`, `make lint`, `make fmt`, `make check`
 - `todos/` — Code review findings (tracked as markdown files)
