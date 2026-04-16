@@ -116,3 +116,15 @@ If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
 **Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate.
+
+---
+
+## Child Work Item Handling
+
+For milestone and project workflows (see self-dev skill), child work items are linked via `parent_task_id`. When correlating a PR to a work item:
+
+1. First try matching `pr_url` in metadata against the event PR URL
+2. If no match, check `reference_url` against the issue linked in the PR
+3. If still no match, check if any work item has this PR's issue as its `parent_task_id` (milestone/project child lookup)
+
+Child work items use the same PR review webhook path — their QA verdict handling is identical to standalone issues.

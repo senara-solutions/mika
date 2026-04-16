@@ -280,3 +280,186 @@ When you receive a GitHub webhook event (`[GitHub]` prefix) and no webhook-speci
 The engine enforces a hard limit of one `run_claude_pilot` dispatch per turn and rejects dispatch when another work item already has an active session. But prompt-level discipline is the first line of defense — do not rely on engine guards to catch scope violations.
 
 **Incident:** mika#583 on 2026-04-15 — `pull_request_review.submitted` webhook arrived, no webhook-specific skill activated. Agent followed generic Workflow, scanned backlog via `list_work_items`, dispatched claude-pilot on unrelated issues #571 and #572.
+
+---
+
+## Milestone Workflow
+
+When the user says "implement milestone <repo>#<n>":
+
+This workflow orchestrates a GitHub milestone as a parent work item with child issue work items.
+
+### Step M1 — Create parent work item
+
+Call `create_work_item` with:
+- `type`: `"milestone"` (REQUIRED — uses mika#595 tasks.type column)
+- `label`: `"Milestone <repo>#<n>"`  
+- `reference_url`: `"https://github.com/senara-solutions/<repo>/milestone/<n>"`
+- `source`: `"self_dev"`
+
+Remember the returned `task_id` as `milestone_wi`.
+
+### Step M2 — Fetch milestone issues
+
+```bash
+gh api repos/senara-solutions/<repo>/milestones/<n>/issues?state=open&sort=created&direction=asc --jq '.[].number'
+```
+
+Store the ordered list of issue numbers as `milestone_issues`.
+
+### Step M3 — Create child work items
+
+For each issue number in `milestone_issues`:
+1. Call `create_work_item` with:
+   - `type`: `"issue"`
+   - `parent_task_id`: `<milestone_wi>`
+   - `label`: `"<repo>#<issue_number>"`
+   - `reference_url`: `"https://github.com/senara-solutions/<repo>/issues/<issue_number>"`
+   - `source`: `"self_dev"`
+2. Store returned `task_id` in ordered list `child_wis`
+
+Notify Vincent: "Milestone <repo>#<n> initialized with {N} issues. Starting sequential execution."
+
+### Step M4 — Serial execution loop
+
+For each `child_task_id` in `child_wis` (in order):
+
+1. **Update child to in_progress:**
+   ```
+   update_work_item_status(task_id=<child_task_id>, status="in_progress")
+   ```
+
+2. **Execute per-issue flow (Steps 1-6 from main workflow):**
+   - Read GitHub issue
+   - Launch claude-pilot with `task_id=<child_task_id>`
+   - Wait for completion callback
+   - Handle QA verdict webhook
+   - Close out child work item
+
+3. **Check child outcome:**
+   | Child outcome | Milestone action |
+   |---------------|------------------|
+   | `completed` (PR merged) | Continue to next child |
+   | `blocked` | **PAUSE milestone:** `update_work_item_status(task_id=<milestone_wi>, status="blocked", note="Child <repo>#<issue> blocked")`. Notify Vincent: "Milestone <repo>#<n> paused — child <repo>#<issue> blocked. Reply 'continue' or 'skip <repo>#<issue>' to proceed." Stop execution. |
+   | `failed` (exhausted retries) | Continue to next child (record failure in milestone metadata) |
+
+4. **Loop** to next child
+
+### Step M5 — Milestone completion
+
+When all children processed:
+1. Gather stats from child work items via `list_work_items` filtered by `parent_task_id=<milestone_wi>`
+2. Transition parent: `update_work_item_status(task_id=<milestone_wi>, status="completed")`
+3. Notify Vincent with summary:
+   ```
+   Milestone <repo>#<n> complete.
+   ✅ Completed: {N} | ❌ Failed: {N} | ⏸️ Blocked: {N}
+   Total cost: ${total_cost} | Total turns: {total_turns}
+   ```
+
+---
+
+## Project Workflow
+
+When the user says "implement project <n>":
+
+Same shape as Milestone Workflow, but fetches from GitHub Projects v2 instead of a milestone.
+
+### Step P1 — Create parent work item
+
+Call `create_work_item` with:
+- `type`: `"project"`
+- `label`: `"Project #<n>"`
+- `reference_url`: `"https://github.com/orgs/senara-solutions/projects/<n>"`
+- `source`: `"self_dev"`
+
+Remember `task_id` as `project_wi`.
+
+### Step P2 — Fetch project items (GraphQL)
+
+```bash
+gh api graphql -f query='
+query {
+  organization(login:"senara-solutions") {
+    projectV2(number:<n>) {
+      items(first:100) {
+        nodes {
+          content {
+            ... on Issue {
+              number
+              repository { name }
+              state
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}' --jq '.data.organization.projectV2.items.nodes[].content | select(.state == "OPEN") | "\(.repository.name)#\(.number)"'
+```
+
+Store ordered list of `repo#issue` references as `project_issues`.
+
+### Step P3 — Create child work items
+
+For each `repo#issue` in `project_issues`:
+1. Parse repo and issue number
+2. Call `create_work_item` with:
+   - `type`: `"issue"`
+   - `parent_task_id`: `<project_wi>`
+   - `label`: `"<repo>#<issue_number>"`
+   - `reference_url`: `"https://github.com/senara-solutions/<repo>/issues/<issue_number>"`
+   - `source`: `"self_dev"`
+
+### Step P4 — Serial execution loop
+
+Same as Milestone Step M4.
+
+### Step P5 — Project completion
+
+Same as Milestone Step M5.
+
+---
+
+## Resume Semantics
+
+### Milestone/Project Resume
+
+If re-invoked while a parent is `in_progress` or `blocked`:
+
+1. **Find the parent:**
+   ```
+   list_work_items(status="in_progress")  # check for type="milestone" or type="project"
+   list_work_items(status="blocked")      # also check blocked
+   ```
+   Match by `reference_url` containing "milestone" or "projects/<n>".
+
+2. **Find next child to resume:**
+   ```
+   list_work_items(status="pending")      # not started
+   list_work_items(status="in_progress")  # interrupted mid-flight
+   list_work_items(status="blocked")      # manual unblock requested
+   ```
+   Filter by `parent_task_id=<parent_wi>`. Pick first by creation order.
+
+3. **Resume execution:**
+   - If child is `pending`: Start from Step M4/P4 step 1
+   - If child is `in_progress` or `blocked`: Check if PR exists, handle accordingly
+   - If no children remain: Close parent as `completed`
+
+### Manual Commands
+
+**"continue"** — Resume a paused milestone/project:
+- Find blocked parent, transition to `in_progress`
+- Find next pending/blocked child, resume loop
+
+**"skip <repo>#<issue>"** — Skip a specific child issue:
+- Find child work item by label matching `<repo>#<issue>`
+- Transition to `cancelled` with note "Skipped per Vincent"
+- Resume loop from next child
+
+**"stop milestone <repo>#<n>" / "stop project <n>"** — Cancel remaining:
+- Transition parent to `cancelled`
+- Cancel all pending children
+- Leave in-progress/blocked children alone (they may complete)

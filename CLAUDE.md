@@ -173,3 +173,61 @@ This repo is part of the [mika-platform](../CLAUDE.md) workspace. For cross-repo
 
 Cross-repo documentation:
 - `../docs/solutions/cross-repo-patterns/` — Security hardening playbook, reference architecture patterns
+
+---
+
+## Skills System
+
+### Engine-Coupled vs Community Skills
+
+Skills are bundled and discovered at build time via `crates/mika-agent/build.rs`. There are two categories:
+
+**Engine-Coupled Skills** (in `skills/bundled/`):
+- Live next to the Rust engine code they depend on
+- Correctness depends on lockstep with engine schemas and contracts
+- Ship atomically with the engine (discovered at build time)
+- Examples: `self-dev`, `claude-pilot`, `qa-review`, `permission-policy`
+
+**Community Skills** (in `mika-skills` repo):
+- Standalone skills with no engine dependencies
+- Distributed via git-based marketplace
+- Examples: external API integrations, utility skills
+
+### Directory Structure (`skills/bundled/`)
+
+```
+skills/bundled/
+├── self-dev/              # Main self-development orchestration
+│   ├── skill.toml
+│   └── system_prompt.md   # Per-issue + milestone + project workflows
+├── self-dev-webhook-qa/   # QA webhook handler for self-dev
+├── self-dev-webhook-ci/   # CI webhook handler for self-dev
+├── claude-pilot/          # Claude Code integration
+├── qa-review/             # PR review skill
+├── permission-policy/     # Permission handler for claude-pilot sessions
+├── build-mika/            # Build verification
+├── deploy-mika/           # Deployment
+├── agents-teams/          # Agent/team management
+└── skill-review/          # Skill review handler
+```
+
+### Build-Time Discovery
+
+The `build.rs` walks `skills/bundled/` and generates `BUNDLED_SKILL_MANIFESTS` containing:
+- Skill name and manifest (from `skill.toml`)
+- System prompt content (from `system_prompt.md`)
+
+Skills are loaded at runtime from this generated constant — no filesystem access required.
+
+### Adding a New Bundled Skill
+
+1. Create `skills/bundled/<skill-name>/` directory
+2. Add `skill.toml` with required fields:
+   ```toml
+   [skill]
+   name = "<skill-name>"
+   version = "0.1.0"
+   keywords = ["trigger", "words"]
+   ```
+3. Add `system_prompt.md` with the skill's system prompt
+4. Build — the skill is automatically discovered and available
