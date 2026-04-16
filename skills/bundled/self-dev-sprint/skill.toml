@@ -1,0 +1,14 @@
+[skill]
+name = "self-dev-sprint"
+description = "Sprint/batch mode for multi-issue sequential execution"
+version = "0.1.0"
+always_on = false
+dependencies = ["self-dev"]
+
+[triggers]
+keywords = [
+    "sprint",
+    "batch",
+    "sprint mode",
+    "batch mode",
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "deploy_mika",
+    "description": "Deploy all mika binaries (mika, mika-server, mika-gateway) from build artifacts. Per-binary health check, backup/rollback, rc-service restart.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string",
+          "description": "Path to the mika repo containing built artifacts at target/release/mika. Defaults to $MIKA_PLATFORM_DIR/mika."
+        }
+      },
+      "required": []
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh",
+      "long_running": true,
+      "estimated_duration_secs": 30
+    }
+  }
+]

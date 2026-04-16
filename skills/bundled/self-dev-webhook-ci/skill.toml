@@ -1,0 +1,13 @@
+[skill]
+name = "self-dev-webhook-ci"
+description = "Webhook handler for CI check_suite failures"
+version = "0.1.0"
+always_on = false
+dependencies = ["self-dev"]
+
+[triggers]
+keywords = [
+    "check_suite",
+    "ci failure",
+    "check suite",
+]

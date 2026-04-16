@@ -1,0 +1,9 @@
+[skill]
+name = "deploy-mika"
+description = "Deploy mika binaries from worktree build artifacts — backup, copy, restart, health check"
+version = "0.1.0"
+always_on = false
+timeout_secs = 120
+
+[triggers]
+keywords = ["deploy mika", "deploy binaries", "install mika"]

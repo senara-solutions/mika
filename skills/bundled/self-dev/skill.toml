@@ -1,0 +1,27 @@
+[skill]
+name = "self-dev"
+description = "Orchestrator: delegates implementation work to Claude Code via claude-pilot"
+version = "0.2.0"
+always_on = true
+timeout_secs = 30
+max_prompt_size = 32768
+dependencies = [
+    "build-mika",
+    "deploy-mika",
+    "claude-pilot",
+    "browser-control",
+]
+
+[constraints]
+required_tools = ["run_claude_pilot"]
+
+[triggers]
+keywords = [
+    "add feature",
+    "implement",
+    "develop yourself",
+    "build",
+    "add yourself",
+    "improve yourself",
+    "new feature",
+]
