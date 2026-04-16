@@ -1,0 +1,26 @@
+[
+  {
+    "name": "resolve_pr_conflicts",
+    "description": "Resolve merge conflicts on a PR branch by rebasing onto the base branch. Long-running — returns a task ID immediately, results arrive via callback when claude-pilot finishes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "worktree_path": {
+          "type": "string",
+          "description": "Absolute path to the existing git worktree for the PR branch. The worktree must already exist (created by self-dev or manually)."
+        },
+        "task_id": {
+          "type": "string",
+          "description": "The UUID returned by create_work_item (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log."
+        }
+      },
+      "required": ["worktree_path", "task_id"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh",
+      "long_running": true,
+      "estimated_duration_secs": 600
+    }
+  }
+]
