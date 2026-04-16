@@ -12,6 +12,8 @@ Tool call summaries (name, truncated input/output, success, non_zero_exit) persi
 
 Compaction includes tool names in summarization. Multi-modal tool results: `ToolOutput` carries optional `images: Vec<ImageData>` (base64-encoded), converted to multi-block `tool_result` content arrays for the Claude API. Prior-turn images are stripped before each API call to prevent unbounded memory growth.
 
+**Per-turn tool_use dedup guard (#582):** `process_tool_calls()` deduplicates identical `(tool_name, arguments)` pairs emitted inside a single LLM response. The underlying tool runs once, the `tool_calls` DB row is saved once, one `ToolCallSummary` is emitted, and duplicate tool_use ids receive a `tool_result` built from the cached `ToolOutput` so the conversation/API history stays paired. Defends against provider-side duplication (observed with non-Anthropic providers). Logs `warn!` with `trace_id`, `tool`, and `step` when it fires.
+
 ### Post-Conditions (EndTurn Chain)
 
 Four sequential post-conditions on assistant text responses:

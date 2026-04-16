@@ -53,6 +53,40 @@ async fn test_multiple_parallel_tool_calls() {
 }
 
 #[tokio::test]
+async fn test_duplicate_tool_use_block_deduplicated() {
+    // Regression test for #582: when the LLM emits two tool_use blocks with
+    // identical (name, arguments) in a single response, the agent must
+    // execute the underlying tool only once and persist only one tool_calls
+    // row. The duplicate block still receives a tool_result (so the API
+    // contract holds), but it reuses the cached output rather than
+    // re-running the tool.
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            multi_tool_response(vec![
+                ("send_message", json!({"text": "sprint started"})),
+                ("send_message", json!({"text": "sprint started"})),
+            ]),
+            text_response("Sprint kicked off."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("start the sprint").await.unwrap();
+
+    assert_has_output(&trace);
+    // Two identical blocks should collapse to a single tool_calls row.
+    let send_calls = trace.calls_for_tool("send_message");
+    assert_eq!(
+        send_calls.len(),
+        1,
+        "Expected exactly 1 send_message call, got {}: {:?}",
+        send_calls.len(),
+        send_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn test_tool_call_with_store_fact() {
     let harness = EvalHarness::builder()
         .responses(vec![
