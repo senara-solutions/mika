@@ -61,7 +61,7 @@ impl Default for MockProviderConfig {
 /// Returns pre-configured responses in order. Panics when the sequence is exhausted
 /// (fast failure for test debugging). Captures all received requests for post-run inspection.
 pub struct MockLlmProvider {
-    responses: Vec<MockResponse>,
+    responses: Mutex<Vec<MockResponse>>,
     cursor: AtomicUsize,
     captured_requests: Arc<Mutex<Vec<LlmRequest>>>,
     config: MockProviderConfig,
@@ -82,6 +82,16 @@ impl MockLlmProvider {
     pub fn calls_made(&self) -> usize {
         self.cursor.load(Ordering::SeqCst)
     }
+
+    /// Replace the response sequence and reset the cursor.
+    ///
+    /// Useful when the test needs to seed DB data (which generates IDs)
+    /// before configuring mock responses that reference those IDs.
+    /// Must be called before `.run()` — not safe during concurrent access.
+    pub fn clear_and_set(&self, responses: Vec<MockResponse>) {
+        *self.responses.lock().unwrap() = responses;
+        self.cursor.store(0, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -91,16 +101,17 @@ impl LlmProvider for MockLlmProvider {
         self.captured_requests.lock().unwrap().push(request.clone());
 
         let index = self.cursor.fetch_add(1, Ordering::SeqCst);
-        if index >= self.responses.len() {
+        let responses = self.responses.lock().unwrap();
+        if index >= responses.len() {
             panic!(
                 "MockLlmProvider: exhausted all {} responses at call {}. \
                  Add more responses or verify agent behavior.",
-                self.responses.len(),
+                responses.len(),
                 index + 1
             );
         }
 
-        match &self.responses[index] {
+        match &responses[index] {
             MockResponse::Success(resp) => Ok(resp.clone()),
             MockResponse::Error(err) => Err(err.clone()),
         }
@@ -188,7 +199,7 @@ impl MockLlmProviderBuilder {
     /// Build the `MockLlmProvider`.
     pub fn build(self) -> MockLlmProvider {
         MockLlmProvider {
-            responses: self.responses,
+            responses: Mutex::new(self.responses),
             cursor: AtomicUsize::new(0),
             captured_requests: Arc::new(Mutex::new(Vec::new())),
             config: self.config,

@@ -13,6 +13,7 @@ mod eval {
     mod test_error_handling;
     mod test_internal_tagging;
     mod test_multi_step;
+    mod test_phantom_retry_guard;
     mod test_tool_calling;
     mod test_verdict_handler;
     mod test_webhook_queue;

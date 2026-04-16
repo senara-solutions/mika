@@ -38,4 +38,4 @@ Multi-provider via `LlmProvider` trait — 11 supported providers, each with its
 
 ## MockLlmProvider
 
-`llm/mock.rs` — sequence-based mock for deterministic agent loop testing, gated behind `test-utils` feature (`#[cfg(any(test, feature = "test-utils"))]`). Used by the eval harness in `crates/mika-agent/tests/eval/`.
+`llm/mock.rs` — sequence-based mock for deterministic agent loop testing, gated behind `test-utils` feature (`#[cfg(any(test, feature = "test-utils"))]`). Used by the eval harness in `crates/mika-agent/tests/eval/`. Responses stored in `Mutex<Vec<MockResponse>>` for dynamic replacement via `clear_and_set()` — enables tests that need to seed DB data (generating IDs) before configuring mock responses that reference those IDs. Must be called before `.run()` (not safe during concurrent access).

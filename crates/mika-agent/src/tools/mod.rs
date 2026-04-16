@@ -41,7 +41,7 @@ mod update_core_memory;
 mod update_fact;
 mod update_skill;
 mod update_team;
-mod update_work_item_status;
+pub mod update_work_item_status;
 mod write_agent_file;
 mod write_workspace;
 
