@@ -23,6 +23,14 @@ HMAC-SHA256 signature validation via `X-Hub-Signature-256`. Event routing:
 - 256KB body limit
 - Multi-tenant routing via `github_repos` table lookup with `agent_base_url` fallback for single-tenant mode
 
+### Inbound delivery retry (#589)
+
+The spawned forwarding task retries on HTTP 429/5xx or request timeouts using the fixed schedule `[2s, 5s, 15s, 60s, 300s]` with ±25% per-attempt jitter (prevents synchronized retry bursts on the same agent). Permanent failures (HTTP 4xx other than 429, connection errors indicating the agent is offline, or unresolvable route) stop retries immediately. Route resolution (`github_repos` lookup + `agent_mapping`) is cached across retries — a single Postgres query per event regardless of retry count.
+
+Semaphore lifecycle during retry: the 30-permit `webhook_semaphore` (shared with Telegram) is released during each retry sleep and re-acquired via `try_acquire_owned` before the next attempt. If the semaphore is full on re-acquire, the retry is abandoned with a dedicated ERROR log (`semaphore at capacity during retry`), distinct from the `retry budget exhausted` ERROR emitted when all 6 attempts return a retryable failure.
+
+The delivery LRU cache has no TTL (size-based eviction only). Under extreme webhook volume (>10k deliveries during a single 300s retry sleep), the `X-GitHub-Delivery` entry may be evicted and a GitHub redelivery would bypass gateway dedup. Agent-side idempotency (work item unique index on `reference_url`) mitigates double-processing. Events that exhaust retries or are abandoned due to semaphore pressure are dropped with ERROR logs; persistent DLQ + replay CLI is tracked in #590.
+
 ## Agent Identification & Reply Routing
 
 - Outbound messages carry `agent_name` in the `/send` payload; gateway prepends `[agent_name]` to Telegram text and stores `(telegram_message_id, chat_id, agent_name)` in `outbound_messages` Postgres table
