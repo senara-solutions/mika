@@ -2136,6 +2136,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
         let t = db.get_task(&id).await.unwrap().unwrap();

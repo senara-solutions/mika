@@ -67,6 +67,7 @@ async fn seed_work_item(harness: &EvalHarness, label: &str) -> String {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         })
         .await
         .unwrap()

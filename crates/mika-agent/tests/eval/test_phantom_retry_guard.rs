@@ -44,6 +44,7 @@ async fn seed_work_item(harness: &EvalHarness, label: &str) -> String {
             reference_url: None,
             source: Some("self_dev".to_string()),
             metadata: None,
+            r#type: None,
         })
         .await
         .unwrap()
@@ -74,6 +75,7 @@ async fn create_callback_child(harness: &EvalHarness, parent_id: &str, status: &
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         })
         .await
         .unwrap();

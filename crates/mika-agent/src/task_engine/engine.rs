@@ -682,6 +682,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         }
     }
 
@@ -836,6 +837,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -873,6 +875,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -910,6 +913,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -935,6 +939,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let c1_id = db.create_task(child1).await.unwrap();
         db.update_task_completed(&c1_id, Some("done"))
@@ -962,6 +967,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let c2_id = db.create_task(child2).await.unwrap();
         // Mark expired manually (in real flow, expire_timed_out_tasks does this)
@@ -1033,6 +1039,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         }
     }
 

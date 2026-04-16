@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::db::{NewTask, Task, is_unique_violation};
+use crate::db::{NewTask, TASK_TYPE_ISSUE, Task, VALID_TASK_TYPES, is_unique_violation};
 use crate::task_engine::types::{action_type, trigger_type};
 
 /// Format a success response for a deduplicated work item (already exists).
@@ -15,6 +15,9 @@ fn format_dedup_response(existing: &Task) -> String {
          Status: {}",
         existing.id, existing.label, existing.status
     );
+    if existing.r#type != TASK_TYPE_ISSUE {
+        response.push_str(&format!("\nType: {}", existing.r#type));
+    }
     if let Some(url) = &existing.reference_url {
         response.push_str(&format!("\nReference: {url}"));
     }
@@ -46,7 +49,8 @@ impl Tool for CreateWorkItemTool {
                 and progressed through status stages. Use for significant tasks like \
                 feature implementation, research projects, or items waiting on external input. \
                 Cannot be used during callback turns. Max 5 agent-created items per session. \
-                Max nesting depth of 3."
+                Max nesting depth of 3. Set 'type' to 'milestone' or 'project' to mark a parent \
+                container that aggregates child 'issue' work items via parent_task_id."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -67,6 +71,12 @@ impl Tool for CreateWorkItemTool {
                     "parent_task_id": {
                         "type": "string",
                         "description": "Optional parent work item ID for subtask nesting"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["issue", "milestone", "project"],
+                        "description": "Work item kind. Defaults to 'issue'. Use 'milestone' or 'project' \
+                                        for parent containers that group child issues via parent_task_id."
                     }
                 },
                 "required": ["label"]
@@ -85,6 +95,11 @@ impl Tool for CreateWorkItemTool {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
         let parent_task_id = input["parent_task_id"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        // Empty/whitespace-only `type` falls back to the default ("issue").
+        let task_type_input = input["type"]
             .as_str()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
@@ -113,6 +128,17 @@ impl Tool for CreateWorkItemTool {
                 VALID_SOURCES.join(", ")
             )));
         }
+        if let Some(t) = task_type_input
+            && !VALID_TASK_TYPES.contains(&t)
+        {
+            return Ok(ToolOutput::error(format!(
+                "Invalid type '{}'. Must be one of: {}",
+                t,
+                VALID_TASK_TYPES.join(", ")
+            )));
+        }
+        // Resolved type used both for the row and for the response message.
+        let task_type = task_type_input.unwrap_or(TASK_TYPE_ISSUE);
 
         // Guard 3: Callback turns block ALL work item creation
         if ctx.is_callback_turn {
@@ -229,6 +255,7 @@ impl Tool for CreateWorkItemTool {
             reference_url: reference_url.map(|s| s.to_string()),
             source: source.map(|s| s.to_string()),
             metadata: None,
+            r#type: Some(task_type.to_string()),
         };
 
         // Dedup path A (reference_url provided): attempt INSERT, catch UNIQUE violation
@@ -262,6 +289,11 @@ impl Tool for CreateWorkItemTool {
                 }
                 if let Some(pid) = parent_task_id {
                     response.push_str(&format!("\nParent: {pid}"));
+                }
+                // Surface non-default types so the caller can confirm. Hide for "issue"
+                // to keep the common-case response compact.
+                if task_type != TASK_TYPE_ISSUE {
+                    response.push_str(&format!("\nType: {task_type}"));
                 }
                 Ok(ToolOutput::success(response))
             }
@@ -306,6 +338,7 @@ impl Tool for CreateWorkItemTool {
                         reference_url: Some(url.to_string()),
                         source: source.map(|s| s.to_string()),
                         metadata: None,
+                        r#type: Some(task_type.to_string()),
                     };
                     let id = ctx.db.create_task(retry_task).await?;
                     let after_value =
@@ -329,6 +362,9 @@ impl Tool for CreateWorkItemTool {
                     }
                     if let Some(pid) = parent_task_id {
                         response.push_str(&format!("\nParent: {pid}"));
+                    }
+                    if task_type != TASK_TYPE_ISSUE {
+                        response.push_str(&format!("\nType: {task_type}"));
                     }
                     Ok(ToolOutput::success(response))
                 }
@@ -967,5 +1003,233 @@ mod tests {
             over_cap.content
         );
         assert!(over_cap.content.contains("Maximum"));
+    }
+
+    // ===== `type` column tests (issue #595) =====
+
+    /// Helper: extract the new work-item ID from a successful create response.
+    fn extract_id(content: &str) -> &str {
+        content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Work item created: ")
+            .expect("response should start with 'Work item created: '")
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_type_defaults_to_issue() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"label": "no type", "source": "user_request"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        // Default type should NOT appear in the response message — it's the common case.
+        assert!(
+            !result.content.contains("Type:"),
+            "default type should be hidden in response: {}",
+            result.content
+        );
+
+        // Row should persist with type='issue'.
+        let id = extract_id(&result.content);
+        let task = ctx
+            .db
+            .get_manual_task(id)
+            .await
+            .unwrap()
+            .expect("just-created work item should be retrievable");
+        assert_eq!(task.r#type, "issue");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_type_milestone() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "milestone parent",
+                    "source": "user_request",
+                    "type": "milestone"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("Type: milestone"),
+            "non-default type should appear in response: {}",
+            result.content
+        );
+
+        let id = extract_id(&result.content);
+        let task = ctx.db.get_manual_task(id).await.unwrap().unwrap();
+        assert_eq!(task.r#type, "milestone");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_type_project() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "project parent",
+                    "source": "user_request",
+                    "type": "project"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Type: project"));
+
+        let id = extract_id(&result.content);
+        let task = ctx.db.get_manual_task(id).await.unwrap().unwrap();
+        assert_eq!(task.r#type, "project");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_type_explicit_issue_hidden() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "explicit issue",
+                    "source": "user_request",
+                    "type": "issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // Explicit "issue" should be treated identically to omitted: hidden.
+        assert!(
+            !result.content.contains("Type:"),
+            "explicit issue type should be hidden: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_type_invalid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "bad type",
+                    "source": "user_request",
+                    "type": "epic"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "should reject invalid type");
+        assert!(
+            result.content.contains("Invalid type 'epic'"),
+            "error should name the offending value: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("issue, milestone, project"),
+            "error should list valid types: {}",
+            result.content
+        );
+
+        // Verify no row was created.
+        let count = ctx
+            .db
+            .count_session_work_items(ctx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "invalid type should not insert a row");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_type_empty_string_defaults() {
+        // Whitespace-only `type` should fall back to the default rather than error.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "whitespace type",
+                    "source": "user_request",
+                    "type": "   "
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        let id = extract_id(&result.content);
+        let task = ctx.db.get_manual_task(id).await.unwrap().unwrap();
+        assert_eq!(task.r#type, "issue");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_milestone_with_parent() {
+        // Existing depth/parent guards should still apply with non-default types.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateWorkItemTool;
+
+        let parent = tool
+            .execute(
+                serde_json::json!({
+                    "label": "milestone container",
+                    "source": "user_request",
+                    "type": "milestone"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let parent_id = extract_id(&parent.content).to_string();
+
+        let child = tool
+            .execute(
+                serde_json::json!({
+                    "label": "child issue",
+                    "source": "user_request",
+                    "parent_task_id": parent_id,
+                    "type": "issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!child.is_error, "got error: {}", child.content);
+        let child_id = extract_id(&child.content);
+        let child_task = ctx.db.get_manual_task(child_id).await.unwrap().unwrap();
+        assert_eq!(child_task.r#type, "issue");
+        assert_eq!(
+            child_task.parent_task_id.as_deref(),
+            Some(parent_id.as_str())
+        );
     }
 }

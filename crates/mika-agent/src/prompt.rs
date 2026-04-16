@@ -1682,6 +1682,7 @@ notify = true
                 reference_url: Some("https://github.com/org/repo/issues/42".to_string()),
                 source: None,
                 metadata: None,
+                r#type: "issue".to_string(),
             }],
             anomalies: vec![TaskHealthAnomaly {
                 task_id: "def-456".to_string(),

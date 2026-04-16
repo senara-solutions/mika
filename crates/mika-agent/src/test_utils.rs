@@ -203,6 +203,7 @@ pub mod test_helpers {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         db.create_task(task).await.unwrap()
     }

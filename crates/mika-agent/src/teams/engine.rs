@@ -849,6 +849,7 @@ impl TeamEngine {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
 
         let parent_task_id = self
@@ -884,6 +885,7 @@ impl TeamEngine {
                 reference_url: None,
                 source: None,
                 metadata: None,
+                r#type: None,
             };
 
             match self.team_db.create_task(child_task).await {

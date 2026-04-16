@@ -491,6 +491,9 @@ pub struct TaskResponse {
     pub updated_at: String,
     pub action_config_preview: Option<String>,
     pub result_preview: Option<String>,
+    /// Work item kind: `"issue"`, `"milestone"`, or `"project"`. Default `"issue"`.
+    /// Added in schema v23 (mika#595).
+    pub r#type: String,
 }
 
 impl From<Task> for TaskResponse {
@@ -525,6 +528,7 @@ impl From<Task> for TaskResponse {
             updated_at: t.updated_at,
             action_config_preview,
             result_preview,
+            r#type: t.r#type,
         }
     }
 }
@@ -606,6 +610,9 @@ pub struct TaskDetailResponse {
     pub updated_at: String,
     pub action_config: String,
     pub result: Option<String>,
+    /// Work item kind: `"issue"`, `"milestone"`, or `"project"`. Default `"issue"`.
+    /// Added in schema v23 (mika#595).
+    pub r#type: String,
 }
 
 impl From<Task> for TaskDetailResponse {
@@ -633,6 +640,7 @@ impl From<Task> for TaskDetailResponse {
             updated_at: t.updated_at,
             action_config: t.action_config,
             result: t.result,
+            r#type: t.r#type,
         }
     }
 }
@@ -1187,5 +1195,63 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert!(clause.contains("created_at >= ?1"));
         assert!(clause.contains("created_at <= ?2"));
+    }
+
+    // ===== Task DTO `type` serialization tests (issue #595) =====
+
+    fn sample_task_with_type(t: &str) -> Task {
+        Task {
+            id: "task-id".to_string(),
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "sample".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            status: "pending".to_string(),
+            process_id: None,
+            input_context: None,
+            result: None,
+            created_by_session: None,
+            created_trace_id: None,
+            execution_trace_id: None,
+            created_at: "2026-04-16T00:00:00Z".to_string(),
+            updated_at: "2026-04-16T00:00:00Z".to_string(),
+            fired_at: None,
+            completed_at: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: t.to_string(),
+        }
+    }
+
+    #[test]
+    fn task_response_serializes_type_as_type_key() {
+        let resp = TaskResponse::from(sample_task_with_type("milestone"));
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["type"], "milestone");
+    }
+
+    #[test]
+    fn task_detail_response_serializes_type_as_type_key() {
+        let resp = TaskDetailResponse::from(sample_task_with_type("project"));
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["type"], "project");
+    }
+
+    #[test]
+    fn task_response_serializes_default_issue_type() {
+        let resp = TaskResponse::from(sample_task_with_type("issue"));
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["type"], "issue");
     }
 }
