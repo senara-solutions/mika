@@ -58,6 +58,7 @@ async fn create_work_item_with_pr_url(db: &AsyncDatabase, pr_url: &str) -> Strin
             reference_url: Some(pr_url.to_string()),
             source: Some("github_issue".to_string()),
             metadata: Some(serde_json::to_string(&metadata).unwrap()),
+            r#type: None,
         })
         .await
         .expect("create task");
@@ -311,6 +312,7 @@ async fn verdict_pass_pending_work_item_passes_through() -> Result<()> {
             reference_url: Some(pr_url.to_string()),
             source: Some("github_issue".to_string()),
             metadata: Some(serde_json::to_string(&metadata).unwrap()),
+            r#type: None,
         })
         .await
         .expect("create task");

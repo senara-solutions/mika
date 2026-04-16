@@ -990,6 +990,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -1023,6 +1024,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -1055,6 +1057,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -1087,6 +1090,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
         // Callback with no result should error
@@ -1129,6 +1133,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(task).await.unwrap();
         // Should not error — reminder path reads from action_config
@@ -1242,6 +1247,7 @@ mod tests {
             reference_url: None,
             source: Some("self_dev".to_string()),
             metadata: None,
+            r#type: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -1267,6 +1273,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let callback_id = db.create_task(callback).await.unwrap();
 
@@ -1325,6 +1332,7 @@ mod tests {
             reference_url: None,
             source: Some("self_dev".to_string()),
             metadata: Some(r#"{"pipeline_retry_count": 1}"#.to_string()),
+            r#type: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -1350,6 +1358,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let callback_id = db.create_task(callback).await.unwrap();
 
@@ -1404,6 +1413,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let callback_id = db.create_task(callback).await.unwrap();
         db.update_task_completed(&callback_id, Some("Session: abc\nTurns: 10"))

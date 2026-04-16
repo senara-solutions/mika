@@ -4,7 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::db::format_ts;
+use crate::db::{TASK_TYPE_ISSUE, format_ts};
 
 pub struct ListWorkItemsTool;
 
@@ -141,12 +141,19 @@ impl Tool for ListWorkItemsTool {
                 .as_deref()
                 .map(|s| format!(" src:{s}"))
                 .unwrap_or_default();
+            // Hide the default ("issue") to keep the common case compact;
+            // surface "milestone"/"project" so parent containers stand out.
+            let task_type = if task.r#type == TASK_TYPE_ISSUE {
+                String::new()
+            } else {
+                format!(" type:{}", task.r#type)
+            };
             let children = child_count
                 .map(|c| format!(" children:{c}"))
                 .unwrap_or_default();
 
             lines.push(format!(
-                "- [{status}] {id} {label} (created:{created}{ref_url}{src}{children})",
+                "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{children})",
                 status = task.status,
                 id = task.id,
                 label = task.label,
@@ -202,6 +209,7 @@ mod tests {
                 reference_url: reference_url.map(|s| s.to_string()),
                 source: source.map(|s| s.to_string()),
                 metadata: None,
+                r#type: None,
             })
             .await
             .unwrap()
@@ -315,6 +323,7 @@ mod tests {
                 reference_url: None,
                 source: None,
                 metadata: None,
+                r#type: None,
             })
             .await
             .unwrap();
@@ -490,6 +499,91 @@ mod tests {
         );
     }
 
+    // ===== `type` rendering tests (issue #595) =====
+
+    /// Helper: create a manual task with an explicit type override.
+    async fn create_typed_work_item(harness: &TestHarness, label: &str, task_type: &str) -> String {
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: trigger_type::MANUAL.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::NONE.to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("test-session".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("user_request".to_string()),
+                metadata: None,
+                r#type: Some(task_type.to_string()),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_hides_default_type() {
+        // Default-type ("issue") rows should NOT have `type:` in their line —
+        // matches the existing pattern of hiding default values.
+        let harness = TestHarness::new();
+        create_work_item(&harness, "Plain issue", Some("user_request"), None).await;
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Plain issue"));
+        assert!(
+            !result.content.contains("type:issue"),
+            "default type should be hidden in line: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_shows_milestone_type() {
+        let harness = TestHarness::new();
+        create_typed_work_item(&harness, "Q2 milestone", "milestone").await;
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("type:milestone"),
+            "milestone type should be visible in line: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_shows_mixed_types() {
+        let harness = TestHarness::new();
+        create_work_item(&harness, "Plain issue", Some("user_request"), None).await;
+        create_typed_work_item(&harness, "Sprint container", "milestone").await;
+        create_typed_work_item(&harness, "Q1 project", "project").await;
+
+        let ctx = harness.ctx();
+        let tool = ListWorkItemsTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        // milestone + project visible; default issue still hidden
+        assert!(result.content.contains("type:milestone"));
+        assert!(result.content.contains("type:project"));
+        assert!(!result.content.contains("type:issue"));
+    }
+
     #[tokio::test]
     async fn test_list_excludes_non_manual_tasks() {
         let harness = TestHarness::new();
@@ -517,6 +611,7 @@ mod tests {
                 reference_url: None,
                 source: None,
                 metadata: None,
+                r#type: None,
             })
             .await
             .unwrap();

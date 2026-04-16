@@ -109,6 +109,7 @@ mod tests {
                 reference_url: None,
                 source: None,
                 metadata: None,
+                r#type: None,
             })
             .await
             .unwrap()

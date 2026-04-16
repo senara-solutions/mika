@@ -217,6 +217,7 @@ impl Tool for CreateTaskTool {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
 
         let id = ctx.db.create_task(task).await?;

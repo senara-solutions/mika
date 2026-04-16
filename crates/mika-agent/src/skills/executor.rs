@@ -796,6 +796,7 @@ async fn execute_long_running(
         reference_url: None,
         source: None,
         metadata: None,
+        r#type: None,
     };
 
     let task_id = match ctx.db.create_task(task).await {
@@ -1888,6 +1889,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let child_id = db.create_task(task).await.unwrap();
         if status != "pending" {
@@ -2175,6 +2177,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         async_db.create_task(non_callback).await.unwrap();
 

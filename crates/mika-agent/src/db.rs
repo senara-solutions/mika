@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub const CURRENT_SCHEMA_VERSION: i64 = 23;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -76,6 +76,16 @@ pub fn is_unique_violation(err: &anyhow::Error) -> bool {
 }
 
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
+
+/// Default value for the `tasks.type` column. New work items default to `"issue"`
+/// unless the caller explicitly requests `"milestone"` or `"project"`.
+pub const TASK_TYPE_ISSUE: &str = "issue";
+pub const TASK_TYPE_MILESTONE: &str = "milestone";
+pub const TASK_TYPE_PROJECT: &str = "project";
+
+/// All valid values for the `tasks.type` column. Enforced by SQLite CHECK and by
+/// the `create_work_item` tool boundary. Order is the documented enum order.
+pub const VALID_TASK_TYPES: &[&str] = &[TASK_TYPE_ISSUE, TASK_TYPE_MILESTONE, TASK_TYPE_PROJECT];
 
 pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     ("user_summary", "No information about the user yet."),
@@ -150,6 +160,10 @@ pub struct Task {
     pub reference_url: Option<String>,
     pub source: Option<String>,
     pub metadata: Option<String>,
+    /// Work item kind: `"issue"`, `"milestone"`, or `"project"`. NOT NULL in the DB,
+    /// defaulted to `"issue"` for backward compatibility (added in schema v23). See
+    /// [`VALID_TASK_TYPES`].
+    pub r#type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +188,11 @@ pub struct NewTask {
     pub reference_url: Option<String>,
     pub source: Option<String>,
     pub metadata: Option<String>,
+    /// Work item kind. `None` (or an empty string) means "use the SQL default"
+    /// (`"issue"`), preserving backward compatibility for existing callers. Values
+    /// other than those in [`VALID_TASK_TYPES`] are rejected by the DB CHECK
+    /// constraint; prefer validating at the tool boundary before INSERT.
+    pub r#type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -747,6 +766,10 @@ impl Database {
             self.migrate_v21_to_v22()?;
             info!(version = 22, "database migrated to v22");
         }
+        if (3..=22).contains(&version) {
+            self.migrate_v22_to_v23()?;
+            info!(version = 23, "database migrated to v23");
+        }
         Ok(())
     }
 
@@ -803,7 +826,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (22);
+            INSERT INTO schema_version (version) VALUES (23);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -871,6 +894,9 @@ impl Database {
                 reference_url TEXT,
                 source TEXT,
                 metadata TEXT,
+                type TEXT NOT NULL DEFAULT 'issue' CHECK (
+                    type IN ('issue', 'milestone', 'project')
+                ),
                 created_by_session TEXT,
                 created_trace_id TEXT,
                 execution_trace_id TEXT,
@@ -2516,6 +2542,26 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v22_to_v23(&self) -> Result<()> {
+        info!("migrating database schema v22 → v23 (tasks: type column)");
+
+        let has_col = self.column_exists("tasks", "type")?;
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !has_col {
+            // SQLite 3.37+ supports CHECK constraints in ALTER TABLE ADD COLUMN.
+            // The DEFAULT backfills all existing rows to 'issue', preserving behavior.
+            sql.push_str(
+                "ALTER TABLE tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'issue' \
+                 CHECK (type IN ('issue', 'milestone', 'project'));\n",
+            );
+        }
+        sql.push_str("INSERT INTO schema_version (version) VALUES (23);\nCOMMIT;");
+
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -2709,19 +2755,27 @@ impl Database {
 
     pub fn create_task(&self, task: &NewTask) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // `type` defaults to "issue" when the caller passes None or an empty string.
+        // The DB CHECK constraint enforces the same allowlist as VALID_TASK_TYPES.
+        let task_type = task
+            .r#type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(TASK_TYPE_ISSUE);
         self.conn.execute(
             "INSERT INTO tasks (
                 id, agent_id, team_run_id, parent_task_id, depth, label,
                 trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
                 next_fire_at, timeout_at, action_type, action_config,
                 input_context, created_by_session, created_trace_id,
-                reference_url, source, metadata
+                reference_url, source, metadata, type
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18,
-                ?19, ?20, ?21
+                ?19, ?20, ?21, ?22
              )",
             params![
                 id,
@@ -2745,6 +2799,7 @@ impl Database {
                 task.reference_url,
                 task.source,
                 task.metadata,
+                task_type,
             ],
         )?;
         Ok(id)
@@ -2754,14 +2809,20 @@ impl Database {
     /// trigger_type='recurring' exists. Returns the task ID if created, None if already existed.
     pub fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
         let id = uuid::Uuid::new_v4().to_string();
+        let task_type = task
+            .r#type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(TASK_TYPE_ISSUE);
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO tasks
              (id, agent_id, team_run_id, parent_task_id, depth, label,
               trigger_type, cron_expr, event_source, event_offset_secs,
               condition_expr, next_fire_at, timeout_at, action_type,
               action_config, status, input_context, created_by_session, created_trace_id,
-              reference_url, source, metadata)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18,?19,?20,?21)",
+              reference_url, source, metadata, type)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'recurring_active',?16,?17,?18,?19,?20,?21,?22)",
             params![
                 id, task.agent_id, task.team_run_id, task.parent_task_id,
                 task.depth, task.label, task.trigger_type, task.cron_expr,
@@ -2769,7 +2830,7 @@ impl Database {
                 task.next_fire_at, task.timeout_at, task.action_type,
                 task.action_config, task.input_context, task.created_by_session,
                 task.created_trace_id, task.reference_url, task.source,
-                task.metadata
+                task.metadata, task_type
             ],
         )?;
         if n > 0 {
@@ -2848,6 +2909,7 @@ impl Database {
             reference_url: r.get(26)?,
             source: r.get(27)?,
             metadata: r.get(28)?,
+            r#type: r.get(29)?,
         })
     }
 
@@ -2856,7 +2918,7 @@ impl Database {
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
          created_trace_id, execution_trace_id, created_at, updated_at, fired_at, completed_at,
-         reference_url, source, metadata";
+         reference_url, source, metadata, type";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
@@ -3055,7 +3117,7 @@ impl Database {
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
-    const TASK_COLUMN_COUNT: usize = 29;
+    const TASK_COLUMN_COUNT: usize = 30;
 
     /// List manual (work item) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
@@ -3125,55 +3187,16 @@ impl Database {
         agent_id: &str,
         reference_url: &str,
     ) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1 AND reference_url = ?2
+               AND trigger_type = 'manual'
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+             LIMIT 1",
+            Self::TASK_COLUMNS
+        );
         self.conn
-            .query_row(
-                "SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
-                        trigger_type, cron_expr, event_source, event_offset_secs,
-                        condition_expr, next_fire_at, timeout_at, action_type,
-                        action_config, status, process_id, input_context, result,
-                        created_by_session, created_trace_id, execution_trace_id,
-                        created_at, updated_at, fired_at, completed_at,
-                        reference_url, source, metadata
-                 FROM tasks
-                 WHERE agent_id = ?1 AND reference_url = ?2
-                   AND trigger_type = 'manual'
-                   AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
-                 LIMIT 1",
-                params![agent_id, reference_url],
-                |r| {
-                    Ok(Task {
-                        id: r.get(0)?,
-                        agent_id: r.get(1)?,
-                        team_run_id: r.get(2)?,
-                        parent_task_id: r.get(3)?,
-                        depth: r.get(4)?,
-                        label: r.get(5)?,
-                        trigger_type: r.get(6)?,
-                        cron_expr: r.get(7)?,
-                        event_source: r.get(8)?,
-                        event_offset_secs: r.get(9)?,
-                        condition_expr: r.get(10)?,
-                        next_fire_at: r.get(11)?,
-                        timeout_at: r.get(12)?,
-                        action_type: r.get(13)?,
-                        action_config: r.get(14)?,
-                        status: r.get(15)?,
-                        process_id: r.get(16)?,
-                        input_context: r.get(17)?,
-                        result: r.get(18)?,
-                        created_by_session: r.get(19)?,
-                        created_trace_id: r.get(20)?,
-                        execution_trace_id: r.get(21)?,
-                        created_at: r.get(22)?,
-                        updated_at: r.get(23)?,
-                        fired_at: r.get(24)?,
-                        completed_at: r.get(25)?,
-                        reference_url: r.get(26)?,
-                        source: r.get(27)?,
-                        metadata: r.get(28)?,
-                    })
-                },
-            )
+            .query_row(&sql, params![agent_id, reference_url], Self::row_to_task)
             .optional()
             .map_err(Into::into)
     }
@@ -3232,55 +3255,16 @@ impl Database {
         agent_id: &str,
         label: &str,
     ) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+               AND trigger_type = 'manual'
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
+             LIMIT 1",
+            Self::TASK_COLUMNS
+        );
         self.conn
-            .query_row(
-                "SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
-                        trigger_type, cron_expr, event_source, event_offset_secs,
-                        condition_expr, next_fire_at, timeout_at, action_type,
-                        action_config, status, process_id, input_context, result,
-                        created_by_session, created_trace_id, execution_trace_id,
-                        created_at, updated_at, fired_at, completed_at,
-                        reference_url, source, metadata
-                 FROM tasks
-                 WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
-                   AND trigger_type = 'manual'
-                   AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')
-                 LIMIT 1",
-                params![agent_id, label],
-                |r| {
-                    Ok(Task {
-                        id: r.get(0)?,
-                        agent_id: r.get(1)?,
-                        team_run_id: r.get(2)?,
-                        parent_task_id: r.get(3)?,
-                        depth: r.get(4)?,
-                        label: r.get(5)?,
-                        trigger_type: r.get(6)?,
-                        cron_expr: r.get(7)?,
-                        event_source: r.get(8)?,
-                        event_offset_secs: r.get(9)?,
-                        condition_expr: r.get(10)?,
-                        next_fire_at: r.get(11)?,
-                        timeout_at: r.get(12)?,
-                        action_type: r.get(13)?,
-                        action_config: r.get(14)?,
-                        status: r.get(15)?,
-                        process_id: r.get(16)?,
-                        input_context: r.get(17)?,
-                        result: r.get(18)?,
-                        created_by_session: r.get(19)?,
-                        created_trace_id: r.get(20)?,
-                        execution_trace_id: r.get(21)?,
-                        created_at: r.get(22)?,
-                        updated_at: r.get(23)?,
-                        fired_at: r.get(24)?,
-                        completed_at: r.get(25)?,
-                        reference_url: r.get(26)?,
-                        source: r.get(27)?,
-                        metadata: r.get(28)?,
-                    })
-                },
-            )
+            .query_row(&sql, params![agent_id, label], Self::row_to_task)
             .optional()
             .map_err(Into::into)
     }
@@ -7709,6 +7693,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -7741,6 +7726,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(&task).unwrap();
         assert!(db.cancel_task(&id, "mika").unwrap());
@@ -7945,6 +7931,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
@@ -7972,6 +7959,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         }
     }
 
@@ -8208,6 +8196,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id1 = db.create_task(&task).unwrap();
         assert!(!id1.is_empty());
@@ -8239,6 +8228,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id2 = db.create_task(&task2).unwrap();
         assert!(!id2.is_empty());
@@ -8272,6 +8262,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         }
     }
 
@@ -8545,6 +8536,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let _id = db.create_task(&reminder).unwrap();
 
@@ -8660,6 +8652,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         db.create_task(&task).unwrap();
 
@@ -8867,6 +8860,91 @@ mod tests {
         assert!(db.column_exists("sessions", "parent_session_id").unwrap());
     }
 
+    // ===== `tasks.type` column tests (issue #595, schema v23) =====
+
+    #[test]
+    fn test_tasks_type_column_exists() {
+        let db = db();
+        assert!(db.column_exists("tasks", "type").unwrap());
+    }
+
+    #[test]
+    fn test_tasks_type_defaults_to_issue() {
+        // Inserting via NewTask with r#type: None should backfill to 'issue'
+        // via the SQL DEFAULT.
+        let db = db();
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "default-type".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+        };
+        let id = db.create_task(&task).unwrap();
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(t.r#type, "issue");
+    }
+
+    #[test]
+    fn test_tasks_type_round_trips_milestone() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "milestone-type".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: Some("milestone".to_string()),
+        };
+        let id = db.create_task(&task).unwrap();
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(t.r#type, "milestone");
+    }
+
+    #[test]
+    fn test_tasks_type_check_constraint_rejects_invalid() {
+        // Direct INSERT bypassing the tool boundary should still be blocked by
+        // the SQLite CHECK constraint.
+        let db = db();
+        let result = db.conn.execute(
+            "INSERT INTO tasks (id, agent_id, label, trigger_type, action_type, type)
+             VALUES ('00000000-0000-0000-0000-000000000099', 'mika', 'bad', 'manual', 'none', 'epic')",
+            [],
+        );
+        assert!(result.is_err(), "CHECK should reject 'epic'");
+    }
+
     #[test]
     fn test_update_task_execution_trace_id() {
         let db = db();
@@ -8891,6 +8969,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -8935,6 +9014,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -9136,6 +9216,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -9582,6 +9663,7 @@ mod tests {
             reference_url: None,
             source: None,
             metadata: None,
+            r#type: None,
         }
     }
 

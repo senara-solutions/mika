@@ -57,6 +57,7 @@ async fn create_work_item(db: &AsyncDatabase, pr_url: &str, branch: &str) -> Str
             reference_url: Some(pr_url.to_string()),
             source: Some("github_issue".to_string()),
             metadata: Some(serde_json::to_string(&metadata).unwrap()),
+            r#type: None,
         })
         .await
         .expect("create work item");
@@ -91,6 +92,7 @@ async fn create_callback_task(db: &AsyncDatabase, parent_id: &str) -> String {
         reference_url: None,
         source: None,
         metadata: None,
+        r#type: None,
     })
     .await
     .expect("create callback task")
@@ -399,6 +401,7 @@ async fn fallback_defers_when_sole_inflight_callback() {
             reference_url: None,
             source: None,
             metadata: Some(serde_json::to_string(&metadata).unwrap()),
+            r#type: None,
         })
         .await
         .expect("create work item");

@@ -222,6 +222,9 @@ impl Tool for CheckWorkItemTool {
         writeln!(output, "Work item: {}", task.id).unwrap();
         writeln!(output, "Label: {}", task.label).unwrap();
         writeln!(output, "Status: {}", task.status).unwrap();
+        // Always emit Type for single-item inspection — disambiguates milestone
+        // and project parents from regular issues at a glance.
+        writeln!(output, "Type: {}", task.r#type).unwrap();
 
         if let Some(ref src) = task.source {
             writeln!(output, "Source: {src}").unwrap();
@@ -347,6 +350,7 @@ mod tests {
                 reference_url: reference_url.map(|s| s.to_string()),
                 source: source.map(|s| s.to_string()),
                 metadata: None,
+                r#type: None,
             })
             .await
             .unwrap()
@@ -493,6 +497,7 @@ mod tests {
                     reference_url: None,
                     source: None,
                     metadata: None,
+                    r#type: None,
                 })
                 .await
                 .unwrap();
@@ -603,5 +608,92 @@ mod tests {
     fn test_parse_http_url_rejected() {
         // Only HTTPS supported
         assert_eq!(parse_github_ref("http://github.com/org/repo/pull/1"), None);
+    }
+
+    // ===== `type` rendering tests (issue #595) =====
+
+    /// Helper: create a manual task with an explicit type override.
+    async fn create_typed_work_item(harness: &TestHarness, label: &str, task_type: &str) -> String {
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: trigger_type::MANUAL.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::NONE.to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("test-session".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("user_request".to_string()),
+                metadata: None,
+                r#type: Some(task_type.to_string()),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_check_shows_default_type() {
+        // Single-item inspection always shows Type, even for the default.
+        let harness = TestHarness::new();
+        let id = create_work_item(&harness, "default issue", None, Some("user_request")).await;
+        let ctx = harness.ctx();
+        let tool = CheckWorkItemTool;
+
+        let result = tool
+            .execute(serde_json::json!({"task_id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("Type: issue"),
+            "should always show Type line: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_shows_milestone_type() {
+        let harness = TestHarness::new();
+        let id = create_typed_work_item(&harness, "milestone parent", "milestone").await;
+        let ctx = harness.ctx();
+        let tool = CheckWorkItemTool;
+
+        let result = tool
+            .execute(serde_json::json!({"task_id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("Type: milestone"),
+            "milestone type should be visible: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_shows_project_type() {
+        let harness = TestHarness::new();
+        let id = create_typed_work_item(&harness, "project parent", "project").await;
+        let ctx = harness.ctx();
+        let tool = CheckWorkItemTool;
+
+        let result = tool
+            .execute(serde_json::json!({"task_id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Type: project"));
     }
 }
