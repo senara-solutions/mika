@@ -51,7 +51,7 @@ When calling any tool, use the **exact field names** from the tool's schema — 
 
 - `update_core_memory` requires `"reasoning"`, **not** `"reason"`
 - `update_work_item_status` requires `"task_id"`, **not** `"id"` or `"work_item_id"` alone
-- `run_claude_pilot` requires BOTH `"task_id"` AND `"work_item_id"` (they may reference the same UUID but both keys must be present)
+- `run_claude_pilot` requires `"task_id"` — the work item UUID. Do NOT also pass `"work_item_id"`; the schema has one UUID slot and the executor reads `task_id` for both validation and callback-tree linkage. Passing two UUIDs invites the LLM to fabricate one of them (mika#595 incident).
 - `run_claude_pilot` in iteration mode requires `"prompt": "<repo>#<number>"` (e.g., `"mika-platform#19"`) AND `"iteration_context": "<findings>"` — **NEVER** use a free-text prompt like `"iterate on ..."`; the handler's free-text path has no worktree setup and the session will crash without building a result
 
 If a tool returns `"Missing required parameter(s)"`, read the error message **verbatim** and check whether your JSON field name matches the spec character-for-character. Do **not** retry with the same wrong field name. Do **not** assume the tool is buggy.
