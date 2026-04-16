@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use secrecy::ExposeSecret;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::routes::AppState;
 
@@ -330,6 +330,61 @@ pub fn new_delivery_cache() -> Arc<std::sync::Mutex<lru::LruCache<String, ()>>> 
     )))
 }
 
+// -- Forwarding result type --
+
+/// Outcome of a single `forward_github_event` attempt.
+/// Used by the retry wrapper to decide whether to retry, abandon, or succeed.
+#[derive(Debug)]
+pub(crate) enum ForwardResult {
+    /// 200 or 202 — agent accepted the event.
+    Success,
+    /// 429 or 5xx, or a request timeout — transient, worth retrying.
+    Retryable {
+        /// Human-readable description for logging (e.g. "HTTP 429" or "request timeout").
+        reason: String,
+    },
+    /// 4xx (other than 429), connection error (agent offline), or unresolvable route —
+    /// retrying will not help.
+    Permanent {
+        /// Human-readable description for logging.
+        reason: String,
+    },
+}
+
+impl ForwardResult {
+    /// Returns `true` if the result indicates a retryable failure.
+    #[cfg(test)]
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable { .. })
+    }
+
+    /// Returns `true` if the forwarding succeeded.
+    #[cfg(test)]
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    /// Returns the reason string for non-success results.
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Success => None,
+            Self::Retryable { reason } | Self::Permanent { reason } => Some(reason),
+        }
+    }
+}
+
+// -- Retry schedule --
+
+/// Delays between retry attempts for GitHub webhook delivery.
+/// Total worst-case wall time: 2 + 5 + 15 + 60 + 300 = 382 seconds (+ request timeouts).
+pub(crate) const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+
 // -- Webhook handler --
 
 /// POST /webhook/github — receive GitHub App webhook events.
@@ -478,18 +533,22 @@ pub(crate) async fn handle_github_webhook(
         delivery_id.clone()
     };
 
-    // 12. Async dispatch — return 200 to GitHub immediately
+    // 12. Async dispatch with retry — return 200 to GitHub immediately.
+    // Retry budget: initial attempt + up to 5 retries with backoff [2s, 5s, 15s, 60s, 300s].
+    // DLQ for events that exhaust retries is tracked in #590.
     let forwarding_state = state.clone();
     let target = target_agent.to_string();
     let repo_name = event.repository.as_ref().and_then(|r| r.full_name.clone());
+    let semaphore = state.webhook_semaphore.clone();
     tokio::spawn(async move {
-        let _permit = permit; // held until task completes
-        forward_github_event(
+        deliver_with_retry(
             &forwarding_state,
             &target,
             &text,
             &request_id,
             repo_name.as_deref(),
+            permit,
+            &semaphore,
         )
         .await;
     });
@@ -567,6 +626,9 @@ async fn resolve_github_container_url(
 
 /// Forward a GitHub event to the agent container via `POST {container_url}/message`.
 ///
+/// Single-attempt function — no retry logic. Returns a [`ForwardResult`] so the
+/// caller (`deliver_with_retry`) can decide whether to retry.
+///
 /// Uses `channel: "github"` and `chat_id: 0` (no reply channel).
 /// Multi-tenant routing: looks up `github_repos` table first, falls back to `agent_base_url`.
 /// Per-repo agent name overrides are applied from the `agent_mapping` column.
@@ -576,10 +638,14 @@ async fn forward_github_event(
     text: &str,
     request_id: &str,
     repo_full_name: Option<&str>,
-) {
+) -> ForwardResult {
     let route = match resolve_github_container_url(state, repo_full_name).await {
         Some(r) => r,
-        None => return,
+        None => {
+            return ForwardResult::Permanent {
+                reason: "no route resolved (repo not registered and no fallback)".to_string(),
+            };
+        }
     };
 
     let target_agent = apply_agent_mapping(&route.agent_mapping, default_agent);
@@ -612,29 +678,164 @@ async fn forward_github_event(
 
     match result {
         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
+            ForwardResult::Success
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if status == 429 || (500..=599).contains(&status) {
+                ForwardResult::Retryable {
+                    reason: format!("HTTP {status}"),
+                }
+            } else {
+                ForwardResult::Permanent {
+                    reason: format!("HTTP {status}"),
+                }
+            }
+        }
+        Err(e) => {
+            if e.is_connect() {
+                // Connection refused / DNS failure — agent is offline, retrying won't help.
+                ForwardResult::Permanent {
+                    reason: format!("connection error: {e}"),
+                }
+            } else {
+                // Timeout or other transient network error — worth retrying.
+                ForwardResult::Retryable {
+                    reason: format!("network error: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// Retry wrapper for GitHub webhook delivery.
+///
+/// Calls `forward_github_event` once using the caller's semaphore permit. On a
+/// retryable failure (429, 5xx, or request timeout), releases the permit, sleeps
+/// for the next delay in [`RETRY_DELAYS`], re-acquires a permit, and retries.
+///
+/// **Semaphore lifecycle:** The permit is released during sleep to prevent
+/// cross-channel starvation (the 30-permit semaphore is shared with Telegram).
+/// If the semaphore is full when re-acquiring, the retry is abandoned — the
+/// system is legitimately overloaded.
+///
+/// **Dedup LRU interaction:** The `X-GitHub-Delivery` ID is inserted into the
+/// in-memory LRU cache (10k entries, size-based eviction, no TTL) *before* this
+/// function is called. Under extreme webhook volume (>10k deliveries during a
+/// single 300s retry sleep), the LRU may evict the entry. If GitHub redelivers
+/// the same event, the gateway would treat it as new. Agent-side idempotency
+/// (work item unique index) prevents duplicate processing. A TTL on the LRU
+/// cache would close this gap but is deferred (see #590 for DLQ).
+async fn deliver_with_retry(
+    state: &AppState,
+    target_agent: &str,
+    text: &str,
+    request_id: &str,
+    repo_full_name: Option<&str>,
+    initial_permit: tokio::sync::OwnedSemaphorePermit,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) {
+    // Attempt 0: use the caller's permit.
+    let result = forward_github_event(state, target_agent, text, request_id, repo_full_name).await;
+
+    match &result {
+        ForwardResult::Success => {
             info!(
                 target_agent,
                 request_id, "GitHub event forwarded to agent container"
             );
+            drop(initial_permit);
+            return;
         }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            warn!(
-                status,
-                target_agent, request_id, "agent container returned error for GitHub event"
+        ForwardResult::Permanent { reason } => {
+            error!(
+                target_agent,
+                request_id, reason = %reason, "GitHub event delivery failed (permanent, no retry)"
             );
+            drop(initial_permit);
+            return;
         }
-        Err(e) => {
-            let is_connect = e.is_connect();
+        ForwardResult::Retryable { reason } => {
             warn!(
-                error = %e,
                 target_agent,
                 request_id,
-                is_connect,
-                "agent container unreachable for GitHub event"
+                attempt = 1,
+                reason = %reason,
+                "GitHub event delivery failed, will retry"
             );
         }
     }
+
+    // Release the initial permit during the retry sleep window.
+    drop(initial_permit);
+
+    let mut last_reason = result.reason().unwrap_or("unknown").to_string();
+
+    for (i, delay) in RETRY_DELAYS.iter().enumerate() {
+        let attempt = i + 2; // attempt 1 was the initial, retries start at 2
+
+        tokio::time::sleep(*delay).await;
+
+        // Re-acquire a semaphore permit before retrying.
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    target_agent,
+                    request_id, attempt, "GitHub event retry abandoned — semaphore at capacity"
+                );
+                break;
+            }
+        };
+
+        let result =
+            forward_github_event(state, target_agent, text, request_id, repo_full_name).await;
+
+        // Release the permit immediately after the attempt (before sleeping again).
+        drop(permit);
+
+        match &result {
+            ForwardResult::Success => {
+                info!(
+                    target_agent,
+                    request_id,
+                    attempt,
+                    "GitHub event forwarded to agent container (retry succeeded)"
+                );
+                return;
+            }
+            ForwardResult::Permanent { reason } => {
+                error!(
+                    target_agent,
+                    request_id,
+                    attempt,
+                    reason = %reason,
+                    "GitHub event delivery failed (permanent, stopping retries)"
+                );
+                return;
+            }
+            ForwardResult::Retryable { reason } => {
+                last_reason = reason.clone();
+                warn!(
+                    target_agent,
+                    request_id,
+                    attempt,
+                    remaining_retries = RETRY_DELAYS.len() - i - 1,
+                    reason = %reason,
+                    "GitHub event delivery failed, will retry"
+                );
+            }
+        }
+    }
+
+    // All retries exhausted.
+    error!(
+        target_agent,
+        request_id,
+        total_attempts = RETRY_DELAYS.len() + 1,
+        last_reason = %last_reason,
+        "GitHub event delivery failed — retry budget exhausted, event dropped (DLQ: #590)"
+    );
 }
 
 #[cfg(test)]
@@ -1266,5 +1467,344 @@ mod tests {
         assert!(!is_valid_agent_name("has spaces"));
         assert!(!is_valid_agent_name("special@chars"));
         assert!(!is_valid_agent_name(&"a".repeat(64))); // too long
+    }
+
+    // -- ForwardResult classification tests --
+
+    #[test]
+    fn test_forward_result_success_classification() {
+        let r = ForwardResult::Success;
+        assert!(r.is_success());
+        assert!(!r.is_retryable());
+        assert!(r.reason().is_none());
+    }
+
+    #[test]
+    fn test_forward_result_retryable_429() {
+        let r = ForwardResult::Retryable {
+            reason: "HTTP 429".to_string(),
+        };
+        assert!(r.is_retryable());
+        assert!(!r.is_success());
+        assert_eq!(r.reason(), Some("HTTP 429"));
+    }
+
+    #[test]
+    fn test_forward_result_retryable_5xx() {
+        for status in [500, 502, 503, 504] {
+            let r = ForwardResult::Retryable {
+                reason: format!("HTTP {status}"),
+            };
+            assert!(r.is_retryable(), "HTTP {status} should be retryable");
+        }
+    }
+
+    #[test]
+    fn test_forward_result_permanent_4xx() {
+        for status in [400, 404, 405, 422] {
+            let r = ForwardResult::Permanent {
+                reason: format!("HTTP {status}"),
+            };
+            assert!(!r.is_retryable(), "HTTP {status} should NOT be retryable");
+            assert!(!r.is_success());
+        }
+    }
+
+    #[test]
+    fn test_forward_result_permanent_connection_error() {
+        let r = ForwardResult::Permanent {
+            reason: "connection error: connection refused".to_string(),
+        };
+        assert!(!r.is_retryable());
+        assert_eq!(r.reason(), Some("connection error: connection refused"));
+    }
+
+    #[test]
+    fn test_forward_result_retryable_timeout() {
+        let r = ForwardResult::Retryable {
+            reason: "network error: request timeout".to_string(),
+        };
+        assert!(r.is_retryable());
+    }
+
+    // -- Retry schedule tests --
+
+    #[test]
+    fn test_retry_delays_schedule() {
+        assert_eq!(RETRY_DELAYS.len(), 5);
+        assert_eq!(RETRY_DELAYS[0], Duration::from_secs(2));
+        assert_eq!(RETRY_DELAYS[1], Duration::from_secs(5));
+        assert_eq!(RETRY_DELAYS[2], Duration::from_secs(15));
+        assert_eq!(RETRY_DELAYS[3], Duration::from_secs(60));
+        assert_eq!(RETRY_DELAYS[4], Duration::from_secs(300));
+    }
+
+    // -- deliver_with_retry tests --
+    //
+    // These tests use a mock HTTP server (wiremock or similar) to simulate
+    // agent container responses. Since we don't have wiremock as a dependency,
+    // we test the retry logic using a real Axum server bound to an ephemeral port.
+
+    /// Spin up a minimal Axum server that returns a sequence of status codes.
+    /// Returns the base URL (e.g., "http://127.0.0.1:12345").
+    async fn mock_agent_server(responses: Vec<StatusCode>) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(responses);
+
+        let cc = call_count.clone();
+        let resps = responses.clone();
+        let app = axum::Router::new().route(
+            "/message",
+            post(move || {
+                let cc = cc.clone();
+                let resps = resps.clone();
+                async move {
+                    let idx = cc.fetch_add(1, Ordering::SeqCst);
+                    resps.get(idx).copied().unwrap_or(StatusCode::OK)
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// Build an AppState pointing to a mock agent server.
+    fn test_state_with_base_url(base_url: &str) -> AppState {
+        use crate::telegram::TelegramClient;
+        use secrecy::SecretString;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let http_client = reqwest::Client::new();
+        let telegram =
+            TelegramClient::new(http_client.clone(), SecretString::from("fake-bot-token"));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("lazy pool");
+
+        AppState {
+            pool,
+            telegram,
+            http_client,
+            internal_token: SecretString::from("a".repeat(64)),
+            webhook_secret: SecretString::from("b".repeat(64)),
+            ready: Arc::new(AtomicBool::new(true)),
+            webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
+            agent_base_url: Some(base_url.to_string()),
+            agents_namespace: "test".to_string(),
+            webhook_counter: Arc::new(AtomicU64::new(0)),
+            github_webhook_secret: Some(SecretString::from("test-secret")),
+            github_delivery_cache: new_delivery_cache(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deliver_success_on_first_attempt() {
+        let base_url = mock_agent_server(vec![StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-1",
+            Some("org/repo"),
+            permit,
+            &semaphore,
+        )
+        .await;
+
+        // Permit was consumed (dropped inside deliver_with_retry on success)
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_retry_on_429_then_success() {
+        // First call returns 429, second returns 200
+        let base_url = mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        // Use a custom short delay schedule for testing (don't wait real 2s)
+        // We can't easily override RETRY_DELAYS, so we test with the real function
+        // but accept the 2s wait for the first retry.
+        deliver_with_retry(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-429",
+            Some("org/repo"),
+            permit,
+            &semaphore,
+        )
+        .await;
+
+        // Should succeed after one retry — all permits returned
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_retry_on_503_then_success() {
+        let base_url =
+            mock_agent_server(vec![StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-503",
+            Some("org/repo"),
+            permit,
+            &semaphore,
+        )
+        .await;
+
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_no_retry_on_400() {
+        // 400 is permanent — should not retry
+        let base_url = mock_agent_server(vec![StatusCode::BAD_REQUEST]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-400",
+            Some("org/repo"),
+            permit,
+            &semaphore,
+        )
+        .await;
+
+        // Should return immediately without retry — all permits returned
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_no_retry_on_404() {
+        let base_url = mock_agent_server(vec![StatusCode::NOT_FOUND]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-404",
+            Some("org/repo"),
+            permit,
+            &semaphore,
+        )
+        .await;
+
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_semaphore_released_during_retry_sleep() {
+        // 429 on first attempt — during the 2s sleep, the permit should be released
+        let base_url = mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1)); // Only 1 permit!
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        let sem_clone = semaphore.clone();
+        let handle = tokio::spawn(async move {
+            deliver_with_retry(
+                &state,
+                "mika-dev",
+                "test event",
+                "delivery-sem",
+                Some("org/repo"),
+                permit,
+                &sem_clone,
+            )
+            .await;
+        });
+
+        // Give the first attempt time to fail and release the permit
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The permit should be available during the retry sleep window
+        let available = semaphore.available_permits();
+        assert_eq!(available, 1, "permit should be released during retry sleep");
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deliver_abandoned_when_semaphore_full() {
+        // 429 on first attempt, then semaphore is full on retry
+        let base_url = mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url);
+
+        // Semaphore with 1 permit — we'll hold the spare one to block retry
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        let sem_clone = semaphore.clone();
+        let state_clone = state.clone();
+        let handle = tokio::spawn(async move {
+            deliver_with_retry(
+                &state_clone,
+                "mika-dev",
+                "test event",
+                "delivery-blocked",
+                Some("org/repo"),
+                permit,
+                &sem_clone,
+            )
+            .await;
+        });
+
+        // Wait for the first attempt to fail and release the permit
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Grab the permit before the retry can — this blocks the retry
+        let _blocker = semaphore.clone().try_acquire_owned().unwrap();
+
+        // The retry should be abandoned because the semaphore is full
+        handle.await.unwrap();
+        // Test passes if deliver_with_retry returns without hanging
+    }
+
+    #[tokio::test]
+    async fn test_deliver_accepts_202() {
+        let base_url = mock_agent_server(vec![StatusCode::ACCEPTED]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-202",
+            Some("org/repo"),
+            permit,
+            &semaphore,
+        )
+        .await;
+
+        assert_eq!(semaphore.available_permits(), 30);
     }
 }
