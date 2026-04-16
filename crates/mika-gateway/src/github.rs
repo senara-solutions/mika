@@ -752,6 +752,33 @@ async fn deliver_with_retry(
     initial_permit: tokio::sync::OwnedSemaphorePermit,
     semaphore: &Arc<tokio::sync::Semaphore>,
 ) {
+    deliver_with_retry_inner(
+        state,
+        target_agent,
+        text,
+        request_id,
+        repo_full_name,
+        initial_permit,
+        semaphore,
+        &RETRY_DELAYS,
+    )
+    .await
+}
+
+/// Inner retry loop with the delay schedule injected. Production callers go
+/// through [`deliver_with_retry`] which uses [`RETRY_DELAYS`]. Tests pass a
+/// custom schedule so timing assertions don't race the production 2s sleep.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_with_retry_inner(
+    state: &AppState,
+    target_agent: &str,
+    text: &str,
+    request_id: &str,
+    repo_full_name: Option<&str>,
+    initial_permit: tokio::sync::OwnedSemaphorePermit,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    retry_delays: &[Duration],
+) {
     // Resolve the route once. Cached across all retry attempts.
     let route = match resolve_github_container_url(state, repo_full_name).await {
         Some(r) => r,
@@ -774,7 +801,7 @@ async fn deliver_with_retry(
     let mut current_permit = Some(initial_permit);
 
     for (retry_idx, delay) in std::iter::once(None)
-        .chain(RETRY_DELAYS.iter().map(Some))
+        .chain(retry_delays.iter().map(Some))
         .enumerate()
     {
         // The first iteration (retry_idx=0) has `delay = None` and uses the caller's permit.
@@ -842,7 +869,7 @@ async fn deliver_with_retry(
                 return;
             }
             ForwardResult::Retryable { reason } => {
-                let remaining = RETRY_DELAYS.len().saturating_sub(retry_idx);
+                let remaining = retry_delays.len().saturating_sub(retry_idx);
                 warn!(
                     target_agent,
                     request_id,
@@ -1832,9 +1859,10 @@ mod tests {
     }
 
     /// Polls `semaphore.available_permits()` until it reaches `target`, up to `budget`.
-    /// Returns the elapsed wait. Used to replace fixed `sleep(N)` timing assumptions
-    /// that flake on slow CI runners — the production retry sleep is ≥1.5s, so a
-    /// 1s+ poll budget catches the released-permit window with margin.
+    /// Returns the elapsed wait. Used in conjunction with the test-only long
+    /// retry-delay schedule below — once the first HTTP attempt completes
+    /// (whenever that is on slow CI), the retry sleep is long enough that the
+    /// poll has a wide window to observe the released permit.
     async fn wait_for_permits(
         semaphore: &Arc<tokio::sync::Semaphore>,
         target: usize,
@@ -1852,9 +1880,27 @@ mod tests {
         }
     }
 
+    /// Test-only retry-delay schedules. Production uses 2s for the first delay;
+    /// these tests need the released-permit window to be wide enough for the
+    /// polling assertion to land regardless of how slow the CI runner's HTTP
+    /// roundtrip is. Two schedules:
+    ///
+    /// - `OBSERVE_ONLY`: very long first delay (60s). The test observes the
+    ///   released permit, then aborts the spawned task. Used by the
+    ///   "permit released during retry sleep" test where we don't need the
+    ///   retry to fire — only to observe the released state.
+    /// - `OBSERVE_AND_ABANDON`: 5s first delay. The test observes release,
+    ///   steals the permit, then waits for the retry to attempt re-acquire
+    ///   and abandon. 5s leaves 4s polling headroom on slow CI plus enough
+    ///   time for the abandon path to fire within the test timeout.
+    const TEST_DELAYS_OBSERVE_ONLY: [Duration; 1] = [Duration::from_secs(60)];
+    const TEST_DELAYS_OBSERVE_AND_ABANDON: [Duration; 1] = [Duration::from_secs(5)];
+
     #[tokio::test]
     async fn test_deliver_semaphore_released_during_retry_sleep() {
-        // 429 on first attempt — during the 2s retry sleep, the permit should be released.
+        // 429 on first attempt — during the retry sleep, the permit must be released.
+        // Uses a 60s test-only retry delay (vs production's 2s) so the polling
+        // assertion isn't racing the retry sleep window.
         let (base_url, _call_count) =
             mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
         let state = test_state_with_base_url(&base_url);
@@ -1863,7 +1909,7 @@ mod tests {
 
         let sem_clone = semaphore.clone();
         let handle = tokio::spawn(async move {
-            deliver_with_retry(
+            deliver_with_retry_inner(
                 &state,
                 "mika-dev",
                 "test event",
@@ -1871,29 +1917,30 @@ mod tests {
                 Some("org/repo"),
                 permit,
                 &sem_clone,
+                &TEST_DELAYS_OBSERVE_ONLY,
             )
             .await;
         });
 
-        // Poll for permit release rather than sleeping a fixed window.
-        // Budget is 1.4s — the production retry sleep is ≥1.5s with jitter,
-        // so this stays well inside the released-permit window even on slow CI.
-        let waited = wait_for_permits(&semaphore, 1, Duration::from_millis(1400)).await;
+        // Poll for permit release with a 10s budget — generous on any CI runner.
+        // The retry sleep is 60s so we have 60s once first attempt completes.
+        let waited = wait_for_permits(&semaphore, 1, Duration::from_secs(10)).await;
         assert_eq!(
             semaphore.available_permits(),
             1,
             "permit should be released during retry sleep (waited {waited:?})"
         );
 
-        handle.await.unwrap();
+        // Don't wait for the spawned task to finish (it's now in a 60s sleep).
+        // Aborting is safe: deliver_with_retry has no shared state to clean up.
+        handle.abort();
     }
 
     #[tokio::test]
     async fn test_deliver_abandoned_when_semaphore_full() {
-        // 429 on first attempt, then semaphore is full on retry.
-        // Queue an OK as fallback to prove the retry path was NOT taken —
-        // the mock server would return OK if the retry fired, but the test
-        // asserts call_count == 1 to prove only the initial attempt ran.
+        // 429 on first attempt, then semaphore is full on retry → abandon path.
+        // Uses 60s test-only retry delay so the test has plenty of time to
+        // steal the permit between first-attempt-end and retry-reacquire.
         let (base_url, call_count) =
             mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
         let state = test_state_with_base_url(&base_url);
@@ -1905,7 +1952,7 @@ mod tests {
         let sem_clone = semaphore.clone();
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
-            deliver_with_retry(
+            deliver_with_retry_inner(
                 &state_clone,
                 "mika-dev",
                 "test event",
@@ -1913,14 +1960,16 @@ mod tests {
                 Some("org/repo"),
                 permit,
                 &sem_clone,
+                &TEST_DELAYS_OBSERVE_AND_ABANDON,
             )
             .await;
         });
 
-        // Poll for the first attempt to release the permit (rather than
-        // sleeping a fixed window that flakes when the localhost HTTP roundtrip
-        // takes longer than expected on a loaded CI runner).
-        wait_for_permits(&semaphore, 1, Duration::from_millis(1400)).await;
+        // Wait for the first attempt to release the permit. Budget 4s — the
+        // 5s retry delay leaves us 1s margin to steal the permit before the
+        // retry tries to re-acquire it. Generous compared to the prior 1.4s
+        // budget that flaked in CI, but bounded by the retry delay.
+        wait_for_permits(&semaphore, 1, Duration::from_secs(4)).await;
         assert_eq!(
             semaphore.available_permits(),
             1,
@@ -1928,6 +1977,7 @@ mod tests {
         );
 
         // Grab the permit before the retry can — this blocks the retry.
+        // Retry sleep is 60s, so we have a huge window to do this.
         let _blocker = semaphore
             .clone()
             .try_acquire_owned()
