@@ -11,14 +11,127 @@ pub mod review_filter;
 
 use std::path::Path;
 
-use self::index::{SkillEntry, SkillValidationWarning, SkippedSkill};
-use crate::db::SkillOverride;
+use self::index::{DisabledSkill, SkillEntry, SkillValidationWarning, SkippedSkill};
+use crate::async_db::AsyncDatabase;
+use crate::db::{Database, SkillOverride};
+
+/// Migrate `.disabled` marker files to DB `skill_overrides` rows.
+///
+/// Scans all skill directories under `skills_dir`. For each skill that has a
+/// `.disabled` marker file, writes `enabled = false` to the DB and attempts to
+/// remove the marker. If marker removal fails (e.g., read-only filesystem),
+/// logs a warning and continues (fail-open).
+///
+/// Idempotent: after the first pass, no markers remain (or they're on a
+/// read-only FS and the DB already has the override).
+pub fn migrate_disabled_markers(
+    skills_dir: &Path,
+    db: &Database,
+    agent_id: &str,
+) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let marker = path.join(".disabled");
+        if !marker.exists() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Write DB override.
+        if let Err(e) = db.set_skill_enabled(agent_id, &name, false) {
+            tracing::warn!(
+                skill = %name,
+                error = %e,
+                "failed to migrate .disabled marker to DB"
+            );
+            continue;
+        }
+
+        // Remove the marker file (fail-open).
+        if let Err(e) = std::fs::remove_file(&marker) {
+            tracing::warn!(
+                skill = %name,
+                error = %e,
+                "migrated .disabled to DB but failed to remove marker file"
+            );
+        } else {
+            tracing::info!(skill = %name, "migrated .disabled marker to DB");
+        }
+    }
+    Ok(())
+}
+
+/// Async wrapper for `migrate_disabled_markers`. Collects skill names with
+/// `.disabled` markers from the filesystem, writes DB overrides, and removes
+/// markers. Uses `AsyncDatabase::with_db` for thread-safe DB access.
+pub async fn migrate_disabled_markers_async(
+    skills_dir: &Path,
+    db: &AsyncDatabase,
+    agent_id: &str,
+) -> anyhow::Result<()> {
+    // Phase 1: Collect marker file paths (filesystem work, no DB).
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut to_migrate: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let marker = path.join(".disabled");
+        if !marker.exists() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            to_migrate.push((name.to_string(), marker));
+        }
+    }
+
+    // Phase 2: Write DB overrides and remove markers.
+    for (name, marker) in to_migrate {
+        let n = name.clone();
+        let a = agent_id.to_owned();
+        if let Err(e) = db.set_skill_enabled(&a, &n, false).await {
+            tracing::warn!(skill = %name, error = %e, "failed to migrate .disabled marker to DB");
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&marker) {
+            tracing::warn!(
+                skill = %name,
+                error = %e,
+                "migrated .disabled to DB but failed to remove marker file"
+            );
+        } else {
+            tracing::info!(skill = %name, "migrated .disabled marker to DB");
+        }
+    }
+    Ok(())
+}
 
 /// Registry of discovered skills, built once at startup.
 #[derive(Debug)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
     skipped: Vec<SkippedSkill>,
+    /// Skills evicted by DB `enabled = false` override.
+    disabled: Vec<DisabledSkill>,
     /// Warnings from post-load semantic validation (`validate_loaded()`).
     /// These skills are still loaded and functional but have non-fatal issues.
     validated_warnings: Vec<SkillValidationWarning>,
@@ -49,6 +162,7 @@ impl SkillRegistry {
         Self {
             skills: result.entries,
             skipped: result.skipped,
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
         }
     }
@@ -58,6 +172,7 @@ impl SkillRegistry {
         Self {
             skills: Vec::new(),
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
         }
     }
@@ -67,6 +182,7 @@ impl SkillRegistry {
         Self {
             skills: Vec::new(),
             skipped,
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
         }
     }
@@ -79,6 +195,16 @@ impl SkillRegistry {
     /// Details of skills that were skipped during scan (name + reason).
     pub fn skipped(&self) -> &[SkippedSkill] {
         &self.skipped
+    }
+
+    /// Skills evicted from the registry by DB `enabled = false` override.
+    pub fn disabled(&self) -> &[DisabledSkill] {
+        &self.disabled
+    }
+
+    /// Number of skills disabled via DB override.
+    pub fn disabled_count(&self) -> usize {
+        self.disabled.len()
     }
 
     /// Validation warnings from `validate_loaded()` — skills that loaded
@@ -213,6 +339,36 @@ impl SkillRegistry {
     /// doesn't match an installed skill name. Does not fail — only emits
     /// `tracing::warn` for each unresolvable dependency.
     pub fn apply_overrides(&mut self, overrides: &[SkillOverride]) {
+        // Phase 0: Evict disabled skills.
+        // Collect disabled skill names first, then evict using retain() + staging vec.
+        // Can't borrow `self.disabled` while `self.skills` is mutably borrowed by retain().
+        let disabled_names: Vec<String> = overrides
+            .iter()
+            .filter(|ov| ov.enabled == Some(false))
+            .map(|ov| ov.skill_name.clone())
+            .collect();
+
+        if !disabled_names.is_empty() {
+            let mut evicted = Vec::new();
+            self.skills.retain(|entry| {
+                let is_disabled = disabled_names
+                    .iter()
+                    .any(|n| entry.manifest.skill.name.eq_ignore_ascii_case(n));
+                if is_disabled {
+                    tracing::info!(
+                        skill = %entry.manifest.skill.name,
+                        "skill disabled via DB override — evicted from registry"
+                    );
+                    evicted.push(DisabledSkill {
+                        name: entry.manifest.skill.name.clone(),
+                    });
+                }
+                !is_disabled
+            });
+            self.disabled.extend(evicted);
+        }
+
+        // Phase 1: Apply remaining overrides (always_on, LLM).
         for ov in overrides {
             let Some(entry) = self
                 .skills
@@ -494,6 +650,7 @@ mod tests {
     fn test_always_on_skills() {
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
@@ -511,6 +668,7 @@ mod tests {
     fn test_always_on_skills_filters_disabled() {
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("memory", true, true),
@@ -578,6 +736,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
         };
@@ -648,6 +807,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![safe_entry, exec_entry, http_entry, prompt_only],
         };
@@ -705,6 +865,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![included, disabled, not_always_on],
         };
@@ -751,6 +912,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![self_dev, claude_pilot],
         };
@@ -774,6 +936,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![a, b, c],
         };
@@ -799,6 +962,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![a, b, c],
         };
@@ -816,6 +980,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![a, b],
         };
@@ -832,6 +997,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![a, b],
         };
@@ -847,6 +1013,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![a],
         };
@@ -885,6 +1052,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![self_dev, claude_pilot],
         };
@@ -935,6 +1103,7 @@ mod tests {
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![safe_with_dep, exec_dep],
         };
@@ -952,6 +1121,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
@@ -964,6 +1134,7 @@ mod tests {
             always_on: Some(true),
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         assert!(registry.skills[0].manifest.skill.always_on);
@@ -978,6 +1149,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![make_entry("Web-Search", false, true)],
         };
@@ -987,6 +1159,7 @@ mod tests {
             always_on: Some(true),
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         assert!(registry.skills[0].manifest.skill.always_on);
@@ -999,6 +1172,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
@@ -1008,6 +1182,7 @@ mod tests {
             always_on: None,
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         assert!(!registry.skills[0].manifest.skill.always_on);
@@ -1020,6 +1195,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![make_entry("web-search", false, true)],
         };
@@ -1029,6 +1205,7 @@ mod tests {
             always_on: Some(true),
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         // No crash, web-search unchanged
@@ -1041,6 +1218,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("web-search", false, true),
@@ -1055,6 +1233,7 @@ mod tests {
             always_on: Some(true),
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         assert_eq!(registry.always_on_skills().len(), 2);
@@ -1064,6 +1243,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_silent_on_valid() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["tmux"]),
@@ -1078,6 +1258,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_warns_on_missing() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![make_entry_with_deps(
                 "self-dev",
@@ -1094,6 +1275,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_case_insensitive() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry_with_deps("self-dev", true, true, &["TMUX"]),
@@ -1108,6 +1290,7 @@ mod tests {
     fn test_apply_overrides_validates_dependencies_no_deps_no_warn() {
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![
                 make_entry("web-search", true, true),
@@ -1138,6 +1321,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![entry],
         };
@@ -1148,6 +1332,7 @@ mod tests {
             always_on: Some(true),
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         // Skill should be removed: always_on + override + empty prompt + oversized file
@@ -1161,6 +1346,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![make_entry("qa-review", false, true)],
         };
@@ -1172,6 +1358,7 @@ mod tests {
             always_on: None,
             llm_provider: Some("anthropic".to_string()),
             llm_model: Some("claude-sonnet-4-6".to_string()),
+            enabled: None,
         }]);
 
         assert!(registry.skills[0].has_override);
@@ -1198,6 +1385,7 @@ mod tests {
         };
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![entry],
         };
@@ -1208,6 +1396,7 @@ mod tests {
             always_on: None,
             llm_provider: None,
             llm_model: Some("deepseek-reasoner".to_string()),
+            enabled: None,
         }]);
 
         assert!(registry.skills[0].has_override);
@@ -1234,6 +1423,7 @@ mod tests {
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
+            disabled: Vec::new(),
             validated_warnings: Vec::new(),
             skills: vec![entry],
         };
@@ -1243,11 +1433,257 @@ mod tests {
             always_on: Some(true),
             llm_provider: None,
             llm_model: None,
+            enabled: None,
         }]);
 
         // Should still be present — no prompt file means tool-only, not broken
         assert_eq!(registry.skills.len(), 1);
         assert!(registry.skills[0].manifest.skill.always_on);
+    }
+
+    // -- Eviction tests (#629) --
+
+    #[test]
+    fn test_apply_overrides_evicts_disabled_skill() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("web-search", false, true),
+                make_entry("memory", false, true),
+            ],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: None,
+            enabled: Some(false),
+        }]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "memory");
+        assert_eq!(registry.disabled.len(), 1);
+        assert_eq!(registry.disabled[0].name, "web-search");
+    }
+
+    #[test]
+    fn test_apply_overrides_enabled_none_keeps_skill() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: None,
+            enabled: None,
+        }]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert!(registry.disabled.is_empty());
+    }
+
+    #[test]
+    fn test_apply_overrides_enabled_true_keeps_skill() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: None,
+            enabled: Some(true),
+        }]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert!(registry.disabled.is_empty());
+    }
+
+    #[test]
+    fn test_apply_overrides_disabled_wins_over_always_on() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", true, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "web-search".to_string(),
+            always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
+            enabled: Some(false),
+        }]);
+
+        assert!(registry.skills.is_empty());
+        assert_eq!(registry.disabled.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_overrides_disabled_nonexistent_skill_ignored() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "nonexistent".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: None,
+            enabled: Some(false),
+        }]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert!(registry.disabled.is_empty());
+    }
+
+    #[test]
+    fn test_apply_overrides_disabled_not_passed_to_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        create_valid_skill(skills_dir, "alpha");
+        create_valid_skill(skills_dir, "beta");
+
+        let mut registry = registry_from_temp(skills_dir);
+        assert_eq!(registry.skills().len(), 2);
+
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "alpha".to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: None,
+            enabled: Some(false),
+        }]);
+        registry.validate_loaded();
+
+        // alpha evicted before validate_loaded, not in validated_warnings either
+        assert_eq!(registry.skills().len(), 1);
+        assert_eq!(registry.disabled().len(), 1);
+    }
+
+    // -- migrate_disabled_markers tests (#629) --
+
+    #[test]
+    fn test_migrate_disabled_markers_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let skill_dir = skills_dir.join("foo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join(".disabled"), "").unwrap();
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].skill_name, "foo");
+        assert_eq!(overrides[0].enabled, Some(false));
+        // Marker file should be removed
+        assert!(!skill_dir.join(".disabled").exists());
+    }
+
+    #[test]
+    fn test_migrate_disabled_markers_no_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let skill_dir = skills_dir.join("foo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // No .disabled marker
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+
+        assert!(db.get_skill_overrides("mika").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_migrate_disabled_markers_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let skill_dir = skills_dir.join("foo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join(".disabled"), "").unwrap();
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        // First run: writes override, removes marker
+        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+        // Second run: no markers, no-op
+        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_disabled_markers_multiple_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        // Two skills with markers, one without
+        let foo = skills_dir.join("foo");
+        let bar = skills_dir.join("bar");
+        let baz = skills_dir.join("baz");
+        std::fs::create_dir_all(&foo).unwrap();
+        std::fs::create_dir_all(&bar).unwrap();
+        std::fs::create_dir_all(&baz).unwrap();
+        std::fs::write(foo.join(".disabled"), "").unwrap();
+        std::fs::write(bar.join(".disabled"), "").unwrap();
+        // baz has no marker
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides.iter().all(|o| o.enabled == Some(false)));
+        assert!(!foo.join(".disabled").exists());
+        assert!(!bar.join(".disabled").exists());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_disabled_markers_async_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let skill_dir = skills_dir.join("foo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join(".disabled"), "").unwrap();
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        migrate_disabled_markers_async(skills_dir, &async_db, "mika")
+            .await
+            .unwrap();
+
+        let overrides = async_db.get_skill_overrides("mika").await.unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].skill_name, "foo");
+        assert_eq!(overrides[0].enabled, Some(false));
+        assert!(!skill_dir.join(".disabled").exists());
+    }
+
+    #[test]
+    fn test_migrate_disabled_markers_nonexistent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("nonexistent");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        // Should not error on missing directory
+        migrate_disabled_markers(&skills_dir, &db, "mika").unwrap();
     }
 
     // -- validate_markdown_content tests (#511) --

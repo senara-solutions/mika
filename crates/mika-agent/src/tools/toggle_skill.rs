@@ -61,8 +61,14 @@ impl Tool for ToggleSkillTool {
             return Ok(ToolOutput::error(e));
         }
 
-        let disabled_marker = skill_dir.join(".disabled");
-        let currently_enabled = !disabled_marker.exists();
+        // Check current enabled state from DB overrides.
+        let agent_id = ctx.db.agent_id();
+        let overrides = ctx.db.get_skill_overrides(agent_id).await?;
+        let current_override = overrides
+            .iter()
+            .find(|o| o.skill_name.eq_ignore_ascii_case(name));
+        // Default is enabled (None or Some(true)).
+        let currently_enabled = current_override.and_then(|o| o.enabled).unwrap_or(true);
 
         if enabled == currently_enabled {
             let state = if enabled { "enabled" } else { "disabled" };
@@ -71,29 +77,19 @@ impl Tool for ToggleSkillTool {
             )));
         }
 
-        if enabled {
-            // Remove .disabled marker
-            if let Err(e) = std::fs::remove_file(&disabled_marker) {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to enable skill '{name}': {e}"
-                )));
-            }
-            ctx.skills_dirty.store(true, Ordering::Release);
-            Ok(ToolOutput::success(format!(
-                "Skill '{name}' enabled. Changes take effect immediately on the next turn."
-            )))
-        } else {
-            // Create .disabled marker
-            if let Err(e) = std::fs::write(&disabled_marker, "") {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to disable skill '{name}': {e}"
-                )));
-            }
-            ctx.skills_dirty.store(true, Ordering::Release);
-            Ok(ToolOutput::success(format!(
-                "Skill '{name}' disabled. Changes take effect immediately on the next turn."
-            )))
+        // Write enabled state to DB.
+        if let Err(e) = ctx.db.set_skill_enabled(agent_id, name, enabled).await {
+            return Ok(ToolOutput::error(format!(
+                "Failed to {} skill '{name}': {e}",
+                if enabled { "enable" } else { "disable" }
+            )));
         }
+
+        ctx.skills_dirty.store(true, Ordering::Release);
+        let state = if enabled { "enabled" } else { "disabled" };
+        Ok(ToolOutput::success(format!(
+            "Skill '{name}' {state}. Changes take effect immediately on the next turn."
+        )))
     }
 }
 
@@ -139,17 +135,25 @@ mod tests {
             .unwrap();
         assert!(!result.is_error, "Got: {}", result.content);
         assert!(result.content.contains("disabled"));
-        assert!(tmp.path().join("skills/my-skill/.disabled").exists());
+        // Verify DB state: override should exist with enabled = false.
+        let overrides = ctx.db.get_skill_overrides(ctx.db.agent_id()).await.unwrap();
+        let ov = overrides
+            .iter()
+            .find(|o| o.skill_name == "my-skill")
+            .unwrap();
+        assert_eq!(ov.enabled, Some(false));
     }
 
     #[tokio::test]
     async fn test_enable_disabled_skill() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        // Pre-disable the skill
-        std::fs::write(tmp.path().join("skills/my-skill/.disabled"), "").unwrap();
-
         let ctx = harness.ctx_with_home(tmp.path());
         let tool = ToggleSkillTool;
+        // Pre-disable via DB
+        ctx.db
+            .set_skill_enabled(ctx.db.agent_id(), "my-skill", false)
+            .await
+            .unwrap();
 
         let result = tool
             .execute(
@@ -160,7 +164,9 @@ mod tests {
             .unwrap();
         assert!(!result.is_error, "Got: {}", result.content);
         assert!(result.content.contains("enabled"));
-        assert!(!tmp.path().join("skills/my-skill/.disabled").exists());
+        // Verify DB state: override row should be deleted (default-equals-delete).
+        let overrides = ctx.db.get_skill_overrides(ctx.db.agent_id()).await.unwrap();
+        assert!(overrides.iter().all(|o| o.skill_name != "my-skill"));
     }
 
     #[tokio::test]
@@ -209,5 +215,79 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("path separators"));
+    }
+
+    #[tokio::test]
+    async fn test_disable_with_existing_always_on_preserves_it() {
+        let (tmp, harness) = setup_with_skill("my-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let agent_id = ctx.db.agent_id();
+        // Set always_on override first
+        ctx.db
+            .set_skill_override(agent_id, "my-skill", true)
+            .await
+            .unwrap();
+
+        let tool = ToggleSkillTool;
+        let result = tool
+            .execute(
+                serde_json::json!({"name": "my-skill", "enabled": false}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "Got: {}", result.content);
+        // Both overrides should coexist
+        let overrides = ctx.db.get_skill_overrides(agent_id).await.unwrap();
+        let ov = overrides
+            .iter()
+            .find(|o| o.skill_name == "my-skill")
+            .unwrap();
+        assert_eq!(ov.enabled, Some(false));
+        assert_eq!(ov.always_on, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_already_disabled() {
+        let (tmp, harness) = setup_with_skill("my-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        // Pre-disable via DB
+        ctx.db
+            .set_skill_enabled(ctx.db.agent_id(), "my-skill", false)
+            .await
+            .unwrap();
+
+        // Reset shared static before asserting (skills_dirty is a process-wide static)
+        ctx.skills_dirty.store(false, Ordering::Release);
+
+        let tool = ToggleSkillTool;
+        let result = tool
+            .execute(
+                serde_json::json!({"name": "my-skill", "enabled": false}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("already disabled"));
+        // skills_dirty should NOT be set for a no-op
+        assert!(!ctx.skills_dirty.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_disable_sets_skills_dirty() {
+        let (tmp, harness) = setup_with_skill("my-skill");
+        let ctx = harness.ctx_with_home(tmp.path());
+        let tool = ToggleSkillTool;
+
+        // Reset shared static before asserting
+        ctx.skills_dirty.store(false, Ordering::Release);
+        tool.execute(
+            serde_json::json!({"name": "my-skill", "enabled": false}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(ctx.skills_dirty.load(Ordering::Acquire));
     }
 }

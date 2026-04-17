@@ -222,7 +222,18 @@ pub async fn run(
         tool_registry.register(tool);
     }
     let tool_registry = Arc::new(tool_registry);
-    let mut skill_registry = SkillRegistry::from_dir(&ctx.home_dir.join("skills"));
+    let skills_dir = ctx.home_dir.join("skills");
+    // Migrate legacy .disabled marker files to DB (one-shot, idempotent).
+    if let Err(e) = mika_agent::skills::migrate_disabled_markers_async(
+        &skills_dir,
+        &ctx.async_db,
+        &ctx.async_db.agent_id,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to migrate .disabled markers");
+    }
+    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
     if let Ok(overrides) = ctx
         .async_db
         .get_skill_overrides(&ctx.async_db.agent_id)

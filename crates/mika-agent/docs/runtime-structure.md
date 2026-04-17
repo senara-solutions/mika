@@ -141,7 +141,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **failed_sends** — `id INTEGER PK AUTO`, `agent_id FK`, `text TEXT`, `request_id TEXT`, `retry_count INTEGER DEFAULT 0`, `created_at TEXT`
 
-**skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20). Per-agent LLM overrides resolve as: DB > manifest `[llm]` > agent default. Set via `mika skills llm <name> set <provider>/<model>`.
+**skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
 ### View
 

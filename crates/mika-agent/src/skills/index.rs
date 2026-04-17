@@ -93,7 +93,9 @@ pub struct SkillEntry {
     pub prompt_snippet: String,
     /// Tools defined in this skill's `tools.json`.
     pub skill_tools: Vec<ResolvedSkillTool>,
-    /// Whether the skill is enabled (no `.disabled` marker file).
+    /// Whether the skill is enabled. Always `true` after scan; disabled state
+    /// is now applied by `SkillRegistry::apply_overrides()` from DB.
+    /// Kept for belt-and-suspenders match-time filter until #630.
     pub enabled: bool,
     /// Whether this entry has a DB override applied (for display purposes).
     pub has_override: bool,
@@ -283,6 +285,15 @@ pub struct SkippedSkill {
     pub name: String,
     /// Human-readable reason for skipping.
     pub reason: String,
+}
+
+/// A skill that was evicted from the registry because it has `enabled = false`
+/// in the `skill_overrides` DB table. Parallels `SkippedSkill` but represents
+/// a user choice rather than an error.
+#[derive(Debug, Clone)]
+pub struct DisabledSkill {
+    /// Skill name from manifest.
+    pub name: String,
 }
 
 /// A loaded skill that has validation warnings (non-fatal issues).
@@ -539,8 +550,9 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             }
         };
 
-        // Check for .disabled marker file
-        let enabled = !path.join(".disabled").exists();
+        // Enabled state now comes from DB via apply_overrides().
+        // Always set to true here; disabled skills are evicted in apply_overrides().
+        let enabled = true;
 
         // Parse tools.json if present
         let skill_tools = load_tools_json(&path);
@@ -2241,7 +2253,10 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_skill() {
+    fn test_disabled_marker_ignored_by_scan() {
+        // .disabled marker is no longer read by scan_skills_dir() — enabled
+        // state comes from DB via apply_overrides(). Skills with markers are
+        // still loaded as enabled; migration converts markers to DB rows.
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("web-search");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -2254,12 +2269,13 @@ mod tests {
             "#,
         )
         .unwrap();
-        // Create .disabled marker
+        // Create .disabled marker — should be ignored by scan.
         fs::write(skill_dir.join(".disabled"), "").unwrap();
 
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
-        assert!(!scan.entries[0].enabled);
+        // Always enabled at scan time; disabled state applied later via DB.
+        assert!(scan.entries[0].enabled);
     }
 
     #[test]

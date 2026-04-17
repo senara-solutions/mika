@@ -21,11 +21,13 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
 
     match args.command {
         None => {
-            let registry = SkillRegistry::from_dir(&skills_dir);
+            let mut registry = SkillRegistry::from_dir(&skills_dir);
+            apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
             list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
         }
         Some(SkillsCommand::List { format }) => {
-            let registry = SkillRegistry::from_dir(&skills_dir);
+            let mut registry = SkillRegistry::from_dir(&skills_dir);
+            apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
             list_skills(&registry, &agent_home, &format)?;
         }
         Some(SkillsCommand::Info { name }) => {
@@ -39,10 +41,10 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
             test_skill_tool(&skills_dir, &skill, &tool, &input).await?;
         }
         Some(SkillsCommand::Enable { name }) => {
-            toggle_skill(&skills_dir, &name, true)?;
+            toggle_skill(&global_home, &skills_dir, agent_name, &name, true)?;
         }
         Some(SkillsCommand::Disable { name }) => {
-            toggle_skill(&skills_dir, &name, false)?;
+            toggle_skill(&global_home, &skills_dir, agent_name, &name, false)?;
         }
         Some(SkillsCommand::Install { source, name, link }) => {
             // Resolve GitHub token only for git operations (App preferred, PAT fallback)
@@ -243,13 +245,34 @@ async fn resolve_github_token_for_git(global_home: &Path, agent_home: &Path) -> 
     settings.agent_github_token().map(|s| s.to_string())
 }
 
+/// Best-effort: apply DB overrides to the registry so `disabled()` is populated.
+/// If the DB isn't available (first run, missing file), silently skip.
+fn apply_db_overrides_if_available(
+    global_home: &Path,
+    agent_id: &str,
+    registry: &mut SkillRegistry,
+) {
+    let db_path = mika_common::home::container_db_path(global_home);
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(db) = mika_agent::db::Database::open(&db_path) else {
+        return;
+    };
+    let Ok(overrides) = db.get_skill_overrides(agent_id) else {
+        return;
+    };
+    registry.apply_overrides(&overrides);
+}
+
 fn list_skills(
     registry: &SkillRegistry,
     agent_home: &Path,
     format: &crate::cli::OutputFormat,
 ) -> Result<()> {
     let skills = registry.skills();
-    if skills.is_empty() {
+    let disabled = registry.disabled();
+    if skills.is_empty() && disabled.is_empty() {
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
             crate::cli::OutputFormat::Text => {
@@ -355,6 +378,12 @@ fn list_skills(
                     variants,
                     llm_badge
                 );
+            }
+            if !disabled.is_empty() {
+                println!("\n  Disabled ({}):", disabled.len());
+                for d in disabled {
+                    println!("    {} [disabled]", d.name);
+                }
             }
             println!();
         }
@@ -654,28 +683,52 @@ async fn test_skill_tool(
     Ok(())
 }
 
-fn toggle_skill(skills_dir: &Path, name: &str, enable: bool) -> Result<()> {
+fn toggle_skill(
+    global_home: &Path,
+    skills_dir: &Path,
+    agent_id: &str,
+    name: &str,
+    enable: bool,
+) -> Result<()> {
     let skill_dir = skills_dir.join(name);
     if !skill_dir.is_dir() {
         bail!("Skill '{name}' not found at {}", skill_dir.display());
     }
 
-    let marker = skill_dir.join(".disabled");
-    if enable {
-        if marker.exists() {
-            std::fs::remove_file(&marker)
-                .with_context(|| format!("failed to remove {}", marker.display()))?;
-            println!("\n  Enabled skill '{name}'.\n");
-        } else {
-            println!("\n  Skill '{name}' is already enabled.\n");
-        }
-    } else if !marker.exists() {
-        std::fs::write(&marker, "")
-            .with_context(|| format!("failed to create {}", marker.display()))?;
-        println!("\n  Disabled skill '{name}'.\n");
-    } else {
-        println!("\n  Skill '{name}' is already disabled.\n");
+    let db_path = mika_common::home::container_db_path(global_home);
+    if !db_path.exists() {
+        bail!(
+            "Mika database not found at {}. Run `mika status` to initialize the agent.",
+            db_path.display()
+        );
     }
+    let db = mika_agent::db::Database::open(&db_path)
+        .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+
+    // Migrate legacy .disabled markers to DB before reading state.
+    // Without this, `mika skills enable foo` on a skill with a .disabled marker
+    // would no-op (DB shows enabled=NULL=true), then the next server startup
+    // migration would re-disable the skill (#629).
+    if let Err(e) = mika_agent::skills::migrate_disabled_markers(skills_dir, &db, agent_id) {
+        eprintln!("  [WARN] failed to migrate .disabled markers: {e}");
+    }
+
+    // Check current state from DB.
+    let overrides = db.get_skill_overrides(agent_id)?;
+    let current_override = overrides
+        .iter()
+        .find(|o| o.skill_name.eq_ignore_ascii_case(name));
+    let currently_enabled = current_override.and_then(|o| o.enabled).unwrap_or(true);
+
+    if enable == currently_enabled {
+        let state = if enable { "enabled" } else { "disabled" };
+        println!("\n  Skill '{name}' is already {state}.\n");
+        return Ok(());
+    }
+
+    db.set_skill_enabled(agent_id, name, enable)?;
+    let action = if enable { "Enabled" } else { "Disabled" };
+    println!("\n  {action} skill '{name}'.\n");
     Ok(())
 }
 
