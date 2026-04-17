@@ -10,6 +10,7 @@ use tempfile::TempDir;
 use mika_agent::agent::{AgentParams, run_agent};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
+use mika_agent::messaging::MessageSender;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools::{ToolRegistry, default_tools};
 use mika_common::config::Settings;
@@ -36,6 +37,7 @@ pub struct EvalHarness {
     is_callback_turn: bool,
     skip_compaction: bool,
     internal: bool,
+    message_sender: Option<Arc<dyn MessageSender>>,
 }
 
 impl EvalHarness {
@@ -56,7 +58,7 @@ impl EvalHarness {
             session_id: &self.session_id,
             home_dir: self.home_dir.path(),
             is_onboarding: self.is_onboarding,
-            message_sender: None,
+            message_sender: self.message_sender.clone(),
             skip_compaction: self.skip_compaction,
             embedding_client: None,
             thinking: None,
@@ -91,6 +93,7 @@ pub struct EvalHarnessBuilder {
     internal: bool,
     provider_name: Option<String>,
     model_name: Option<String>,
+    message_sender: Option<Arc<dyn MessageSender>>,
 }
 
 impl Default for EvalHarnessBuilder {
@@ -106,6 +109,7 @@ impl Default for EvalHarnessBuilder {
             internal: false,
             provider_name: None,
             model_name: None,
+            message_sender: None,
         }
     }
 }
@@ -171,6 +175,12 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Set a custom message sender. Default: `None`.
+    pub fn message_sender(mut self, sender: Arc<dyn MessageSender>) -> Self {
+        self.message_sender = Some(sender);
+        self
+    }
+
     /// Build the harness, creating the in-memory DB and temp directories.
     pub async fn build(self) -> Result<EvalHarness> {
         // Create temp directory with minimal agent structure
@@ -219,6 +229,7 @@ impl EvalHarnessBuilder {
             is_callback_turn: self.is_callback_turn,
             skip_compaction: self.skip_compaction,
             internal: self.internal,
+            message_sender: self.message_sender,
         })
     }
 }

@@ -303,8 +303,14 @@ async fn handle_pass_verdict(
                                 event.pr_number, event.repo, event.reviewer
                             )
                         };
-                        if let Err(e) = sender.send(&notification).await {
-                            warn!(error = %e, "Failed to send merge notification");
+                        match sender.send(&notification).await {
+                            Ok(crate::messaging::SendOutcome::Delivered) => {}
+                            Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                                warn!(reason = %reason, "Merge notification delivery failed");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to send merge notification");
+                            }
                         }
                     }
 

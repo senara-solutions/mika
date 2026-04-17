@@ -833,13 +833,25 @@ async fn run_agent_for_message(
         Ok(output) => {
             if let Some(response) = output.text {
                 info!("agent loop completed");
-                if let Err(e) = sender_arc.send(&response).await {
-                    error!(error = %e, "failed to send response");
+                match sender_arc.send(&response).await {
+                    Ok(crate::messaging::SendOutcome::Delivered) => {}
+                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                        warn!(reason = %reason, "response delivery failed, saved to failed_sends");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to send response");
+                    }
                 }
             } else {
                 info!("agent loop completed (no text response)");
-                if let Err(e) = sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
-                    error!(error = %e, "failed to send fallback response");
+                match sender_arc.send(agent::EMPTY_RESPONSE_FALLBACK).await {
+                    Ok(crate::messaging::SendOutcome::Delivered) => {}
+                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                        warn!(reason = %reason, "fallback response delivery failed, saved to failed_sends");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to send fallback response");
+                    }
                 }
             }
         }
@@ -882,11 +894,16 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
 
     for send in sends {
         match sender.send(&send.text).await {
-            Ok(()) => {
+            Ok(crate::messaging::SendOutcome::Delivered) => {
                 let _ = agent_state.db.delete_failed_send(send.id).await;
                 info!(id = send.id, "flushed failed send");
             }
-            Err(_) => {
+            Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
+                let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+            }
+            Err(e) => {
+                warn!(id = send.id, error = %e, "failed send flush: sender error");
                 let _ = agent_state.db.increment_failed_send_retry(send.id).await;
             }
         }

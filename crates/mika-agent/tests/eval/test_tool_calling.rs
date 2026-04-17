@@ -1,5 +1,10 @@
 //! Integration tests: tool calling scenarios.
 
+use std::sync::Arc;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use mika_agent::messaging::{MessageSender, SendOutcome};
 use mika_common::llm::mock::*;
 use mika_common::llm::{LlmContent, LlmContentBlock, LlmRole};
 use serde_json::json;
@@ -218,4 +223,90 @@ async fn test_text_based_tool_call_retry() {
     assert_tools_include(&trace, &["search_memory"]);
     // 3 steps: text (retry), tool call, final response
     assert_exact_steps(&trace, 3);
+}
+
+// --- send_message gateway error surfacing (#581) ---
+
+/// Test sender returning a configurable outcome for eval harness tests.
+struct EvalMockSender {
+    outcome: SendOutcome,
+}
+
+#[async_trait]
+impl MessageSender for EvalMockSender {
+    async fn send(&self, _text: &str) -> Result<SendOutcome> {
+        Ok(self.outcome.clone())
+    }
+}
+
+#[tokio::test]
+async fn test_send_message_gateway_failure_surfaces_error() {
+    // LLM calls send_message, sender returns Failed -> tool_call should record success=false
+    let sender = Arc::new(EvalMockSender {
+        outcome: SendOutcome::Failed {
+            reason: "gateway /send returned 502 Bad Gateway".to_string(),
+        },
+    });
+
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("send_message", json!({"text": "Sprint started"})),
+            text_response("I tried to send the message but delivery failed."),
+        ])
+        .message_sender(sender)
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("Send a sprint update").await.unwrap();
+
+    assert_tools_include(&trace, &["send_message"]);
+
+    // The tool call should be recorded as a failure
+    let send_calls = trace.calls_for_tool("send_message");
+    assert_eq!(
+        send_calls.len(),
+        1,
+        "expected exactly one send_message call"
+    );
+    assert!(
+        !send_calls[0].success,
+        "expected success=false for gateway failure, got success=true"
+    );
+    assert_tool_output_contains(&trace, "send_message", 0, "delivery failed");
+    assert_tool_output_contains(&trace, "send_message", 0, "502 Bad Gateway");
+}
+
+#[tokio::test]
+async fn test_send_message_gateway_success_records_success() {
+    // LLM calls send_message, sender returns Delivered -> tool_call should record success=true
+    let sender = Arc::new(EvalMockSender {
+        outcome: SendOutcome::Delivered,
+    });
+
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("send_message", json!({"text": "Hello user"})),
+            text_response("Message sent successfully."),
+        ])
+        .message_sender(sender)
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("Send a hello message").await.unwrap();
+
+    assert_tools_include(&trace, &["send_message"]);
+
+    let send_calls = trace.calls_for_tool("send_message");
+    assert_eq!(
+        send_calls.len(),
+        1,
+        "expected exactly one send_message call"
+    );
+    assert!(
+        send_calls[0].success,
+        "expected success=true for delivered message, got success=false"
+    );
+    assert_tool_output_contains(&trace, "send_message", 0, "Message sent.");
 }

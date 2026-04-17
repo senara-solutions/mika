@@ -310,8 +310,14 @@ pub async fn try_handle_ci_success(
                      Merge initiated (squash, delete branch).",
                     pr.number, event.repo, verdict_review.reviewer
                 );
-                if let Err(e) = sender.send(&notification).await {
-                    warn!(error = %e, "Failed to send CI success merge notification");
+                match sender.send(&notification).await {
+                    Ok(crate::messaging::SendOutcome::Delivered) => {}
+                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                        warn!(reason = %reason, "CI success merge notification delivery failed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to send CI success merge notification");
+                    }
                 }
             }
 

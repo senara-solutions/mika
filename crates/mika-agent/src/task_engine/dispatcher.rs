@@ -141,7 +141,15 @@ impl TaskDispatcher {
         }
 
         if let Some(sender) = &self.message_sender {
-            sender.send(text).await?;
+            match sender.send(text).await? {
+                crate::messaging::SendOutcome::Delivered => {}
+                // Task-engine sends are fire-and-forget; delivery failure is logged
+                // but does not fail the dispatch (unlike the send_message tool path
+                // which surfaces Failed as ToolOutput::error for LLM awareness).
+                crate::messaging::SendOutcome::Failed { reason } => {
+                    warn!(task_id = %task.id, reason = %reason, "send_message task: delivery failed");
+                }
+            }
         } else {
             debug!(task_id = %task.id, "send_message: no sender configured, dropping message");
         }
@@ -926,15 +934,15 @@ mod tests {
     use super::*;
     use crate::async_db::AsyncDatabase;
     use crate::db::{Database, NewTask};
-    use crate::messaging::MessageSender;
+    use crate::messaging::{MessageSender, SendOutcome};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
     struct NoopSender;
     #[async_trait::async_trait]
     impl MessageSender for NoopSender {
-        async fn send(&self, _text: &str) -> anyhow::Result<()> {
-            Ok(())
+        async fn send(&self, _text: &str) -> anyhow::Result<SendOutcome> {
+            Ok(SendOutcome::Delivered)
         }
     }
 

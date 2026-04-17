@@ -634,8 +634,8 @@ mod tests {
     struct NoopSender;
     #[async_trait::async_trait]
     impl MessageSender for NoopSender {
-        async fn send(&self, _text: &str) -> anyhow::Result<()> {
-            Ok(())
+        async fn send(&self, _text: &str) -> anyhow::Result<crate::messaging::SendOutcome> {
+            Ok(crate::messaging::SendOutcome::Delivered)
         }
     }
 
