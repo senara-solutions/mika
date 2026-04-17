@@ -163,6 +163,17 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn set_skill_enabled(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let (a, s) = (agent_id.to_owned(), skill_name.to_owned());
+        self.with_db(move |db| db.set_skill_enabled(&a, &s, enabled))
+            .await
+    }
+
     pub async fn delete_skill_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
         let (a, s) = (agent_id.to_owned(), skill_name.to_owned());
         self.with_db(move |db| db.delete_skill_override(&a, &s))

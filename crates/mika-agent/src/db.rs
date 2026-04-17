@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 23;
+pub const CURRENT_SCHEMA_VERSION: i64 = 24;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -421,6 +421,9 @@ pub struct SkillOverride {
     pub always_on: Option<bool>,
     pub llm_provider: Option<String>,
     pub llm_model: Option<String>,
+    /// Tri-state: `None` = default (enabled), `Some(false)` = disabled,
+    /// `Some(true)` = explicitly enabled.
+    pub enabled: Option<bool>,
 }
 
 // ===== Observability Types =====
@@ -770,6 +773,10 @@ impl Database {
             self.migrate_v22_to_v23()?;
             info!(version = 23, "database migrated to v23");
         }
+        if (3..=23).contains(&version) {
+            self.migrate_v23_to_v24()?;
+            info!(version = 24, "database migrated to v24");
+        }
         Ok(())
     }
 
@@ -826,7 +833,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (23);
+            INSERT INTO schema_version (version) VALUES (24);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1106,6 +1113,7 @@ impl Database {
                 always_on    INTEGER,
                 llm_provider TEXT,
                 llm_model    TEXT,
+                enabled      INTEGER,
                 PRIMARY KEY (agent_id, skill_name)
             );
 
@@ -2562,6 +2570,21 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v23_to_v24(&self) -> Result<()> {
+        info!("migrating database schema v23 → v24 (skill_overrides: enabled column)");
+
+        let has_col = self.column_exists("skill_overrides", "enabled")?;
+
+        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        if !has_col {
+            sql.push_str("ALTER TABLE skill_overrides ADD COLUMN enabled INTEGER;\n");
+        }
+        sql.push_str("INSERT INTO schema_version (version) VALUES (24);\nCOMMIT;");
+
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
@@ -2627,7 +2650,7 @@ impl Database {
     /// Get all skill overrides for an agent.
     pub fn get_skill_overrides(&self, agent_id: &str) -> Result<Vec<SkillOverride>> {
         let mut stmt = self.conn.prepare(
-            "SELECT skill_name, always_on, llm_provider, llm_model
+            "SELECT skill_name, always_on, llm_provider, llm_model, enabled
              FROM skill_overrides WHERE agent_id = ?1",
         )?;
         let rows = stmt
@@ -2637,6 +2660,7 @@ impl Database {
                     always_on: r.get(1)?,
                     llm_provider: r.get(2)?,
                     llm_model: r.get(3)?,
+                    enabled: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -2679,6 +2703,47 @@ impl Database {
         Ok(())
     }
 
+    /// Set (upsert) an enabled override for a skill.
+    ///
+    /// `enabled = false` disables the skill; `enabled = true` explicitly enables it.
+    /// When setting to `true` (the default) and all other override columns are NULL,
+    /// the row is deleted (default-equals-delete).
+    pub fn set_skill_enabled(&self, agent_id: &str, skill_name: &str, enabled: bool) -> Result<()> {
+        let db_val: Option<bool> = if enabled { None } else { Some(false) };
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result: rusqlite::Result<()> = (|| {
+            self.conn.execute(
+                "INSERT INTO skill_overrides (agent_id, skill_name, enabled)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(agent_id, skill_name) DO UPDATE SET enabled = excluded.enabled",
+                params![agent_id, skill_name, db_val],
+            )?;
+            // Default-equals-delete: if all columns are NULL, remove the row.
+            if enabled {
+                self.conn.execute(
+                    "DELETE FROM skill_overrides
+                      WHERE agent_id = ?1 AND skill_name = ?2
+                        AND always_on IS NULL
+                        AND llm_provider IS NULL
+                        AND llm_model IS NULL
+                        AND enabled IS NULL",
+                    params![agent_id, skill_name],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e.into())
+            }
+        }
+    }
+
     /// Clear the LLM override columns for a skill. If the resulting row has no
     /// remaining override values (all columns NULL), the row is deleted.
     ///
@@ -2698,7 +2763,8 @@ impl Database {
                   WHERE agent_id = ?1 AND skill_name = ?2
                     AND always_on IS NULL
                     AND llm_provider IS NULL
-                    AND llm_model IS NULL",
+                    AND llm_model IS NULL
+                    AND enabled IS NULL",
                 params![agent_id, skill_name],
             )?;
             Ok(())
@@ -8840,6 +8906,95 @@ mod tests {
         let db = db();
         // Should not error
         db.delete_skill_override("mika", "nonexistent").unwrap();
+    }
+
+    #[test]
+    fn test_set_skill_enabled_disable() {
+        let db = db();
+        db.set_skill_enabled("mika", "foo", false).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        let ov = overrides.iter().find(|o| o.skill_name == "foo").unwrap();
+        assert_eq!(ov.enabled, Some(false));
+    }
+
+    #[test]
+    fn test_set_skill_enabled_enable_deletes_row() {
+        let db = db();
+        // Disable first
+        db.set_skill_enabled("mika", "foo", false).unwrap();
+        assert_eq!(db.get_skill_overrides("mika").unwrap().len(), 1);
+        // Enable (default) — row should be deleted (default-equals-delete)
+        db.set_skill_enabled("mika", "foo", true).unwrap();
+        assert!(db.get_skill_overrides("mika").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_set_skill_enabled_preserves_always_on() {
+        let db = db();
+        // Set always_on first
+        db.set_skill_override("mika", "foo", true).unwrap();
+        // Now disable
+        db.set_skill_enabled("mika", "foo", false).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        let ov = overrides.iter().find(|o| o.skill_name == "foo").unwrap();
+        assert_eq!(ov.always_on, Some(true));
+        assert_eq!(ov.enabled, Some(false));
+    }
+
+    #[test]
+    fn test_set_skill_enabled_enable_with_always_on_keeps_row() {
+        let db = db();
+        // Set both always_on and disabled
+        db.set_skill_override("mika", "foo", true).unwrap();
+        db.set_skill_enabled("mika", "foo", false).unwrap();
+        // Now enable — row should remain because always_on is non-NULL
+        db.set_skill_enabled("mika", "foo", true).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        let ov = overrides.iter().find(|o| o.skill_name == "foo").unwrap();
+        assert_eq!(ov.always_on, Some(true));
+        assert_eq!(ov.enabled, None); // Cleared to NULL
+    }
+
+    #[test]
+    fn test_set_skill_enabled_preserves_llm_override() {
+        let db = db();
+        db.set_skill_llm_override("mika", "foo", "anthropic", "claude-sonnet-4-6")
+            .unwrap();
+        db.set_skill_enabled("mika", "foo", false).unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        let ov = overrides.iter().find(|o| o.skill_name == "foo").unwrap();
+        assert_eq!(ov.llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(ov.enabled, Some(false));
+    }
+
+    #[test]
+    fn test_set_skill_enabled_round_trip() {
+        let db = db();
+        // Disable → enable → state is clean
+        db.set_skill_enabled("mika", "bar", false).unwrap();
+        assert_eq!(db.get_skill_overrides("mika").unwrap().len(), 1);
+        db.set_skill_enabled("mika", "bar", true).unwrap();
+        assert!(db.get_skill_overrides("mika").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_enabled_column_exists_in_skill_overrides() {
+        let db = db();
+        assert!(db.column_exists("skill_overrides", "enabled").unwrap());
+    }
+
+    #[test]
+    fn test_delete_skill_llm_override_with_enabled_keeps_row() {
+        let db = db();
+        db.set_skill_llm_override("mika", "foo", "anthropic", "claude-sonnet-4-6")
+            .unwrap();
+        db.set_skill_enabled("mika", "foo", false).unwrap();
+        // Delete LLM override — row should remain because enabled is non-NULL
+        db.delete_skill_llm_override("mika", "foo").unwrap();
+        let overrides = db.get_skill_overrides("mika").unwrap();
+        let ov = overrides.iter().find(|o| o.skill_name == "foo").unwrap();
+        assert_eq!(ov.llm_provider, None);
+        assert_eq!(ov.enabled, Some(false));
     }
 
     #[test]

@@ -336,7 +336,14 @@ async fn init_agent(
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
-    let mut skill_registry = SkillRegistry::from_dir(&agent_home.join("skills"));
+    let skills_dir = agent_home.join("skills");
+    // Migrate legacy .disabled marker files to DB (one-shot, idempotent).
+    if let Err(e) =
+        crate::skills::migrate_disabled_markers_async(&skills_dir, &async_db, agent_name).await
+    {
+        tracing::warn!(error = %e, "failed to migrate .disabled markers");
+    }
+    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
     if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
         skill_registry.apply_overrides(&overrides);
     }

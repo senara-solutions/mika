@@ -58,7 +58,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Grounding rule:** The system prompt prohibits the agent from claiming downstream system state unless a tool result confirms it. Reinforced in `format_callback_framing` and `SilentTrigger::Callback`.
 - **Confirmation before action:** The system prompt instructs the agent to answer informational questions directly without starting multi-step workflows.
 - **Context priority:** current user message > core memory > active skill context > conversation summary > conversation history > search results. See `docs/memory-classification.md`.
-- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v22. See `crates/mika-agent/CLAUDE.md` for schema details.
+- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v24. See `crates/mika-agent/CLAUDE.md` for schema details.
 - **Secrets:** `Settings` has manual `Debug` impl that redacts API key and OTLP auth header. Exec handler executor scrubs all MIKA_* env vars from child processes. MCP child processes use `env_clear()` + allowlist. Git subprocesses scrub MIKA_* vars and set `GIT_TERMINAL_PROMPT=0`.
 - **Labels:** `.github/labels.yml` is the canonical label taxonomy (type, priority, component). All issue-creation paths reference it.
 - **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `sync_channel(512)` mpsc channel (closure-based dispatch). Clone-able, Send+Sync. `with_db` releases the mutex before calling `send()` to avoid deadlocks.
