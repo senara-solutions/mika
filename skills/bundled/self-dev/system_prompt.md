@@ -334,7 +334,7 @@ Remember the returned `task_id` as `milestone_wi`.
 ### Step M2 — Fetch milestone issues
 
 ```bash
-run_gh issue list --milestone <n> --repo senara-solutions/<repo> --state open --json number,title --jq '.[].number'
+run_gh issue list --milestone <n> --repo senara-solutions/<repo> --state open --json number,title --jq 'sort_by(.number) | .[].number'
 ```
 
 Store the ordered list of issue numbers as `milestone_issues`.
@@ -435,7 +435,7 @@ query {
       }
     }
   }
-}' --jq '.data.organization.projectV2.items.nodes[].content | select(.state == "OPEN") | "\(.repository.name)#\(.number)"'
+}' --jq '[.data.organization.projectV2.items.nodes[].content | select(.state == "OPEN")] | sort_by(.number) | .[] | "\(.repository.name)#\(.number)"'
 ```
 
 Store ordered list of `repo#issue` references as `project_issues`.
