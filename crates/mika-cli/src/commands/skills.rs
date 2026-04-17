@@ -263,6 +263,7 @@ fn apply_db_overrides_if_available(
         return;
     };
     registry.apply_overrides(&overrides);
+    registry.log_summary();
 }
 
 fn list_skills(
@@ -272,7 +273,8 @@ fn list_skills(
 ) -> Result<()> {
     let skills = registry.skills();
     let disabled = registry.disabled();
-    if skills.is_empty() && disabled.is_empty() {
+    let skipped = registry.skipped();
+    if skills.is_empty() && disabled.is_empty() && skipped.is_empty() {
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
             crate::cli::OutputFormat::Text => {
@@ -286,7 +288,7 @@ fn list_skills(
 
     match format {
         crate::cli::OutputFormat::Json => {
-            let entries: Vec<serde_json::Value> = skills
+            let loaded: Vec<serde_json::Value> = skills
                 .iter()
                 .map(|entry| {
                     let name = &entry.manifest.skill.name;
@@ -321,10 +323,33 @@ fn list_skills(
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&entries)?);
+            let disabled_json: Vec<serde_json::Value> = disabled
+                .iter()
+                .map(|d| serde_json::json!({"name": d.name, "status": "disabled"}))
+                .collect();
+            let skipped_json: Vec<serde_json::Value> = skipped
+                .iter()
+                .map(|s| {
+                    serde_json::json!({"name": s.name, "status": "skipped", "reason": s.reason})
+                })
+                .collect();
+            let output = serde_json::json!({
+                "loaded": loaded,
+                "disabled": disabled_json,
+                "skipped": skipped_json,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
         crate::cli::OutputFormat::Text => {
-            println!("\n  Skills ({}):", skills.len());
+            println!(
+                "\n  Skills: {} loaded, {} disabled, {} skipped",
+                skills.len(),
+                disabled.len(),
+                skipped.len()
+            );
+            if !skills.is_empty() {
+                println!();
+            }
             for entry in skills {
                 let name = &entry.manifest.skill.name;
                 let tool_count = entry.skill_tools.len();
@@ -349,7 +374,6 @@ fn list_skills(
                 } else {
                     ""
                 };
-                let status = if entry.enabled { "" } else { " [disabled]" };
                 let variants = {
                     let hand = entry.variant_count();
                     let gen_count = entry.generated_model_prompts.len();
@@ -368,13 +392,12 @@ fn list_skills(
                     String::new()
                 };
                 println!(
-                    "    {} ({}) — {}{}{}{}{}{}",
+                    "    {} ({}) — {}{}{}{}{}",
                     name,
                     tools_desc,
                     entry.manifest.skill.description,
                     origin,
                     always_on,
-                    status,
                     variants,
                     llm_badge
                 );
@@ -383,6 +406,12 @@ fn list_skills(
                 println!("\n  Disabled ({}):", disabled.len());
                 for d in disabled {
                     println!("    {} [disabled]", d.name);
+                }
+            }
+            if !skipped.is_empty() {
+                println!("\n  Skipped ({}):", skipped.len());
+                for s in skipped {
+                    println!("    {} — {}", s.name, s.reason);
                 }
             }
             println!();

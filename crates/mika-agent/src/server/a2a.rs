@@ -125,6 +125,7 @@ async fn run_a2a_agent(
         {
             registry.apply_overrides(&overrides);
         }
+        registry.log_summary();
         let new = Arc::new(registry);
         *agent_state.skills.lock().unwrap() = new.clone();
         new

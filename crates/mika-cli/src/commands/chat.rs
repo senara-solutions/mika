@@ -114,6 +114,7 @@ async fn spawn_agent_worker(
     {
         skill_registry.apply_overrides(&overrides);
     }
+    skill_registry.log_summary();
     skill_registry.validate_loaded();
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
@@ -229,6 +230,7 @@ async fn spawn_agent_worker(
                         {
                             registry.apply_overrides(&overrides);
                         }
+                        registry.log_summary();
                         worker_skills = Arc::new(registry);
                         skills_reloaded = true;
                     }
@@ -286,6 +288,7 @@ async fn spawn_agent_worker(
                         {
                             registry.apply_overrides(&overrides);
                         }
+                        registry.log_summary();
                         worker_skills = Arc::new(registry);
                         skills_reloaded = true;
                     }

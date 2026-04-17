@@ -347,6 +347,7 @@ async fn init_agent(
     if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
         skill_registry.apply_overrides(&overrides);
     }
+    skill_registry.log_summary();
     skill_registry.validate_loaded();
     let skill_registry = Arc::new(skill_registry);
 

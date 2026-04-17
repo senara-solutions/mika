@@ -139,26 +139,11 @@ pub struct SkillRegistry {
 
 impl SkillRegistry {
     /// Scan a skills directory and build the registry.
+    ///
+    /// Does not log — call [`log_summary()`](Self::log_summary) after
+    /// [`apply_overrides()`](Self::apply_overrides) to emit accurate three-state counts.
     pub fn from_dir(skills_dir: &Path) -> Self {
         let result = index::scan_skills_dir(skills_dir);
-        if !result.skipped.is_empty() {
-            tracing::warn!(
-                count = result.skipped.len(),
-                "skipped invalid skill(s) at startup — run `mika skills validate` for details"
-            );
-        }
-        // Log successfully loaded skills
-        let loaded_names: Vec<&str> = result
-            .entries
-            .iter()
-            .map(|e| e.manifest.skill.name.as_str())
-            .collect();
-        tracing::info!(
-            count = loaded_names.len(),
-            skipped = result.skipped.len(),
-            names = ?loaded_names,
-            "skills loaded"
-        );
         Self {
             skills: result.entries,
             skipped: result.skipped,
@@ -184,6 +169,27 @@ impl SkillRegistry {
             skipped,
             disabled: Vec::new(),
             validated_warnings: Vec::new(),
+        }
+    }
+
+    /// Log a three-state summary of loaded, disabled, and skipped skills.
+    ///
+    /// Call **after** [`apply_overrides()`](Self::apply_overrides) so the counts
+    /// reflect the final registry state. Emits one `INFO` summary line and a
+    /// per-skip `WARN` line for each skipped skill.
+    pub fn log_summary(&self) {
+        tracing::info!(
+            loaded = self.skills.len(),
+            disabled = self.disabled.len(),
+            skipped = self.skipped.len(),
+            "skills loaded"
+        );
+        for s in &self.skipped {
+            tracing::warn!(
+                name = %s.name,
+                reason = %s.reason,
+                "skill skipped"
+            );
         }
     }
 
@@ -410,50 +416,6 @@ impl SkillRegistry {
                 }
             }
         }
-
-        // Post-override validation: remove always_on skills with empty prompts
-        // caused by oversized prompt files. This catches the edge case where a DB
-        // override flips always_on=true on a skill whose prompt was already silently
-        // emptied during scan (because it was not always_on at scan time).
-        //
-        // Collect removed skills into `skipped` for TUI visibility.
-        let mut removed = Vec::new();
-        self.skills.retain(|entry| {
-            if entry.manifest.skill.always_on && entry.has_override && entry.prompt_snippet.is_empty()
-            {
-                // Check if the skill has a prompt file that exceeds its size limit
-                let snippet_path = entry.dir.join("system_prompt.md");
-                let effective_limit = entry
-                    .manifest
-                    .skill
-                    .max_prompt_size
-                    .map(|v| v.min(index::MAX_PROMPT_SIZE_CEILING))
-                    .unwrap_or(index::MAX_PROMPT_SNIPPET_SIZE);
-                if let Ok(meta) = std::fs::metadata(&snippet_path)
-                    && meta.len() > effective_limit
-                {
-                    tracing::error!(
-                        skill = %entry.manifest.skill.name,
-                        size = meta.len(),
-                        limit = effective_limit,
-                        "always_on skill (via DB override) has oversized prompt — removing from registry. \
-                         An always_on skill without its prompt is functionally broken. \
-                         Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
-                    );
-                    removed.push(SkippedSkill {
-                        name: entry.manifest.skill.name.clone(),
-                        reason: format!(
-                            "removed: always_on override but prompt oversized ({}B, limit {}B)",
-                            meta.len(),
-                            effective_limit
-                        ),
-                    });
-                    return false;
-                }
-            }
-            true
-        });
-        self.skipped.extend(removed);
     }
 
     /// Return always-on skills that are safe for silent/background mode.
@@ -1299,45 +1261,6 @@ mod tests {
         };
         // No dependencies declared — nothing to validate
         registry.apply_overrides(&[]);
-    }
-
-    #[test]
-    fn test_apply_overrides_removes_always_on_override_with_oversized_prompt() {
-        use crate::db::SkillOverride;
-        use std::fs;
-
-        // Create a real skill directory with an oversized prompt
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("big-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        // 20KB prompt exceeds 16KB default limit
-        let content = "x".repeat(20 * 1024);
-        fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
-
-        // Simulate a skill that was loaded with empty prompt (not always_on at scan time)
-        let mut entry = make_entry("big-skill", false, true);
-        entry.dir = skill_dir;
-        entry.prompt_snippet = String::new(); // emptied due to oversized prompt
-
-        let mut registry = SkillRegistry {
-            skipped: Vec::new(),
-            disabled: Vec::new(),
-            validated_warnings: Vec::new(),
-            skills: vec![entry],
-        };
-
-        // DB override flips always_on to true
-        registry.apply_overrides(&[SkillOverride {
-            skill_name: "big-skill".to_string(),
-            always_on: Some(true),
-            llm_provider: None,
-            llm_model: None,
-            enabled: None,
-        }]);
-
-        // Skill should be removed: always_on + override + empty prompt + oversized file
-        assert!(registry.skills.is_empty());
-        assert_eq!(registry.skipped_count(), 1);
     }
 
     #[test]
