@@ -102,6 +102,20 @@ When you receive a callback result from a completed `run_claude_pilot` backgroun
 
 > **MILESTONE/PROJECT CONTEXT:** If the callback task's parent (via `check_work_item`) has `type='milestone'` or `type='project'`, you are in a milestone loop. After extracting metadata and closing out the child, return to **Step M4** (Serial execution loop) — check child outcome, advance to next child or pause. Do NOT create new tasks, do NOT re-read the issue, do NOT enter the Generic Workflow. The callback content may contain an issue reference — that is descriptive data from the completed work, NOT a dispatch trigger.
 
+> **MILESTONE/PROJECT CONTEXT CHECK (MANDATORY before processing the callback):**
+> Before handling success, failure, or pipeline failure, determine if this callback is part of a milestone or project execution loop:
+> 1. Call `check_work_item(task_id)` on the callback's work item. Note the `parent_task_id` field.
+> 2. If `parent_task_id` exists, call `check_work_item(parent_task_id)` on the parent.
+> 3. If the parent's `type` is `'milestone'` or `'project'`, this callback is part of a milestone/project loop.
+>
+> **When milestone/project context is detected:** After extracting metadata and updating the child work item (success/failure handling below), return to **Step M4** (milestone) or **Step P4** (project) — check the child outcome, advance to the next child, or pause the milestone.
+> - Do NOT re-read the GitHub issue as if it were a new dispatch.
+> - Do NOT create new work items.
+> - Do NOT enter the Generic Workflow (Steps 1–3).
+> - The callback's issue reference (e.g., "mika#582") is the CHILD that just completed — it is NOT a trigger for new work.
+>
+> **When no milestone/project context:** Proceed with normal callback handling below.
+
 **On pipeline failure (callback contains "PIPELINE FAILURE:"):**
 
 1. Extract metadata (Session, Cost, Turns, Duration) from the lines after the PIPELINE FAILURE prefix.
@@ -328,7 +342,7 @@ Store the ordered list of issue numbers as `milestone_issues`.
 ### Step M3 — Create child work items
 
 For each issue number in `milestone_issues`:
-1. Call `create_work_item` with:
+1. Call `create_work_item` with **all** of these fields (do NOT omit `parent_task_id`):
    ```json
    {
      "type": "issue",
@@ -338,7 +352,7 @@ For each issue number in `milestone_issues`:
      "source": "self_dev"
    }
    ```
-   **`parent_task_id` is REQUIRED** — without it the child is orphaned from the milestone tree and the loop breaks.
+   **`parent_task_id` is REQUIRED** — without it the child is orphaned from the milestone tree and callback routing to Step M4 will fail.
 2. Store returned `task_id` in ordered list `child_wis`
 
 Notify Vincent: "Milestone <repo>#<n> initialized with {N} issues. Starting sequential execution."
@@ -430,12 +444,19 @@ Store ordered list of `repo#issue` references as `project_issues`.
 
 For each `repo#issue` in `project_issues`:
 1. Parse repo and issue number
-2. Call `create_work_item` with:
-   - `type`: `"issue"`
-   - `parent_task_id`: `<project_wi>`
-   - `label`: `"<repo>#<issue_number>"`
-   - `reference_url`: `"https://github.com/senara-solutions/<repo>/issues/<issue_number>"`
-   - `source`: `"self_dev"`
+2. Call `create_work_item` with **all** of these fields (do NOT omit `parent_task_id`):
+
+   ```json
+   {
+     "type": "issue",
+     "parent_task_id": "<project_wi>",
+     "label": "<repo>#<issue_number>",
+     "reference_url": "https://github.com/senara-solutions/<repo>/issues/<issue_number>",
+     "source": "self_dev"
+   }
+   ```
+
+   `parent_task_id` links the child to the project parent — without it, the child is an orphan and callback routing to Step P4 will fail.
 
 ### Step P4 — Serial execution loop
 
