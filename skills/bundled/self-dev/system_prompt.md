@@ -108,7 +108,7 @@ When you receive a callback result from a completed `run_claude_pilot` backgroun
 > 2. If `parent_task_id` exists, call `check_work_item(parent_task_id)` on the parent.
 > 3. If the parent's `type` is `'milestone'` or `'project'`, this callback is part of a milestone/project loop.
 >
-> **When milestone/project context is detected:** After extracting metadata and updating the child work item (success/failure handling below), return to **Step M4** (milestone) or **Step P4** (project) — check the child outcome, advance to the next child, or pause the milestone.
+> **When milestone/project context is detected:** Process the callback through the success/failure/pipeline-failure handling below as normal. If the handling path is terminal (child reaches `completed`, `blocked`, or `failed` after exhausting retries), return to **Step M4** (milestone) or **Step P4** (project) — check the child outcome, advance to the next child, or pause the milestone. If the handling path is non-terminal (e.g., pipeline-failure retry that re-dispatches claude-pilot), follow that path's "wait for callback" instruction — do NOT return to M4/P4 yet; the next callback will re-enter this check.
 > - Do NOT re-read the GitHub issue as if it were a new dispatch.
 > - Do NOT create new work items.
 > - Do NOT enter the Generic Workflow (Steps 1–3).
