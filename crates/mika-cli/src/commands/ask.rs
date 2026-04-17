@@ -241,8 +241,8 @@ pub async fn run(
     {
         skill_registry.apply_overrides(&overrides);
     }
-    skill_registry.log_summary();
     skill_registry.validate_loaded();
+    skill_registry.log_summary();
 
     // Surface validation warnings on stderr (Unit 4: #530)
     let warn_count = skill_registry.validated_warnings().len();

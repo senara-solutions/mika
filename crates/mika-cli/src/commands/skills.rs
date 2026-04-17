@@ -23,11 +23,13 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         None => {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
             apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
+            registry.log_summary();
             list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
         }
         Some(SkillsCommand::List { format }) => {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
             apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
+            registry.log_summary();
             list_skills(&registry, &agent_home, &format)?;
         }
         Some(SkillsCommand::Info { name }) => {
@@ -263,7 +265,6 @@ fn apply_db_overrides_if_available(
         return;
     };
     registry.apply_overrides(&overrides);
-    registry.log_summary();
 }
 
 fn list_skills(
@@ -276,7 +277,14 @@ fn list_skills(
     let skipped = registry.skipped();
     if skills.is_empty() && disabled.is_empty() && skipped.is_empty() {
         match format {
-            crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Json => {
+                let output = serde_json::json!({
+                    "loaded": [],
+                    "disabled": [],
+                    "skipped": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No skills loaded.\n");
                 println!("  Create one with: mika skills create <name>");

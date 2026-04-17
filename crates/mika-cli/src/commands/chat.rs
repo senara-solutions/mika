@@ -114,8 +114,8 @@ async fn spawn_agent_worker(
     {
         skill_registry.apply_overrides(&overrides);
     }
-    skill_registry.log_summary();
     skill_registry.validate_loaded();
+    skill_registry.log_summary();
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();

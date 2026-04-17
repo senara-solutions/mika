@@ -174,9 +174,11 @@ impl SkillRegistry {
 
     /// Log a three-state summary of loaded, disabled, and skipped skills.
     ///
-    /// Call **after** [`apply_overrides()`](Self::apply_overrides) so the counts
-    /// reflect the final registry state. Emits one `INFO` summary line and a
-    /// per-skip `WARN` line for each skipped skill.
+    /// Call **after** both [`apply_overrides()`](Self::apply_overrides) and
+    /// [`validate_loaded()`](Self::validate_loaded) so the counts reflect the
+    /// final registry state (validation may promote broken skills to skipped).
+    /// Emits one `INFO` summary line and a per-skip `WARN` line for each
+    /// skipped skill.
     pub fn log_summary(&self) {
         tracing::info!(
             loaded = self.skills.len(),
@@ -1336,13 +1338,13 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_overrides_keeps_always_on_override_with_no_prompt_file() {
+    fn test_apply_overrides_keeps_always_on_override_with_empty_prompt() {
         use crate::db::SkillOverride;
 
-        // Skill with no prompt file (tool-only) — should NOT be removed
+        // Tool-only skill with empty prompt — always_on override should apply
+        // without removing the skill. Empty prompt is valid for tool-only skills.
         let mut entry = make_entry("tool-only", false, true);
         entry.prompt_snippet = String::new();
-        // dir points to a non-existent path, so metadata check will fail → keep
 
         let mut registry = SkillRegistry {
             skipped: Vec::new(),
