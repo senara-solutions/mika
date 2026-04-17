@@ -231,11 +231,19 @@ pub async fn handle_message(
         }
     };
 
-    // Store chat_id on every message (for outbound sends)
-    let _ = agent_state
-        .db
-        .set_customer_config("chat_id", &req.chat_id.to_string())
-        .await;
+    // Store chat_id only when present and non-zero. Telegram chat IDs are
+    // always non-zero (positive for private chats, negative for groups/channels).
+    // Non-Telegram channels (e.g., GitHub webhooks) omit chat_id entirely;
+    // storing a sentinel 0 would poison the value used for outbound Telegram
+    // delivery. See #580.
+    if let Some(chat_id) = req.chat_id
+        && chat_id != 0
+    {
+        let _ = agent_state
+            .db
+            .set_customer_config("chat_id", &chat_id.to_string())
+            .await;
+    }
 
     let request_id = req.request_id.clone();
 

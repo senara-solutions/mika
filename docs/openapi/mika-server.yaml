@@ -197,7 +197,6 @@ components:
       description: Inbound message from the gateway.
       required:
       - text
-      - chat_id
       - channel
       - request_id
       properties:
@@ -207,8 +206,14 @@ components:
         channel:
           type: string
         chat_id:
-          type: integer
+          type:
+          - integer
+          - 'null'
           format: int64
+          description: |-
+            Telegram chat ID for outbound delivery. Absent for non-Telegram channels
+            (e.g., GitHub webhooks). Only stored in `customer_config` when present and
+            non-zero to prevent poisoning the stored chat_id.
         images:
           type:
           - array

@@ -668,7 +668,6 @@ async fn forward_to_resolved_route(
     let url = &route.container_url;
     let payload = serde_json::json!({
         "text": text,
-        "chat_id": 0,
         "channel": "github",
         "request_id": request_id,
         "agent": target_agent,

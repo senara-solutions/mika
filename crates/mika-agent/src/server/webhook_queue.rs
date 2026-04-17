@@ -219,7 +219,7 @@ mod tests {
     fn make_request(text: &str) -> MessageRequest {
         MessageRequest {
             text: text.to_string(),
-            chat_id: 0,
+            chat_id: None,
             channel: "github".to_string(),
             request_id: "test-req-1".to_string(),
             agent: "mika-dev".to_string(),
