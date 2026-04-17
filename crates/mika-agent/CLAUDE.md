@@ -121,7 +121,9 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 ## MessageSender Trait
 
-`#[async_trait]` with `Send + Sync` bounds for `Arc<dyn MessageSender>`. Text-only outbound. CLI prints to stdout. Server uses `GatewayMessageSender`. Team engine agents intentionally have `message_sender: None`.
+`#[async_trait]` with `Send + Sync` bounds for `Arc<dyn MessageSender>`. Returns `Result<SendOutcome>` where `SendOutcome` is `Delivered` (gateway 2xx) or `Failed { reason }` (non-2xx after retry, saved to `failed_sends`). `Err` is reserved for infrastructure failures (chat_id resolution, DB errors). Text-only outbound. CLI prints to stdout. Server uses `GatewayMessageSender` (one retry after 2s, error classification: connection/timeout/HTTP status with body snippet). Team engine agents intentionally have `message_sender: None`.
+
+**Callsite handling policy:** The `send_message` tool surfaces `Failed` as `ToolOutput::error` so the LLM knows delivery failed. The task-engine dispatcher absorbs `Failed` with a warning (fire-and-forget for scheduled sends). Server handlers and notification paths (verdict, CI success) log warnings on `Failed` but continue. The `failed_sends` flush path increments retry count on `Failed`.
 
 ## Conversation Compaction & Rewind
 

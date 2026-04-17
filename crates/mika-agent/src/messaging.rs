@@ -6,6 +6,19 @@ use tracing::warn;
 
 use crate::async_db::AsyncDatabase;
 
+/// Outcome of a message delivery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Message was delivered successfully (gateway returned 2xx).
+    Delivered,
+    /// Delivery failed after retries. The message was saved to `failed_sends`
+    /// for later flush, but the agent should treat this as a failure.
+    Failed {
+        /// Human-readable reason including HTTP status or network error classification.
+        reason: String,
+    },
+}
+
 /// Trait for sending outbound messages to the user.
 /// CLI mode uses the fallback in send_message tool; HTTP mode will POST to the gateway.
 ///
@@ -20,14 +33,14 @@ use crate::async_db::AsyncDatabase;
 /// Send + Sync bounds allow `Arc<dyn MessageSender>` in AppState and ToolContext.
 #[async_trait]
 pub trait MessageSender: Send + Sync {
-    async fn send(&self, text: &str) -> Result<()>;
+    async fn send(&self, text: &str) -> Result<SendOutcome>;
 }
 
 /// Sends outbound messages by POSTing to the gateway's /send endpoint.
 ///
 /// On failure, retries once after 2s. If both attempts fail, saves to
-/// `failed_sends` table for later flush — returns Ok so the agent loop
-/// doesn't think the tool failed.
+/// `failed_sends` table for later flush and returns `Ok(SendOutcome::Failed)`
+/// so the caller can surface the delivery failure to the LLM.
 pub struct GatewayMessageSender {
     client: reqwest::Client,
     gateway_url: String,
@@ -83,19 +96,43 @@ impl GatewayMessageSender {
             .json(payload)
             .timeout(Duration::from_secs(10))
             .send()
-            .await?;
+            .await
+            .map_err(Self::classify_reqwest_error)?;
 
         if resp.status().is_success() {
             Ok(())
         } else {
-            anyhow::bail!("gateway /send returned {}", resp.status())
+            let status = resp.status();
+            let body_snippet = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            if body_snippet.is_empty() {
+                anyhow::bail!("gateway /send returned {status}")
+            } else {
+                anyhow::bail!("gateway /send returned {status}: {body_snippet}")
+            }
+        }
+    }
+
+    /// Classify a reqwest transport error into a human-readable message.
+    fn classify_reqwest_error(e: reqwest::Error) -> anyhow::Error {
+        if e.is_connect() {
+            anyhow::anyhow!("gateway unreachable (connection error): {e}")
+        } else if e.is_timeout() {
+            anyhow::anyhow!("gateway request timed out: {e}")
+        } else {
+            anyhow::anyhow!("gateway request failed: {e}")
         }
     }
 }
 
 #[async_trait]
 impl MessageSender for GatewayMessageSender {
-    async fn send(&self, text: &str) -> Result<()> {
+    async fn send(&self, text: &str) -> Result<SendOutcome> {
         let chat_id = self.resolve_chat_id().await?;
 
         tracing::debug!(
@@ -114,18 +151,24 @@ impl MessageSender for GatewayMessageSender {
 
         // First attempt
         match self.try_send(&payload).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(SendOutcome::Delivered),
             Err(e) => warn!(error = %e, "first /send attempt failed, retrying in 2s"),
         }
 
         // Retry after 2s
         tokio::time::sleep(Duration::from_secs(2)).await;
         match self.try_send(&payload).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(SendOutcome::Delivered),
             Err(e) => {
                 warn!(error = %e, "retry failed, saving to failed_sends");
-                self.db.save_failed_send(text, None).await?;
-                Ok(()) // Return Ok — message queued, don't confuse Claude
+                let reason = e.to_string();
+                // Capture the delivery failure reason before attempting DB write.
+                // If save_failed_send fails, we still surface the original gateway
+                // error to the caller (not the DB error).
+                if let Err(db_err) = self.db.save_failed_send(text, None).await {
+                    warn!(error = %db_err, "failed to save to failed_sends table");
+                }
+                Ok(SendOutcome::Failed { reason })
             }
         }
     }
