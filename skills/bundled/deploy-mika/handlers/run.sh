@@ -115,9 +115,9 @@ for bin in $BINARIES; do
         cp "$DST" "$BACKUP" 2>/dev/null || true
     fi
 
-    # Copy new binary
+    # Install new binary (atomic inode replacement — no ETXTBSY when target is running)
     set +e
-    cp "$SRC" "$DST"
+    install -m 755 "$SRC" "$DST"
     CP_EXIT=$?
     set -e
 
