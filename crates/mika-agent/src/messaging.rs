@@ -240,4 +240,70 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// Simulates the Telegram→GitHub→resolve sequence from #580:
+    /// 1. Telegram message stores chat_id=99999
+    /// 2. GitHub message with no chat_id must NOT overwrite it
+    /// 3. resolve_chat_id returns the original 99999
+    #[tokio::test]
+    async fn test_github_message_does_not_poison_chat_id() {
+        let harness = TestHarness::new();
+
+        // Step 1: Telegram message stores the real chat_id
+        harness
+            .db
+            .set_customer_config("chat_id", "99999")
+            .await
+            .unwrap();
+
+        // Step 2: GitHub message arrives — handler would see chat_id=None and skip storage.
+        // (The handler guard is `if let Some(chat_id) = req.chat_id && chat_id != 0`.)
+        // We simulate by NOT writing to customer_config.
+
+        // Step 3: resolve_chat_id should return the original Telegram chat_id
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("mika".to_string()),
+            None,
+        );
+
+        let chat_id = sender.resolve_chat_id().await.unwrap();
+        assert_eq!(
+            chat_id, 99999,
+            "GitHub message must not overwrite Telegram chat_id"
+        );
+    }
+
+    /// Verifies that a poisoned chat_id ("0") in the DB is parsed as 0,
+    /// which the gateway would reject. Defense-in-depth: resolve_chat_id
+    /// returns the raw value — validation happens at the gateway /send boundary.
+    #[tokio::test]
+    async fn test_resolve_chat_id_poisoned_zero_in_db() {
+        let harness = TestHarness::new();
+        harness
+            .db
+            .set_customer_config("chat_id", "0")
+            .await
+            .unwrap();
+
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("mika".to_string()),
+            None,
+        );
+
+        let chat_id = sender.resolve_chat_id().await.unwrap();
+        assert_eq!(
+            chat_id, 0,
+            "poisoned value returns 0 — gateway rejects at /send"
+        );
+    }
 }

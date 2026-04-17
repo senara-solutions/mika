@@ -234,7 +234,7 @@ async fn expired_webhooks_are_drained() {
         DeferredWebhook {
             request: MessageRequest {
                 text: "expired webhook".to_string(),
-                chat_id: 0,
+                chat_id: None,
                 channel: "github".to_string(),
                 request_id: "req-expired".to_string(),
                 agent: "mika-dev".to_string(),
@@ -249,7 +249,7 @@ async fn expired_webhooks_are_drained() {
         DeferredWebhook {
             request: MessageRequest {
                 text: "active webhook".to_string(),
-                chat_id: 0,
+                chat_id: None,
                 channel: "github".to_string(),
                 request_id: "req-active".to_string(),
                 agent: "mika-dev".to_string(),
@@ -283,7 +283,7 @@ async fn drain_for_work_item_preserves_order() {
         DeferredWebhook {
             request: MessageRequest {
                 text: format!("webhook {req_id}"),
-                chat_id: 0,
+                chat_id: None,
                 channel: "github".to_string(),
                 request_id: req_id.to_string(),
                 agent: "mika-dev".to_string(),

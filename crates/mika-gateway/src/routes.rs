@@ -821,6 +821,16 @@ pub(crate) async fn handle_send(
             .into_response();
     }
 
+    // Validate chat_id is a usable Telegram identifier (positive for private chats,
+    // negative for groups/channels — but never zero, which is an invalid sentinel).
+    if payload.chat_id == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "chat_id must be non-zero"})),
+        )
+            .into_response();
+    }
+
     // Validate agent_name format (defense-in-depth at trust boundary)
     // Mirrors mika-common validate_agent_name: lowercase alphanumeric + hyphens, max 32 chars,
     // no leading/trailing hyphens, no consecutive hyphens.
@@ -1227,6 +1237,41 @@ mod tests {
     fn test_container_url_str_base_url_overrides() {
         let url = container_url_str("abc-123", Some("http://localhost:9090"), "mika-agents");
         assert_eq!(url, "http://localhost:9090");
+    }
+
+    #[test]
+    fn test_send_payload_chat_id_validation_rules() {
+        // Mirrors the handle_send chat_id validation: `if payload.chat_id == 0`
+        // returns 400. Telegram chat IDs are non-zero: positive for private chats,
+        // negative for groups/channels. Zero is an invalid sentinel (#580).
+        //
+        // Note: handle_send requires AppState (Postgres + TelegramClient) which
+        // is not available in unit tests. This test mirrors the validation logic
+        // directly, same pattern as test_agent_name_validation_rules above.
+        fn is_valid_chat_id(id: i64) -> bool {
+            id != 0
+        }
+
+        // Valid: positive (private chat)
+        assert!(is_valid_chat_id(12345));
+        assert!(is_valid_chat_id(1));
+        assert!(is_valid_chat_id(i64::MAX));
+
+        // Valid: negative (group/channel)
+        assert!(is_valid_chat_id(-100_123_456_789));
+        assert!(is_valid_chat_id(-1));
+        assert!(is_valid_chat_id(i64::MIN));
+
+        // Invalid: zero sentinel
+        assert!(!is_valid_chat_id(0));
+    }
+
+    #[test]
+    fn test_send_payload_negative_chat_id_deserializes() {
+        // Negative chat_ids are valid Telegram group/channel identifiers.
+        let json = r#"{"chat_id": -100123456789, "text": "hello"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.chat_id, -100_123_456_789);
     }
 
     #[test]
