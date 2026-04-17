@@ -1,0 +1,80 @@
+{
+  "reviewer": "reliability",
+  "findings": [
+    {
+      "id": "REL-001",
+      "title": "Duplicate tool_use with images double-decrements shared image_bytes_budget",
+      "severity": "medium",
+      "confidence": 0.92,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1561-1719",
+      "description": "image_bytes_budget is initialized once per process_tool_calls call (line 1561) and shared across all tool_use block iterations. When dedup fires (cached.clone() path, line 1586), the returned ToolOutput still contains the full images Vec (cloned from the cache). The image processing block at lines 1671-1713 runs unconditionally for every iteration — including cached ones — and decrements image_bytes_budget for each image in the cloned output. A single-step response with two identical tool_use blocks that produce images will consume the budget twice: the first block processes images normally, then the second (dedup) block re-enters the same loop and either exhausts the remaining budget prematurely (causing later legitimate tool results to get the 'budget exceeded' truncation message) or, if the first block already consumed most of the budget, the second block will emit '[N image(s) skipped: step memory budget exceeded]' in a tool_result that the LLM sees — causing confusion since the first result showed the image successfully.",
+      "impact": "If a deduplicated tool produces images (currently no builtin tool does, but exec-handler skills using the __mika_v1 image protocol can), the second tool_result in the LLM conversation will show images as budget-exceeded even though they were included in the first result. This can cause the LLM to misinterpret partial results. Additionally, subsequent tool_use blocks in the same step (non-duplicate) will have a deflated budget.",
+      "reproduction": "Craft an exec-handler skill that returns images via __mika_v1. Configure a non-Anthropic provider that emits duplicate tool_use blocks. The second duplicate result will show image-skip warnings.",
+      "recommendation": "Skip the image processing loop entirely for cached (dedup) results. Since the purpose of the dedup clone is to produce a matching tool_result for the LLM API's id-pairing requirement, the simplest fix is to strip images from the cloned output before the image loop: replace `cached.clone()` with a version that zeroes out the images field (e.g., `ToolOutput { images: vec![], ..cached.clone() }`). Alternatively, add a boolean `is_dedup: bool` flag to the output returned from the cache branch and skip the image processing block when it is true."
+    },
+    {
+      "id": "REL-002",
+      "title": "Error caching propagates send_message DB save failure to the duplicate as a phantom success",
+      "severity": "low",
+      "confidence": 0.78,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1579-1586",
+      "description": "When the first tool_use block for send_message fails at the DB save step (ctx.db.save_message returns Err), execute_tool propagates the anyhow::Error which becomes ToolOutput::error via the execute_tool wrapper. This error output IS cached in the executed HashMap. The duplicate block then receives a clone of the error output — which is correct for send_message (the message was not sent, so the duplicate should also reflect failure). However, the error in this case was a transient DB write failure, not a business-logic error. The duplicate inherits a non-retryable error string without any indication that retry might resolve the underlying condition.",
+      "impact": "If the DB layer was transiently unavailable during the first send_message execution, the duplicate silently inherits the failure rather than attempting a retry. For send_message specifically, this is actually the desired behavior (avoid double-send), but the logged warning at line 1580 only says 'duplicate tool_use block suppressed' with no indication that the underlying first execution also failed. This makes failure diagnosis harder in traces.",
+      "reproduction": "Simulate a transient SQLite lock error during save_message. Observe that both tool_result blocks in the LLM history show the DB error, but only one warn! log line mentions the suppression.",
+      "recommendation": "Low priority — the behavior (both blocks fail together) is actually correct for send_message semantics. Consider adding the first execution's is_error status to the dedup warning log line so operators can distinguish 'suppressed a success' from 'suppressed a failure': `warn!(trace_id, tool, step, cached_was_error = cached.is_error, \"duplicate tool_use block suppressed\")`."
+    },
+    {
+      "id": "REL-003",
+      "title": "Audit trail gap: duplicate tool_use produces two tool_result history entries but only one tool_calls DB row",
+      "severity": "low",
+      "confidence": 0.95,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": "1602-1645",
+      "description": "The save_tool_call DB write (lines 1602-1646) is inside the non-cache branch of the if-let-else. When dedup fires, the duplicate tool_use id receives a tool_result pushed to the conversation history (line 1715) but no corresponding row is written to the tool_calls SQLite table. The dashboard API endpoints (handle_tool_calls, handle_trace_tool_calls, handle_session_tool_calls in server/dashboard.rs) query the tool_calls table for observability. An observer correlating LLM API history (which shows two tool_results) with the dashboard tool_calls list (which shows one row) will see a discrepancy. The warn! log at line 1580 does indicate suppression, but the dashboard UI has no visibility into this.",
+      "impact": "Observability gap: the dashboard tool-calls panel will show 1 row while the raw LLM conversation contains 2 tool_result blocks. For audit purposes (e.g., compliance review of how many times send_message was invoked) the DB count is correct (once), but operators may not know to look for the warn! log to explain the mismatch.",
+      "reproduction": "Trigger dedup via a non-Anthropic provider. Inspect /api/v1/sessions/{id}/tool-calls — it will show fewer rows than the actual LLM conversation turn count.",
+      "recommendation": "Document the intentional discrepancy in the code comment at line 1562. Optionally: write a second tool_calls row for the duplicate with a `dedup_of` column referencing the first tool_id, or add a `suppressed_count` column to the existing row. Lowest-effort: expand the existing warn! log to include the original tool_id so log-based auditing can reconstruct the full picture."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-001",
+      "description": "tools_called HashSet (line 972) iterates raw response.content before dedup runs in process_tool_calls. A duplicate tool_use block adds the tool name to the set twice — but HashSet.insert is idempotent, so required_tools enforcement, completion-claim guard, and fabricated-action guard all see the correct unique set. No accounting risk from this path.",
+      "confidence": 0.95
+    },
+    {
+      "id": "RR-002",
+      "description": "Partial-move of ToolOutput fields: in the image-present else branch, output.content is moved into blocks (line 1675) and output.images is moved by the for loop (line 1677). output.is_error is subsequently read at line 1718. Because bool is Copy, Rust allows reading Copy fields from a partially-moved struct. This compiles and runs correctly — no partial-move bug.",
+      "confidence": 0.98
+    },
+    {
+      "id": "RR-003",
+      "description": "Timeout non-re-entry: a cached dedup hit does not re-enter tokio::time::timeout. This is correct — cache lookup is microsecond-scale and cannot meaningfully hang. No timeout reliability concern.",
+      "confidence": 0.97
+    },
+    {
+      "id": "RR-004",
+      "description": "send_message under dedup: the first invocation runs ctx.db.save_message + sender.send exactly once. The cached clone returns ToolOutput::success(\"Message sent.\") with empty images, so the second tool_result block in the LLM history also says 'Message sent.' — which is correct (the message was sent once). The dedup guard achieves the desired behavior of preventing double delivery.",
+      "confidence": 0.97
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-001",
+      "description": "No eval harness test exercises the dedup path with a tool that returns images (ToolOutput::success_with_images). The image budget double-decrement (REL-001) is only observable in a test that: (1) configures MockLlmProvider to emit two identical tool_use blocks in one response, (2) uses an exec-handler or mock tool returning images, and (3) asserts that the second tool_result does NOT contain the budget-exceeded marker.",
+      "priority": "medium"
+    },
+    {
+      "id": "TG-002",
+      "description": "No test asserts that the tool_calls DB table contains exactly one row when dedup fires (as opposed to two). Adding such an assertion to an eval test would document the intentional audit-trail behavior described in REL-003 and prevent future regressions if the dedup path is accidentally changed to write two rows.",
+      "priority": "low"
+    },
+    {
+      "id": "TG-003",
+      "description": "No test covers the case where the first (real) invocation errors and the duplicate inherits that error. For send_message specifically: if save_message fails, both tool_results show the error, yet the warn! log only mentions suppression. A test asserting both the DB state (no message saved) and the tool_result content (error propagated) would close this gap.",
+      "priority": "low"
+    }
+  ]
+}

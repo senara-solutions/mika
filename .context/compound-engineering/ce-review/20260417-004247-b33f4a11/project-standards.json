@@ -1,0 +1,23 @@
+{
+  "reviewer": "project-standards",
+  "findings": [],
+  "residual_risks": [
+    {
+      "area": "serde_json::to_string silently swallowed on dedup key",
+      "detail": "Line 1577 uses serde_json::to_string(arguments).unwrap_or_default() to build the dedup key. If serialization produced an empty string for two semantically different Values (e.g., serde_json bug or future type change), two distinct tool calls would be incorrectly collapsed. In practice serde_json::Value serialization is infallible for any Value, so this is negligible. The same pattern already exists at line 1619 for the DB path, making this consistent with established codebase style. No standards rule is violated; risk is noted for awareness.",
+      "severity": "negligible"
+    },
+    {
+      "area": "ToolOutput::Clone adds image buffer clone cost",
+      "detail": "Images are base64 String fields already capped by MAX_IMAGE_BYTES_PER_STEP. Clone cost is bounded. Duplicate tool_use blocks with images are extremely rare. No standards violation; noted for awareness.",
+      "severity": "negligible"
+    }
+  ],
+  "testing_gaps": [
+    {
+      "gap": "No inline unit test for ToolOutput::Clone round-trip",
+      "detail": "The plan (Implementation Units, Unit 1, Test scenarios) listed a small inline #[cfg(test)] mod tests unit test for ToolOutput::Clone round-trip as optional. It was not added. Root CLAUDE.md convention is '#[cfg(test)] mod tests inline in each module'. Because the derive is mechanical and covered implicitly by the eval test, this is minor, but the stated plan intent was not fulfilled.",
+      "severity": "low"
+    }
+  ]
+}

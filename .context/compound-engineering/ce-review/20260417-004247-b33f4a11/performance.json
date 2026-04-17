@@ -1,0 +1,34 @@
+{
+  "reviewer": "performance",
+  "findings": [
+    {
+      "id": "PERF-001",
+      "title": "Redundant serde_json serialization of arguments on non-duplicate path: dedup key (line 1577) and DB save (line 1619) are identical serializations",
+      "severity": "low",
+      "confidence": 0.68,
+      "file": "crates/mika-agent/src/agent.rs",
+      "lines": [1577, 1589, 1619],
+      "description": "Each non-duplicate tool block serializes `arguments` (a &serde_json::Value) three times: line 1577 via serde_json::to_string for the dedup key string, line 1589 via arguments.to_string() (Display impl, equivalent to serialization) for input_summary, and line 1619 via serde_json::to_string for the DB save input_json. Lines 1577 and 1619 produce identical strings. The line-1577 serialization is the only new allocation introduced by this PR; lines 1589 and 1619 pre-existed. For typical tool arguments (small JSON objects, well under 1 KB), each serialization costs microseconds and a few hundred bytes. For the largest possible inputs near MAX_PAYLOAD_BYTES (200 KB, e.g. write_workspace content), three serializations allocate ~600 KB of short-lived intermediate strings per tool block. At max 20 tool steps per turn with up to 5 blocks per step (worst case 100 blocks), and with MIKA_STORE_TOOL_CALLS=true (production default), the worst-case transient overhead is ~60 MB of allocations per turn — all immediately freed per-block. This is bounded and not a leak. The function is not a hot loop: async I/O (execute_tool, DB save) dominates wall time between blocks.",
+      "impact": "Not production-observable under normal workloads. The extra allocation per block from line 1577 is completely masked by the execute_tool latency (30s timeout, async I/O). Only visible in allocation profiling under adversarial inputs at maximum payload size.",
+      "recommendation": "The dedup key string from line 1577 could be reused as input_json at line 1619, eliminating one serde_json::to_string call. This is a minor code tidy-up: hoist the dedup string binding before the if/else and shadow input_json with a reference to it inside the store_tool_calls block. Not a performance fix — do only if the three-serialization pattern is already flagged in an allocation profile."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-001",
+      "description": "The review brief's concern about 'clone TWICE on the duplicate path' does not match the implementation. On the cache-hit path (line 1586), there is exactly one clone: cached.clone() produces output, which is then moved into content-building at lines 1672-1677. On the cache-miss path (line 1667), there is exactly one clone into the executed map, then the original output is moved out and consumed. No double-clone occurs on either path.",
+      "severity": "informational"
+    },
+    {
+      "id": "RR-002",
+      "description": "Image-bearing ToolOutput clone into executed map (line 1667): if a tool returns images (up to 5x5 MB base64 strings per the exec handler protocol), the cache-miss clone doubles the image payload in memory for the function lifetime (until HashMap is dropped at line 1735). The per-step image budget is capped at MAX_IMAGE_BYTES_PER_STEP = 20 MB by the inclusion loop at lines 1677-1688, so actual peak overhead is bounded. Duplicate image-returning tool blocks are not a realistic scenario — the dedup guard is a defense against provider-side glitches, not repeated large-output tools.",
+      "severity": "informational"
+    },
+    {
+      "id": "RR-003",
+      "description": "HashMap vs Vec linear scan for dedup storage: at N=1-5 tool blocks per LLM response step (observed typical range), a Vec<((String,String), ToolOutput)> with linear key search would avoid the HashMap bucket allocation and hashing overhead. However the performance difference at N<20 is unmeasurable in practice, and HashMap degrades more gracefully if a provider ever emits a pathologically large number of duplicate blocks.",
+      "severity": "informational"
+    }
+  ],
+  "testing_gaps": []
+}

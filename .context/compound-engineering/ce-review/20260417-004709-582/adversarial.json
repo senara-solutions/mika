@@ -1,0 +1,103 @@
+{
+  "reviewer": "adversarial",
+  "findings": [
+    {
+      "id": "ADV-001",
+      "title": "Image budget double-consumed by cached duplicate: single large image can exhaust 40 MB of the 20 MB step budget",
+      "severity": "medium",
+      "confidence": 0.95,
+      "autofix_class": "manual",
+      "owner": "downstream-resolver",
+      "evidence": [
+        "The image budget deduction block (agent.rs lines 1671-1682) is OUTSIDE the dedup branch. It runs for every tool_use block, whether the output came from cache or from a fresh execution.",
+        "Trigger: LLM emits two identical tool_use blocks for a vision/screenshot tool (e.g. browser-control) that returns a 15 MB base64 image in ToolOutput.images.",
+        "Step 1: First block executes, output with 15 MB image stored in `executed` cache, image_bytes_budget decremented from 20 MB to 5 MB.",
+        "Step 2: Second (duplicate) block hits the cache branch at line 1579, returns the cached ToolOutput (clone includes full 15 MB image Vec).",
+        "Step 3: Code falls through to line 1671 outside the branch — image_count is non-zero, the loop at line 1677 checks img_bytes (15 MB) > image_bytes_budget (5 MB), breaks immediately.",
+        "Step 4: included==0, so the fallback at line 1699 produces a text-only result for the SECOND tool_result, but still consumed 0 budget. Actually the first run already consumed 15 MB, so the second has only 5 MB left — this is fine for that specific case.",
+        "ACTUAL HARM PATH: LLM emits [A(img=11MB), B(img=11MB), A(img=11MB)]. First A executes, budget=9MB. B executes (different key), budget fails (11>9), B gets '[1 image skipped]'. Third block A hits cache — output.images still has the 11 MB clone — loop checks 11 MB > 9 MB, skips image, emits text-only tool_result. The LEGITIMATE tool B was starved because the duplicate A consumed budget on first run, leaving B unable to include its image. The duplicate then re-consumed 0 budget but the damage is already done via the initial execution path.",
+        "More precisely: the dedup guard prevents re-execution but the cached ToolOutput.images are still cloned and fed into the budget-check path, so N identical image-producing tool blocks will attempt (and fail) to each consume N*img_size against the 20 MB limit. Each failed attempt silently degrades the tool_result for legitimate downstream blocks."
+      ],
+      "suggested_fix": "After retrieving from cache, construct the tool_result using only the text content of the cached output (skip image blocks entirely or re-check against remaining budget before re-cloning images). Or: zero out images in the cached ToolOutput copy: `let mut output = cached.clone(); output.images.clear();` when constructing the duplicate result. The LLM already saw the image in the first tool_result — re-sending it is wasteful and budget-dangerous."
+    },
+    {
+      "id": "ADV-002",
+      "title": "send_message dedup silently suppresses DB persist + external delivery for duplicate: user never receives second notification",
+      "severity": "high",
+      "confidence": 0.92,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "evidence": [
+        "send_message.execute() has two side effects: (1) ctx.db.save_message() persists the outbound message to conversation history, and (2) sender.send() delivers it externally via Telegram gateway.",
+        "If an LLM emits two identical send_message({text: 'Your report is ready'}) blocks in one turn, the dedup guard executes the tool once, caches ToolOutput::success('Message sent.'), and returns the cached output for the duplicate.",
+        "The second send_message call never reaches execute(), so the second save_message() and sender.send() are both skipped.",
+        "The cached ToolOutput content is 'Message sent.' — the LLM sees this as success for both blocks and has no reason to retry.",
+        "The conversation history contains exactly one copy of the outbound message, and Telegram receives it exactly once. This is the intended behavior for the dedup guard.",
+        "HOWEVER: the scenario that triggered #582 is a provider bug where the LLM emitted send_message twice for ONE intended send. The guard correctly handles this. But consider a legitimate case: a skill that intentionally calls send_message({text:'Draft'}) then send_message({text:'Draft'}) to send the same notification to two different recipients — this is architecturally blocked. More realistically, a reminder skill that builds two reminders with identical text in the same turn will have the second delivery silently dropped with no error surfaced to the LLM.",
+        "The guard is correct for the bug case but creates a new behavioral assumption: any skill or agent pattern that legitimately sends identical messages twice in one turn is now broken without any warning visible in the tool_result. The LLM receives 'Message sent.' for both and has no signal that the second was suppressed."
+      ],
+      "suggested_fix": "Consider whether send_message should be exempt from dedup (stateful delivery tools differ from idempotent read tools). Alternatively, make the cached tool_result for send_message return a distinct content like 'Duplicate suppressed — message was already sent this turn.' so the LLM has an accurate model of what happened. The warn! log fires but the LLM never sees it."
+    },
+    {
+      "id": "ADV-003",
+      "title": "OpenAI-compatible provider key-order bypass: semantically identical args with different JSON key order produce different dedup keys",
+      "severity": "low",
+      "confidence": 0.88,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "evidence": [
+        "The dedup key is (name, serde_json::to_string(arguments).unwrap_or_default()).",
+        "serde_json::to_string on a serde_json::Value::Object preserves insertion order. Two Value::Object instances with the same keys and values but different insertion order produce different serialized strings.",
+        "For Anthropic (primary provider): the input field is deserialized from JSON and the key order is determined by the raw JSON bytes from the API. Claude API typically returns consistent key ordering within a single response, so two identical tool_use blocks will have identical byte-order and will be caught.",
+        "For OpenAI-compatible providers (openai.rs line 627-641): arguments are parsed from tc.function.arguments (a String) via serde_json::from_str::<Value>(). serde_json::Map preserves insertion order from the source string. If the provider returns two tool calls with identical parameters but one has {\"a\":1,\"b\":2} and the other has {\"b\":2,\"a\":1}, these produce different dedup keys.",
+        "Trigger: OpenRouter with a Mistral or GPT model emits two identical tool calls where arguments have different key ordering. The dedup guard misses the duplicate, the tool executes twice.",
+        "The plan explicitly accepts this as 'fail open' — the guard fires on byte-identical duplicates, not semantic-identical ones. This is documented. The risk is: for tools with side effects (send_message, store_fact, create_work_item), the second execution produces the harmful outcome the guard was designed to prevent.",
+        "This is not a regression (pre-fix also executed twice), but it means the guard's protection is provider-dependent. On non-Anthropic providers it may not fire for the exact bug class #582 was targeting."
+      ],
+      "suggested_fix": "Consider canonicalizing the arguments Value before serializing: sort object keys recursively before serde_json::to_string. This provides semantic dedup instead of byte-identical dedup. Cost: one extra allocation per tool call (negligible)."
+    },
+    {
+      "id": "ADV-004",
+      "title": "Interleaved duplicate pattern [A, B, A] emits one summary for A but two tool_results — conversation history has mismatched cardinality",
+      "severity": "low",
+      "confidence": 0.82,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "evidence": [
+        "When LLM emits [A, B, A]: first A executes, summary pushed, result pushed. B executes, summary pushed, result pushed. Second A hits cache — no summary pushed (summaries.push is inside the else branch at line 1658), but tool_result IS pushed (line 1715 is outside the branch).",
+        "Result: summaries vec has 2 entries [A, B], tool_results vec has 3 entries [A, B, A].",
+        "The tool_results are attached to the conversation via request.messages (line 1715 appends to tool_results which are later pushed). The assistant message contains 3 tool_use blocks (from response_content_to_blocks at line 1724). The subsequent user message must contain exactly 3 tool_result blocks to satisfy the API.",
+        "tool_results has 3 entries matching 3 assistant tool_use blocks — so the API pairing IS correct.",
+        "However, the summaries used for messages.metadata (line 892) has only 2 entries, not 3. The tool_call_summaries fed into format_step_exceeded_fallback (line 387) will not include the second A execution. This is cosmetic — observability shows one fewer tool invocation than actually occurred in the conversation.",
+        "The DB tool_calls table also has only 1 row for A (correct — tool ran once). The discrepancy is between: conversation history (3 tool_use/result pairs, semantically correct) vs metadata/DB (2 records). A human or agent reading the timeline will see 2 tool calls but the LLM turn had 3 tool_use blocks."
+      ],
+      "suggested_fix": "For the cached path, push a lightweight summary entry indicating suppression (e.g., ToolCallSummary with name=name, success=true, output_summary='[deduped]'). This keeps cardinality consistent between tool_results and summaries."
+    },
+    {
+      "id": "ADV-005",
+      "title": "Cascade: create_work_item duplicate guard bypassed if reference_url differs, but dedup guard fires — DB unique index and dedup guard operate on different keys",
+      "severity": "low",
+      "confidence": 0.72,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "evidence": [
+        "The dedup guard keys on (tool_name, full_args_json). create_work_item takes title, description, reference_url, and optionally type/parent_task_id.",
+        "If the LLM emits two identical create_work_item calls with the same title+reference_url, the dedup guard fires correctly — tool runs once, DB unique index on reference_url is never tested against the duplicate.",
+        "Inverse case: the DB has its own idempotency guard (idx_tasks_manual_active_ref_url partial unique index, and label case-insensitive pre-check). These guards exist precisely because the LLM might call create_work_item twice across separate TURNS. The dedup guard now handles the within-turn case.",
+        "Interaction risk: if two work items are created in the same turn with the SAME title but DIFFERENT reference_urls, the dedup key is different (args differ), both execute, and the DB label pre-check fires for the second one — returning a JSON error to the LLM. This is correct behavior, not a regression.",
+        "However: if the LLM emits [create_work_item(title=X, ref=Y), create_work_item(title=X, ref=Y)] — exactly identical — the dedup fires, only one DB row created, second gets cached 'Created.' response. LLM sees two successes but only one item exists. If the agent logic (e.g. a skill) then calls update_work_item_status on both 'created' items using the IDs from the responses, it will try to use the same ID twice — the second update will succeed (idempotent status transition) or fail depending on state. No data corruption, but the agent's mental model is wrong."
+      ],
+      "suggested_fix": "No code change required. Document in the warn! log that the LLM will receive 'success' for the duplicate with the same ID as the first execution. Skills that parse tool_result JSON to extract IDs should handle duplicate IDs in the same turn."
+    }
+  ],
+  "residual_risks": [
+    "The guard is strictly within one process_tool_calls invocation. A tool emitted in step N and again in step N+1 (across agent loop iterations) is not deduplicated. This is documented and intentional.",
+    "serde_json::Value never fails to serialize (all variants are representable as JSON), so the unwrap_or_default() fallback to empty string is unreachable in practice — but if it fires due to a future Value variant, two different-valued tools with unparseable args would share the key '' and the second would be incorrectly suppressed.",
+    "The executed HashMap is not bounded. An adversarial LLM emitting N distinct tool calls in one response accumulates N ToolOutput entries in memory. Each ToolOutput can hold up to MAX_PAYLOAD_BYTES (200 KB) of content. With 20 tool steps and no per-step cap on distinct tools, this is bounded by the tool step limit and existing tool output size caps — not a new risk introduced by this diff."
+  ],
+  "testing_gaps": [
+    "No eval test for [A, B, A] interleaved pattern — only back-to-back [A, A] is implied by the fix description.",
+    "No eval test for image-producing tools with duplicates verifying that budget accounting is correct.",
+    "No eval test for send_message dedup in silent mode (where the missing DB persist has observability consequences)."
+  ]
+}

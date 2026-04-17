@@ -137,7 +137,7 @@ pub struct ImageData {
 }
 
 /// Result of a tool execution.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,

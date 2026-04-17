@@ -1559,6 +1559,12 @@ async fn process_tool_calls(
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
     let mut image_bytes_budget = MAX_IMAGE_BYTES_PER_STEP;
+    // Per-turn dedup: if the LLM emits two tool_use blocks with identical
+    // (name, arguments) in a single response, execute the tool once and reuse
+    // the cached output for subsequent blocks. This defends the engine against
+    // provider-side tool_use duplication (see #582). Scope is strictly this
+    // function call — duplicates across steps or turns are unaffected.
+    let mut dedup_cache: HashMap<(String, String), ToolOutput> = HashMap::new();
     for block in &response_content {
         if let LlmResponseContent::ToolCall {
             id,
@@ -1566,85 +1572,112 @@ async fn process_tool_calls(
             arguments,
         } = block
         {
-            debug!(tool = %name, "executing tool");
-            let input_summary = truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
-            let dispatch = ToolDispatchCtx {
-                tools,
-                skill_tools,
-                ctx: tool_ctx,
-                skill_timeout,
-                mcp_manager,
-                long_running_ctx,
-            };
-            let tool_start = std::time::Instant::now();
-            let output = execute_tool(&dispatch, name, arguments.clone()).await;
-            let tool_latency_ms = tool_start.elapsed().as_millis() as u64;
+            let dedup_key = (
+                name.clone(),
+                serde_json::to_string(arguments).unwrap_or_default(),
+            );
+            let output = if let Some(cached) = dedup_cache.get(&dedup_key) {
+                warn!(
+                    trace_id = %tool_ctx.trace_id,
+                    tool = %name,
+                    step,
+                    cached_was_error = cached.is_error,
+                    "duplicate tool_use block suppressed; reusing prior result"
+                );
+                // Clone the cached result but strip images: the LLM already
+                // received them in the tool_result paired with the first
+                // duplicate's id, so re-emitting them would both waste the
+                // shared `image_bytes_budget` and send redundant bytes on
+                // the API request. Text content is preserved so the
+                // duplicate tool_use id still gets a meaningful pair.
+                let mut reused = cached.clone();
+                reused.images.clear();
+                reused
+            } else {
+                debug!(tool = %name, "executing tool");
+                let input_summary = truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
+                let dispatch = ToolDispatchCtx {
+                    tools,
+                    skill_tools,
+                    ctx: tool_ctx,
+                    skill_timeout,
+                    mcp_manager,
+                    long_running_ctx,
+                };
+                let tool_start = std::time::Instant::now();
+                let output = execute_tool(&dispatch, name, arguments.clone()).await;
+                let tool_latency_ms = tool_start.elapsed().as_millis() as u64;
 
-            // Record full tool call in database
-            if store_tool_calls {
-                let tool_id = uuid::Uuid::new_v4().to_string();
-                let (tool_source, tool_skill_name) = if tools.get(name).is_some() {
-                    ("builtin", None)
-                } else if let Some(st) = skill_tools.get(name.as_str()) {
-                    let sn = st
-                        .skill_dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    ("skill", Some(sn))
-                } else {
-                    ("mcp", None)
-                };
-                let non_zero = !output.is_error && has_non_zero_exit_prefix(&output.content);
-                let input_json = serde_json::to_string(arguments).unwrap_or_default();
-                let err_msg = if output.is_error {
-                    Some(output.content.as_str())
-                } else {
-                    None
-                };
-                if let Err(e) = db
-                    .save_tool_call(
-                        &tool_id,
-                        session_id,
-                        Some(tool_ctx.trace_id),
-                        llm_call_id,
-                        step,
-                        name,
-                        tool_source,
-                        tool_skill_name.as_deref(),
-                        Some(&input_json),
-                        Some(&output.content),
-                        !output.is_error && !non_zero,
-                        non_zero,
-                        tool_latency_ms,
-                        err_msg,
-                    )
-                    .await
-                {
-                    warn!(tool = %name, error = %e, "failed to save tool_call record");
+                // Record full tool call in database
+                if store_tool_calls {
+                    let tool_id = uuid::Uuid::new_v4().to_string();
+                    let (tool_source, tool_skill_name) = if tools.get(name).is_some() {
+                        ("builtin", None)
+                    } else if let Some(st) = skill_tools.get(name.as_str()) {
+                        let sn = st
+                            .skill_dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        ("skill", Some(sn))
+                    } else {
+                        ("mcp", None)
+                    };
+                    let non_zero = !output.is_error && has_non_zero_exit_prefix(&output.content);
+                    let input_json = serde_json::to_string(arguments).unwrap_or_default();
+                    let err_msg = if output.is_error {
+                        Some(output.content.as_str())
+                    } else {
+                        None
+                    };
+                    if let Err(e) = db
+                        .save_tool_call(
+                            &tool_id,
+                            session_id,
+                            Some(tool_ctx.trace_id),
+                            llm_call_id,
+                            step,
+                            name,
+                            tool_source,
+                            tool_skill_name.as_deref(),
+                            Some(&input_json),
+                            Some(&output.content),
+                            !output.is_error && !non_zero,
+                            non_zero,
+                            tool_latency_ms,
+                            err_msg,
+                        )
+                        .await
+                    {
+                        warn!(tool = %name, error = %e, "failed to save tool_call record");
+                    }
                 }
-            }
+
+                let image_count = output.images.len();
+                let output_summary = if image_count > 0 {
+                    truncate_summary(
+                        &format!("{} [+{image_count} image(s)]", output.content),
+                        OUTPUT_SUMMARY_MAX,
+                    )
+                } else {
+                    truncate_summary(&output.content, OUTPUT_SUMMARY_MAX)
+                };
+                let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
+                summaries.push(ToolCallSummary {
+                    step,
+                    name: name.clone(),
+                    input_summary,
+                    output_summary,
+                    success: !output.is_error && !non_zero_exit,
+                    non_zero_exit,
+                });
+
+                dedup_cache.insert(dedup_key, output.clone());
+                output
+            };
 
             let image_count = output.images.len();
-            let output_summary = if image_count > 0 {
-                truncate_summary(
-                    &format!("{} [+{image_count} image(s)]", output.content),
-                    OUTPUT_SUMMARY_MAX,
-                )
-            } else {
-                truncate_summary(&output.content, OUTPUT_SUMMARY_MAX)
-            };
-            let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
-            summaries.push(ToolCallSummary {
-                step,
-                name: name.clone(),
-                input_summary,
-                output_summary,
-                success: !output.is_error && !non_zero_exit,
-                non_zero_exit,
-            });
-
             let content = if output.images.is_empty() {
                 LlmToolResultContent::Text(output.content)
             } else {

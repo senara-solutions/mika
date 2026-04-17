@@ -1,0 +1,24 @@
+{
+  "review": "agent-native",
+  "issue": 582,
+  "branch": "feat/582/send-message-emitted-twice-in-same-turn-",
+  "base": "57417ab7abd7aba1778a636ed536ac23185c339b",
+  "verdict": "PASS",
+  "score": "no parity delta — engine-internal change only",
+  "summary": "The fix introduces a per-turn dedup HashMap inside process_tool_calls(). It adds Clone to ToolOutput, adds one warn! log, and adds a regression eval test. No user-facing actions were added. No agent tools were added, removed, or restricted. No system-prompt content was changed. The change is invisible above the tool-dispatch layer.",
+  "findings": {
+    "critical": [],
+    "warnings": [],
+    "observations": [
+      {
+        "id": "OBS-01",
+        "description": "The warn! log ('duplicate tool_use block suppressed') lands only in the structured log file. The dashboard has no warn-level anomaly surface. If provider-side duplication becomes frequent, operators have no automated alert path — they must grep logs. This is consistent with existing warn! usage in the codebase and is advisory only.",
+        "recommendation": "No action required now. If recurrence rate needs tracking, a counter in the llm_calls or a separate anomaly table could surface it in the dashboard Timeline view."
+      }
+    ]
+  },
+  "action_parity_delta": "none",
+  "context_parity_delta": "none",
+  "capability_removed": false,
+  "new_user_only_action": false
+}

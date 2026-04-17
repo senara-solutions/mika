@@ -1,0 +1,77 @@
+{
+  "run_id": "20260417-004247-b33f4a11",
+  "reviewer": "agent-native-architecture",
+  "subject": "Per-turn tool_use dedup guard (#582)",
+  "base_commit": "57417ab7abd7aba1778a636ed536ac23185c339b",
+  "verdict": "PASS",
+  "score": {
+    "high_priority_capabilities_agent_accessible": "N/A — no new user-facing capability added",
+    "parity_preserved": true
+  },
+  "analysis": {
+    "action_parity": {
+      "assessment": "preserved",
+      "detail": "Dedup is an engine-internal guard. No new user action is introduced. No corresponding agent tool gap is created. The LLM (agent) still receives both tool_result blocks in the conversation history (one real, one cached clone), preserving full API-level visibility into what the turn produced. The suppression is transparent to the LLM by design."
+    },
+    "context_parity": {
+      "assessment": "gap — low priority",
+      "detail": "When the guard fires, only a warn!() log is emitted (trace_id, tool, step). The LLM agent cannot discover that dedup occurred. The tool_calls DB table records the first execution only (save_tool_call is inside the else branch, not reached on the cache-hit path). No audit_event is written. Comparable engine-level events (webhook_deferred, webhook_replayed, verdict_handled) all write audit_events that are then queryable via list_audit_events and query_timeline. The dedup event is the only engine-level guard of comparable significance that lacks an audit_event entry.",
+      "comparable_guards_with_audit_events": [
+        "webhook_deferred (handlers.rs:156)",
+        "webhook_replayed (handlers.rs:655)",
+        "verdict_handled (verdict_handler.rs:276)"
+      ]
+    },
+    "tool_design": {
+      "assessment": "not applicable — no new tool",
+      "detail": "No tool was added or modified. The guard is purely internal."
+    },
+    "shared_workspace": {
+      "assessment": "preserved",
+      "detail": "Guard operates in the same process and DB as all other agent-turn logic. No separate sandbox or divergent data path introduced."
+    },
+    "autonomous_session_visibility": {
+      "assessment": "gap — low priority",
+      "detail": "Claude-pilot / mika-dev sessions have no structured channel to observe dedup firing. The warn!() log is written to the mika-server log file (MIKA_SERVER_LOG_FILE), which is not surfaced to the mika-dev permission callback (canUseTool). Autonomous agents using list_audit_events or query_timeline to self-diagnose anomalies would not see dedup suppression events, whereas they can see webhook_deferred, webhook_replayed, and verdict_handled. If a provider regression caused repeated dedup firing, autonomous sessions could not detect the pattern without parsing raw logs."
+    },
+    "documentation": {
+      "assessment": "adequate for operators; not agent-discoverable",
+      "detail": "CLAUDE.md (crates/mika-agent/CLAUDE.md line 15) has a clear paragraph documenting the guard: name, mechanism, scope, and warn! log fields. This is discoverable by Claude Code reading the codebase but is not injected into the agent system prompt and not reachable via any introspection tool."
+    }
+  },
+  "findings": [
+    {
+      "id": "AN-001",
+      "severity": "observation",
+      "priority": "low",
+      "title": "Dedup suppression not recorded as audit_event",
+      "location": "crates/mika-agent/src/agent.rs:1579-1586",
+      "description": "When the dedup cache hit fires, only warn!() is emitted. Comparable engine-level events (webhook_deferred, webhook_replayed, verdict_handled) write audit_events that agents can query via list_audit_events and query_timeline. A tool_use_dedup_suppressed audit event would make anomalous provider behaviour diagnosable by autonomous sessions without log access.",
+      "recommendation": "Consider calling db.log_audit_event on the cache-hit path with event_name='tool_use_dedup_suppressed', target_key=name, before_value=None, after_value=None, trace_id=tool_ctx.trace_id. Not required for correctness but would close the introspection gap.",
+      "confidence": 0.92
+    },
+    {
+      "id": "AN-002",
+      "severity": "observation",
+      "priority": "low",
+      "title": "Duplicate tool_use block not recorded in tool_calls table",
+      "location": "crates/mika-agent/src/agent.rs:1602-1645",
+      "description": "save_tool_call is inside the else branch; the cache-hit path skips DB persistence entirely. If an operator queries tool_calls history to investigate a provider regression, they see only one invocation per step, with no indication a second block was suppressed. This is consistent with the 'run once' semantics described in CLAUDE.md but creates a silent gap in the DB record of the turn.",
+      "recommendation": "Either document in save_tool_call's comment that duplicates are not recorded (for operator clarity), or save a second row with a suppressed=true flag or an error-like note in the output field. Low priority — the warn! log carries enough signal for debugging.",
+      "confidence": 0.85
+    }
+  ],
+  "what_is_working_well": [
+    "Dedup key is (name, serialized arguments) — precise and reproducible across providers.",
+    "Both tool_result blocks are still pushed to the LLM request, preserving API-level conversation pairing semantics.",
+    "CLAUDE.md documents the guard clearly with issue number, scope, and log fields.",
+    "warn!() includes trace_id, tool name, and step number — sufficient for operator log-based debugging.",
+    "Guard is scoped strictly to a single process_tool_calls invocation; cross-step and cross-turn dedup are explicitly excluded, preventing over-suppression."
+  ],
+  "no_action_needed": [
+    "No new user-facing action was added, so no tool gap exists.",
+    "Agent system prompt does not need updating — the guard is invisible to the LLM by design and there is no new capability to advertise.",
+    "No schema change, so no migration gap.",
+    "The LLM history has both tool_result blocks, so the LLM cannot observe the suppression and cannot be confused by it."
+  ]
+}
