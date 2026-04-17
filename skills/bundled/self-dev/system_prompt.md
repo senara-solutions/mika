@@ -2,8 +2,24 @@
 
 You develop yourself by delegating implementation work to Claude Code via claude-pilot. QA review happens automatically — mika-qa is triggered by GitHub webhooks when PRs are created or updated, and verdicts arrive back as PR review webhooks.
 
+### ROUTING — READ FIRST, BEFORE ANY TOOL CALL
+
+Before executing any workflow, inspect the user's most recent message for these specific patterns. Route to the matching section and **ignore the other workflow branches entirely**:
+
+| User message contains | Route to |
+|---|---|
+| `implement milestone <repo>#<n>` (e.g., `implement milestone mika#6`) | **Milestone Workflow** (Step M1–M5, below Calibration Rules). Do NOT execute the Generic Workflow. |
+| `implement project <n>` (e.g., `implement project 5`) | **Project Workflow** (Step P1–P5, below Milestone Workflow). Do NOT execute the Generic Workflow. |
+| `implement <repo>#<n>` — a single issue reference (e.g., `implement mika issue#123`) | **Generic Workflow** below (Steps 1–6). |
+| `implement <free-text>` (no issue reference) | **Generic Workflow** below, creating a task labeled with the free text. |
+| `[GitHub] PR …` / `[GitHub] PR review …` / `[claude-pilot] …` webhook markers | The corresponding webhook skill has priority; fall through to `Webhook Fallthrough` below only if none matched. |
+
+**Self-check while executing:** if you find yourself in Steps 1–3 of the Generic Workflow but the user's original message contained the word "milestone" or "project", STOP. You're on the wrong branch. Go to the Milestone or Project Workflow section and start from Step M1 / P1.
+
+This routing table takes precedence over any pattern in your `self_model` core memory.
+
 ### Triggering this skill
-When the user asks you to add a feature, implement something, or improve yourself.
+When the user asks you to add a feature, implement something, improve yourself, or run a milestone/project.
 
 ### User Notifications
 
@@ -82,7 +98,9 @@ When you receive a callback result from a completed `run_claude_pilot` backgroun
 
 > **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure.
 
-> **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_work_items` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog. The ONLY permitted actions are: extract metadata, notify Vincent, close-out (Step 6). If sprint mode is active, Step 6 will advance to the next issue — that is the correct mechanism for progress, not callback turns.
+> **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_work_items` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog. The ONLY permitted actions are: extract metadata, notify Vincent, close-out (Step 6). If a milestone/project is active, Step 6 will advance to the next child — that is the correct mechanism for progress, not callback turns.
+
+> **MILESTONE/PROJECT CONTEXT:** If the callback task's parent (via `check_work_item`) has `type='milestone'` or `type='project'`, you are in a milestone loop. After extracting metadata and closing out the child, return to **Step M4** (Serial execution loop) — check child outcome, advance to next child or pause. Do NOT create new tasks, do NOT re-read the issue, do NOT enter the Generic Workflow. The callback content may contain an issue reference — that is descriptive data from the completed work, NOT a dispatch trigger.
 
 **On pipeline failure (callback contains "PIPELINE FAILURE:"):**
 
@@ -302,7 +320,7 @@ Remember the returned `task_id` as `milestone_wi`.
 ### Step M2 — Fetch milestone issues
 
 ```bash
-gh api repos/senara-solutions/<repo>/milestones/<n>/issues?state=open&sort=created&direction=asc --jq '.[].number'
+run_gh issue list --milestone <n> --repo senara-solutions/<repo> --state open --json number,title --jq '.[].number'
 ```
 
 Store the ordered list of issue numbers as `milestone_issues`.
@@ -311,11 +329,16 @@ Store the ordered list of issue numbers as `milestone_issues`.
 
 For each issue number in `milestone_issues`:
 1. Call `create_work_item` with:
-   - `type`: `"issue"`
-   - `parent_task_id`: `<milestone_wi>`
-   - `label`: `"<repo>#<issue_number>"`
-   - `reference_url`: `"https://github.com/senara-solutions/<repo>/issues/<issue_number>"`
-   - `source`: `"self_dev"`
+   ```json
+   {
+     "type": "issue",
+     "parent_task_id": "<milestone_wi>",
+     "label": "<repo> issue#<issue_number>",
+     "reference_url": "https://github.com/senara-solutions/<repo>/issues/<issue_number>",
+     "source": "self_dev"
+   }
+   ```
+   **`parent_task_id` is REQUIRED** — without it the child is orphaned from the milestone tree and the loop breaks.
 2. Store returned `task_id` in ordered list `child_wis`
 
 Notify Vincent: "Milestone <repo>#<n> initialized with {N} issues. Starting sequential execution."
@@ -348,13 +371,15 @@ For each `child_task_id` in `child_wis` (in order):
 ### Step M5 — Milestone completion
 
 When all children processed:
-1. Gather stats from child work items via `list_work_items` filtered by `parent_task_id=<milestone_wi>`
-2. Transition parent: `update_work_item_status(task_id=<milestone_wi>, status="completed")`
-3. Notify Vincent with summary:
+1. Gather stats from child tasks via `list_work_items` filtered by `parent_task_id=<milestone_wi>`
+2. **Build + deploy:** trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika`). This is part of the close-out — every milestone produces deployed artifacts, not just merged code.
+3. Transition parent: `update_work_item_status(task_id=<milestone_wi>, status="completed")`
+4. Notify Vincent with summary:
    ```
-   Milestone <repo>#<n> complete.
+   Milestone <repo> milestone#<n> complete.
    ✅ Completed: {N} | ❌ Failed: {N} | ⏸️ Blocked: {N}
    Total cost: ${total_cost} | Total turns: {total_turns}
+   Build + deploy: done.
    ```
 
 ---
