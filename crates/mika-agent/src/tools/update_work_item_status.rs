@@ -61,7 +61,9 @@ impl Tool for UpdateWorkItemStatusTool {
                 Only works on manual work items, not system tasks (reminders, callbacks, etc.). \
                 Transitions are validated: pending can go to any status; in_progress can go to \
                 blocked/completed/cancelled; blocked can go to in_progress/completed/cancelled. \
-                Completed and cancelled are terminal — cannot be changed. \
+                Completed and cancelled are terminal — status cannot be changed, but metadata \
+                can still be attached by passing the metadata field (the status field is ignored \
+                in that case and the call succeeds). \
                 Every transition is logged as an audit event. \
                 Optionally attach or merge structured metadata (JSON object) on the work item."
                 .to_string(),
@@ -206,18 +208,30 @@ impl Tool for UpdateWorkItemStatusTool {
         // Validate the transition against the state machine
         if !is_valid_transition(&old_status, status) {
             let allowed = allowed_transitions(&old_status);
-            return if allowed.is_empty() {
-                Ok(ToolOutput::error(format!(
+
+            // Terminal-state metadata fallback (#617): when the task is in a terminal
+            // state and the caller provided metadata, apply the metadata and skip the
+            // status change instead of rejecting the entire call. This prevents
+            // late-arriving callbacks from losing metadata on tasks that were already
+            // completed by a faster structural handler.
+            if allowed.is_empty() {
+                if let Some(new_meta) = metadata_input {
+                    merge_and_persist_metadata(task_id, new_meta, ctx).await?;
+                    return Ok(ToolOutput::success(format!(
+                        "Status unchanged ('{old_status}' is terminal). Metadata updated."
+                    )));
+                }
+                return Ok(ToolOutput::error(format!(
                     "Cannot transition from '{old_status}' to '{status}'. \
                      '{old_status}' is a terminal state — completed and cancelled work items cannot be changed."
-                )))
-            } else {
-                Ok(ToolOutput::error(format!(
-                    "Cannot transition from '{old_status}' to '{status}'. \
-                     Valid transitions from '{old_status}': {}.",
-                    allowed.join(", ")
-                )))
-            };
+                )));
+            }
+
+            return Ok(ToolOutput::error(format!(
+                "Cannot transition from '{old_status}' to '{status}'. \
+                 Valid transitions from '{old_status}': {}.",
+                allowed.join(", ")
+            )));
         }
 
         // Perform the status update
@@ -911,6 +925,213 @@ mod tests {
                 result.content
             );
         }
+    }
+
+    // -- Terminal-state metadata fallback tests (#617) --
+
+    #[tokio::test]
+    async fn test_terminal_metadata_fallback_completed_with_metadata() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "Completed with late metadata").await;
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "completed"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Try to write metadata with a stale status — should succeed via fallback
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"cost_usd": 14.06, "session_id": "abc123"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.is_error,
+            "should succeed with metadata fallback, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("terminal"),
+            "should mention terminal, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Metadata updated"),
+            "should confirm metadata, got: {}",
+            result.content
+        );
+
+        // Verify status is still completed
+        let task = ctx.db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+
+        // Verify metadata was persisted
+        let meta: serde_json::Value =
+            serde_json::from_str(task.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["cost_usd"], 14.06);
+        assert_eq!(meta["session_id"], "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_terminal_metadata_fallback_cancelled_with_metadata() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "Cancelled with late metadata").await;
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "cancelled"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"reason": "auto-cancelled"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.is_error,
+            "should succeed on cancelled, got: {}",
+            result.content
+        );
+        assert!(result.content.contains("terminal"));
+        assert!(result.content.contains("Metadata updated"));
+
+        let task = ctx.db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_terminal_metadata_fallback_merges_with_existing() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "Merge test").await;
+
+        // Set initial metadata and complete
+        tool.execute(
+            serde_json::json!({
+                "task_id": id,
+                "status": "completed",
+                "metadata": {"merge_commit": "abc123", "pr_number": 612}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Late-arriving callback metadata should merge with existing
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "in_progress",
+                    "metadata": {"cost_usd": 14.06, "duration_ms": 839068}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+
+        // Verify both old and new metadata are present
+        let task = ctx.db.get_task(&id).await.unwrap().unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(task.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["merge_commit"], "abc123");
+        assert_eq!(meta["pr_number"], 612);
+        assert_eq!(meta["cost_usd"], 14.06);
+        assert_eq!(meta["duration_ms"], 839068);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_no_metadata_still_rejected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "No metadata terminal").await;
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "completed"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Status-only call without metadata — should still be rejected
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "in_progress"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_error,
+            "status-only call on terminal task should still be rejected"
+        );
+        assert!(result.content.contains("terminal state"));
+    }
+
+    #[tokio::test]
+    async fn test_non_terminal_invalid_transition_with_metadata_still_rejected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateWorkItemStatusTool;
+
+        let id = create_work_item(&harness, "Non-terminal reject").await;
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "in_progress"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // in_progress → pending is invalid even with metadata
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "pending",
+                    "metadata": {"should": "not be written"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_error,
+            "non-terminal invalid transition should reject even with metadata"
+        );
+        assert!(result.content.contains("Valid transitions from"));
+
+        // Verify metadata was NOT written
+        let task = ctx.db.get_task(&id).await.unwrap().unwrap();
+        assert!(task.metadata.is_none());
     }
 
     // -- Phantom retry guard tests (#579) --
