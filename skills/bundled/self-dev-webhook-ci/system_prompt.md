@@ -6,10 +6,10 @@ When you receive a GitHub webhook event for `check_suite.completed` with failure
 
 > **CRITICAL: DO NOT end your turn without acting.** This is a CI failure notification.
 
-1. **Correlate to work item.** Extract repo and branch from the event. Call `list_work_items(status: "in_progress")` and match by `branch` in metadata.
-2. **Staleness check:** If no matching work item found, or work item is `completed`/`cancelled`: ignore — this CI failure is not from our work.
-3. **Check if mika-qa already flagged it.** If the work item metadata already has a recent `block[ci]` verdict (from a PR review webhook), skip — the PR review handler is already dealing with it.
-4. **Cancel auto-merge if active.** If `verdict_merge: auto` in work item metadata: cancel auto-merge immediately via `run_gh("pr edit <PR_URL> --no-auto-merge")`. Do this BEFORE any fix attempt — prevents GitHub from merging a partial fix if CI transiently passes during iteration. Update metadata: `{"verdict_merge": "cancelled_for_retry"}`. After a successful fix push, the re-review pass handler will re-enable auto-merge.
+1. **Correlate to task.** Extract repo and branch from the event. Call `list_tasks(status: "in_progress")` and match by `branch` in metadata.
+2. **Staleness check:** If no matching task found, or task is `completed`/`cancelled`: ignore — this CI failure is not from our work.
+3. **Check if mika-qa already flagged it.** If the task metadata already has a recent `block[ci]` verdict (from a PR review webhook), skip — the PR review handler is already dealing with it.
+4. **Cancel auto-merge if active.** If `verdict_merge: auto` in task metadata: cancel auto-merge immediately via `run_gh("pr edit <PR_URL> --no-auto-merge")`. Do this BEFORE any fix attempt — prevents GitHub from merging a partial fix if CI transiently passes during iteration. Update metadata: `{"verdict_merge": "cancelled_for_retry"}`. After a successful fix push, the re-review pass handler will re-enable auto-merge.
 5. **Act:** Check `ci_fix_count` in metadata (default 0). If >= 2: escalate to Vincent. Otherwise: launch claude-pilot to fix CI, update `ci_fix_count` in metadata. The fix push will trigger mika-qa via webhook.
 
 ---
@@ -24,7 +24,7 @@ If you are a **webhook-triggered turn** (check_suite failure, pull_request_revie
 
 **The only way to modify a worktree** is to launch a new claude-pilot session with `run_claude_pilot` in iteration mode (see Rule 4 for the correct call shape). claude-pilot owns the worktree; you do not.
 
-If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file` or `run_shell`, **stop**. Transition the work item to an appropriate state, notify Vincent, and dispatch the iteration via `run_claude_pilot`.
+If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file` or `run_shell`, **stop**. Transition the task to an appropriate state, notify Vincent, and dispatch the iteration via `run_claude_pilot`.
 
 **Incident:** trace `ec24edd0-...` on 2026-04-08 — CI webhook arrived, agent diagnosed correctly but attempted to fix via `write_agent_file`/`run_shell` in the sandbox. Changes never reached the worktree.
 

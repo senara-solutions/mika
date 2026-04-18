@@ -1,14 +1,14 @@
 mod a2a_call;
 mod cancel_reminder;
 mod cancel_task;
-mod check_work_item;
+mod check_task;
 mod complete_task;
 mod create_agent;
 mod create_reminder;
+mod create_scheduled_task;
 pub mod create_skill;
 mod create_task;
 mod create_team;
-mod create_work_item;
 mod delegate_task;
 mod delete_skill;
 mod delete_team;
@@ -21,10 +21,10 @@ mod list_agent_files;
 mod list_agents;
 mod list_audit_events;
 mod list_reminders;
+mod list_scheduled_tasks;
 mod list_skills;
 mod list_tasks;
 mod list_teams;
-mod list_work_items;
 mod list_workspace;
 pub(crate) mod pr_merge_with_gate;
 mod query_timeline;
@@ -40,8 +40,8 @@ mod toggle_skill;
 mod update_core_memory;
 mod update_fact;
 mod update_skill;
+pub mod update_task_status;
 mod update_team;
-pub mod update_work_item_status;
 mod write_agent_file;
 mod write_workspace;
 
@@ -96,9 +96,9 @@ pub struct ToolContext<'a> {
     /// Memory tools require an `evidence` field and use a higher edit cap.
     pub is_reflection: bool,
     /// True when running within a task context (callback, delegation, team agent).
-    /// Blocks top-level work item creation (Guard 1).
+    /// Blocks top-level task creation (Guard 1).
     pub is_task_context: bool,
-    /// True when running in a callback turn (Guard 3 — blocks ALL work item creation).
+    /// True when running in a callback turn (Guard 3 — blocks ALL task creation).
     pub is_callback_turn: bool,
     /// Current LLM provider name (e.g., "anthropic", "openrouter").
     /// Used by builtin handlers that need to know the agent's active provider.
@@ -322,21 +322,21 @@ pub(crate) async fn validate_task_exists(
     }
 }
 
-/// Validate that a `work_item_id` references an active manual work item.
+/// Validate that a `task_id` references an active manual task.
 /// Returns `Some(error_message)` if validation fails, `None` if valid.
-pub(crate) async fn validate_work_item(
+pub(crate) async fn validate_task(
     db: &crate::async_db::AsyncDatabase,
-    work_item_id: &str,
+    task_id: &str,
 ) -> Option<String> {
-    if work_item_id.is_empty() {
+    if task_id.is_empty() {
         return Some(
-            "You must create a work item first using create_work_item, then pass its ID here. \
+            "You must create a task first using create_task, then pass its ID here. \
              No delegation without tracking."
                 .to_string(),
         );
     }
     // Layer 1+2: format validation + DB existence via shared helper
-    let task = match validate_task_exists(db, "work_item_id", work_item_id).await {
+    let task = match validate_task_exists(db, "task_id", task_id).await {
         Ok(t) => t,
         Err(tool_output) => return Some(tool_output.content),
     };
@@ -347,8 +347,8 @@ pub(crate) async fn validate_work_item(
         None
     } else {
         Some(format!(
-            "Work item '{work_item_id}' is not an active work item. \
-             It must be a manual work item with status pending, in_progress, or blocked."
+            "Task '{task_id}' is not an active task. \
+             It must be a manual task with status pending, in_progress, or blocked."
         ))
     }
 }
@@ -630,10 +630,10 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(write_agent_file::WriteAgentFileTool));
     registry.register(Box::new(read_agent_file::ReadAgentFileTool));
     registry.register(Box::new(list_agent_files::ListAgentFilesTool));
+    registry.register(Box::new(list_scheduled_tasks::ListScheduledTasksTool));
+    // Task read-only tools — available to all agents (including delegates)
     registry.register(Box::new(list_tasks::ListTasksTool));
-    // Work item read-only tools — available to all agents (including delegates)
-    registry.register(Box::new(list_work_items::ListWorkItemsTool));
-    registry.register(Box::new(check_work_item::CheckWorkItemTool));
+    registry.register(Box::new(check_task::CheckTaskTool));
     // PR merge with CI gate — structural backstop against merging with failing checks.
     // Intentionally in default_tools() (not management_tools_if_needed) so delegates
     // spawned via claude-pilot are also gated. The tool itself never merges with failing
@@ -695,11 +695,11 @@ pub fn management_tools_if_needed(
         tools.push(Box::new(update_team::UpdateTeamTool {
             home_dir: home_dir.to_path_buf(),
         }));
-        // Work item write tools — orchestrator-only (delegates receive
-        // work_item_id from the orchestrator via delegate_task and never
-        // need to create or update work items themselves).
-        tools.push(Box::new(create_work_item::CreateWorkItemTool));
-        tools.push(Box::new(update_work_item_status::UpdateWorkItemStatusTool));
+        // Task write tools — orchestrator-only (delegates receive
+        // task_id from the orchestrator via delegate_task and never
+        // need to create or update tasks themselves).
+        tools.push(Box::new(create_task::CreateTaskTool));
+        tools.push(Box::new(update_task_status::UpdateTaskStatusTool));
     }
 
     tools
@@ -954,9 +954,9 @@ mod tests {
         let harness = TestHarness::new();
 
         // Invalid format — field propagated through validate_uuid
-        let result = validate_task_exists(&harness.db, "work_item_id", "bad").await;
+        let result = validate_task_exists(&harness.db, "task_id", "bad").await;
         let err = result.unwrap_err();
-        assert!(err.content.contains("work_item_id"));
+        assert!(err.content.contains("task_id"));
 
         // Not found — field propagated through task_not_found
         let result = validate_task_exists(

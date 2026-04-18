@@ -16,7 +16,7 @@ The agent fabricated a PR comment URL ("Comment posted: https://github.com/…#i
 The agent loop had three EndTurn post-conditions but none caught the case where the agent claims an action with a fabricated URL and zero tool calls:
 1. Text-based tool call detection — catches XML tool calls as text
 2. Required-tools gate — only fires when skills declare `required_tools`
-3. Completion-claim guard — catches "merged"/"deployed" without work item updates
+3. Completion-claim guard — catches "merged"/"deployed" without task updates
 
 External skills (like qa-review) that don't declare `required_tools` had no safety net.
 

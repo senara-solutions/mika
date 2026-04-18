@@ -1,8 +1,8 @@
 //! Integration tests: completion-claim guard (#483).
 //!
 //! Verifies that the agent loop rejects EndTurn responses containing
-//! completion-claim keywords when `update_work_item_status` was not called
-//! and active work items exist.
+//! completion-claim keywords when `update_task_status` was not called
+//! and active tasks exist.
 
 use async_trait::async_trait;
 use mika_agent::db::NewTask;
@@ -14,20 +14,20 @@ use serde_json::json;
 use super::assertions::*;
 use super::harness::EvalHarness;
 
-/// Stub tool that mimics `update_work_item_status` for the guard's registry check.
-/// The guard only checks `tools.get("update_work_item_status").is_some()` —
+/// Stub tool that mimics `update_task_status` for the guard's registry check.
+/// The guard only checks `tools.get("update_task_status").is_some()` —
 /// it never actually dispatches to it, so a minimal stub is sufficient.
-struct StubUpdateWorkItemStatusTool;
+struct StubUpdateTaskStatusTool;
 
 #[async_trait]
-impl Tool for StubUpdateWorkItemStatusTool {
+impl Tool for StubUpdateTaskStatusTool {
     fn name(&self) -> &str {
-        "update_work_item_status"
+        "update_task_status"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "update_work_item_status".to_string(),
+            name: "update_task_status".to_string(),
             description: "Stub for completion-claim guard tests".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
         }
@@ -42,8 +42,8 @@ impl Tool for StubUpdateWorkItemStatusTool {
     }
 }
 
-/// Helper: insert a manual work item in "pending" status for the test agent.
-async fn seed_work_item(harness: &EvalHarness, label: &str) -> String {
+/// Helper: insert a manual task in "pending" status for the test agent.
+async fn seed_task(harness: &EvalHarness, label: &str) -> String {
     harness
         .db
         .create_task(NewTask {
@@ -73,8 +73,8 @@ async fn seed_work_item(harness: &EvalHarness, label: &str) -> String {
         .unwrap()
 }
 
-/// Helper: set a work item's status to the given value.
-async fn set_work_item_status(harness: &EvalHarness, task_id: &str, status: &str) {
+/// Helper: set a task's status to the given value.
+async fn set_task_status(harness: &EvalHarness, task_id: &str, status: &str) {
     harness
         .db
         .update_manual_task_status(task_id, status)
@@ -82,32 +82,32 @@ async fn set_work_item_status(harness: &EvalHarness, task_id: &str, status: &str
         .unwrap();
 }
 
-/// Build a tool registry that includes `update_work_item_status` (orchestrator tool).
-fn tools_with_update_work_item_status() -> mika_agent::tools::ToolRegistry {
+/// Build a tool registry that includes `update_task_status` (orchestrator tool).
+fn tools_with_update_task_status() -> mika_agent::tools::ToolRegistry {
     let mut tools = default_tools();
-    tools.register(Box::new(StubUpdateWorkItemStatusTool));
+    tools.register(Box::new(StubUpdateTaskStatusTool));
     tools
 }
 
-/// Guard fires when agent says "merged" without calling update_work_item_status,
-/// and active work items exist.
+/// Guard fires when agent says "merged" without calling update_task_status,
+/// and active tasks exist.
 #[tokio::test]
 async fn guard_fires_on_fabricated_completion() {
     let harness = EvalHarness::builder()
         .responses(vec![
             // Step 1: Fabricated completion claim — guard should reject this
             text_response("PR merged successfully. Main synced."),
-            // Step 2: After re-prompt, agent calls update_work_item_status
+            // Step 2: After re-prompt, agent calls update_task_status
             // then gives a proper response (we just test the re-prompt happened)
             text_response("Let me verify the actual state first."),
         ])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    // Seed an active work item
-    seed_work_item(&harness, "Implement feature #480").await;
+    // Seed an active task
+    seed_task(&harness, "Implement feature #480").await;
 
     let trace = harness.run("The QA bot approved PR #482").await.unwrap();
 
@@ -118,17 +118,17 @@ async fn guard_fires_on_fabricated_completion() {
     assert_output_contains(&trace, "verify");
 }
 
-/// Guard does NOT fire when there are no active work items.
+/// Guard does NOT fire when there are no active tasks.
 #[tokio::test]
 async fn guard_skips_when_no_active_items() {
     let harness = EvalHarness::builder()
         .responses(vec![text_response("Task completed successfully.")])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    // No work items seeded — guard should not fire
+    // No tasks seeded — guard should not fire
     let trace = harness.run("How did the task go?").await.unwrap();
 
     assert_has_output(&trace);
@@ -137,21 +137,21 @@ async fn guard_skips_when_no_active_items() {
     assert_exact_steps(&trace, 1);
 }
 
-/// Guard does NOT fire when update_work_item_status is not in the tool registry
+/// Guard does NOT fire when update_task_status is not in the tool registry
 /// (e.g., delegate agents with default_tools() only).
 #[tokio::test]
 async fn guard_skips_when_tool_not_registered() {
-    // Use default_tools() which does NOT include update_work_item_status
+    // Use default_tools() which does NOT include update_task_status
     let harness = EvalHarness::builder()
         .responses(vec![text_response(
             "Task completed. Everything is deployed.",
         )])
-        .build() // default_tools() — no update_work_item_status
+        .build() // default_tools() — no update_task_status
         .await
         .unwrap();
 
-    // Seed a work item anyway — guard should still not fire because tool isn't registered
-    seed_work_item(&harness, "Some task").await;
+    // Seed a task anyway — guard should still not fire because tool isn't registered
+    seed_task(&harness, "Some task").await;
 
     let trace = harness.run("Status update?").await.unwrap();
 
@@ -160,26 +160,26 @@ async fn guard_skips_when_tool_not_registered() {
     assert_exact_steps(&trace, 1);
 }
 
-/// Guard does NOT fire when update_work_item_status was called in the turn.
+/// Guard does NOT fire when update_task_status was called in the turn.
 #[tokio::test]
 async fn guard_skips_when_tool_was_called() {
     let harness = EvalHarness::builder()
         .responses(vec![
-            // Step 1: Agent calls update_work_item_status
+            // Step 1: Agent calls update_task_status
             tool_call_response(
-                "update_work_item_status",
+                "update_task_status",
                 json!({"task_id": "test-id", "status": "completed"}),
             ),
             // Step 2: Agent produces completion text
-            text_response("Task completed and work item updated."),
+            text_response("Task completed and status updated."),
         ])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    // Seed work item
-    seed_work_item(&harness, "Feature work").await;
+    // Seed task
+    seed_task(&harness, "Feature work").await;
 
     let trace = harness.run("Finish up the task").await.unwrap();
 
@@ -196,12 +196,12 @@ async fn guard_skips_on_no_keywords() {
         .responses(vec![text_response(
             "I've analyzed the code and found several issues to address.",
         )])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    seed_work_item(&harness, "Code review task").await;
+    seed_task(&harness, "Code review task").await;
 
     let trace = harness.run("Review the code").await.unwrap();
 
@@ -220,12 +220,12 @@ async fn guard_fires_once_only() {
             // Step 2: Retry also fabricates — guard does NOT fire again
             text_response("Confirmed: everything is deployed and running."),
         ])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    seed_work_item(&harness, "Deploy feature").await;
+    seed_task(&harness, "Deploy feature").await;
 
     let trace = harness.run("What's the status?").await.unwrap();
 
@@ -235,22 +235,22 @@ async fn guard_fires_once_only() {
     assert_output_contains(&trace, "deployed");
 }
 
-/// Guard does NOT fire for blocked-only work items (they can't be completed).
+/// Guard does NOT fire for blocked-only tasks (they can't be completed).
 #[tokio::test]
 async fn guard_skips_when_only_blocked_items() {
     let harness = EvalHarness::builder()
         .responses(vec![text_response(
             "Investigation complete. The item is blocked on API access.",
         )])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    let task_id = seed_work_item(&harness, "Blocked task").await;
+    let task_id = seed_task(&harness, "Blocked task").await;
     // Transition to in_progress first (required by state machine), then to blocked
-    set_work_item_status(&harness, &task_id, "in_progress").await;
-    set_work_item_status(&harness, &task_id, "blocked").await;
+    set_task_status(&harness, &task_id, "in_progress").await;
+    set_task_status(&harness, &task_id, "blocked").await;
 
     let trace = harness
         .run("What's the status of the blocked item?")

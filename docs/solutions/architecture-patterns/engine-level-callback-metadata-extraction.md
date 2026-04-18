@@ -4,14 +4,14 @@ category: architecture-patterns
 date: 2026-04-02
 tags: [callback, metadata, task-engine, dispatcher, work-item, reliability]
 issue: "#376"
-modules: [task_engine/dispatcher, tools/update_work_item_status]
+modules: [task_engine/dispatcher, tools/update_task_status]
 ---
 
 # Engine-Level Callback Metadata Extraction
 
 ## Problem
 
-When claude-pilot completes and mika-dev receives the callback, the work item's `metadata` field remained empty. No `session_id`, `cost_usd`, `duration_ms`, `turns`, `branch`, or `pr_url` was recorded. Audit commands couldn't report per-task costs, and the dashboard task detail page showed empty metadata.
+When claude-pilot completes and mika-dev receives the callback, the task's `metadata` field remained empty. No `session_id`, `cost_usd`, `duration_ms`, `turns`, `branch`, or `pr_url` was recorded. Audit commands couldn't report per-task costs, and the dashboard task detail page showed empty metadata.
 
 **Root cause:** Metadata persistence was entirely agent-driven via prompt instructions in the self-dev skill's Step 6 (close-out). Step 6 is the **last** action in a complex callback flow that includes QA delegation, retry loops, and notifications. When the 20-step tool budget was exhausted by earlier actions, Step 6 was dropped. The `max_steps_exceeded` continuation turn runs with tools disabled, so metadata could never be recovered.
 
@@ -31,7 +31,7 @@ if is_callback {
 ```
 
 The function:
-1. Checks `task.parent_task_id` references a `trigger_type='manual'` work item
+1. Checks `task.parent_task_id` references a `trigger_type='manual'` task
 2. Parses callback result text for structured fields via regex (`Session:`, `Turns:`, `Cost:`, `Duration:`)
 3. Shallow-merges extracted fields into existing metadata (preserves keys like `pipeline_retry_count`)
 4. Persists via `update_work_item_metadata()` — the same DB function the agent's tool uses
@@ -52,7 +52,7 @@ The shallow merge in `merge_and_persist_metadata()` means later calls enrich (ne
 
 **Prompt-only enforcement doesn't work for critical persistence.** When a workflow has N steps and the last step does the critical write, any step budget pressure drops it. The fix pattern: move the critical write to the engine (deterministic, pre-agent) for base data, and restructure the prompt to persist enrichments early (before expensive operations).
 
-This is the same lesson as the delegation work item guard (#278): "Prompt-only enforcement is unreliable — the agent ignores instructions after compaction. Code-level guards are the only reliable enforcement mechanism."
+This is the same lesson as the delegation task guard (#278): "Prompt-only enforcement is unreliable — the agent ignores instructions after compaction. Code-level guards are the only reliable enforcement mechanism."
 
 ## Prevention
 

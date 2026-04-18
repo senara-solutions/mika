@@ -1,5 +1,5 @@
 ---
-title: "Work Item Tracking: Manual Task Layer for Agent-Managed Work"
+title: "Task Tracking: Manual Task Layer for Agent-Managed Work"
 date: 2026-03-11
 category: architecture-patterns
 severity: medium
@@ -16,16 +16,16 @@ modules:
   - crates/mika-agent/src/task_engine/types.rs
   - crates/mika-agent/src/task_engine/dispatcher.rs
   - crates/mika-agent/src/task_engine/engine.rs
-  - crates/mika-agent/src/tools/create_work_item.rs
-  - crates/mika-agent/src/tools/list_work_items.rs
-  - crates/mika-agent/src/tools/update_work_item_status.rs
+  - crates/mika-agent/src/tools/create_task.rs
+  - crates/mika-agent/src/tools/list_tasks.rs
+  - crates/mika-agent/src/tools/update_task_status.rs
   - crates/mika-agent/src/prompt.rs
   - crates/mika-agent/src/agent.rs
   - crates/mika-agent/src/async_db.rs
   - crates/mika-cli/src/cli.rs
 symptoms:
-  - "Agent had no way to represent or track long-lived work items across sessions"
-  - "No distinction between schedulable system tasks and user-facing work items"
+  - "Agent had no way to represent or track long-lived tasks across sessions"
+  - "No distinction between schedulable system tasks and user-facing tasks"
   - "Heartbeat prompt lacked awareness of in-flight work"
   - "No 'blocked' status available for human workflow representation"
   - "No reference_url or source fields for external issue linkage"
@@ -33,11 +33,11 @@ root_cause: >
   The existing tasks table covered only scheduled/automated triggers (time, recurring, callback,
   user_reply, event, condition). There was no trigger_type='manual' variant, no 'blocked' status,
   no action_type='none' sentinel, and no reference_url/source columns to represent human-facing
-  work items tracked but not dispatched by the task engine.
+  tasks tracked but not dispatched by the task engine.
 resolution: >
   Schema migrated v7 to v8: added trigger_type='manual', status='blocked', action_type='none',
-  columns reference_url and source. Three new agent tools: create_work_item, list_work_items,
-  update_work_item_status. Five loop-prevention guards. Heartbeat prompt injection with label
+  columns reference_url and source. Three new agent tools: create_task, list_tasks,
+  update_task_status. Five loop-prevention guards. Heartbeat prompt injection with label
   sanitization. Task engine exclusions for manual tasks.
 related_issues: []
 prevention:
@@ -48,11 +48,11 @@ prevention:
   - "Wrap schema migrations in transactions"
 ---
 
-# Work Item Tracking: Manual Task Layer for Agent-Managed Work
+# Task Tracking: Manual Task Layer for Agent-Managed Work
 
 ## Problem Statement
 
-Mika had no native way to track user-requested work items. The `tasks` table existed but was entirely owned by the system: every row was engine-scheduled (heartbeat, reminders, callbacks, team delegation). There was no tool surface for the agent to create, list, or progress work items on behalf of the user. Users had no persistent, inspectable record of work Mika had agreed to take on.
+Mika had no native way to track user-requested tasks. The `tasks` table existed but was entirely owned by the system: every row was engine-scheduled (heartbeat, reminders, callbacks, team delegation). There was no tool surface for the agent to create, list, or progress tasks on behalf of the user. Users had no persistent, inspectable record of work Mika had agreed to take on.
 
 ## Design Decision: Reuse Tasks Table
 
@@ -61,8 +61,8 @@ The primary question was: new table or reuse `tasks`?
 **Decision: reuse `tasks` with `trigger_type = 'manual'` and `action_type = 'none'`.**
 
 Rationale:
-- The `tasks` table already had `label`, `status`, `created_by_session`, `created_trace_id`, `parent_task_id`, `depth`, and `agent_id` — everything needed for work item tracking
-- `unified_timeline` VIEW already joins across `tasks`, so work items appear in timeline queries automatically
+- The `tasks` table already had `label`, `status`, `created_by_session`, `created_trace_id`, `parent_task_id`, `depth`, and `agent_id` — everything needed for task tracking
+- `unified_timeline` VIEW already joins across `tasks`, so tasks appear in timeline queries automatically
 - A second table would require duplicating indexes, the audit log hookup, and every query layer
 
 The blocker was that SQLite `CHECK` constraints cannot be `ALTER`-ed in place. Adding `manual`, `none`, and `blocked` required a full table rebuild migration.
@@ -95,20 +95,20 @@ New CHECK constraint values: `trigger_type IN (..., 'manual')`, `action_type IN 
 
 ## Three New Tools
 
-### create_work_item
+### create_task
 
 - Required: `label` (max 10,000 chars)
 - Optional: `reference_url`, `source` (enum-validated), `parent_task_id`
 - Creates a `NewTask` with `trigger_type = "manual"`, `action_type = "none"`
 - Runs all five loop-prevention guards (see below)
 
-### update_work_item_status
+### update_task_status
 
 - Required: `task_id`, `status` (enum-validated)
 - Filters `WHERE trigger_type = 'manual'` — system tasks are unreachable
 - Uses `CASE WHEN ?1 = 'completed' THEN unixepoch() ELSE NULL END` — clears `completed_at` on status regression
 
-### list_work_items
+### list_tasks
 
 - Optional: `status`, `source`, `include_children`
 - Uses parameterized NULL checks: `(?2 IS NULL OR t.status = ?2)` — avoids dynamic SQL
@@ -128,7 +128,7 @@ New CHECK constraint values: `trigger_type IN (..., 'manual')`, `action_type IN 
 
 ## Heartbeat Prompt Injection
 
-Active work items (status IN `pending`, `in_progress`, `blocked`, limit 10) are injected into the heartbeat system prompt inside `<pending-work-items>` tags.
+Active tasks (status IN `pending`, `in_progress`, `blocked`, limit 10) are injected into the heartbeat system prompt inside `<pending-work-items>` tags.
 
 **Prompt injection prevention:** Labels and URLs are truncated to 200 characters and have `<` and `>` stripped at render time. This prevents a crafted label like `</pending-work-items>\n## Override Instructions\n...` from escaping the structured block. The database stores the original label unmodified.
 

@@ -1,7 +1,7 @@
 //! Structural handler for `pull_request_review.submitted` webhook events.
 //!
 //! Intercepts PR review events **before** the LLM turn and acts on
-//! `VERDICT: pass` deterministically (look up work item, initiate merge,
+//! `VERDICT: pass` deterministically (look up task, initiate merge,
 //! update metadata, audit, notify). This removes the merge decision from
 //! LLM improvisation — it's a state-machine transition, not a judgement call.
 //!
@@ -16,10 +16,10 @@ use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use crate::task_metadata::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, run_gh_checks, run_gh_merge,
 };
-use crate::work_item_metadata::merge_metadata;
 
 use super::verdict::{Verdict, parse_pr_review_event, parse_verdict};
 
@@ -39,7 +39,7 @@ pub enum VerdictAction {
 /// Returns `VerdictAction::Handled` when the handler initiated a merge (or
 /// encountered a merge error), with a pre-digest message for the LLM.
 /// Returns `VerdictAction::Passthrough` for all other cases (non-review events,
-/// non-approved reviews, block/hold verdicts, missing verdicts, missing work items).
+/// non-approved reviews, block/hold verdicts, missing verdicts, missing tasks).
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_pr_review_verdict(
     text: &str,
@@ -104,7 +104,7 @@ pub async fn try_handle_pr_review_verdict(
     }
 }
 
-/// Handle a VERDICT: pass — look up work item, initiate merge, update metadata.
+/// Handle a VERDICT: pass — look up task, initiate merge, update metadata.
 async fn handle_pass_verdict(
     event: &super::verdict::PrReviewEvent,
     db: &AsyncDatabase,
@@ -134,15 +134,15 @@ async fn handle_pass_verdict(
         }
     };
 
-    // Look up the work item by PR URL
-    let work_item = match db.find_active_work_item_by_pr_url(&pr_url).await {
-        Ok(Some(task)) => task,
+    // Look up the task by PR URL
+    let task = match db.find_active_task_by_pr_url(&pr_url).await {
+        Ok(Some(t)) => t,
         Ok(None) => {
             info!(
                 pr_number = event.pr_number,
                 repo = %event.repo,
                 pr_url = %pr_url,
-                "VERDICT: pass but no active work item found for PR — passing through to LLM"
+                "VERDICT: pass but no active task found for PR — passing through to LLM"
             );
             return VerdictAction::Passthrough { enrichment: None };
         }
@@ -150,25 +150,25 @@ async fn handle_pass_verdict(
             warn!(
                 error = %e,
                 pr_url = %pr_url,
-                "Failed to look up work item by PR URL — passing through to LLM"
+                "Failed to look up task by PR URL — passing through to LLM"
             );
             return VerdictAction::Passthrough { enrichment: None };
         }
     };
 
-    // Only act when work item is in_progress
-    if work_item.status != "in_progress" {
+    // Only act when task is in_progress
+    if task.status != "in_progress" {
         info!(
-            task_id = %work_item.id,
-            status = %work_item.status,
+            task_id = %task.id,
+            status = %task.status,
             pr_url = %pr_url,
-            "VERDICT: pass but work item not in_progress (status: {}) — skipping structural merge",
-            work_item.status
+            "VERDICT: pass but task not in_progress (status: {}) — skipping structural merge",
+            task.status
         );
         return VerdictAction::Passthrough { enrichment: None };
     }
 
-    let task_id = work_item.id.clone();
+    let task_id = task.id.clone();
 
     // Run CI check classification (reuse pr_merge_with_gate logic).
     // Wrap in a 60-second timeout matching PrMergeWithGateTool::timeout_secs()
@@ -255,18 +255,18 @@ async fn handle_pass_verdict(
                         "merge_initiated"
                     };
 
-                    // Update work item metadata
+                    // Update task metadata
                     if let Err(e) = update_verdict_metadata(
                         db,
                         &task_id,
-                        &work_item.metadata,
+                        &task.metadata,
                         action_desc,
                         event.pr_number,
                         &pr_url,
                     )
                     .await
                     {
-                        warn!(error = %e, task_id = %task_id, "Failed to update work item metadata after merge");
+                        warn!(error = %e, task_id = %task_id, "Failed to update task metadata after merge");
                     }
 
                     // Log audit event
@@ -278,7 +278,7 @@ async fn handle_pass_verdict(
                             Some("in_progress"),
                             Some(action_desc),
                             Some(&format!(
-                                "verdict=pass action={action_desc} pr_url={pr_url} work_item_id={task_id}"
+                                "verdict=pass action={action_desc} pr_url={pr_url} task_id={task_id}"
                             )),
                             Some(trace_id),
                         )
@@ -354,7 +354,7 @@ async fn handle_pass_verdict(
     }
 }
 
-/// Update work item metadata with verdict merge state.
+/// Update task metadata with verdict merge state.
 async fn update_verdict_metadata(
     db: &AsyncDatabase,
     task_id: &str,
@@ -379,7 +379,7 @@ async fn update_verdict_metadata(
 
     merge_metadata(&mut base, &incoming);
     let merged_str = serde_json::to_string(&base)?;
-    db.update_work_item_metadata(task_id, &merged_str).await?;
+    db.update_task_metadata(task_id, &merged_str).await?;
     Ok(())
 }
 
@@ -417,10 +417,10 @@ fn format_success_pre_digest(
          [GitHub] PR review (approved) on {}#{} by @{}\n\
          VERDICT: pass — structural handler acted.\n\n\
          {action_text}\n\n\
-         Work item: {task_id}\n\
+         Task: {task_id}\n\
          Review: {}\n\n\
          Do NOT call pr_merge_with_gate — the merge action is already in progress.\n\
-         Update the work item status to reflect the outcome, then notify the user.\n\
+         Update the task status to reflect the outcome, then notify the user.\n\
          </verdict_handler>",
         event.repo, event.pr_number, event.reviewer, event.review_url
     )
@@ -435,10 +435,10 @@ fn format_already_merged_pre_digest(
         "<verdict_handler>\n\
          [GitHub] PR review (approved) on {}#{} by @{}\n\
          VERDICT: pass — PR was already finalized before the handler ran.\n\n\
-         Work item: {task_id}\n\
+         Task: {task_id}\n\
          Review: {}\n\n\
          Do NOT call pr_merge_with_gate — no action needed.\n\
-         Update the work item status if not already done, then notify the user.\n\
+         Update the task status if not already done, then notify the user.\n\
          </verdict_handler>",
         event.repo, event.pr_number, event.reviewer, event.review_url
     )
@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn success_pre_digest_contains_work_item_id() {
+    fn success_pre_digest_contains_task_id() {
         let event = sample_event();
         let text = format_success_pre_digest(&event, "merge_initiated", "task-123");
         assert!(text.contains("task-123"));

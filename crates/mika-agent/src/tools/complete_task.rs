@@ -177,7 +177,7 @@ mod tests {
             "action_config": "{\"text\":\"hello\"}",
             "fire_at": "2099-01-01T00:00:00Z"
         });
-        let create_output = crate::tools::create_task::CreateTaskTool
+        let create_output = crate::tools::create_scheduled_task::CreateScheduledTaskTool
             .execute(create_input, &ctx)
             .await
             .unwrap();

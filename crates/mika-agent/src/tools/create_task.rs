@@ -1,20 +1,38 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::db::NewTask;
-use crate::task_engine::types::action_type;
-use crate::task_engine::types::trigger_type as tt;
-use crate::timestamp;
+use crate::db::{NewTask, TASK_TYPE_ISSUE, Task, VALID_TASK_TYPES, is_unique_violation};
+use crate::task_engine::types::{action_type, trigger_type};
 
-/// Agent tool for creating scheduled/callback tasks.
-///
-/// Removed from `default_tools()` — long-running skills auto-create callback tasks.
-/// Retained for tests (e.g. `complete_task::tests`).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Format a success response for a deduplicated task (already exists).
+fn format_dedup_response(existing: &Task) -> String {
+    let mut response = format!(
+        "Task already exists for this reference: {}\n\
+         Label: {}\n\
+         Status: {}",
+        existing.id, existing.label, existing.status
+    );
+    if existing.r#type != TASK_TYPE_ISSUE {
+        response.push_str(&format!("\nType: {}", existing.r#type));
+    }
+    if let Some(url) = &existing.reference_url {
+        response.push_str(&format!("\nReference: {url}"));
+    }
+    response.push_str(&format!(
+        "\nCreated: {}\n\nReuse this task ID for subsequent operations.",
+        existing.created_at
+    ));
+    response
+}
+
+/// Maximum agent-created tasks per session (Guard 5).
+const MAX_TASKS_PER_SESSION: i64 = 5;
+
+const VALID_SOURCES: &[&str] = &["user_request", "github_issue", "team_run", "self_dev"];
+
 pub struct CreateTaskTool;
 
 #[async_trait]
@@ -26,61 +44,67 @@ impl Tool for CreateTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "create_task".to_string(),
-            description: "Create a scheduled or callback-triggered task. \
-                Use trigger_type='time' for one-shot tasks (requires fire_at), \
-                'recurring' for cron-scheduled tasks (requires cron_expr), \
-                or 'callback' for tasks that fire when an external process calls \
-                POST /tasks/{id}/complete. action_type controls what happens: \
-                'send_message' sends a message (action_config: {\"text\":\"...\"}), \
-                'run_skill' runs a skill (action_config: {\"skill_name\":\"...\",\"args\":{}}), \
-                'inject_context' injects text into the next agent turn \
-                (action_config: {\"context\":\"...\"}), \
-                'resume_agent' re-runs the agent with the callback result as context."
+            description: "Create a trackable task to represent a piece of work. \
+                Tasks can be linked to external references (GitHub issues, URLs) \
+                and progressed through status stages. Use for significant tasks like \
+                feature implementation, research projects, or items waiting on external input. \
+                Cannot be used during callback turns. Max 5 agent-created tasks per session. \
+                Max nesting depth of 3. Set 'type' to 'milestone' or 'project' to mark a parent \
+                container that aggregates child 'issue' tasks via parent_task_id."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "label": {
                         "type": "string",
-                        "description": "Human-readable label for the task"
+                        "description": "Description of the task"
                     },
-                    "trigger_type": {
+                    "reference_url": {
                         "type": "string",
-                        "description": "When the task fires: 'time' (one-shot, requires fire_at), 'recurring' (cron, requires cron_expr), or 'callback' (fired by external POST /tasks/{id}/complete)",
-                        "enum": ["time", "recurring", "callback"]
+                        "description": "Optional URL reference (GitHub issue, document, etc.)"
                     },
-                    "action_type": {
+                    "source": {
                         "type": "string",
-                        "description": "What to do when the task fires",
-                        "enum": ["send_message", "run_skill", "inject_context", "resume_agent"]
+                        "enum": ["user_request", "github_issue", "team_run", "self_dev"],
+                        "description": "Origin of the task"
                     },
-                    "action_config": {
+                    "parent_task_id": {
                         "type": "string",
-                        "description": "JSON string with action parameters. Defaults to '{}' if omitted."
+                        "description": "Optional parent task ID for subtask nesting"
                     },
-                    "fire_at": {
+                    "type": {
                         "type": "string",
-                        "description": "ISO 8601 datetime (UTC). Required for trigger_type='time'."
-                    },
-                    "cron_expr": {
-                        "type": "string",
-                        "description": "6-field cron expression (seconds field first). Required for trigger_type='recurring'. Example: '0 0 9 * * *' fires at 9am UTC daily."
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Optional. Task expires if not completed within this many seconds from creation."
+                        "enum": ["issue", "milestone", "project"],
+                        "description": "Task kind. Defaults to 'issue'. Use 'milestone' or 'project' \
+                                        for parent containers that group child issues via parent_task_id."
                     }
                 },
-                "required": ["label", "trigger_type", "action_type"]
+                "required": ["label"]
             }),
         }
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let label = input["label"].as_str().unwrap_or("").trim();
-        let trigger_type_str = input["trigger_type"].as_str().unwrap_or("").trim();
-        let action_type_val = input["action_type"].as_str().unwrap_or("").trim();
+        let reference_url = input["reference_url"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let source = input["source"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let parent_task_id = input["parent_task_id"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        // Empty/whitespace-only `type` falls back to the default ("issue").
+        let task_type_input = input["type"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
 
+        // Validate inputs
         if label.is_empty() {
             return Ok(ToolOutput::error("'label' is required."));
         }
@@ -90,153 +114,262 @@ impl Tool for CreateTaskTool {
                 label.len()
             )));
         }
-        if trigger_type_str.is_empty() {
-            return Ok(ToolOutput::error("'trigger_type' is required."));
+        if let Some(url) = reference_url
+            && url.len() > MAX_INPUT_LEN
+        {
+            return Ok(ToolOutput::error("'reference_url' is too long."));
         }
-        if action_type_val.is_empty() {
-            return Ok(ToolOutput::error("'action_type' is required."));
-        }
-
-        match trigger_type_str {
-            tt::TIME | tt::RECURRING | tt::CALLBACK => {}
-            other => {
-                return Ok(ToolOutput::error(format!(
-                    "Invalid trigger_type '{other}'. Must be one of: time, recurring, callback"
-                )));
-            }
-        }
-
-        match action_type_val {
-            action_type::SEND_MESSAGE
-            | action_type::RUN_SKILL
-            | action_type::INJECT_CONTEXT
-            | action_type::RESUME_AGENT => {}
-            other => {
-                return Ok(ToolOutput::error(format!(
-                    "Invalid action_type '{other}'. Must be one of: send_message, run_skill, inject_context, resume_agent"
-                )));
-            }
-        }
-
-        let action_config_str = input["action_config"].as_str().unwrap_or("{}");
-        if action_config_str.len() > MAX_INPUT_LEN {
+        if let Some(src) = source
+            && !VALID_SOURCES.contains(&src)
+        {
             return Ok(ToolOutput::error(format!(
-                "'action_config' too long: {} characters (max: {MAX_INPUT_LEN})",
-                action_config_str.len()
+                "Invalid source '{}'. Must be one of: {}",
+                src,
+                VALID_SOURCES.join(", ")
             )));
         }
-        if serde_json::from_str::<serde_json::Value>(action_config_str).is_err() {
+        if let Some(t) = task_type_input
+            && !VALID_TASK_TYPES.contains(&t)
+        {
+            return Ok(ToolOutput::error(format!(
+                "Invalid type '{}'. Must be one of: {}",
+                t,
+                VALID_TASK_TYPES.join(", ")
+            )));
+        }
+        // Resolved type used both for the row and for the response message.
+        let task_type = task_type_input.unwrap_or(TASK_TYPE_ISSUE);
+
+        // Guard 3: Callback turns block ALL task creation
+        if ctx.is_callback_turn {
             return Ok(ToolOutput::error(
-                "'action_config' must be a valid JSON string.",
+                "Cannot create tasks during a callback turn. Answer the question and return.",
             ));
         }
 
-        let (next_fire_at, cron_expr) = match trigger_type_str {
-            tt::TIME => {
-                let fire_at_str = input["fire_at"].as_str().unwrap_or("");
-                if fire_at_str.is_empty() {
-                    return Ok(ToolOutput::error(
-                        "'fire_at' is required for trigger_type='time'.",
-                    ));
-                }
-                if fire_at_str.len() > 64 {
-                    return Ok(ToolOutput::error("'fire_at' is too long."));
-                }
-                let parsed = match chrono::DateTime::parse_from_rfc3339(fire_at_str) {
-                    Ok(dt) => dt.with_timezone(&Utc),
-                    Err(_) => {
+        // Guard 1: No top-level creation from task context
+        if ctx.is_task_context && parent_task_id.is_none() {
+            return Ok(ToolOutput::error(
+                "Cannot create top-level tasks from within a task context. \
+                 Provide a parent_task_id to create a subtask instead.",
+            ));
+        }
+
+        // Validate parent_task_id format before DB lookup
+        if let Some(parent_id) = parent_task_id
+            && let Err(e) = super::validate_uuid("parent_task_id", parent_id)
+        {
+            return Ok(e);
+        }
+
+        // Guard 2: Depth cap (application-level check before hitting DB constraint)
+        let depth = if let Some(parent_id) = parent_task_id {
+            match ctx.db.get_task_depth(parent_id).await? {
+                Some(parent_depth) => {
+                    let child_depth = parent_depth + 1;
+                    if child_depth > 3 {
                         return Ok(ToolOutput::error(
-                            "Invalid 'fire_at'. Use ISO 8601 format like '2026-02-25T15:00:00Z'.",
+                            "Maximum nesting depth (3) exceeded. Cannot create deeper subtasks.",
                         ));
                     }
-                };
-                if parsed <= Utc::now() {
-                    return Ok(ToolOutput::error("'fire_at' must be in the future."));
+                    child_depth
                 }
-                (Some(timestamp::format(&parsed)), None)
-            }
-            tt::RECURRING => {
-                let cron = input["cron_expr"].as_str().unwrap_or("").trim();
-                if cron.is_empty() {
-                    return Ok(ToolOutput::error(
-                        "'cron_expr' is required for trigger_type='recurring'.",
-                    ));
-                }
-                if cron.len() > 128 {
-                    return Ok(ToolOutput::error("'cron_expr' is too long."));
-                }
-                match crate::task_engine::cron::next_fire_from_cron(cron, &timestamp::now()) {
-                    Ok(ts) => (Some(ts), Some(cron.to_string())),
-                    Err(_) => {
-                        return Ok(ToolOutput::error(
-                            "Invalid 'cron_expr'. Use a 6-field cron expression (seconds field first).",
-                        ));
-                    }
+                None => {
+                    return Ok(ToolOutput::error(format!(
+                        "Parent task '{parent_id}' not found."
+                    )));
                 }
             }
-            _ => (None, None), // callback: no next_fire_at
+        } else {
+            0
         };
 
-        const MAX_TIMEOUT_SECS: i64 = 7_776_000; // 90 days
+        // Dedup: check for existing active tasks before session cap and INSERT.
+        // Dedup returns existing items as success — it's not a "new creation" so it
+        // must run before the session cap guard to avoid blocking legitimate reuse.
 
-        let timeout_at = if let Some(secs) = input["timeout_secs"].as_i64() {
-            if secs <= 0 {
-                return Ok(ToolOutput::error(
-                    "'timeout_secs' must be a positive integer.",
-                ));
-            }
-            if secs > MAX_TIMEOUT_SECS {
+        // Dedup path A (reference_url provided): pre-check by URL
+        if let Some(url) = reference_url
+            && let Some(existing) = ctx.db.find_active_task_by_ref_url(url).await?
+        {
+            ctx.db
+                .log_audit_event(
+                    ctx.session_id,
+                    "create_task",
+                    &format!("task:{}", existing.id),
+                    None,
+                    Some(&format!("dedup_reused — {} (ref: {url})", existing.label)),
+                    None,
+                    Some(ctx.trace_id),
+                )
+                .await?;
+            return Ok(ToolOutput::success(format_dedup_response(&existing)));
+        }
+
+        // Dedup path B (label-only, no reference_url): pre-check by label
+        if reference_url.is_none()
+            && let Some(existing) = ctx.db.find_active_task_by_label(label).await?
+        {
+            ctx.db
+                .log_audit_event(
+                    ctx.session_id,
+                    "create_task",
+                    &format!("task:{}", existing.id),
+                    None,
+                    Some(&format!("dedup_reused — {}", existing.label)),
+                    None,
+                    Some(ctx.trace_id),
+                )
+                .await?;
+            return Ok(ToolOutput::success(format_dedup_response(&existing)));
+        }
+
+        // Guard 5: Cap agent-created tasks per session
+        if source != Some("user_request") {
+            let count = ctx.db.count_session_tasks(ctx.session_id).await?;
+            if count >= MAX_TASKS_PER_SESSION {
                 return Ok(ToolOutput::error(format!(
-                    "'timeout_secs' cannot exceed {} seconds (90 days).",
-                    MAX_TIMEOUT_SECS
+                    "Maximum of {MAX_TASKS_PER_SESSION} agent-created tasks per session reached."
                 )));
             }
-            Some(timestamp::now_plus(chrono::Duration::seconds(secs)))
-        } else {
-            None
-        };
+        }
 
         let task = NewTask {
             agent_id: ctx.db.agent_id.clone(),
             team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
+            parent_task_id: parent_task_id.map(|s| s.to_string()),
+            depth,
             label: label.to_string(),
-            trigger_type: trigger_type_str.to_string(),
-            cron_expr,
+            trigger_type: trigger_type::MANUAL.to_string(),
+            cron_expr: None,
             event_source: None,
             event_offset_secs: None,
             condition_expr: None,
-            next_fire_at,
-            timeout_at,
-            action_type: action_type_val.to_string(),
-            action_config: action_config_str.to_string(),
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::NONE.to_string(),
+            action_config: "{}".to_string(),
             input_context: None,
             created_by_session: Some(ctx.session_id.to_string()),
             created_trace_id: Some(ctx.trace_id.to_string()),
-            reference_url: None,
-            source: None,
+            reference_url: reference_url.map(|s| s.to_string()),
+            source: source.map(|s| s.to_string()),
             metadata: None,
-            r#type: None,
+            r#type: Some(task_type.to_string()),
         };
 
-        let id = ctx.db.create_task(task).await?;
+        // Dedup path A (reference_url provided): attempt INSERT, catch UNIQUE violation
+        match ctx.db.create_task(task).await {
+            Ok(id) => {
+                // Log audit event for new creation
+                let after_value = if let Some(url) = reference_url {
+                    format!("created — {label} (ref: {url})")
+                } else {
+                    format!("created — {label}")
+                };
+                ctx.db
+                    .log_audit_event(
+                        ctx.session_id,
+                        "create_task",
+                        &format!("task:{id}"),
+                        None,
+                        Some(&*after_value),
+                        None,
+                        Some(ctx.trace_id),
+                    )
+                    .await?;
 
-        ctx.db
-            .log_audit_event(
-                ctx.session_id,
-                "create_task",
-                &format!("task:{id}"),
-                None,
-                Some(&*format!("{trigger_type_str}/{action_type_val} — {label}")),
-                None,
-                Some(ctx.trace_id),
-            )
-            .await?;
-
-        Ok(ToolOutput::success(format!(
-            "Task {id} created ({trigger_type_str}/{action_type_val})."
-        )))
+                let mut response = format!("Task created: {id}\nLabel: {label}\nStatus: pending");
+                if let Some(url) = reference_url {
+                    response.push_str(&format!("\nReference: {url}"));
+                }
+                if let Some(src) = source {
+                    response.push_str(&format!("\nSource: {src}"));
+                }
+                if let Some(pid) = parent_task_id {
+                    response.push_str(&format!("\nParent: {pid}"));
+                }
+                // Surface non-default types so the caller can confirm. Hide for "issue"
+                // to keep the common-case response compact.
+                if task_type != TASK_TYPE_ISSUE {
+                    response.push_str(&format!("\nType: {task_type}"));
+                }
+                Ok(ToolOutput::success(response))
+            }
+            Err(err) if reference_url.is_some() && is_unique_violation(&err) => {
+                // UNIQUE constraint on (agent_id, reference_url) fired — find the existing item
+                let url = reference_url.unwrap();
+                if let Some(existing) = ctx.db.find_active_task_by_ref_url(url).await? {
+                    // Log dedup reuse in audit
+                    ctx.db
+                        .log_audit_event(
+                            ctx.session_id,
+                            "create_task",
+                            &format!("task:{}", existing.id),
+                            None,
+                            Some(&format!("dedup_reused — {} (ref: {url})", existing.label)),
+                            None,
+                            Some(ctx.trace_id),
+                        )
+                        .await?;
+                    Ok(ToolOutput::success(format_dedup_response(&existing)))
+                } else {
+                    // Edge case: item transitioned to terminal between INSERT and SELECT.
+                    // Retry the INSERT once.
+                    let retry_task = NewTask {
+                        agent_id: ctx.db.agent_id.clone(),
+                        team_run_id: None,
+                        parent_task_id: parent_task_id.map(|s| s.to_string()),
+                        depth,
+                        label: label.to_string(),
+                        trigger_type: trigger_type::MANUAL.to_string(),
+                        cron_expr: None,
+                        event_source: None,
+                        event_offset_secs: None,
+                        condition_expr: None,
+                        next_fire_at: None,
+                        timeout_at: None,
+                        action_type: action_type::NONE.to_string(),
+                        action_config: "{}".to_string(),
+                        input_context: None,
+                        created_by_session: Some(ctx.session_id.to_string()),
+                        created_trace_id: Some(ctx.trace_id.to_string()),
+                        reference_url: Some(url.to_string()),
+                        source: source.map(|s| s.to_string()),
+                        metadata: None,
+                        r#type: Some(task_type.to_string()),
+                    };
+                    let id = ctx.db.create_task(retry_task).await?;
+                    let after_value =
+                        format!("created — {label} (ref: {url}, retry after dedup race)");
+                    ctx.db
+                        .log_audit_event(
+                            ctx.session_id,
+                            "create_task",
+                            &format!("task:{id}"),
+                            None,
+                            Some(&after_value),
+                            None,
+                            Some(ctx.trace_id),
+                        )
+                        .await?;
+                    let mut response =
+                        format!("Task created: {id}\nLabel: {label}\nStatus: pending");
+                    response.push_str(&format!("\nReference: {url}"));
+                    if let Some(src) = source {
+                        response.push_str(&format!("\nSource: {src}"));
+                    }
+                    if let Some(pid) = parent_task_id {
+                        response.push_str(&format!("\nParent: {pid}"));
+                    }
+                    if task_type != TASK_TYPE_ISSUE {
+                        response.push_str(&format!("\nType: {task_type}"));
+                    }
+                    Ok(ToolOutput::success(response))
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -246,7 +379,7 @@ mod tests {
     use crate::test_utils::test_helpers::TestHarness;
 
     #[tokio::test]
-    async fn test_create_task_callback_resume_agent() {
+    async fn test_create_task_basic() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
@@ -254,22 +387,20 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Analyze codebase",
-                    "trigger_type": "callback",
-                    "action_type": "resume_agent",
-                    "action_config": "{}"
+                    "label": "Implement feature X",
+                    "source": "user_request"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
-        assert!(result.content.contains("created"));
-        assert!(result.content.contains("callback/resume_agent"));
+        assert!(result.content.contains("Task created"));
+        assert!(result.content.contains("Implement feature X"));
     }
 
     #[tokio::test]
-    async fn test_create_task_time_send_message() {
+    async fn test_create_task_with_reference() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
@@ -277,43 +408,251 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Daily standup reminder",
-                    "trigger_type": "time",
-                    "action_type": "send_message",
-                    "action_config": "{\"text\":\"Time for standup!\"}",
-                    "fire_at": "2099-12-31T09:00:00Z"
+                    "label": "Fix issue #42",
+                    "reference_url": "https://github.com/org/repo/issues/42",
+                    "source": "github_issue"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
-        assert!(result.content.contains("time/send_message"));
+        assert!(
+            result
+                .content
+                .contains("Reference: https://github.com/org/repo/issues/42")
+        );
+        assert!(result.content.contains("Source: github_issue"));
     }
 
     #[tokio::test]
-    async fn test_create_task_time_requires_fire_at() {
+    async fn test_create_task_empty_label() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
 
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("'label' is required"));
+    }
+
+    #[tokio::test]
+    async fn test_create_task_callback_guard() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.is_callback_turn = true;
+        let tool = CreateTaskTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"label": "Should fail", "source": "user_request"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("callback turn"));
+    }
+
+    #[tokio::test]
+    async fn test_create_task_task_context_guard() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.is_task_context = true;
+        let tool = CreateTaskTool;
+
+        // Top-level creation blocked
+        let result = tool
+            .execute(
+                serde_json::json!({"label": "Should fail", "source": "user_request"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("top-level"));
+    }
+
+    #[tokio::test]
+    async fn test_create_task_session_cap() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // Create MAX_TASKS_PER_SESSION items
+        let mut item_ids = Vec::new();
+        for i in 0..MAX_TASKS_PER_SESSION {
+            let result = tool
+                .execute(serde_json::json!({"label": format!("Item {i}")}), &ctx)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "item {i} failed: {}", result.content);
+            let id = result
+                .content
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("Task created: ")
+                .unwrap()
+                .to_string();
+            item_ids.push(id);
+        }
+
+        // 6th should be rejected (all 5 are active)
+        let result = tool
+            .execute(serde_json::json!({"label": "One too many"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Maximum"));
+
+        // Complete one item — should free up a slot
+        ctx.db
+            .update_task_status(&item_ids[0], "completed")
+            .await
+            .unwrap();
+
+        // Now creating a 6th should succeed (only 4 active)
+        let result = tool
+            .execute(serde_json::json!({"label": "After completing one"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "should succeed after completing one: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_session_cap_excludes_user_request() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // Create MAX items with source != user_request
+        for i in 0..MAX_TASKS_PER_SESSION {
+            tool.execute(
+                serde_json::json!({"label": format!("Agent item {i}")}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+
+        // user_request should still work
+        let result = tool
+            .execute(
+                serde_json::json!({"label": "User request", "source": "user_request"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "user_request should bypass cap: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_with_parent() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // Create parent
+        let parent_result = tool
+            .execute(
+                serde_json::json!({"label": "Parent task", "source": "user_request"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!parent_result.is_error);
+        // Extract the UUID from the response
+        let parent_id = parent_result
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .unwrap();
+
+        // Create child
+        let child_result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Child task",
+                    "parent_task_id": parent_id,
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !child_result.is_error,
+            "got error: {}",
+            child_result.content
+        );
+        assert!(
+            child_result
+                .content
+                .contains(&format!("Parent: {parent_id}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_depth_cap() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // Create a chain: depth 0 → 1 → 2 → 3 → 4 (should fail at 4)
+        let mut parent_id = None;
+        for depth in 0..=3 {
+            let mut input = serde_json::json!({
+                "label": format!("Level {depth}"),
+                "source": "user_request"
+            });
+            if let Some(pid) = &parent_id {
+                input["parent_task_id"] = serde_json::json!(pid);
+            }
+            let result = tool.execute(input, &ctx).await.unwrap();
+            if depth <= 3 {
+                assert!(!result.is_error, "depth {depth} failed: {}", result.content);
+                parent_id = Some(
+                    result
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .strip_prefix("Task created: ")
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+
+        // Depth 4 should fail
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Missing fire_at",
-                    "trigger_type": "time",
-                    "action_type": "send_message"
+                    "label": "Too deep",
+                    "parent_task_id": parent_id.unwrap(),
+                    "source": "user_request"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("fire_at"));
+        assert!(result.content.contains("depth"));
     }
 
     #[tokio::test]
-    async fn test_create_task_recurring_requires_cron() {
+    async fn test_create_task_invalid_parent_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
@@ -321,20 +660,24 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Missing cron",
-                    "trigger_type": "recurring",
-                    "action_type": "run_skill"
+                    "label": "Orphan",
+                    "parent_task_id": "nonexistent-id",
+                    "source": "user_request"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("cron_expr"));
+        assert!(
+            result.content.contains("invalid_uuid"),
+            "expected UUID error, got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
-    async fn test_create_task_invalid_action_type() {
+    async fn test_create_task_parent_not_found() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
@@ -342,71 +685,371 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Bad action",
-                    "trigger_type": "callback",
-                    "action_type": "explode"
+                    "label": "Orphan",
+                    "parent_task_id": "00000000-0000-0000-0000-000000000000",
+                    "source": "user_request"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("Invalid action_type"));
+        assert!(result.content.contains("not found"));
     }
 
+    // ===== Dedup tests (issue #303) =====
+
     #[tokio::test]
-    async fn test_create_task_invalid_trigger_type() {
+    async fn test_create_task_dedup_by_reference_url() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
 
-        let result = tool
+        let url = "https://github.com/org/repo/issues/303";
+
+        // First creation succeeds normally
+        let result1 = tool
             .execute(
                 serde_json::json!({
-                    "label": "Bad trigger",
-                    "trigger_type": "magic",
-                    "action_type": "send_message"
+                    "label": "Fix issue #303",
+                    "reference_url": url,
+                    "source": "github_issue"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
-        assert!(result.is_error);
-        assert!(result.content.contains("Invalid trigger_type"));
+        assert!(
+            !result1.is_error,
+            "first create failed: {}",
+            result1.content
+        );
+        assert!(result1.content.contains("Task created"));
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .unwrap()
+            .to_string();
+
+        // Second creation with same URL returns existing item
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Fix issue #303 (retry)",
+                    "reference_url": url,
+                    "source": "github_issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error, "dedup failed: {}", result2.content);
+        assert!(
+            result2.content.contains("already exists"),
+            "expected dedup response, got: {}",
+            result2.content
+        );
+        assert!(
+            result2.content.contains(&id1),
+            "should return original ID {id1}, got: {}",
+            result2.content
+        );
     }
 
     #[tokio::test]
-    async fn test_create_task_with_timeout() {
+    async fn test_create_task_dedup_by_label() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // First creation (no reference_url)
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Research memory patterns",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .unwrap()
+            .to_string();
+
+        // Second creation with same label returns existing
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Research memory patterns",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error);
+        assert!(result2.content.contains("already exists"));
+        assert!(result2.content.contains(&id1));
+    }
+
+    #[tokio::test]
+    async fn test_create_task_dedup_case_insensitive_label() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // Create with one casing
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Fix Login Bug",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .unwrap()
+            .to_string();
+
+        // Same label different casing → dedup
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "fix login bug",
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error);
+        assert!(result2.content.contains("already exists"));
+        assert!(result2.content.contains(&id1));
+    }
+
+    #[tokio::test]
+    async fn test_create_task_allows_after_terminal() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        let url = "https://github.com/org/repo/issues/99";
+
+        // Create and complete item
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Old task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+        let id1 = result1
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .unwrap()
+            .to_string();
+        ctx.db.update_task_status(&id1, "completed").await.unwrap();
+
+        // New creation with same URL should succeed (old is terminal)
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Retry task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error, "failed: {}", result2.content);
+        assert!(
+            result2.content.contains("Task created"),
+            "expected new creation, got: {}",
+            result2.content
+        );
+        // Should be a different ID
+        let id2 = result2
+            .content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .unwrap();
+        assert_ne!(id1, id2, "should be a new item, not the old completed one");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_dedup_cross_agent() {
+        // Different agents should be able to create items with the same reference_url
+        let harness1 = TestHarness::new();
+        let harness2 = TestHarness::with_agent("other-agent");
+        let ctx1 = harness1.ctx();
+        let ctx2 = harness2.ctx();
+        let tool = CreateTaskTool;
+
+        let url = "https://github.com/org/repo/issues/50";
+
+        let result1 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Agent 1 task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx1,
+            )
+            .await
+            .unwrap();
+        assert!(!result1.is_error);
+
+        let result2 = tool
+            .execute(
+                serde_json::json!({
+                    "label": "Agent 2 task",
+                    "reference_url": url,
+                    "source": "user_request"
+                }),
+                &ctx2,
+            )
+            .await
+            .unwrap();
+        assert!(!result2.is_error, "cross-agent failed: {}", result2.content);
+        assert!(
+            result2.content.contains("Task created"),
+            "different agent should create new item, got: {}",
+            result2.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_dedup_skips_session_counter() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        // Create 4 unique items (leaves 1 slot)
+        for i in 0..4 {
+            tool.execute(
+                serde_json::json!({"label": format!("Unique item {i}")}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Create item with URL
+        tool.execute(
+            serde_json::json!({
+                "label": "URL item",
+                "reference_url": "https://example.com/issue/1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Now at 5/5 cap
+
+        // Dedup hit on URL item should NOT consume a slot
+        let dedup_result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "URL item retry",
+                    "reference_url": "https://example.com/issue/1"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!dedup_result.is_error);
+        assert!(dedup_result.content.contains("already exists"));
+
+        // The cap is still at 5/5 — dedup didn't consume a slot.
+        // Verify by trying to create a truly new item (should fail, cap reached)
+        let over_cap = tool
+            .execute(serde_json::json!({"label": "Truly new item"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            over_cap.is_error,
+            "should be at cap, but got: {}",
+            over_cap.content
+        );
+        assert!(over_cap.content.contains("Maximum"));
+    }
+
+    // ===== `type` column tests (issue #595) =====
+
+    /// Helper: extract the new task ID from a successful create response.
+    fn extract_id(content: &str) -> &str {
+        content
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Task created: ")
+            .expect("response should start with 'Task created: '")
+    }
+
+    #[tokio::test]
+    async fn test_create_task_type_defaults_to_issue() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
 
         let result = tool
             .execute(
-                serde_json::json!({
-                    "label": "Timed callback",
-                    "trigger_type": "callback",
-                    "action_type": "resume_agent",
-                    "timeout_secs": 3600
-                }),
+                serde_json::json!({"label": "no type", "source": "user_request"}),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
+        // Default type should NOT appear in the response message — it's the common case.
+        assert!(
+            !result.content.contains("Type:"),
+            "default type should be hidden in response: {}",
+            result.content
+        );
 
-        // Verify task was stored
-        let tasks = harness
+        // Row should persist with type='issue'.
+        let id = extract_id(&result.content);
+        let task = ctx
             .db
-            .get_tasks_by_status(vec!["pending".to_string()])
+            .get_manual_task(id)
             .await
-            .unwrap();
-        let task = tasks.iter().find(|t| t.label == "Timed callback").unwrap();
-        assert!(task.timeout_at.is_some());
+            .unwrap()
+            .expect("just-created task should be retrievable");
+        assert_eq!(task.r#type, "issue");
     }
 
     #[tokio::test]
-    async fn test_create_task_timeout_exceeds_max() {
+    async fn test_create_task_type_milestone() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
@@ -414,21 +1057,28 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Too long timeout",
-                    "trigger_type": "callback",
-                    "action_type": "resume_agent",
-                    "timeout_secs": 99_999_999
+                    "label": "milestone parent",
+                    "source": "user_request",
+                    "type": "milestone"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
-        assert!(result.is_error);
-        assert!(result.content.contains("90 days"));
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("Type: milestone"),
+            "non-default type should appear in response: {}",
+            result.content
+        );
+
+        let id = extract_id(&result.content);
+        let task = ctx.db.get_manual_task(id).await.unwrap().unwrap();
+        assert_eq!(task.r#type, "milestone");
     }
 
     #[tokio::test]
-    async fn test_create_task_invalid_json_action_config() {
+    async fn test_create_task_type_project() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = CreateTaskTool;
@@ -436,16 +1086,145 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({
-                    "label": "Bad config",
-                    "trigger_type": "callback",
-                    "action_type": "resume_agent",
-                    "action_config": "not json"
+                    "label": "project parent",
+                    "source": "user_request",
+                    "type": "project"
                 }),
                 &ctx,
             )
             .await
             .unwrap();
-        assert!(result.is_error);
-        assert!(result.content.contains("valid JSON"));
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Type: project"));
+
+        let id = extract_id(&result.content);
+        let task = ctx.db.get_manual_task(id).await.unwrap().unwrap();
+        assert_eq!(task.r#type, "project");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_type_explicit_issue_hidden() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "explicit issue",
+                    "source": "user_request",
+                    "type": "issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // Explicit "issue" should be treated identically to omitted: hidden.
+        assert!(
+            !result.content.contains("Type:"),
+            "explicit issue type should be hidden: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_type_invalid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "bad type",
+                    "source": "user_request",
+                    "type": "epic"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "should reject invalid type");
+        assert!(
+            result.content.contains("Invalid type 'epic'"),
+            "error should name the offending value: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("issue, milestone, project"),
+            "error should list valid types: {}",
+            result.content
+        );
+
+        // Verify no row was created.
+        let count = ctx.db.count_session_tasks(ctx.session_id).await.unwrap();
+        assert_eq!(count, 0, "invalid type should not insert a row");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_type_empty_string_defaults() {
+        // Whitespace-only `type` should fall back to the default rather than error.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "label": "whitespace type",
+                    "source": "user_request",
+                    "type": "   "
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        let id = extract_id(&result.content);
+        let task = ctx.db.get_manual_task(id).await.unwrap().unwrap();
+        assert_eq!(task.r#type, "issue");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_milestone_with_parent() {
+        // Existing depth/parent guards should still apply with non-default types.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = CreateTaskTool;
+
+        let parent = tool
+            .execute(
+                serde_json::json!({
+                    "label": "milestone container",
+                    "source": "user_request",
+                    "type": "milestone"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let parent_id = extract_id(&parent.content).to_string();
+
+        let child = tool
+            .execute(
+                serde_json::json!({
+                    "label": "child issue",
+                    "source": "user_request",
+                    "parent_task_id": parent_id,
+                    "type": "issue"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!child.is_error, "got error: {}", child.content);
+        let child_id = extract_id(&child.content);
+        let child_task = ctx.db.get_manual_task(child_id).await.unwrap().unwrap();
+        assert_eq!(child_task.r#type, "issue");
+        assert_eq!(
+            child_task.parent_task_id.as_deref(),
+            Some(parent_id.as_str())
+        );
     }
 }

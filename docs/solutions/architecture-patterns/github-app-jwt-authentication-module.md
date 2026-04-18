@@ -30,7 +30,7 @@ Follows the `OAuthTokenManager` pattern from `oauth.rs`:
 
 Token is resolved **once per agent turn** via `Settings::resolve_github_token()`, not lazily in each tool. This means:
 - No structural changes to `ToolContext` (stays `github_token: Option<&'a str>`)
-- Zero changes to downstream tools (`run_gh`, `check_work_item`, `fetch_pr_diff`)
+- Zero changes to downstream tools (`run_gh`, `check_task`, `fetch_pr_diff`)
 - Trade-off: one `RwLock::read()` per turn even without GitHub tool calls (nanoseconds)
 
 ### Key Design Decisions

@@ -491,7 +491,7 @@ pub struct TaskResponse {
     pub updated_at: String,
     pub action_config_preview: Option<String>,
     pub result_preview: Option<String>,
-    /// Work item kind: `"issue"`, `"milestone"`, or `"project"`. Default `"issue"`.
+    /// Task kind: `"issue"`, `"milestone"`, or `"project"`. Default `"issue"`.
     /// Added in schema v23 (mika#595).
     pub r#type: String,
 }
@@ -610,7 +610,7 @@ pub struct TaskDetailResponse {
     pub updated_at: String,
     pub action_config: String,
     pub result: Option<String>,
-    /// Work item kind: `"issue"`, `"milestone"`, or `"project"`. Default `"issue"`.
+    /// Task kind: `"issue"`, `"milestone"`, or `"project"`. Default `"issue"`.
     /// Added in schema v23 (mika#595).
     pub r#type: String,
 }

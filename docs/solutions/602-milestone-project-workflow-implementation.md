@@ -9,9 +9,9 @@ https://github.com/senara-solutions/mika/issues/602
 
 Added "Milestone Workflow" and "Project Workflow" sections after the existing per-issue flow. These branches:
 
-- Create parent work items with `type='milestone'` or `type='project'`
+- Create parent tasks with `type='milestone'` or `type='project'`
 - Fetch issues from GitHub milestones or Projects v2
-- Create child work items with `parent_task_id` linkage
+- Create child tasks with `parent_task_id` linkage
 - Execute children sequentially via existing per-issue flow
 - Handle resume semantics for interrupted runs
 
@@ -27,7 +27,7 @@ Removed redundant `mika/skills/bundled/self-dev-sprint/` directory entirely. Its
 
 ### 3. self-dev-webhook-qa/system_prompt.md — Terminology updates
 
-Updated webhook handling to recognize child work items by `parent_task_id` and clarified that milestones/projects use the same PR review webhook path.
+Updated webhook handling to recognize child tasks by `parent_task_id` and clarified that milestones/projects use the same PR review webhook path.
 
 ### 4. CLAUDE.md — Documentation
 

@@ -13,7 +13,7 @@ issue: "#375"
 
 When the silent agent loop processed complex callbacks (e.g., claude-pilot → mika-dev → mika-qa
 delegation chain), the callback phase consumed all 10 tool steps on PR discovery, QA delegation,
-and CI investigation — leaving zero steps for acting on the QA verdict. The work item was left
+and CI investigation — leaving zero steps for acting on the QA verdict. The task was left
 `in_progress` with no status update and no user notification.
 
 Three independent deficiencies compounded:

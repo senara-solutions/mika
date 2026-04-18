@@ -10,7 +10,7 @@ tags: [agent-core, silent-mode, callbacks, skills, security]
 
 ## Problem
 
-When a long-running `run_claude_pilot` call crashed transiently (V8 startup error on 2026-04-14, sprint ticket mika#334), the callback turn fired with `failed: true` and self-dev's retry prompt instructed the agent to re-invoke `run_claude_pilot`. The tool call returned `Unknown tool: run_claude_pilot` twice. The work item transitioned `in_progress → blocked` and the entire sprint stalled.
+When a long-running `run_claude_pilot` call crashed transiently (V8 startup error on 2026-04-14, sprint ticket mika#334), the callback turn fired with `failed: true` and self-dev's retry prompt instructed the agent to re-invoke `run_claude_pilot`. The tool call returned `Unknown tool: run_claude_pilot` twice. The task transitioned `in_progress → blocked` and the entire sprint stalled.
 
 ## Root Cause
 
@@ -51,8 +51,8 @@ The exhaustive `match` (no wildcard) forces a compile error when a new `SilentTr
 
 The filter was a **structural backstop** against exec handlers running in callback turns. That backstop is now relaxed for callbacks, but **four independent guards remain**:
 
-1. **Dispatch-readiness guard (#525)** — `validate_dispatch_readiness()` rejects new long-running dispatches when the target work item is not `pending`/`in_progress` OR an active callback child task already exists. A callback cannot spawn a new `run_claude_pilot` against the same work item.
-2. **`is_task_context: true`** in silent `ToolContext` blocks top-level `create_work_item` calls. A compromised callback result cannot make the agent fabricate a new work item to sidestep into.
+1. **Dispatch-readiness guard (#525)** — `validate_dispatch_readiness()` rejects new long-running dispatches when the target task is not `pending`/`in_progress` OR an active callback child task already exists. A callback cannot spawn a new `run_claude_pilot` against the same task.
+2. **`is_task_context: true`** in silent `ToolContext` blocks top-level `create_task` calls. A compromised callback result cannot make the agent fabricate a new task to sidestep into.
 3. **Trust boundary** — callback `result` content is already wrapped in `<callback_result trust="untrusted">` framing with an explicit anti-instruction-following directive.
 4. **`is_callback_turn` flag** now correctly propagates (`matches!(params.trigger, SilentTrigger::Callback { .. })`) to the silent `ToolContext`, giving future per-tool defense-in-depth (e.g., gating `shell_exec` on `!ctx.is_callback_turn`) a working hook.
 

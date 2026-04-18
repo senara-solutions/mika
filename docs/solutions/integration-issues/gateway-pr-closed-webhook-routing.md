@@ -5,11 +5,11 @@ date: 2026-04-13
 tags: [gateway, webhook, github, auto-merge, work-item-lifecycle]
 ---
 
-# Gateway drops pull_request.closed — work items stuck in_progress
+# Gateway drops pull_request.closed — tasks stuck in_progress
 
 ## Problem
 
-When mika-qa passes a PR and `pr_merge_with_gate` enables auto-merge, GitHub eventually closes the PR (merged: true) after CI passes. The gateway's `route_event()` had no arm for `pull_request.closed`, so the event was silently dropped. mika-dev never learned the PR merged and the work item stayed `in_progress` indefinitely.
+When mika-qa passes a PR and `pr_merge_with_gate` enables auto-merge, GitHub eventually closes the PR (merged: true) after CI passes. The gateway's `route_event()` had no arm for `pull_request.closed`, so the event was silently dropped. mika-dev never learned the PR merged and the task stayed `in_progress` indefinitely.
 
 ## Root Cause
 
@@ -23,4 +23,4 @@ When mika-qa passes a PR and `pr_merge_with_gate` enables auto-merge, GitHub eve
 
 ## Prevention
 
-When adding new webhook event handling in the autonomous loop, trace the full lifecycle: event source (GitHub) -> gateway routing -> skill activation -> work item state transition. Any gap in this chain means state gets stuck.
+When adding new webhook event handling in the autonomous loop, trace the full lifecycle: event source (GitHub) -> gateway routing -> skill activation -> task state transition. Any gap in this chain means state gets stuck.

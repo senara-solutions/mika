@@ -29,7 +29,7 @@ The spawned forwarding task retries on HTTP 429/5xx or request timeouts using th
 
 Semaphore lifecycle during retry: the 30-permit `webhook_semaphore` (shared with Telegram) is released during each retry sleep and re-acquired via `try_acquire_owned` before the next attempt. If the semaphore is full on re-acquire, the retry is abandoned with a dedicated ERROR log (`semaphore at capacity during retry`), distinct from the `retry budget exhausted` ERROR emitted when all 6 attempts return a retryable failure.
 
-The delivery LRU cache has no TTL (size-based eviction only). Under extreme webhook volume (>10k deliveries during a single 300s retry sleep), the `X-GitHub-Delivery` entry may be evicted and a GitHub redelivery would bypass gateway dedup. Agent-side idempotency (work item unique index on `reference_url`) mitigates double-processing. Events that exhaust retries or are abandoned due to semaphore pressure are dropped with ERROR logs; persistent DLQ + replay CLI is tracked in #590.
+The delivery LRU cache has no TTL (size-based eviction only). Under extreme webhook volume (>10k deliveries during a single 300s retry sleep), the `X-GitHub-Delivery` entry may be evicted and a GitHub redelivery would bypass gateway dedup. Agent-side idempotency (task unique index on `reference_url`) mitigates double-processing. Events that exhaust retries or are abandoned due to semaphore pressure are dropped with ERROR logs; persistent DLQ + replay CLI is tracked in #590.
 
 ## Agent Identification & Reply Routing
 

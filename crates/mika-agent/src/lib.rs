@@ -14,6 +14,7 @@ pub mod server;
 pub mod skills;
 pub mod startup;
 pub mod task_engine;
+pub mod task_metadata;
 pub mod teams;
 #[cfg(test)]
 pub mod test_utils;
@@ -21,4 +22,3 @@ pub mod timestamp;
 pub mod tools;
 pub mod validate;
 pub mod well_known_agents;
-pub mod work_item_metadata;

@@ -8,7 +8,7 @@ component: tooling
 severity: medium
 applies_when:
   - Fetching a batch of GitHub issues for sequential processing (milestone or project workflows)
-  - Any workflow step that retrieves work items and processes them in order
+  - Any workflow step that retrieves tasks and processes them in order
   - Adding new gh CLI or GraphQL queries that list issues for dispatch
 tags:
   - milestone-workflow
@@ -29,7 +29,7 @@ When child issues have dependency ordering — earlier issues are prerequisites 
 
 ## Guidance
 
-Always add explicit ascending sort by issue number when fetching batches of work items for sequential processing.
+Always add explicit ascending sort by issue number when fetching batches of tasks for sequential processing.
 
 **Milestone workflow (gh CLI):**
 
@@ -65,7 +65,7 @@ Without explicit sorting, the workflow silently relies on an API default that ca
 
 - Adding any new `gh issue list` or GraphQL query that fetches multiple issues for sequential processing
 - Any batch work-item dispatch step in self-dev, qa-review, or other orchestration skills
-- Whenever the processing order of work items matters for correctness
+- Whenever the processing order of tasks matters for correctness
 
 ## Examples
 

@@ -35,10 +35,10 @@ pub mod health_thresholds {
     /// Callback task stuck at `completed` (not delivered) for longer than this is anomalous.
     pub const STUCK_CALLBACK_SECS: i64 = 600; // 10 minutes
 
-    /// Manual work item `blocked` with no `updated_at` change for longer than this is anomalous.
+    /// Manual task `blocked` with no `updated_at` change for longer than this is anomalous.
     pub const STALE_BLOCKED_SECS: i64 = 86_400; // 24 hours
 
-    /// Manual work item `pending` with no callback child for longer than this is anomalous (#583).
+    /// Manual task `pending` with no callback child for longer than this is anomalous (#583).
     pub const STALE_PENDING_SECS: i64 = 86_400; // 24 hours
 
     /// Task `in_progress` for longer than this (when no `estimated_duration_secs`) is anomalous.

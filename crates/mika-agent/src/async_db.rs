@@ -340,41 +340,37 @@ impl AsyncDatabase {
         .await
     }
 
-    pub async fn count_session_work_items(&self, session_id: &str) -> Result<i64> {
+    pub async fn count_session_tasks(&self, session_id: &str) -> Result<i64> {
         let a = self.agent_id.clone();
         let s = session_id.to_owned();
-        self.with_db(move |db| db.count_session_work_items(&a, &s))
-            .await
+        self.with_db(move |db| db.count_session_tasks(&a, &s)).await
     }
 
-    pub async fn find_active_work_item_by_ref_url(
-        &self,
-        reference_url: &str,
-    ) -> Result<Option<Task>> {
+    pub async fn find_active_task_by_ref_url(&self, reference_url: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let url = reference_url.to_owned();
-        self.with_db(move |db| db.find_active_work_item_by_ref_url(&a, &url))
+        self.with_db(move |db| db.find_active_task_by_ref_url(&a, &url))
             .await
     }
 
-    pub async fn find_active_work_item_by_pr_url(&self, pr_url: &str) -> Result<Option<Task>> {
+    pub async fn find_active_task_by_pr_url(&self, pr_url: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let url = pr_url.to_owned();
-        self.with_db(move |db| db.find_active_work_item_by_pr_url(&a, &url))
+        self.with_db(move |db| db.find_active_task_by_pr_url(&a, &url))
             .await
     }
 
-    pub async fn find_active_work_item_by_branch(&self, branch: &str) -> Result<Option<Task>> {
+    pub async fn find_active_task_by_branch(&self, branch: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let b = branch.to_owned();
-        self.with_db(move |db| db.find_active_work_item_by_branch(&a, &b))
+        self.with_db(move |db| db.find_active_task_by_branch(&a, &b))
             .await
     }
 
-    pub async fn find_active_work_item_by_label(&self, label: &str) -> Result<Option<Task>> {
+    pub async fn find_active_task_by_label(&self, label: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let l = label.to_owned();
-        self.with_db(move |db| db.find_active_work_item_by_label(&a, &l))
+        self.with_db(move |db| db.find_active_task_by_label(&a, &l))
             .await
     }
 
@@ -384,9 +380,9 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task_depth(&i, &a)).await
     }
 
-    pub async fn list_active_work_items(&self) -> Result<Vec<Task>> {
+    pub async fn list_active_tasks(&self) -> Result<Vec<Task>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.list_active_work_items(&a)).await
+        self.with_db(move |db| db.list_active_tasks(&a)).await
     }
 
     pub async fn get_task_health_summary(&self) -> Result<TaskHealthSummary> {
@@ -1654,13 +1650,9 @@ impl AsyncDatabase {
 
     // -- Dashboard: Dev Runs --
 
-    pub async fn update_work_item_metadata(
-        &self,
-        task_id: &str,
-        metadata_json: &str,
-    ) -> Result<bool> {
+    pub async fn update_task_metadata(&self, task_id: &str, metadata_json: &str) -> Result<bool> {
         let (i, m) = (task_id.to_owned(), metadata_json.to_owned());
-        self.with_db(move |db| db.update_work_item_metadata(&i, &m))
+        self.with_db(move |db| db.update_task_metadata(&i, &m))
             .await
     }
 

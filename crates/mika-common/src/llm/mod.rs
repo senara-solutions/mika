@@ -579,7 +579,7 @@ send_message({"text":"test"})
         // #453: non-Anthropic models echo `context>` instead of `</context>`
         let input = r#"Hello.
 <context type="tool_history" trust="metadata">
-list_work_items({"source":"self_dev"}) → No work items found...
+list_tasks({"source":"self_dev"}) → No tasks found...
 context>
 Bye."#;
         assert_eq!(strip_internal_tags(input), "Hello.\n\nBye.");

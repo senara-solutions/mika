@@ -44,14 +44,14 @@ The verdict handler (`server::verdict_handler`) intercepts `pull_request_review.
 1. **Parse** the gateway-formatted text using `parse_pr_review_event()` (regex match on `[GitHub] PR review ({state}) on {repo}#{number}`)
 2. **Extract verdict** from the review body using `parse_verdict()` — case-insensitive match on `VERDICT:` at start of line
 3. **Act on verdict:**
-   - `pass` → look up work item by `metadata.claude_pilot.pr_url`, check status is `in_progress`, then call `run_gh_checks` + `classify_checks` + `run_gh_merge` (reused from `pr_merge_with_gate`)
+   - `pass` → look up task by `metadata.claude_pilot.pr_url`, check status is `in_progress`, then call `run_gh_checks` + `classify_checks` + `run_gh_merge` (reused from `pr_merge_with_gate`)
    - `block[*]` / `hold[*]` → pass through to LLM (LLM still drives retry logic)
    - Missing → log warning, pass through with `verdict_missing=true` enrichment
 4. **Pre-digest** the result for the LLM as a fait accompli — the LLM receives "merge initiated" rather than the raw review text
 
 Key design decisions:
 - **Reuse `pr_merge_with_gate` internals** (`run_gh_checks`, `classify_checks`, `run_gh_merge`) — made `pub(crate)` for shared access. Same CI gate classification logic applies.
-- **No new work item statuses** — gates on existing `in_progress` + `metadata.claude_pilot.pr_url` presence. Tracks merge state in `metadata.verdict_merge` to avoid schema migration.
+- **No new task statuses** — gates on existing `in_progress` + `metadata.claude_pilot.pr_url` presence. Tracks merge state in `metadata.verdict_merge` to avoid schema migration.
 - **Pre-digest avoids completion-claim guard trigger words** — uses "merge initiated" / "auto-merge enabled" instead of "merged" / "completed" since the engine action happens outside the LLM's tool calls.
 - **60-second timeout** on subprocess calls to prevent agent lock starvation.
 
@@ -77,10 +77,10 @@ Do NOT use this pattern when:
 ## Examples
 
 **Before (LLM-driven, unreliable):**
-The LLM receives raw webhook text `[GitHub] PR review (approved) on repo#522 by @mika-qa` and must independently: (1) recognize this is an approval, (2) find `VERDICT: pass` in the body, (3) look up the work item, (4) call `pr_merge_with_gate`. Any step can fail or be improvised incorrectly.
+The LLM receives raw webhook text `[GitHub] PR review (approved) on repo#522 by @mika-qa` and must independently: (1) recognize this is an approval, (2) find `VERDICT: pass` in the body, (3) look up the task, (4) call `pr_merge_with_gate`. Any step can fail or be improvised incorrectly.
 
 **After (structural handler):**
-The engine intercepts the event, parses the verdict, looks up the work item, and calls merge before the LLM sees the message. The LLM receives a pre-digested `<verdict_handler>` block describing what the engine did.
+The engine intercepts the event, parses the verdict, looks up the task, and calls merge before the LLM sees the message. The LLM receives a pre-digested `<verdict_handler>` block describing what the engine did.
 
 ## Related
 
@@ -89,7 +89,7 @@ The engine intercepts the event, parses the verdict, looks up the work item, and
 - `docs/solutions/architecture-patterns/merge-two-step-llm-tool-contracts.md` — anti-pattern the handler avoids (atomic, not two-step)
 - `docs/solutions/architecture-patterns/deterministic-skill-context-injection.md` — related pattern of engine-owned pre-fetch
 - mika#524 — implementation issue
-- mika#525 — companion: tool-level refusal for `run_claude_pilot` on invalid work item states
+- mika#525 — companion: tool-level refusal for `run_claude_pilot` on invalid task states
 
 ## Companion: CI Success Handler (`check_suite.completed/success`)
 

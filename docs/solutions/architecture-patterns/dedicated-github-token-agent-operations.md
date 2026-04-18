@@ -15,7 +15,7 @@ related_docs:
 
 ## Problem
 
-`MIKA_INVESTIGATE_GITHUB_TOKEN` was purpose-built for the investigation panel (dashboard issue creation) but was being reused across agent operations — context injection, work item enrichment, and dev-run PR merges. This conflated two different permission scopes: the investigation panel only needs Issues R/W, while agent operations need Pull requests R/W, Issues R/W, and Contents R.
+`MIKA_INVESTIGATE_GITHUB_TOKEN` was purpose-built for the investigation panel (dashboard issue creation) but was being reused across agent operations — context injection, task enrichment, and dev-run PR merges. This conflated two different permission scopes: the investigation panel only needs Issues R/W, while agent operations need Pull requests R/W, Issues R/W, and Contents R.
 
 Discovered when mika-qa failed to review a private repo PR — the investigation token returned 404 because it lacked Pull requests permission.
 

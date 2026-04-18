@@ -19,7 +19,7 @@ Use `address_pr_comments` when:
 |-------|----------|-------------|
 | `pr_url` | Yes | Full GitHub PR URL (e.g., `https://github.com/senara-solutions/mika/pull/42`) |
 | `worktree_path` | Yes | Absolute path to the existing git worktree for the PR branch |
-| `task_id` | Yes | UUID from `create_work_item` for log correlation |
+| `task_id` | Yes | UUID from `create_task` for log correlation |
 
 ### Behavior
 

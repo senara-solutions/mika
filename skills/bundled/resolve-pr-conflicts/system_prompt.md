@@ -34,7 +34,7 @@ Do **not** use `resolve_pr_conflicts` for:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `worktree_path` | Yes | Absolute path to the existing git worktree for the PR branch |
-| `task_id` | Yes | UUID from `create_work_item` for log correlation |
+| `task_id` | Yes | UUID from `create_task` for log correlation |
 
 ### Behavior
 

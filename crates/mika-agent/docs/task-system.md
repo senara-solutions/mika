@@ -5,7 +5,7 @@ description: Task lifecycle reference — trigger types, action types, status tr
 
 # Task System
 
-Mika's task engine is a unified SQLite-backed scheduler that manages all background work — from one-shot reminders to recurring heartbeats, long-running callbacks, and user-tracked work items.
+Mika's task engine is a unified SQLite-backed scheduler that manages all background work — from one-shot reminders to recurring heartbeats, long-running callbacks, and user-tracked tasks.
 
 ## Trigger Types
 
@@ -19,7 +19,7 @@ Each task has a `trigger_type` that determines how it fires:
 | `user_reply` | Fires when the user replies to the conversation |
 | `event` | Fires on a system event |
 | `condition` | Fires when a specific condition is met |
-| `manual` | User-tracked work items created via `create_work_item` — not auto-dispatched by the task engine |
+| `manual` | User-tracked tasks created via `create_task` — not auto-dispatched by the task engine |
 | `a2a` | Agent-to-Agent protocol tasks — created by remote A2A requests |
 
 ## Action Types
@@ -33,7 +33,7 @@ Each task has an `action_type` that determines what happens when it fires:
 | `inject_context` | Injects context into the agent's system prompt |
 | `resume_agent` | Resumes the agent loop (used with callback tasks from long-running processes) |
 | `invoke_orchestrator` | Fires the team orchestrator (used for team suspend/resume after delegated work completes) |
-| `none` | No automated action — used by `manual` work items which are tracking-only entries |
+| `none` | No automated action — used by `manual` tasks which are tracking-only entries |
 
 ## Status Definitions
 
@@ -42,7 +42,7 @@ Each task has an `action_type` that determines what happens when it fires:
 | `pending` | No | Task created, waiting to fire or be acted upon |
 | `recurring_active` | No | Recurring task armed and waiting for next cron fire time |
 | `in_progress` | No | Task has been claimed and is currently executing |
-| `blocked` | No | Work item is blocked (manual tasks only, user-managed) |
+| `blocked` | No | Task is blocked (manual tasks only, user-managed) |
 | `completed` | Yes* | Task finished successfully (*except callback tasks which proceed to `delivered`) |
 | `delivered` | Yes | Callback task result has been injected into the conversation |
 | `failed` | Yes | Task execution failed |
@@ -93,7 +93,7 @@ pending → completed  (external process calls POST /tasks/{id}/complete or `mik
 
 Full lifecycle: `pending → completed → delivered`. The `completed → delivered` transition is the critical handoff where the result enters the conversation. A task stuck at `completed` without reaching `delivered` is an anomaly that requires investigation.
 
-### `manual` (work items)
+### `manual` (tasks)
 
 ```
 pending → in_progress → completed
@@ -111,7 +111,7 @@ Validated transitions (enforced at the tool layer):
 - `blocked` → in_progress, completed, cancelled
 - Terminal states (`completed`, `cancelled`) cannot transition to a new status, but metadata can still be written by including the `metadata` field (#617)
 
-Manual work items are not auto-dispatched by the task engine. Status is managed via `create_work_item`, `update_work_item_status`, and `check_work_item` tools.
+Manual tasks are not auto-dispatched by the task engine. Status is managed via `create_task`, `update_task_status`, and `check_task` tools.
 
 ### `user_reply` / `event` / `condition`
 
@@ -133,5 +133,5 @@ These are task states that indicate something may need attention:
 | **Stuck callback** | A callback task in `completed` status that was never transitioned to `delivered` (stuck for >10 minutes) | Investigate why the result was not delivered to the conversation. Ask the user. |
 | **Failed recurring** | A recurring task (e.g. heartbeat, reflection) in `failed` status — it should be cycling but has stopped | Alert the user. The recurring schedule has broken. |
 | **Long-running task** | A task `in_progress` for longer than its expected duration (>1 hour default, or 2x `estimated_duration_secs`) | Flag it to the user — the task may be stuck or the process may have died. |
-| **Stale blocked item** | A manual work item in `blocked` status with no activity for >24 hours | Ask the user if the blocker has been resolved or if the item should be updated. |
-| **GitHub-linked item** | A manual work item with a GitHub PR/issue `reference_url` — the linked PR may have been merged | Use `check_work_item` to inspect the PR/issue status and suggest updating the work item accordingly. |
+| **Stale blocked item** | A manual task in `blocked` status with no activity for >24 hours | Ask the user if the blocker has been resolved or if the task should be updated. |
+| **GitHub-linked item** | A manual task with a GitHub PR/issue `reference_url` — the linked PR may have been merged | Use `check_task` to inspect the PR/issue status and suggest updating the task accordingly. |

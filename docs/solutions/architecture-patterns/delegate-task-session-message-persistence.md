@@ -57,7 +57,7 @@ Enables `prune_old_sessions()` to clean up delegate sessions (7-day retention af
 let delegate_metadata = serde_json::json!({
     "trigger": "delegate",
     "orchestrator": current_agent_id,
-    "work_item_id": work_item_id
+    "task_id": task_id
 }).to_string();
 if let Err(e) = async_db
     .create_session_with_parent(&session_id, agent_name, "delegate",

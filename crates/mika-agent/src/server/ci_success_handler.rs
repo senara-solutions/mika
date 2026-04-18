@@ -36,10 +36,10 @@ use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use crate::task_metadata::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, run_gh_checks, run_gh_merge, run_gh_subprocess,
 };
-use crate::work_item_metadata::merge_metadata;
 
 use super::verdict::{Verdict, parse_verdict};
 use super::verdict_handler::VerdictAction;
@@ -242,12 +242,12 @@ pub async fn try_handle_ci_success(
     }
 
     // 6. All conditions met — initiate merge
-    // Look up work item by PR URL for metadata update
+    // Look up task by PR URL for metadata update
     let pr_url = format!("https://github.com/{}/pull/{}", event.repo, pr.number);
-    let work_item = match db.find_active_work_item_by_pr_url(&pr_url).await {
-        Ok(wi) => wi,
+    let task = match db.find_active_task_by_pr_url(&pr_url).await {
+        Ok(t) => t,
         Err(e) => {
-            warn!(error = %e, pr_url = %pr_url, "Failed to look up work item by PR URL");
+            warn!(error = %e, pr_url = %pr_url, "Failed to look up task by PR URL");
             None
         }
     };
@@ -272,17 +272,14 @@ pub async fn try_handle_ci_success(
 
     match merge_result {
         Ok(_output) => {
-            let task_id = work_item
-                .as_ref()
-                .map(|wi| wi.id.as_str())
-                .unwrap_or("none");
+            let task_id = task.as_ref().map(|t| t.id.as_str()).unwrap_or("none");
 
-            // Update work item metadata
-            if let Some(ref wi) = work_item
+            // Update task metadata
+            if let Some(ref t) = task
                 && let Err(e) =
-                    update_ci_merge_metadata(db, &wi.id, &wi.metadata, pr.number, &pr_url).await
+                    update_ci_merge_metadata(db, &t.id, &t.metadata, pr.number, &pr_url).await
             {
-                warn!(error = %e, task_id = %wi.id, "Failed to update work item metadata after CI success merge");
+                warn!(error = %e, task_id = %t.id, "Failed to update task metadata after CI success merge");
             }
 
             // Log audit event
@@ -294,7 +291,7 @@ pub async fn try_handle_ci_success(
                     Some("in_progress"),
                     Some("merge_initiated"),
                     Some(&format!(
-                        "trigger=check_suite_success pr_url={pr_url} work_item_id={task_id}"
+                        "trigger=check_suite_success pr_url={pr_url} task_id={task_id}"
                     )),
                     Some(trace_id),
                 )
@@ -352,10 +349,7 @@ pub async fn try_handle_ci_success(
                     pre_digest: format_already_merged_pre_digest(
                         &event,
                         pr.number,
-                        work_item
-                            .as_ref()
-                            .map(|wi| wi.id.as_str())
-                            .unwrap_or("none"),
+                        task.as_ref().map(|t| t.id.as_str()).unwrap_or("none"),
                     ),
                 };
             }
@@ -497,7 +491,7 @@ async fn find_pass_verdict(
 // Metadata helpers
 // ---------------------------------------------------------------------------
 
-/// Update work item metadata with CI success merge state.
+/// Update task metadata with CI success merge state.
 async fn update_ci_merge_metadata(
     db: &AsyncDatabase,
     task_id: &str,
@@ -522,7 +516,7 @@ async fn update_ci_merge_metadata(
 
     merge_metadata(&mut base, &incoming);
     let merged_str = serde_json::to_string(&base)?;
-    db.update_work_item_metadata(task_id, &merged_str).await?;
+    db.update_task_metadata(task_id, &merged_str).await?;
     Ok(())
 }
 
@@ -545,9 +539,9 @@ fn format_success_pre_digest(
          [GitHub] Check suite success on {}#{} (branch: {})\n\
          CI checks all green + VERDICT: pass from @{reviewer} — structural handler acted.\n\n\
          Squash-merge has been initiated for PR #{pr_number} on {} (branch deletion requested).\n\n\
-         Work item: {task_id}\n\n\
+         Task: {task_id}\n\n\
          Do NOT call pr_merge_with_gate — the merge action is already in progress.\n\
-         Update the work item status to reflect the outcome, then notify the user.\n\
+         Update the task status to reflect the outcome, then notify the user.\n\
          </ci_success_handler>",
         event.repo, pr_number, event.branch, event.repo
     )
@@ -563,9 +557,9 @@ fn format_already_merged_pre_digest(
         "<ci_success_handler>\n\
          [GitHub] Check suite success on {}#{} (branch: {})\n\
          CI checks all green — PR was already finalized before the handler ran.\n\n\
-         Work item: {task_id}\n\n\
+         Task: {task_id}\n\n\
          Do NOT call pr_merge_with_gate — no action needed.\n\
-         Update the work item status if not already done, then notify the user.\n\
+         Update the task status if not already done, then notify the user.\n\
          </ci_success_handler>",
         event.repo, pr_number, event.branch
     )
@@ -662,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn success_pre_digest_contains_work_item_id() {
+    fn success_pre_digest_contains_task_id() {
         let event = sample_event();
         let text = format_success_pre_digest(&event, 571, "mika-qa", "task-123");
         assert!(text.contains("task-123"));

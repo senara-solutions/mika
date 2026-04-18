@@ -51,7 +51,7 @@ Used `COALESCE(s.task_id, json_extract(s.metadata, '$.task_id'))` in all queries
 
 ## Key Decisions
 
-1. **`task_id` semantic:** The immediate trigger task ID (not the root work item). Parent work items are reachable via `tasks.parent_task_id` joins — keeps the data model normalized.
+1. **`task_id` semantic:** The immediate trigger task ID (not the root task). Parent tasks are reachable via `tasks.parent_task_id` joins — keeps the data model normalized.
 2. **ALTER TABLE, not rebuild:** Sessions table has no CHECK constraints to widen, so a simple column addition suffices.
 3. **Dual storage in CLI path:** `mika ask --task-id` writes to both the metadata JSON (backward compat) and the new column. The JSON storage is transitional.
 4. **Shallow tree traversal:** `get_sessions_for_task_tree` collects root + direct children only (not recursive). Sufficient for current task trees; deeper drilling uses the children endpoint.

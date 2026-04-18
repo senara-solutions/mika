@@ -79,7 +79,7 @@ Join the existing agent-loop guard family when defending against provider quirks
 
 1. **Text-based tool call detection** — catches XML tool calls emitted as text (`detect_text_based_tool_call`).
 2. **Required-tools gate** — keyword-matched skills declaring `[constraints] required_tools` block EndTurn without the tool call (#265).
-3. **Completion-claim guard** — blocks EndTurn text claiming completion keywords without `update_work_item_status` (#483).
+3. **Completion-claim guard** — blocks EndTurn text claiming completion keywords without `update_task_status` (#483).
 4. **Fabricated action-claim guard** — blocks EndTurn claiming a GitHub resource URL with zero tool calls (#308).
 5. **Per-turn tool_use dedup guard (this doc)** — dispatch-layer, suppresses byte-identical tool_use blocks within one response (#582).
 

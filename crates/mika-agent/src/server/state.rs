@@ -42,7 +42,7 @@ pub struct AgentState {
     /// tokens are preferred over `MIKA_GITHUB_TOKEN` PAT for agent operations.
     pub github_app: Option<Arc<GitHubApp>>,
     /// In-memory queue of deferred GitHub webhooks awaiting callback completion (#528).
-    /// Webhooks targeting a work item with an in-flight callback are held here until
+    /// Webhooks targeting a task with an in-flight callback are held here until
     /// the callback completes or the 60s timeout expires.
     pub webhook_queue: Arc<tokio::sync::Mutex<Vec<DeferredWebhook>>>,
 }

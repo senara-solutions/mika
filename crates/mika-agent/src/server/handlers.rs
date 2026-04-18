@@ -137,11 +137,11 @@ pub async fn handle_message(
         }
     };
 
-    // Webhook deferral check (#528): if this is a GitHub webhook targeting a work item
+    // Webhook deferral check (#528): if this is a GitHub webhook targeting a task
     // with an in-flight callback, queue it instead of processing immediately.
     if req.channel == "github"
         && let Some(correlation) = correlate_webhook(&req.text)
-        && let Some((work_item_id, event_desc)) =
+        && let Some((task_id, event_desc)) =
             should_defer_webhook(&agent_state.db, &correlation).await
     {
         let now = std::time::Instant::now();
@@ -154,11 +154,11 @@ pub async fn handle_message(
             .log_audit_event(
                 "system",
                 "webhook_deferred",
-                &format!("task:{work_item_id}"),
+                &format!("task:{task_id}"),
                 None,
                 Some(&event_desc),
                 Some(&format!(
-                    "Webhook deferred: in-flight callback for work item {work_item_id}"
+                    "Webhook deferred: in-flight callback for task {task_id}"
                 )),
                 None,
             )
@@ -169,15 +169,15 @@ pub async fn handle_message(
 
         info!(
             request_id = %request_id,
-            work_item_id = %work_item_id,
+            task_id = %task_id,
             event = %event_desc,
-            "deferring webhook: work item has in-flight callback"
+            "deferring webhook: task has in-flight callback"
         );
 
         let deferred = DeferredWebhook {
             request: req,
             received_at: now,
-            work_item_id: work_item_id.clone(),
+            task_id: task_id.clone(),
             event_desc,
             deadline,
         };
@@ -186,7 +186,7 @@ pub async fn handle_message(
         agent_state.webhook_queue.lock().await.push(deferred);
 
         // Spawn timeout task that drains only deadline-expired webhooks.
-        // Uses drain_expired (not drain_for_work_item) so recently-arrived
+        // Uses drain_expired (not drain_for_task) so recently-arrived
         // webhooks that haven't hit their individual deadline are preserved.
         let queue = agent_state.webhook_queue.clone();
         let agent_state_timeout = agent_state.clone();
@@ -418,7 +418,7 @@ pub async fn handle_task_complete(
         let webhook_queue = agent_state.webhook_queue.clone();
         let agent_state_drain = agent_state.clone();
         let state_drain = state.clone();
-        let parent_work_item_id = completed_task.parent_task_id.clone();
+        let parent_task_id = completed_task.parent_task_id.clone();
         tokio::spawn(async move {
             // Persist result and mark completed in DB before dispatch
             match db
@@ -484,19 +484,19 @@ pub async fn handle_task_complete(
                     warn!(task_id = %completed_task.id, error = %e, "resume_agent dispatch failed");
                 }
                 Ok(()) => {
-                    // Drain deferred webhooks for the parent work item (#528).
+                    // Drain deferred webhooks for the parent task (#528).
                     // Only drain on successful dispatch — when AgentBusy fires, the
                     // callback silent-agent turn has not run, so metadata (pr_url etc.)
                     // has not been persisted yet. The 60s timeout provides the safety net.
-                    if let Some(ref parent_id) = parent_work_item_id {
+                    if let Some(ref parent_id) = parent_task_id {
                         let deferred = {
                             let mut q = webhook_queue.lock().await;
-                            webhook_queue::drain_for_work_item(&mut q, parent_id)
+                            webhook_queue::drain_for_task(&mut q, parent_id)
                         };
                         if !deferred.is_empty() {
                             info!(
                                 count = deferred.len(),
-                                work_item_id = %parent_id,
+                                task_id = %parent_id,
                                 "replaying deferred webhooks after callback completion"
                             );
                             replay_deferred_webhooks(deferred, &state_drain, &agent_state_drain)
@@ -537,7 +537,7 @@ pub async fn handle_task_complete(
                     .into_response();
             }
             Ok(true) => {
-                // Drain deferred webhooks for the parent work item (#528).
+                // Drain deferred webhooks for the parent task (#528).
                 if let Some(ref parent_id) = task.parent_task_id {
                     let webhook_queue = agent_state.webhook_queue.clone();
                     let agent_state_drain = agent_state.clone();
@@ -548,12 +548,12 @@ pub async fn handle_task_complete(
                     tokio::spawn(async move {
                         let deferred = {
                             let mut q = webhook_queue.lock().await;
-                            webhook_queue::drain_for_work_item(&mut q, &parent_id)
+                            webhook_queue::drain_for_task(&mut q, &parent_id)
                         };
                         if !deferred.is_empty() {
                             info!(
                                 count = deferred.len(),
-                                work_item_id = %parent_id,
+                                task_id = %parent_id,
                                 "replaying deferred webhooks after non-resume callback completion"
                             );
                             replay_deferred_webhooks(deferred, &state_drain, &agent_state_drain)
@@ -639,7 +639,7 @@ pub async fn handle_task_cancel(
 /// Replay deferred webhooks through the normal message processing path.
 ///
 /// Each webhook is processed sequentially, acquiring the agent lock for each turn.
-/// This ensures the verdict handler and LLM see consistent work item metadata.
+/// This ensures the verdict handler and LLM see consistent task metadata.
 async fn replay_deferred_webhooks(
     webhooks: Vec<DeferredWebhook>,
     state: &AppState,
@@ -649,7 +649,7 @@ async fn replay_deferred_webhooks(
         let deferral_ms = deferred.received_at.elapsed().as_millis();
         info!(
             request_id = %deferred.request.request_id,
-            work_item_id = %deferred.work_item_id,
+            task_id = %deferred.task_id,
             event = %deferred.event_desc,
             deferral_ms = deferral_ms,
             "replaying deferred webhook"
@@ -661,7 +661,7 @@ async fn replay_deferred_webhooks(
             .log_audit_event(
                 "system",
                 "webhook_replayed",
-                &format!("task:{}", deferred.work_item_id),
+                &format!("task:{}", deferred.task_id),
                 None,
                 Some(&format!("deferral_ms={deferral_ms}")),
                 Some(&format!(

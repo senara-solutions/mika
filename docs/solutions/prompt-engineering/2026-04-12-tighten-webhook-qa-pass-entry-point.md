@@ -15,7 +15,7 @@ mika-dev received a `pull_request_review.submitted` webhook with `VERDICT: pass`
 Three gaps in the `self-dev-webhook-qa/system_prompt.md` allowed this:
 
 1. **No event-type fingerprint.** The prompt assumed the LLM would correctly identify `pull_request_review.submitted` from message text. The LLM misread it as `pull_request.opened`.
-2. **Work item correlation before action.** Step 1 was "correlate to work item" — if that step confused the LLM, merge never happened. The PR URL was already in the webhook; merge should not depend on work item lookup.
+2. **Task correlation before action.** Step 1 was "correlate to task" — if that step confused the LLM, merge never happened. The PR URL was already in the webhook; merge should not depend on task lookup.
 3. **No zero-narration directive.** The prompt said "DO NOT end your turn without acting" but never prohibited narration *before* acting. The LLM filled silence with text instead of making a tool call.
 
 ## Solution
@@ -30,11 +30,11 @@ Added explicit fingerprint block that names what the event IS and what it is NOT
 
 ### 2. Reordered flow: parse → merge → correlate
 
-Old order: correlate work item (Step 1) → parse verdict (Step 2) → act (Step 3)
+Old order: correlate task (Step 1) → parse verdict (Step 2) → act (Step 3)
 
-New order: parse verdict (Step 1) → extract PR coords (Step 2) → act/merge (Step 3) → correlate work item (Step 4) → update status (Step 5)
+New order: parse verdict (Step 1) → extract PR coords (Step 2) → act/merge (Step 3) → correlate task (Step 4) → update status (Step 5)
 
-The `pass` case now calls `pr_merge_with_gate` before any work item lookup. If correlation fails later, the merge already succeeded. Step 4 says: "If no work item found, skip work item updates — the merge/action in Step 3 already succeeded."
+The `pass` case now calls `pr_merge_with_gate` before any task lookup. If correlation fails later, the merge already succeeded. Step 4 says: "If no task found, skip task updates — the merge/action in Step 3 already succeeded."
 
 ### 3. Zero-narration rule on pass verdict
 

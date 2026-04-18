@@ -23,7 +23,7 @@ After #567 loosened the silent-mode tool filter so callback turns could use exec
 
 ## Symptoms
 
-- `Unknown tool: run_claude_pilot` on callback turn retry (work item `84f9ec29`, mika#334)
+- `Unknown tool: run_claude_pilot` on callback turn retry (task `84f9ec29`, mika#334)
 - `self-dev` skill prompt visible in callback context but its dependency `claude-pilot` (which defines `run_claude_pilot`) excluded from tool definitions
 
 ## What Didn't Work

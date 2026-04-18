@@ -131,7 +131,7 @@ pub fn format_callback_framing(
         result
     };
     let parent_line = parent_task_id
-        .map(|id| format!("\nParent work item: {id}"))
+        .map(|id| format!("\nParent task: {id}"))
         .unwrap_or_default();
     format!(
         "{status_line}\n\n\
@@ -585,7 +585,7 @@ async fn run_loop(
     // Whether we already injected a text-based tool call correction. Only allow one retry.
     let mut text_tool_call_retry_done = false;
     // Whether we already injected a completion-claim correction. Only allow one retry.
-    // Guards against fabricated completion claims without update_work_item_status calls (#483).
+    // Guards against fabricated completion claims without update_task_status calls (#483).
     let mut completion_claim_retry_done = false;
     // Whether we already injected a fabricated-action correction. Only allow one retry.
     // Guards against fabricated action claims with URLs but zero tool calls (#308).
@@ -785,8 +785,8 @@ async fn run_loop(
 
                     // Completion-claim guard: if the agent claims work is done (e.g.,
                     // "merged", "deployed", "completed") but didn't call
-                    // update_work_item_status, reject and re-prompt once. This catches
-                    // fabricated completion claims that leave work items stuck in
+                    // update_task_status, reject and re-prompt once. This catches
+                    // fabricated completion claims that leave tasks stuck in
                     // in_progress. Only fires on EndTurn. See #483.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !completion_claim_retry_done
@@ -794,12 +794,12 @@ async fn run_loop(
                     {
                         // Only enforce if the agent has the tool available
                         // (delegates and team agents don't — they get default_tools() only)
-                        if tools.get("update_work_item_status").is_some()
-                            && !tools_called.contains("update_work_item_status")
+                        if tools.get("update_task_status").is_some()
+                            && !tools_called.contains("update_task_status")
                         {
-                            // Lazy-resolve active work items (only completable statuses)
+                            // Lazy-resolve active tasks (only completable statuses)
                             let active_items: Vec<_> = db
-                                .list_active_work_items()
+                                .list_active_tasks()
                                 .await
                                 .unwrap_or_default()
                                 .into_iter()
@@ -813,7 +813,7 @@ async fn run_loop(
                                     keyword,
                                     active_items = active_items.len(),
                                     label = mode.label(),
-                                    "Completion claim detected without update_work_item_status call — re-prompting"
+                                    "Completion claim detected without update_task_status call — re-prompting"
                                 );
 
                                 let item_list = active_items
@@ -832,14 +832,14 @@ async fn run_loop(
                                         ),
                                     ),
                                 });
-                                // Inject a correction telling the model to update work items
+                                // Inject a correction telling the model to update tasks
                                 request.messages.push(LlmMessage {
                                     role: LlmRole::User,
                                     content: LlmContent::Text(format!(
                                         "[Your response was rejected because you claimed completion \
-                                         (matched: \"{keyword}\") but did not call update_work_item_status. \
-                                         You have {} active work item(s):\n{item_list}\n\n\
-                                         Call update_work_item_status for each relevant work item, \
+                                         (matched: \"{keyword}\") but did not call update_task_status. \
+                                         You have {} active task(s):\n{item_list}\n\n\
+                                         Call update_task_status for each relevant task, \
                                          or retract the completion claim if the work is not actually done. \
                                          Do not fabricate or assume results — verify with tools first.]",
                                         active_items.len(),
@@ -1088,7 +1088,7 @@ pub struct AgentParams<'a> {
     pub user_images: &'a [LlmImage],
     /// Brave Search API key (optional; enables web_search builtin skill).
     pub brave_api_key: Option<&'a str>,
-    /// GitHub token for checking PR/issue status on work items (optional).
+    /// GitHub token for checking PR/issue status on tasks (optional).
     pub github_token: Option<&'a str>,
     /// GitHub App authentication manager (optional). When present, installation
     /// tokens are preferred over `github_token` PAT via `resolve_github_token()`.
@@ -1850,8 +1850,8 @@ pub enum SilentTrigger {
         result: String,
         /// Whether the task failed (true) or completed successfully (false).
         failed: bool,
-        /// The parent work item ID, if the callback task has a parent linkage.
-        /// Surfaced in the callback framing so the agent knows which work item
+        /// The parent task ID, if the callback task has a parent linkage.
+        /// Surfaced in the callback framing so the agent knows which task
         /// this callback relates to. See #313.
         parent_task_id: Option<String>,
     },
@@ -2192,7 +2192,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         // Reflects actual trigger: `true` for SilentTrigger::Callback, `false` otherwise.
         // Silent callback loop prevention already relies on structural guards
         // (`long_running: None` blocks long-running task spawning, `is_task_context: true`
-        // blocks top-level work item creation). Propagating this flag lets future
+        // blocks top-level task creation). Propagating this flag lets future
         // per-tool defense-in-depth hardening gate exec handlers on callback context (#567).
         is_callback_turn: matches!(params.trigger, SilentTrigger::Callback { .. }),
         provider_name: provider,
@@ -4252,7 +4252,7 @@ mod tests {
             "PR created: https://github.com/example/repo/pull/42",
             false,
         );
-        assert!(ctx.contains("Parent work item: wi-parent-uuid-123"));
+        assert!(ctx.contains("Parent task: wi-parent-uuid-123"));
         assert!(ctx.contains("Task: 'long_running:run_claude_pilot' (ID: task-003)"));
     }
 
@@ -4265,7 +4265,7 @@ mod tests {
             "Script completed",
             false,
         );
-        assert!(!ctx.contains("Parent work item"));
+        assert!(!ctx.contains("Parent task"));
         assert!(ctx.contains("Task: 'long_running:run_shell' (ID: task-004)"));
     }
 
@@ -4279,7 +4279,7 @@ mod tests {
             true,
         );
         // Parent line still present even when the callback failed
-        assert!(ctx.contains("Parent work item: wi-parent-uuid-456"));
+        assert!(ctx.contains("Parent task: wi-parent-uuid-456"));
         assert!(ctx.contains("FAILED"));
     }
 

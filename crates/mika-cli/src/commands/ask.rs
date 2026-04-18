@@ -204,7 +204,7 @@ pub async fn run(
         // Fall through to normal agent loop with task_id in session metadata + trace
     }
 
-    // Prepend work item context if --parent-task-id is provided
+    // Prepend task context if --parent-task-id is provided
     let user_message = if let Some(pt) = parent_task_id {
         format!("[work-item:{pt}] {user_message}")
     } else {

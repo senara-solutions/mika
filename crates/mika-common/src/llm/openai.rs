@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_extract_xml_tool_calls_bare_function_tag() {
-        let text = r#"<function=list_work_items>
+        let text = r#"<function=list_tasks>
 {"status": "active"}
 </function>"#;
         let (calls, remaining) = extract_xml_tool_calls(text);
@@ -1271,7 +1271,7 @@ mod tests {
             name, arguments, ..
         } = &calls[0]
         {
-            assert_eq!(name, "list_work_items");
+            assert_eq!(name, "list_tasks");
             assert_eq!(arguments, &json!({"status": "active"}));
         } else {
             panic!("expected ToolCall");
@@ -1300,14 +1300,14 @@ mod tests {
 
     #[test]
     fn test_extract_xml_tool_calls_empty_arguments() {
-        let text = "<function=list_work_items></function>";
+        let text = "<function=list_tasks></function>";
         let (calls, remaining) = extract_xml_tool_calls(text);
         assert_eq!(calls.len(), 1);
         if let LlmResponseContent::ToolCall {
             name, arguments, ..
         } = &calls[0]
         {
-            assert_eq!(name, "list_work_items");
+            assert_eq!(name, "list_tasks");
             assert_eq!(arguments, &json!({}));
         } else {
             panic!("expected ToolCall");
@@ -1439,8 +1439,7 @@ mod tests {
                 message: OpenAiMessage {
                     role: "assistant".into(),
                     content: Some(OpenAiContent::Text(
-                        "<tool_call>\n<function=list_work_items>\n{}\n</function>\n</tool_call>"
-                            .into(),
+                        "<tool_call>\n<function=list_tasks>\n{}\n</function>\n</tool_call>".into(),
                     )),
                     tool_calls: None,
                     tool_call_id: None,

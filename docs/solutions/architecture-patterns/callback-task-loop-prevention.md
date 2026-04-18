@@ -68,7 +68,7 @@ Four defensive layers, each independently sufficient to prevent the loop:
 
 The `--task-id` path now calls `run_silent_agent()` instead of `run_agent()`. Silent mode scopes the tool surface: **non-callback** silent triggers (`Heartbeat`, `Reflection`, `Reminder`, `SkillRun`) use `safe_always_on_skills()` which filters out exec/http handler skills. **Callback triggers** use `callback_safe_skills()`, which preserves exec/http handlers because the agent is continuing a tool call it already authorized in conversation mode (#567).
 
-Loop prevention for callbacks no longer relies on structural skill filtering — it relies on `validate_dispatch_readiness()` in `skills/executor.rs` (#525), which rejects new long-running dispatches when: (a) the target work item is not `pending`/`in_progress`, or (b) an active callback child task already exists. The `is_task_context: true` flag in the callback `ToolContext` also blocks top-level `create_work_item` calls.
+Loop prevention for callbacks no longer relies on structural skill filtering — it relies on `validate_dispatch_readiness()` in `skills/executor.rs` (#525), which rejects new long-running dispatches when: (a) the target task is not `pending`/`in_progress`, or (b) an active callback child task already exists. The `is_task_context: true` flag in the callback `ToolContext` also blocks top-level `create_task` calls.
 
 ```rust
 // Before: full agent with all tools

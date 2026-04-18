@@ -10,7 +10,7 @@ related_issues: ["#397", "#375", "#363"]
 
 ## Problem
 
-When a callback turn creates a CI follow-up reminder via `create_reminder` with `action_type: resume_agent`, the reminder fires as `SilentTrigger::Reminder` which got `MAX_TOOL_STEPS = 10` — not the `MAX_CALLBACK_TOOL_STEPS = 20` that callbacks receive. This caused the agent to hit `agent exceeded max tool steps` during complex reminder-triggered workflows that needed 12-15+ steps (e.g., check CI, delegate QA, parse verdict, update work item, notify user, launch retry).
+When a callback turn creates a CI follow-up reminder via `create_reminder` with `action_type: resume_agent`, the reminder fires as `SilentTrigger::Reminder` which got `MAX_TOOL_STEPS = 10` — not the `MAX_CALLBACK_TOOL_STEPS = 20` that callbacks receive. This caused the agent to hit `agent exceeded max tool steps` during complex reminder-triggered workflows that needed 12-15+ steps (e.g., check CI, delegate QA, parse verdict, update task, notify user, launch retry).
 
 ## Root Cause
 

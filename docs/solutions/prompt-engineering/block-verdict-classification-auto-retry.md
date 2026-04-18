@@ -30,7 +30,7 @@ The QA review skill emitted a single untyped `block` verdict for all hard failur
 2. **Self-dev skill** (`self-dev/system_prompt.md`): Added block classification and auto-retry:
    - Verdict parsing extended to handle `block[<sub_type>]` (same regex pattern as `hold[<sub_type>]`)
    - `block[ci]` triggers auto-retry via claude-pilot dispatch, capped at 2 retries
-   - `block_retry_count` tracked in work item metadata (independent of `qa_retry_count`)
+   - `block_retry_count` tracked in task metadata (independent of `qa_retry_count`)
    - Metadata persistence verified after each update (infinite loop guard)
    - Non-fixable blocks (`block[security]`, `block[pipeline]`, bare `block`) retain escalation behavior
 
@@ -44,4 +44,4 @@ The QA review skill emitted a single untyped `block` verdict for all hard failur
 
 - **Pattern: sub-typed verdicts.** When adding new verdict types to QA review, always use sub-types (e.g., `verdict[sub_type]`) rather than freeform reason parsing. Sub-types are reliable to parse; reason text is fragile.
 - **Pattern: independent retry budgets.** When adding retry logic for a new verdict type, use a separate counter (e.g., `block_retry_count`) rather than sharing existing counters. This prevents unintended budget interactions across different failure modes.
-- **Pattern: metadata persistence verification.** Always call `check_work_item` after `update_work_item_status` to verify metadata was persisted. Without this guard, a persistence failure makes the retry budget unbounded.
+- **Pattern: metadata persistence verification.** Always call `check_task` after `update_task_status` to verify metadata was persisted. Without this guard, a persistence failure makes the retry budget unbounded.

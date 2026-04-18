@@ -2,11 +2,11 @@
 title: Terminal-State Metadata Rejection Race Between Verdict Handler and Callback
 date: 2026-04-18
 category: logic-errors
-module: mika-agent/tools/update_work_item_status
+module: mika-agent/tools/update_task_status
 problem_type: logic_error
 component: tooling
 symptoms:
-  - "update_work_item_status rejects metadata writes on completed/cancelled tasks with 'terminal state' error"
+  - "update_task_status rejects metadata writes on completed/cancelled tasks with 'terminal state' error"
   - "Late-arriving callback metadata (cost_usd, duration_ms, pr_url, session_id) silently lost after verdict_handler auto-completes a task"
   - "Task metadata incomplete — merge metadata present but claude_pilot metadata missing"
 root_cause: logic_error
@@ -25,7 +25,7 @@ tags:
 
 ## Problem
 
-`update_work_item_status` rejected the entire call when the status transition was invalid, even if the caller only wanted to add metadata. Terminal-state tasks (`completed`, `cancelled`) could never receive metadata updates from late-arriving callbacks, causing data loss.
+`update_task_status` rejected the entire call when the status transition was invalid, even if the caller only wanted to add metadata. Terminal-state tasks (`completed`, `cancelled`) could never receive metadata updates from late-arriving callbacks, causing data loss.
 
 ## Symptoms
 
@@ -40,9 +40,9 @@ tags:
 
 ## Solution
 
-Added a **terminal-state metadata fallback** in the transition validation block of `update_work_item_status`. When the transition is invalid AND the current status is terminal AND metadata is provided, the tool applies the metadata and returns success without changing the status.
+Added a **terminal-state metadata fallback** in the transition validation block of `update_task_status`. When the transition is invalid AND the current status is terminal AND metadata is provided, the tool applies the metadata and returns success without changing the status.
 
-Key code change in `crates/mika-agent/src/tools/update_work_item_status.rs`:
+Key code change in `crates/mika-agent/src/tools/update_task_status.rs`:
 
 ```rust
 // Validate the transition against the state machine

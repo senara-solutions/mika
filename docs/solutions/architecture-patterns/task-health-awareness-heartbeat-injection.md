@@ -11,7 +11,7 @@ issue: 117
 
 ## Problem
 
-Mika's hourly heartbeat runs only surfaced active manual work items via a flat `<pending-work-items>` block. Anomalous task states across all trigger types — stuck callbacks, failed recurring tasks, stale blocked items, long-running tasks — were invisible to the agent. The agent also lacked self-knowledge about task lifecycles (trigger types, status transitions) and could not answer user questions about her own task system accurately.
+Mika's hourly heartbeat runs only surfaced active manual tasks via a flat `<pending-work-items>` block. Anomalous task states across all trigger types — stuck callbacks, failed recurring tasks, stale blocked items, long-running tasks — were invisible to the agent. The agent also lacked self-knowledge about task lifecycles (trigger types, status transitions) and could not answer user questions about her own task system accurately.
 
 ## Root Cause
 
@@ -35,15 +35,15 @@ Replaced `pending_work_items: &[Task]` on `SilentPromptContext` with `task_healt
 
 **Key design decisions:**
 
-- **Unified `<task-health>` block** replaces `<pending-work-items>` — includes both active work items AND anomalies in one section, preventing token waste from redundant blocks.
+- **Unified `<task-health>` block** replaces `<pending-work-items>` — includes both active tasks AND anomalies in one section, preventing token waste from redundant blocks.
 - **5 anomaly types** with hardcoded threshold constants in `task_engine::types::health_thresholds`:
   - `stuck_callback` — callback `completed` but not `delivered` for >10min
   - `failed_recurring` — recurring task `failed` in last 24h
   - `long_running` — task `in_progress` for >1h (non-manual)
-  - `stale_blocked` — manual work item `blocked` with no activity >24h
-  - `github_linked` — active work item with GitHub reference URL
+  - `stale_blocked` — manual task `blocked` with no activity >24h
+  - `github_linked` — active task with GitHub reference URL
 - **Anomaly cap** at 10 (`MAX_ANOMALIES`) with priority ordering: stuck > failed > long > stale > github
-- **Heartbeat and callback gating** — task health and preferences loaded for `SilentTrigger::Heartbeat` and `SilentTrigger::Callback`, not reflection/skill_run triggers. Callback turns benefit from work item context for correlating results to in-flight work items (#314)
+- **Heartbeat and callback gating** — task health and preferences loaded for `SilentTrigger::Heartbeat` and `SilentTrigger::Callback`, not reflection/skill_run triggers. Callback turns benefit from task context for correlating results to in-flight tasks (#314)
 - **Preferences filtered** to `task_policy_*` prefix via `search_preferences("task_policy_")`
 
 **Helper extraction:** The 5 anomaly queries share a `query_anomalies` closure that handles row-mapping, iteration, and struct construction — eliminating ~130 lines of duplicated code.
@@ -56,7 +56,7 @@ Stored preferences injected as `<stored-preferences>` block with `<task-health-i
 
 1. **Follow the `<pending-work-items>` injection pattern** for any new structured data in heartbeat prompts: sanitize labels (200-char truncation, strip `<>` and newlines), cap result counts, use XML-tagged blocks.
 
-2. **Gate task health data to heartbeat and callback triggers only** — don't inject into reflection/skill_run prompts where the agent has a different job. Callback turns benefit from work item context for correlating results to in-flight work items (#314).
+2. **Gate task health data to heartbeat and callback triggers only** — don't inject into reflection/skill_run prompts where the agent has a different job. Callback turns benefit from task context for correlating results to in-flight tasks (#314).
 
 3. **Filter injected preferences by purpose** — don't dump all preferences into every prompt. Use `search_preferences("prefix_")` to scope to the relevant category.
 
