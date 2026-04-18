@@ -271,6 +271,57 @@ pub(crate) fn validate_uuid(
     })
 }
 
+/// Validate that a UUID-typed task parameter references an existing task owned by
+/// the calling agent. Combines format validation ([`validate_uuid`]) with a DB
+/// existence + agent-scope check in a single call.
+///
+/// Returns `Ok(Task)` on success, or `Err(ToolOutput)` with structured JSON:
+/// - Format error: `{"error": "invalid_uuid", "field": ..., ...}` (from `validate_uuid`)
+/// - Not found / wrong agent: `{"error": "task_not_found", "field": ..., "task_id": ..., "reason": ...}`
+/// - DB error: `{"error": "db_error", "field": ..., "reason": ...}` (fail-closed)
+///
+/// # Example
+/// ```ignore
+/// let task = validate_task_exists(ctx.db, "task_id", id).await
+///     .map_err(|e| return Ok(e))?; // or: match ... { Err(e) => return Ok(e), Ok(t) => t }
+/// ```
+pub(crate) async fn validate_task_exists(
+    db: &crate::async_db::AsyncDatabase,
+    field_name: &str,
+    value: &str,
+) -> std::result::Result<crate::db::Task, ToolOutput> {
+    // Layer 1: format validation (cheap, no I/O)
+    validate_uuid(field_name, value)?;
+
+    // Layer 2: DB existence + agent-scope check
+    match db.get_task(value).await {
+        Ok(Some(task)) => Ok(task),
+        Ok(None) => {
+            // value is a valid UUID (36 chars) — no truncation needed
+            Err(ToolOutput::error(
+                serde_json::json!({
+                    "error": "task_not_found",
+                    "field": field_name,
+                    "task_id": value,
+                    "reason": "no task with this ID exists for the current agent"
+                })
+                .to_string(),
+            ))
+        }
+        Err(e) => {
+            // Fail closed: DB errors reject the call rather than passing through
+            Err(ToolOutput::error(
+                serde_json::json!({
+                    "error": "db_error",
+                    "field": field_name,
+                    "reason": format!("failed to look up task: {e}")
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
 /// Validate that a `work_item_id` references an active manual work item.
 /// Returns `Some(error_message)` if validation fails, `None` if valid.
 pub(crate) async fn validate_work_item(
@@ -284,26 +335,21 @@ pub(crate) async fn validate_work_item(
                 .to_string(),
         );
     }
-    // Validate UUID format before DB lookup — catches fabricated/malformed IDs early
-    if let Err(tool_output) = validate_uuid("work_item_id", work_item_id) {
-        return Some(tool_output.content);
-    }
-    match db.get_task(work_item_id).await {
-        Ok(Some(ref wi))
-            if wi.trigger_type == "manual"
-                && matches!(wi.status.as_str(), "pending" | "in_progress" | "blocked") =>
-        {
-            None
-        }
-        Ok(Some(_)) => Some(format!(
+    // Layer 1+2: format validation + DB existence via shared helper
+    let task = match validate_task_exists(db, "work_item_id", work_item_id).await {
+        Ok(t) => t,
+        Err(tool_output) => return Some(tool_output.content),
+    };
+    // Layer 3: business-rule checks (trigger_type + active status)
+    if task.trigger_type == "manual"
+        && matches!(task.status.as_str(), "pending" | "in_progress" | "blocked")
+    {
+        None
+    } else {
+        Some(format!(
             "Work item '{work_item_id}' is not an active work item. \
              It must be a manual work item with status pending, in_progress, or blocked."
-        )),
-        Ok(None) => Some(format!(
-            "Work item '{work_item_id}' not found. \
-             Create one first using create_work_item."
-        )),
-        Err(e) => Some(format!("Failed to validate work item: {e}")),
+        ))
     }
 }
 
@@ -749,6 +795,178 @@ mod tests {
         let result = validate_uuid("id", "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
         let uuid = result.unwrap();
         assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    }
+
+    // === validate_task_exists tests ===
+
+    use crate::db::NewTask;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    async fn create_test_task(harness: &TestHarness, label: &str) -> String {
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_valid() {
+        let harness = TestHarness::new();
+        let id = create_test_task(&harness, "valid task").await;
+
+        let result = validate_task_exists(&harness.db, "task_id", &id).await;
+        assert!(result.is_ok());
+        let task = result.unwrap();
+        assert_eq!(task.label, "valid task");
+        assert_eq!(task.id, id);
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_invalid_format() {
+        let harness = TestHarness::new();
+
+        let result = validate_task_exists(&harness.db, "task_id", "not-a-uuid").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("invalid_uuid"));
+        assert!(err.content.contains("task_id"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_empty_string() {
+        let harness = TestHarness::new();
+
+        let result = validate_task_exists(&harness.db, "id", "").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("invalid_uuid"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_not_in_db() {
+        let harness = TestHarness::new();
+
+        let result = validate_task_exists(
+            &harness.db,
+            "task_id",
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("task_not_found"));
+        assert!(err.content.contains("task_id"));
+        assert!(err.content.contains("00000000-0000-0000-0000-000000000000"));
+        assert!(err.content.contains("no task with this ID exists"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_cross_agent() {
+        // Create a task with agent "agent-a"
+        let harness_a = TestHarness::with_agent("agent-a");
+        let task_id = create_test_task(&harness_a, "agent-a task").await;
+
+        // Try to validate with agent "agent-b" — should get task_not_found (not info disclosure)
+        let harness_b = TestHarness::with_agent("agent-b");
+        let result = validate_task_exists(&harness_b.db, "task_id", &task_id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("task_not_found"));
+        // Must NOT reveal that the task exists for another agent
+        assert!(!err.content.contains("agent-a"));
+        assert!(err.content.contains("no task with this ID exists"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_cross_agent_identical_to_nonexistent() {
+        // Cross-agent error should be structurally identical to non-existent error
+        let harness_a = TestHarness::with_agent("agent-a");
+        let task_id = create_test_task(&harness_a, "agent-a task").await;
+
+        let harness_b = TestHarness::with_agent("agent-b");
+        let cross_agent_err = validate_task_exists(&harness_b.db, "task_id", &task_id)
+            .await
+            .unwrap_err();
+
+        let nonexistent_err = validate_task_exists(
+            &harness_b.db,
+            "task_id",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .await
+        .unwrap_err();
+
+        // Parse both as JSON and compare structure (excluding task_id values which differ)
+        let cross: serde_json::Value = serde_json::from_str(&cross_agent_err.content).unwrap();
+        let nonexist: serde_json::Value = serde_json::from_str(&nonexistent_err.content).unwrap();
+
+        assert_eq!(cross["error"], nonexist["error"]);
+        assert_eq!(cross["field"], nonexist["field"]);
+        assert_eq!(cross["reason"], nonexist["reason"]);
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_error_json_parseable() {
+        let harness = TestHarness::new();
+
+        let result = validate_task_exists(
+            &harness.db,
+            "my_field",
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .await;
+        let err = result.unwrap_err();
+
+        let json: serde_json::Value = serde_json::from_str(&err.content).unwrap();
+        assert_eq!(json["error"], "task_not_found");
+        assert_eq!(json["field"], "my_field");
+        assert!(json["task_id"].is_string());
+        assert!(json["reason"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_field_name_propagated() {
+        let harness = TestHarness::new();
+
+        // Invalid format — field propagated through validate_uuid
+        let result = validate_task_exists(&harness.db, "work_item_id", "bad").await;
+        let err = result.unwrap_err();
+        assert!(err.content.contains("work_item_id"));
+
+        // Not found — field propagated through task_not_found
+        let result = validate_task_exists(
+            &harness.db,
+            "parent_id",
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(err.content.contains("parent_id"));
     }
 
     // === validate_and_resolve_path tests ===

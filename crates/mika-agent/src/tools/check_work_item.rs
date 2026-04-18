@@ -203,18 +203,18 @@ impl Tool for CheckWorkItemTool {
         if task_id.is_empty() {
             return Ok(ToolOutput::error("'task_id' is required."));
         }
-        if let Err(e) = super::validate_uuid("task_id", task_id) {
-            return Ok(e);
-        }
 
-        // Look up the work item (manual tasks only, agent-scoped)
-        let task = match ctx.db.get_manual_task(task_id).await? {
-            Some(t) => t,
-            None => {
+        // Format + existence + agent-scope validation in one call
+        let task = match super::validate_task_exists(ctx.db, "task_id", task_id).await {
+            Ok(t) if t.trigger_type == "manual" => t,
+            Ok(t) => {
                 return Ok(ToolOutput::error(format!(
-                    "Work item '{task_id}' not found. Only manual (work item) tasks can be checked with this tool."
+                    "Task '{task_id}' exists but is not a manual work item (trigger_type='{}').\
+                     This tool only operates on work items created with create_work_item.",
+                    t.trigger_type
                 )));
             }
+            Err(e) => return Ok(e),
         };
 
         // Build the base output
@@ -439,7 +439,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("not found"));
+        assert!(result.content.contains("task_not_found"));
     }
 
     #[tokio::test]

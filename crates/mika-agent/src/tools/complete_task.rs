@@ -42,9 +42,6 @@ impl Tool for CompleteTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        if let Err(e) = super::validate_uuid("id", id) {
-            return Ok(e);
-        }
 
         let result = input["result"].as_str().unwrap_or("").trim();
         if result.is_empty() {
@@ -57,10 +54,10 @@ impl Tool for CompleteTaskTool {
             )));
         }
 
-        // Load and validate the task
-        let task = match ctx.db.get_task(id).await? {
-            Some(t) => t,
-            None => return Ok(ToolOutput::error(format!("Task '{}' not found.", id))),
+        // Format + existence + agent-scope validation in one call
+        let task = match super::validate_task_exists(ctx.db, "id", id).await {
+            Ok(t) => t,
+            Err(e) => return Ok(e),
         };
 
         if task.trigger_type != trigger_type::CALLBACK {
@@ -165,7 +162,7 @@ mod tests {
             serde_json::json!({"id": "00000000-0000-0000-0000-000000000000", "result": "result"});
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(output.is_error);
-        assert!(output.content.contains("not found"));
+        assert!(output.content.contains("task_not_found"));
     }
 
     #[tokio::test]
