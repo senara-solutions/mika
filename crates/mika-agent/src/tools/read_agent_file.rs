@@ -1,12 +1,69 @@
+use std::path::Path;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path};
+use crate::db::core_memory_section_names;
 
 /// Maximum file size that can be read from the agent home directory (100 KB).
 const MAX_READ_SIZE: u64 = 100 * 1024;
+
+/// Check whether a path targets a core_memory section.
+///
+/// Returns `Some(section_name)` if the path matches a core_memory section,
+/// `None` otherwise. Core memory is DB-backed and auto-injected into the
+/// system prompt — it has no filesystem representation.
+fn is_core_memory_path(path: &str) -> Option<&'static str> {
+    // Normalize: strip leading ./ and ~/
+    let normalized = path
+        .strip_prefix("./")
+        .or_else(|| path.strip_prefix("~/"))
+        .unwrap_or(path);
+
+    // Check for core_memory/ or core-memory/ prefix
+    let after_prefix = normalized
+        .strip_prefix("core_memory/")
+        .or_else(|| normalized.strip_prefix("core-memory/"));
+
+    if let Some(remainder) = after_prefix {
+        // Extract the file stem (without .md extension)
+        let stem = Path::new(remainder)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(remainder);
+        for section in core_memory_section_names() {
+            if stem == section {
+                return Some(section);
+            }
+        }
+        return None;
+    }
+
+    // Check for exact directory match: "core_memory" or "core-memory"
+    if normalized == "core_memory" || normalized == "core-memory" {
+        // Return a generic indicator — the path targets the core_memory directory itself
+        return Some("core_memory");
+    }
+
+    // Check for bare section name (with or without .md extension)
+    let stem = Path::new(normalized)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(normalized);
+    // Only match if the full path IS the section name (not a substring or nested path)
+    if normalized == stem || normalized == format!("{stem}.md") {
+        for section in core_memory_section_names() {
+            if stem == section {
+                return Some(section);
+            }
+        }
+    }
+
+    None
+}
 
 pub struct ReadAgentFileTool;
 
@@ -19,7 +76,7 @@ impl Tool for ReadAgentFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_agent_file".to_string(),
-            description: "Read a file from the agent's home directory. Returns the file contents as text. Files larger than 100 KB are rejected.".to_string(),
+            description: "Read a file from the agent's home directory. Returns the file contents as text. Files larger than 100 KB are rejected. Does NOT access core_memory — core_memory sections (self_model, user_summary, etc.) are auto-injected into your system prompt and cannot be read as files. To modify core_memory, use update_core_memory.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -40,6 +97,22 @@ impl Tool for ReadAgentFileTool {
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or("");
         let agent_param = input["agent"].as_str();
+
+        // Reject core_memory paths with a domain-specific error
+        if let Some(section) = is_core_memory_path(path) {
+            return Ok(ToolOutput::error(format!(
+                "Path '{}' is not filesystem-accessible. core_memory sections ({}) \
+                 are auto-injected into your system prompt on every turn — the content \
+                 is already available in the 'Core Memory' block above. \
+                 To modify core_memory, use the update_core_memory tool.",
+                path,
+                if section == "core_memory" {
+                    core_memory_section_names().join(", ")
+                } else {
+                    format!("including '{section}'")
+                }
+            )));
+        }
 
         // Resolve base directory (own home or target agent's home)
         let base_dir = match resolve_agent_home(agent_param, ctx).await {
@@ -379,6 +452,146 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("my notes"));
+    }
+
+    // --- Core memory path rejection tests ---
+
+    #[test]
+    fn test_is_core_memory_path_prefixed() {
+        assert_eq!(
+            is_core_memory_path("core_memory/self_model.md"),
+            Some("self_model")
+        );
+        assert_eq!(
+            is_core_memory_path("core_memory/user_summary"),
+            Some("user_summary")
+        );
+        assert_eq!(
+            is_core_memory_path("core-memory/self_model.md"),
+            Some("self_model")
+        );
+        assert_eq!(
+            is_core_memory_path("core_memory/current_priorities.md"),
+            Some("current_priorities")
+        );
+        assert_eq!(
+            is_core_memory_path("core_memory/key_people"),
+            Some("key_people")
+        );
+        assert_eq!(
+            is_core_memory_path("core_memory/workflows.md"),
+            Some("workflows")
+        );
+    }
+
+    #[test]
+    fn test_is_core_memory_path_bare_names() {
+        assert_eq!(is_core_memory_path("self_model"), Some("self_model"));
+        assert_eq!(is_core_memory_path("self_model.md"), Some("self_model"));
+        assert_eq!(is_core_memory_path("user_summary"), Some("user_summary"));
+        assert_eq!(is_core_memory_path("workflows.md"), Some("workflows"));
+    }
+
+    #[test]
+    fn test_is_core_memory_path_tilde_prefix() {
+        assert_eq!(
+            is_core_memory_path("~/core_memory/workflows.md"),
+            Some("workflows")
+        );
+        assert_eq!(is_core_memory_path("~/self_model.md"), Some("self_model"));
+    }
+
+    #[test]
+    fn test_is_core_memory_path_dot_prefix() {
+        assert_eq!(
+            is_core_memory_path("./core_memory/self_model.md"),
+            Some("self_model")
+        );
+    }
+
+    #[test]
+    fn test_is_core_memory_path_directory() {
+        assert_eq!(is_core_memory_path("core_memory"), Some("core_memory"));
+        assert_eq!(is_core_memory_path("core-memory"), Some("core_memory"));
+    }
+
+    #[test]
+    fn test_is_core_memory_path_non_matching() {
+        // Substring of "core_memory" in a different path should not match
+        assert_eq!(is_core_memory_path("notes/core_memory_backup.md"), None);
+        // File containing section name as substring should not match
+        assert_eq!(is_core_memory_path("my_self_model.md"), None);
+        // Normal files should not match
+        assert_eq!(is_core_memory_path("notes.md"), None);
+        assert_eq!(is_core_memory_path("sub/notes.md"), None);
+        assert_eq!(is_core_memory_path("config.toml"), None);
+        // Non-existent section under core_memory/ prefix
+        assert_eq!(is_core_memory_path("core_memory/nonexistent.md"), None);
+    }
+
+    #[tokio::test]
+    async fn test_read_core_memory_section_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "core_memory/self_model.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not filesystem-accessible"),
+            "expected domain-specific error, got: {}",
+            output.content
+        );
+        assert!(
+            output
+                .content
+                .contains("auto-injected into your system prompt"),
+            "expected system prompt guidance, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("update_core_memory"),
+            "expected update_core_memory redirect, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_core_memory_bare_name_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "self_model" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("not filesystem-accessible"));
+    }
+
+    #[tokio::test]
+    async fn test_read_core_memory_non_matching_path_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("notes")).unwrap();
+        fs::write(home.join("notes/core_memory_backup.md"), "backup data").unwrap();
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_home(&home);
+        let input = serde_json::json!({ "path": "notes/core_memory_backup.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "should NOT reject: {}", output.content);
+        assert!(output.content.contains("backup data"));
     }
 
     #[tokio::test]

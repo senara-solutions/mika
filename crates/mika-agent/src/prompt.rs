@@ -214,7 +214,10 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         &mut prompt,
         ctx.core_memory,
         Some(
-            "These are your persistent memory blocks. Update them using the update_core_memory tool.",
+            "These are your persistent memory blocks, auto-loaded into this prompt on every turn. \
+             The content below is already available — do NOT attempt to read it via read_agent_file \
+             (core_memory is DB-backed, not filesystem-stored). \
+             To modify core_memory, use the update_core_memory tool.",
         ),
     );
 
@@ -476,7 +479,8 @@ Core memory tracks key people briefly — the people table is the full record.\n
         writeln!(
             prompt,
             "- You can read files from your home directory with read_agent_file (path relative to {}). \
-             Files larger than 100 KB are rejected.",
+             Files larger than 100 KB are rejected. \
+             core_memory sections cannot be read with this tool — they are already in your system prompt above.",
             home.display()
         )
         .unwrap();
@@ -487,7 +491,8 @@ Core memory tracks key people briefly — the people table is the full record.\n
         );
         prompt.push_str(
             "- You can read files from your home directory with read_agent_file (relative paths only). \
-             Files larger than 100 KB are rejected.\n",
+             Files larger than 100 KB are rejected. \
+             core_memory sections cannot be read with this tool — they are already in your system prompt above.\n",
         );
     }
     prompt.push_str(
@@ -574,7 +579,14 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     write_identity_section(&mut prompt, ctx.identity);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, None, ctx.telegram_configured);
-    write_core_memory_section(&mut prompt, ctx.core_memory, None);
+    write_core_memory_section(
+        &mut prompt,
+        ctx.core_memory,
+        Some(
+            "Auto-loaded on every turn. Do NOT read via read_agent_file. \
+             Use update_core_memory to modify.",
+        ),
+    );
 
     // Pending commitments
     if !ctx.pending_commitments.is_empty() {
