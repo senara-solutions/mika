@@ -117,6 +117,12 @@ Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR
 
 **Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate.
 
+### Rule 7 — `run_gh` input schema discipline
+
+`run_gh` takes TWO SEPARATE INPUTS: `"command"` (array of gh subcommand arguments) and `"repo"` (string, `owner/repo` target). `--repo` is a **sibling parameter to `command`**, NOT a flag inside the array. Any shorthand example like `run_gh("pr list --repo senara-solutions/mika ...")` is **not literal** — split it: put every token EXCEPT `--repo VALUE` into `command`, pull `VALUE` into `repo`. Including `--repo` inside `command` causes the wrapper to reject the call. If that happens, **move `--repo` out of the array** — do NOT drop it (you will silently query the wrong repo). `gh api` is not an allowed subcommand. Permitted: `pr, issue, run, workflow, release, repo, search, label, milestone, project`.
+
+**Incident:** session `4cbc6de7-...` on 2026-04-17 — milestone #12 dispatch failed because `--repo` was passed inside `command`, wrapper rejected it, agent dropped `--repo` on retry and falsely concluded milestone didn't exist.
+
 ---
 
 ## Child Work Item Handling

@@ -62,3 +62,9 @@ If during implementation you discover the code lives in a **different repository
 Special case for "skill" tickets: if the skill is a **bundled template** (shipped inside `mika/crates/mika-agent/templates/skills/`), the ticket belongs on the `mika` repo, not `mika-skills`. The `mika-skills` marketplace repo is for community/external skills only.
 
 **Incident:** `mika#485` + `mika-skills#102` on 2026-04-08 — rename in `mika#485`, artifacts orphaned in `mika-skills#102` (docs-only). Split was root cause.
+
+### Rule 2 — `run_gh` input schema discipline
+
+`run_gh` takes TWO SEPARATE INPUTS: `"command"` (array of gh subcommand arguments) and `"repo"` (string, `owner/repo` target). `--repo` is a **sibling parameter to `command`**, NOT a flag inside the array. Any shorthand example like `run_gh("pr list --repo senara-solutions/mika ...")` is **not literal** — split it: put every token EXCEPT `--repo VALUE` into `command`, pull `VALUE` into `repo`. Including `--repo` inside `command` causes the wrapper to reject the call. If that happens, **move `--repo` out of the array** — do NOT drop it (you will silently query the wrong repo). `gh api` is not an allowed subcommand. Permitted: `pr, issue, run, workflow, release, repo, search, label, milestone, project`.
+
+**Incident:** session `4cbc6de7-...` on 2026-04-17 — milestone #12 dispatch failed because `--repo` was passed inside `command`, wrapper rejected it, agent dropped `--repo` on retry and falsely concluded milestone didn't exist.
