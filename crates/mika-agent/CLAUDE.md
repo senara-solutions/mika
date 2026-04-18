@@ -43,6 +43,8 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 **Cross-agent file access:** `read_agent_file`, `write_agent_file`, and `list_agent_files` accept an optional `agent` parameter for orchestrator-only cross-agent file access. `resolve_agent_home(agent_param, ctx)` helper validates permissions.
 
+**Core memory path guard (#645):** `read_agent_file` rejects paths targeting core_memory sections with a domain-specific error before reaching `validate_and_resolve_path`. `is_core_memory_path(path)` matches `core_memory/` and `core-memory/` prefixes, bare section names (with or without `.md`), tilde/dot-prefixed variants, and exact directory names. Uses `core_memory_section_names()` from `db.rs` as single source of truth. The system prompt's core_memory preamble and tool-usage section also warn against reading core_memory via file tools (defense-in-depth).
+
 ### Management Tools
 
 12 tools for multi-agent/team workflows (`create_agent`, `list_agents`, `create_team`, `delete_team`, `update_team`, `delegate_task`, `list_teams`, `run_team`, `get_team_status`, `get_team_history`, `create_task`, `update_task_status`). `create_agent`, `list_agents`, `create_team` always registered; others added when `agents.len() > 1 || !teams.is_empty()`. Orchestrator guards: only default agent or team-listed orchestrators can delegate/run teams; self-delegation blocked. **Task guard:** `delegate_task` and long-running skills require `task_id` referencing an active manual task. Per-tool timeouts: `run_team` (300s), `delegate_task` (120s).
