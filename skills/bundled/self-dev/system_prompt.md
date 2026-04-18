@@ -301,6 +301,10 @@ Do not chain inferences together without verification. "SyntaxError + optional c
 
 Never mention a PR number (e.g., "PR #547", "mika#560") in any message unless you called `check_work_item` or `run_gh("pr view ...")` / `run_gh("pr list ...")` **in the same turn** and extracted the number from the tool output. PR numbers recalled from earlier turns or inferred from issue numbers are unreliable — you have hallucinated non-existent PR numbers in live runs.
 
+**This includes status notifications.** After `run_claude_pilot` returns "task submitted", the ONLY valid notification is: "claude-pilot started for <repo>#<issue> — awaiting callback." Never include PR numbers, PR URLs, or "PR ready" claims until the callback returns a confirmed PR URL. "Task submitted" means "running" — not "done."
+
+**Incident (mika#608, 2026-04-18):** Agent announced "PR #640 ready" immediately after dispatching claude-pilot. PR #640 did not exist — claude-pilot was still running. The PR number was fabricated from the issue number pattern.
+
 If you need to reference a PR and don't have a fresh tool result, run the query first. If you cannot query (e.g., no network), say "PR URL not confirmed" instead of guessing.
 
 **Incident:** sprint 2026-04-13 — cited "PR #547" for mika#531 twice. PR #547 does not exist. The number was fabricated.
@@ -321,6 +325,10 @@ When the user says "implement milestone <repo>#<n>":
 
 This workflow orchestrates a GitHub milestone as a parent work item with child issue work items.
 
+**CRITICAL: Steps M1 → M2 → M3 are setup. ALL THREE must complete before ANY dispatch.** Do NOT call `run_claude_pilot` until every child work item exists. Do NOT skip M2. Do NOT create only one child. The milestone is a batch — create ALL children first, execute them later.
+
+**Incident (mika milestone#7, 2026-04-18):** Agent skipped M2, created only one child for #617, and immediately dispatched claude-pilot. The other 4 issues were never tracked. The milestone was stuck at pending with zero active children. Root cause: agent pattern-matched into single-issue dispatch mode instead of following the milestone batch workflow.
+
 ### Step M1 — Create parent work item
 
 Call `create_work_item` with:
@@ -331,17 +339,19 @@ Call `create_work_item` with:
 
 Remember the returned `task_id` as `milestone_wi`.
 
-### Step M2 — Fetch milestone issues
+### Step M2 — Fetch milestone issues (MANDATORY — do NOT skip)
 
 ```bash
 run_gh issue list --milestone <n> --repo senara-solutions/<repo> --state open --json number,title --jq 'sort_by(.number) | .[].number'
 ```
 
-Store the ordered list of issue numbers as `milestone_issues`.
+Store the ordered list of issue numbers as `milestone_issues`. This list drives M3 — without it you will create incomplete children.
 
-### Step M3 — Create child work items
+**GATE:** If `milestone_issues` is empty, notify Vincent and stop. If you did not run this command, you MUST run it now before proceeding to M3.
 
-For each issue number in `milestone_issues`:
+### Step M3 — Create ALL child work items (MANDATORY — every issue, not just one)
+
+For **each** issue number in `milestone_issues` (ALL of them, not just the first):
 1. Call `create_work_item` with **all** of these fields (do NOT omit `parent_task_id`):
    ```json
    {
@@ -354,6 +364,10 @@ For each issue number in `milestone_issues`:
    ```
    **`parent_task_id` is REQUIRED** — without it the child is orphaned from the milestone tree and callback routing to Step M4 will fail.
 2. Store returned `task_id` in ordered list `child_wis`
+
+**GATE:** Verify `len(child_wis) == len(milestone_issues)`. If not equal, you missed issues — go back and create the missing children. Do NOT proceed to M4 until every issue has a child work item.
+
+**Record to memory:** `store_fact(category="event", description="Milestone <repo>#<n> initialized with {N} child issues: #X, #Y, #Z. Parent task: <milestone_wi>.")`
 
 Notify Vincent: "Milestone <repo>#<n> initialized with {N} issues. Starting sequential execution."
 
@@ -376,9 +390,9 @@ For each `child_task_id` in `child_wis` (in order):
 3. **Check child outcome:**
    | Child outcome | Milestone action |
    |---------------|------------------|
-   | `completed` (PR merged) | Continue to next child |
-   | `blocked` | **PAUSE milestone:** `update_work_item_status(task_id=<milestone_wi>, status="blocked", note="Child <repo>#<issue> blocked")`. Notify Vincent: "Milestone <repo>#<n> paused — child <repo>#<issue> blocked. Reply 'continue' or 'skip <repo>#<issue>' to proceed." Stop execution. |
-   | `failed` (exhausted retries) | Continue to next child (record failure in milestone metadata) |
+   | `completed` (PR merged) | `store_fact(category="event", description="Milestone <repo>#<n> child <repo> issue#<issue> completed. PR merged.")`. Continue to next child |
+   | `blocked` | `store_fact(category="event", description="Milestone <repo>#<n> child <repo> issue#<issue> blocked. Reason: <reason>.")`. **PAUSE milestone:** `update_work_item_status(task_id=<milestone_wi>, status="blocked", note="Child <repo>#<issue> blocked")`. Notify Vincent: "Milestone <repo>#<n> paused — child <repo>#<issue> blocked. Reply 'continue' or 'skip <repo>#<issue>' to proceed." Stop execution. |
+   | `failed` (exhausted retries) | `store_fact(category="event", description="Milestone <repo>#<n> child <repo> issue#<issue> failed after retries.")`. Continue to next child (record failure in milestone metadata) |
 
 4. **Loop** to next child
 
@@ -388,7 +402,8 @@ When all children processed:
 1. Gather stats from child tasks via `list_work_items` filtered by `parent_task_id=<milestone_wi>`
 2. **Build + deploy:** trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika`). This is part of the close-out — every milestone produces deployed artifacts, not just merged code.
 3. Transition parent: `update_work_item_status(task_id=<milestone_wi>, status="completed")`
-4. Notify Vincent with summary:
+4. **Record to memory:** `store_fact(category="event", description="Milestone <repo>#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
+5. Notify Vincent with summary:
    ```
    Milestone <repo> milestone#<n> complete.
    ✅ Completed: {N} | ❌ Failed: {N} | ⏸️ Blocked: {N}
