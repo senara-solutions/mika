@@ -109,7 +109,7 @@ Validated transitions (enforced at the tool layer):
 - `pending` → any status
 - `in_progress` → blocked, completed, cancelled
 - `blocked` → in_progress, completed, cancelled
-- Terminal states (`completed`, `cancelled`) cannot transition
+- Terminal states (`completed`, `cancelled`) cannot transition to a new status, but metadata can still be written by including the `metadata` field (#617)
 
 Manual work items are not auto-dispatched by the task engine. Status is managed via `create_work_item`, `update_work_item_status`, and `check_work_item` tools.
 
