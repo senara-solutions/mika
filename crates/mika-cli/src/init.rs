@@ -66,6 +66,9 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
     )?;
     startup::seed_core_memory_if_empty(&db, &agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(&agent_home, settings.disable_bundled_skills);
+    if settings.dev_mode {
+        mika_agent::well_known_agents::seed_well_known_skill_overrides(&db, agent_name);
+    }
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
     Ok((settings, async_db, agent_home, global_home))
@@ -138,9 +141,22 @@ fn ensure_initialized_for_agent(
     // In multi-agent layout, check the specific agent's home
     if home::is_multi_agent_layout(global_home) {
         if !agent_home.join("config.toml").exists() {
-            anyhow::bail!(
-                "Agent '{agent_name}' not found. Create it with `mika agents create {agent_name}`."
-            );
+            // Auto-provision well-known agents if dev_mode is enabled
+            if mika_agent::well_known_agents::find_well_known_agent(agent_name).is_some()
+                && let Ok(global_settings) = Settings::load(global_home)
+                && global_settings.dev_mode
+            {
+                mika_agent::well_known_agents::provision_well_known_agents(
+                    global_home,
+                    global_settings.disable_agent_provisioning,
+                );
+            }
+            // Re-check after provisioning attempt
+            if !agent_home.join("config.toml").exists() {
+                anyhow::bail!(
+                    "Agent '{agent_name}' not found. Create it with `mika agents create {agent_name}`."
+                );
+            }
         }
     } else if !home::is_initialized(global_home) {
         anyhow::bail!(
