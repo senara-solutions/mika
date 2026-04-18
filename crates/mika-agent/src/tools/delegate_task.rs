@@ -455,8 +455,8 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(
-            result.content.contains("not found"),
-            "expected not found error, got: {}",
+            result.content.contains("task_not_found"),
+            "expected task_not_found error, got: {}",
             result.content
         );
     }

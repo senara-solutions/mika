@@ -1,6 +1,7 @@
 ---
 title: UUID Validation at Tool Boundary
 date: 2026-04-13
+last_updated: 2026-04-18
 category: best-practices
 module: mika-agent/tools
 problem_type: best_practice
@@ -96,9 +97,54 @@ if let Err(e) = super::validate_uuid("id", id) {
 // Only well-formed UUIDs reach the DB
 ```
 
+## Three-Layer Validation Chain (#596)
+
+The validation system follows a layered architecture. Each layer builds on the previous:
+
+| Layer | Helper | What it checks | Returns |
+|-------|--------|----------------|---------|
+| **1. Format** | `validate_uuid(field, value)` | UUID is syntactically valid (8-4-4-4-12 hex) | `Result<Uuid, ToolOutput>` |
+| **2. Existence** | `validate_task_exists(db, field, value)` | Format (layer 1) + task exists in DB + agent-scoped | `Result<Task, ToolOutput>` |
+| **3. Business rules** | `validate_work_item(db, work_item_id)` | Existence (layer 2) + trigger_type=manual + active status | `Option<String>` |
+
+**Layer 2: `validate_task_exists`** (added in #596) is the primary defense against fabricated UUIDs reaching tool handlers. It:
+- Calls `validate_uuid()` for format checking (layer 1)
+- Queries `db.get_task(value)` which is agent-scoped (`WHERE id = ?1 AND agent_id = ?2`)
+- Returns structured JSON errors distinguishable from format errors:
+
+```json
+{
+  "error": "task_not_found",
+  "field": "task_id",
+  "task_id": "00000000-0000-0000-0000-000000000000",
+  "reason": "no task with this ID exists for the current agent"
+}
+```
+
+Call pattern in tool `execute()` methods (replaces the old two-step pattern):
+```rust
+let id = input["id"].as_str().unwrap_or("").trim();
+if id.is_empty() {
+    return Ok(ToolOutput::error("'id' is required."));
+}
+let task = match super::validate_task_exists(ctx.db, "id", id).await {
+    Ok(t) => t,
+    Err(e) => return Ok(e),
+};
+// task is now a validated Task struct — proceed to business logic
+```
+
+**Design decisions:**
+- Cross-agent UUIDs return the same `task_not_found` error as non-existent UUIDs (no information disclosure)
+- DB errors fail closed (`db_error` structured JSON) rather than passing through
+- The helper returns `Task` directly, eliminating redundant follow-up DB queries
+- `cancel_task_and_kill` and other infrastructure code are NOT in scope — only tool `execute()` methods
+
+**Layer 3: `validate_work_item`** now calls `validate_task_exists` internally, then layers trigger_type and status checks. The return type stays `Option<String>` for backward compatibility with `delegate_task` and dispatch-readiness callers.
+
 ## Related
 
 - [Dispatch-readiness guard](../architecture-patterns/dispatch-readiness-guard-long-running-status-validation.md) — catches valid-but-stale UUIDs (#525)
 - [Fabricated action-claim guard](../architecture-patterns/fabricated-action-claim-guard.md) — structural guard philosophy
 - [Team workspace hardening](../security-issues/team-workspace-ref-dir-validation-hardening.md) — precedent for `Uuid::parse_str()` at entry boundaries
-- GitHub issue: [#531](https://github.com/senara-solutions/mika/issues/531)
+- GitHub issues: [#531](https://github.com/senara-solutions/mika/issues/531) (format validation), [#596](https://github.com/senara-solutions/mika/issues/596) (existence validation)

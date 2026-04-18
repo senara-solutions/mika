@@ -2010,8 +2010,8 @@ mod tests {
 
         assert!(output.is_error);
         assert!(
-            output.content.contains("not found"),
-            "expected not-found error for valid-format-but-nonexistent UUID, got: {}",
+            output.content.contains("task_not_found"),
+            "expected task_not_found error for valid-format-but-nonexistent UUID, got: {}",
             output.content
         );
     }

@@ -130,7 +130,9 @@ Server mode additionally requires:
 - `MIKA_INTERNAL_TOKEN` — Shared secret for Bearer auth between gateway and agent
 
 Optional (startup behavior):
+- `MIKA_DEV_MODE` — Enable dev mode (default: false). When true, auto-provisions well-known development agents (`mika-dev`, `mika-qa`) on startup with role-specific identity, soul, and skill assignments. mika-dev gets self-dev family skills; mika-qa gets qa-review family skills. Idempotent — existing agents are never overwritten.
 - `MIKA_DISABLE_BUNDLED_SKILLS` — Skip bundled skill re-sync on startup (default: false). WARNING: do not enable in production — prevents security updates to handler scripts.
+- `MIKA_DISABLE_AGENT_PROVISIONING` — Skip well-known agent auto-creation on startup (default: false). When true, prevents `dev_mode` from creating or updating agent identity files, allowing manual edits to persist across restarts/deploys. Same pattern as `MIKA_DISABLE_BUNDLED_SKILLS`.
 
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)

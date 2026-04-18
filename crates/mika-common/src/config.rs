@@ -668,6 +668,18 @@ pub struct Settings {
     #[serde(default)]
     pub disable_bundled_skills: bool,
 
+    /// Enable dev mode — auto-provisions well-known development agents
+    /// (mika-dev, mika-qa) with role-specific identity and skill assignments
+    /// on startup (default: false)
+    #[serde(default)]
+    pub dev_mode: bool,
+
+    /// Disable agent provisioning on startup (default: false).
+    /// When true, prevents auto-creation and file overwrites for well-known agents,
+    /// allowing manual edits to persist across restarts/deploys.
+    #[serde(default)]
+    pub disable_agent_provisioning: bool,
+
     /// Enable OpenTelemetry trace export (default: false, requires "telemetry" feature)
     #[serde(default)]
     pub telemetry_enabled: bool,
@@ -1132,6 +1144,11 @@ impl std::fmt::Debug for Settings {
             .field("server_log_file", &self.server_log_file)
             .field("dashboard_enabled", &self.dashboard_enabled)
             .field("disable_bundled_skills", &self.disable_bundled_skills)
+            .field("dev_mode", &self.dev_mode)
+            .field(
+                "disable_agent_provisioning",
+                &self.disable_agent_provisioning,
+            )
             .field("telemetry_enabled", &self.telemetry_enabled)
             .field("otlp_endpoint", &self.otlp_endpoint)
             .field(
@@ -1294,6 +1311,45 @@ mod tests {
         assert!(settings.disable_bundled_skills);
 
         unsafe { std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_mode_from_env() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_DEV_MODE", "true") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.dev_mode);
+
+        unsafe { std::env::remove_var("MIKA_DEV_MODE") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable_agent_provisioning_from_env() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_DISABLE_AGENT_PROVISIONING", "true") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.disable_agent_provisioning);
+
+        unsafe { std::env::remove_var("MIKA_DISABLE_AGENT_PROVISIONING") };
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_mode_defaults_false() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(!settings.dev_mode);
+        assert!(!settings.disable_agent_provisioning);
     }
 
     #[test]

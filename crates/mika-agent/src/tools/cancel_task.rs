@@ -39,7 +39,10 @@ impl Tool for CancelTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        if let Err(e) = super::validate_uuid("id", id) {
+        // Format + existence pre-check — catches fabricated UUIDs before they reach
+        // the cancel_task_and_kill infrastructure layer. The kill path does its own
+        // get_task internally, so this is an intentional extra DB read for safety.
+        if let Err(e) = super::validate_task_exists(ctx.db, "id", id).await {
             return Ok(e);
         }
 
@@ -146,7 +149,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("not found"));
+        assert!(result.content.contains("task_not_found"));
     }
 
     #[tokio::test]

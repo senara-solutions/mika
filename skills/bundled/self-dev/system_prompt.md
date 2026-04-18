@@ -263,9 +263,16 @@ When calling any tool, use the **exact field names** from the tool's schema — 
 - `run_claude_pilot` requires `"task_id"` — the task UUID. Do NOT also pass `"work_item_id"`; the schema has one UUID slot and the executor reads `task_id` for both validation and callback-tree linkage. Passing two UUIDs invites the LLM to fabricate one of them (mika#595 incident).
 - `run_claude_pilot` in iteration mode requires `"prompt": "<repo>#<number>"` (e.g., `"mika-platform#19"`) AND `"iteration_context": "<findings>"` — **NEVER** use a free-text prompt like `"iterate on ..."`; the handler's free-text path has no worktree setup and the session will crash without building a result
 
+- `run_gh` takes TWO SEPARATE INPUTS, not a single shell string. The schema is:
+  - `"command"`: array of gh subcommand arguments (e.g., `["issue", "list", "--milestone", "12", "--state", "open"]`)
+  - `"repo"`: a string, the `owner/repo` target (e.g., `"senara-solutions/mika"`) — **a sibling parameter to `command`, NOT a flag inside the array**.
+  Any example in this prompt written as shorthand — `run_gh("pr list --head <branch> --repo senara-solutions/<repo> ...")` — is **not literal**. When you execute it, you MUST split it: put every token EXCEPT `--repo VALUE` into `command`, and pull `VALUE` into the `repo` parameter. Including `--repo` inside `command` causes the wrapper to reject the call. If you see that error, **move `--repo` out of the array into the `repo` parameter** — do NOT drop `--repo` and retry without it (you will silently query the wrong repo and be lied to by the "not found" response). Also: `gh api` is **not an allowed subcommand**. Permitted: `pr, issue, run, workflow, release, repo, search, label, milestone, project`.
+
 If a tool returns `"Missing required parameter(s)"`, read the error message **verbatim** and check whether your JSON field name matches the spec character-for-character. Do **not** retry with the same wrong field name. Do **not** assume the tool is buggy.
 
-**Incident:** trace `091d4ec0-...` on 2026-04-08 — two `update_core_memory` failures using `"reason"` instead of `"reasoning"`. Also: `mika-platform#19` iteration retry crashed on a free-text prompt.
+**Incidents:**
+- trace `091d4ec0-...` on 2026-04-08 — two `update_core_memory` failures using `"reason"` instead of `"reasoning"`. Also: `mika-platform#19` iteration retry crashed on a free-text prompt.
+- session `4cbc6de7-7e02-4552-a93f-524557cbe1eb` on 2026-04-17 — milestone #12 dispatch failed because `--repo` was passed inside `command`, wrapper rejected it, agent dropped `--repo` on retry and falsely concluded milestone didn't exist.
 
 ### Rule 6 — Always use pr_merge_with_gate for PR merges
 
@@ -301,6 +308,10 @@ Do not chain inferences together without verification. "SyntaxError + optional c
 
 Never mention a PR number (e.g., "PR #547", "mika#560") in any message unless you called `check_task` or `run_gh("pr view ...")` / `run_gh("pr list ...")` **in the same turn** and extracted the number from the tool output. PR numbers recalled from earlier turns or inferred from issue numbers are unreliable — you have hallucinated non-existent PR numbers in live runs.
 
+**This includes status notifications.** After `run_claude_pilot` returns "task submitted", the ONLY valid notification is: "claude-pilot started for <repo>#<issue> — awaiting callback." Never include PR numbers, PR URLs, or "PR ready" claims until the callback returns a confirmed PR URL. "Task submitted" means "running" — not "done."
+
+**Incident (mika#608, 2026-04-18):** Agent announced "PR #640 ready" immediately after dispatching claude-pilot. PR #640 did not exist — claude-pilot was still running. The PR number was fabricated from the issue number pattern.
+
 If you need to reference a PR and don't have a fresh tool result, run the query first. If you cannot query (e.g., no network), say "PR URL not confirmed" instead of guessing.
 
 **Incident:** sprint 2026-04-13 — cited "PR #547" for mika#531 twice. PR #547 does not exist. The number was fabricated.
@@ -321,6 +332,10 @@ When the user says "implement <repo> milestone#<n>":
 
 This workflow orchestrates a GitHub milestone as a parent task with child issue tasks.
 
+**CRITICAL: Steps M1 → M2 → M3 are setup. ALL THREE must complete before ANY dispatch.** Do NOT call `run_claude_pilot` until every child task exists. Do NOT skip M2. Do NOT create only one child. The milestone is a batch — create ALL children first, execute them later.
+
+**Incident (mika milestone#7, 2026-04-18):** Agent skipped M2, created only one child for #617, and immediately dispatched claude-pilot. The other 4 issues were never tracked. The milestone was stuck at pending with zero active children. Root cause: agent pattern-matched into single-issue dispatch mode instead of following the milestone batch workflow.
+
 ### Step M1 — Create parent task
 
 Call `create_task` with:
@@ -331,18 +346,27 @@ Call `create_task` with:
 
 Remember the returned `task_id` as `milestone_wi`.
 
-### Step M2 — Fetch milestone issues
+### Step M2 — Fetch milestone issues (MANDATORY — do NOT skip)
 
-```bash
-run_gh issue list --milestone <n> --repo senara-solutions/<repo> --state open --json number,title --jq 'sort_by(.number) | .[].number'
+```json
+run_gh({
+  "command": ["issue", "list", "--milestone", "<n>", "--state", "open", "--json", "number,title", "--jq", "sort_by(.number) | .[].number"],
+  "repo": "senara-solutions/<repo>"
+})
 ```
 
-Store the ordered list of issue numbers as `milestone_issues`.
+Note: `repo` is a sibling parameter to `command`, never a flag inside the array.
 
-### Step M3 — Create child tasks
+Store the ordered list of issue numbers as `milestone_issues`. This list drives M3 — without it you will create incomplete children.
 
-For each issue number in `milestone_issues`:
-1. Call `create_task` with **all** of these fields (do NOT omit `parent_task_id`):
+**GATE:** If `milestone_issues` is empty, notify Vincent and stop. If you did not run this command, you MUST run it now before proceeding to M3.
+
+### Step M3 — Create ALL child tasks (MANDATORY — every issue, not just one)
+
+**PRE-FLIGHT CHECK (mandatory before every `create_task` call):** Call `list_tasks` filtered by matching `reference_url` to the GitHub issue URL (`https://github.com/senara-solutions/<repo>/issues/<issue_number>`). If a task already exists for that issue, reuse its `task_id` — do NOT create a duplicate. Append the existing `task_id` to `child_wis` and move to the next issue.
+
+For **each** issue number in `milestone_issues` (ALL of them, not just the first):
+1. **Call `create_task` with EXACTLY these 5 fields** — copy the JSON block as-is, substituting the angle-bracket placeholders:
    ```json
    {
      "type": "issue",
@@ -352,8 +376,12 @@ For each issue number in `milestone_issues`:
      "source": "self_dev"
    }
    ```
-   **`parent_task_id` is REQUIRED** — without it the child is orphaned from the milestone tree and callback routing to Step M4 will fail.
+   ⚠️ **ALL 5 FIELDS ARE REQUIRED.** Omitting `parent_task_id` ORPHANS the child from the milestone tree — callback routing to Step M4 will fail and the milestone loop breaks. Omitting `reference_url` disables the pre-flight check on the next run, causing duplicates. Do not truncate the JSON to `{"label": "...", "type": "issue"}` — that form is INCOMPLETE.
 2. Store returned `task_id` in ordered list `child_wis`
+
+**GATE:** Verify `len(child_wis) == len(milestone_issues)`. If not equal, you missed issues — go back and create the missing children. Do NOT proceed to M4 until every issue has a child task.
+
+**Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> initialized with {N} child issues: #X, #Y, #Z. Parent task: <milestone_wi>.")`
 
 Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues. Starting sequential execution."
 
@@ -376,9 +404,9 @@ For each `child_task_id` in `child_wis` (in order):
 3. **Check child outcome:**
    | Child outcome | Milestone action |
    |---------------|------------------|
-   | `completed` (PR merged) | Continue to next child |
-   | `blocked` | **PAUSE milestone:** `update_task_status(task_id=<milestone_wi>, status="blocked", note="Child <repo>#<issue> blocked")`. Notify Vincent: "Milestone <repo> milestone#<n> paused — child <repo>#<issue> blocked. Reply 'continue' or 'skip <repo>#<issue>' to proceed." Stop execution. |
-   | `failed` (exhausted retries) | Continue to next child (record failure in milestone metadata) |
+   | `completed` (PR merged) | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> completed. PR merged.")`. Continue to next child |
+   | `blocked` | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> blocked. Reason: <reason>.")`. **PAUSE milestone:** `update_task_status(task_id=<milestone_wi>, status="blocked", note="Child <repo> issue#<issue> blocked")`. Notify Vincent: "Milestone <repo> milestone#<n> paused — child <repo> issue#<issue> blocked. Reply 'continue' or 'skip <repo> issue#<issue>' to proceed." Stop execution. |
+   | `failed` (exhausted retries) | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> failed after retries.")`. Continue to next child (record failure in milestone metadata) |
 
 4. **Loop** to next child
 
@@ -388,7 +416,8 @@ When all children processed:
 1. Gather stats from child tasks via `list_tasks` filtered by `parent_task_id=<milestone_wi>`
 2. **Build + deploy:** trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika`). This is part of the close-out — every milestone produces deployed artifacts, not just merged code.
 3. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
-4. Notify Vincent with summary:
+4. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
+5. Notify Vincent with summary:
    ```
    Milestone <repo> milestone#<n> complete.
    ✅ Completed: {N} | ❌ Failed: {N} | ⏸️ Blocked: {N}
@@ -442,9 +471,11 @@ Store ordered list of `repo#issue` references as `project_issues`.
 
 ### Step P3 — Create child tasks
 
+**PRE-FLIGHT CHECK (mandatory before every `create_task` call):** Call `list_tasks` filtered by matching `reference_url` to the GitHub issue URL (`https://github.com/senara-solutions/<repo>/issues/<issue_number>`). If a task already exists for that issue, reuse its `task_id` — do NOT create a duplicate. Append the existing `task_id` to `child_wis` and move to the next issue.
+
 For each `repo#issue` in `project_issues`:
 1. Parse repo and issue number
-2. Call `create_task` with **all** of these fields (do NOT omit `parent_task_id`):
+2. **Call `create_task` with EXACTLY these 5 fields** — copy the JSON block as-is, substituting the angle-bracket placeholders:
 
    ```json
    {
@@ -456,7 +487,7 @@ For each `repo#issue` in `project_issues`:
    }
    ```
 
-   `parent_task_id` links the child to the project parent — without it, the child is an orphan and callback routing to Step P4 will fail.
+   ⚠️ **ALL 5 FIELDS ARE REQUIRED.** Omitting `parent_task_id` ORPHANS the child from the project tree — callback routing to Step P4 will fail and the project loop breaks. Omitting `reference_url` disables the pre-flight check on the next run, causing duplicates. Do not truncate the JSON to `{"label": "...", "type": "issue"}` — that form is INCOMPLETE.
 
 ### Step P4 — Serial execution loop
 

@@ -294,6 +294,8 @@ fn dummy_settings() -> Settings {
         server_log_file: None,
         dashboard_enabled: false,
         disable_bundled_skills: false,
+        dev_mode: false,
+        disable_agent_provisioning: false,
         telemetry_enabled: false,
         otlp_endpoint: None,
         otlp_auth_header: None,
