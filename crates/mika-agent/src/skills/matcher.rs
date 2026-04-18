@@ -41,9 +41,6 @@ pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<Mat
     // First pass: direct matches (always_on or keyword hit), tracking reason
     let mut matched_reasons: HashMap<usize, MatchReason> = HashMap::new();
     for (i, entry) in skills.iter().enumerate() {
-        if !entry.enabled {
-            continue;
-        }
         let keyword_hit = entry
             .keywords_lower
             .iter()
@@ -134,12 +131,6 @@ mod tests {
         }
     }
 
-    fn make_disabled_entry(name: &str, keywords: &[&str], always_on: bool) -> SkillEntry {
-        let mut entry = make_entry(name, keywords, always_on);
-        entry.enabled = false;
-        entry
-    }
-
     #[test]
     fn test_always_on_included_regardless() {
         let skills = vec![make_entry("memory", &[], true)];
@@ -201,27 +192,9 @@ mod tests {
         assert!(matched.is_empty());
     }
 
-    #[test]
-    fn test_disabled_skills_excluded() {
-        let skills = vec![
-            make_entry("enabled", &["search"], false),
-            make_disabled_entry("disabled", &["search"], false),
-        ];
-        let matched = match_skills(&skills, "search for something");
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].entry.manifest.skill.name, "enabled");
-    }
-
-    #[test]
-    fn test_disabled_always_on_excluded() {
-        let skills = vec![
-            make_entry("enabled", &[], true),
-            make_disabled_entry("disabled", &[], true),
-        ];
-        let matched = match_skills(&skills, "hello");
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].entry.manifest.skill.name, "enabled");
-    }
+    // Note: disabled skills are evicted from the registry by apply_overrides()
+    // before match_skills() is ever called (#629, #630). No match-time disabled
+    // filter exists — the registry contract guarantees all entries are enabled.
 
     // --- Match reason tests (#265) ---
 

@@ -725,6 +725,7 @@ async fn run_agent_for_message(
         if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
             registry.apply_overrides(&overrides);
         }
+        registry.log_summary();
         let new = Arc::new(registry);
         *a.skills.lock().unwrap() = new.clone();
         new

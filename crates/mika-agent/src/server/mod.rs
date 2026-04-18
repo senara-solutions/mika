@@ -348,6 +348,7 @@ async fn init_agent(
         skill_registry.apply_overrides(&overrides);
     }
     skill_registry.validate_loaded();
+    skill_registry.log_summary();
     let skill_registry = Arc::new(skill_registry);
 
     let engine_sender = GatewayMessageSender::new(

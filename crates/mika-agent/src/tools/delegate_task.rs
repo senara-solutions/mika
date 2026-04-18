@@ -126,6 +126,7 @@ impl Tool for DelegateTaskTool {
         if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
             skills.apply_overrides(&overrides);
         }
+        skills.log_summary();
 
         // Register delegate agent so sessions FK constraint is satisfied.
         // Follows the team engine pattern (engine.rs line 95).

@@ -108,6 +108,7 @@ impl TeamEngine {
             if let Ok(overrides) = db.get_skill_overrides(&ta.name) {
                 skills.apply_overrides(&overrides);
             }
+            skills.log_summary();
             let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
 
             // Per-agent config cascade: per-agent config.toml > global config.toml > env vars.

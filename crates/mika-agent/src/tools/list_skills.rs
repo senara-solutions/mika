@@ -53,6 +53,7 @@ impl Tool for ListSkillsTool {
         // Run semantic validation to promote broken-handler/tools.json skills to skipped,
         // matching the startup paths (chat.rs, ask.rs, server/mod.rs).
         registry.validate_loaded();
+        registry.log_summary();
 
         let entries = registry.skills();
 

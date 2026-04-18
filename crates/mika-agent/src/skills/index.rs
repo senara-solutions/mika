@@ -93,9 +93,9 @@ pub struct SkillEntry {
     pub prompt_snippet: String,
     /// Tools defined in this skill's `tools.json`.
     pub skill_tools: Vec<ResolvedSkillTool>,
-    /// Whether the skill is enabled. Always `true` after scan; disabled state
-    /// is now applied by `SkillRegistry::apply_overrides()` from DB.
-    /// Kept for belt-and-suspenders match-time filter until #630.
+    /// Whether the skill is enabled. Always `true` after scan; disabled skills
+    /// are evicted by `SkillRegistry::apply_overrides()` and never appear in `entries`.
+    /// Retained for JSON output backward compatibility.
     pub enabled: bool,
     /// Whether this entry has a DB override applied (for display purposes).
     pub has_override: bool,
@@ -500,31 +500,19 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             SnippetLoadResult::Ok(content) => content,
             SnippetLoadResult::Empty => String::new(),
             SnippetLoadResult::Oversized { size, limit } => {
-                if manifest.skill.always_on {
-                    error!(
-                        skill = %manifest.skill.name,
-                        path = %snippet_path.display(),
-                        size,
-                        limit,
-                        "always_on skill prompt exceeds size limit — skill NOT loaded. \
-                         An always_on skill without its prompt is functionally broken. \
-                         Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
-                    );
-                    skipped.push(SkippedSkill {
-                        name: manifest.skill.name.clone(),
-                        reason: format!("oversized prompt ({size}B, limit {limit}B)"),
-                    });
-                    continue;
-                }
                 error!(
                     skill = %manifest.skill.name,
                     path = %snippet_path.display(),
                     size,
                     limit,
-                    "prompt snippet exceeds size limit — prompt will be empty. \
+                    "prompt exceeds size limit — skill NOT loaded. \
                      Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
                 );
-                String::new()
+                skipped.push(SkippedSkill {
+                    name: manifest.skill.name.clone(),
+                    reason: format!("oversized prompt ({size}B, limit {limit}B)"),
+                });
+                continue;
             }
             SnippetLoadResult::ReadError(e) => {
                 if manifest.skill.always_on {
@@ -2084,6 +2072,7 @@ mod tests {
 
     #[test]
     fn test_scan_clamps_override_to_ceiling() {
+        // Oversized prompts (over ceiling) cause the skill to be hard-skipped (#630)
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("huge-prompt");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -2102,13 +2091,15 @@ mod tests {
         fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
 
         let scan = scan_skills_dir(tmp.path());
-        assert_eq!(scan.entries.len(), 1);
-        // Should be empty because 100KB > 64KB ceiling
-        assert_eq!(scan.entries[0].prompt_snippet, "");
+        assert_eq!(scan.entries.len(), 0);
+        assert_eq!(scan.skipped.len(), 1);
+        assert_eq!(scan.skipped[0].name, "huge-prompt");
+        assert!(scan.skipped[0].reason.contains("oversized prompt"));
     }
 
     #[test]
     fn test_scan_skips_snippet_over_default() {
+        // Oversized prompts (over default limit) cause the skill to be hard-skipped (#630)
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("too-big");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -2126,8 +2117,10 @@ mod tests {
         fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
 
         let scan = scan_skills_dir(tmp.path());
-        assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].prompt_snippet, "");
+        assert_eq!(scan.entries.len(), 0);
+        assert_eq!(scan.skipped.len(), 1);
+        assert_eq!(scan.skipped[0].name, "too-big");
+        assert!(scan.skipped[0].reason.contains("oversized prompt"));
     }
 
     #[test]
@@ -2229,8 +2222,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_non_always_on_with_oversized_prompt_still_loads() {
-        // Non-always_on skills should still load with empty prompt (existing behavior)
+    fn test_scan_non_always_on_with_oversized_prompt_is_skipped() {
+        // Non-always_on skills with oversized prompts are hard-skipped (#630)
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("optional");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -2245,6 +2238,30 @@ mod tests {
         .unwrap();
         let content = "x".repeat(17 * 1024);
         fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
+
+        let scan = scan_skills_dir(tmp.path());
+        assert_eq!(scan.entries.len(), 0);
+        assert_eq!(scan.skipped.len(), 1);
+        assert_eq!(scan.skipped[0].name, "optional");
+        assert!(scan.skipped[0].reason.contains("oversized prompt"));
+    }
+
+    #[test]
+    fn test_scan_tool_only_skill_without_prompt_loads() {
+        // Tool-only skills (no system_prompt.md) should still load — regression guard (#630)
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("tool-only");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "tool-only"
+            description = "A tool-only skill"
+            "#,
+        )
+        .unwrap();
+        // No system_prompt.md — this is a tool-only skill
 
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
